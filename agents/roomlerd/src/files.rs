@@ -31,9 +31,9 @@
 //!   multiplexing binary chunks by id, which SCTP on a DC doesn't do
 //!   for us — browsers would need to open one DC per transfer. Ship
 //!   the simple path first; queue client-side.
-//! - Destination: `~/Downloads` (or platform equivalent per
-//!   `directories::UserDirs::download_dir()`). Falls back to the OS
-//!   temp dir if the user has no Downloads (rare — headless CI).
+//! - Destination: the Downloads of whoever the file is written as. Never
+//!   the temp dir on Linux (#3688: the daemon's own `~/Downloads`, made
+//!   0700, else a refusal); Windows falls back to the machine's folder.
 //! - Filename safety: the browser-provided `name` is stripped to its
 //!   basename and any character outside `[A-Za-z0-9._-]` is replaced
 //!   with `_` so the agent never writes outside Downloads. Collisions
@@ -56,6 +56,18 @@ use tokio::sync::Mutex;
 use tunnel_core::env::node_env_os;
 
 use crate::files_dir;
+
+/// #3688 — a received file's staging on Linux, held by handles.
+#[cfg(target_os = "linux")]
+mod staging;
+
+/// #3688 — a transfer's staging, held by handles from its begin (or resume)
+/// to its end: on Linux, its folders ([`staging::Held`]; `None` only in the
+/// tests' own staging-root mode); elsewhere nothing, and the steps go by path.
+#[cfg(target_os = "linux")]
+type HeldStaging = Option<staging::Held>;
+#[cfg(not(target_os = "linux"))]
+type HeldStaging = ();
 
 /// 2 GiB. SCTP DCs in webrtc-rs can carry larger payloads in theory
 /// but per-transfer >2 GB is outside the "drop a file" use case and
@@ -167,6 +179,10 @@ pub(crate) static FILES_DIR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mut
 ///   per-user identity to resolve, its default ladder already lands in its
 ///   own folders, and the LocalAPI socket is owner-only (0600) — the pipe's
 ///   non-admin caller does not exist on Unix, so the rule is belt and braces.
+///   On Linux that home is the one root's account names (`account_home`),
+///   never the `HOME` its environment names (`sudo -E` keeps the caller's;
+///   a drop-in may set one), so another account's home there never becomes
+///   where a configured or a chosen folder may sit (#3688).
 /// * Everyone else — unprivileged: this process can only write where its own
 ///   user can, so the folder rules apply and the profile rule does not.
 pub fn writer_context() -> files_dir::Writer {
@@ -183,9 +199,13 @@ pub fn writer_context() -> files_dir::Writer {
     {
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
+            #[cfg(target_os = "linux")]
+            let active_home = account_home().map(|home| home.to_string_lossy().into_owned());
+            #[cfg(not(target_os = "linux"))]
+            let active_home = process_home();
             return files_dir::Writer {
                 privileged: true,
-                active_home: process_home(),
+                active_home,
             };
         }
     }
@@ -202,6 +222,14 @@ fn process_home() -> Option<String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // #3688 — a test's stand-in for the daemon's own home, so the
+        // placement rule's home is never a real one either: the `HOME` its
+        // environment names (`stand_in::env_home`), which `BaseDirs` reads,
+        // else its account's own.
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(home) = stand_in::env_home_now().or_else(stand_in::own_home_now) {
+            return home.map(|home| home.to_string_lossy().into_owned());
+        }
         directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
     }
 }
@@ -563,14 +591,28 @@ impl FsAs {
 
     /// #3688 — whether a received file is written by the daemon alone: a
     /// root daemon with nobody at seat0 ([`Self::DaemonAlone`]). Its files
-    /// are born 0600, root's only, wherever they land: on a server that is
-    /// the shared `/tmp`.
+    /// are born 0600, root's only, wherever they land: in root's own
+    /// Downloads ([`default_download_dir`]).
     fn writes_alone(&self) -> bool {
         #[cfg(target_os = "linux")]
         if matches!(self, Self::DaemonAlone) {
             return true;
         }
         false
+    }
+
+    /// #3688 — whether a received file is written by root itself: the
+    /// daemon alone (nobody at seat0), or a daemon that is root (root at the
+    /// screen, or the switch off). Such a writer's resume and end place only
+    /// in a folder the rule gives it now ([`root_may_place_in`]), and its
+    /// folder upload follows no link on the way.
+    #[cfg(target_os = "linux")]
+    fn writes_as_root(&self) -> bool {
+        match self {
+            Self::DaemonAlone => true,
+            Self::Daemon => own_euid() == 0,
+            _ => false,
+        }
     }
 
     /// #3688 — whether a read's steps hold each handle they open to what
@@ -626,9 +668,18 @@ impl FsAs {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         let who = self.clone();
-        tokio::task::spawn_blocking(move || who.run_here(f))
-            .await
-            .context("a file-transfer step's thread")?
+        // #3688 — what a test stood in on its thread (the daemon's own home,
+        // the environment's, whether file systems keep modes) goes with the
+        // step to its thread.
+        #[cfg(all(test, target_os = "linux"))]
+        let carried = stand_in::carried();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(all(test, target_os = "linux"))]
+            let _carried = carried.stand();
+            who.run_here(f)
+        })
+        .await
+        .context("a file-transfer step's thread")?
     }
 
     /// [`Self::run`] on THIS thread, which must be a blocking one.
@@ -1405,7 +1456,7 @@ pub async fn sweep_orphans() -> (usize, usize) {
     // Linux system install, the person at seat0, in their own folder.
     let who = FsAs::now();
     let w = who.clone();
-    let roots = who
+    let (roots, private) = who
         .run(move || {
             let mut roots: Vec<PathBuf> = Vec::new();
             if let Ok(d) = default_download_dir_as(&w, false) {
@@ -1419,22 +1470,49 @@ pub async fn sweep_orphans() -> (usize, usize) {
             {
                 roots.push(c);
             }
-            Ok(roots)
+            // R4 — and the writer's own private staging folder, whose
+            // children are partials.
+            #[cfg(target_os = "linux")]
+            let private = private_staging_root(&w);
+            #[cfg(not(target_os = "linux"))]
+            let private: Option<PathBuf> = None;
+            Ok((roots, private))
         })
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(%e, "sweep_orphans: could not resolve the drop folders as their writer");
-            Vec::new()
+            (Vec::new(), None)
         });
-    if roots.is_empty() {
+    if roots.is_empty() && private.is_none() {
         tracing::debug!("sweep_orphans: Downloads dir not resolvable; skipping");
         return (0, 0);
     }
     let (mut kept, mut swept) = (0, 0);
-    for root in &roots {
-        let (k, s) = sweep_orphans_dir_as(&who, root.join(".roomler-partial")).await;
+    let walked = roots
+        .iter()
+        .map(|root| root.join(".roomler-partial"))
+        .chain(private);
+    for dir in walked {
+        let (k, s) = sweep_orphans_dir_as(&who, dir).await;
         kept += k;
         swept += s;
+    }
+    // #3688 — and the empty folders `staging::keeps_modes`'s probe left in a
+    // drop folder (a crash between their make and their removal): nothing a
+    // probe makes stays.
+    #[cfg(target_os = "linux")]
+    {
+        let probes = who
+            .run(move || {
+                Ok(roots
+                    .iter()
+                    .map(|root| staging::sweep_probes(root))
+                    .sum::<usize>())
+            })
+            .await;
+        if let Err(e) = probes {
+            tracing::debug!(%e, "sweep_orphans: probe folders not swept");
+        }
     }
     (kept, swept)
 }
@@ -1497,7 +1575,16 @@ async fn sweep_orphans_dir_as(who: &FsAs, dir: PathBuf) -> (usize, usize) {
 
 /// The sweep's filesystem half, on THIS (blocking) thread under the
 /// caller's identity: the survivors as `(id, meta.json)`, and how many
-/// partials were removed.
+/// partials were removed. #3688 — on Linux a partial is a survivor only
+/// when it is its stager's own and nobody else may write it, every step
+/// opened without following a link (`staging::sweep`).
+#[cfg(target_os = "linux")]
+fn sweep_orphans_dir_here(dir: &std::path::Path, now: i64) -> (Vec<(String, PathBuf)>, usize) {
+    staging::sweep(dir, now, PARTIAL_ORPHAN_TTL_SECS)
+}
+
+/// [`sweep_orphans_dir_here`] elsewhere, by path.
+#[cfg(not(target_os = "linux"))]
 fn sweep_orphans_dir_here(dir: &std::path::Path, now: i64) -> (Vec<(String, PathBuf)>, usize) {
     let mut survivors = Vec::new();
     let mut swept = 0usize;
@@ -1790,6 +1877,11 @@ pub(crate) struct IncomingTransfer {
     /// a source the daemon opens into a file the person creates. Otherwise
     /// `who`.
     pub stager: FsAs,
+    /// #3688: its staging, held from its begin (or resume) to its end, so
+    /// the end places from the folders it began in, never from whatever has
+    /// those names by then (Linux; nothing elsewhere).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub held: HeldStaging,
     /// rc.19: increments [`ACTIVE_TRANSFERS`] on creation, decrements
     /// on drop. Last field so it drops AFTER `file` — guarantees the
     /// kernel page cache has reached the disk-flush queue before the
@@ -1972,25 +2064,27 @@ impl FilesHandler {
         // validated) or Downloads (default). When dest_path is set
         // but invalid (denylist hit / not a directory), fall back to
         // Downloads with a warning so the upload doesn't silently
-        // drop the operator's data.
-        let target_dir = match dest_path.filter(|p| !p.is_empty()) {
+        // drop the operator's data. #3688 — a default folder that cannot
+        // receive files says why in its own words, which the viewer shows
+        // (it shows an error's outermost line only).
+        // #3688 — and whether it is the daemon's own default folder, whose
+        // rule its staging then holds the handle it opens to.
+        let (target_dir, the_default) = match dest_path.filter(|p| !p.is_empty()) {
             Some(dp) => match resolve_dest_path_as(&who, dp).await {
-                Ok(d) => d,
+                Ok(d) => (d, false),
                 Err(e) => {
                     tracing::warn!(
                         dest_path = dp,
                         %e,
                         "files: dest_path rejected; falling back to Downloads"
                     );
-                    download_dir_for(&who)
-                        .await
-                        .context("resolving Downloads folder")?
+                    drop_folder_for(&who).await?
                 }
             },
-            None => download_dir_for(&who)
-                .await
-                .context("resolving Downloads folder")?,
+            None => drop_folder_for(&who).await?,
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = the_default;
         let filename = sanitize_filename(&name);
 
         // rc.19: stage at <dest_dir>/.roomler-partial/<id>/data so a
@@ -2028,7 +2122,7 @@ impl FilesHandler {
         };
 
         // The staging half, as the stager.
-        let (meta_path, file) = {
+        let (partial_dir, file, held) = {
             let (target_dir, partial_dir, filename, id, reserved_final) = (
                 target_dir.clone(),
                 partial_dir.clone(),
@@ -2041,8 +2135,36 @@ impl FilesHandler {
             // #3688 — the daemon alone (nobody at seat0): its files are
             // born readable by root only, in whatever folder they land.
             let private = stager.writes_alone();
+            // #3688 — on Linux, staged and held by handles (`staging`);
+            // the tests' own staging-root mode keeps the steps below.
+            #[cfg(target_os = "linux")]
+            let (by_handles, as_stager) = (!self.stages_in_a_root(), stager.clone());
             stager
                 .run(move || {
+                    #[cfg(target_os = "linux")]
+                    if by_handles {
+                        let meta = PartialMeta {
+                            protocol_version: 1,
+                            filename: filename.clone(),
+                            expected_size: expected,
+                            dest_dir: target_dir.clone(),
+                            reserved_final_path: reserved_final.clone(),
+                            created_at_unix: chrono::Utc::now().timestamp(),
+                            rel_path: rel_for_meta,
+                            person_sid,
+                        };
+                        let meta_bytes = serde_json::to_vec_pretty(&meta)
+                            .context("serialising partial meta.json")?;
+                        let (held, file) = stage_held(
+                            &as_stager,
+                            &target_dir,
+                            &id,
+                            &meta_bytes,
+                            private,
+                            the_default,
+                        )?;
+                        return Ok((held.dir_path().to_path_buf(), file, Some(held)));
+                    }
                     // B1 fix — reject if an existing partial dir is on disk for
                     // this id. The browser MUST send `files:resume` instead, or
                     // generate a new UUID. Without this check the data file
@@ -2098,10 +2220,11 @@ impl FilesHandler {
                     let file = new_file(private)
                         .open(&data_path)
                         .with_context(|| format!("creating {}", data_path.display()))?;
-                    Ok((meta_path, file))
+                    Ok((partial_dir, file, HeldStaging::default()))
                 })
                 .await?
         };
+        let meta_path = partial_dir.join("meta.json");
         // The open file carries the identity's rights from here on; the
         // writes through it need no identity of their own.
         let file = File::from_std(file);
@@ -2141,6 +2264,7 @@ impl FilesHandler {
             rel_path: rel_path.map(|s| s.to_string()),
             who,
             stager,
+            held,
             _active_guard: ActiveTransferGuard::new(),
         });
         Ok(reserved_final)
@@ -2249,6 +2373,43 @@ impl FilesHandler {
             state.rel_path.clone(),
             state.partial_dir.clone(),
         );
+        // #3688 — on Linux, placed from the held staging into the held
+        // target, never by path: a folder moved aside since and another put
+        // in its place changes nothing. A root writer places only in a
+        // folder the rule gives it now, and its folder upload follows no
+        // link on the way.
+        #[cfg(target_os = "linux")]
+        if let Some(held) = state.held.take() {
+            let who = state.who.clone();
+            let placed = state
+                .who
+                .run(move || {
+                    let root_writer = who.writes_as_root();
+                    if root_writer {
+                        let target = held
+                            .target()
+                            .ok_or_else(|| anyhow!("no folder is held to place the file in"))?;
+                        root_may_place_in(&who, &dest_dir, target).map_err(|why| {
+                            anyhow!(
+                                "{} is not a folder this computer receives files into now \
+                                 ({why}), so the file is not placed there",
+                                dest_dir.display()
+                            )
+                        })?;
+                    }
+                    let (folders, name) = rel
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .and_then(folder_upload_parts)
+                        .unwrap_or((Vec::new(), filename));
+                    staging::place(held, &dest_dir, &folders, &name, root_writer)
+                })
+                .await?;
+            if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+                g.remove(&state.id);
+            }
+            return Ok((placed, state.received));
+        }
         // #3048 — staged by the daemon, placed for the person: copied across.
         if state.stager.is_the_daemon() && !state.who.is_the_daemon() {
             let placed = place_across(
@@ -2463,19 +2624,40 @@ impl FilesHandler {
         transfer_id(id)?;
         // First clear in-flight state if it matches.
         let mut cleared_state = false;
-        {
+        let in_flight = {
             let mut guard = self.incoming.lock().await;
-            if let Some(state) = guard.as_ref()
-                && state.id == id
-            {
-                *guard = None;
+            if guard.as_ref().is_some_and(|state| state.id == id) {
                 cleared_state = true;
+                guard.take()
+            } else {
+                None
             }
+        };
+        // #3688 — on Linux the in-flight upload's staging goes through the
+        // handles it holds, as whoever staged it.
+        #[cfg(target_os = "linux")]
+        if let Some(mut state) = in_flight
+            && let Some(held) = state.held.take()
+        {
+            drop(state.file);
+            let _ = state
+                .stager
+                .run(move || {
+                    staging::discard(held);
+                    Ok(())
+                })
+                .await;
+            if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+                g.remove(id);
+            }
+            return Ok(true);
         }
+        #[cfg(not(target_os = "linux"))]
+        drop(in_flight);
         // Remove the staging dir if known via the registry. Even if
         // in-flight state didn't match, a partial from a previous DC
         // might still be on disk.
-        let staging = {
+        let registered = {
             let g = match PARTIAL_REGISTRY.lock() {
                 Ok(g) => g,
                 Err(_) => return Ok(cleared_state),
@@ -2488,7 +2670,31 @@ impl FilesHandler {
                     .map(|p| (p.to_path_buf(), e.who.clone()))
             })
         };
-        if let Some((dir, who)) = staging {
+        if let Some((dir, who)) = registered {
+            // #3688 — on Linux walked again with rule 3's checks, and
+            // removed through handles only when it is its stager's own;
+            // anything else stays for the sweep.
+            #[cfg(target_os = "linux")]
+            if !self.stages_in_a_root() {
+                let (notes, id_s, w) = (dir.join("meta.json"), id.to_string(), who.clone());
+                let _ = who
+                    .run(move || {
+                        match staging::reopen(&notes, &id_s, private_staging_root(&w).as_deref()) {
+                            Ok((held, _)) => staging::discard(held),
+                            Err(e) => tracing::warn!(
+                                id = %id_s,
+                                error = %format!("{e:#}"),
+                                "files: a cancelled partial that is not its stager's own is left"
+                            ),
+                        }
+                        Ok(())
+                    })
+                    .await;
+                if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+                    g.remove(id);
+                }
+                return Ok(true);
+            }
             // FR-97 P3d — removed as whoever staged it.
             let _ = who
                 .run(move || {
@@ -2569,10 +2775,40 @@ impl FilesHandler {
                     self.partial_dir(std::path::Path::new(""), id)?
                         .join("meta.json")
                 } else {
-                    let downloads = download_dir_for(&now)
-                        .await
-                        .context("resolving Downloads for on-demand resume probe")?;
-                    self.partial_dir(&downloads, id)?.join("meta.json")
+                    // R4 — on Linux, first in the stager's own private folder,
+                    // where an upload into a folder that keeps no modes stages.
+                    #[cfg(target_os = "linux")]
+                    let private = {
+                        let (w, id_s) = (stager.clone(), id.to_string());
+                        stager
+                            .run(move || {
+                                Ok(private_staging_root(&w)
+                                    .map(|root| root.join(&id_s).join("meta.json"))
+                                    .filter(|notes| std::fs::symlink_metadata(notes).is_ok()))
+                            })
+                            .await?
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let private: Option<PathBuf> = None;
+                    match private {
+                        Some(notes) => notes,
+                        None => {
+                            // #3688 — on Linux the lookup creates nothing: the
+                            // drop folder as it would resolve now, unmade.
+                            #[cfg(target_os = "linux")]
+                            let downloads = {
+                                let w = now.clone();
+                                now.run(move || drop_folder_without_creating(&w))
+                                    .await
+                                    .context("resolving Downloads for on-demand resume probe")?
+                            };
+                            #[cfg(not(target_os = "linux"))]
+                            let downloads = download_dir_for(&now)
+                                .await
+                                .context("resolving Downloads for on-demand resume probe")?;
+                            self.partial_dir(&downloads, id)?.join("meta.json")
+                        }
+                    }
                 };
                 let probe = canonical.clone();
                 if !stager
@@ -2594,6 +2830,13 @@ impl FilesHandler {
         };
         if let Some(why) = who.refusal() {
             return Err(anyhow!(why));
+        }
+        // #3688 — on Linux, walked again with rule 3's checks and held.
+        #[cfg(target_os = "linux")]
+        if !self.stages_in_a_root() {
+            return self
+                .resume_held(id, requested_offset, meta_path, stager, who)
+                .await;
         }
 
         // FR-97 P3d — read, truncate and reopen as whoever staged the
@@ -2677,6 +2920,144 @@ impl FilesHandler {
             rel_path: meta.rel_path.clone(),
             who,
             stager,
+            held: HeldStaging::default(),
+            _active_guard: ActiveTransferGuard::new(),
+        });
+        tracing::info!(
+            id,
+            requested_offset,
+            accepted_offset = accepted,
+            "files: resume accepted"
+        );
+        Ok(accepted)
+    }
+
+    /// #3688 — [`Self::resume_incoming_as`] on Linux, as the stager: the
+    /// partial walked again from its notes' path and held (`staging::reopen`),
+    /// trusted only when its folder, notes and `data` are the stager's own
+    /// and nobody else may write them, each opened without following a link
+    /// (rule 3). A root writer's partial must also sit beside the folder its
+    /// notes record, under a bare name, and that folder must be one the rule
+    /// gives it now (rule 4): its file is placed there, never where the notes
+    /// alone say. The person's, or a per-user daemon's, is placed where its
+    /// notes say, as them (FR-97 P3d). Anything else is "no partial state",
+    /// and the viewer starts that upload over.
+    #[cfg(target_os = "linux")]
+    async fn resume_held(
+        &self,
+        id: &str,
+        requested_offset: u64,
+        meta_path: PathBuf,
+        stager: FsAs,
+        who: FsAs,
+    ) -> Result<u64> {
+        let placer = who.person_sid().map(str::to_string);
+        let (id_s, w, st, partial_dir) = (
+            id.to_string(),
+            who.clone(),
+            stager.clone(),
+            meta_path.parent().map(std::path::Path::to_path_buf),
+        );
+        let (meta, held, accepted, file) = stager
+            .run(move || {
+                let refuse = |why: String| {
+                    tracing::warn!(
+                        id = %id_s,
+                        %why,
+                        "files: a resume found no partial it may trust — refused"
+                    );
+                    anyhow!("no partial state for id {id_s}")
+                };
+                let private_root = private_staging_root(&st);
+                let (mut held, beside) =
+                    staging::reopen(&meta_path, &id_s, private_root.as_deref())
+                        .map_err(|e| refuse(format!("{e:#}")))?;
+                let notes = staging::read_notes(&held).map_err(|e| refuse(format!("{e:#}")))?;
+                let meta: PartialMeta = serde_json::from_slice(&notes)
+                    .with_context(|| format!("parsing {}", meta_path.display()))?;
+                // #3048 — placed only for the person the transfer began for.
+                if let Some(began_for) = meta.person_sid.as_deref()
+                    && !placer
+                        .as_deref()
+                        .is_some_and(|sid| sid.eq_ignore_ascii_case(began_for))
+                {
+                    return Err(anyhow!(NOT_THE_PERSON));
+                }
+                match (w.writes_as_root(), beside) {
+                    (true, Some(base)) => {
+                        if meta.dest_dir != base {
+                            return Err(refuse(format!(
+                                "its notes record {}, but it sits beside {}",
+                                meta.dest_dir.display(),
+                                base.display()
+                            )));
+                        }
+                        if sanitize_filename(&meta.filename) != meta.filename {
+                            return Err(refuse(
+                                "its notes record a name that is not a bare one".into(),
+                            ));
+                        }
+                        let target = held
+                            .target()
+                            .ok_or_else(|| refuse("no folder is held beside it".into()))?;
+                        root_may_place_in(&w, &base, target).map_err(refuse)?;
+                    }
+                    // R4 — staged in root's private folder, for a folder
+                    // that keeps no modes: that folder must be one the rule
+                    // gives now, under a bare name, and one no other
+                    // account may write.
+                    (true, None) => {
+                        if sanitize_filename(&meta.filename) != meta.filename {
+                            return Err(refuse(
+                                "its notes record a name that is not a bare one".into(),
+                            ));
+                        }
+                        let folder = staging::open_folder(&meta.dest_dir).map_err(|e| {
+                            refuse(format!("opening {}: {e}", meta.dest_dir.display()))
+                        })?;
+                        root_may_place_in(&w, &meta.dest_dir, &folder).map_err(refuse)?;
+                        staging::may_receive(&folder, own_euid(), true)
+                            .map_err(|why| refuse(format!("{}: {why}", meta.dest_dir.display())))?;
+                        held.place_in(folder);
+                    }
+                    (false, _) => {
+                        let folder = staging::open_folder(&meta.dest_dir)
+                            .with_context(|| format!("opening {}", meta.dest_dir.display()))?;
+                        held.place_in(folder);
+                    }
+                }
+                let (data, disk_size) =
+                    staging::reopen_data(&held).map_err(|e| refuse(format!("{e:#}")))?;
+                // B3 truncation, on the handle just checked: aligned to the
+                // 256 KiB `files:progress` cadence.
+                const ALIGN_MASK: u64 = !(256 * 1024 - 1);
+                let accepted = requested_offset.min(disk_size) & ALIGN_MASK;
+                data.set_len(accepted)
+                    .with_context(|| format!("truncating data to {accepted}"))?;
+                Ok((meta, held, accepted, data))
+            })
+            .await?;
+        let file = File::from_std(file);
+        let mut guard = self.incoming.lock().await;
+        if guard.is_some() {
+            return Err(anyhow!(
+                "files:resume {id} but another transfer is in-flight on this DC"
+            ));
+        }
+        *guard = Some(IncomingTransfer {
+            id: id.to_string(),
+            expected: meta.expected_size,
+            received: accepted,
+            file,
+            last_progress: accepted,
+            partial_dir: partial_dir.unwrap_or_default(),
+            dest_dir: meta.dest_dir.clone(),
+            filename: meta.filename.clone(),
+            last_synced: accepted,
+            rel_path: meta.rel_path.clone(),
+            who,
+            stager,
+            held: Some(held),
             _active_guard: ActiveTransferGuard::new(),
         });
         tracing::info!(
@@ -3902,6 +4283,26 @@ pub fn sanitize_filename(name: &str) -> String {
 /// `dir` is the Downloads directory; the returned path lives under
 /// `dir/<root>/<sub...>/<file>` with each segment safe.
 fn resolve_folder_upload_path(dir: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    let (folders, file_name) = folder_upload_parts(rel)?;
+    let mut path = dir.to_path_buf();
+    for c in &folders {
+        path.push(c);
+    }
+    // Apply collision-safe rename to the leaf file. The directory
+    // prefix is shared across all files in a folder upload so we
+    // intentionally do NOT version-suffix it — a re-upload of the
+    // same folder merges files into the same destination directory
+    // (each colliding file picks up its own `(2)` suffix). This
+    // matches the behaviour operators expect from a desktop
+    // file-manager paste-on-existing-folder.
+    Some(unique_path(&path, &file_name))
+}
+
+/// A folder upload's relative path as its folders and its file name, each
+/// component sanitised ([`resolve_folder_upload_path`]'s rules); `None` for
+/// one with fewer than two usable components or deeper than 32. #3688 — the
+/// end of a held transfer makes those folders from the folder it holds.
+fn folder_upload_parts(rel: &str) -> Option<(Vec<String>, String)> {
     // Normalise separators: Windows-style backslashes can sneak in
     // if a buggy browser converts paths.
     let normalised = rel.replace('\\', "/");
@@ -3922,18 +4323,7 @@ fn resolve_folder_upload_path(dir: &std::path::Path, rel: &str) -> Option<PathBu
     }
     // Last component is the file; everything before is dir hierarchy.
     let file_name = components.pop()?;
-    let mut path = dir.to_path_buf();
-    for c in &components {
-        path.push(c);
-    }
-    // Apply collision-safe rename to the leaf file. The directory
-    // prefix is shared across all files in a folder upload so we
-    // intentionally do NOT version-suffix it — a re-upload of the
-    // same folder merges files into the same destination directory
-    // (each colliding file picks up its own `(2)` suffix). This
-    // matches the behaviour operators expect from a desktop
-    // file-manager paste-on-existing-folder.
-    Some(unique_path(&path, &file_name))
+    Some((components, file_name))
 }
 
 /// Given a base directory and a desired filename, return a path that
@@ -3983,28 +4373,44 @@ fn split_stem_ext(name: &str) -> (&str, &str) {
 /// refusal is logged and falls back rather than failing the drop.
 /// FR-97 P3d — the drop folder for `who`, resolved as them (the configured
 /// folder's gate creates it and probes a write).
+#[cfg(any(test, not(target_os = "linux")))]
 async fn download_dir_for(who: &FsAs) -> Result<PathBuf> {
-    let w = who.clone();
-    who.run(move || download_dir_as(&w)).await
+    drop_folder_for(who).await.map(|(folder, _)| folder)
 }
 
-/// [`download_dir`] for `who`, on a thread under their identity. For the
-/// person at seat0: the configured folder when it passes for them (inside
-/// THEIR home, FR-84 D4's rule), else their own Downloads.
+/// [`download_dir_for`], and whether the folder is the daemon's own default
+/// one ([`default_download_dir`]), which a begin then holds to its rule on
+/// the handle its staging opens (#3688).
+async fn drop_folder_for(who: &FsAs) -> Result<(PathBuf, bool)> {
+    let w = who.clone();
+    who.run(move || drop_folder_as(&w)).await
+}
+
+/// The drop folder for `who` ([`drop_folder_as`]), on a thread under their
+/// identity.
+#[cfg(all(test, target_os = "windows"))]
 fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
+    drop_folder_as(who).map(|(folder, _)| folder)
+}
+
+/// [`download_dir_as`], and whether the folder is the daemon's own default
+/// one. For the person at seat0: the configured folder when it passes for
+/// them (inside THEIR home, FR-84 D4's rule), else their own Downloads,
+/// neither the daemon's.
+fn drop_folder_as(who: &FsAs) -> Result<(PathBuf, bool)> {
     match who {
-        FsAs::Daemon => download_dir(),
+        FsAs::Daemon => drop_folder_with(&writer_context()),
         // #3688 — nobody at seat0: the configured folder is checked with no
         // active home ([`FsAs::writer`]), so it never resolves in the
         // daemon's own home, and the drop lands in the default folder.
         #[cfg(target_os = "linux")]
-        FsAs::DaemonAlone => download_dir_with(&who.writer()),
+        FsAs::DaemonAlone => drop_folder_with(&who.writer()),
         #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => {
             if let Some(raw) = configured_files_dir() {
                 let writer = who.writer();
                 match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
-                    Ok(dir) => return Ok(dir),
+                    Ok(dir) => return Ok((dir, false)),
                     Err(e) => tracing::warn!(
                         files_dir = %raw,
                         active_home = ?writer.active_home,
@@ -4014,7 +4420,7 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
                     ),
                 }
             }
-            Ok(person_downloads(home))
+            Ok((person_downloads(home), false))
         }
         // #3048 — the same for the person signed in to a Windows worker's
         // session: their `files_dir` when it passes for them (inside THEIR
@@ -4026,7 +4432,7 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
             if let Some(raw) = configured_files_dir() {
                 let writer = who.writer();
                 match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
-                    Ok(dir) => return Ok(dir),
+                    Ok(dir) => return Ok((dir, false)),
                     Err(e) => tracing::warn!(
                         files_dir = %raw,
                         active_home = ?writer.active_home,
@@ -4036,10 +4442,9 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
                     ),
                 }
             }
-            Ok(person_downloads_windows(
-                downloads.as_deref(),
-                profile,
-                true,
+            Ok((
+                person_downloads_windows(downloads.as_deref(), profile, true),
+                false,
             ))
         }
         #[cfg(target_os = "windows")]
@@ -4073,16 +4478,18 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
     }
 }
 
+/// Where the daemon's own drop lands: [`drop_folder_with`] for this process.
+#[cfg(test)]
 fn download_dir() -> Result<PathBuf> {
-    download_dir_with(&writer_context())
+    drop_folder_with(&writer_context()).map(|(folder, _)| folder)
 }
 
-/// [`download_dir`] for `writer`: the configured folder when it passes for
-/// it, else the default ladder.
-fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
+/// The drop folder for `writer`: the configured folder when it passes for
+/// it, else the default ladder, and whether it is that default folder.
+fn drop_folder_with(writer: &files_dir::Writer) -> Result<(PathBuf, bool)> {
     if let Some(raw) = configured_files_dir() {
         match files_dir::validate(&raw, writer, &files_dir::Rules::from_env()) {
-            Ok(dir) => return Ok(dir),
+            Ok(dir) => return Ok((dir, false)),
             Err(e) => tracing::warn!(
                 files_dir = %raw,
                 privileged = writer.privileged,
@@ -4092,12 +4499,273 @@ fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
             ),
         }
     }
-    default_download_dir(true)
+    Ok((default_download_dir(true)?, true))
 }
 
 /// The default ladder — what `files_dir` unset has always meant. `log` =
 /// false for the status answer, which is recomputed every few seconds while
 /// the companion is open and must not repeat the fallback's warning each time.
+///
+/// #3688 — on Linux it is the daemon's own folder, never one another account
+/// can write: the XDG Downloads folder when it exists and passes, else
+/// `~/Downloads`, made 0700 when a file arrives (`log`; looking makes
+/// nothing), else a refusal saying why, which the viewer shows. Each is
+/// opened following links, and the folder it leads to must be the writer's
+/// own; for root, one no other account may write; for a per-user daemon,
+/// one not every account may (Ubuntu's private-group umask makes
+/// `~/Downloads` 0775), unless its file system keeps no owners or modes,
+/// where it need only be one the daemon can write into
+/// (`staging::may_receive`). Root's home is its account's, and must pass
+/// root's rule too ([`own_home_and_downloads`]). It was the temp dir: on a
+/// server, root's was `/tmp`.
+#[cfg(target_os = "linux")]
+fn default_download_dir(log: bool) -> Result<PathBuf> {
+    let uid = own_euid();
+    let strict = uid == 0;
+    let cannot = |folder: &std::path::Path, why: &str| {
+        anyhow!("{} cannot receive files: {why}", folder.display())
+    };
+    let (home, xdg) = own_home_and_downloads();
+    if let Some(xdg) = xdg {
+        match staging::open_folder(&xdg) {
+            Ok(held) => match staging::may_receive(&held, uid, strict) {
+                Ok(()) => return Ok(xdg),
+                Err(why) if log => tracing::warn!(
+                    folder = %xdg.display(),
+                    %why,
+                    "files: the XDG Downloads folder cannot receive files — trying ~/Downloads"
+                ),
+                Err(_) => {}
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if log => tracing::warn!(
+                folder = %xdg.display(),
+                %e,
+                "files: the XDG Downloads folder does not open — trying ~/Downloads"
+            ),
+            Err(_) => {}
+        }
+    }
+    let home = home.map_err(|why| anyhow!("{why}"))?;
+    let downloads = home.join("Downloads");
+    let held = match staging::open_folder(&downloads) {
+        Ok(held) => held,
+        // Looking makes nothing: where the first file would make it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !log => return Ok(downloads),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            use std::os::unix::fs::DirBuilderExt;
+            match std::fs::DirBuilder::new().mode(0o700).create(&downloads) {
+                Ok(()) => tracing::info!(
+                    folder = %downloads.display(),
+                    "files: made the default folder, 0700"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(cannot(&downloads, &format!("it could not be made ({e})"))),
+            }
+            staging::open_folder(&downloads)
+                .map_err(|e| cannot(&downloads, &format!("it does not open ({e})")))?
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+            return Err(cannot(&downloads, "it is not a folder"));
+        }
+        Err(e) => return Err(cannot(&downloads, &format!("it does not open ({e})"))),
+    };
+    staging::may_receive(&held, uid, strict).map_err(|why| cannot(&downloads, &why))?;
+    Ok(downloads)
+}
+
+/// #3688 — this process's effective uid: root's 0 for a system install.
+#[cfg(target_os = "linux")]
+fn own_euid() -> u32 {
+    // SAFETY: `geteuid` reads this process's own credentials.
+    unsafe { libc::geteuid() }
+}
+
+/// #3688 — the folder a received file for `who` would land in now, with
+/// nothing made: the configured folder when it passes for them, else the
+/// default one. Where a resume's lookup looks for a partial. As `who`.
+#[cfg(target_os = "linux")]
+fn drop_folder_without_creating(who: &FsAs) -> Result<PathBuf> {
+    if let Ok(Some(configured)) = configured_folder_without_creating(who) {
+        return Ok(configured);
+    }
+    default_download_dir_as(who, false)
+}
+
+/// #3688 — begin's staging on Linux, on the stager's thread: the target
+/// folder opened (its links followed) and held; when begin resolved it as
+/// the daemon's own default folder (`the_default`), that very handle
+/// checked by its rule ([`default_download_dir`]); then the partial made
+/// beside it and held (`staging::stage`): `data` 0600 for the daemon alone
+/// (#3697), 0644 otherwise. R4 — a folder whose file system keeps no modes
+/// (`staging::keeps_modes`) stages in the stager's private folder instead
+/// ([`private_staging_root`], `staging::stage_privately`), and a root
+/// writer stays strict there: never into a folder another account can
+/// write.
+#[cfg(target_os = "linux")]
+fn stage_held(
+    stager: &FsAs,
+    target_dir: &std::path::Path,
+    id: &str,
+    meta: &[u8],
+    private: bool,
+    the_default: bool,
+) -> Result<(staging::Held, std::fs::File)> {
+    #[cfg(test)]
+    stand_in::before_a_folder_opens(target_dir);
+    let base = staging::open_folder(target_dir)
+        .with_context(|| format!("opening {}", target_dir.display()))?;
+    let cannot = |why: String| anyhow!("{} cannot receive files: {why}", target_dir.display());
+    let uid = own_euid();
+    if the_default {
+        staging::may_receive(&base, uid, uid == 0).map_err(cannot)?;
+    }
+    let data_mode = if private { 0o600 } else { 0o644 };
+    if staging::keeps_modes(&base) {
+        return staging::stage(base, target_dir, id, meta, data_mode);
+    }
+    if stager.writes_as_root() {
+        staging::may_receive(&base, uid, true).map_err(cannot)?;
+    }
+    let root = private_staging_root(stager).ok_or_else(|| {
+        anyhow!(
+            "{} keeps no file modes, and file transfer has no folder of its own to stage in",
+            target_dir.display()
+        )
+    })?;
+    staging::stage_privately(base, &root, id, meta, data_mode)
+}
+
+/// R4 — the stager's own private staging folder, on a file system that
+/// keeps modes, for an upload into a folder whose file system keeps none
+/// (`staging::keeps_modes`): the person's `~/.local/state/roomler/staging`
+/// (their own `XDG_STATE_HOME` is not the daemon's to know), a per-user
+/// daemon's `$XDG_STATE_HOME/roomler/staging` (else under
+/// `~/.local/state`), root's `/var/lib/roomler/staging`. A test's stood-in
+/// home holds the daemon's.
+#[cfg(target_os = "linux")]
+fn private_staging_root(stager: &FsAs) -> Option<PathBuf> {
+    const OWN: &str = "roomler/staging";
+    let state = |home: &std::path::Path| home.join(".local/state");
+    match stager {
+        FsAs::Person { home, .. } => Some(state(home).join(OWN)),
+        FsAs::Daemon | FsAs::DaemonAlone => {
+            #[cfg(test)]
+            if let Some(home) = stand_in::own_home_now() {
+                let home = home?;
+                return Some(if own_euid() == 0 {
+                    home.join("var/lib").join(OWN)
+                } else {
+                    state(&home).join(OWN)
+                });
+            }
+            if own_euid() == 0 {
+                return Some(PathBuf::from("/var/lib").join(OWN));
+            }
+            std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .or_else(|| directories::BaseDirs::new().map(|d| state(d.home_dir())))
+                .map(|base| base.join(OWN))
+        }
+        FsAs::Nobody | FsAs::CannotTell => None,
+    }
+}
+
+/// #3688, R4 — the home this process's account names in the account
+/// database (`getpwuid_r` of its effective uid), never the `HOME` its
+/// environment names: root's default folder sits in it, and FR-84 D4's
+/// placement rule takes it as root's active home ([`writer_context`]). A
+/// test stands it in (`stand_in::own_home`).
+#[cfg(target_os = "linux")]
+fn account_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = stand_in::own_home_now() {
+        return home;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0 as libc::c_char; 1024];
+    // SAFETY: an all-zero `passwd` is a valid value (its pointers null),
+    // read only after a successful call filled it.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    loop {
+        // SAFETY: every pointer is to memory this frame owns, sized as
+        // passed; the answer points into `buf`, read before it moves.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                own_euid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 64 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        break;
+    }
+    // SAFETY: a NUL-terminated string in `buf`, which the call filled.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let dir = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    dir.is_absolute().then_some(dir)
+}
+
+/// #3688 rule 4 — whether `folder`, held as `held`, is one a root writer
+/// (`FsAs::writes_as_root`) may place a received file in now: the default
+/// folder, with that handle passing its rule; and for a daemon that is root
+/// (not the daemon alone), also the configured folder as it resolves now, or
+/// a folder a controller may choose now ([`resolve_dest_path_here`], its
+/// canonical path the same). `Err` says why not. Run as `who`.
+#[cfg(target_os = "linux")]
+fn root_may_place_in(
+    who: &FsAs,
+    folder: &std::path::Path,
+    held: &std::fs::File,
+) -> Result<(), String> {
+    match default_download_dir_as(who, false) {
+        Ok(default) if default == folder => {
+            let uid = own_euid();
+            return staging::may_receive(held, uid, uid == 0);
+        }
+        // The default folder itself fails its rule now: say that.
+        Err(e) if !matches!(who, FsAs::Daemon) => return Err(format!("{e:#}")),
+        _ => {}
+    }
+    if !matches!(who, FsAs::Daemon) {
+        return Err(format!(
+            "with nobody at the screen only the default folder receives files, and {} is not it",
+            folder.display()
+        ));
+    }
+    if let Ok(Some(configured)) = configured_folder_without_creating(who)
+        && configured == folder
+    {
+        return Ok(());
+    }
+    match resolve_dest_path_here(
+        &folder.to_string_lossy(),
+        &who.writer(),
+        &files_dir::Rules::from_env(),
+    ) {
+        Ok(canonical) if canonical == folder => Ok(()),
+        Ok(canonical) => Err(format!(
+            "{} resolves to {}",
+            folder.display(),
+            canonical.display()
+        )),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// The default ladder elsewhere: the Downloads `directories` names (always
+/// `~/Downloads` on macOS), else Windows' machine folder.
+#[cfg(not(target_os = "linux"))]
 fn default_download_dir(log: bool) -> Result<PathBuf> {
     // #3048 — a SystemContext worker (LocalSystem in the person's session)
     // writes as the person signed in, into THEIR Downloads, read from their
@@ -4135,14 +4803,62 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
         }
         Ok(staging)
     }
-    // Non-Windows: keep the temp-dir final fallback (headless CI,
-    // unusual service accounts on Linux/macOS — those don't have
-    // Defender's SystemTemp-scan problem).
+    // macOS: `directories` always names `~/Downloads` there, so this temp-dir
+    // fallback is not reached. (Linux has its own ladder, above: #3688.)
     #[cfg(not(target_os = "windows"))]
     {
         let _ = log;
         Ok(std::env::temp_dir())
     }
+}
+
+/// #3688 — the daemon's own home (`Err`: why there is none to take), and
+/// the Downloads folder its `user-dirs.dirs` names (`XDG_DOWNLOAD_DIR`). A
+/// per-user daemon's: `$HOME`, and the folder as `directories` reads it.
+/// R4 — root's: the home its account names ([`account_home`]), never the
+/// `HOME` its environment names, and only when that home passes root's own
+/// rule (`staging::may_receive`); its `user-dirs.dirs` read only when it is
+/// root's own plain file nobody else may write, and taken only for a folder
+/// inside that home ([`xdg_download_dir`]). A test stands homes in for its
+/// thread (`stand_in::own_home`, `stand_in::env_home`).
+#[cfg(target_os = "linux")]
+fn own_home_and_downloads() -> (Result<PathBuf, String>, Option<PathBuf>) {
+    const NO_HOME: &str =
+        "file transfer has no folder to receive files into: this account has no home folder";
+    if own_euid() == 0 {
+        let Some(home) = account_home() else {
+            return (Err(NO_HOME.into()), None);
+        };
+        let cannot = |why: &str| Err(format!("{} cannot receive files: {why}", home.display()));
+        let held = match staging::open_folder(&home) {
+            Ok(held) => held,
+            Err(e) => return (cannot(&format!("it does not open ({e})")), None),
+        };
+        if let Err(why) = staging::may_receive(&held, own_euid(), true) {
+            return (cannot(&why), None);
+        }
+        let xdg = staging::read_own_file(&held, ".config/user-dirs.dirs")
+            .and_then(|text| xdg_download_dir(&text, &home));
+        return (Ok(home), xdg);
+    }
+    // The environment's home as `BaseDirs` reads it, and its
+    // `user-dirs.dirs` as `UserDirs` does.
+    #[cfg(test)]
+    if let Some(home) = stand_in::env_home_now().or_else(stand_in::own_home_now) {
+        let xdg = home.as_deref().and_then(|home| {
+            std::fs::read_to_string(home.join(".config/user-dirs.dirs"))
+                .ok()
+                .and_then(|text| stand_in::xdg_as_directories_reads_it(&text, home))
+        });
+        return (home.ok_or_else(|| NO_HOME.into()), xdg);
+    }
+    (
+        directories::BaseDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .ok_or_else(|| NO_HOME.into()),
+        directories::UserDirs::new()
+            .and_then(|d| d.download_dir().map(std::path::Path::to_path_buf)),
+    )
 }
 
 /// #3669 — who the Windows tests stand in, shared with the peer's tests,
@@ -4331,6 +5047,249 @@ pub(crate) mod stand_in {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((dir, Box::new(swap)));
+    }
+
+    // #3688 — the daemon's own home, stood in on one thread: `Some(home)`,
+    // or `None` for an account with no home. The default folder's ladder
+    // reads it (`own_home_and_downloads`), and `FsAs::run` carries it to the
+    // blocking thread a step runs on, so no test touches a real home,
+    // `/root/Downloads` or the temp dir.
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static OWN_HOME: std::cell::RefCell<Option<Option<PathBuf>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// While this lives, the daemon's own home is the one stood in, on the
+    /// thread that stood it in; what was stood in before comes back after.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct OwnHomeStoodIn {
+        before: Option<Option<PathBuf>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnHomeStoodIn {
+        fn drop(&mut self) {
+            let before = self.before.take();
+            OWN_HOME.with(|home| *home.borrow_mut() = before);
+        }
+    }
+
+    /// #3688 — stand `home` in for the daemon's own home on this thread
+    /// (`None`: it has none).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn own_home(home: Option<&Path>) -> OwnHomeStoodIn {
+        let before = OWN_HOME.with(|h| h.borrow_mut().replace(home.map(Path::to_path_buf)));
+        OwnHomeStoodIn { before }
+    }
+
+    /// The home stood in on this thread, if one is.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn own_home_now() -> Option<Option<PathBuf>> {
+        OWN_HOME.with(|home| home.borrow().clone())
+    }
+
+    // #3688 — the home the daemon's environment names (`$HOME`, which
+    // `directories` reads), stood in on one thread apart from its account's
+    // own ([`own_home`]): a daemon started with another account's `HOME`.
+    // With none stood in, the environment names the account's own.
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static ENV_HOME: std::cell::RefCell<Option<Option<PathBuf>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// While this lives, the environment's home is the one stood in, on the
+    /// thread that stood it in.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct EnvHomeStoodIn {
+        before: Option<Option<PathBuf>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvHomeStoodIn {
+        fn drop(&mut self) {
+            let before = self.before.take();
+            ENV_HOME.with(|home| *home.borrow_mut() = before);
+        }
+    }
+
+    /// #3688 — stand `home` in for the home the daemon's environment names,
+    /// on this thread (`None`: it names none).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn env_home(home: Option<&Path>) -> EnvHomeStoodIn {
+        let before = ENV_HOME.with(|h| h.borrow_mut().replace(home.map(Path::to_path_buf)));
+        EnvHomeStoodIn { before }
+    }
+
+    /// The environment's home stood in on this thread, if one is.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn env_home_now() -> Option<Option<PathBuf>> {
+        ENV_HOME.with(|home| home.borrow().clone())
+    }
+
+    /// `XDG_DOWNLOAD_DIR` out of a `user-dirs.dirs` the way `directories`
+    /// reads it (dirs-sys): a quoted `$HOME/…` under `home`, or any absolute
+    /// path; `$HOME/` alone, or anything else, names none.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn xdg_as_directories_reads_it(text: &str, home: &Path) -> Option<PathBuf> {
+        let value = text.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=")?;
+            rest.trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_string)
+        })?;
+        if value == "$HOME/" {
+            return None;
+        }
+        match value.strip_prefix("$HOME/") {
+            Some(rel) => Some(home.join(rel)),
+            None => value.starts_with('/').then(|| PathBuf::from(value)),
+        }
+    }
+
+    // #3688, R4 — whether the file systems a step stages on keep Unix owners
+    // and modes, stood in on one thread: `Some(false)` stands in a FAT disk,
+    // WSL's drive mounts without metadata, a share mounted with fixed modes.
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static MODES_KEPT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// While this lives, every file system keeps modes as stood in, on the
+    /// thread that stood it in.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct ModesKeptStoodIn {
+        before: Option<bool>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ModesKeptStoodIn {
+        fn drop(&mut self) {
+            MODES_KEPT.with(|kept| kept.set(self.before));
+        }
+    }
+
+    /// #3688, R4 — stand in whether file systems keep modes, on this thread
+    /// (`None`: as each really does).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn modes_kept(kept: Option<bool>) -> ModesKeptStoodIn {
+        ModesKeptStoodIn {
+            before: MODES_KEPT.with(|k| k.replace(kept)),
+        }
+    }
+
+    /// Whether file systems keep modes, as stood in on this thread.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn modes_kept_now() -> Option<bool> {
+        MODES_KEPT.with(std::cell::Cell::get)
+    }
+
+    /// What a test stood in on its thread, for the blocking thread a step
+    /// runs on (`FsAs::run`).
+    #[cfg(target_os = "linux")]
+    pub(crate) struct Carried {
+        own_home: Option<Option<PathBuf>>,
+        env_home: Option<Option<PathBuf>>,
+        modes_kept: Option<bool>,
+    }
+
+    /// What this thread stood in, to carry.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn carried() -> Carried {
+        Carried {
+            own_home: own_home_now(),
+            env_home: env_home_now(),
+            modes_kept: modes_kept_now(),
+        }
+    }
+
+    /// The carried stand-ins, stood in on this thread while it lives.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct CarriedStoodIn {
+        _own_home: Option<OwnHomeStoodIn>,
+        _env_home: Option<EnvHomeStoodIn>,
+        _modes_kept: ModesKeptStoodIn,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Carried {
+        pub(crate) fn stand(self) -> CarriedStoodIn {
+            CarriedStoodIn {
+                _own_home: self.own_home.map(|home| own_home(home.as_deref())),
+                _env_home: self.env_home.map(|home| env_home(home.as_deref())),
+                _modes_kept: modes_kept(self.modes_kept),
+            }
+        }
+    }
+
+    /// What a begin does once it has opened an upload's `.roomler-partial`
+    /// and before it makes the upload's own folder in it: by the path of the
+    /// folder that staging sits in.
+    #[cfg(target_os = "linux")]
+    type BeforeTheId = (PathBuf, Box<dyn FnOnce() + Send>);
+
+    #[cfg(target_os = "linux")]
+    static BEFORE_THE_ID: Mutex<Vec<BeforeTheId>> = Mutex::new(Vec::new());
+
+    /// #3688 — once a begin has opened `base`'s `.roomler-partial`, and
+    /// before it makes the upload's folder in it, that `.roomler-partial` is
+    /// removed: another upload's end removing it once empty, between the two.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn staging_goes_before_the_id_is_made(base: &Path) {
+        let staging = base.join(".roomler-partial");
+        BEFORE_THE_ID
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                base.to_path_buf(),
+                Box::new(move || {
+                    std::fs::remove_dir(&staging).expect("removing the empty staging folder");
+                }),
+            ));
+    }
+
+    // #3688 — what `staging::keeps_modes`'s probe meets between making its
+    // folder and opening it, once, on the thread that stood it in.
+    #[cfg(target_os = "linux")]
+    type ProbeStep = Box<dyn FnOnce(&Path)>;
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static BEFORE_THE_PROBE_OPENS: std::cell::RefCell<Option<ProbeStep>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// #3688 — once `staging::keeps_modes`'s probe has made its folder, and
+    /// before it opens it, `step` runs with that folder's path (through the
+    /// folder it was made in): another account removing it, or putting a
+    /// folder of its own in its place.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn before_the_probe_opens(step: impl FnOnce(&Path) + 'static) {
+        BEFORE_THE_PROBE_OPENS.with(|s| *s.borrow_mut() = Some(Box::new(step)));
+    }
+
+    /// Runs what this thread set with [`before_the_probe_opens`], once.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn the_probe_is_made(probe: &Path) {
+        if let Some(step) = BEFORE_THE_PROBE_OPENS.with(|s| s.borrow_mut().take()) {
+            step(probe);
+        }
+    }
+
+    /// Runs what a test set for `base` with
+    /// [`staging_goes_before_the_id_is_made`], once.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn before_the_id_is_made(base: &Path) {
+        let step = {
+            let mut held = BEFORE_THE_ID.lock().unwrap_or_else(PoisonError::into_inner);
+            let at = held.iter().position(|(b, _)| b == base);
+            at.map(|i| held.remove(i).1)
+        };
+        if let Some(step) = step {
+            step();
+        }
     }
 
     /// Runs what a test set for `dir` with [`swap_before_open`], once.
@@ -4592,6 +5551,11 @@ mod tests {
     fn configured_files_dir_is_used_when_valid_and_ignored_when_not() {
         let _lock = FILES_DIR_TEST_LOCK.blocking_lock();
         let _home = HOME_ENV_LOCK.blocking_lock();
+        // #3688 — the default folder's home, stood in: never a real one.
+        #[cfg(target_os = "linux")]
+        let own = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let _own = stand_in::own_home(Some(own.path()));
         set_files_dir(None);
         let default = default_download_dir(false).unwrap();
         let default_s = default.to_string_lossy().into_owned();
@@ -4655,6 +5619,11 @@ mod tests {
     fn a_files_dir_that_became_invalid_falls_back_at_use_time() {
         let _lock = FILES_DIR_TEST_LOCK.blocking_lock();
         let _home = HOME_ENV_LOCK.blocking_lock();
+        // #3688 — the default folder's home, stood in: never a real one.
+        #[cfg(target_os = "linux")]
+        let own = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let _own = stand_in::own_home(Some(own.path()));
         let dir = scratch_drop_dir("stale");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&dir);
@@ -6511,6 +7480,17 @@ mod tests {
             .await
             .unwrap();
             tokio::fs::write(dir.join("data"), b"").await.unwrap();
+            // #3688 — its stager's own whatever the umask, as a begin makes
+            // it: the sweep trusts no partial another account may write.
+            #[cfg(unix)]
+            for (p, mode) in [
+                (dir.clone(), 0o700),
+                (dir.join("meta.json"), 0o600),
+                (dir.join("data"), 0o600),
+            ] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
         }
 
         let (kept, swept) = sweep_orphans_in(&dest).await;
@@ -6674,6 +7654,17 @@ mod tests {
             .await
             .unwrap();
             tokio::fs::write(dir.join("data"), b"").await.unwrap();
+            // #3688 — its stager's own whatever the umask, as a begin makes
+            // it: the sweep trusts no partial another account may write.
+            #[cfg(unix)]
+            for (p, mode) in [
+                (dir.clone(), 0o700),
+                (dir.join("meta.json"), 0o600),
+                (dir.join("data"), 0o600),
+            ] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
         }
         let (kept, swept) = sweep_orphans_root(&root).await;
         assert_eq!(swept, 1, "should sweep the 25h-old dir");
@@ -6776,7 +7767,7 @@ mod seat_user_tests {
         }
 
         /// A home `nobody` owns, as a person's is theirs.
-        fn nobodys_home() -> (tempfile::TempDir, crate::fs_identity::Account) {
+        pub(super) fn nobodys_home() -> (tempfile::TempDir, crate::fs_identity::Account) {
             let person =
                 crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
             let home = tempfile::tempdir().unwrap();
@@ -6785,7 +7776,10 @@ mod seat_user_tests {
             (home, person)
         }
 
-        fn as_person(person: &crate::fs_identity::Account, home: &std::path::Path) -> FsAs {
+        pub(super) fn as_person(
+            person: &crate::fs_identity::Account,
+            home: &std::path::Path,
+        ) -> FsAs {
             FsAs::Person {
                 account: person.clone(),
                 home: home.to_path_buf(),
@@ -7324,7 +8318,7 @@ mod seat_user_tests {
         }
 
         /// #3688 — with nobody at seat0 a received file is the daemon's, in
-        /// the default folder, which on a server is the shared `/tmp`: it is
+        /// the default folder, root's own `~/Downloads` (a stand-in here): it is
         /// born root's and 0600, its partial and the partial's notes
         /// included, so no other account reads any of it at any point.
         #[tokio::test]
@@ -7335,6 +8329,8 @@ mod seat_user_tests {
             // No folder chosen: the drop folder, which is process-wide and
             // which a test beside this one sets.
             let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            // Root's own home, stood in: never the real `/root/Downloads`.
+            let _home = super::own_staging::OwnHome::new(false, true);
             let lands = download_dir_for(&FsAs::DaemonAlone).await.unwrap();
             let only_root = |path: &std::path::Path| {
                 let md = std::fs::metadata(path).unwrap();
@@ -7417,10 +8413,12 @@ mod seat_user_tests {
             );
         }
 
-        /// A link the person planted where the staging goes is followed with
+        /// A link the person planted where their file goes is followed with
         /// THEIR rights: into a folder only root may write, the begin is
         /// refused and nothing lands there. The control: root's own rights go
-        /// straight through the same link.
+        /// straight through the same link. #3688 — the link is their
+        /// Downloads itself; one planted as the staging folder is not
+        /// followed at all (rule 2).
         #[tokio::test]
         async fn a_link_in_the_persons_folder_gets_only_the_persons_rights() {
             if !root() {
@@ -7433,16 +8431,42 @@ mod seat_user_tests {
             let roots_only = tempfile::tempdir().unwrap();
             std::fs::set_permissions(roots_only.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
-            let link = home.path().join(".roomler-partial");
-            std::os::unix::fs::symlink(roots_only.path(), &link).unwrap();
-            std::os::unix::fs::lchown(&link, Some(person.uid), Some(person.gid)).unwrap();
+            let plant = |link: &std::path::Path| {
+                std::os::unix::fs::symlink(roots_only.path(), link).unwrap();
+                std::os::unix::fs::lchown(link, Some(person.uid), Some(person.gid)).unwrap();
+            };
+            let h = FilesHandler::new();
 
+            // #3688 — planted as the staging folder: refused, never followed.
+            let staging = home.path().join(".roomler-partial");
+            plant(&staging);
+            let refused = h
+                .begin_as(
+                    as_person(&person, home.path()),
+                    format!("p3d-staging-link-{}", std::process::id()),
+                    "probe.txt".into(),
+                    5,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("a staging folder that is a link is refused");
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "{} is not a folder, so file transfer does not stage there",
+                    staging.display()
+                )
+            );
+            std::fs::remove_file(&staging).unwrap();
+
+            let link = home.path().join("Downloads");
+            plant(&link);
             // The control: as root, the planted link leads straight in.
             let probe = link.join("root-probe");
             std::fs::create_dir(&probe).expect("root creates through the planted link");
             std::fs::remove_dir(&probe).unwrap();
 
-            let h = FilesHandler::new();
             let id = format!("p3d-link-{}", std::process::id());
             let err = h
                 .begin_as(
@@ -7958,6 +8982,8 @@ CAN_GRAPHICAL=0
     #[tokio::test]
     async fn nobody_at_the_screen_takes_no_configured_folder_either() {
         let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        // The default folder's home, stood in: never a real one.
+        let _own = own_staging::OwnHome::new(false, true);
         let home = writer_context()
             .active_home
             .map(PathBuf::from)
@@ -8759,6 +9785,1787 @@ CAN_GRAPHICAL=0
                 assert!(!after_panic, "a panicking step ends its impersonation");
                 assert!(!impersonating(), "the runtime's own thread never did");
             });
+        }
+    }
+
+    /// #3688 — a received file on Linux stays off folders another account
+    /// can write: the daemon's own default folder (rule 1), the staging
+    /// folders (rule 2), the partial state a resume or the sweep trusts (rule
+    /// 3), where a root writer's resume places (rule 4), and the handles a
+    /// transfer holds from begin to end (rule 6). CI runs this module as the
+    /// runner and again as root (its sudo step), so each test holds for both;
+    /// what only root can set up (another account's folder) says so. Every
+    /// test stands in the daemon's own home, so none touches a real home,
+    /// `/root/Downloads` or the temp dir.
+    #[cfg(target_os = "linux")]
+    mod own_staging {
+        use super::*;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::path::Path;
+
+        pub(super) fn euid() -> u32 {
+            // SAFETY: reads our own credentials.
+            unsafe { libc::geteuid() }
+        }
+
+        /// Root, or a skip; under `ROOMLERD_TEST_REQUIRE_ROOT` (CI's sudo
+        /// step) a test that is not root fails instead.
+        fn as_root() -> bool {
+            let root = euid() == 0;
+            if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+                panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+            }
+            root
+        }
+
+        /// The daemon's own home for one test, stood in on its thread (and on
+        /// every step a transfer takes for it): `downloads` makes
+        /// `~/Downloads` (0700), `xdg` names it in `~/.config/user-dirs.dirs`.
+        pub(super) struct OwnHome {
+            _stood: stand_in::OwnHomeStoodIn,
+            dir: tempfile::TempDir,
+        }
+
+        impl OwnHome {
+            pub(super) fn new(downloads: bool, xdg: bool) -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                // Its owner's own, as a home is, whatever the umask (root's
+                // must pass root's rule).
+                chmod(dir.path(), 0o700);
+                if downloads {
+                    std::fs::create_dir(dir.path().join("Downloads")).unwrap();
+                    chmod(&dir.path().join("Downloads"), 0o700);
+                }
+                if xdg {
+                    std::fs::create_dir_all(dir.path().join(".config")).unwrap();
+                    std::fs::write(
+                        dir.path().join(".config/user-dirs.dirs"),
+                        "XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n",
+                    )
+                    .unwrap();
+                }
+                let stood = stand_in::own_home(Some(dir.path()));
+                Self { _stood: stood, dir }
+            }
+
+            pub(super) fn path(&self) -> &Path {
+                self.dir.path()
+            }
+
+            pub(super) fn downloads(&self) -> PathBuf {
+                self.dir.path().join("Downloads")
+            }
+        }
+
+        fn chmod(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        /// The mode bits and the owner of `path` itself, a link not followed.
+        fn mode_and_owner(path: &Path) -> (u32, u32) {
+            let md = std::fs::symlink_metadata(path).unwrap();
+            (md.mode() & 0o7777, md.uid())
+        }
+
+        /// What the viewer is told when the default folder is refused.
+        fn cannot_receive(folder: &Path, why: &str) -> String {
+            format!("{} cannot receive files: {why}", folder.display())
+        }
+
+        /// Why a folder others may write is refused: for root, any other
+        /// account; for a per-user daemon, every account.
+        fn writable_by_others() -> &'static str {
+            if euid() == 0 {
+                "another account can write to it"
+            } else {
+                "every account can write to it"
+            }
+        }
+
+        /// An id of this test run's own.
+        fn tid(tag: &str) -> String {
+            format!("own-{tag}-{}", std::process::id())
+        }
+
+        fn registered(id: &str) -> bool {
+            PARTIAL_REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(id)
+        }
+
+        fn register(id: &str, meta_path: PathBuf, who: FsAs) {
+            PARTIAL_REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string(), PartialEntry { meta_path, who });
+        }
+
+        fn forget(ids: &[&str]) {
+            let mut g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            for id in ids {
+                g.remove(*id);
+            }
+        }
+
+        /// A partial as a begin leaves one, in `staging`: `<id>` made
+        /// `dir_mode`, its `meta.json` and `data` made `file_mode`, its notes
+        /// naming `dest`, begun `age` seconds ago.
+        fn partial(
+            staging: &Path,
+            id: &str,
+            dest: &Path,
+            age: i64,
+            dir_mode: u32,
+            file_mode: u32,
+        ) -> PathBuf {
+            let dir = staging.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = PartialMeta {
+                protocol_version: 1,
+                filename: format!("{id}.bin"),
+                expected_size: 8,
+                dest_dir: dest.to_path_buf(),
+                reserved_final_path: dest.join(format!("{id}.bin")),
+                created_at_unix: chrono::Utc::now().timestamp() - age,
+                rel_path: None,
+                person_sid: None,
+            };
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::fs::write(dir.join("data"), b"0123").unwrap();
+            chmod(&dir.join("meta.json"), file_mode);
+            chmod(&dir.join("data"), file_mode);
+            chmod(&dir, dir_mode);
+            dir
+        }
+
+        /// Everything under `root`, each with its length, mode and owner, a
+        /// link not followed: a change anywhere under it shows.
+        fn tree(root: &Path) -> std::collections::BTreeSet<(PathBuf, u64, u32, u32)> {
+            let mut out = std::collections::BTreeSet::new();
+            let mut dirs = vec![root.to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(md) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if md.is_dir() {
+                        dirs.push(path.clone());
+                    }
+                    out.insert((path, md.len(), md.mode() & 0o7777, md.uid()));
+                }
+            }
+            out
+        }
+
+        /// Rule 1 — the daemon's own default folder is never the temp dir.
+        /// With no `~/Downloads`, a received file lands there (made when one
+        /// arrives); with no home, or a `~/Downloads` every account can
+        /// write, it is refused, saying why. Before, both fell back to the
+        /// temp dir: on a server, root's was `/tmp`.
+        #[tokio::test]
+        async fn the_temp_dir_is_never_a_writers_folder() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let temp = std::env::temp_dir();
+            {
+                let home = OwnHome::new(false, false);
+                for who in [FsAs::Daemon, FsAs::DaemonAlone] {
+                    assert_eq!(
+                        default_download_dir_as(&who, false).ok(),
+                        Some(home.downloads()),
+                        "{who:?}: the status card names ~/Downloads, never {}",
+                        temp.display()
+                    );
+                }
+                assert!(!home.downloads().exists(), "looking made nothing");
+            }
+            {
+                let _no_home = stand_in::own_home(None);
+                for who in [FsAs::Daemon, FsAs::DaemonAlone] {
+                    let got = download_dir_for(&who).await;
+                    assert_eq!(
+                        got.as_ref().map_err(|e| e.to_string()).err().as_deref(),
+                        Some(
+                            "file transfer has no folder to receive files into: this account \
+                             has no home folder"
+                        ),
+                        "{who:?} with no home: {got:?}"
+                    );
+                }
+            }
+            let open = OwnHome::new(true, false);
+            chmod(&open.downloads(), 0o777);
+            for who in [FsAs::Daemon, FsAs::DaemonAlone] {
+                let got = download_dir_for(&who).await;
+                assert_eq!(
+                    got.as_ref().map_err(|e| e.to_string()).err(),
+                    Some(cannot_receive(&open.downloads(), writable_by_others())),
+                    "{who:?}, a Downloads every account can write: {got:?}"
+                );
+            }
+        }
+
+        /// Rule 1 — with no Downloads, the first received file makes
+        /// `~/Downloads`: 0700 and its writer's (root's on a system install).
+        #[tokio::test]
+        async fn the_fallback_folder_is_made_0700_and_owned_by_its_writer() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            for (n, who) in [FsAs::Daemon, FsAs::DaemonAlone].into_iter().enumerate() {
+                let home = OwnHome::new(false, false);
+                let lands = download_dir_for(&who).await;
+                assert_eq!(
+                    lands.as_ref().ok(),
+                    Some(&home.downloads()),
+                    "{who:?}: ~/Downloads, never the temp dir"
+                );
+                assert_eq!(
+                    mode_and_owner(&home.downloads()),
+                    (0o700, euid()),
+                    "{who:?}: made 0700, its writer's"
+                );
+                let h = FilesHandler::new();
+                let id = tid(&format!("fallback-{n}"));
+                h.begin_as(who.clone(), id.clone(), "a.txt".into(), 2, None, None)
+                    .await
+                    .expect("begin");
+                h.chunk(b"hi").await.expect("chunk");
+                let (placed, _) = h.end(&id).await.expect("end");
+                assert_eq!(placed, home.downloads().join("a.txt"), "{who:?}: in it");
+            }
+        }
+
+        /// Rule 1, as R3 rules it — the folder a rung resolves to is checked
+        /// for its writer. Every account may write it: refused. Another
+        /// account may (group-writable): refused for root, taken for a
+        /// per-user daemon, whose `~/Downloads` Ubuntu's private-group umask
+        /// makes 0775. Another account's: refused (only root can set that
+        /// up). A link is followed, and the folder it leads to is checked.
+        #[tokio::test]
+        async fn a_downloads_folder_is_checked_by_its_writer() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, false);
+            let dl = home.downloads();
+            let asks = || default_download_dir_as(&FsAs::Daemon, false).map_err(|e| e.to_string());
+            chmod(&dl, 0o770);
+            if euid() == 0 {
+                assert_eq!(
+                    asks(),
+                    Err(cannot_receive(&dl, "another account can write to it")),
+                    "root, a group-writable Downloads"
+                );
+            } else {
+                assert_eq!(asks(), Ok(dl.clone()), "a per-user daemon, group-writable");
+            }
+            chmod(&dl, 0o777);
+            assert_eq!(
+                asks(),
+                Err(cannot_receive(&dl, writable_by_others())),
+                "world-writable"
+            );
+            chmod(&dl, 0o700);
+            if euid() == 0 {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                std::os::unix::fs::chown(&dl, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                assert_eq!(
+                    asks(),
+                    Err(cannot_receive(&dl, "it belongs to another account")),
+                    "another account's"
+                );
+                std::os::unix::fs::chown(&dl, Some(0), Some(0)).unwrap();
+            }
+            let real = home.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            chmod(&real, 0o700);
+            std::fs::remove_dir(&dl).unwrap();
+            std::os::unix::fs::symlink(&real, &dl).unwrap();
+            assert_eq!(asks(), Ok(dl.clone()), "a link to the writer's own folder");
+            assert_eq!(
+                download_dir_for(&FsAs::Daemon)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Ok(dl.clone()),
+                "and a received file lands through it"
+            );
+            chmod(&real, 0o777);
+            assert_eq!(
+                asks(),
+                Err(cannot_receive(&dl, writable_by_others())),
+                "a link to a folder every account can write"
+            );
+        }
+
+        /// R2 — the daemon's staging is made with explicit modes, so it passes
+        /// its own checks under any umask (a per-user daemon on Ubuntu runs
+        /// under 0002): `.roomler-partial` and `<id>` 0700, `meta.json` 0600,
+        /// `data` 0600 for the daemon alone (#3697) and no wider than 0644
+        /// otherwise, every one its stager's. The umask is the process's, so
+        /// the test runs again in a child process of its own under 0002, and
+        /// no other test runs under it.
+        #[tokio::test]
+        async fn a_partial_is_made_its_stagers_own_whatever_the_umask() {
+            const UNDER_0002: &str = "ROOMLERD_TEST_UNDER_UMASK_0002";
+            if std::env::var_os(UNDER_0002).is_none() {
+                let this = "files::seat_user_tests::own_staging::\
+                            a_partial_is_made_its_stagers_own_whatever_the_umask";
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([this, "--exact", "--test-threads=1"])
+                    .env(UNDER_0002, "1")
+                    .output()
+                    .expect("the test run again in a child");
+                let said = String::from_utf8_lossy(&child.stdout);
+                assert!(
+                    child.status.success() && said.contains("1 passed"),
+                    "under umask 0002:\n{said}\n{}",
+                    String::from_utf8_lossy(&child.stderr)
+                );
+                return;
+            }
+            // SAFETY: sets this child process's own umask; it runs this test
+            // alone.
+            unsafe { libc::umask(0o002) };
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let staging = home.downloads().join(".roomler-partial");
+            for (n, (who, widest)) in [(FsAs::Daemon, 0o644), (FsAs::DaemonAlone, 0o600)]
+                .into_iter()
+                .enumerate()
+            {
+                let h = FilesHandler::new();
+                let id = tid(&format!("modes-{n}"));
+                h.begin_as(who.clone(), id.clone(), "m.bin".into(), 4, None, None)
+                    .await
+                    .expect("begin");
+                let partial = staging.join(&id);
+                assert_eq!(
+                    mode_and_owner(&staging),
+                    (0o700, euid()),
+                    "{who:?}: .roomler-partial"
+                );
+                assert_eq!(mode_and_owner(&partial), (0o700, euid()), "{who:?}: <id>");
+                assert_eq!(
+                    mode_and_owner(&partial.join("meta.json")),
+                    (0o600, euid()),
+                    "{who:?}: meta.json"
+                );
+                let (data, owner) = mode_and_owner(&partial.join("data"));
+                assert!(
+                    owner == euid() && data & !widest == 0,
+                    "{who:?}: data {data:o}, no wider than {widest:o}"
+                );
+                assert!(h.cancel_incoming(&id).await.expect("a plain id"));
+            }
+        }
+
+        /// R1 — a `.roomler-partial` that is the writer's own but open to
+        /// others (one a per-user daemon made under umask 0002 before this
+        /// change) is tightened to 0700 through its handle and used, at begin
+        /// and by the sweep.
+        #[tokio::test]
+        async fn the_writers_own_open_staging_folder_is_tightened_not_refused() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let staging = home.downloads().join(".roomler-partial");
+            std::fs::create_dir(&staging).unwrap();
+            chmod(&staging, 0o777);
+            let h = FilesHandler::new();
+            let id = tid("tighten");
+            h.begin_as(FsAs::Daemon, id.clone(), "t.bin".into(), 2, None, None)
+                .await
+                .expect("begin, in the writer's own folder");
+            assert_eq!(
+                mode_and_owner(&staging),
+                (0o700, euid()),
+                "tightened at begin"
+            );
+            h.chunk(b"ok").await.expect("chunk");
+            let (placed, _) = h.end(&id).await.expect("end");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"ok");
+            std::fs::create_dir_all(&staging).unwrap();
+            chmod(&staging, 0o777);
+            let kept = tid("tighten-kept");
+            partial(&staging, &kept, &home.downloads(), 60, 0o700, 0o600);
+            sweep_orphans_in(&home.downloads()).await;
+            let took = registered(&kept);
+            forget(&[&kept]);
+            assert_eq!(
+                mode_and_owner(&staging),
+                (0o700, euid()),
+                "tightened by the sweep"
+            );
+            assert!(took, "and its own partial registered");
+        }
+
+        /// Rule 2 — a `.roomler-partial` that is a link is never adopted:
+        /// begin refuses, saying why, and makes nothing where it leads; the
+        /// sweep neither registers nor removes what is there.
+        #[tokio::test]
+        async fn a_staging_folder_that_is_a_link_is_refused_at_begin_and_by_the_sweep() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let elsewhere = home.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            chmod(&elsewhere, 0o700);
+            let there = tid("link-there");
+            partial(&elsewhere, &there, &home.downloads(), 60, 0o700, 0o600);
+            let staging = home.downloads().join(".roomler-partial");
+            std::os::unix::fs::symlink(&elsewhere, &staging).unwrap();
+            let before = tree(&elsewhere);
+            let h = FilesHandler::new();
+            let id = tid("link-begin");
+            let begun = h
+                .begin_as(FsAs::Daemon, id.clone(), "l.bin".into(), 2, None, None)
+                .await;
+            h.abort().await;
+            assert_eq!(
+                begun.map_err(|e| e.to_string()),
+                Err(format!(
+                    "{} is not a folder, so file transfer does not stage there",
+                    staging.display()
+                ))
+            );
+            assert_eq!(
+                tree(&elsewhere),
+                before,
+                "nothing made where the link leads"
+            );
+            let swept = sweep_orphans_in(&home.downloads()).await;
+            let took = registered(&there);
+            forget(&[&there, &id]);
+            assert_eq!(swept, (0, 0), "the sweep takes nothing there");
+            assert!(!took, "nor registers it");
+            assert_eq!(tree(&elsewhere), before, "nor removes it");
+        }
+
+        /// Rule 2 — a `.roomler-partial` another account owns is never
+        /// adopted: begin refuses, saying why, and changes nothing in it; the
+        /// sweep neither registers nor removes the partial in it. Only root
+        /// can give a folder to another account.
+        #[tokio::test]
+        async fn a_staging_folder_another_account_owns_is_refused_at_begin_and_by_the_sweep() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let nobody =
+                crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+            let staging = home.downloads().join(".roomler-partial");
+            std::fs::create_dir(&staging).unwrap();
+            chmod(&staging, 0o700);
+            let theirs = tid("theirs");
+            let in_theirs = partial(&staging, &theirs, &home.downloads(), 60, 0o700, 0o600);
+            for p in [
+                staging.clone(),
+                in_theirs.clone(),
+                in_theirs.join("meta.json"),
+                in_theirs.join("data"),
+            ] {
+                std::os::unix::fs::chown(&p, Some(nobody.uid), Some(nobody.gid)).unwrap();
+            }
+            let before = tree(&staging);
+            let h = FilesHandler::new();
+            let id = tid("theirs-begin");
+            let begun = h
+                .begin_as(FsAs::DaemonAlone, id.clone(), "o.bin".into(), 2, None, None)
+                .await;
+            h.abort().await;
+            assert_eq!(
+                begun.map_err(|e| e.to_string()),
+                Err(format!(
+                    "{} belongs to another account, so file transfer does not stage there",
+                    staging.display()
+                ))
+            );
+            assert_eq!(tree(&staging), before, "nothing changed in it");
+            assert_eq!(
+                mode_and_owner(&staging),
+                (0o700, nobody.uid),
+                "nor its mode or owner"
+            );
+            let swept = sweep_orphans_dir_as(&FsAs::DaemonAlone, staging.clone()).await;
+            let took = registered(&theirs);
+            forget(&[&theirs, &id]);
+            assert_eq!(swept, (0, 0), "the sweep takes nothing there");
+            assert!(!took, "nor registers it");
+            assert_eq!(tree(&staging), before, "nor removes anything");
+        }
+
+        /// Rule 3 — a resume opens `data` and `meta.json` without following
+        /// links: a link at either is refused as no partial state (the viewer
+        /// starts over), and what it leads to is untouched.
+        #[tokio::test]
+        async fn a_link_at_data_or_meta_json_is_refused_on_resume() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let staging = home.downloads().join(".roomler-partial");
+            let elsewhere = home.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let outside = home.path().join("elsewhere.txt");
+            std::fs::write(&outside, b"a file of its own").unwrap();
+            let h = FilesHandler::new();
+            let at_data = tid("link-data");
+            h.begin_as(FsAs::Daemon, at_data.clone(), "d.bin".into(), 8, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            h.abort().await;
+            let data = staging.join(&at_data).join("data");
+            std::fs::remove_file(&data).unwrap();
+            std::os::unix::fs::symlink(&outside, &data).unwrap();
+            let resumed = h.resume_incoming_as(FsAs::Daemon, &at_data, 0).await;
+            h.abort().await;
+            let elsewhere_after = std::fs::read(&outside).unwrap();
+            let at_meta = tid("link-meta");
+            h.begin_as(FsAs::Daemon, at_meta.clone(), "m.bin".into(), 8, None, None)
+                .await
+                .expect("begin");
+            h.abort().await;
+            let meta = staging.join(&at_meta).join("meta.json");
+            let mut notes: PartialMeta =
+                serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+            notes.dest_dir = elsewhere.clone();
+            let other_notes = elsewhere.join("notes.json");
+            std::fs::write(&other_notes, serde_json::to_vec(&notes).unwrap()).unwrap();
+            std::fs::remove_file(&meta).unwrap();
+            std::os::unix::fs::symlink(&other_notes, &meta).unwrap();
+            let resumed_meta = h.resume_incoming_as(FsAs::Daemon, &at_meta, 0).await;
+            h.abort().await;
+            let _ = h.cancel_incoming(&at_data).await;
+            let _ = h.cancel_incoming(&at_meta).await;
+            forget(&[&at_data, &at_meta]);
+            assert_eq!(
+                resumed.map_err(|e| e.to_string()),
+                Err(format!("no partial state for id {at_data}")),
+                "a link at data"
+            );
+            assert_eq!(
+                elsewhere_after, b"a file of its own",
+                "what it leads to, untouched"
+            );
+            assert_eq!(
+                resumed_meta.map_err(|e| e.to_string()),
+                Err(format!("no partial state for id {at_meta}")),
+                "a link at meta.json"
+            );
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                1,
+                "nothing placed where those notes say"
+            );
+        }
+
+        /// Rule 3, R1 — a resume trusts a partial only when it is its
+        /// stager's own and nobody else may write it. One another account can
+        /// write (made under umask 0002 before this change, say) is refused
+        /// once and stays as it was; the viewer starts that upload over.
+        #[tokio::test]
+        async fn a_resume_of_a_partial_another_account_can_write_is_refused() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let h = FilesHandler::new();
+            let id = tid("open-resume");
+            h.begin_as(FsAs::Daemon, id.clone(), "o.bin".into(), 8, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            h.abort().await;
+            let partial = home.downloads().join(".roomler-partial").join(&id);
+            chmod(&partial, 0o770);
+            let resumed = h.resume_incoming_as(FsAs::Daemon, &id, 0).await;
+            h.abort().await;
+            let left = (mode_and_owner(&partial).0, partial.join("data").exists());
+            let _ = h.cancel_incoming(&id).await;
+            forget(&[&id]);
+            assert_eq!(
+                resumed.map_err(|e| e.to_string()),
+                Err(format!("no partial state for id {id}"))
+            );
+            assert_eq!(left, (0o770, true), "left as it was");
+        }
+
+        /// Rule 3, R1 — the startup sweep registers a partial only when its
+        /// folder and both files are its stager's own and nobody else may
+        /// write them, opened without following links. The stager's own
+        /// folder that fails that is never registered, and goes once it is
+        /// over a day old; a link is left as it is, and so is what it leads to.
+        #[tokio::test]
+        async fn the_sweep_trusts_only_partials_that_are_their_stagers_own() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let staging = dl.join(".roomler-partial");
+            std::fs::create_dir(&staging).unwrap();
+            chmod(&staging, 0o700);
+            let elsewhere = home.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let hour = 3600;
+            let own = tid("sweep-own");
+            partial(&staging, &own, &dl, hour, 0o700, 0o600);
+            let open = tid("sweep-open");
+            partial(&staging, &open, &dl, hour, 0o770, 0o600);
+            let open_stale = tid("sweep-open-stale");
+            let stale = partial(&staging, &open_stale, &dl, 25 * hour, 0o770, 0o600);
+            std::fs::File::open(&stale)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600),
+                )
+                .unwrap();
+            let notes_link = tid("sweep-notes-link");
+            let with_link = partial(&staging, &notes_link, &dl, hour, 0o700, 0o600);
+            let notes = elsewhere.join("notes.json");
+            std::fs::rename(with_link.join("meta.json"), &notes).unwrap();
+            std::os::unix::fs::symlink(&notes, with_link.join("meta.json")).unwrap();
+            let id_link = tid("sweep-id-link");
+            let real = tid("sweep-real");
+            partial(&elsewhere, &real, &dl, hour, 0o700, 0o600);
+            std::os::unix::fs::symlink(elsewhere.join(&real), staging.join(&id_link)).unwrap();
+            let outside = tree(&elsewhere);
+
+            let counts = sweep_orphans_in(&dl).await;
+            let mine = [
+                own.as_str(),
+                open.as_str(),
+                open_stale.as_str(),
+                notes_link.as_str(),
+                id_link.as_str(),
+            ];
+            let took: Vec<&str> = mine.iter().copied().filter(|id| registered(id)).collect();
+            forget(&mine);
+            assert_eq!(took, vec![own.as_str()], "only the stager's own partial");
+            assert_eq!(counts, (1, 1), "(kept, swept)");
+            assert!(
+                staging.join(&open).exists(),
+                "a fresh one that fails is left"
+            );
+            assert!(
+                !stale.exists(),
+                "a stale one of its own goes, whatever its mode"
+            );
+            assert!(
+                with_link.join("meta.json").is_symlink(),
+                "a link at meta.json is left"
+            );
+            assert!(
+                staging.join(&id_link).is_symlink(),
+                "a link for a partial is left"
+            );
+            assert_eq!(tree(&elsewhere), outside, "and nothing where a link leads");
+        }
+
+        /// Rule 4 — a root writer's resume never takes its folder from disk.
+        /// With nobody at the screen, the folder a partial's notes record must
+        /// be the one it sits beside, and that must be the default folder the
+        /// rule gives now. Notes naming another folder, or a partial beside
+        /// another folder, are refused as no partial state, and nothing lands
+        /// there.
+        #[tokio::test]
+        async fn a_resume_whose_recorded_folder_is_not_the_rules_folder_is_refused() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let elsewhere = home.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            chmod(&elsewhere, 0o700);
+            let h = FilesHandler::new();
+            let renamed = tid("rule4-notes");
+            h.begin_as(
+                FsAs::DaemonAlone,
+                renamed.clone(),
+                "r.bin".into(),
+                8,
+                None,
+                None,
+            )
+            .await
+            .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            h.abort().await;
+            let meta = home
+                .downloads()
+                .join(".roomler-partial")
+                .join(&renamed)
+                .join("meta.json");
+            let mut notes: PartialMeta =
+                serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+            notes.dest_dir = elsewhere.clone();
+            // The same file, so the same owner and mode: only what it says changed.
+            std::fs::write(&meta, serde_json::to_vec(&notes).unwrap()).unwrap();
+            let named_elsewhere = h.resume_incoming_as(FsAs::DaemonAlone, &renamed, 0).await;
+            h.abort().await;
+            let beside = tid("rule4-beside");
+            let estaging = elsewhere.join(".roomler-partial");
+            std::fs::create_dir(&estaging).unwrap();
+            chmod(&estaging, 0o700);
+            let p = partial(&estaging, &beside, &elsewhere, 60, 0o700, 0o600);
+            register(&beside, p.join("meta.json"), FsAs::DaemonAlone);
+            let beside_elsewhere = h.resume_incoming_as(FsAs::DaemonAlone, &beside, 0).await;
+            h.abort().await;
+            let landed = std::fs::read_dir(&elsewhere).unwrap().count();
+            let _ = h.cancel_incoming(&renamed).await;
+            forget(&[&renamed, &beside]);
+            assert_eq!(
+                named_elsewhere.map_err(|e| e.to_string()),
+                Err(format!("no partial state for id {renamed}")),
+                "notes naming another folder"
+            );
+            assert_eq!(
+                beside_elsewhere.map_err(|e| e.to_string()),
+                Err(format!("no partial state for id {beside}")),
+                "a partial beside another folder"
+            );
+            assert_eq!(landed, 1, "nothing landed there but its staging");
+        }
+
+        /// Rule 6 — a transfer holds its staging by handles from begin to end.
+        /// Its `.roomler-partial`, or its `<id>`, moved aside mid-upload with
+        /// another put in its place: the file placed is still the one
+        /// received, never what was put there.
+        #[tokio::test]
+        async fn a_staging_folder_swapped_mid_upload_is_not_followed() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let staging = dl.join(".roomler-partial");
+            for (n, whole) in [true, false].into_iter().enumerate() {
+                let h = FilesHandler::new();
+                let id = tid(&format!("swap-{n}"));
+                let name = format!("swap-{n}.txt");
+                h.begin_as(FsAs::Daemon, id.clone(), name.clone(), 14, None, None)
+                    .await
+                    .expect("begin");
+                h.chunk(b"the real bytes").await.expect("chunk");
+                let (moved, aside, notes) = if whole {
+                    let aside = dl.join(format!(".aside-{n}"));
+                    (
+                        staging.clone(),
+                        aside.clone(),
+                        aside.join(&id).join("meta.json"),
+                    )
+                } else {
+                    let aside = staging.join(format!("{id}.aside"));
+                    (staging.join(&id), aside.clone(), aside.join("meta.json"))
+                };
+                std::fs::rename(&moved, &aside).unwrap();
+                let other = staging.join(&id);
+                std::fs::create_dir_all(&other).unwrap();
+                std::fs::write(other.join("data"), b"another file!!").unwrap();
+                std::fs::copy(&notes, other.join("meta.json")).unwrap();
+                let ended = h.end(&id).await;
+                let _ = std::fs::remove_dir_all(&aside);
+                let _ = std::fs::remove_dir_all(&staging);
+                forget(&[&id]);
+                let (placed, bytes) = ended.expect("end");
+                assert_eq!(
+                    (bytes, std::fs::read(&placed).unwrap()),
+                    (14, b"the real bytes".to_vec()),
+                    "{} swapped: the file received",
+                    if whole { ".roomler-partial" } else { "<id>" }
+                );
+                assert_eq!(placed, dl.join(&name));
+            }
+        }
+
+        /// Rule 6 — a root writer's folder upload makes and opens each
+        /// subfolder from the folder it holds, never through a link: a
+        /// subfolder that is a link refuses, and nothing lands where it leads.
+        /// A per-user daemon still follows its own links with its own rights
+        /// (the control; as root, the daemon is a root writer too).
+        #[tokio::test]
+        async fn a_folder_upload_follows_no_link_for_root() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let elsewhere = home.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let link = home.downloads().join("Shared");
+            std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+            let h = FilesHandler::new();
+            let id = tid("rel-link");
+            h.begin_as(
+                FsAs::DaemonAlone,
+                id.clone(),
+                "x.txt".into(),
+                2,
+                Some("Shared/x.txt"),
+                None,
+            )
+            .await
+            .expect("begin");
+            h.chunk(b"hi").await.expect("chunk");
+            let ended = h.end(&id).await;
+            let landed = std::fs::read_dir(&elsewhere).unwrap().count();
+            let _ = h.cancel_incoming(&id).await;
+            forget(&[&id]);
+            assert_eq!(
+                ended.map_err(|e| e.to_string()),
+                Err(format!(
+                    "{} is not a folder, so file transfer does not place the file there",
+                    link.display()
+                ))
+            );
+            assert_eq!(landed, 0, "nothing landed where the link leads");
+            if euid() != 0 {
+                let id = tid("rel-link-own");
+                h.begin_as(
+                    FsAs::Daemon,
+                    id.clone(),
+                    "y.txt".into(),
+                    2,
+                    Some("Shared/y.txt"),
+                    None,
+                )
+                .await
+                .expect("begin");
+                h.chunk(b"hi").await.expect("chunk");
+                let (placed, _) = h
+                    .end(&id)
+                    .await
+                    .expect("a per-user daemon follows its own link");
+                assert_eq!(placed, link.join("y.txt"));
+                assert!(elsewhere.join("y.txt").exists());
+            }
+        }
+
+        /// A partial of `who`'s own, as [`partial`] makes it, given to `who`.
+        fn partial_of(
+            who: &crate::fs_identity::Account,
+            staging: &Path,
+            id: &str,
+            dest: &Path,
+            age: i64,
+        ) -> PathBuf {
+            let dir = partial(staging, id, dest, age, 0o700, 0o600);
+            for p in [dir.clone(), dir.join("meta.json"), dir.join("data")] {
+                std::os::unix::fs::chown(&p, Some(who.uid), Some(who.gid)).unwrap();
+            }
+            dir
+        }
+
+        /// The configured folder, put back to unset when it drops.
+        struct Configured;
+
+        impl Configured {
+            fn set(folder: &Path) -> Self {
+                set_files_dir(Some(folder.to_string_lossy().into_owned()));
+                Self
+            }
+        }
+
+        impl Drop for Configured {
+            fn drop(&mut self) {
+                set_files_dir(None);
+            }
+        }
+
+        /// R4 — a per-user daemon whose Downloads sits on a file system that
+        /// ignores Unix owners and modes, where every folder reads 0777: the
+        /// folder is not refused for reading world-writable, the upload
+        /// stages in the daemon's own private folder
+        /// (`~/.local/state/roomler/staging`), not beside it, and the end
+        /// copies the file across. A resume after a restart and the startup
+        /// sweep find it there. The temp dir is still refused. As root, the
+        /// daemon is root, which stays strict
+        /// (`root_stays_strict_where_modes_are_not_kept`).
+        #[tokio::test]
+        async fn a_per_user_daemons_folder_that_keeps_no_modes_receives_by_copy() {
+            if euid() == 0 {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            chmod(&dl, 0o777);
+            let _fat = stand_in::modes_kept(Some(false));
+            assert_eq!(
+                default_download_dir_as(&FsAs::Daemon, false).map_err(|e| e.to_string()),
+                Ok(dl.clone()),
+                "not refused for reading world-writable"
+            );
+            let private = home.path().join(".local/state/roomler/staging");
+            let h = FilesHandler::new();
+            let id = tid("fat-user");
+            h.begin_as(FsAs::Daemon, id.clone(), "f.txt".into(), 4, None, None)
+                .await
+                .expect("begin");
+            let partial_dir = private.join(&id);
+            let staged = (
+                private.is_dir().then(|| mode_and_owner(&private)),
+                partial_dir.is_dir().then(|| mode_and_owner(&partial_dir)),
+                partial_dir.join("data").is_file(),
+                dl.join(".roomler-partial").exists(),
+            );
+            h.chunk(b"fat!").await.expect("chunk");
+            let ended = h.end(&id).await;
+            forget(&[&id]);
+            assert_eq!(
+                staged,
+                (Some((0o700, euid())), Some((0o700, euid())), true, false),
+                "staged in its own private folder, 0700, nothing beside the target"
+            );
+            let (placed, _) = ended.expect("end");
+            assert_eq!(placed, dl.join("f.txt"));
+            assert_eq!(std::fs::read(&placed).unwrap(), b"fat!", "copied across");
+            assert!(!partial_dir.exists(), "its staging goes");
+
+            let again = tid("fat-user-resume");
+            h.begin_as(FsAs::Daemon, again.clone(), "g.txt".into(), 8, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            h.abort().await;
+            forget(&[&again]);
+            let resumed = h.resume_incoming_as(FsAs::Daemon, &again, 0).await;
+            assert_eq!(
+                resumed.as_ref().map_err(|e| e.to_string()),
+                Ok(&0),
+                "a resume after a restart finds it in the private folder"
+            );
+            h.chunk(b"12345678").await.expect("chunk");
+            let (placed, _) = h.end(&again).await.expect("end");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"12345678");
+
+            let fresh = tid("fat-user-fresh");
+            partial(&private, &fresh, &dl, 3600, 0o700, 0o600);
+            let stale = tid("fat-user-stale");
+            partial(&private, &stale, &dl, 25 * 3600, 0o700, 0o600);
+            sweep_orphans().await;
+            let took = registered(&fresh);
+            forget(&[&fresh, &stale]);
+            assert!(took, "the sweep registers a fresh one there");
+            assert!(!private.join(&stale).exists(), "and removes a stale one");
+
+            let real = home.path().join("Downloads.real");
+            std::fs::rename(&dl, &real).unwrap();
+            std::os::unix::fs::symlink(std::env::temp_dir(), &dl).unwrap();
+            assert_eq!(
+                default_download_dir_as(&FsAs::Daemon, false).map_err(|e| e.to_string()),
+                Err(cannot_receive(&dl, "it is the temp folder")),
+                "the temp dir stays refused"
+            );
+        }
+
+        /// R4 — root stays strict where modes are not kept: a default folder
+        /// others can write is still refused. One that passes its rule stages
+        /// in root's own private folder (`/var/lib/roomler/staging`, stood in
+        /// under the test's home), 0700 and root's, `data` 0600 for the daemon
+        /// alone; the end copies the file across, and a resume after a
+        /// restart and the sweep find it there.
+        #[tokio::test]
+        async fn root_stays_strict_where_modes_are_not_kept() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let _fat = stand_in::modes_kept(Some(false));
+            chmod(&dl, 0o777);
+            for who in [FsAs::Daemon, FsAs::DaemonAlone] {
+                assert_eq!(
+                    download_dir_for(&who).await.map_err(|e| e.to_string()),
+                    Err(cannot_receive(&dl, "another account can write to it")),
+                    "{who:?}: refused"
+                );
+            }
+            chmod(&dl, 0o700);
+            let private = home.path().join("var/lib/roomler/staging");
+            let h = FilesHandler::new();
+            for (n, (who, mode)) in [(FsAs::Daemon, 0o644), (FsAs::DaemonAlone, 0o600)]
+                .into_iter()
+                .enumerate()
+            {
+                let id = tid(&format!("fat-root-{n}"));
+                let name = format!("r{n}.txt");
+                h.begin_as(who.clone(), id.clone(), name.clone(), 4, None, None)
+                    .await
+                    .expect("begin");
+                let partial_dir = private.join(&id);
+                let data = partial_dir.join("data");
+                let staged = (
+                    private.is_dir().then(|| mode_and_owner(&private)),
+                    partial_dir.is_dir().then(|| mode_and_owner(&partial_dir)),
+                    data.is_file().then(|| mode_and_owner(&data)),
+                    dl.join(".roomler-partial").exists(),
+                );
+                h.chunk(b"root").await.expect("chunk");
+                let ended = h.end(&id).await;
+                forget(&[&id]);
+                assert_eq!(
+                    staged,
+                    (Some((0o700, 0)), Some((0o700, 0)), Some((mode, 0)), false),
+                    "{who:?}: staged in root's own private folder"
+                );
+                let (placed, _) = ended.expect("end");
+                assert_eq!(placed, dl.join(&name));
+                assert_eq!(
+                    (std::fs::read(&placed).unwrap(), mode_and_owner(&placed)),
+                    (b"root".to_vec(), (mode, 0)),
+                    "{who:?}: copied across"
+                );
+                assert!(!partial_dir.exists(), "{who:?}: its staging goes");
+            }
+            let again = tid("fat-root-resume");
+            h.begin_as(
+                FsAs::DaemonAlone,
+                again.clone(),
+                "s.txt".into(),
+                8,
+                None,
+                None,
+            )
+            .await
+            .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            h.abort().await;
+            forget(&[&again]);
+            let resumed = h.resume_incoming_as(FsAs::DaemonAlone, &again, 0).await;
+            assert_eq!(
+                resumed.as_ref().map_err(|e| e.to_string()),
+                Ok(&0),
+                "a resume after a restart finds it in root's private folder"
+            );
+            h.chunk(b"12345678").await.expect("chunk");
+            let (placed, _) = h.end(&again).await.expect("end");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"12345678");
+            let fresh = tid("fat-root-fresh");
+            partial(&private, &fresh, &dl, 3600, 0o700, 0o600);
+            let stale = tid("fat-root-stale");
+            partial(&private, &stale, &dl, 25 * 3600, 0o700, 0o600);
+            let counts = sweep_orphans_dir_as(&FsAs::DaemonAlone, private.clone()).await;
+            let took = registered(&fresh);
+            forget(&[&fresh, &stale]);
+            assert_eq!((counts, took), ((1, 1), true), "the sweep covers it");
+        }
+
+        /// R4 — the person at the screen, whose Downloads sits on a file
+        /// system that ignores Unix owners and modes (a disk root mounted:
+        /// every folder there reads root's, 0777). The upload stages in THEIR
+        /// own private folder (`~/.local/state/roomler/staging`), made as
+        /// them, and the end copies the file across as them. A resume after a
+        /// restart and the sweep find it there.
+        #[tokio::test]
+        async fn a_persons_folder_that_keeps_no_modes_receives_by_copy() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let (home, person) = super::as_root::nobodys_home();
+            let dl = home.path().join("Downloads");
+            std::fs::create_dir(&dl).unwrap();
+            chmod(&dl, 0o777);
+            let who = super::as_root::as_person(&person, home.path());
+            let _fat = stand_in::modes_kept(Some(false));
+            let private = home.path().join(".local/state/roomler/staging");
+            let h = FilesHandler::new();
+            let id = tid("fat-person");
+            h.begin_as(who.clone(), id.clone(), "p.txt".into(), 4, None, None)
+                .await
+                .expect("begin");
+            let partial_dir = private.join(&id);
+            let data = partial_dir.join("data");
+            let staged = (
+                private.is_dir().then(|| mode_and_owner(&private)),
+                partial_dir.is_dir().then(|| mode_and_owner(&partial_dir)),
+                data.is_file().then(|| mode_and_owner(&data)),
+                dl.join(".roomler-partial").exists(),
+            );
+            h.chunk(b"mine").await.expect("chunk");
+            let ended = h.end(&id).await;
+            forget(&[&id]);
+            assert_eq!(
+                staged,
+                (
+                    Some((0o700, person.uid)),
+                    Some((0o700, person.uid)),
+                    Some((0o644, person.uid)),
+                    false
+                ),
+                "staged in their own private folder, as them"
+            );
+            let (placed, _) = ended.expect("end");
+            assert_eq!(placed, dl.join("p.txt"));
+            assert_eq!(
+                (std::fs::read(&placed).unwrap(), mode_and_owner(&placed).1),
+                (b"mine".to_vec(), person.uid),
+                "copied across, theirs"
+            );
+            assert!(!partial_dir.exists(), "its staging goes");
+            let again = tid("fat-person-resume");
+            h.begin_as(who.clone(), again.clone(), "q.txt".into(), 8, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            h.abort().await;
+            forget(&[&again]);
+            let resumed = h.resume_incoming_as(who.clone(), &again, 0).await;
+            assert_eq!(
+                resumed.as_ref().map_err(|e| e.to_string()),
+                Ok(&0),
+                "a resume after a restart finds it in their private folder"
+            );
+            h.chunk(b"12345678").await.expect("chunk");
+            let (placed, _) = h.end(&again).await.expect("end");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"12345678");
+            let fresh = tid("fat-person-fresh");
+            partial_of(&person, &private, &fresh, &dl, 3600);
+            let stale = tid("fat-person-stale");
+            partial_of(&person, &private, &stale, &dl, 25 * 3600);
+            let counts = sweep_orphans_dir_as(&who, private.clone()).await;
+            let took = registered(&fresh);
+            forget(&[&fresh, &stale]);
+            assert_eq!((counts, took), ((1, 1), true), "the sweep covers it");
+        }
+
+        /// R4 finding 2 — a root daemon takes its home from its account
+        /// (`getpwuid`), never from the `HOME` its environment names (`sudo
+        /// -E`, or a drop-in that sets it): another account's home there, with
+        /// a `user-dirs.dirs` naming a folder of root's outside it, chooses
+        /// nothing. Its own home must pass root's rule, and its
+        /// `user-dirs.dirs` counts only when it is root's own plain file
+        /// nobody else may write, and only for a folder inside that home.
+        #[tokio::test]
+        async fn a_root_daemon_takes_its_home_from_its_account_not_its_environment() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let roots = OwnHome::new(true, false);
+            let (foreign, person) = super::as_root::nobodys_home();
+            let picked = tempfile::tempdir().unwrap();
+            chmod(picked.path(), 0o700);
+            let names = |home: &Path, value: &str| {
+                std::fs::create_dir_all(home.join(".config")).unwrap();
+                let file = home.join(".config/user-dirs.dirs");
+                let _ = std::fs::remove_file(&file);
+                std::fs::write(&file, format!("XDG_DOWNLOAD_DIR=\"{value}\"\n")).unwrap();
+                file
+            };
+            let file = names(foreign.path(), &picked.path().to_string_lossy());
+            for p in [foreign.path().join(".config"), file] {
+                std::os::unix::fs::chown(&p, Some(person.uid), Some(person.gid)).unwrap();
+            }
+            let _env = stand_in::env_home(Some(foreign.path()));
+            let asks =
+                || default_download_dir_as(&FsAs::DaemonAlone, false).map_err(|e| e.to_string());
+            assert_eq!(
+                asks(),
+                Ok(roots.downloads()),
+                "the environment's home and what it names choose nothing"
+            );
+            let inside = roots.path().join("Inside");
+            std::fs::create_dir(&inside).unwrap();
+            chmod(&inside, 0o700);
+            names(roots.path(), "$HOME/Inside");
+            assert_eq!(asks(), Ok(inside.clone()), "its own user-dirs.dirs, inside");
+            names(roots.path(), &picked.path().to_string_lossy());
+            assert_eq!(asks(), Ok(roots.downloads()), "outside its home: not taken");
+            let elsewhere = roots.path().join("dirs-elsewhere");
+            std::fs::write(&elsewhere, "XDG_DOWNLOAD_DIR=\"$HOME/Inside\"\n").unwrap();
+            let file = roots.path().join(".config/user-dirs.dirs");
+            std::fs::remove_file(&file).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+            assert_eq!(asks(), Ok(roots.downloads()), "a link there: not read");
+            let file = names(roots.path(), "$HOME/Inside");
+            std::os::unix::fs::chown(&file, Some(person.uid), Some(person.gid)).unwrap();
+            assert_eq!(
+                asks(),
+                Ok(roots.downloads()),
+                "another account's file there: not read"
+            );
+            chmod(roots.path(), 0o777);
+            assert_eq!(
+                asks(),
+                Err(cannot_receive(
+                    roots.path(),
+                    "another account can write to it"
+                )),
+                "a home others can write: refused"
+            );
+            chmod(roots.path(), 0o700);
+        }
+
+        /// R4 finding 3 — another upload's end removes an empty
+        /// `.roomler-partial`. Landing after a begin opened it and before it
+        /// made its upload's folder there, it costs nothing: the begin makes
+        /// and opens it again, and goes on.
+        #[tokio::test]
+        async fn a_begin_whose_staging_folder_goes_before_its_id_is_made_makes_it_again() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            stand_in::staging_goes_before_the_id_is_made(&dl);
+            let h = FilesHandler::new();
+            let id = tid("staging-goes");
+            let begun = h
+                .begin_as(FsAs::Daemon, id.clone(), "s.txt".into(), 2, None, None)
+                .await;
+            assert_eq!(
+                begun.as_ref().map(drop).map_err(|e| format!("{e:#}")),
+                Ok(()),
+                "begin"
+            );
+            h.chunk(b"ok").await.expect("chunk");
+            let (placed, _) = h.end(&id).await.expect("end");
+            assert_eq!(std::fs::read(&placed).unwrap(), b"ok");
+            assert!(
+                !dl.join(".roomler-partial").exists(),
+                "an empty one still goes at the end"
+            );
+        }
+
+        /// R4 finding 4 — begin passes down that its target is the daemon's
+        /// own default folder, and the very handle its staging opens is held
+        /// to that folder's rule: a `~/Downloads` swapped, after it was
+        /// resolved, for a link to a folder others can write is refused there,
+        /// saying why, and nothing is staged in it. (The handle was checked
+        /// only when resolving the default folder again gave the same path,
+        /// which the swap made fail.)
+        #[tokio::test]
+        async fn a_default_folder_swapped_before_its_staging_is_held_to_its_rule() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let open = home.path().join("open");
+            std::fs::create_dir(&open).unwrap();
+            chmod(&open, 0o777);
+            stand_in::swap_before_open(&dl, &open);
+            let h = FilesHandler::new();
+            let id = tid("swapped-default");
+            let begun = h
+                .begin_as(FsAs::Daemon, id.clone(), "w.txt".into(), 2, None, None)
+                .await;
+            h.abort().await;
+            forget(&[&id]);
+            assert_eq!(
+                begun.map_err(|e| e.to_string()),
+                Err(cannot_receive(&dl, writable_by_others()))
+            );
+            assert_eq!(
+                std::fs::read_dir(&open).unwrap().count(),
+                0,
+                "nothing staged in it"
+            );
+        }
+
+        /// Rule 4, which R4 found untested for a daemon that is root — by
+        /// the drop-in (the switch off), or with root itself at the screen:
+        /// it places a received file in the configured folder, or in a folder
+        /// a controller chose, as each resolves now, at the end and on a
+        /// resume.
+        #[tokio::test]
+        async fn a_root_daemon_places_in_the_configured_or_a_chosen_folder() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let drop_in = linux_fs_as(true, false, false, || unreachable!("no seat asked"));
+            let at_the_screen = linux_fs_as(true, true, false, || Seat::Root);
+            assert_eq!((&drop_in, &at_the_screen), (&FsAs::Daemon, &FsAs::Daemon));
+            let configured = home.path().join("configured");
+            let chosen = home.path().join("chosen");
+            for d in [&configured, &chosen] {
+                std::fs::create_dir(d).unwrap();
+                chmod(d, 0o700);
+            }
+            let _configured = Configured::set(&configured);
+            let chosen_s = chosen.to_string_lossy().into_owned();
+            let h = FilesHandler::new();
+            for (n, who) in [drop_in, at_the_screen].into_iter().enumerate() {
+                for (dest, lands) in [(None, &configured), (Some(chosen_s.as_str()), &chosen)] {
+                    let id = tid(&format!("root-places-{n}-{}", dest.is_some()));
+                    let name = format!("{id}.txt");
+                    h.begin_as(who.clone(), id.clone(), name.clone(), 4, None, dest)
+                        .await
+                        .expect("begin");
+                    h.chunk(b"1234").await.expect("chunk");
+                    let ended = h.end(&id).await;
+                    forget(&[&id]);
+                    assert_eq!(
+                        ended.map(|(p, _)| p).map_err(|e| e.to_string()),
+                        Ok(lands.join(&name)),
+                        "{n}: at the end"
+                    );
+                    let again = format!("{id}-resumed");
+                    let name = format!("{again}.txt");
+                    h.begin_as(who.clone(), again.clone(), name.clone(), 8, None, dest)
+                        .await
+                        .expect("begin");
+                    h.chunk(b"1234").await.expect("chunk");
+                    h.abort().await;
+                    let resumed = h.resume_incoming_as(who.clone(), &again, 0).await;
+                    assert_eq!(
+                        resumed.as_ref().map_err(|e| e.to_string()),
+                        Ok(&0),
+                        "{n}: resumed"
+                    );
+                    h.chunk(b"12345678").await.expect("chunk");
+                    let ended = h.end(&again).await;
+                    forget(&[&again]);
+                    assert_eq!(
+                        ended.map(|(p, _)| p).map_err(|e| e.to_string()),
+                        Ok(lands.join(&name)),
+                        "{n}: after a resume"
+                    );
+                }
+            }
+        }
+
+        /// Rule 4, which R4 found untested — an end places only in a folder
+        /// the rule gives a root writer now: its default folder opened to
+        /// other accounts mid-upload refuses the end, saying why, and the
+        /// partial survives it, so a resume once the folder is the daemon's
+        /// own again completes the upload.
+        #[tokio::test]
+        async fn an_end_the_rule_refuses_keeps_its_partial_for_a_resume() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let h = FilesHandler::new();
+            let id = tid("end-refused");
+            h.begin_as(FsAs::DaemonAlone, id.clone(), "e.txt".into(), 4, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"1234").await.expect("chunk");
+            chmod(&dl, 0o777);
+            let ended = h.end(&id).await;
+            chmod(&dl, 0o700);
+            let partial_dir = dl.join(".roomler-partial").join(&id);
+            let survived = (
+                std::fs::read(partial_dir.join("data")).ok(),
+                partial_dir.join("meta.json").is_file(),
+                registered(&id),
+                dl.join("e.txt").exists(),
+            );
+            let resumed = h.resume_incoming_as(FsAs::DaemonAlone, &id, 4).await;
+            let placed = match &resumed {
+                Ok(_) => {
+                    h.chunk(b"1234").await.expect("chunk");
+                    h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            forget(&[&id]);
+            assert_eq!(
+                ended.map(|(p, _)| p).map_err(|e| e.to_string()),
+                Err(format!(
+                    "{} is not a folder this computer receives files into now ({}), so the \
+                     file is not placed there",
+                    dl.display(),
+                    cannot_receive(&dl, writable_by_others())
+                ))
+            );
+            assert_eq!(
+                survived,
+                (Some(b"1234".to_vec()), true, true, false),
+                "the partial survives it"
+            );
+            assert_eq!(
+                resumed.map_err(|e| e.to_string()),
+                Ok(0),
+                "and resumes, from 0"
+            );
+            assert_eq!(placed, Ok(dl.join("e.txt")));
+        }
+
+        /// #3688 — a per-user daemon whose Downloads sits on a file system that
+        /// keeps no Unix owners either: a VirtualBox shared folder reads
+        /// `root:vboxsf`, a share mounted with a fixed owner reads that one.
+        /// A folder's owner says nothing there, so the daemon's default folder
+        /// is not refused for reading another account's when the daemon can
+        /// write into it (here a folder root owns that every account may
+        /// write, reached through `~/Downloads`): the upload stages in the
+        /// daemon's own private folder, and the end copies the file across.
+        /// Another account's folder it cannot write into (`XDG_DOWNLOAD_DIR`
+        /// naming `/usr`) is passed over. As root, the daemon is root, which
+        /// stays strict: another account's folder is refused.
+        #[tokio::test]
+        async fn a_per_user_daemons_folder_of_another_owner_keeping_no_modes_receives_by_copy() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(false, false);
+            let dl = home.downloads();
+            let _fat = stand_in::modes_kept(Some(false));
+            if as_root() {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                std::fs::create_dir(&dl).unwrap();
+                chmod(&dl, 0o700);
+                std::os::unix::fs::chown(&dl, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                for who in [FsAs::Daemon, FsAs::DaemonAlone] {
+                    assert_eq!(
+                        download_dir_for(&who).await.map_err(|e| e.to_string()),
+                        Err(cannot_receive(&dl, "it belongs to another account")),
+                        "{who:?}: root stays strict"
+                    );
+                }
+                return;
+            }
+            // Root's, and every account may write it, as FHS keeps
+            // `/var/tmp` (or `/dev/shm`); never the temp dir.
+            let temp = std::fs::canonicalize(std::env::temp_dir()).ok();
+            let theirs = ["/var/tmp", "/dev/shm"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|p| {
+                    std::fs::metadata(p)
+                        .is_ok_and(|md| md.is_dir() && md.uid() != euid() && md.mode() & 0o002 != 0)
+                        && std::fs::canonicalize(p).ok() != temp
+                })
+                .expect("a folder another account owns that every account may write");
+            std::os::unix::fs::symlink(&theirs, &dl).unwrap();
+            std::fs::create_dir_all(home.path().join(".config")).unwrap();
+            std::fs::write(
+                home.path().join(".config/user-dirs.dirs"),
+                "XDG_DOWNLOAD_DIR=\"/usr\"\n",
+            )
+            .unwrap();
+            assert_eq!(
+                default_download_dir_as(&FsAs::Daemon, false).map_err(|e| e.to_string()),
+                Ok(dl.clone()),
+                "another account's folder it can write into: taken; one it cannot: passed over"
+            );
+            /// What the end places in that shared folder, removed with the test.
+            struct Placed(PathBuf);
+            impl Drop for Placed {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let private = home.path().join(".local/state/roomler/staging");
+            let h = FilesHandler::new();
+            let id = tid("fat-theirs");
+            let name = format!("{id}.txt");
+            let landed = Placed(theirs.join(&name));
+            h.begin_as(FsAs::Daemon, id.clone(), name.clone(), 4, None, None)
+                .await
+                .expect("begin");
+            let partial_dir = private.join(&id);
+            let staged = (
+                partial_dir.is_dir().then(|| mode_and_owner(&partial_dir)),
+                theirs.join(".roomler-partial").join(&id).exists(),
+            );
+            h.chunk(b"vbox").await.expect("chunk");
+            let ended = h.end(&id).await;
+            forget(&[&id]);
+            assert_eq!(
+                staged,
+                (Some((0o700, euid())), false),
+                "staged in its own private folder, nothing beside the target"
+            );
+            let (placed, _) = ended.expect("end");
+            assert_eq!(placed, dl.join(&name));
+            assert_eq!(
+                (std::fs::read(&landed.0).ok(), mode_and_owner(&landed.0).1),
+                (Some(b"vbox".to_vec()), euid()),
+                "copied across, the daemon's"
+            );
+            assert!(!partial_dir.exists(), "its staging goes");
+        }
+
+        /// #3688 — a daemon that is root (root at the screen, or the switch off)
+        /// judges a configured folder, or one a controller chose, by FR-84
+        /// D4's rule against the home its account names (`getpwuid`), never
+        /// the `HOME` its environment names (`sudo -E` keeps the caller's, a
+        /// drop-in may set one): a folder inside another account's home named
+        /// there is not taken, and the upload lands in the default folder.
+        /// `~` expands against its account's home.
+        #[tokio::test]
+        async fn a_root_daemons_configured_or_chosen_folder_is_judged_against_its_accounts_home() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, false);
+            let (foreign, _person) = super::as_root::nobodys_home();
+            let _env = stand_in::env_home(Some(foreign.path()));
+            let theirs = foreign.path().join("Drops");
+            std::fs::create_dir(&theirs).unwrap();
+            chmod(&theirs, 0o700);
+            let _configured = Configured::set(&theirs);
+            let seen = (
+                writer_context().active_home.map(PathBuf::from),
+                download_dir_for(&FsAs::Daemon)
+                    .await
+                    .map_err(|e| e.to_string()),
+                resolve_dest_path_as(&FsAs::Daemon, &theirs.to_string_lossy())
+                    .await
+                    .is_ok(),
+            );
+            assert_eq!(
+                seen,
+                (Some(home.path().to_path_buf()), Ok(home.downloads()), false),
+                "the environment's home decides nothing: neither the configured folder nor a \
+                 chosen one inside it is taken"
+            );
+            let ours = home.path().join("Drops");
+            std::fs::create_dir(&ours).unwrap();
+            chmod(&ours, 0o700);
+            set_files_dir(Some("~/Drops".into()));
+            assert_eq!(
+                download_dir_for(&FsAs::Daemon)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Ok(ours),
+                "`~` expands against its account's home"
+            );
+        }
+
+        /// #3688 — `keeps_modes`'s probe, met by another account between
+        /// making its folder and opening it, answers nothing: a probe removed
+        /// before it opens, or (as root) replaced by another account's folder
+        /// that every account may write, leaves the answer "keeps modes", so
+        /// the folder's owner and modes still count; and that other folder's
+        /// mode is left as it is.
+        #[test]
+        fn a_probe_that_does_not_open_as_it_was_made_answers_nothing() {
+            let target = tempfile::tempdir().unwrap();
+            chmod(target.path(), 0o777);
+            let held = staging::open_folder(target.path()).unwrap();
+            staging::forget_what_keeps_modes();
+            stand_in::before_the_probe_opens(|probe| std::fs::remove_dir(probe).unwrap());
+            let removed = staging::keeps_modes(&held);
+            staging::forget_what_keeps_modes();
+            let mut swapped = None;
+            if as_root() {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                let theirs = target.path().join("theirs");
+                std::fs::create_dir(&theirs).unwrap();
+                std::fs::write(theirs.join("kept"), b"x").unwrap();
+                chmod(&theirs, 0o777);
+                std::os::unix::fs::chown(&theirs, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                stand_in::before_the_probe_opens(move |probe| {
+                    std::fs::remove_dir(probe).unwrap();
+                    std::fs::rename(&theirs, probe).unwrap();
+                });
+                let answer = staging::keeps_modes(&held);
+                staging::forget_what_keeps_modes();
+                let left = std::fs::read_dir(target.path())
+                    .unwrap()
+                    .flatten()
+                    .find(|e| e.path().join("kept").exists())
+                    .map(|e| mode_and_owner(&e.path()).0);
+                swapped = Some((answer, left));
+            }
+            assert_eq!(
+                (removed, swapped),
+                (true, as_root().then_some((true, Some(0o777)))),
+                "no answer from a probe that did not open as made; another account's folder untouched"
+            );
+        }
+
+        /// #3688 — root's private staging folder sits in root's own
+        /// `/var/lib/roomler` (stood in under the test's home): opened from its
+        /// parent without following a link, root's, and no other account may
+        /// write it; made 0755 when absent. Another account's, one others may
+        /// write, or a link there refuses the upload, saying why.
+        #[tokio::test]
+        async fn roots_private_staging_sits_only_in_roots_own_var_lib_roomler() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let _fat = stand_in::modes_kept(Some(false));
+            let roomler = home.path().join("var/lib/roomler");
+            std::fs::create_dir_all(roomler.parent().unwrap()).unwrap();
+            let nobody =
+                crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+            let elsewhere = tempfile::tempdir().unwrap();
+            let h = FilesHandler::new();
+            let mut refused = Vec::new();
+            for n in 0..3 {
+                let _ = std::fs::remove_dir_all(&roomler);
+                let _ = std::fs::remove_file(&roomler);
+                if n == 2 {
+                    std::os::unix::fs::symlink(elsewhere.path(), &roomler).unwrap();
+                } else {
+                    std::fs::create_dir(&roomler).unwrap();
+                    chmod(&roomler, if n == 0 { 0o755 } else { 0o777 });
+                }
+                if n == 0 {
+                    std::os::unix::fs::chown(&roomler, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                }
+                let id = tid(&format!("var-lib-{n}"));
+                let begun = h
+                    .begin_as(FsAs::DaemonAlone, id.clone(), "v.txt".into(), 1, None, None)
+                    .await;
+                if begun.is_ok() {
+                    h.abort().await;
+                }
+                forget(&[&id]);
+                refused.push(begun.err().map(|e| format!("{e:#}")));
+            }
+            let shown = roomler.display();
+            let why = |why: &str| {
+                Some(format!(
+                    "{shown} {why}, so file transfer does not stage there"
+                ))
+            };
+            let refused: Vec<_> = refused
+                .into_iter()
+                .zip([
+                    why("belongs to another account"),
+                    why("is open to other accounts"),
+                    why("is not a folder"),
+                ])
+                .map(|(got, want)| got.zip(want).is_some_and(|(got, want)| got.contains(&want)))
+                .collect();
+            let _ = std::fs::remove_file(&roomler);
+            let _ = std::fs::remove_dir_all(&roomler);
+            let id = tid("var-lib-made");
+            h.begin_as(FsAs::DaemonAlone, id.clone(), "m.txt".into(), 1, None, None)
+                .await
+                .expect("begin");
+            let made = mode_and_owner(&roomler);
+            h.chunk(b"m").await.expect("chunk");
+            let ended = h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string());
+            forget(&[&id]);
+            assert_eq!(
+                (refused, made, ended),
+                (
+                    vec![true; 3],
+                    (0o755, 0),
+                    Ok(home.downloads().join("m.txt"))
+                ),
+                "refused, saying why, unless root's own; made 0755 root:root when absent"
+            );
+        }
+
+        /// #3688 — a probe's folder left behind in a drop folder (a crash
+        /// between its make and its removal) goes at the startup sweep when it
+        /// is its stager's own and empty. One with something in it, a link
+        /// named so and (as root) another account's are left as they are.
+        #[tokio::test]
+        async fn the_sweep_removes_a_probe_folder_left_behind() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let probe = |n: u8| dl.join(format!(".roomler-probe-{n:016x}"));
+            let (left, full, link, theirs) = (probe(1), probe(2), probe(3), probe(4));
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&full).unwrap();
+            std::fs::write(full.join("kept"), b"x").unwrap();
+            std::os::unix::fs::symlink(home.path(), &link).unwrap();
+            if as_root() {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                std::fs::create_dir(&theirs).unwrap();
+                std::os::unix::fs::chown(&theirs, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                staging::sweep_probes(&dl);
+            } else {
+                sweep_orphans().await;
+            }
+            assert_eq!(
+                (
+                    left.exists(),
+                    full.join("kept").exists(),
+                    link.symlink_metadata().is_ok(),
+                    theirs.exists() == as_root()
+                ),
+                (false, true, true, true),
+                "only its stager's own empty probe folder goes"
+            );
+        }
+
+        /// #3688 — an upload staged privately whose copy across fails (its
+        /// folder could not be written at the end) keeps its partial, and a
+        /// resume completes it once the folder can be written again.
+        #[tokio::test]
+        async fn a_copy_across_that_fails_keeps_its_partial() {
+            if euid() == 0 {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let _fat = stand_in::modes_kept(Some(false));
+            let private = home.path().join(".local/state/roomler/staging");
+            let h = FilesHandler::new();
+            let id = tid("copy-fails");
+            h.begin_as(FsAs::Daemon, id.clone(), "c.txt".into(), 4, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"copy").await.expect("chunk");
+            chmod(&dl, 0o500);
+            let ended = h.end(&id).await;
+            chmod(&dl, 0o700);
+            let kept = (
+                std::fs::read(private.join(&id).join("data")).ok(),
+                private.join(&id).join("meta.json").is_file(),
+                registered(&id),
+                dl.join("c.txt").exists(),
+            );
+            let resumed = h.resume_incoming_as(FsAs::Daemon, &id, 4).await;
+            let placed = match &resumed {
+                Ok(at) => {
+                    h.chunk(&b"copy"[*at as usize..]).await.expect("chunk");
+                    h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            forget(&[&id]);
+            assert!(ended.is_err(), "the end fails");
+            assert_eq!(
+                (kept, placed),
+                (
+                    (Some(b"copy".to_vec()), true, true, false),
+                    Ok(dl.join("c.txt"))
+                ),
+                "the partial stays, and a resume completes it"
+            );
+        }
+
+        /// #3688 — a private partial resumes at an offset past the 256 KiB
+        /// mark, from that mark, and the file placed is the one sent.
+        #[tokio::test]
+        async fn a_private_partial_resumes_past_256_kib() {
+            if euid() == 0 {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let _fat = stand_in::modes_kept(Some(false));
+            let sent: Vec<u8> = (0..600 * 1024).map(|i| (i % 251) as u8).collect();
+            let h = FilesHandler::new();
+            let id = tid("resume-past");
+            h.begin_as(
+                FsAs::Daemon,
+                id.clone(),
+                "big.bin".into(),
+                sent.len() as u64,
+                None,
+                None,
+            )
+            .await
+            .expect("begin");
+            h.chunk(&sent[..300 * 1024]).await.expect("chunk");
+            h.abort().await;
+            forget(&[&id]);
+            let resumed = h
+                .resume_incoming_as(FsAs::Daemon, &id, 300 * 1024)
+                .await
+                .map_err(|e| e.to_string());
+            let at = resumed.clone();
+            let placed = match resumed {
+                Ok(at) => {
+                    h.chunk(&sent[at as usize..]).await.expect("chunk");
+                    h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e),
+            };
+            forget(&[&id]);
+            assert_eq!(at, Ok(256 * 1024), "resumed from the 256 KiB mark");
+            let placed = placed.expect("end");
+            assert_eq!(placed, home.downloads().join("big.bin"));
+            assert!(
+                std::fs::read(&placed).unwrap() == sent,
+                "the file placed is the one sent"
+            );
         }
     }
 }
