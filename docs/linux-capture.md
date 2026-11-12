@@ -529,7 +529,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:98`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7148`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:7149`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2620`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -1683,9 +1683,9 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:1116`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:1359`) — the same `loginctl` walk the FR-27
 consent companion uses. It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:1169-1172`),
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:1412-1415`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
@@ -2199,7 +2199,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1160-1183`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2956`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2963`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

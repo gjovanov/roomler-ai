@@ -1,6 +1,6 @@
 # FR-138: A server roll no longer ends a remote-control session — the session outlives its control socket
 
-**Issue:** [#3604](https://github.com/gjovanov/roomler-ai/issues/3604) · **Status:** claimed 2026-11-09; D1–D4 (§8) decided by the operator 2026-11-09, each as recommended, and D5 on 2026-11-11; P0's baseline read 2026-11-09 (§10); built: P1a, P1b-1, P1b-2, P1c, P2a, P2a-2 and P2b (§5), and three follow-up PRs (#3641, #3658, and #3693, which carries D5); P3 in the field since 2026-11-10, with production's window at 60 for the devices in the resume scope: GREEN on `direct` and `turn` on Linux, Windows and macOS (macOS with P2b, agent 0.4.215), which meets AC1, and in every field cell of AC4 and AC9; `derp` is owed (§10) · **Owner:** the agent's signalling loop, the fleet hub and the remote module, the viewer's session page · **Anchors:** master `c200023ea`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [FR-135](FR-135-one-rc-media-pipeline.md) D15 = C, the operator, 2026-11-02 · **Builds on:** [FR-28](FR-28-derp-drain-on-pod-roll.md) (the flat redial and the pre-pull: the reattach this FR waits through), R3 (`tunnel_peers_survive_reattach`: the same shape for QUIC tunnel peers), [FR-85](FR-85-hq-screen-recording.md) P3b-3 (a recording's re-attach grace), [FR-101](FR-101-rc-session-hygiene.md) (the limits a resumed session keeps), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent and the host's Disconnect) · **Related:** #3429, [FR-22](FR-22-time-to-first-frame.md), [FR-52](FR-52-cross-org-remote-access.md), [FR-43](FR-43-macos-single-enrollment.md)
+**Issue:** [#3604](https://github.com/gjovanov/roomler-ai/issues/3604) · **Status:** claimed 2026-11-09; D1–D4 (§8) decided by the operator 2026-11-09, each as recommended, and D5 on 2026-11-11; P0's baseline read 2026-11-09 (§10); built: P1a, P1b-1, P1b-2, P1c, P2a, P2a-2 and P2b (§5), and three follow-up PRs (#3641, #3658, and #3693, which carries D5); P3 in the field since 2026-11-10, with production's window at 60 for the devices in the resume scope: GREEN on `direct` and `turn` on Linux, Windows and macOS (macOS with P2b, agent 0.4.215), which meets AC1, and in every field cell of AC4 and AC9; on `derp`, a Windows session was kept through a roll on agent 0.4.216 (§10). AC1–AC6, AC8 and AC9 are ticked, and AC7 waits on P4 · **Owner:** the agent's signalling loop, the fleet hub and the remote module, the viewer's session page · **Anchors:** master `c200023ea`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [FR-135](FR-135-one-rc-media-pipeline.md) D15 = C, the operator, 2026-11-02 · **Builds on:** [FR-28](FR-28-derp-drain-on-pod-roll.md) (the flat redial and the pre-pull: the reattach this FR waits through), R3 (`tunnel_peers_survive_reattach`: the same shape for QUIC tunnel peers), [FR-85](FR-85-hq-screen-recording.md) P3b-3 (a recording's re-attach grace), [FR-101](FR-101-rc-session-hygiene.md) (the limits a resumed session keeps), [FR-27](FR-27-consent-surfaces-and-desktop-companion.md) (consent and the host's Disconnect) · **Related:** #3429, [FR-22](FR-22-time-to-first-frame.md), [FR-52](FR-52-cross-org-remote-access.md), [FR-43](FR-43-macos-single-enrollment.md)
 
 ## Summary, for the operator
 
@@ -183,7 +183,7 @@ it to the docs phase.
 | A live session's peer on the agent: the WebRTC connection, its media pumps, its channels, its input registration, its banner, its idle clock, its recording | yes | until it is re-claimed, or the window from the moment it was detached, whichever comes first |
 | A session still waiting for consent or for its offer | no, as today (#2416: `signaling.rs:410` withdraws the prompt) | — |
 | An external session (FR-52) | no, as today (D3) | — |
-| A session on `derp` | the agent keeps its peer, but the viewer redials as today (§4.5), and its new request ends the old session at once | until the viewer's redial |
+| A session on `derp` | yes, when its DERP path comes back before ICE gives up on the pair, as it did on 2026-11-12 (§10). Otherwise the viewer redials as today (§4.5), and its new request ends the old session at once | as above, or until the viewer's redial |
 | The viewer's peer and its decode worker | yes | until `resume_by` plus 5 s, then today's redial; a page that never got `resume_by` counts from its own socket's loss (§4.5) |
 | The row | stays Active, with `detached_at`, `resume_by` and its fencing number `attach_seq` | until resumed, ended, or swept past `resume_by` |
 | Anything in the dying pod's memory | no | — |
@@ -477,19 +477,29 @@ and to claim its session back.
   the new `rc:session.request`, so the server ends the old session before its capacity gate (§4.4). Today's
   best-effort hangup stays, except before a redial of a session the server said is detached (D5 = A), and is no
   longer the only thing that frees the slot.
-- **A session on `derp` redials as today.** Its pair rides the overlay through the DERP floor
-  (`agents/roomlerd/src/session_carrier.rs:69-70`), and `/derp` is pod-local, so a roll takes that path down until
-  the overlay reattaches. The viewer's peer goes `disconnected` when its connectivity checks stop being answered,
-  and nothing bounds `/derp`'s return under the page's 4 s grace (`useRemoteControl.ts:276`), so the page redials.
-  Its `replaces` frees the old session's slot at once. When the roll has also cut the device's control socket, so
-  the session is detached, that redial ends its row `agent_disconnect` (`end_source: redial`, D5 = A): the roll's
-  end, counted as one, which is why AC7 reads `direct` and `turn`. FR-28 is the work that shortens that outage.
+- **A session on `derp` is kept when its DERP path returns in time, and redials otherwise.** Its pair rides the
+  overlay through the DERP floor (`agents/roomlerd/src/session_carrier.rs:69-70`), and `/derp` is pod-local, so a
+  roll takes that path down until the overlay reattaches, and the pair's connectivity checks go unanswered
+  meanwhile. When the mesh rebuilds its DERP carrier before ICE gives up on the pair, no transport signal fires and
+  the session is kept like one on `direct` or `turn`: on 2026-11-12 a Windows session's carrier was back about 4 s
+  after the cut, the device's peer never left `Connected`, and the session resumed with no redial and no
+  `agent_busy` (§10). Nothing bounds `/derp`'s return, though. When the outage outlasts what ICE tolerates, the
+  viewer's peer goes `disconnected` past the page's 4 s grace (`useRemoteControl.ts:276`), or `failed`, and the
+  page redials. Its `replaces` frees the old session's slot at once. When the roll has also cut the device's
+  control socket, so the session is detached, that redial ends its row `agent_disconnect` (`end_source: redial`,
+  D5 = A): the roll's end, counted as one, which is why AC7 reads `direct` and `turn`. FR-28 is the work that
+  shortens that outage.
 - **The person's Disconnect during the gap** arrives as `rc:ended` on the control channel, and the page closes as it
   does for `host_disconnect` today: no ladder, the replay arguments dropped (`useRemoteControl.ts:9315-9327`).
 - **A record of its own.** A resumed session writes no `rc.connect` record, because no attempt starts. The page sends
   `rc.resume` (`v`, `outcome` resumed, ended or expired, `gap_ms` from the last frame painted before the cut to the
   first after it, `ws_down_ms`) through `/api/log/browser`, the road `rc.connect` takes
-  (`ui/src/composables/rcConnectTimingUpload.ts:82`). It is AC2's instrument.
+  (`ui/src/composables/rcConnectTimingUpload.ts:82`). It is AC2's instrument. Only the first frame painted after
+  the cut counts (`createHoldPaintGap`), so `gap_ms` reads the gap the cut opened, never a stall that starts after
+  that frame. `direct` and `turn` media never crosses the server, so there it is a fair reading: the 2026-11-12
+  macOS `turn` cell's pump sent 20 frames every 2 s straight through its detach. On `derp` the frames already in
+  flight land first and the stall comes after them, so `gap_ms` under-reads it: 128 ms on 2026-11-12, while the
+  device's data channel buffered about 3 s of video (§10).
 - **The stale-build reload is untouched.** #3582's policy takes over only a `redialing` session, and a held one reads
   `live` (`useRemoteControl.ts:452-454`), so it gets the banner, never a reload in the middle of a hold.
 
@@ -642,8 +652,10 @@ The same read for every RED and GREEN, so that they compare.
 1. **Sessions.** One live session on each carrier, `direct`, `turn` and `derp` (FR-102 P9c's `remote_sessions.carrier`),
    to a Windows, a Linux and a macOS host, each started a few minutes before the roll (§2.5's TURN line). Standing-
    consent devices and test guests only, never a corporate laptop without its owner's agreement. Read the open
-   sessions before the roll: a roll ends every one of them today. The `derp` session is expected to redial even
-   after P3 (§4.5): it is read for its slot, freed at once by `replaces`.
+   sessions before the roll: a roll ends every one of them today. After P3 the `derp` session is kept when its DERP
+   path returns in time, and redials otherwise (§4.5): it is read for which of the two it did and, when it redials,
+   for its slot, freed at once by `replaces`. Its `gap_ms` under-reads a stall on `derp` (§4.5), so its picture is
+   read from the device's data-channel sends as well.
 2. **Before.** On each host, the daemon's UDP socket count, and the `remote_sessions` rows of the hosts.
 3. **The roll.** `kubectl rollout restart deploy/roomler2`, the timestamps of both waves from the pods.
 4. **After.** Per session: the rows (a new one, or the same one with its `detached_at` gone); the viewer's `rc.connect`
@@ -659,12 +671,14 @@ The same read for every RED and GREEN, so that they compare.
   a Linux and a macOS host, keeps its `remote_sessions` row (no new row, no end), the page records no `after_drop`
   redial for it, and the device raises no consent prompt. Shown RED first: today all of them end (FR-28's 9 of 9,
   and the 2026-11-09 roll).
-- [ ] **AC2, the picture (FR-28's AC1, moved here).** On `direct` and `turn`, no gap above 500 ms in the frames the
+- [x] **AC2, the picture (FR-28's AC1, moved here).** On `direct` and `turn`, no gap above 500 ms in the frames the
   viewer paints across the roll, read from `rc.resume`'s `gap_ms`; 2436 ms was measured on 2026-08-29, and today a
-  roll costs a new session. A session on `derp` redials as today (§4.5), and its old row ends at its new request,
-  with no `agent_busy`. (FR-28's wording named the `video DC delivery gap` line, which is console-only and floored
-  at 1500 ms, so it cannot read 500 ms.)
-- [ ] **AC3, nothing leaks.** On each OS class the daemon's UDP socket count returns to its step-2 baseline within
+  roll costs a new session. A session on `derp` is kept when its DERP path returns within what ICE tolerates, and
+  redials otherwise (§4.5). Either way there is no `agent_busy`, and when it redials, its old row ends at its new
+  request. `gap_ms` under-reads a stall on `derp` (§4.5), so the 500 ms bound reads `direct` and `turn` only.
+  (FR-28's wording named the `video DC delivery gap` line, which is console-only and floored at 1500 ms, so it
+  cannot read 500 ms.)
+- [x] **AC3, nothing leaks.** On each OS class the daemon's UDP socket count returns to its step-2 baseline within
   five minutes of each session's real end; every `detached` line is followed by one `resumed` or one `closed` line
   for the same session; no `peer close overran its budget` line names a kept peer.
 - [x] **AC4, the server still decides.** In integration tests, and once in the field on a test guest: an admin's end,
@@ -672,18 +686,19 @@ The same read for every RED and GREEN, so that they compare.
   the session within 5 s of the agent's next registration and never later than the window plus the close budget. A
   session nobody claims ends at the window as `agent_disconnect`. The person's Disconnect during the gap ends it at
   once, and the row records `host_disconnect`.
-- [ ] **AC5, old meets new.** An agent without the verb, an agent with the switch off, a server with the window at 0,
+- [x] **AC5, old meets new.** An agent without the verb, an agent with the switch off, a server with the window at 0,
   a device outside the scope, an older viewer, and a server rolled back to an older image during a gap each behave
   as today or end at the window, one test each, and the matrix is in the docs. The rollback case reads the audit
   listing of a session that holds the new kinds, on P1's image, and the docs state the floor (§5).
-- [ ] **AC6, everything else still ends.** A shutdown, an update, sleep, a resume from suspend, `rc:goodbye`, a key
+- [x] **AC6, everything else still ends.** A shutdown, an update, sleep, a resume from suspend, `rc:goodbye`, a key
   rotation and a refused token each close every peer at once (a unit test per arm). A session not yet live, and an
   external one, end as today.
 - [ ] **AC7, the class reads zero.** A week of production promotes after P4 reads no session on `direct` and `turn`
   ended `agent_disconnect` inside a promote run on a host in the scope (FR-135 S19's first class). That answers
-  FR-135's AC21 for its owner. A session on `derp` redials at a roll (§4.5), and since D5 = A its old row ends
-  `agent_disconnect` at that redial, the roll's end counted honestly, so AC7 does not read it.
-- [ ] **AC8, docs.** `docs/remote-control.md` gains a section on a session that outlives its control socket, with
+  FR-135's AC21 for its owner. A session on `derp` redials at a roll when its DERP path is not back in time
+  (§4.5), and since D5 = A its old row then ends `agent_disconnect` at that redial, the roll's end counted
+  honestly, so AC7 does not read `derp`.
+- [x] **AC8, docs.** `docs/remote-control.md` gains a section on a session that outlives its control socket, with
   both sequence diagrams, the state diagram and the old-and-new matrix; `docs/multi-pod-scale-out.md` and
   `docs/deployment.md` say what a roll does to a session now; the window, the scope and the agent's switch are in the
   operator docs; and any page added gets its row in `docs/README.md`'s index.
@@ -712,9 +727,10 @@ raised, on 2026-11-11.
   process, so nothing here can keep its session. The shutdown arm stays terminal.
 - **The machine sleeping**, and a resume from suspend.
 - **A session not yet live**: a consent prompt or an offer in flight ends as today (#2416).
-- **`/derp`'s own outage at a roll** (FR-28): a session on `derp` redials as today, because its viewer reads the
-  outage as a drop (§4.5). `replaces` frees its slot at once, and when the roll also detached the session, ends its
-  row `agent_disconnect` (D5 = A), which is why AC7 reads `direct` and `turn` only.
+- **`/derp`'s own outage at a roll** (FR-28): this FR does not shorten it. A session on `derp` is kept when its DERP
+  path returns within what ICE tolerates, and otherwise redials, because its viewer reads the outage as a drop
+  (§4.5). `replaces` frees its slot at once, and when the roll also detached the session, ends its row
+  `agent_disconnect` (D5 = A), which is why AC7 reads `direct` and `turn` only.
 - **A cluster-wide hub.** The row and the two claims are enough; moving the hub's state into Redis is a larger change
   and this FR does not need it.
 - **Tunnel, SSH and conference sessions.** Tunnels have R3; a meeting's media runs through the SFU in the pod and
@@ -749,3 +765,8 @@ raised, on 2026-11-11.
 | 2026-11-12 | `hosted-20261112-ee0797e`, both pods deleted in turn on the same image; agent 0.4.215; window 60 | **P2b's GREEN, the roll of 12:43:45Z to 12:44:11Z: the supervised Mac, `direct`. A delegated session outlived the daemon's control socket.** The Mac took agent 0.4.215 at 12:39:46Z and kept its device row. The GUI worker announced `features=["keep-delegated"]`, the daemon logged that the GUI worker keeps its delegated sessions with the switch on, and the server announced a window of 60 s. A session to it on `direct` was live at the roll. The daemon logged `rc session detached (delegated)` at 12:43:58.7Z and `rc session resumed (delegated)` at 12:44:02.4Z, `kept_ms` 3679, `told=true`. The GUI worker kept its peer, and its encoder's heartbeats ran unbroken through the gap. **It kept its row**, `attach_seq` 1, and the page did not redial. The viewer's `rc.resume`: `outcome=resumed`, **`gap_ms` 13**, `held_ms` 4182. At the session's end the GUI worker's UDP sockets went from 17 to 0 within 15 s and were still 0 at +5 min, and the root daemon stayed at its 5. No `peer close overran its budget` line appeared (#3604 comment 6824113872) |
 | 2026-11-12 | the same roll; agent 0.4.215; window 60 | **P3 read again on agent 0.4.215: a Linux lab desktop, `turn`, GREEN.** The roll cut it at the same instant as the Mac's session. The device logged `rc session detached` at 12:43:58.7Z and `rc session resumed` at 12:44:01.8Z, `kept_ms` 3118. **It kept its row**, and the page did not redial. The viewer's `rc.resume`: **`gap_ms` 66**, `held_ms` 4069. The daemon held 12 UDP sockets before the session and 27 during it, and 5 at +15 s and at +5 min after its end. No `peer close overran its budget` line appeared (#3604 comment 6824113872) |
 | 2026-11-12 | `hosted-20261112-ee0797e`, both pods deleted in turn on the same image; agent 0.4.215; window 60 | **AC1's macOS `turn` cell, GREEN: the roll of 15:43:14Z to 15:43:40Z.** A throwaway macOS lab guest with the published one-row install, the supervised shape: the root daemon and the signed-in person's GUI worker, whose sessions are delegated (P2b). Its switch was on, it was in the resume scope, and its consent was `auto`. Every UDP packet was dropped inside the guest, so the session rode a TURN relay over TCP: the row's `carrier` was `turn`, and the viewer's `rc:video-info` said `transport: relay`. The session began at 15:42:04Z, under two minutes before the roll (a TURN credential bounds its allocation, §2.5); the guest's UDP baseline before it was 5 sockets for the daemon and 0 for the GUI worker, and no other session or call was open. The device's control socket dropped at 15:43:27.6Z: the daemon detached the delegated session and the GUI worker kept its peer, and the daemon claimed it on its new connection, resumed it at 15:43:31.3Z, `kept_ms` 3723, and told the worker. **It kept its row**, Active, `attach_seq` 1, with no new row. The page uploaded one `rc.connect` record (attempt 1, `after_drop: false`) and did not redial, and no consent prompt was raised at the resume (AC1). The viewer's `rc.resume`: `outcome=resumed`, **`gap_ms` 112**, `ws_down_ms` 4055, `held_ms` 4492, with the viewer's tab hidden throughout. After the viewer's Disconnect at 15:45:12Z the daemon closed the session on the server's end, and the worker's peer reached `Closed` 1.0 s later, the close grace, with no `overran its budget` line. The daemon and the GUI worker were back at 5 and 0 UDP sockets by 2 min 48 s after the end, and still there at 5 min 40 s. The `detached` line was followed by one `resumed` line, and the end by one close. With this cell AC1 holds on every combination it names (#3604 comment 6828472977) |
+| 2026-11-12 | #3784: tests and one server refusal, no roll | **AC5, AC6 and AC8 ticked.** AC6's two links that no test held now have one each. An update reaches the shutdown arm that closes every peer: `an_update_reaches_the_shutdown_that_closes_every_peer` reads the daemon's shutdown watch `true` once the installer is running. An external session (FR-52) is built with no link, so it closes at every exit: `an_external_session_is_built_without_a_link`. Each failed on its assertion against a local mutant that removed the line it guards. A desired-config push naming `rc_sessions_survive_reattach` is now refused 403 by its whole name, as `rc_media_canary` is, and audited as `device_owned_switch` (`a_push_naming_the_resume_switch_is_refused_by_its_whole_name`, RED in integration-tests run 43285814982, where the push answered 200). AC5's matrix and AC6's table, with the test behind each cell, are in `docs/remote-control.md` §11.19, and the rest of AC8's pages came with #3770 |
+| 2026-11-12 | agent 0.4.216, which carries #3744; its switch on; window 60 | **#3716's Repro passes: a peer that fails on a TURNS-over-TCP relay closes inside its budget.** A throwaway Windows 11 lab guest, self-update off, in the resume scope. Its UDP was dropped on the hypervisor, so the session rode `turn`, TURNS over TCP, on four relay links. The tab was closed without Disconnect at about 19:17Z, and the session ended `error` 26 s later. The device's peer went `Failed` in the same second as the server's terminate, and `Closed` 1 s later, FR-138's close grace, with no `peer close overran its budget` line. The session's sockets were gone 93 s after the end and still gone at +4 min, its worker back at its idle 4 UDP sockets. #3716 is closed (#3716 comment 6833616467) |
+| 2026-11-12 | both pods deleted in turn on the same image; agent 0.4.216; window 60 | **The `derp` cell: the session was KEPT through the roll of 20:08:47Z to 20:09:14Z, not redialed.** The same guest, enrolled in an org it shares with the viewer's machine, so that a session could ride the mesh. Its UDP and its TCP to every TURN server were dropped, `rc_overlay: true` was set on the device, and relay assist was off in the viewer, so the row's `carrier` read `derp`. When the first pod went, the device logged `rc session detached` (`exit="read_error"`, `window_s=60`) and `/derp WS closed; reconnecting` at the same instant, then `rc session resumed`, `kept_ms` 3120. The mesh's DERP carrier to the viewer's machine was rebuilt about 4 s after the cut, and the device's peer never left `Connected`: no `Disconnected` and no `Failed` line. **It kept its row**, `attach_seq` 1, carrier `derp`, until it ended `controller_hangup` at the Disconnect 4 min later, and there was no `agent_busy` anywhere. The page uploaded one `rc.connect` record, the original, and did not redial. The viewer's `rc.resume`: `outcome=resumed`, **`gap_ms` 128**, `ws_down_ms` 3888, `held_ms` 4241, `hidden: true`. While `/derp` was down, the device's data channel buffered about 3 s of throttled sends, its buffer over the high watermark. `gap_ms` does not show that stall: it spans the last frame painted before the cut to the first after it, and the frames already in flight landed first (§4.5). §4.5 had said that a `derp` session redials at a roll. On this cell and AC1's, whose `direct` and `turn` sessions read `gap_ms` 13 to 262 ms, the operator ticked AC2 and fixed its wording: a `derp` session is kept when its DERP path returns within what ICE tolerates, and redials otherwise (#3604 comments 6834852470 and 6835065673) |
+| 2026-11-12 | agent 0.4.216 | **AC3 on Windows, read on the same guest: ticked.** After both sessions ended, the worker's UDP was back at its idle 4 within 93 s for the `turn` session and within 3 min for the `derp` one. The one `detached` line was followed by one `resumed` line, and no `peer close overran its budget` line appeared in any of the device's five logs. With Linux (the 0.4.216 lab: UDP 0 within 20 to 30 s of each close) and macOS (the 11-12 `turn` cell: back at its baseline within 3 min), every OS class has its read (#3604 comment 6834852470) |
+| 2026-11-12 | #3784, merged as `5d4a2795d`; no roll | **#3784 merged at 20:25Z, with the operator's sign-off.** Its integration run was GREEN, 43290455722 (986 tests), after the RED 43285814982 in the #3784 row above. Every arm of AC6 has a test, so AC6 is ticked (#3604 comment 6835065673) |

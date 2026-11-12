@@ -2489,6 +2489,45 @@ pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
     format!("policy {}{source} — {state}{lid}", p.policy)
 }
 
+/// #3781 — `roomler status`'s `tray` lines for
+/// [`NodeStatus::companion_too_old`]: the tray beside this Windows daemon is
+/// too old to connect to it, Roomler replaces it by itself and when, the one
+/// command that retries now and the one that says why it failed. Those are
+/// the service's when the machine-wide service refreshes the tray, and this
+/// daemon's own when it does that itself.
+fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
+    let first = match &c.installed {
+        Some(v) => format!(
+            "OUT OF DATE: {v} cannot connect to this daemon, which needs {} or later",
+            c.minimum
+        ),
+        None => format!(
+            "version UNKNOWN (no version marker): one older than {} cannot connect to this \
+             daemon",
+            c.minimum
+        ),
+    };
+    let (retry, why) = if c.by_service {
+        (
+            "Restart-Service Roomler (as an administrator)",
+            "roomler logs --source service --grep \"desktop companion\"",
+        )
+    } else {
+        (
+            "restart roomlerd",
+            "roomler logs --grep \"desktop companion\"",
+        )
+    };
+    vec![
+        first,
+        "Roomler replaces it by itself, retrying every few minutes for an hour after a start, \
+         then every 4 h"
+            .to_string(),
+        format!("To retry now: {retry}"),
+        format!("Why it failed: {why}"),
+    ]
+}
+
 /// #3387 — `roomler status`'s line for [`NodeStatus::waiting_for_machine_enrollment`].
 const WAITING_FOR_MACHINE_ENROLLMENT: &str = "no machine enrollment yet: the Roomler service \
      runs this person's own enrollment as them, so the lock and sign-in screens cannot be \
@@ -2508,6 +2547,15 @@ fn print_status(s: &NodeStatus) {
             "  last update {}",
             last_install_line(li, &s.version, unix_now())
         );
+    }
+    // #3781 — a Windows tray too old to connect to this daemon. Printed only
+    // when the daemon reports one, so every other device's output is
+    // byte-stable.
+    if let Some(c) = &s.companion_too_old {
+        for (i, line) in tray_lines(c).iter().enumerate() {
+            let label = if i == 0 { "tray" } else { "" };
+            println!("  {label:<11} {line}");
+        }
     }
     println!("  mode        {mode}");
     // #3387 — only from the person's own worker that a machine-wide service
@@ -4708,6 +4756,45 @@ mod devices_tests {
         p.on_ac = Some(false);
         p.held = false;
         assert!(power_line(&p, true).starts_with("policy on-ac, on battery — free to sleep"));
+    }
+
+    /// #3781 — `roomler status` on a device whose tray is too old to connect
+    /// says so, says that Roomler retries by itself and when, and gives the
+    /// one command that retries now and the one that says why it failed: the
+    /// service's, or this daemon's own when it refreshes the tray itself. A
+    /// tray of unknown version says that, not a version it does not know.
+    #[test]
+    fn the_tray_lines_say_it_cannot_connect_and_what_to_do() {
+        let mut c = localapi::CompanionTooOld {
+            installed: Some("0.4.212".into()),
+            minimum: "0.4.216".into(),
+            by_service: true,
+        };
+        assert_eq!(
+            tray_lines(&c),
+            [
+                "OUT OF DATE: 0.4.212 cannot connect to this daemon, which needs 0.4.216 or later",
+                "Roomler replaces it by itself, retrying every few minutes for an hour after a \
+                 start, then every 4 h",
+                "To retry now: Restart-Service Roomler (as an administrator)",
+                "Why it failed: roomler logs --source service --grep \"desktop companion\"",
+            ]
+        );
+
+        c.by_service = false;
+        let own = tray_lines(&c);
+        assert_eq!(own[2], "To retry now: restart roomlerd");
+        assert_eq!(
+            own[3],
+            "Why it failed: roomler logs --grep \"desktop companion\""
+        );
+
+        c.installed = None;
+        assert_eq!(
+            tray_lines(&c)[0],
+            "version UNKNOWN (no version marker): one older than 0.4.216 cannot connect to this \
+             daemon"
+        );
     }
 
     /// FR-55 AC6 — `config set power_policy` on a Mac prints the daemon's own

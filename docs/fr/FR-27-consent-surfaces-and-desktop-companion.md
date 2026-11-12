@@ -67,7 +67,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:6009`, `ssh.rs:2180` vs `git grep write_pending`
+   — `signaling.rs:6010`, `ssh.rs:2180` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
@@ -108,7 +108,7 @@ Every line below was read on `origin/master` at `861d4557`.
    and exits, so there is nothing to wait for).
 9. **`companion::refresh_if_stale` is Windows-only** and nothing reports the
    companion's version to the server, so "Update all" cannot tell anyone the
-   desktop stayed behind. — `agents/roomlerd/src/companion.rs:115`
+   desktop stayed behind. — `agents/roomlerd/src/companion.rs:358`
 10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:530`, at master `5c5a70767`),
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.

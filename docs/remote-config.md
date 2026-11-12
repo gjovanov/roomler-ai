@@ -251,7 +251,7 @@ owner's: gate 3 of cross-org access, and the password record behind it. `Desired
 cannot hold one, under a prefix test, so the key that matters is also the one added
 after the test was written. The route says so instead of answering 200 for a key it
 dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
-(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:186`). That
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:224`). That
 refusal is a courtesy to the admin who asked. What stops a compromised server is the
 device, whose frame type drops the key whatever a frame carries
 (`a_pushed_external_key_never_reaches_the_device`,
@@ -301,7 +301,7 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:197`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:235`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
 (`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2947`), and a test
@@ -326,7 +326,7 @@ it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
 (`agents/roomlerd/src/remote_config.rs:571`). The server passes it on unread
-(`crates/modules/fleet/src/remote_config.rs:304`): an entry the gate cannot read
+(`crates/modules/fleet/src/remote_config.rs:342`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
 cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
@@ -367,10 +367,10 @@ built-in defaults, and never further, because nothing pushed can turn a path's n
 code on ahead of its default. The server checks the value's shape and refuses a
 spelling no device could read with a 400 (`check_media_path_list`,
 `crates/remote_control/src/models.rs:2971`, called at
-`crates/modules/fleet/src/remote_config.rs:279`), so `media-plan` or `Media_Plan`
+`crates/modules/fleet/src/remote_config.rs:317`), so `media-plan` or `Media_Plan`
 never reads as applied while doing nothing. It does not check the names, which
 belong to the device's build: it stores the value as given
-(`crates/modules/fleet/src/remote_config.rs:305`), and a device ignores a name its
+(`crates/modules/fleet/src/remote_config.rs:343`), and a device ignores a name its
 build does not know. A newer phase's name therefore reaches an older agent as
 nothing, and still sits in its file for the release that knows it.
 
@@ -418,8 +418,8 @@ in [FR-135](fr/FR-135-one-rc-media-pipeline.md)'s step log.
 default does, is NOT pushable**, for `zero_copy`'s reason (FR-132 decision 1):
 turning new code on stays the device's decision, or a release's. A body naming it
 is refused with a 403 and audited as `device_owned_switch`, by whole name
-(`crates/modules/fleet/src/remote_config.rs:317`), so a push never answers 200 as
-if it had taken. It is set on the device
+(`DeviceSwitch`, `crates/modules/fleet/src/remote_config.rs:100`; the refusal, `:355`),
+so a push never answers 200 as if it had taken. It is set on the device
 (`roomler config set rc_media_canary <names>`), is live the same way, and loses to
 `rc_media_legacy`. The model test that guards it compares whole keys
 (`the_device_owned_refusals_are_not_pushable`). A canary entry this build has no
@@ -431,10 +431,15 @@ session through the loss of the control socket, is not pushable either.** It
 stays the device's decision, as `ws_flat_redial` and
 `tunnel_peers_survive_reattach` do: `DesiredConfig` has no such field
 (`crates/remote_control/src/models.rs:2777`), and the daemon reads the key when it
-starts (`crates/agent-core/src/config_surface.rs:726`). Unlike `rc_media_canary`,
-a body that names it is not refused by name: the key is dropped unread with the
-body's other unknown keys (`rest`, `crates/modules/fleet/src/remote_config.rs:58`),
-so the answer cannot tell anyone that it changed nothing. Set it on the device
+starts (`crates/agent-core/src/config_surface.rs:726`). A body that names it is
+refused as one naming `rc_media_canary` is: a 403 whose message names this key,
+audited as `device_owned_switch`, by whole name, so a key that only starts like it
+is not it (`DeviceSwitch`, `crates/modules/fleet/src/remote_config.rs:100`;
+`a_push_naming_the_resume_switch_is_refused_by_its_whole_name`,
+`crates/tests/src/rc_resume_tests.rs:516`). Until FR-138's AC6 it was dropped
+unread with the body's other unknown keys (`rest`,
+`crates/modules/fleet/src/remote_config.rs:59`), and the push answered 200 as if it
+had taken. Set it on the device
 (`roomler config set rc_sessions_survive_reattach true`, then `roomler restart`).
 The fleet is staged server-side instead, through the resume scope, which a platform
 admin keeps
@@ -642,7 +647,7 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3165`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3195`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check

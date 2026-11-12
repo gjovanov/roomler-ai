@@ -272,7 +272,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3942`, `crates/agent-core/src/config.rs:4303`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3942`, `crates/agent-core/src/config.rs:4310`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -563,7 +563,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3478`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3522`) |
+| `config::load` (`crates/agent-core/src/config.rs:3485`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3529`) |
 | `config::read_if_present` (`:3554`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -599,7 +599,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2574`, `:2596`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2583`, `:2605`), at the clean-run promotion
 (`record_clean_run_at`, `:2555`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4406`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -845,17 +845,17 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4590`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4597`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
   again for that owner, so the entry `%PROGRAMDATA%` hands whoever made it
-  names Administrators (`machine_tree.rs:868`). A link is refused, never taken
+  names Administrators (`machine_tree.rs:895`). A link is refused, never taken
   over. What that person made below them stays theirs. Setup also seals
   `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
   that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:1064`), and was the
+  administrators once the repair has run (`machine_tree.rs:1091`), and was the
   machine's as found before it (#3666; Setup reads it before it seals
   `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
   written in its place, keeping no `.prev` and no key this build does not know
@@ -1471,8 +1471,9 @@ folder they name from the system, never from the environment they were started w
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:952` |
 | The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:999`, `crates/agent-core/src/appdirs.rs:779` |
-| The one-time sweep of the vacated install folder | Rooted as above; a folder that is a link, or sits below one, is left as it is. | `agents/roomlerd/src/install_cleanup.rs:267` |
-| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the per-user package's Scheduled Tasks it finds (`Roomler` and the one under the retired name), then removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below `C:\Users\<name>` of the person signed in to the step's session (`plan_per_user_removal`). A tree that is a link, holds one or is reached through one is left in place with a line that names it (`link_inside`), and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session it removes no tree either. | `agents/roomlerd/src/install_cleanup.rs:177`, `agents/roomlerd/src/install_cleanup.rs:341`, `agents/roomlerd/src/install_cleanup.rs:435`, `agents/roomlerd/src/install_cleanup.rs:487`, `crates/agent-core/src/appdirs.rs:313` |
+| The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:254`, `agents/roomlerd/src/install_cleanup.rs:286` |
+| The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:631`, `agents/roomlerd/src/install_cleanup.rs:679` |
+| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the per-user package's Scheduled Tasks it finds (`Roomler` and the one under the retired name), then removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session it removes no tree either, and when it cannot tell the session's account, or the system records no profile for it, it removes none and its line says which. | `agents/roomlerd/src/install_cleanup.rs:179`, `agents/roomlerd/src/install_cleanup.rs:383`, `agents/roomlerd/src/install_cleanup.rs:509`, `agents/roomlerd/src/install_cleanup.rs:561`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
 
 **Which tree an account's folders are in (#3747).** An account's tree is the one that holds its
 config folder: the NEW one when it holds one, else the OLD one when it holds one. Only when
@@ -1918,7 +1919,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3165`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2454,13 +2455,13 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5039`).
+(`crates/localapi/src/lib.rs:5069`).
 
 The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3165`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
 read-only and refuses to set by name (`localapi::person_may`, `:3341`). Whether
 the console user should flip those from the app is the decision left open on
@@ -2546,7 +2547,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3654`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2659`).
+back to the version that is running (`crates/agent-core/src/config.rs:2668`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -2714,8 +2715,41 @@ when one is needed (FR-27).
 |---|---|
 | `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. A per-user Linux daemon cannot write `/usr`: there a root update helper (`roomler-update.service`) installs, and the daemon restarts onto the new binary once nothing it serves would be cut (FR-96). Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version. On a Windows service install the post-install watcher's last act is to **settle** the `Roomler` service: it waits out a stop still in flight, starts the service when it reads STOPPED, and trusts RUNNING only after 15 s unbroken. Windows Installer's Restart Manager can stop the freshly installed service *after* the install has finished, and a single `sc start` answers 1056 ("already running") for a service that is still stopping (#2711). `last-install.json` records what it saw (`service Roomler: running (1 start; seen StopPending→Stopped→Running)`). The watcher writes its verdict without `println!` (#2934, #2935): an update driven by `roomler exec … self-update` leaves it the exec's stdout, whose reader is gone by then, and the panic that followed was filed as an agent crash |
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin): since FR-97 P6b the release's `.asc` is checked against the pinned key on every OS, and Linux and macOS install too, the tarball or (where dpkg owns the binary) the `.deb` ([`tunnel-install.md` §10](tunnel-install.md)). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
-| `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686) |
+| `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686). A refresh that fails is retried every 4 h, and within minutes while the tray is too old to connect ([below](#a-tray-older-than-its-daemon-windows-3781)) |
 | wizard | Fetch-latest by nature; `setup-v<V>` is cut with every `agent-v<V>` (the lockstep job in `release-agent.yml`) |
+
+### A tray older than its daemon (Windows, #3781)
+
+From `agent-v0.4.217` the LocalAPI pipe gives a person's session only the exact open a tray makes
+from `agent-v0.4.216` on (#3742, #3760). A tray from before 0.4.216 asks for more, so a daemon that
+runs elevated or as SYSTEM refuses every connect it makes, and none of its pages reach the daemon
+until the daemon replaces it. That is a machine-wide install, unless its worker runs as a person
+without administrator rights. A daemon that runs as the person owns its pipe, and that person's
+old tray still connects there.
+
+The daemon's refresh replaces the tray within seconds of an update. When it cannot, for example
+because endpoint protection blocks the swap, it retries soon. The retry is keyed on the tray's
+version marker (`roomler-desktop.exe.version`, beside the daemon). While the marker is older than
+0.4.216, missing, or names no version, the waits are 2, 5, 10 and 15 minutes, then 15 to the end
+of the first hour after the service (or the per-user daemon) starts, then every 4 hours. Each wait
+logs one line: `desktop companion is too old to connect to this daemon; its refresh is retried`,
+with `installed`, `needs` and `next_try_in_min`.
+
+`roomler status` says so, under `version` and `last update`:
+
+```
+  tray        OUT OF DATE: 0.4.212 cannot connect to this daemon, which needs 0.4.216 or later
+              Roomler replaces it by itself, retrying every few minutes for an hour after a start, then every 4 h
+              To retry now: Restart-Service Roomler (as an administrator)
+              Why it failed: roomler logs --source service --grep "desktop companion"
+```
+
+A tray with no marker reads `version UNKNOWN (no version marker)` instead. Restarting the service
+retries at once. When the log shows the swap refused (`desktop companion refresh skipped`, with
+access denied or a file in use), allowing Roomler to replace `roomler-desktop.exe` in its install
+folder ends it. `ROOMLERD_COMPANION_SYNC=0` turns the retry off, the faster one with it. The
+mechanics:
+[`desktop-companion.md` §13.2](desktop-companion.md#132-a-tray-too-old-for-its-daemon-windows-3781).
 
 ## Verifying what you install
 

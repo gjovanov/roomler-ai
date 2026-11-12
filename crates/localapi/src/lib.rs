@@ -480,6 +480,36 @@ pub struct NodeStatus {
     /// daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_worker: Option<GuiWorkerStatus>,
+    /// #3781 — the desktop companion (tray) beside this Windows daemon is too
+    /// old to connect to it. Since #3760 the pipe gives an interactive user
+    /// only the exact open a tray from [`CompanionTooOld::minimum`] on makes
+    /// (#3742), and a daemon that runs elevated or as SYSTEM owns its pipe, so
+    /// the person's tray reaches it through that entry alone.
+    ///
+    /// From a daemon that has the field, absent means fine or not applicable,
+    /// never unknown: the tray connects, there is none, this daemon runs as the
+    /// person (the pipe's owner, whose own tray still connects), or this is not
+    /// Windows. A tray whose version nobody can vouch for is reported, with
+    /// `installed` absent. A daemon that predates the field never sends it, and
+    /// an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_too_old: Option<CompanionTooOld>,
+}
+
+/// #3781 — what [`NodeStatus::companion_too_old`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CompanionTooOld {
+    /// The tray's version, as the marker the daemon writes beside it on every
+    /// refresh names it. `None` = no marker, or one that does not read as a
+    /// version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    /// The oldest tray this daemon accepts.
+    pub minimum: String,
+    /// The machine-wide `Roomler` service refreshes the tray, not this
+    /// process: its tries are in `roomler logs --source service`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_service: bool,
 }
 
 /// FR-43 P3c — what [`NodeStatus::gui_worker`] reports.
@@ -6401,6 +6431,7 @@ mod tests {
                 started_at_ms: None,
                 macos_grants: None,
                 gui_worker: None,
+                companion_too_old: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -7916,6 +7947,58 @@ mod tests {
         );
         let back: NodeStatus = serde_json::from_str(&wire).unwrap();
         assert!(back.waiting_for_machine_enrollment);
+    }
+
+    /// #3781 — `companion_too_old` is additive both ways: absent from an older
+    /// daemon and from one whose tray connects (its JSON is unchanged), a tray
+    /// of unknown version round-trips with no `installed`, and a status that
+    /// carries the field still parses for a reader that predates it.
+    #[test]
+    fn companion_too_old_is_additive_both_ways() {
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(st.companion_too_old, None);
+        let fine = serde_json::to_string(&st).unwrap();
+        assert!(!fine.contains("companion_too_old"), "{fine}");
+
+        let too_old = NodeStatus {
+            companion_too_old: Some(CompanionTooOld {
+                installed: Some("0.4.212".into()),
+                minimum: "0.4.216".into(),
+                by_service: true,
+            }),
+            ..st.clone()
+        };
+        let wire = serde_json::to_string(&too_old).unwrap();
+        assert!(
+            wire.contains(
+                r#""companion_too_old":{"installed":"0.4.212","minimum":"0.4.216","by_service":true}"#
+            ),
+            "{wire}"
+        );
+        let back: NodeStatus = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.companion_too_old, too_old.companion_too_old);
+
+        let unknown = CompanionTooOld {
+            installed: None,
+            minimum: "0.4.216".into(),
+            by_service: false,
+        };
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert_eq!(json, r#"{"minimum":"0.4.216"}"#);
+        assert_eq!(
+            serde_json::from_str::<CompanionTooOld>(&json).unwrap(),
+            unknown
+        );
+
+        /// `NodeStatus` as a CLI from before the field reads it.
+        #[derive(Deserialize)]
+        struct OlderReader {
+            name: String,
+            connected: bool,
+        }
+        let older: OlderReader = serde_json::from_str(&wire).unwrap();
+        assert_eq!((older.name.as_str(), older.connected), ("h", true));
     }
 
     #[test]

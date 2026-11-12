@@ -638,6 +638,36 @@ impl TenantDao {
             .unwrap_or_default())
     }
 
+    /// The role ids a member holds in a tenant that the tenant has (#3635):
+    /// the ids [`Self::member_role_ids`] lists, kept only where a role row of
+    /// `tenant_id` exists, in the row's order. Empty when the user is not a
+    /// member or holds no role, so a caller matching role subjects against it
+    /// matches none of them.
+    ///
+    /// The tunnel forward gate reads it on every forward request, so a role
+    /// counts only in the org that owns it, and only while that org has it.
+    pub async fn member_live_role_ids(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> DaoResult<Vec<ObjectId>> {
+        let listed = self.member_role_ids(tenant_id, user_id).await?;
+        if listed.is_empty() {
+            return Ok(listed);
+        }
+        let live: std::collections::HashSet<ObjectId> = self
+            .roles
+            .find_many(
+                doc! { "tenant_id": tenant_id, "_id": { "$in": &listed } },
+                None,
+            )
+            .await?
+            .into_iter()
+            .filter_map(|r| r.id)
+            .collect();
+        Ok(listed.into_iter().filter(|id| live.contains(id)).collect())
+    }
+
     /// FR-129 A1 — every member holding `flag` in `tenant_id`, in two
     /// queries (the members, the tenant's roles) rather than one
     /// [`Self::get_member_permissions`] per member: the "device paired"

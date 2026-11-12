@@ -3289,6 +3289,32 @@ mod tests {
         );
     }
 
+    /// FR-138 D3 — an external (FR-52) session is built with no link, so the
+    /// table closes it at every exit, as before
+    /// (`a_delegated_or_external_session_closes_at_a_transient_exit`). It is
+    /// external when FR-52 sealed its answer, and the offer's one way into the
+    /// table drops the link for it. A source check: the offer's arm needs a
+    /// live socket, a binding and a peer. A delegated one is never `keepable`
+    /// (`delegate::session_keepable`).
+    #[test]
+    fn an_external_session_is_built_without_a_link() {
+        let code = signaling_code();
+        assert_eq!(
+            code.matches("letexternal=extauth_mac.is_some();").count(),
+            1,
+            "D3: a session is external when FR-52 sealed its answer"
+        );
+        assert_eq!(
+            code.matches(".insert(session_id,peer,").count(),
+            1,
+            "the offer's one way into the table"
+        );
+        assert!(
+            code.contains("peers.insert(session_id,peer,link.filter(|_|!external))"),
+            "D3: an external session goes into the table with no link"
+        );
+    }
+
     // ─── FR-138 P2b: a supervised Mac's delegated sessions ─────────────────
     //
     // The daemon claims a delegated session and keeps a RECORD of it, with no

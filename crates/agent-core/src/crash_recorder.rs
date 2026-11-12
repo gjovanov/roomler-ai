@@ -24,9 +24,33 @@
 //!   `%PROGRAMDATA%\roomler\roomler-agent\crashes\` because
 //!   `directories::ProjectDirs::data_local_dir()` under LocalSystem
 //!   resolves to `C:\Windows\System32\config\systemprofile\…` which
-//!   the user-context worker can't read. PROGRAMDATA is world-
-//!   readable (ACL set on dir creation) so the same uploader scans
-//!   both dirs and merges results.
+//!   the user-context worker can't read. The same uploader scans both
+//!   dirs and merges results; the supervisor's dir is the machine's,
+//!   reached by handle (below).
+//!
+//! ## The machine folder, by handle (FR-145)
+//!
+//! A crashes dir below the machine's `ProgramData` (the supervisor's, and a
+//! SYSTEM worker's `service-logs\crashes`) is reached by handle, never by
+//! path (`machine_tree::HeldPath::machine`): each folder on the way opened
+//! below the one above it, never through a link, its final path checked.
+//!
+//! - `crashes` is made sealed (`Seal::Readable`, D10): SYSTEM and
+//!   Administrators write, Users read and list, so a worker running as the
+//!   signed-in person drains the supervisor's records. One an earlier build
+//!   made is sealed in place, and a record name in it that is not a plain
+//!   file of SYSTEM's or Administrators' is deleted by handle. A link, a
+//!   file or another account's folder at `crashes` is moved aside whole, as
+//!   `crashes.moved-<unix>`.
+//! - A record is a fresh temp file, flushed, then renamed into place by
+//!   handle. The scan lists and reads below the folder's handle, a record
+//!   that does not parse is renamed into `malformed` by handle, and the
+//!   uploader deletes through the folder it read from ([`Sidecar::remove`]).
+//! - A link on the way leaves the crash unrecorded, with one WARN per
+//!   process start (`crash records left alone: …`), counted with the
+//!   suppression tally. It is never written anywhere else.
+//! - `ROOMLERD_MACHINE_TREE_HELD=0`: written and read by path as before,
+//!   with one WARN naming the switch.
 //!
 //! On non-Windows the Supervisor context resolves to the writing
 //! process's own Worker dir. The one supervisor there is macOS's (FR-43,
@@ -211,7 +235,18 @@ fn record_inner(
     log_tail_override: Option<String>,
 ) -> std::io::Result<PathBuf> {
     let dir = crashes_dir_for(ctx)?;
-    fs::create_dir_all(&dir)?;
+    record_inner_at(&dir, reason, summary, log_tail_override)
+}
+
+/// [`record_inner`] into the crashes folder `dir`, which the caller names: a
+/// test names a folder of its own.
+fn record_inner_at(
+    dir: &Path,
+    reason: CrashReason,
+    summary: &str,
+    log_tail_override: Option<String>,
+) -> std::io::Result<PathBuf> {
+    let place = Place::to_write(dir)?;
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -226,11 +261,11 @@ fn record_inner(
     // uploader). See `should_suppress` for the rate-limit + cap
     // contract; `log_suppression_throttled` keeps the warn from
     // spamming.
-    if let Some(reason) = should_suppress(&dir, now_unix) {
+    if let Some(reason) = place.should_suppress(now_unix) {
         // rc.51: tally the suppressed write so the next sidecar that
         // DOES land carries the count — loop intensity stays visible.
         SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
-        log_suppression_throttled(&dir, reason, now_unix);
+        log_suppression_throttled(dir, reason, now_unix);
         return Err(std::io::Error::other(reason.as_str()));
     }
 
@@ -272,8 +307,18 @@ fn record_inner(
     // those alone.
     fit_to_envelope(&mut payload, MAX_PAYLOAD_BYTES);
 
-    let final_path = dir.join(format!("{now_unix}-{pid}.json"));
-    let tmp_path = dir.join(format!("{now_unix}-{pid}.json.tmp"));
+    let name = format!("{now_unix}-{pid}.json");
+    #[cfg(windows)]
+    if let Place::Held(held) = &place {
+        // FR-145 — a fresh temp file below the held folder, flushed (#2955),
+        // then renamed onto the name by handle.
+        let json =
+            serde_json::to_vec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
+        held.write_file(&name, &json, crate::machine_tree::Seal::Readable)?;
+        return Ok(held.path().join(name));
+    }
+    let final_path = dir.join(&name);
+    let tmp_path = dir.join(format!("{name}.tmp"));
     {
         let mut f = fs::File::create(&tmp_path)?;
         serde_json::to_writer(&mut f, &payload)
@@ -331,17 +376,192 @@ fn supervisor_crashes_dir() -> std::io::Result<PathBuf> {
         })
 }
 
+/// FR-145 — where a record is written: below the machine's folder, held by
+/// handle ([`crate::machine_tree::HeldPath`]), or a plain path (the person's
+/// own daemon in its profile; macOS and Linux).
+enum Place<'a> {
+    Plain(&'a Path),
+    #[cfg(windows)]
+    Held(crate::machine_tree::HeldPath),
+}
+
+/// The start of the error a record left alone answers with: logged once per
+/// process start ([`left_alone`]), never again by [`record_with_log_tail`].
+const LEFT_ALONE: &str = "crash_recorder: crash records left alone: ";
+
+impl<'a> Place<'a> {
+    /// `dir`, ready to take a record. On Windows a folder below the machine's
+    /// `ProgramData` (the supervisor's `crashes`, a SYSTEM worker's
+    /// `service-logs\crashes`) is reached by handle and sealed
+    /// (`Seal::Readable`, D10: a worker running as the person drains it); a
+    /// link on the way leaves the record unwritten. Any other folder is made
+    /// as before.
+    fn to_write(dir: &'a Path) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        if in_machine_tree(dir) && held_switch_on() {
+            use crate::machine_tree::{HeldPath, Seal};
+            let held = HeldPath::machine(dir, Seal::Readable).map_err(|refused| {
+                // A crash that goes unrecorded: the next record carries it.
+                SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
+                left_alone(refused)
+            })?;
+            if held.resealed() {
+                // An earlier build's open folder, sealed in place with nothing
+                // handed down: each record name is sealed by its own handle
+                // when it is a plain file of SYSTEM's or Administrators', and
+                // goes when it is not. Other names are left as they are.
+                let gone = held.keep_only_plain(
+                    |n| n.ends_with(".json") || n.ends_with(".tmp"),
+                    Seal::Readable,
+                );
+                if !gone.is_empty() {
+                    let gone: Vec<String> = gone.iter().map(ToString::to_string).collect();
+                    tracing::warn!(
+                        ?gone,
+                        "crash_recorder: crashes sealed; what was not a record removed, or left"
+                    );
+                }
+            }
+            return Ok(Self::Held(held));
+        }
+        fs::create_dir_all(dir)?;
+        Ok(Self::Plain(dir))
+    }
+
+    /// [`should_suppress`], over this folder's entries.
+    fn should_suppress(&self, now_unix: i64) -> Option<SuppressReason> {
+        match self {
+            Self::Plain(dir) => should_suppress(dir, now_unix),
+            #[cfg(windows)]
+            Self::Held(held) => {
+                let entries = held.entries().ok()?;
+                suppress_among(entries.iter().map(|e| e.name.as_str()), now_unix)
+            }
+        }
+    }
+}
+
+/// FR-145 — records left alone, written or read: one WARN per process start,
+/// and an error [`record_with_log_tail`] does not log again. The crash is
+/// never written anywhere else. Only the writer counts a refusal with the
+/// suppression tally, as one crash that went unrecorded; a refused read is
+/// not a crash.
+#[cfg(windows)]
+fn left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::Error {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("{LEFT_ALONE}{refused}");
+    }
+    std::io::Error::other(format!("{LEFT_ALONE}{refused}"))
+}
+
+/// `dir` is below the machine's `ProgramData`.
+#[cfg(windows)]
+fn in_machine_tree(dir: &Path) -> bool {
+    crate::appdirs::names_below(dir, &crate::appdirs::machine_program_data())
+        .is_some_and(|names| !names.is_empty())
+}
+
+/// FR-145's kill switch (`ROOMLERD_MACHINE_TREE_HELD=0`): off, the records are
+/// written and read by path as before, with one WARN naming the switch.
+#[cfg(windows)]
+fn held_switch_on() -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let on = crate::machine_tree::Switches::from_env().held;
+    if !on && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "crash_recorder: ROOMLERD_MACHINE_TREE_HELD=0: crash records in the machine folder \
+             are written and read by path, not by handle"
+        );
+    }
+    on
+}
+
+/// A pending sidecar: its name and the folder it was read from, so the
+/// uploader deletes what it read through the same folder (FR-145: below the
+/// machine's folder, by handle), never by a path looked up again.
+#[derive(Clone)]
+pub struct Sidecar {
+    path: PathBuf,
+    name: String,
+    len: u64,
+    modified_unix: i64,
+    folder: SidecarFolder,
+}
+
+#[derive(Clone)]
+enum SidecarFolder {
+    Plain,
+    #[cfg(windows)]
+    Held(std::sync::Arc<crate::machine_tree::HeldPath>),
+}
+
+impl std::fmt::Debug for Sidecar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Sidecar").field(&self.path).finish()
+    }
+}
+
+impl Sidecar {
+    /// The sidecar at `path`, read by path: a folder outside the machine's.
+    /// `None` when it is not there.
+    pub fn plain(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        let modified_unix = meta
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(Self {
+            path: path.to_path_buf(),
+            name: path.file_name()?.to_str()?.to_string(),
+            len: meta.len(),
+            modified_unix,
+            folder: SidecarFolder::Plain,
+        })
+    }
+
+    /// Where it is, for log lines.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Its identity for the uploader's ledger: `<len>:<mtime> <file name>`,
+    /// from when it was read.
+    pub fn signature(&self) -> String {
+        format!("{}:{} {}", self.len, self.modified_unix, self.name)
+    }
+
+    /// Delete it: below the machine's folder through the folder it was read
+    /// from, by handle (a link of its name refused); elsewhere by path.
+    /// `NotFound` when it is not there.
+    pub fn remove(&self) -> std::io::Result<()> {
+        match &self.folder {
+            SidecarFolder::Plain => fs::remove_file(&self.path),
+            #[cfg(windows)]
+            SidecarFolder::Held(held) => match held.remove_file(&self.name) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(std::io::ErrorKind::NotFound.into()),
+                Err(refused) => Err(refused.into()),
+            },
+        }
+    }
+}
+
 /// Drain pending crash payloads from BOTH the worker + supervisor
 /// dirs (deduped by file path on the rare case they're the same
-/// directory). Returned tuples carry the on-disk path so the
-/// uploader can delete each on successful POST.
+/// directory). Returned tuples carry the sidecar (its name and folder) so
+/// the uploader can delete each on successful POST.
 ///
 /// Oversized or unreadable files are logged + left on disk — better to
 /// leak a few orphan sidecars than to silently lose a crash record. A
 /// file that does not parse is moved ONCE into `malformed/` (#2955): kept
-/// for a later look, never re-warned on every start.
-pub fn pending_all() -> Vec<(PathBuf, AgentCrashPayload)> {
-    let mut out: Vec<(PathBuf, AgentCrashPayload)> = Vec::new();
+/// for a later look, never re-warned on every start. FR-145: below the
+/// machine's folder each is listed and read below the folder's handle,
+/// never through a link.
+pub fn pending_all() -> Vec<(Sidecar, AgentCrashPayload)> {
+    let mut out: Vec<(Sidecar, AgentCrashPayload)> = Vec::new();
     let mut seen_dirs: Vec<PathBuf> = Vec::with_capacity(2);
     for ctx in [WriterContext::Worker, WriterContext::Supervisor] {
         if let Ok(dir) = crashes_dir_for(ctx) {
@@ -358,7 +578,11 @@ pub fn pending_all() -> Vec<(PathBuf, AgentCrashPayload)> {
     out
 }
 
-fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
+fn scan_dir(dir: &Path) -> Vec<(Sidecar, AgentCrashPayload)> {
+    #[cfg(windows)]
+    if in_machine_tree(dir) && held_switch_on() {
+        return scan_held(dir);
+    }
     let mut out = Vec::new();
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -393,7 +617,11 @@ fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
             }
         };
         match serde_json::from_slice::<AgentCrashPayload>(&bytes) {
-            Ok(payload) => out.push((path, payload)),
+            Ok(payload) => {
+                if let Some(sidecar) = Sidecar::plain(&path) {
+                    out.push((sidecar, payload));
+                }
+            }
             // #2955 — moved aside ONCE: kept for a later look, but never
             // re-read and re-warned on every start. A torn write (a power
             // loss mid-record) is NUL-filled, and no future parser reads it.
@@ -416,6 +644,78 @@ fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
     out
 }
 
+/// FR-145 — [`scan_dir`] below the machine's folder: `dir` reached from the
+/// machine's `ProgramData` by handle (making nothing), its entries listed and
+/// each record read below its handle, never through a link; a record that
+/// does not parse goes into `malformed`, renamed by handle.
+#[cfg(windows)]
+fn scan_held(dir: &Path) -> Vec<(Sidecar, AgentCrashPayload)> {
+    use crate::machine_tree::{HeldPath, Seal};
+    let mut out = Vec::new();
+    let held = match HeldPath::below(&crate::appdirs::machine_program_data(), dir) {
+        Ok(Some(held)) => std::sync::Arc::new(held),
+        Ok(None) => return out,
+        Err(refused) => {
+            let _ = left_alone(refused);
+            return out;
+        }
+    };
+    let entries = match held.entries() {
+        Ok(entries) => entries,
+        Err(refused) => {
+            tracing::warn!(%refused, "crash_recorder: listing the crashes folder failed");
+            return out;
+        }
+    };
+    for entry in entries {
+        if entry.is_dir || !entry.name.ends_with(".json") {
+            continue;
+        }
+        let path = held.path().join(&entry.name);
+        if entry.len > MAX_PAYLOAD_BYTES as u64 {
+            tracing::warn!(file = %path.display(), bytes = entry.len, "crash_recorder: skipping oversized sidecar");
+            continue;
+        }
+        let bytes = match held.read_file(&entry.name, MAX_PAYLOAD_BYTES as u64) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(refused) => {
+                tracing::warn!(%refused, "crash_recorder: read failed");
+                continue;
+            }
+        };
+        match serde_json::from_slice::<AgentCrashPayload>(&bytes) {
+            Ok(payload) => out.push((
+                Sidecar {
+                    path,
+                    name: entry.name,
+                    len: entry.len,
+                    modified_unix: entry.modified_unix,
+                    folder: SidecarFolder::Held(held.clone()),
+                },
+                payload,
+            )),
+            Err(e) => match held
+                .sealed_dir(MALFORMED_DIR, Seal::Readable)
+                .and_then(|into| held.rename_file(&entry.name, &into, &entry.name, false))
+            {
+                Ok(()) => tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "crash_recorder: malformed sidecar moved aside into {MALFORMED_DIR}"
+                ),
+                Err(refused) => tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    move_error = %refused,
+                    "crash_recorder: skipping malformed sidecar"
+                ),
+            },
+        }
+    }
+    out
+}
+
 /// #2955 — where a sidecar that does not parse goes: a subdirectory, which
 /// [`scan_dir`] never reads (it does not recurse).
 const MALFORMED_DIR: &str = "malformed";
@@ -430,6 +730,86 @@ fn quarantine(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
     let target = target_dir.join(name);
     fs::rename(path, &target)?;
     Ok(target)
+}
+
+// ─── The uploader's verdicts ──────────────────────────────────────────────
+
+/// The uploader's ledger (#1748): one line for each record that got a final
+/// verdict but that this process may not delete, so it is never sent again.
+/// It lives in the uploading process's log folder.
+pub const VERDICTS_FILE: &str = "crash-verdicts.txt";
+
+/// Append `line` to [`VERDICTS_FILE`] in `dir`. FR-145: below the machine's
+/// folder (a SYSTEM worker's `service-logs`), `dir` is reached by handle and
+/// sealed (`Seal::Readable`), and the line goes through
+/// [`crate::machine_tree::HeldPath::append_file`]: a link, or a file with
+/// more than one name, at the ledger's name is deleted as itself, never
+/// written through, and the file made again. A refusal is logged once per
+/// process start, and the line is written nowhere else. Elsewhere by path,
+/// as before.
+pub fn append_verdict(dir: &Path, line: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if in_machine_tree(dir) && held_switch_on() {
+        use crate::machine_tree::{HeldPath, Seal};
+        let held = HeldPath::machine(dir, Seal::Readable).map_err(verdicts_left_alone)?;
+        if held.resealed() {
+            // Sealed in place with nothing handed down: the ledger, when it
+            // is there, is sealed by its own handle; nothing else is touched.
+            let gone = held.keep_only_plain(|n| n == VERDICTS_FILE, Seal::Readable);
+            if !gone.is_empty() {
+                let gone: Vec<String> = gone.iter().map(ToString::to_string).collect();
+                tracing::warn!(?gone, "crash_recorder: the verdicts' folder sealed");
+            }
+        }
+        let mut f = held
+            .append_file(VERDICTS_FILE, Seal::Readable)
+            .map_err(verdicts_left_alone)?;
+        return writeln!(f, "{line}");
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(VERDICTS_FILE))?;
+    writeln!(f, "{line}")
+}
+
+/// [`VERDICTS_FILE`] in `dir`: empty when it is not there or cannot be read
+/// (the cost is one more send, never a lost crash). FR-145: below the
+/// machine's folder, read below `dir`'s handle, never through a link and
+/// never a file with more than one name.
+pub fn read_verdicts(dir: &Path) -> String {
+    #[cfg(windows)]
+    if in_machine_tree(dir) && held_switch_on() {
+        let read =
+            crate::machine_tree::HeldPath::below(&crate::appdirs::machine_program_data(), dir)
+                .and_then(|held| match held {
+                    Some(held) => held.read_file(VERDICTS_FILE, MAX_VERDICTS_BYTES),
+                    None => Ok(None),
+                });
+        return match read {
+            Ok(bytes) => String::from_utf8_lossy(&bytes.unwrap_or_default()).into_owned(),
+            Err(refused) => {
+                let _ = verdicts_left_alone(refused);
+                String::new()
+            }
+        };
+    }
+    fs::read_to_string(dir.join(VERDICTS_FILE)).unwrap_or_default()
+}
+
+/// The most of [`VERDICTS_FILE`] that is read: some 25,000 verdicts.
+#[cfg(windows)]
+const MAX_VERDICTS_BYTES: u64 = 1024 * 1024;
+
+/// FR-145 — the ledger left alone below the machine's folder: one WARN per
+/// process start. Not a crash, so not counted with the suppression tally.
+#[cfg(windows)]
+fn verdicts_left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::Error {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("crash_recorder: crash verdicts left alone: {refused}");
+    }
+    refused.into()
 }
 
 // ─── Crash-loop suppression ────────────────────────────────────────────────
@@ -456,7 +836,9 @@ impl SuppressReason {
 }
 
 fn is_suppression_message(msg: &str) -> bool {
-    msg == SuppressReason::RecentSidecar.as_str() || msg == SuppressReason::HardCapReached.as_str()
+    msg == SuppressReason::RecentSidecar.as_str()
+        || msg == SuppressReason::HardCapReached.as_str()
+        || msg.starts_with(LEFT_ALONE)
 }
 
 /// Pure: should the next sidecar write to `dir` be suppressed?
@@ -474,21 +856,27 @@ fn is_suppression_message(msg: &str) -> bool {
 /// Pure over dir contents + clock so tests drive every branch
 /// without mocks.
 pub fn should_suppress(dir: &Path, now_unix: i64) -> Option<SuppressReason> {
-    let entries: Vec<i64> = match fs::read_dir(dir) {
-        Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                if p.extension().and_then(|s| s.to_str()) != Some("json") {
-                    return None;
-                }
-                let stem = p.file_stem()?.to_str()?;
-                let (ts_str, _) = stem.split_once('-')?;
-                ts_str.parse::<i64>().ok()
-            })
-            .collect(),
-        Err(_) => return None,
-    };
+    let names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    suppress_among(names.iter().map(String::as_str), now_unix)
+}
+
+/// [`should_suppress`] over a folder's entry names (FR-145: below the
+/// machine's folder, its listing by handle).
+fn suppress_among<'n>(
+    names: impl Iterator<Item = &'n str>,
+    now_unix: i64,
+) -> Option<SuppressReason> {
+    let entries: Vec<i64> = names
+        .filter_map(|name| {
+            let stem = name.strip_suffix(".json")?;
+            let (ts_str, _) = stem.split_once('-')?;
+            ts_str.parse::<i64>().ok()
+        })
+        .collect();
 
     if entries.len() >= HARD_CAP {
         return Some(SuppressReason::HardCapReached);
@@ -1402,5 +1790,382 @@ mod tests {
 
         assert!(scan_dir(&dir).is_empty());
         assert!(torn.exists(), "the sidecar was not lost");
+    }
+
+    /// FR-145 — the supervisor's crash records in the machine folder, each
+    /// case in a child process of this test binary: a case names its own
+    /// stand-in for the machine's `%ProgramData%` (#3702's `program_data_is`),
+    /// which is process-wide. Making a sealed folder and writing into it
+    /// takes SYSTEM's or an elevated administrator's token, so a case says so
+    /// and stops unelevated, and fails in CI's elevated lane.
+    #[cfg(windows)]
+    mod in_the_machine_folder {
+        use std::path::{Path, PathBuf};
+
+        use super::super::record_inner_at;
+        use crate::machine_tree::test_support::{
+            aces, elevated_or_skip, icacls, junction, owner, program_data, protected, sddl,
+        };
+        use roomler_ai_remote_control::models::CrashReason;
+
+        const ROOT: &str = "ROOMLER_NODE_TEST_CRASH_ROOT";
+        const CHECKED: &str = "crash-record case: checked";
+
+        /// The parent's half: a stand-in `%ProgramData%` with an open machine
+        /// folder below it (an attended host's), and a folder beside it that
+        /// nothing names; then the case `name` in a child, which must say it ran.
+        fn run(name: &str, case: &str) {
+            if !elevated_or_skip(case) {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let pd = program_data(root.path());
+            std::fs::create_dir_all(pd.join("roomler").join("roomler")).unwrap();
+            std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
+            let module = module_path!();
+            let test = format!(
+                "{}::{name}",
+                module.split_once("::").map_or(module, |(_, rest)| rest)
+            );
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+                .env(ROOT, root.path())
+                .output()
+                .unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{said}");
+            assert!(said.contains(CHECKED), "the child ran the case: {said}");
+        }
+
+        /// The child's half: the stand-in, before anything names the machine
+        /// tree. `None` in the parent.
+        fn child() -> Option<PathBuf> {
+            let root = PathBuf::from(std::env::var_os(ROOT)?);
+            crate::appdirs::test_fixture::program_data_is(root.join("ProgramData"));
+            Some(root)
+        }
+
+        /// The names in `dir` a record write leaves: `*.json`, `*.json.tmp`.
+        fn records_in(dir: &Path) -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|n| n.ends_with(".json") || n.ends_with(".json.tmp"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// A junction or a symbolic link, read without following it.
+        fn is_link(path: &Path) -> bool {
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+        }
+
+        /// How many names the file at `path` has, read through a handle of
+        /// the test's own, opened by name.
+        fn links(path: &Path) -> u32 {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let file = std::fs::File::open(path).unwrap();
+            let handle = file.as_raw_handle() as HANDLE;
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a live handle; `info` is the struct the call fills in.
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+            let error = std::io::Error::last_os_error();
+            assert!(ok != 0, "{}: {error}", path.display());
+            info.nNumberOfLinks
+        }
+
+        /// T11 — `crashes` is a junction: the record lands in a new, sealed
+        /// `crashes`, with no `.json` or `.json.tmp` where the junction led,
+        /// and the junction is kept beside it as `crashes.moved-<unix>`. A
+        /// junction above it: refused, nothing written anywhere.
+        #[test]
+        fn a_crash_record_lands_in_a_sealed_crashes_never_through_a_junction() {
+            let Some(root) = child() else {
+                return run(
+                    "a_crash_record_lands_in_a_sealed_crashes_never_through_a_junction",
+                    "T11: a crash record and a junction",
+                );
+            };
+            let elsewhere = root.join("elsewhere");
+            let machine = crate::appdirs::machine_global_dir();
+            let crashes = machine.join("crashes");
+            junction(&crashes, &elsewhere);
+            let written = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            );
+            assert!(
+                records_in(&elsewhere).is_empty(),
+                "nothing is written where the junction leads: {:?} ({written:?})",
+                records_in(&elsewhere)
+            );
+            assert!(!is_link(&crashes), "crashes is a real folder ({written:?})");
+            assert_eq!(
+                records_in(&crashes).len(),
+                1,
+                "the record is in the new crashes: {:?} ({written:?})",
+                records_in(&crashes)
+            );
+            let shape = sddl(&crashes);
+            let mut got = aces(&shape);
+            got.sort();
+            assert!(
+                protected(&shape)
+                    && got == ["A;OICI;0x1200a9;;;BU", "A;OICI;FA;;;BA", "A;OICI;FA;;;SY"],
+                "crashes is sealed, Users read: {shape}"
+            );
+            let moved: Vec<PathBuf> = std::fs::read_dir(&machine)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("crashes.moved-"))
+                })
+                .map(|e| e.path())
+                .collect();
+            assert!(
+                moved.len() == 1 && is_link(&moved[0]),
+                "the junction is kept beside it: {moved:?}"
+            );
+
+            // A junction above it: the machine folder's parent is one, to a
+            // tree that holds the same names.
+            let parent = machine.parent().unwrap().to_path_buf();
+            let above = root.join("above");
+            std::fs::create_dir_all(above.join("roomler").join("crashes")).unwrap();
+            std::fs::rename(&parent, root.join("roomler-parent-aside")).unwrap();
+            junction(&parent, &above);
+            let written = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            );
+            assert!(
+                records_in(&above.join("roomler").join("crashes")).is_empty(),
+                "nothing is written through a junction above crashes ({written:?})"
+            );
+            let refused = written.expect_err("a junction above crashes is refused");
+            assert!(refused.to_string().contains("link"), "{refused}");
+            println!("{CHECKED}");
+        }
+
+        /// FR-145 T21 — the reads and acts below a held `crashes`: a record that
+        /// does not parse is moved by handle into a sealed `malformed`, and a
+        /// junction where `malformed` goes is moved aside with nothing put
+        /// where it led; a record whose name became a symbolic link after it
+        /// was read is not deleted through the link. Control: a record read
+        /// is deleted through the folder it was read from.
+        #[test]
+        fn records_are_moved_and_deleted_by_handle_never_through_a_link() {
+            use super::super::{MALFORMED_DIR, scan_dir};
+            let Some(root) = child() else {
+                return run(
+                    "records_are_moved_and_deleted_by_handle_never_through_a_link",
+                    "crash records moved and deleted by handle",
+                );
+            };
+            let elsewhere = root.join("elsewhere");
+            let crashes = crate::appdirs::machine_global_dir().join("crashes");
+            let first = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            )
+            .expect("the recorder makes a sealed crashes and writes a record");
+            super::write_valid_sidecar(&crashes, 2, 2);
+            std::fs::write(crashes.join("1-1.json"), b"not json").unwrap();
+            junction(&crashes.join(MALFORMED_DIR), &elsewhere);
+
+            let pending = scan_dir(&crashes);
+            let malformed = crashes.join(MALFORMED_DIR);
+            assert!(
+                records_in(&elsewhere).is_empty(),
+                "nothing is moved where the junction led: {:?}",
+                records_in(&elsewhere)
+            );
+            assert!(
+                !is_link(&malformed) && malformed.join("1-1.json").is_file(),
+                "the record that does not parse is in a real malformed"
+            );
+            assert!(!crashes.join("1-1.json").exists());
+            let shape = sddl(&malformed);
+            assert!(protected(&shape), "malformed is sealed: {shape}");
+            let names: Vec<String> = pending
+                .iter()
+                .map(|(s, _)| s.path().file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            let first_name = first.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                names.len() == 2
+                    && names.contains(&first_name)
+                    && names.contains(&"2-2.json".into()),
+                "{names:?}"
+            );
+
+            // The second record's name becomes a symbolic link after the read.
+            let target = elsewhere.join("t.json");
+            std::fs::write(&target, b"keep").unwrap();
+            let second = crashes.join("2-2.json");
+            std::fs::remove_file(&second).unwrap();
+            std::os::windows::fs::symlink_file(&target, &second).unwrap();
+            let by_name = |n: &str| pending.iter().find(|(s, _)| s.path().ends_with(n)).unwrap();
+            let refused = by_name("2-2.json").0.remove();
+            assert!(refused.is_err(), "a link is not deleted: {refused:?}");
+            assert!(
+                is_link(&second) && target.is_file(),
+                "the link and its file stay"
+            );
+
+            // Control: the recorder's record is deleted through its folder.
+            by_name(&first_name).0.remove().expect("deleted by handle");
+            assert!(!first.exists());
+            println!("{CHECKED}");
+        }
+
+        /// FR-145 T20 — a read walk that is refused (a junction above `crashes`)
+        /// is not a suppressed crash: the tally the next record carries
+        /// stays as it was. Control: a refused write is one.
+        #[test]
+        fn a_refused_read_is_not_counted_as_a_suppressed_crash() {
+            use super::super::{SUPPRESSED_SINCE_LAST, scan_dir};
+            use std::sync::atomic::Ordering;
+            let Some(root) = child() else {
+                return run(
+                    "a_refused_read_is_not_counted_as_a_suppressed_crash",
+                    "a refused read and the crash tally",
+                );
+            };
+            let machine = crate::appdirs::machine_global_dir();
+            let crashes = machine.join("crashes");
+            let parent = machine.parent().unwrap().to_path_buf();
+            let above = root.join("above");
+            std::fs::create_dir_all(above.join("roomler").join("crashes")).unwrap();
+            std::fs::rename(&parent, root.join("roomler-parent-aside")).unwrap();
+            junction(&parent, &above);
+
+            let before = SUPPRESSED_SINCE_LAST.load(Ordering::Relaxed);
+            for _ in 0..3 {
+                assert!(scan_dir(&crashes).is_empty(), "nothing is read");
+            }
+            let after_reads = SUPPRESSED_SINCE_LAST.load(Ordering::Relaxed);
+            let written = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            );
+            let after_write = SUPPRESSED_SINCE_LAST.load(Ordering::Relaxed);
+            assert_eq!(
+                after_reads, before,
+                "three refused reads are not suppressed crashes"
+            );
+            assert!(written.is_err(), "the write is refused: {written:?}");
+            assert_eq!(after_write, before + 1, "the refused write is one");
+            println!("{CHECKED}");
+        }
+
+        /// FR-145 T19 — the uploader's ledger in a SYSTEM worker's `service-logs`:
+        /// (a) a first verdict makes `service-logs` sealed, Administrators its
+        /// owner, as it does for the service. Then the ledger's name is made a
+        /// hard link to a file outside that Administrators own, so a second
+        /// name is the one thing wrong with it. The folder is sealed already,
+        /// so the next walk seals and deletes nothing before the append: the
+        /// line reaches `append_file`'s own check and goes to a new file of one
+        /// name, the file outside unchanged and nothing moved aside. (b)
+        /// `service-logs` is a junction: nothing is written where it leads.
+        /// Control: the first verdict, and the verdict is there to read in
+        /// both.
+        #[test]
+        fn a_verdict_is_never_written_through_a_hard_link_or_a_junction() {
+            use super::super::{VERDICTS_FILE, append_verdict, read_verdicts};
+            let Some(root) = child() else {
+                return run(
+                    "a_verdict_is_never_written_through_a_hard_link_or_a_junction",
+                    "the uploader's ledger and a link",
+                );
+            };
+            let elsewhere = root.join("elsewhere");
+            let machine = crate::appdirs::machine_global_dir();
+            let logs = machine.join("service-logs");
+            let ledger = logs.join(VERDICTS_FILE);
+
+            // (a) The first verdict makes `service-logs`, sealed.
+            let first = append_verdict(&logs, "12:34 1-2.json");
+            assert!(first.is_ok(), "the first verdict: {first:?}");
+            let shape = sddl(&logs);
+            let mut got = aces(&shape);
+            got.sort();
+            assert!(
+                protected(&shape)
+                    && owner(&shape) == "BA"
+                    && got == ["A;OICI;0x1200a9;;;BU", "A;OICI;FA;;;BA", "A;OICI;FA;;;SY"],
+                "service-logs is made sealed, Users read, Administrators its owner: {shape}"
+            );
+            // Then the ledger's name is a hard link to a file outside, owned
+            // by Administrators as a file the service wrote would be.
+            let outside = elsewhere.join("outside.txt");
+            std::fs::write(&outside, b"outside\n").unwrap();
+            assert!(
+                icacls(&outside, &["/setowner", "*S-1-5-32-544"]) && owner(&sddl(&outside)) == "BA",
+                "the file outside is Administrators'"
+            );
+            std::fs::remove_file(&ledger).unwrap();
+            std::fs::hard_link(&outside, &ledger).unwrap();
+            assert_eq!(links(&ledger), 2, "the ledger's name is a second name");
+            let linked = append_verdict(&logs, "23:45 3-4.json");
+            let outside_now = std::fs::read(&outside).unwrap();
+            let names = (links(&ledger), links(&outside));
+            let moved: Vec<String> = std::fs::read_dir(&machine)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("service-logs.moved-"))
+                .collect();
+            let read_a = read_verdicts(&logs);
+
+            // (b) `service-logs` is a junction to a folder outside.
+            std::fs::rename(&logs, root.join("service-logs-aside")).unwrap();
+            junction(&logs, &elsewhere);
+            let through = append_verdict(&logs, "56:78 5-6.json");
+            let led_to = std::fs::read_to_string(elsewhere.join(VERDICTS_FILE)).ok();
+            let read_b = read_verdicts(&logs);
+
+            assert!(
+                outside_now == b"outside\n" && led_to.is_none(),
+                "no verdict is written through a link: (a) the file outside \
+                 now holds {:?} ({linked:?}); (b) where the junction leads: \
+                 {led_to:?} ({through:?})",
+                String::from_utf8_lossy(&outside_now)
+            );
+            assert!(linked.is_ok() && through.is_ok(), "{linked:?} {through:?}");
+            assert_eq!(
+                names,
+                (1, 1),
+                "(a) a new ledger of one name, and the file outside keeps only its own"
+            );
+            assert!(
+                moved.is_empty(),
+                "(a) the sealed service-logs is kept, not moved aside: {moved:?}"
+            );
+            assert_eq!(read_a, "23:45 3-4.json\n", "(a) the new ledger");
+            assert_eq!(read_b, "56:78 5-6.json\n", "(b) the new ledger");
+            assert!(!is_link(&logs), "service-logs is a real folder again");
+            println!("{CHECKED}");
+        }
     }
 }

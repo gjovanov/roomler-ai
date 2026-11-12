@@ -257,6 +257,8 @@ For an "ops team reaches the prod Postgres" policy:
 | Max concurrent flows | leave blank, or `64` for tight JDBC-pool bounds |
 | Max bytes / session | leave blank, or e.g. `10737418240` for 10 GiB cap |
 
+A `Role ID` subject matches whoever holds that role in this organization when they open a forward. Give someone the role and their next forward is allowed; take it back, or remove them from the organization, and their next forward is refused with `acl_denied`, on a tunnel that is already open too. A forward from `roomler` matches the roles of its owner, the person whose enrollment token enrolled it; a device that opens forwards itself (§6's `forward --daemon` and declared routes) acts for its owner, so it matches the roles its owner holds. Details: [tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635).
+
 Click **Create policy**. The row appears in the table and goes live immediately — there's no policy cache in front of MongoDB; every `TcpForwardRequest` reads the live set.
 
 For a tenant-wide catch-all (everyone → every agent → anywhere) **for testing only**:

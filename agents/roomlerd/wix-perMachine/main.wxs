@@ -391,8 +391,8 @@
           impersonated (SYSTEM) so it can: (a) delete a per-user task
           via `schtasks /Delete /TN RoomlerAgent /F` (SYSTEM has the
           rights), (b) reach into the active-session user's
-          %LOCALAPPDATA% / %APPDATA% via the WTSQueryUserToken-backed
-          `active_user_profile_root()` (system-context feature). On
+          %LOCALAPPDATA% / %APPDATA% in the profile Windows records for
+          that person's SID (FR-145; system-context feature). On
           headless installs with no logged-in user the helper logs a
           skip and returns 0. Return="ignore" so a cleanup glitch
           doesn't sink the install. Same-flavour invocations exit 0

@@ -1937,9 +1937,9 @@ jobs:
       # machine config is folded into only when it is private.
       # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
       # the whole workflow file fails to load), and no ` #` in a name.
-      - name: "The machine tree is repaired and checked, and the anchor key's check (#3073, #3609, #3737)"
+      - name: "The machine tree is repaired and checked, the anchor key's check, and the machine folder by handle (#3073, #3609, #3737, FR-145)"
         if: ${{ !cancelled() }}
-        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base --nocapture
+        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base crash_recorder::tests machine_tree::held::tests --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.

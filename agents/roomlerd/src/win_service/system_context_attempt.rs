@@ -538,7 +538,7 @@ mod tests {
         assert!(icacls(&tree.record(), &["/grant", "*S-1-5-32-546:(F)"]));
         let repair_off = Switches {
             repair: false,
-            check: true,
+            ..Switches::ON
         };
         let refused = read_last_private_in(&tree, repair_off);
         assert!(refused.is_err(), "not private: {refused:?}");

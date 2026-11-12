@@ -1273,12 +1273,12 @@ pub(crate) mod legacy {
 
     /// `dir` held open by its own handle, when no link is on the way to it
     /// and it is a folder with exactly the owner and DACL `anchor create`
-    /// gave it. `Ok(None)`: it is not there.
+    /// gave it. `Ok(None)`: it is not there. FR-145 (D6): reached from the
+    /// machine's `ProgramData` by handle, each folder on the way opened below
+    /// the one above it, never through a link.
     fn held_in_its_shape(dir: &Path) -> Result<Option<HeldFolder>, String> {
-        if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
-            return Err(format!("{} is a link", link.display()));
-        }
-        let Some(folder) = HeldFolder::open(dir)? else {
+        let base = roomler_node_core::appdirs::machine_program_data();
+        let Some(folder) = roomler_node_core::machine_tree::held_below(&base, dir)? else {
             return Ok(None);
         };
         if !super::legacy_folder_ok(&folder.security()?) {
@@ -1314,8 +1314,15 @@ pub(crate) mod legacy {
     /// it.
     #[cfg(test)]
     pub fn read_at(dir: &Path, name: &str) -> Result<Option<super::Anchor>, String> {
-        let Some(text) =
-            roomler_node_core::machine_tree::read_private(dir, name, "the anchor file", 64 * 1024)?
+        // Reached from the folder above it: a test names a folder outside
+        // the machine's tree too.
+        let base = dir.parent().ok_or("the anchor's folder has no parent")?;
+        let Some(folder) = PrivateFolder::open_under(base, dir)? else {
+            return Ok(None);
+        };
+        let Some(text) = folder
+            .read(name, "the anchor file", 64 * 1024)?
+            .map(|file| file.text)
         else {
             return Ok(None);
         };

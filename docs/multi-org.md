@@ -280,7 +280,7 @@ refusal would race it.
   ([`overlay.rs:1019-1029`](../agents/roomlerd/src/overlay.rs#L1019-L1029)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2647-2669`](../agents/roomler-cli/src/localclient.rs#L2647-L2669)):
+  ([`localclient.rs:2695-2717`](../agents/roomler-cli/src/localclient.rs#L2695-L2717)):
 
   ```
     overlay ip  —
@@ -902,7 +902,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2096-2098`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2105-2107`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
