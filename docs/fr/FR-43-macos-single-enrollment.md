@@ -56,7 +56,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
   daemon … that is the trap the macOS LaunchDaemon split walks into".
 - **Division**: signalling + consent + policy in the daemon; the rc session's WebRTC
   peer, capture, encode, input, clipboard and file transfer in the worker (media stays
-  local to the session that can produce it — no pixels cross the socket).
+  local to the session that can produce it — no pixels cross the socket). *Amended 2026-11-12 (#3757): file transfer runs in the worker only. A session no worker serves has its peer in the root daemon, which declines the `files` channel with a reason the viewer shows ([`desktop-companion.md` §9.6](../desktop-companion.md#96-a-macs-system-install-transfers-files-only-in-the-persons-session-3757)); until then it served that channel itself.*
 - **TCC**: the worker is the same bundle at the same path, so Screen Recording and
   Accessibility grants carry. This is only safe *now*: before FR-5's stable signing
   identity, any change to how the capture process launches risked re-prompting on every
