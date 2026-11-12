@@ -3642,10 +3642,11 @@ const DIR_LIST_TIMEOUT_SECS: u64 = 3;
 ///
 /// FR-21 P4. The viewer used to hardcode
 // RETIRED-NAME-ANCHOR-BEGIN
-// appdirs::app_segment() keeps resolving the pre-rename `roomler-agent`
-// segment while that tree exists, so a host installed before the rename
-// keeps finding its own staging dir and uploads. Every occurrence below is
-// that fallback or a test pinning it — the retired name is the INPUT.
+// appdirs::machine_global_dir() keeps resolving the pre-rename `roomler-agent`
+// segment while that tree exists and the new one does not, so a host
+// installed before the rename keeps finding its own staging dir and uploads.
+// Every occurrence below is that fallback or a test pinning it — the retired
+// name is the INPUT.
 /// `C:\ProgramData\roomler\roomler-agent\staging`, but `machine_global_dir()`
 /// resolves the `roomler` segment on a fresh install and only falls back to the
 /// pre-rename `roomler-agent` segment when that tree already exists — so the

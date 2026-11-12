@@ -3441,10 +3441,10 @@ pub fn default_config_path() -> Result<PathBuf> {
 }
 
 // RETIRED-NAME-ANCHOR(2): names the PRE-RENAME appdirs segment a host installed before
-// P4b still has; appdirs::app_segment resolves it, so it is an input.
+// P4b still has; appdirs::machine_global_dir resolves it, so it is an input.
 /// rc.52: machine-global config path —
 /// `%PROGRAMDATA%\roomler\roomler\config.toml` (a pre-rename host keeps
-/// its `\roomler\roomler-agent\` tree — see `appdirs::app_segment`).
+/// its `\roomler\roomler-agent\` tree — see `appdirs::machine_global_dir`).
 ///
 /// `default_config_path()` resolves to a per-USER profile
 /// (`%APPDATA%` via `ProjectDirs`). A SystemContext worker runs as

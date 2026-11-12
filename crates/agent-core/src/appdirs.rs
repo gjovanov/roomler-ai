@@ -90,8 +90,10 @@ fn use_old_segment() -> bool {
     })
 }
 
-/// The resolved per-user app segment ("roomler" for fresh/migrated hosts,
-/// "roomler-agent" for a pre-rename install whose tree still exists).
+/// The resolved per-user app segment: "roomler-agent" for a pre-rename install
+/// whose config folder is in the old tree and not in the new one, or, with no
+/// config folder in either tree, whose local data folder is only in the old
+/// tree; "roomler" otherwise (fresh and migrated hosts).
 fn app_segment() -> &'static str {
     if use_old_segment() { OLD_APP } else { NEW_APP }
 }
@@ -513,9 +515,11 @@ fn hklm_text(key: &str, value: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Same new-then-old resolution as [`project_dirs`], keyed independently on the
-/// machine-global tree (a perMachine/SystemContext host's enrolled config lives
-/// here and must not be orphaned). Consumers `.join(...)` their subdir
+/// The machine-global tree (a perMachine/SystemContext host's enrolled config
+/// lives here and must not be orphaned): the new folder if it exists, else the
+/// old one if it exists, else the new one. This choice keys on the folders
+/// themselves and is taken independently of [`project_dirs`]'s, which keys on
+/// the config folders. Consumers `.join(...)` their subdir
 /// (`config.toml`, `service-logs`, `crashes`, `staging`, ...).
 #[cfg(target_os = "windows")]
 pub fn machine_global_dir() -> PathBuf {
@@ -645,8 +649,9 @@ pub fn migration_notes() -> &'static [String] {
 /// machine-global root, each independent):
 ///   * legacy exists, new doesn't → atomic same-volume `fs::rename`
 ///   * both exist (split-brain from the self-heal era) → left in place
-///     (NEW-wins resolution already applies; config cleanup is the
-///     `ConfigCleanupStale` verb's job)
+///     (the resolution keeps the tree that holds the config folder, the new
+///     one when both do, and with no config folder the new data folder's;
+///     config cleanup is the `ConfigCleanupStale` verb's job)
 ///   * legacy absent → nothing to do
 ///
 /// Never deletes; a failed rename (locked file, ACL) is noted and the
@@ -1141,7 +1146,9 @@ fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> Result
                     }
                 }
                 // The NEW folder this move made goes too: the segment choice
-                // keys on it. `remove_dir` leaves it while anything is in it.
+                // keys on a new config folder, and on a new data folder where
+                // neither tree holds a config folder. `remove_dir` leaves it
+                // while anything is in it.
                 if made_new {
                     let _ = std::fs::remove_dir(new);
                 }
