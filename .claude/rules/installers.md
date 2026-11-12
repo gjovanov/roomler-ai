@@ -123,8 +123,9 @@ program started from any of those, on the person's desktop, and closing it stopp
 --headless` is an EDR rule. The launcher leaves with the daemon's exit code and holds it in a
 kill-on-close job, because `schtasks /End` kills the launcher alone (measured); what the daemon
 spawns stays out of that job, or `msiexec` dies with it on an update. It must not touch the data
-tree: `appdirs::use_old_segment` is new-if-present, so a log folder made from outside the daemon
-orphans a legacy host's config, which is why stderr capture lives in the daemon.
+tree: where neither tree holds a config folder, a new local data folder decides the tree
+(`appdirs::use_old_segment`), so a log folder made from outside the daemon moves a legacy host's
+logs, markers and stores to the empty new tree, which is why stderr capture lives in the daemon.
 ⚠️ **The per-Machine MSI carries the service's `Environment` across an upgrade, and that may never fail
 one** (#3375, `docs/installation.md`). The old product's removal deletes the service, so
 `CaptureServiceEnvironment` (`agents/roomler-msi-ca`) reads the block before `InstallInitialize`, and

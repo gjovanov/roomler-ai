@@ -84,7 +84,7 @@ tungstenite writes a client's whole upgrade request at TRACE, the `Authorization
 line included, and marking the value sensitive does not reach that line. The
 daemon's and the CLI's subscribers drop those lines whatever `RUST_LOG` asks
 (`upgrade_auth::may_log`, `crates/remote_control/src/upgrade_auth.rs:243`), with a
-global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:402`,
+global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:403`,
 `agents/roomler-cli/src/cli.rs:829`). Not a directive, on purpose: a fixed
 `tungstenite=debug` would raise those crates above the default `warn`, and any
 target directive loses to a span-scoped one such as `[org]=trace`, which
