@@ -80,6 +80,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::delegate::DelegateFrame;
 use crate::delegate::WorkerInbound;
 use crate::delegate::write_frame;
+use crate::delegate::{WorkerLane, WorkerOrder};
 use crate::macos_supervisor::{LIFELINE_BACKSTOP, LinkEnd};
 use roomler_ai_remote_control::signaling::ClientMsg;
 
@@ -190,9 +191,12 @@ pub async fn run(
     // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
+    // FR-138 P2b — and the third: the daemon's orders about the sessions it
+    // will claim, on their own lane.
     channels: Option<(
         tokio::sync::mpsc::Sender<WorkerInbound>,
         tokio::sync::mpsc::Receiver<ClientMsg>,
+        tokio::sync::mpsc::Sender<crate::delegate::WorkerOrder>,
     )>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     // #2987 — the agent's internal shutdown, which the stdin thread sends when
@@ -203,7 +207,7 @@ pub async fn run(
         tracing::debug!("delegation: not a supervised worker; not attaching");
         return;
     }
-    let Some((to_signaling, mut from_signaling)) = channels else {
+    let Some((to_signaling, mut from_signaling, orders)) = channels else {
         tracing::warn!("delegation: --supervised but no signalling channels; not attaching");
         return;
     };
@@ -228,16 +232,23 @@ pub async fn run(
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(
+        let mut lane = OrdersLane::new(&orders);
+        let attach = attach_once(
             &secret,
             &to_signaling,
             &mut from_signaling,
+            &mut lane,
             &mut logs,
             person,
             &mut shutdown,
         )
-        .await
-        {
+        .await;
+        // FR-138 P2b — a greeted attach's end, with its cause.
+        lane.ended(match &attach {
+            Ok(()) => "closed".to_string(),
+            Err(e) => e.to_string(),
+        });
+        match attach {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -270,11 +281,53 @@ pub async fn run(
     }
 }
 
+/// FR-138 P2b (B4, B9) — the orders lane as one attach holds it: the daemon's
+/// orders go on it, and a greeted attach's end is said on it once, however
+/// the attach ends, with its cause ([`WorkerOrder::Paused`]). The delegated
+/// sessions close there, since the daemon ended each as `error` (D6, review
+/// MEDIUM-1), and the line that says so names the cause. Never waits.
+struct OrdersLane<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<WorkerOrder>,
+    /// Greeted, and its end not said yet.
+    up: bool,
+}
+
+impl<'a> OrdersLane<'a> {
+    fn new(tx: &'a tokio::sync::mpsc::Sender<WorkerOrder>) -> Self {
+        Self { tx, up: false }
+    }
+
+    /// The daemon greeted the attach: the channel is up again.
+    fn attached(&mut self) {
+        let _ = self.tx.try_send(WorkerOrder::Attached);
+        self.up = true;
+    }
+
+    /// One of the daemon's orders. `false` when the lane is full or closed.
+    fn order(&self, order: WorkerOrder) -> bool {
+        self.tx.try_send(order).is_ok()
+    }
+
+    /// The attach ended: said once, and only for a greeted one.
+    fn ended(&mut self, cause: String) {
+        if std::mem::take(&mut self.up) {
+            let _ = self.tx.try_send(WorkerOrder::Paused { cause });
+        }
+    }
+}
+
+impl Drop for OrdersLane<'_> {
+    fn drop(&mut self) {
+        self.ended("the attach loop stopped".to_string());
+    }
+}
+
 /// One attach attempt: connect, authorise, then pump until the channel ends.
 async fn attach_once(
     secret: &str,
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
+    lane: &mut OrdersLane<'_>,
     logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     // FR-43 P3b — `Some(auto_grant_session)` when this worker hands the
     // person's floor to the daemon.
@@ -340,6 +393,10 @@ async fn attach_once(
             return Err(std::io::Error::other(format!("unparseable greeting: {e}")));
         }
     }
+    // FR-138 P2b (B9) — the channel is up: the delegated sessions' links point
+    // at it again, and its end, whatever ends it, is said on the lane with
+    // its cause ([`OrdersLane::ended`]).
+    lane.attached();
 
     // FR-43 P2c — tell the daemon what THIS process can do, as the first thing
     // after the handshake. The daemon is in session 0 and honestly reports
@@ -366,6 +423,7 @@ async fn attach_once(
             &mut wr,
             &DelegateFrame::WorkerCaps {
                 caps: Box::new(caps),
+                features: crate::delegate::worker_features(),
             },
         )
         .await?;
@@ -390,16 +448,19 @@ async fn attach_once(
                 match line? {
                     None => return Ok(()),
                     Some(line) if line.trim().is_empty() => {}
-                    Some(line) => match serde_json::from_str::<DelegateFrame>(&line) {
-                        Ok(DelegateFrame::Ping) => write_frame(&mut wr, &DelegateFrame::Pong).await?,
-                        Ok(DelegateFrame::Pong) => {}
-                        Ok(DelegateFrame::Attached { .. }) => {
+                    // FR-138 P2b (B4) — each frame takes its lane: params and
+                    // rc messages the inbound lane, the daemon's orders their
+                    // own, the rest this loop ([`crate::delegate::worker_lane`]).
+                    Some(line) => match serde_json::from_str::<DelegateFrame>(&line).map(crate::delegate::worker_lane) {
+                        Ok(WorkerLane::Here(DelegateFrame::Ping)) => write_frame(&mut wr, &DelegateFrame::Pong).await?,
+                        Ok(WorkerLane::Here(DelegateFrame::Pong)) => {}
+                        Ok(WorkerLane::Here(DelegateFrame::Attached { .. })) => {
                             tracing::debug!("delegation: a second `attached` frame; ignoring");
                         }
                         // Params must reach the signalling loop BEFORE the
                         // offer that consumes them; one ordered channel both
                         // ways is what guarantees it.
-                        Ok(DelegateFrame::SessionParams(p)) => {
+                        Ok(WorkerLane::Inbound(WorkerInbound::Params(p))) => {
                             let sid = p.session_id.clone();
                             if to_signaling.try_send(WorkerInbound::Params(p)).is_err() {
                                 tracing::warn!(
@@ -408,7 +469,24 @@ async fn attach_once(
                                 );
                             }
                         }
-                        Ok(DelegateFrame::ToWorker { msg }) => {
+                        // FR-138 P2b — the daemon's orders about the sessions
+                        // it holds a record of. Never waits: a full lane costs
+                        // the order, and the line names it. A session the
+                        // delegated table keeps still closes at its own
+                        // deadline, and the `Ended` of an attached session has
+                        // the server's `Terminate` crossing beside it.
+                        Ok(WorkerLane::Order(order)) => {
+                            let kind = order.kind();
+                            let sessions = order.session_ids();
+                            if !lane.order(order) {
+                                tracing::warn!(
+                                    order = kind,
+                                    ?sessions,
+                                    "delegation: orders queue full or closed; dropped an order (FR-138 P2b)"
+                                );
+                            }
+                        }
+                        Ok(WorkerLane::Inbound(WorkerInbound::Msg(msg))) => {
                             let kind = crate::delegate::server_msg_kind(&msg);
                             // A full queue means the signalling loop is wedged,
                             // not merely busy. Dropping and SAYING SO beats
@@ -429,7 +507,7 @@ async fn attach_once(
                         // sessions resolve the device's `rc_overlay` against
                         // this registry: empty, the `utunN` address read as
                         // foreign and stayed a host candidate.
-                        Ok(DelegateFrame::OverlayFootprint { v4_nets }) => {
+                        Ok(WorkerLane::Here(DelegateFrame::OverlayFootprint { v4_nets })) => {
                             tunnel_core::overlay_footprint::note_v4_blocks(&v4_nets);
                             tracing::info!(
                                 blocks = v4_nets.len(),
@@ -441,7 +519,7 @@ async fn attach_once(
                         // per-user socket), and keep busy runs HERE. Answered
                         // inline: a status is immediate and an `off` waits at
                         // most `LOCAL_OFF_WAIT`, well inside the ping cadence.
-                        Ok(DelegateFrame::KeepBusyAsk { id, off }) => {
+                        Ok(WorkerLane::Here(DelegateFrame::KeepBusyAsk { id, off })) => {
                             let info = crate::keep_busy::answer_local(off).await;
                             tracing::info!(
                                 id,
@@ -459,17 +537,26 @@ async fn attach_once(
                             )
                             .await?;
                         }
-                        Ok(
+                        Ok(WorkerLane::Here(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
                             | DelegateFrame::KeepBusyTold { .. }
                             | DelegateFrame::WorkerLogs { .. }
                             | DelegateFrame::PersonFloor(..),
-                        ) => {
+                        )) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
                             tracing::warn!("delegation: daemon sent a worker-only frame; ignoring");
                         }
+                        // `worker_lane` puts these on their lanes above.
+                        Ok(WorkerLane::Here(
+                            DelegateFrame::SessionParams(..)
+                            | DelegateFrame::ToWorker { .. }
+                            | DelegateFrame::Detached { .. }
+                            | DelegateFrame::Resumed { .. }
+                            | DelegateFrame::Close { .. }
+                            | DelegateFrame::Ended { .. },
+                        )) => tracing::debug!("delegation: a frame for another lane; skipping"),
                         // Skip, never close: a NEWER daemon may push a frame
                         // this worker has never heard of, and an additive
                         // protocol is only additive if old readers skip it.
@@ -517,6 +604,7 @@ async fn attach_once(
                     &mut wr,
                     &DelegateFrame::WorkerCaps {
                         caps: Box::new(caps),
+                        features: crate::delegate::worker_features(),
                     },
                 )
                 .await?;
@@ -753,5 +841,40 @@ mod tests {
         let floor = person_floor(false);
         assert!(!floor.auto_grant_session);
         assert_eq!(floor.session_policy, crate::session_policy::device_policy());
+    }
+
+    /// FR-138 P2b (review MEDIUM-1) — a greeted attach's end is said once on
+    /// the orders lane, with its cause, and so is one whose loop stopped; an
+    /// attach the daemon never greeted says nothing.
+    #[test]
+    fn a_greeted_attach_says_its_end_once_with_its_cause() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.ended("refused".to_string());
+        }
+        assert!(rx.try_recv().is_err(), "never greeted: nothing");
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.attached();
+            lane.ended("Broken pipe (os error 32)".to_string());
+        }
+        assert_eq!(rx.try_recv().ok(), Some(WorkerOrder::Attached));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(WorkerOrder::Paused {
+                cause: "Broken pipe (os error 32)".to_string()
+            })
+        );
+        assert!(rx.try_recv().is_err(), "said once");
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.attached();
+        }
+        assert_eq!(rx.try_recv().ok(), Some(WorkerOrder::Attached));
+        assert!(
+            matches!(rx.try_recv().ok(), Some(WorkerOrder::Paused { .. })),
+            "a greeted attach whose loop stopped says it too"
+        );
     }
 }

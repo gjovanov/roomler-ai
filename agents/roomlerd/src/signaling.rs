@@ -1143,6 +1143,27 @@ pub async fn run(
         usize::from(crate::encode::caps::rc_max_sessions()),
         crate::session_table::real_end_hook(indicator.clone()),
     );
+    // FR-138 P2b — a loop that holds the delegation host lends it to its
+    // table: the records of the delegated sessions it will claim are bound
+    // there, and the worker's orders go through it.
+    if let Some(host) = delegation.host() {
+        table.set_host(host.clone());
+    }
+    // FR-138 P2b (B1) — a GUI worker's delegated sessions that the daemon will
+    // claim, on a table of their own beside the worker's own, driven by the
+    // daemon's orders and spanning this loop's connections. Every return
+    // below closes it too (`close_side`).
+    let mut side: Option<DelegatedSide> = delegation.worker_side().map(|(orders, channel)| {
+        DelegatedSide::new(
+            SessionTable::for_worker(
+                usize::from(crate::encode::caps::rc_max_sessions()),
+                crate::session_table::real_end_hook(indicator.clone()),
+                &channel,
+            ),
+            orders,
+            channel,
+        )
+    });
     // Operator-consent broker: created in `run_cmd` and passed in (P2b), so the
     // LocalAPI shares the SAME instance and its live `pending` set. Lives across
     // reconnects, so a sentinel dropped while the WS was down is still honoured.
@@ -1202,6 +1223,7 @@ pub async fn run(
         if *shutdown.borrow() {
             info!("shutdown signalled; exiting signaling loop");
             table.close_all(ConnExit::Shutdown.label()).await;
+            close_side(&mut side, ConnExit::Shutdown.label()).await;
             return Ok(());
         }
         // FR-55 P4 — after a goodbye before a sleep, no dial until the wake:
@@ -1214,10 +1236,14 @@ pub async fn run(
         // that is over at its first look is not polled again.)
         if futures::poll!(&mut hold).is_pending() {
             table.close_all(ConnExit::Sleep.label()).await;
+            close_side(&mut side, ConnExit::Sleep.label()).await;
             tokio::select! {
-                _ = &mut hold => {},
+                _ = serving_delegated(&mut hold, &mut side) => {},
                 _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return Ok(()); }
+                    if *shutdown.borrow() {
+                        close_side(&mut side, ConnExit::Shutdown.label()).await;
+                        return Ok(());
+                    }
                 },
             }
         }
@@ -1251,6 +1277,7 @@ pub async fn run(
             &carrier_ready_tx,
             &mut carrier_ready_rx,
             &mut table,
+            &mut side,
         )
         .await;
         // FR-138 — an exit that skipped its arm (a `?`) strands no session.
@@ -1297,9 +1324,12 @@ pub async fn run(
                 {
                     recovered_last = true;
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        _ = serving_delegated(tokio::time::sleep(Duration::from_secs(1)), &mut side) => {},
                         _ = shutdown.changed() => {
-                            if *shutdown.borrow() { return Ok(()); }
+                            if *shutdown.borrow() {
+                                close_side(&mut side, ConnExit::Shutdown.label()).await;
+                                return Ok(());
+                            }
                         },
                     }
                     continue;
@@ -1336,9 +1366,12 @@ pub async fn run(
                     }
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(auth_backoff) => {},
+                    _ = serving_delegated(tokio::time::sleep(auth_backoff), &mut side) => {},
                     _ = shutdown.changed() => {
-                        if *shutdown.borrow() { return Ok(()); }
+                        if *shutdown.borrow() {
+                            close_side(&mut side, ConnExit::Shutdown.label()).await;
+                            return Ok(());
+                        }
                     },
                 }
             }
@@ -1361,6 +1394,7 @@ pub async fn run(
                         org = %ctx.label,
                         "{gone} — stopping this org's loop (other orgs unaffected)"
                     );
+                    close_side(&mut side, "loop_ended").await;
                     return Err(gone.into());
                 }
                 // rc.53: server told us to stop reconnecting. The
@@ -1423,9 +1457,12 @@ pub async fn run(
                     "overlay key rotated — reconnecting under the new identity"
                 );
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                    _ = serving_delegated(tokio::time::sleep(Duration::from_millis(500)), &mut side) => {},
                     _ = shutdown.changed() => {
-                        if *shutdown.borrow() { return Ok(()); }
+                        if *shutdown.borrow() {
+                            close_side(&mut side, ConnExit::Shutdown.label()).await;
+                            return Ok(());
+                        }
                     },
                 }
             }
@@ -1459,6 +1496,7 @@ pub async fn run(
                             "duplicate-instance duel on this org — stopping its loop \
                              (other orgs unaffected)"
                         );
+                        close_side(&mut side, "loop_ended").await;
                         return Err(anyhow::anyhow!(
                             "duplicate-instance duel: displaced {displacements}× in the \
                              window — another process is using this org's agent_id ({message})",
@@ -1490,9 +1528,12 @@ pub async fn run(
                 // stagger out of phase and one wins; sustained duels climb
                 // the ladder instead of escalating to an exit.
                 tokio::select! {
-                    _ = tokio::time::sleep(replaced_backoff_for(displacements)) => {},
+                    _ = serving_delegated(tokio::time::sleep(replaced_backoff_for(displacements)), &mut side) => {},
                     _ = shutdown.changed() => {
-                        if *shutdown.borrow() { return Ok(()); }
+                        if *shutdown.borrow() {
+                            close_side(&mut side, ConnExit::Shutdown.label()).await;
+                            return Ok(());
+                        }
                     },
                 }
                 // Reset the transient backoff — the next reconnect
@@ -1546,7 +1587,7 @@ pub async fn run(
                 let wait = tokio::time::sleep(flat_wait.unwrap_or(backoff));
                 tokio::pin!(wait);
                 loop {
-                    let kept = table.has_kept();
+                    let kept = table.has_kept() || side_holds_any(&side);
                     tokio::select! {
                         _ = &mut wait => {
                             if flat_wait.is_none() {
@@ -1569,13 +1610,16 @@ pub async fn run(
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
                                 table.close_all(ConnExit::Shutdown.label()).await;
+                                close_side(&mut side, ConnExit::Shutdown.label()).await;
                                 return Ok(());
                             }
                             break;
                         },
                         event = table.next_event() => table.serve(event).await,
+                        // FR-138 P2b (B4) — and the worker's delegated side.
+                        event = next_side(&mut side) => serve_side(&mut side, event).await,
                         Some((sid, end)) = device_end(&mut kill_rx, &mut idle_rx), if kept => {
-                            end_in_gap(&mut table, sid, end, &indicator);
+                            end_in_gap(&mut table, &mut side, sid, end, &indicator);
                         },
                     }
                 }
@@ -1772,6 +1816,10 @@ async fn connect_once(
     // FR-138 P2a — the org's sessions, borrowed from `run` so a kept one
     // outlives this connection. Every exit below detaches or closes them.
     peers: &mut SessionTable,
+    // FR-138 P2b (B1) — a GUI worker's delegated sessions the daemon will
+    // claim, borrowed from `run`: this connection's exits leave them alone,
+    // but for the machine's own (B8).
+    side: &mut Option<DelegatedSide>,
 ) -> Result<(), ConnectError> {
     // FR-103 — the token as of THIS connect, never the startup copy.
     let token = ctx.token.get();
@@ -1792,7 +1840,8 @@ async fn connect_once(
     // arms below read the last answer.
     // FR-138 — and the dial serves what the last connection kept meanwhile.
     let dial = crate::ws_connect::dial(&control, WS_CONNECT_TIMEOUT);
-    let (mut ws, response) = match serving_kept(dial, peers, kill_rx, idle_rx, &indicator).await {
+    let dialled = serving_kept(dial, peers, side, kill_rx, idle_rx, &indicator).await;
+    let (mut ws, response) = match dialled {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
@@ -1861,8 +1910,10 @@ async fn connect_once(
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     // FR-138 — the switch, read once for this connection: with it on, the
-    // hello says `rc-resume` and claims what the last connection kept. P2a-2
-    // (L11): a loop that holds the delegation host keeps nothing until P2b.
+    // hello says `rc-resume` and claims what the last connection kept. P2b
+    // (A11): a loop that holds the delegation host reads it as every loop
+    // does; its delegated sessions are kept as records, and one it cannot
+    // keep it does not claim.
     let survive = crate::session_table::connection_keeps(
         crate::session_table::survive_enabled(),
         delegation.host().is_some(),
@@ -1962,6 +2013,7 @@ async fn connect_once(
     serving_kept(
         send_msg(&mut ws, &hello),
         peers,
+        side,
         kill_rx,
         idle_rx,
         &indicator,
@@ -2077,6 +2129,7 @@ async fn connect_once(
             },
         ),
         peers,
+        side,
         kill_rx,
         idle_rx,
         &indicator,
@@ -2275,6 +2328,7 @@ async fn connect_once(
                 if *shutdown.borrow() {
                     info!("shutdown signalled; closing ws");
                     peers.end_connection(ConnExit::Shutdown).await;
+                    close_side(side, ConnExit::Shutdown.label()).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     // Terminal: a daemon shutdown must tear peers down, never
                     // stash them (the process is going away).
@@ -2304,6 +2358,7 @@ async fn connect_once(
                     Err(e) => warn!(%e, "the sleep goodbye did not go out (FR-55 P4)"),
                 }
                 peers.end_connection(ConnExit::Sleep).await;
+                close_side(side, ConnExit::Sleep.label()).await;
                 close_all_tunnel_peers(&mut tunnel_peers).await;
                 park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                 let _ = send_frame(&mut ws, Message::Close(None)).await;
@@ -2359,6 +2414,7 @@ async fn connect_once(
                         "suspend/resume detected at keepalive — cycling the control WS"
                     );
                     peers.end_connection(ConnExit::ResumeFromSuspend).await;
+                    close_side(side, ConnExit::ResumeFromSuspend.label()).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(AgentDidNotRun(
@@ -2395,6 +2451,9 @@ async fn connect_once(
                     // wall-clock check above: a pause that long ends the
                     // connection as the resume it is.
                     peers.end_connection(ConnExit::after_rx_deadline(paused)).await;
+                    if ConnExit::after_rx_deadline(paused) == ConnExit::ResumeFromSuspend {
+                        close_side(side, ConnExit::ResumeFromSuspend.label()).await;
+                    }
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     let why = format!("ws rx deadline: no inbound frames for {} s", silent.as_secs());
@@ -2805,6 +2864,13 @@ async fn connect_once(
                     watchdog::stage(ctx.pump, "heartbeat.stats");
                     send_one_session_stats(*session_id, peer, ctx.pump).await;
                 }
+                // FR-138 P2b (B7) — and the delegated table's, each on its link.
+                if let Some(s) = side.as_ref() {
+                    for (session_id, peer) in s.table.iter() {
+                        watchdog::stage(ctx.pump, "heartbeat.stats");
+                        send_one_session_stats(*session_id, peer, ctx.pump).await;
+                    }
+                }
                 watchdog::tick(ctx.pump);
             }
             Some(mut outbound_msg) = outbound_rx.recv() => {
@@ -2870,7 +2936,11 @@ async fn connect_once(
                 // the weak-handle property P9c kept. A full or closed sender
                 // is logged by the shared helper, never fatal, and the next
                 // tick retries.
-                if let Some(peer) = peers.get(&sid) {
+                // FR-138 P2b (B7) — or the delegated table's.
+                if let Some(peer) = peers
+                    .get(&sid)
+                    .or_else(|| side.as_ref().and_then(|s| s.table.get(&sid)))
+                {
                     send_one_session_stats(sid, peer, ctx.pump).await;
                 }
                 watchdog::tick(ctx.pump);
@@ -2901,8 +2971,39 @@ async fn connect_once(
                 crate::gpu_clock::on_sessions_changed(peers.len());
                 watchdog::tick(ctx.pump);
             }
+            // FR-138 P2b (B4) — the daemon's orders about the delegated
+            // sessions it will claim, and their table's events.
+            event = next_side(side) => {
+                let _stage = watchdog::enter(ctx.pump, "delegated_sessions");
+                serve_side(side, event).await;
+                watchdog::tick(ctx.pump);
+            }
             Some((sid, end)) = device_end(kill_rx, idle_rx) => {
                 let _stage = watchdog::enter(ctx.pump, "device_end");
+                // FR-138 P2b (B7) — a session of the worker's delegated table:
+                // its end, and the audit's last sample before it, go up the
+                // channel through that table, which never waits (F3). The road
+                // comes from the table, never from the peer's sender, which is
+                // its link's.
+                if let Some(s) = side.as_mut()
+                    && s.table.holds(&sid)
+                {
+                    let end = if s.table.no_video(&sid) { DeviceEnd::NoVideo } else { end };
+                    if let Some(peer) = s.table.get(&sid)
+                        && let Some(stats) = final_session_stats(sid, peer).await
+                    {
+                        s.table.queue_end(stats);
+                    }
+                    s.table.end_by_device(sid, end.terminate(sid), end.label(), host_disconnect_grace());
+                    pending_codecs.remove(&sid);
+                    pending_transports.remove(&sid);
+                    pending_audio.remove(&sid);
+                    pending_permissions.remove(&sid);
+                    pending_session_meta.remove(&sid);
+                    crate::extauth::end_session(remote_cfg, sid);
+                    watchdog::tick(ctx.pump);
+                    continue;
+                }
                 // #3245 — a pump with no encoder asks through the kill channel too,
                 // and its end says something else. FR-138 P2a-2 (L10): a kept
                 // session's pump too.
@@ -3156,6 +3257,11 @@ async fn connect_once(
                                 pending_chunk_framing.insert(sid, p.chunk_framing);
                                 pending_audio.insert(sid, p.audio);
                                 pending_permissions.insert(sid, p.permissions);
+                                // FR-138 P2b (B2) — the daemon will claim this
+                                // one: its messages go to the delegated table.
+                                if let Some(s) = side.as_mut() {
+                                    s.note_params(sid, p.keepable);
+                                }
                                 // FR-85 P1e-mac — the record context the daemon
                                 // resolved. This worker is the half that records:
                                 // it owns the peer, and its recorder runs as the
@@ -3210,12 +3316,21 @@ async fn connect_once(
                     kind = crate::delegate::server_msg_kind(&delegated_msg),
                     "delegation: serving a delegated rc message"
                 );
+                // FR-138 P2b (B2) — a session the daemon will claim is served
+                // on the delegated table; everything else as today.
+                let on_side = side.as_ref().is_some_and(|s| s.serves(&delegated_msg));
+                let served_id = crate::delegate::server_session_id(&delegated_msg);
+                let ended = matches!(delegated_msg, ServerMsg::Terminate { .. });
+                let table: &mut SessionTable = match side.as_mut() {
+                    Some(s) if on_side => &mut s.table,
+                    _ => &mut *peers,
+                };
                 handle_server_msg(
                     ctx,
                     &cfg.tenant_id,
                     &mut ws,
                     delegated_msg,
-                    peers,
+                    table,
                     &mut pending_codecs,
                     &mut pending_transports,
                     &mut pending_chroma,
@@ -3243,6 +3358,12 @@ async fn connect_once(
                     carrier_ready_tx,
                 )
                 .await?;
+                if on_side
+                    && let Some(s) = side.as_mut()
+                    && let Some(sid) = served_id
+                {
+                    s.served(sid, ended);
+                }
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
@@ -3793,14 +3914,44 @@ async fn handle_server_msg(
     // screen, is gone. Each org's session still asks that org's consent, and
     // the prompt names the org (`prompt_org`). The host hands a session over
     // only for the org whose params crossed, so no org reaches into another's.
+    //
+    // FR-138 P2b (A7) — the server ended a delegated session: the daemon's
+    // record of it goes, whether or not the end crosses, and its worker is
+    // ordered to end it, on the lane it serves while its own socket is down.
+    if let ServerMsg::Terminate {
+        session_id,
+        reason,
+        limit,
+    } = &msg
+    {
+        peers.drop_record(session_id, reason, limit.as_deref());
+    }
+    // FR-138 P2b (A3, review LOW-1) — the attach generation is read BEFORE an
+    // offer crosses: a channel that ends between the send and the record
+    // leaves the record under the generation of the worker that got the offer,
+    // which is gone, and so never claimed or counted. None off the host.
+    let offer_generation = peers.live_generation();
+    // FR-138 P2b (A1) — routing first, then delegation: with the switch on, a
+    // session this loop's own table holds (attached or kept) is served here,
+    // and its `Terminate` or `Ice` never crosses to a worker that attached
+    // since. Off, the gate is today's.
     if let Some(delegate) = delegate
         && crate::delegate::delegable_inbound(&msg)
+        && !crate::delegate::served_by_daemon(
+            peers.keeps_sessions(),
+            crate::delegate::server_session_id(&msg).is_some_and(|s| peers.holds(&s)),
+        )
         && delegate.send_to_worker(crate::delegate::org_key(ctx.is_primary, &ctx.label), &msg)
     {
         tracing::debug!(
             kind = crate::delegate::server_msg_kind(&msg),
             "delegated an rc message to the GUI worker"
         );
+        // FR-138 P2b (A3) — a keepable session's offer crossed: the daemon
+        // keeps a record of it, to claim it through this socket's loss.
+        if let ServerMsg::SdpOffer { session_id, .. } = &msg {
+            peers.cross_offer(*session_id, offer_generation);
+        }
         return Ok(());
     }
 
@@ -4213,6 +4364,15 @@ async fn handle_server_msg(
                             // which a push to its row put in force here but
                             // not in the worker that builds the peer.
                             media_legacy: remote_cfg.media_legacy_for_delegate(),
+                            // FR-138 P2b (A2) — this session will be claimed through
+                            // this loop's control-socket loss: the switch, a
+                            // worker that said `keep-delegated`, and never an
+                            // external session.
+                            keepable: crate::delegate::session_keepable(
+                                peers.keeps_sessions(),
+                                delegate.worker_keeps(),
+                                external_consent.is_some(),
+                            ),
                         },
                     )),
                 );
@@ -4675,10 +4835,12 @@ async fn handle_server_msg(
             // FR-138 — a session this connection may keep through its loss
             // holds one sender for everything (its link), which the table
             // points at each new connection. A delegated session keeps the
-            // road it was handed (P2b's), and with the switch off every
-            // session takes this connection's sender, as before.
-            let link = (delegated.is_none() && peers.keeps_sessions())
-                .then(|| peers.link(session_id, outbound_tx));
+            // road it was handed, and with the switch off every session takes
+            // this connection's sender, as before. FR-138 P2b (B3) — one the
+            // daemon will claim is built on a GUI worker's delegated table,
+            // and its link points at the delegation channel.
+            let link = (peers.keeps_sessions() && (delegated.is_none() || peers.is_worker()))
+                .then(|| peers.link(session_id, delegated.unwrap_or(outbound_tx)));
             let session_tx = link.as_ref().map_or_else(
                 || delegated.unwrap_or(outbound_tx).clone(),
                 crate::session_table::SessionLink::sender,
@@ -6821,7 +6983,7 @@ async fn send_one_session_stats(
 /// moved nothing worth auditing, or when its telemetry did not answer within
 /// [`SESSION_STATS_BUDGET`]: a sample of zeros could overwrite the live
 /// totals of a session the server has not ended yet.
-async fn final_session_stats(
+pub(crate) async fn final_session_stats(
     session_id: bson::oid::ObjectId,
     peer: &AgentPeer,
 ) -> Option<ClientMsg> {
@@ -7102,34 +7264,200 @@ pub(crate) fn prompt_org(
 async fn serving_kept<F: std::future::Future>(
     fut: F,
     table: &mut SessionTable,
+    // FR-138 P2b (B4) — and a GUI worker's delegated side: on a two-row Mac a
+    // roll drops the worker's own socket too, and the daemon's orders and the
+    // deadlines are served while it redials.
+    side: &mut Option<DelegatedSide>,
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
     idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
     indicator: &ViewerIndicator,
 ) -> F::Output {
     tokio::pin!(fut);
     loop {
-        let kept = table.has_kept();
+        let kept = table.has_kept() || side_holds_any(side);
         tokio::select! {
             out = &mut fut => return out,
             event = table.next_event() => table.serve(event).await,
+            event = next_side(side) => serve_side(side, event).await,
             Some((sid, end)) = device_end(kill_rx, idle_rx), if kept => {
-                end_in_gap(table, sid, end, indicator);
+                end_in_gap(table, side, sid, end, indicator);
             }
         }
     }
+}
+
+/// FR-138 P2b (B1) — a GUI worker's delegated sessions that the daemon said it
+/// will claim through the loss of its control socket (`SessionParams.keepable`):
+/// a second table beside the worker's own, driven by the daemon's orders
+/// ([`crate::delegate::WorkerOrder`]) instead of by the worker's own
+/// connection, and living across that connection's reconnects. What its
+/// sessions say goes up the delegation channel. Every return of [`run`]
+/// closes it.
+pub(crate) struct DelegatedSide {
+    table: SessionTable,
+    /// `None` where no attach loop feeds the lane, or once it closed.
+    orders: Option<mpsc::Receiver<crate::delegate::WorkerOrder>>,
+    /// The delegation channel's sender.
+    channel: mpsc::Sender<ClientMsg>,
+    /// B2 — sessions whose params said `keepable`, until their offer puts them
+    /// on the table or their end comes. Bounded, oldest out.
+    keepable: std::collections::VecDeque<bson::oid::ObjectId>,
+}
+
+/// More than the device's capacity can ever ask for at once.
+const SIDE_KEEPABLE_CAP: usize = 64;
+
+impl DelegatedSide {
+    fn new(
+        table: SessionTable,
+        orders: Option<mpsc::Receiver<crate::delegate::WorkerOrder>>,
+        channel: mpsc::Sender<ClientMsg>,
+    ) -> Self {
+        Self {
+            table,
+            orders,
+            channel,
+            keepable: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// B2 — a session's params arrived: one the daemon will claim is noted,
+    /// and its messages go to this table.
+    fn note_params(&mut self, session_id: bson::oid::ObjectId, keepable: bool) {
+        self.keepable.retain(|s| *s != session_id);
+        if keepable {
+            self.keepable.push_back(session_id);
+            while self.keepable.len() > SIDE_KEEPABLE_CAP {
+                self.keepable.pop_front();
+            }
+        }
+    }
+
+    /// B2 — whether `msg` is about a session this side serves: noted from its
+    /// params, or held.
+    fn serves(&self, msg: &ServerMsg) -> bool {
+        crate::delegate::server_session_id(msg)
+            .is_some_and(|s| self.keepable.contains(&s) || self.table.holds(&s))
+    }
+
+    /// B2 — a message about `session_id` was served here: once the table holds
+    /// it, or it ended, it needs no note.
+    fn served(&mut self, session_id: bson::oid::ObjectId, ended: bool) {
+        if ended || self.table.holds(&session_id) {
+            self.keepable.retain(|s| *s != session_id);
+        }
+    }
+
+    /// One of the daemon's orders, served by the delegated table.
+    async fn obey(&mut self, order: crate::delegate::WorkerOrder) {
+        self.table
+            .obey(order, &self.channel, host_disconnect_grace())
+            .await;
+    }
+}
+
+/// FR-138 P2b — what the delegated side must act on next.
+enum SideEvent {
+    /// An order; `None` once the lane closed.
+    Order(Option<crate::delegate::WorkerOrder>),
+    Table(crate::session_table::TableEvent),
+}
+
+/// FR-138 P2b (B4) — the delegated side's next order or table event. Never,
+/// for every process that is not a GUI worker. Cancel-safe.
+async fn next_side(side: &mut Option<DelegatedSide>) -> SideEvent {
+    let Some(side) = side.as_mut() else {
+        return std::future::pending().await;
+    };
+    let orders = side.orders.as_mut();
+    tokio::select! {
+        order = next_order(orders) => SideEvent::Order(order),
+        event = side.table.next_event() => SideEvent::Table(event),
+    }
+}
+
+async fn next_order(
+    rx: Option<&mut mpsc::Receiver<crate::delegate::WorkerOrder>>,
+) -> Option<crate::delegate::WorkerOrder> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// FR-138 P2b — act on what [`next_side`] returned.
+async fn serve_side(side: &mut Option<DelegatedSide>, event: SideEvent) {
+    let Some(s) = side.as_mut() else {
+        return;
+    };
+    match event {
+        SideEvent::Table(event) => s.table.serve(event).await,
+        // A closed lane is never polled again: it would ready at once.
+        SideEvent::Order(None) => s.orders = None,
+        SideEvent::Order(Some(order)) => s.obey(order).await,
+    }
+}
+
+/// FR-138 P2b (B4) — `fut`, while the delegated side is served: what `run`
+/// does wherever it waits.
+async fn serving_delegated<F: std::future::Future>(
+    fut: F,
+    side: &mut Option<DelegatedSide>,
+) -> F::Output {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            event = next_side(side) => serve_side(side, event).await,
+        }
+    }
+}
+
+/// FR-138 P2b (B8) — the delegated sessions close: an exit about the machine
+/// itself (a stop, a sleep, a resume from suspend), or the loop's end. The
+/// worker's own row's goodbye, key rotation or refused token are about its
+/// own enrollment, and leave them to the daemon.
+async fn close_side(side: &mut Option<DelegatedSide>, why: &'static str) {
+    if let Some(s) = side.as_mut() {
+        s.table.close_all(why).await;
+    }
+}
+
+/// FR-138 P2b — the delegated side holds a session, attached or kept: an end
+/// at the device is served for it while this loop has no connection.
+fn side_holds_any(side: &Option<DelegatedSide>) -> bool {
+    side.as_ref().is_some_and(|s| s.table.len() > 0)
 }
 
 /// FR-138 — the person at the device ended a session while no connection is
 /// up. A kept one stops serving at once, says `rc:ended` on its control
 /// channel, closes after the grace, and its `rc:terminate` waits for the next
 /// connection. One the table does not hold is said on the next connection, as
-/// it would have been read off this channel there.
+/// it would have been read off this channel there. FR-138 P2b (B7) — one of a
+/// GUI worker's delegated table ends through that table, up the channel.
 fn end_in_gap(
     table: &mut SessionTable,
+    side: &mut Option<DelegatedSide>,
     sid: bson::oid::ObjectId,
     end: DeviceEnd,
     indicator: &ViewerIndicator,
 ) {
+    if let Some(s) = side.as_mut()
+        && s.table.holds(&sid)
+    {
+        let end = if s.table.no_video(&sid) {
+            DeviceEnd::NoVideo
+        } else {
+            end
+        };
+        s.table.end_by_device(
+            sid,
+            end.terminate(sid),
+            end.label(),
+            host_disconnect_grace(),
+        );
+        return;
+    }
     // #3245 — a kept session's pump with no encoder asks through the kill
     // channel too, and its end is `no_video`, not the person's (P2a-2, L10).
     let end = if table.no_video(&sid) {

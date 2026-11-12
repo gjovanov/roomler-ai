@@ -124,7 +124,14 @@ pub enum DelegateFrame {
     /// `no-gui-session`; the worker is in the GUI session and holds the real
     /// grants. While a worker is attached, the DEVICE is a capture target, and
     /// the row has to say so or the dashboard tells the operator it is not one.
-    WorkerCaps { caps: Box<AgentCaps> },
+    WorkerCaps {
+        caps: Box<AgentCaps>,
+        /// FR-138 P2b — what this worker does with a delegated session beyond
+        /// serving it, as words matched by equality ([`KEEP_DELEGATED`]). An
+        /// older worker sends none, and an older daemon ignores the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+    },
     /// Daemon → worker: everything the daemon resolved while answering
     /// `rc:session.request`, which the worker's `rc:sdp.offer` handler needs.
     SessionParams(Box<SessionParams>),
@@ -175,6 +182,217 @@ pub enum DelegateFrame {
     /// org's session ([`DelegateHost::person_floor`]); any other daemon, and an
     /// older one, skips it.
     PersonFloor(PersonFloor),
+    /// FR-138 P2b — daemon → worker: this loop's control socket was lost on a
+    /// transient exit, and the daemon will claim these sessions on its next
+    /// connection. The worker keeps their peers for `keep_ms` at most, from the
+    /// frame's receipt. Sent only to a worker that said [`KEEP_DELEGATED`].
+    Detached {
+        /// Hex, like every other id this channel carries.
+        sessions: Vec<String>,
+        /// The exit's label ([`crate::session_table::ConnExit::label`]).
+        exit: String,
+        /// The host's addresses moved: a kept peer closes once it leaves
+        /// `Connected`, since the remote-control path has no ICE restart.
+        netchange: bool,
+        keep_ms: u64,
+    },
+    /// FR-138 P2b — daemon → worker: the server accepted the claim, and the
+    /// session goes on.
+    Resumed { session_id: String },
+    /// FR-138 P2b — daemon → worker: close this session (the daemon's deadline,
+    /// a terminal exit, a claim it can no longer make). The worker's own
+    /// deadline closes a kept session anyway, so a lost `Close` leaks nothing.
+    Close { session_id: String, reason: String },
+    /// FR-138 P2b — daemon → worker: the server ended a session the daemon
+    /// keeps a record of (a kick, the maximum length, a refused claim, the
+    /// viewer's hang-up), with the `reason` and `limit` of its `rc:terminate`.
+    /// An order, so the worker serves it wherever it serves orders, its own
+    /// connection down included; the `Terminate` that crosses beside it waits
+    /// for that connection. Whichever of the two the worker reads first ends
+    /// the session, and the other finds nothing. Sent only to the worker whose
+    /// records these are, which said [`KEEP_DELEGATED`].
+    Ended {
+        session_id: String,
+        reason: roomler_ai_remote_control::models::EndReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
+    },
+}
+
+/// FR-138 P2b — the word a worker says in [`DelegateFrame::WorkerCaps`] when it
+/// keeps a delegated session's peer through the daemon's control-socket loss.
+/// Matched by equality, as `RpcCap` is.
+pub const KEEP_DELEGATED: &str = "keep-delegated";
+
+/// FR-138 P2b — the words this worker says in its caps frame: it keeps a
+/// delegated session's peer through the daemon's control-socket loss, on the
+/// daemon's orders ([`KEEP_DELEGATED`]).
+pub fn worker_features() -> Vec<String> {
+    vec![KEEP_DELEGATED.to_string()]
+}
+
+/// FR-138 P2b — the feature words the daemon knows. A word a worker gains is
+/// added here too, or the daemon never hears it.
+const WORKER_FEATURE_WORDS: [&str; 1] = [KEEP_DELEGATED];
+
+/// FR-138 P2b — what the daemon keeps of its worker's feature words, as
+/// [`worker_words`] keeps its capability words (#3706): the words this build
+/// knows ([`WORKER_FEATURE_WORDS`]), each once, in the worker's order,
+/// matched by equality. Any other word is dropped, a near miss of a known
+/// word too.
+fn worker_feature_words(features: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for word in features {
+        if WORKER_FEATURE_WORDS.contains(&word.as_str()) && !kept.contains(word) {
+            kept.push(word.clone());
+        }
+    }
+    kept
+}
+
+/// `skip_serializing_if` for a flag whose `false` an older reader already
+/// assumes.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// FR-138 P2b — the daemon's orders about the sessions it will claim, on the
+/// worker's own lane: served wherever the worker's signalling loop waits, its
+/// own connection's select and its backoff, so a roll's orders and the
+/// deadlines are served while the worker's own socket is down too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerOrder {
+    /// [`DelegateFrame::Detached`].
+    Detached {
+        sessions: Vec<String>,
+        exit: String,
+        netchange: bool,
+        keep_ms: u64,
+    },
+    /// [`DelegateFrame::Resumed`].
+    Resumed { session_id: String },
+    /// [`DelegateFrame::Close`].
+    Close { session_id: String, reason: String },
+    /// [`DelegateFrame::Ended`].
+    Ended {
+        session_id: String,
+        reason: roomler_ai_remote_control::models::EndReason,
+        limit: Option<String>,
+    },
+    /// The channel to the daemon ended, and both processes may live on (D5):
+    /// the delegated sessions' links stop waiting until the next attach.
+    /// `cause` says why the channel ended.
+    Paused { cause: String },
+    /// The channel is back: the delegated sessions' links point at it again.
+    Attached,
+}
+
+impl WorkerOrder {
+    /// FR-138 P2b (second review LOW-B) — the order's kind, for a line that
+    /// says which order was lost.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Detached { .. } => "detached",
+            Self::Resumed { .. } => "resumed",
+            Self::Close { .. } => "close",
+            Self::Ended { .. } => "ended",
+            Self::Paused { .. } => "paused",
+            Self::Attached => "attached",
+        }
+    }
+
+    /// FR-138 P2b (second review LOW-B) — the sessions the order names, for
+    /// the same line. None for the channel's own `Paused` and `Attached`.
+    pub fn session_ids(&self) -> Vec<String> {
+        match self {
+            Self::Detached { sessions, .. } => sessions.clone(),
+            Self::Resumed { session_id }
+            | Self::Close { session_id, .. }
+            | Self::Ended { session_id, .. } => vec![session_id.clone()],
+            Self::Paused { .. } | Self::Attached => Vec::new(),
+        }
+    }
+}
+
+/// FR-138 P2b — where a frame from the daemon goes in the worker.
+#[derive(Debug)]
+pub enum WorkerLane {
+    /// The signalling loop's inbound lane, in order: params before the offer.
+    Inbound(WorkerInbound),
+    /// The orders lane ([`WorkerOrder`]).
+    Order(WorkerOrder),
+    /// Served by the attach loop itself (liveness, keep busy, the footprint).
+    Here(DelegateFrame),
+}
+
+/// FR-138 P2b — the worker's route for a frame from the daemon: params and rc
+/// messages to the inbound lane, the daemon's orders about the sessions it
+/// will claim to the orders lane, the rest to the attach loop. A pure function,
+/// because the attach loop is `cfg(unix)` and this must be testable everywhere.
+pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
+    match frame {
+        DelegateFrame::SessionParams(p) => WorkerLane::Inbound(WorkerInbound::Params(p)),
+        DelegateFrame::ToWorker { msg } => WorkerLane::Inbound(WorkerInbound::Msg(msg)),
+        DelegateFrame::Detached {
+            sessions,
+            exit,
+            netchange,
+            keep_ms,
+        } => WorkerLane::Order(WorkerOrder::Detached {
+            sessions,
+            exit,
+            netchange,
+            keep_ms,
+        }),
+        DelegateFrame::Resumed { session_id } => {
+            WorkerLane::Order(WorkerOrder::Resumed { session_id })
+        }
+        DelegateFrame::Close { session_id, reason } => {
+            WorkerLane::Order(WorkerOrder::Close { session_id, reason })
+        }
+        // The server's end of a session the daemon keeps a record of: on this
+        // lane it is served while the worker's own socket redials, where the
+        // `Terminate` beside it on the inbound lane waits for that socket.
+        DelegateFrame::Ended {
+            session_id,
+            reason,
+            limit,
+        } => WorkerLane::Order(WorkerOrder::Ended {
+            session_id,
+            reason,
+            limit,
+        }),
+        other => WorkerLane::Here(other),
+    }
+}
+
+/// FR-138 P2b (A1) — whether a delegable message about a session is served by
+/// the daemon instead of crossing: a session the daemon's own table holds,
+/// attached or kept, is the daemon's, and a worker that attached since must not
+/// be handed its `Terminate` or `Ice`. Only with the switch on: off, the gate
+/// is byte for byte what it was.
+pub(crate) fn served_by_daemon(switch_on: bool, daemon_holds: bool) -> bool {
+    switch_on && daemon_holds
+}
+
+/// FR-138 P2b (A2) — whether a delegated session's params say `keepable`: the
+/// device's switch on this connection, an attached worker that said
+/// [`KEEP_DELEGATED`], and not an external session, which is never kept
+/// (FR-138 D3). Anything else is served as today.
+pub(crate) fn session_keepable(switch_on: bool, worker_keeps: bool, external: bool) -> bool {
+    switch_on && worker_keeps && !external
+}
+
+/// FR-138 P2b (A1) — the session a delegable server message is about.
+pub(crate) fn server_session_id(msg: &ServerMsg) -> Option<bson::oid::ObjectId> {
+    match msg {
+        ServerMsg::SessionCreated { session_id, .. }
+        | ServerMsg::SdpOffer { session_id, .. }
+        | ServerMsg::SdpAnswer { session_id, .. }
+        | ServerMsg::Ice { session_id, .. }
+        | ServerMsg::Terminate { session_id, .. } => Some(*session_id),
+        _ => None,
+    }
 }
 
 /// FR-43 P3b — what the person at a one-row Mac asked of every session: the
@@ -477,6 +695,13 @@ pub struct SessionParams {
     /// entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_legacy: Option<String>,
+    /// FR-138 P2b — the daemon will claim this session through the loss of its
+    /// control socket, so the worker builds it on its delegated table, whose
+    /// peers it keeps on the daemon's orders. Said only to a worker that said
+    /// [`KEEP_DELEGATED`], and only with the device's switch on; absent (an
+    /// older daemon) reads `false`, which is today.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keepable: bool,
 }
 
 /// FR-85 P1e-mac — what a delegated session's `record` channel needs, carried
@@ -555,6 +780,12 @@ pub struct WorkerLink {
     /// Checked rather than assumed; a priority queue here would be machinery
     /// for a guarantee nothing needs.
     pub outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+    /// FR-138 P2b — the daemon's orders about the sessions it will claim
+    /// ([`WorkerOrder`]), on their own lane: the signalling loop serves them
+    /// wherever it waits, its own connection down included. Taken once by the
+    /// loop ([`Delegation::worker_side`]); `None` where no attach loop feeds
+    /// one.
+    pub orders: Option<tokio::sync::mpsc::Receiver<WorkerOrder>>,
 }
 
 /// How this process takes part in delegation.
@@ -600,6 +831,21 @@ impl Delegation {
     )> {
         match self {
             Delegation::Worker(link) => Some((&mut link.inbound, &link.outbound)),
+            _ => None,
+        }
+    }
+
+    /// FR-138 P2b (B1) — a worker's delegated side: the orders lane, taken
+    /// out once, and the channel's sender its delegated sessions speak up.
+    /// `None` for every process that is not a worker.
+    pub fn worker_side(
+        &mut self,
+    ) -> Option<(
+        Option<tokio::sync::mpsc::Receiver<WorkerOrder>>,
+        tokio::sync::mpsc::Sender<ClientMsg>,
+    )> {
+        match self {
+            Delegation::Worker(link) => Some((link.orders.take(), link.outbound.clone())),
             _ => None,
         }
     }
@@ -812,6 +1058,21 @@ struct Inner {
     /// them, on its own enrollment. `None` (the default, and every Mac not on
     /// `macos_one_row`) drops them: such a worker uploads its own.
     worker_logs: Mutex<Option<tokio::sync::mpsc::Sender<crate::logs_upload::LogLine>>>,
+    /// FR-138 P2b — the attached worker's words ([`KEEP_DELEGATED`]), from its
+    /// caps frame. Cleared with the channel, as its caps are.
+    worker_features: Mutex<Vec<String>>,
+    /// FR-138 P2b — the sessions whose params crossed `keepable`: the gate
+    /// makes a record for one when its offer crosses. Bounded
+    /// ([`SESSION_ORGS_KEPT`]), oldest out.
+    keepable: Mutex<std::collections::VecDeque<String>>,
+    /// FR-138 P2b — where a worker's reply about a session the daemon keeps a
+    /// record of goes: that record's link, in its org loop's table, which
+    /// forwards it while attached and keeps what the server must hear while
+    /// kept. Cleared with the channel.
+    bindings: Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// FR-138 P2b (A9) — bumped each time a channel ends: a record made under
+    /// an older one belongs to a worker that is gone, with its peers.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -1224,6 +1485,11 @@ impl DelegateHost {
             DelegateFrame::SessionParams(p) => Some(p.session_id.clone()),
             _ => None,
         };
+        // FR-138 P2b — and whether the daemon will claim it, by the same rule.
+        let keepable = match &frame {
+            DelegateFrame::SessionParams(p) if p.keepable => Some(p.session_id.clone()),
+            _ => None,
+        };
         let tx = self
             .inner
             .to_worker
@@ -1252,6 +1518,15 @@ impl DelegateHost {
             note_session(&mut held, session, org);
         }
         drop(held);
+        if let Some(session_id) = keepable {
+            let mut held = self.inner.keepable.lock().expect("keepable mutex");
+            if !held.iter().any(|s| *s == session_id) {
+                held.push_back(session_id);
+                while held.len() > SESSION_ORGS_KEPT {
+                    held.pop_front();
+                }
+            }
+        }
         if let Some(session_id) = recorded {
             let mut held = self
                 .inner
@@ -1364,6 +1639,9 @@ impl DelegateHost {
         // person's floor stays: it only tightens, and the next worker's first
         // frames replace it.
         self.inner.sessions.lock().expect("sessions mutex").clear();
+        // FR-138 P2b — and which sessions the daemon would have claimed: the
+        // next worker never got their params.
+        self.inner.keepable.lock().expect("keepable mutex").clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -1416,6 +1694,16 @@ impl DelegateHost {
         // attaches until that clear is done: `attached` is released only after
         // `run` returns, and one channel is attached at a time.
         let result = self.run(rd, wr).await;
+        // FR-138 P2b — what P2b holds for the channel ends with it however
+        // `run` ended, a write or read error too, and BEFORE the flag clears,
+        // so the next worker to attach never shares this one's generation or
+        // bindings. (What `run` clears however the channel ended, the sender,
+        // the caps and the questions, is master's.)
+        let cause = match &result {
+            Ok(()) => "closed".to_string(),
+            Err(e) => e.to_string(),
+        };
+        self.records_channel_ended(&cause);
         self.inner.attached.store(false, Ordering::Release);
         match result {
             Ok(()) => tracing::info!("delegation channel closed"),
@@ -1432,18 +1720,7 @@ impl DelegateHost {
         wr: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> std::io::Result<()> {
         let ended = self.frames(rd, wr).await;
-        *self.inner.to_worker.lock().expect("to_worker mutex") = None;
-        // ⚠️ Clear the caps with the channel. Keeping them would leave the row
-        // advertising a capture target that has gone, and the next session
-        // would get the black screen P2b existed to fix.
-        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
-        // FR-92 — and the questions it will now never answer: dropping each
-        // sender ends its caller's wait at once instead of at the timeout.
-        self.inner
-            .keep_busy_asks
-            .lock()
-            .expect("keep_busy_asks mutex")
-            .clear();
+        self.channel_ended();
         ended
     }
 
@@ -1526,21 +1803,33 @@ impl DelegateHost {
                 Ok(DelegateFrame::WorkerLogs { lines }) => self.worker_logs(lines),
                 // FR-43 P3b — and its person's consent floor.
                 Ok(DelegateFrame::PersonFloor(floor)) => self.note_person_floor(floor),
-                Ok(DelegateFrame::WorkerCaps { caps }) => {
+                Ok(DelegateFrame::WorkerCaps { caps, features }) => {
                     // #3695 — only the words that are the worker's to say.
                     let caps = worker_words(*caps);
+                    // FR-138 P2b — and of its feature words, the known ones.
+                    let features = worker_feature_words(&features);
                     tracing::info!(
                         permissions = ?caps.permissions,
                         has_input = caps.has_input_permission,
+                        ?features,
                         "delegation: worker announced its capabilities"
                     );
                     *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(caps);
+                    *self
+                        .inner
+                        .worker_features
+                        .lock()
+                        .expect("worker features mutex") = features;
                 }
                 Ok(
                     DelegateFrame::ToWorker { .. }
                     | DelegateFrame::SessionParams { .. }
                     | DelegateFrame::OverlayFootprint { .. }
-                    | DelegateFrame::KeepBusyAsk { .. },
+                    | DelegateFrame::KeepBusyAsk { .. }
+                    | DelegateFrame::Detached { .. }
+                    | DelegateFrame::Resumed { .. }
+                    | DelegateFrame::Close { .. }
+                    | DelegateFrame::Ended { .. },
                 ) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
@@ -1558,19 +1847,192 @@ impl DelegateHost {
         Ok(())
     }
 
+    /// The channel to the worker ended: what belonged to it goes with it.
+    /// [`Self::run`] runs it however the channel ends.
+    fn channel_ended(&self) {
+        *self.inner.to_worker.lock().expect("to_worker mutex") = None;
+        // ⚠️ Clear the caps with the channel. Keeping them would leave the row
+        // advertising a capture target that has gone, and the next session
+        // would get the black screen P2b existed to fix.
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
+        // FR-92 — and the questions it will now never answer: dropping each
+        // sender ends its caller's wait at once instead of at the timeout.
+        self.inner
+            .keep_busy_asks
+            .lock()
+            .expect("keep_busy_asks mutex")
+            .clear();
+    }
+
+    /// FR-138 P2b — the channel to the worker ended, `cause` its why: what P2b
+    /// holds for it goes with it. Run by [`Self::serve`] on EVERY end of
+    /// [`Self::run`], an I/O error's too (a worker gone mid-write is EPIPE),
+    /// and a line over [`DELEGATE_LINE_MAX`]'s.
+    /// Before, only a clean end ran it, and a record of a worker gone that way
+    /// kept its generation: counted, claimed at the next roll, with no peer
+    /// behind it. With the switch off it changes nothing: the worker's word it
+    /// clears is read only with the switch on, no record reads the generation
+    /// it bumps, and the bindings it drains are empty.
+    fn records_channel_ended(&self, cause: &str) {
+        // The worker's word goes with it: a session asked next is not
+        // keepable until a worker says it again.
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .clear();
+        // (A9) The sessions it kept for the daemon's claim: a record of this
+        // generation belongs to a worker whose channel ended, whose process
+        // took its peers, or, alive, closes them (MEDIUM-1). Bumped BEFORE the
+        // ends below, so the table that reads one reads the record as gone.
+        // (D6) Each bound record hears its session end as `error`: attached,
+        // the table says it to the server on this connection, and the viewer
+        // stops watching a frozen picture; kept, after the next hello. The
+        // sends never wait.
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        let bound: Vec<(String, tokio::sync::mpsc::Sender<ClientMsg>)> = self
+            .inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .drain()
+            .collect();
+        for (session, link) in bound {
+            let Ok(session_id) = bson::oid::ObjectId::parse_str(&session) else {
+                continue;
+            };
+            tracing::info!(
+                %session,
+                %cause,
+                "delegation: the channel to the GUI worker that held a kept-for-claim session \
+                 ended; it ends as `error` (FR-138 P2b)"
+            );
+            let _ = link.try_send(ClientMsg::Terminate {
+                session_id,
+                reason: roomler_ai_remote_control::models::EndReason::Error,
+                limit: None,
+            });
+        }
+    }
+
+    /// FR-138 P2b (A2) — whether the attached worker keeps a delegated
+    /// session's peer through the daemon's control-socket loss: it said
+    /// [`KEEP_DELEGATED`], matched by equality. No worker, or an older one:
+    /// `false`, and its sessions are served as today.
+    pub fn worker_keeps(&self) -> bool {
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .iter()
+            .any(|w| w == KEEP_DELEGATED)
+    }
+
+    /// FR-138 P2b — whether `session`'s params crossed `keepable`.
+    pub(crate) fn is_keepable(&self, session: &str) -> bool {
+        self.inner
+            .keepable
+            .lock()
+            .expect("keepable mutex")
+            .iter()
+            .any(|s| s == session)
+    }
+
+    /// FR-138 P2b (A9) — the attach generation: bumped each time a channel
+    /// ends.
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    /// FR-138 P2b (A3) — send the worker's replies about `session` into
+    /// `link`, a record's link in its org loop's table.
+    pub(crate) fn bind(&self, session: String, link: tokio::sync::mpsc::Sender<ClientMsg>) {
+        self.inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .insert(session, link);
+    }
+
+    /// FR-138 P2b — the record of `session` is gone: its replies go where
+    /// every reply goes.
+    pub(crate) fn unbind(&self, session: &str) {
+        self.inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .remove(session);
+    }
+
+    /// FR-138 P2b — an order about a session the daemon holds a record of
+    /// ([`DelegateFrame::Detached`], [`DelegateFrame::Resumed`],
+    /// [`DelegateFrame::Close`], [`DelegateFrame::Ended`]). Never waits: a full
+    /// queue costs the order. A session the worker keeps still closes at its
+    /// own deadline, and the `Ended` of an attached session has the server's
+    /// `Terminate` crossing beside it. `false` with no worker.
+    pub(crate) fn send_order(&self, frame: DelegateFrame) -> bool {
+        let tx = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone();
+        tx.is_some_and(|tx| tx.try_send(frame).is_ok())
+    }
+
+    /// A worker "attached" the way `run` attaches one, its queue set, for a
+    /// test that reads the frames the daemon sends it.
+    #[cfg(test)]
+    pub(crate) fn attach_for_test(&self) -> tokio::sync::mpsc::Receiver<DelegateFrame> {
+        let (tx, rx) = tokio::sync::mpsc::channel(RECORD_SESSIONS_KEPT * 2);
+        *self.inner.to_worker.lock().expect("to_worker mutex") = Some(tx);
+        rx
+    }
+
+    /// The channel's clean end, as `run` and `serve` end it, for a test.
+    #[cfg(test)]
+    pub(crate) fn end_channel_for_test(&self) {
+        self.channel_ended();
+        self.records_channel_ended("closed");
+    }
+
     /// Put a worker's reply on the control WS — if the whitelist allows it.
     ///
     /// ⚠️ The check is HERE, not at the worker, and that is the whole point:
     /// the worker is unprivileged and may be compromised, so a filter it
     /// applies to itself is not a filter. Anything it may put on this socket it
     /// says AS THE DEVICE.
-    fn relay_upstream(&self, msg: ClientMsg) {
+    pub(crate) fn relay_upstream(&self, msg: ClientMsg) {
         if !delegable_outbound(&msg) && !self.records_session_of(&msg) {
             tracing::warn!(
                 kind = msg_kind(&msg),
                 "delegation: worker tried to send a message it is not allowed to; dropping"
             );
             return;
+        }
+        // FR-138 P2b (A3) — a session the daemon keeps a record of: into that
+        // record's link, which forwards it to the connection while attached,
+        // and while kept hands what the server must hear to its table and drops
+        // the rest. Never waits, and never falls through to a connection: one
+        // the record has left may be a dead one.
+        if let Some(session) = client_session_of(&msg) {
+            let bound = self
+                .inner
+                .bindings
+                .lock()
+                .expect("bindings mutex")
+                .get(&session)
+                .cloned();
+            if let Some(link) = bound {
+                if link.try_send(msg).is_err() {
+                    tracing::debug!(
+                        %session,
+                        "delegation: a kept-for-claim session's link is full; dropped a reply \
+                         (FR-138 P2b)"
+                    );
+                }
+                return;
+            }
         }
         // FR-43 P3b — back on the WS of the org that handed the session over.
         // A secondary's reply with its WS down is dropped, never sent to the
@@ -1805,6 +2267,7 @@ mod tests {
                 record: vec!["remote".into()],
                 ..Default::default()
             }),
+            features: Vec::new(),
         };
         write_frame(&mut cwr, &caps).await.unwrap();
         cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
@@ -1842,6 +2305,7 @@ mod tests {
         );
         let frame = DelegateFrame::WorkerCaps {
             caps: Box::new(caps),
+            features: Vec::new(),
         };
         write_frame(&mut cwr, &frame).await.unwrap();
         cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
@@ -2422,6 +2886,265 @@ mod tests {
         assert!(!secret_eq("abc", "abd"));
         assert!(!secret_eq("", "x"));
     }
+
+    /// FR-138 P2b (R12, A2) — a delegated session is said `keepable` only to a
+    /// worker that said `keep-delegated` (by equality: a near miss is not the
+    /// word), only with the switch on, and never for an external session; and
+    /// this build's worker says the word.
+    #[tokio::test]
+    async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
+        assert_eq!(
+            worker_features(),
+            vec![KEEP_DELEGATED.to_string()],
+            "this build's worker says it"
+        );
+        assert!(
+            session_keepable(true, true, false),
+            "switch on, a P2b worker"
+        );
+        assert!(!session_keepable(false, true, false), "switch off");
+        assert!(
+            !session_keepable(true, false, false),
+            "an older worker, or none"
+        );
+        assert!(!session_keepable(true, true, true), "an external session");
+
+        let host = DelegateHost::new();
+        assert!(!host.worker_keeps(), "no worker");
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        async fn caps(
+            cwr: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+            features: Vec<String>,
+        ) {
+            let frame = DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features,
+            };
+            write_frame(cwr, &frame).await.unwrap();
+            // The daemon reads in order: its Pong means the caps were read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(matches!(next_frame(lines).await, DelegateFrame::Pong));
+        }
+        caps(&mut cwr, &mut lines, Vec::new()).await;
+        assert!(!host.worker_keeps(), "an older worker says no word");
+        caps(
+            &mut cwr,
+            &mut lines,
+            vec!["keep-delegated-v2".into(), "keep".into()],
+        )
+        .await;
+        assert!(!host.worker_keeps(), "a near miss is not the word");
+        caps(&mut cwr, &mut lines, vec![KEEP_DELEGATED.to_string()]).await;
+        assert!(host.worker_keeps(), "a P2b worker");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.worker_keeps(), "gone with its channel");
+    }
+
+    /// FR-138 P2b (review HIGH-2) — the channel ends on an I/O error, its
+    /// worker gone while the daemon writes to it (EPIPE): what P2b holds for
+    /// the channel ends with it all the same, as on a clean end. The attach
+    /// generation moves on, each bound record hears its session end as
+    /// `error` (D6), the bindings go, and the worker's word with them. Written
+    /// first: before the fix only a clean end ran any of it.
+    #[tokio::test]
+    async fn p2b_review_a_channel_that_ends_on_a_write_error_ends_what_p2b_held() {
+        let host = DelegateHost::new();
+        let secret = host.mint();
+        // Two pipes, one each way, so the daemon's writes can fail while its
+        // reads go on: the error exit, not the clean end of a read EOF.
+        let (mut to_daemon, daemon_rd) = tokio::io::duplex(4096);
+        let (daemon_wr, from_daemon) = tokio::io::duplex(4096);
+        let h = host.clone();
+        let task = tokio::spawn(async move {
+            h.serve(&secret, Box::new(daemon_rd), Box::new(daemon_wr))
+                .await
+        });
+        let mut lines = BufReader::new(from_daemon).lines();
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::Attached { .. }
+        ));
+        write_frame(
+            &mut to_daemon,
+            &DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features: vec![KEEP_DELEGATED.to_string()],
+            },
+        )
+        .await
+        .unwrap();
+        to_daemon.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.worker_keeps(), "a P2b worker is attached");
+        let session = bson::oid::ObjectId::new();
+        let (link, mut heard) = tokio::sync::mpsc::channel(8);
+        host.bind(session.to_hex(), link);
+        let before = host.generation();
+
+        // The worker is gone: the daemon's next write, the pong, is EPIPE.
+        drop(lines);
+        to_daemon.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon's loop ends on the write error")
+            .unwrap();
+
+        assert_eq!(
+            host.generation(),
+            before + 1,
+            "the attach generation moves on"
+        );
+        let said = heard.try_recv().ok();
+        assert!(
+            matches!(
+                said,
+                Some(ClientMsg::Terminate {
+                    session_id,
+                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                    ..
+                }) if session_id == session
+            ),
+            "D6: the bound record's session ends as error: {said:?}"
+        );
+        assert!(
+            !host.worker_keeps(),
+            "the worker's word goes with its channel"
+        );
+        host.relay_upstream(ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        });
+        assert!(heard.try_recv().is_err(), "the binding is gone");
+    }
+
+    /// FR-138 P2b, over #3706 — one caps frame through both of the daemon's
+    /// known-words filters: `keep-delegated` survives, so a P2b worker is
+    /// still one (without it P2b would silently never engage), and a feature
+    /// word this build does not know is dropped, a near miss of the word too,
+    /// as #3706 drops a capability word it does not know.
+    #[tokio::test]
+    async fn p2b_the_keep_word_passes_the_workers_known_words_and_an_unknown_word_does_not() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into(), "everything".into()],
+                ..Default::default()
+            }),
+            features: vec![
+                "keep-delegated-v2".into(),
+                KEEP_DELEGATED.to_string(),
+                "x".repeat(1 << 16),
+                KEEP_DELEGATED.to_string(),
+                "KEEP-DELEGATED".into(),
+            ],
+        };
+        write_frame(&mut cwr, &frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.worker_keeps(), "the word survives the worker's words");
+        assert_eq!(
+            host.effective_record(),
+            Some(vec!["remote".to_string()]),
+            "#3706's filter acts on the same frame"
+        );
+        assert_eq!(
+            *host
+                .inner
+                .worker_features
+                .lock()
+                .expect("worker features mutex"),
+            vec![KEEP_DELEGATED.to_string()],
+            "the known word, once; nothing else"
+        );
+
+        let unknown = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps::default()),
+            features: vec!["keep-delegated-v2".into(), "keep".into()],
+        };
+        write_frame(&mut cwr, &unknown).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(!host.worker_keeps(), "a near miss is not the word");
+        assert!(
+            host.inner
+                .worker_features
+                .lock()
+                .expect("worker features mutex")
+                .is_empty(),
+            "an unknown word is dropped"
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// FR-138 P2b, over #3706 — a channel #3706 closes over its line limit
+    /// ends what P2b held as every other end does, because `serve` runs
+    /// `records_channel_ended` after `run` however it ended: the attach
+    /// generation moves on, the bound record hears its session end as
+    /// `error` (D6), its binding goes, and the worker's word with it. #3706's
+    /// own clear of the worker's words holds beside it.
+    #[tokio::test]
+    async fn p2b_a_channel_closed_over_the_line_limit_ends_what_p2b_held() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let caps = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into()],
+                ..Default::default()
+            }),
+            features: vec![KEEP_DELEGATED.to_string()],
+        };
+        write_frame(&mut cwr, &caps).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+        assert!(host.worker_keeps(), "a P2b worker is attached");
+        let session = bson::oid::ObjectId::new();
+        let (link, mut heard) = tokio::sync::mpsc::channel(8);
+        host.bind(session.to_hex(), link);
+        let before = host.generation();
+
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; DELEGATE_LINE_MAX + 1]).await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed");
+        task.await.unwrap();
+
+        assert_eq!(
+            host.generation(),
+            before + 1,
+            "the attach generation moves on"
+        );
+        let said = heard.try_recv().ok();
+        assert!(
+            matches!(
+                said,
+                Some(ClientMsg::Terminate {
+                    session_id,
+                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                    ..
+                }) if session_id == session
+            ),
+            "D6: the bound record's session ends as error: {said:?}"
+        );
+        assert!(
+            !host.worker_keeps(),
+            "the worker's word goes with its channel"
+        );
+        assert_eq!(host.effective_record(), None, "#3706's clear holds");
+        host.relay_upstream(ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        });
+        assert!(heard.try_recv().is_err(), "the binding is gone");
+        drop(writer);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2653,6 +3376,138 @@ mod routing_tests {
         });
         assert!(!k.is_empty() && k != "?", "got {k}");
     }
+
+    /// FR-138 P2b (R2, A1) — with the switch on, a delegable message about a
+    /// session the daemon's own table holds is the daemon's, and never crosses
+    /// to a worker that attached since: its `Terminate` or `Ice` would go to a
+    /// process that never held the peer.
+    #[test]
+    fn p2b_a_session_the_daemon_holds_is_served_there_with_the_switch_on() {
+        assert!(
+            served_by_daemon(true, true),
+            "a daemon-held session's Terminate or Ice never crosses"
+        );
+        assert!(
+            !served_by_daemon(true, false),
+            "a session the daemon does not hold crosses as before"
+        );
+    }
+
+    /// FR-138 P2b (a6's amendment) — with the switch off the gate is today's: a
+    /// `Terminate` for a session the daemon holds still crosses, as on master.
+    /// A guard, so it passes before the implementation and after it.
+    #[test]
+    fn p2b_with_the_switch_off_the_gate_is_todays() {
+        assert!(!served_by_daemon(false, true), "off, it still crosses");
+        assert!(!served_by_daemon(false, false));
+    }
+
+    /// FR-138 P2b (R23, B4) — the daemon's orders go to the worker's orders
+    /// lane, which is served wherever its loop waits; params and rc messages
+    /// keep their one ordered inbound lane, and liveness stays in the attach
+    /// loop.
+    #[test]
+    fn p2b_the_daemons_orders_go_to_their_own_lane_and_the_rest_as_before() {
+        let id = oid().to_hex();
+        let lane = worker_lane(DelegateFrame::Detached {
+            sessions: vec![id.clone()],
+            exit: "read_error".into(),
+            netchange: false,
+            keep_ms: 60_000,
+        });
+        assert!(
+            matches!(
+                lane,
+                WorkerLane::Order(WorkerOrder::Detached { ref sessions, keep_ms: 60_000, .. })
+                    if *sessions == vec![id.clone()]
+            ),
+            "Detached: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::Resumed {
+            session_id: id.clone(),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Order(WorkerOrder::Resumed { ref session_id }) if *session_id == id),
+            "Resumed: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::Close {
+            session_id: id.clone(),
+            reason: "deadline".into(),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Order(WorkerOrder::Close { ref reason, .. }) if reason == "deadline"),
+            "Close: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::ToWorker {
+            msg: Box::new(ServerMsg::Ice {
+                session_id: oid(),
+                candidate: serde_json::Value::Null,
+            }),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Inbound(WorkerInbound::Msg(_))),
+            "an rc message: {lane:?}"
+        );
+        assert!(
+            matches!(
+                worker_lane(DelegateFrame::Ping),
+                WorkerLane::Here(DelegateFrame::Ping)
+            ),
+            "liveness stays in the attach loop"
+        );
+    }
+
+    /// FR-138 P2b (review HIGH-1) — the server's end of a session the daemon
+    /// keeps a record of travels the worker's ORDERS lane, which the worker
+    /// serves wherever its loop waits, its own socket's dial, hello and every
+    /// backoff included. The inbound lane, where the `Terminate` beside it
+    /// waits, is read only once that socket is up. Its wire is stable, and a
+    /// frame with no limit parses. Written first: before the fix it went to
+    /// the attach loop, which skips it.
+    #[test]
+    fn p2b_review_the_daemons_end_takes_the_orders_lane() {
+        use serde_json::json;
+        let id = oid().to_hex();
+        let frame = DelegateFrame::Ended {
+            session_id: id.clone(),
+            reason: EndReason::IdleTimeout,
+            limit: Some("max_duration".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).ok(),
+            Some(json!({"t": "ended", "d": {
+                "session_id": id, "reason": "idle_timeout", "limit": "max_duration"
+            }})),
+            "its wire"
+        );
+        let bare = serde_json::from_value::<DelegateFrame>(json!({"t": "ended", "d": {
+            "session_id": id, "reason": "admin_terminated"
+        }}))
+        .ok();
+        assert!(
+            matches!(
+                bare,
+                Some(DelegateFrame::Ended {
+                    reason: EndReason::AdminTerminated,
+                    limit: None,
+                    ..
+                })
+            ),
+            "no limit: {bare:?}"
+        );
+        let lane = worker_lane(frame);
+        assert!(
+            matches!(
+                lane,
+                WorkerLane::Order(WorkerOrder::Ended {
+                    ref session_id,
+                    reason: EndReason::IdleTimeout,
+                    ref limit,
+                }) if *session_id == id && limit.as_deref() == Some("max_duration")
+            ),
+            "the orders lane: {lane:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2665,6 +3520,7 @@ mod role_tests {
         Delegation::Worker(WorkerLink {
             inbound: in_rx,
             outbound: out_tx,
+            orders: None,
         })
     }
 
@@ -2702,6 +3558,7 @@ mod role_tests {
         let mut role = Delegation::Worker(WorkerLink {
             inbound: in_rx,
             outbound: out_tx,
+            orders: None,
         });
         let sid = bson::oid::ObjectId::new();
         in_tx
@@ -2771,6 +3628,7 @@ mod params_tests {
             idle_secs: None,
             lock_on_end: None,
             media_legacy: None,
+            keepable: false,
         };
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
             .expect("serialises");
@@ -2814,6 +3672,7 @@ mod params_tests {
             idle_secs: None,
             lock_on_end: None,
             media_legacy: Some("media_plan".into()),
+            keepable: false,
         };
         let wire = serde_json::to_string(&p).unwrap();
         let back: SessionParams = serde_json::from_str(&wire).unwrap();
@@ -2845,6 +3704,7 @@ mod params_tests {
             idle_secs: None,
             lock_on_end: None,
             media_legacy: None,
+            keepable: false,
         };
         let track = serde_json::to_string(&p).unwrap();
         p.transport = Some("data-channel-h264".into());
@@ -2872,6 +3732,7 @@ mod params_tests {
             idle_secs: None,
             lock_on_end: None,
             media_legacy: None,
+            keepable: false,
         }
     }
 
@@ -3555,6 +4416,97 @@ mod params_tests {
                 files: FeaturePolicy::Off,
                 audio: FeaturePolicy::Off,
             }
+        );
+    }
+
+    // ─── FR-138 P2b ─────────────────────────────────────────────────────────
+
+    /// FR-138 P2b (R13) — the three orders and both fields keep a stable wire,
+    /// and a frame from an older peer, without them, still parses. Written
+    /// first: at the seam the orders and the fields are off the wire.
+    #[test]
+    fn p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse() {
+        use serde_json::json;
+        let id = bson::oid::ObjectId::new().to_hex();
+        let detached = DelegateFrame::Detached {
+            sessions: vec![id.clone()],
+            exit: "read_error".into(),
+            netchange: false,
+            keep_ms: 60_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&detached).ok(),
+            Some(json!({"t": "detached", "d": {
+                "sessions": [id], "exit": "read_error", "netchange": false, "keep_ms": 60000
+            }})),
+            "Detached"
+        );
+        assert_eq!(
+            serde_json::to_value(DelegateFrame::Resumed {
+                session_id: id.clone()
+            })
+            .ok(),
+            Some(json!({"t": "resumed", "d": {"session_id": id}})),
+            "Resumed"
+        );
+        assert_eq!(
+            serde_json::to_value(DelegateFrame::Close {
+                session_id: id.clone(),
+                reason: "deadline".into()
+            })
+            .ok(),
+            Some(json!({"t": "close", "d": {"session_id": id, "reason": "deadline"}})),
+            "Close"
+        );
+        let back = serde_json::from_value::<DelegateFrame>(json!({"t": "detached", "d": {
+            "sessions": [id], "exit": "netchange_probe", "netchange": true, "keep_ms": 120000
+        }}))
+        .ok();
+        assert!(
+            matches!(
+                back,
+                Some(DelegateFrame::Detached { ref sessions, netchange: true, keep_ms: 120_000, .. })
+                    if *sessions == vec![id.clone()]
+            ),
+            "a Detached reads back: {back:?}"
+        );
+
+        let caps = serde_json::to_value(DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps::default()),
+            features: vec![KEEP_DELEGATED.to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            caps["d"]["features"],
+            json!(["keep-delegated"]),
+            "the word is on the wire"
+        );
+        let older = serde_json::from_value::<DelegateFrame>(json!({
+            "t": "worker_caps",
+            "d": {"caps": serde_json::to_value(AgentCaps::default()).unwrap()}
+        }))
+        .unwrap();
+        assert!(
+            matches!(older, DelegateFrame::WorkerCaps { ref features, .. } if features.is_empty()),
+            "an older worker's caps parse, with no word"
+        );
+
+        let mut p = params(
+            &id,
+            roomler_ai_remote_control::permissions::Permissions::empty(),
+        );
+        p.keepable = true;
+        let wire = serde_json::to_value(&p).unwrap();
+        assert_eq!(wire["keepable"], json!(true), "keepable is on the wire");
+        let back: SessionParams = serde_json::from_value(wire).unwrap();
+        assert!(back.keepable);
+        p.keepable = false;
+        let wire = serde_json::to_value(&p).unwrap();
+        assert!(wire.get("keepable").is_none(), "false stays off it: {wire}");
+        let older: SessionParams = serde_json::from_value(wire).unwrap();
+        assert!(
+            !older.keepable,
+            "an older daemon's params read not keepable"
         );
     }
 }
