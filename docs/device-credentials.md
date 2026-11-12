@@ -99,7 +99,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:96` |
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1425` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2113` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2168` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:412` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
