@@ -1405,9 +1405,9 @@
             <code>{{ rc.mediaUnavailable.value.code }}</code>.
             <span v-if="rc.mediaUnavailable.value.detail">{{ rc.mediaUnavailable.value.detail }}</span>
           </p>
-          <p class="text-caption text-medium-emphasis mt-1">
-            Remote shell, file transfer and the other channels are unaffected.
-          </p>
+          <!-- #3786 — what still works without a picture is the agent's to say, in the hint above:
+               only it knows its OS and install. A fixed line here said file transfer was unaffected,
+               under a hint saying otherwise (a Linux system install, nobody at its screen: #3711). -->
         </div>
         <!-- FR-93 P2d-2 — the host is asking the person at its screen to share
              it. Before this the canvas stayed blank and the viewer re-created
