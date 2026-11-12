@@ -384,25 +384,48 @@ address and port join the two lines.
 past the budget now goes on to its end, and logs `peer close finished in the background, past
 its budget` (or, at the ceiling, `peer close did not finish within its ceiling`). The overrun
 line now reads `peer close overran its budget — it goes on in the background (#3716)`. A close
-that panicked logs `peer close panicked` with its session and the panic, and the caller gets an
-error, not a clean close.
+that panicked logs `peer close panicked` with its session and the panic from its own task, so
+the line comes even after the caller stopped waiting, and a caller still waiting gets an error,
+not a clean close.
 
 **Tests** (`agents/roomlerd/src/peer_close_tests.rs`, two plain webrtc-rs peers on a vnet,
-black-box: close time, the parked writer, packets on the wire, tasks alive on a runtime of the
-test's own, what the receiver gets):
+black-box: close time, the parked writer, packets on the wire, the agent's tasks alive on a
+runtime of its own, what the receiver gets):
 
 | Test | Holds | Before the fix |
 |---|---|---|
-| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:255`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, sends nothing more, and leaves no task | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
-| `a_healthy_close_still_takes_milliseconds` (`:315`) | the same close with the path alive | passes, 1 ms here |
-| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:355`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
-| `many_writers_share_one_ordered_channel` (`:470`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
+| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:289`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, sends nothing more, and leaves no task | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
+| `a_healthy_close_still_takes_milliseconds` (`:350`) | the same close with the path alive | passes, 1 ms here |
+| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:391`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
+| `many_writers_share_one_ordered_channel` (`:507`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
+
+The stand-in viewer runs on a runtime of its own (`on_viewer`, `:71`), so the agent's runtime
+counts the agent's tasks alone. The viewer's peer, the one that offers, now and then keeps two
+tasks alive after its close: in 6 runs of 60 with the agent closing first, and 3 of 30 with the
+viewer first. On a runtime both peers shared, the healthy-close test read them as the agent's
+and failed (`3 tasks alive after both closes, 1 before the peers`). The agent's runtime never
+kept a task past its baseline in those 90 runs.
+
+The reset's order has a unit test of its own, on one thread:
+`test_stream_reset_waits_for_a_write_turn`
+(`crates/vendored/webrtc-sctp/src/stream/stream_test.rs:240`). While a write holds its turn,
+the shutdown returns at once and queues nothing. Once the write has queued its message and let
+go of the turn, the reset follows it. Without the reset task's wait for the turn, the queue
+ends [reset, data]. CI runs the vendored crate's drift check, not its tests. Run them with
+`cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib`, and delete the
+`Cargo.lock` that leaves in the crate before a `--regen` or `--check`. Its two
+`fuzz_artifact_test` tests fail on any checkout: the crates.io tarball ships no `fuzz/` tree.
 
 **Not covered:** a TURNS/TCP leg that is dead but never reset. Its writes block until the OS
 gives the connection up (`crates/tcp-turn-conn/src/lib.rs:257`), with the TURN client's lock
 held across them. Its read side does report a reset or EOF, to the TURN client's read loop
 only: that loop exits, and nothing above it hears. Every field case had the link reset
 (`os error 10054`, `Broken pipe`), so its writes failed fast.
+
+Nor the viewer's two tasks: they were not named, since tokio's task dump runs on Linux only.
+The agent answers in these tests, as it does a browser, and its peer never kept them. As a
+tunnel client the daemon offers too (`crates/tunnel-core/src/driver.rs:1172`), a role these
+tests do not give it.
 
 ### ⚠️ Every client path that ends a session must tell the exit agent (#1754)
 
