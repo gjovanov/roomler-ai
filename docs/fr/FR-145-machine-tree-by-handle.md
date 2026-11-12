@@ -192,7 +192,7 @@ unchanged).
 | `record_inner` (`crash_recorder.rs:231-341`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
 | `scan_dir`, `should_suppress` (`:571-573`, `:768-769`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
 | `quarantine` (`:714-723`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
-| the uploader's deletes (`crash_uploader.rs:126`, `:141`, `:351-352`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
+| the uploader's deletes (`crash_uploader.rs:126`, `:141`, `:344-345`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
 
 A refusal is logged once per process start (`crash_recorder: crash records left alone: <at> is a link`, or
 `… ends elsewhere (<final path>)`), counted with the suppression tally, and the crash goes unrecorded. It is never
@@ -436,7 +436,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
   reader reads (`app.rs:7461`) for no gain.
-- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1315-1317`). Options: in this FR; a design pass of
+- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1405-1407`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1371-1385`; the earlier anchor
@@ -457,7 +457,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 
 ## Out of scope
 
-- File-transfer staging (`files.rs:1315-1317` and its pipeline): its own design pass (D5).
+- File-transfer staging (`files.rs:1405-1407` and its pipeline): its own design pass (D5).
 - The person's own daemon's files in their profile, which stay as they are.
 - macOS and Linux.
 - Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1162`).
