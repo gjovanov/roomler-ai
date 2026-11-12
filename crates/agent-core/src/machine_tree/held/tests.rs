@@ -461,7 +461,7 @@ fn file_sealed(sddl: &str, readable: bool) -> bool {
     crate::machine_tree::test_support::protected(sddl) && got == want
 }
 
-/// T16 (R145) — an open folder Administrators own is sealed in place without
+/// T16 — an open folder Administrators own is sealed in place without
 /// handing the seal down: the scrub deletes, as names, a hard link and a
 /// junction at names the site uses, and a hard link at a name it does not use
 /// is left alone; no file outside changes its DACL or its bytes. Control: the
@@ -603,14 +603,14 @@ fn as_restricted<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// R145 — a thread that acts as another account never makes an entry that
+/// T17 — a thread that acts as another account never makes an entry that
 /// account owns: the token may not name Administrators as the owner, and the
 /// make is refused instead of falling back to the caller as the owner.
 /// Control: the same make on a thread that is itself is made, Administrators
 /// its owner.
 #[test]
 fn nothing_is_made_for_the_account_a_thread_acts_as() {
-    if !elevated_or_skip("R145: a make while the thread acts as another account") {
+    if !elevated_or_skip("T17: a make while the thread acts as another account") {
         return;
     }
     let root = tempfile::tempdir().unwrap();
@@ -631,7 +631,7 @@ fn nothing_is_made_for_the_account_a_thread_acts_as() {
     println!("{CHECKED}: impersonation");
 }
 
-/// D10 (R145) — a reader that runs as the person reaches the `Readable`
+/// T18, D10 — a reader that runs as the person reaches the `Readable`
 /// `crashes` below a folder it may not list: a middle folder sealed to SYSTEM
 /// and Administrators, `crashes` below it `Readable` with a record in it.
 /// Under a token with Administrators deny-only, `walk` passes the middle

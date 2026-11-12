@@ -637,7 +637,7 @@ impl HeldPath {
     /// (on that file alone); anything else is deleted, a link as itself,
     /// never followed. The reseal hands nothing down, so names `uses` does
     /// not match are never opened and keep what they had: a hard link among
-    /// them never carries a seal to a file outside (R145). What was deleted,
+    /// them never carries a seal to a file outside. What was deleted,
     /// or could not be opened, sealed or deleted, for one WARN.
     pub fn keep_only_plain(&self, uses: impl Fn(&str) -> bool, seal: Seal) -> Vec<Refusal> {
         let mut out = Vec::new();
@@ -845,9 +845,9 @@ impl HeldPath {
         let aces = seal.aces(OBJECT_INHERIT | CONTAINER_INHERIT);
         let resealed = !(sd.owner == ADMINISTRATORS && super::is_exactly(&sd, &aces));
         if resealed {
-            // On the folder alone: nothing is handed down to what it holds
-            // (R145), so a hard link left in it never carries the seal to a
-            // file outside. The site seals the entries it uses by name
+            // On the folder alone: nothing is handed down to what it holds,
+            // so a hard link left in it never carries the seal to a file
+            // outside. The site seals the entries it uses by name
             // (`keep_only_plain`).
             set_own_sd(&found, &seal.sddl(true, true), true)
                 .map_err(|e| self.refuse_at(name, Why::Io(e)))?;
@@ -943,7 +943,7 @@ impl HeldPath {
                 Ok(made) => return Ok(made),
                 // Never on a thread that acts as another account (a panic
                 // inside `as_session_user`, a transfer written as the person):
-                // that account would own what SYSTEM makes (R145).
+                // that account would own what SYSTEM makes.
                 Err(STATUS_INVALID_OWNER) if owner && impersonating() => {
                     return Err(self.refuse_at(
                         name,
@@ -1143,7 +1143,7 @@ fn plain_and_ours(file: &File) -> Result<(), Why> {
 /// entry behind `file`, through its handle and on that entry alone
 /// (`SetKernelObjectSecurity`): unlike `SetSecurityInfo` and
 /// `SetNamedSecurityInfo`, the system's own set never hands a folder's new
-/// inheritable entries down to what it holds, on any build (R145).
+/// inheritable entries down to what it holds, on any build.
 fn set_own_sd(file: &File, sddl: &str, owner: bool) -> std::io::Result<()> {
     let sd = win::Descriptor::from_sddl(sddl)?;
     let mut info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;

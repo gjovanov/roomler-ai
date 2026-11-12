@@ -1172,7 +1172,7 @@ mod tests {
         }
     }
 
-    /// FR-145 T14 (b), R145 — the swap at the act: once the walk holds
+    /// FR-145 T14 (b) — the swap at the act: once the walk holds
     /// `AppData\Local\roomler`, after every check a walk or a re-check by
     /// path could make, that folder is renamed aside and a junction put at
     /// its name (`between_check_and_use`). The tree removed is the held

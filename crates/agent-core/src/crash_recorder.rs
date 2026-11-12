@@ -445,7 +445,7 @@ impl<'a> Place<'a> {
 /// and an error [`record_with_log_tail`] does not log again. The crash is
 /// never written anywhere else. Only the writer counts a refusal with the
 /// suppression tally, as one crash that went unrecorded; a refused read is
-/// not a crash (R145).
+/// not a crash.
 #[cfg(windows)]
 fn left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::Error {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1945,7 +1945,7 @@ mod tests {
             println!("{CHECKED}");
         }
 
-        /// R145 — the reads and acts below a held `crashes`: a record that
+        /// FR-145 T21 — the reads and acts below a held `crashes`: a record that
         /// does not parse is moved by handle into a sealed `malformed`, and a
         /// junction where `malformed` goes is moved aside with nothing put
         /// where it led; a record whose name became a symbolic link after it
@@ -2019,7 +2019,7 @@ mod tests {
             println!("{CHECKED}");
         }
 
-        /// R145: a read walk that is refused (a junction above `crashes`)
+        /// FR-145 T20 — a read walk that is refused (a junction above `crashes`)
         /// is not a suppressed crash: the tally the next record carries
         /// stays as it was. Control: a refused write is one.
         #[test]
@@ -2061,7 +2061,7 @@ mod tests {
             println!("{CHECKED}");
         }
 
-        /// The uploader's ledger in a SYSTEM worker's `service-logs` (R145):
+        /// FR-145 T19 — the uploader's ledger in a SYSTEM worker's `service-logs`:
         /// (a) its name is a hard link to a file outside: the verdict goes to
         /// a new file of one name, and the file outside is unchanged; (b)
         /// `service-logs` is a junction: nothing is written where it leads.
