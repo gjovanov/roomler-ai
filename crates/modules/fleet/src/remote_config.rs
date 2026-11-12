@@ -89,7 +89,7 @@ pub enum ConfigDenyReason {
     /// FR-52 — the body names an `external_*` key, which no server may push.
     DeviceOwnedKey,
     /// FR-135 §7.1, FR-138 — the body names one of the device's own switches,
-    /// which no server may push. One code for each, and words naming its key.
+    /// which no server may push. All share one code; the words name the key.
     DeviceOwnedSwitch(DeviceSwitch),
 }
 
