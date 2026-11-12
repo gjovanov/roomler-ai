@@ -42,12 +42,13 @@ A folder arrives as itself. Drop `Reports`, which holds `q3.pdf` and a subfolder
 
 Each transfer has a row in the session toolbar's transfers list, and a transfer
 continues while you keep working in the session. A row's percentage counts what
-has reached the other end, so it only moves forward. An upload that has to
-reconnect starts again from what the remote machine kept, and its row shows that
-point. **Cancel** on a row stops that transfer, in either direction, and the row
-reads **Cancelled**. A file you stop sending never shows up half-written in the
-folder: what arrived is kept aside in a hidden `.roomler-partial` folder, which
-Roomler clears of anything older than a day when it starts.
+has reached the other end, so while a transfer runs it only moves forward. If an
+upload has to reconnect, it goes on from what the remote machine kept, and its
+row shows that point. **Cancel** on a row stops that transfer, in either
+direction, and the row reads **Cancelled**. A file you stop sending never shows
+up half-written in the folder: what arrived is kept aside in a hidden
+`.roomler-partial` folder, which Roomler clears of anything older than a day
+when it starts.
 
 ## What the far end sees
 
