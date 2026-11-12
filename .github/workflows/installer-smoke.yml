@@ -1660,6 +1660,12 @@ jobs:
     env:
       # rust-cache set this for the job until wave 22; set it here.
       CARGO_INCREMENTAL: 0
+      # FR-46 P5a: the config folder's pre-rename path. The postinstall still
+      # migrates it and both readers of the opt-out marker still dual-read it,
+      # so two steps below seed it on purpose. This is the job's one name for
+      # it: every use is "$LEGACY_ETC".
+      # RETIRED-NAME-ANCHOR: the retired config folder, named once.
+      LEGACY_ETC: /etc/roomler-agent
     steps:
       - uses: actions/checkout@v4
 
@@ -2287,11 +2293,11 @@ jobs:
           # it must carry the opt-out across too. Both readers of the marker
           # dual-read, so the live channel stays shut throughout.
           "$BUNDLE_CHECK"
-          # RETIRED-NAME-ANCHOR(4): the migration SOURCE, seeded on purpose.
-          test ! -e /etc/roomler-agent \
-            || { echo "::error::/etc/roomler-agent exists before the migration is seeded"; exit 1; }
-          sudo mv /etc/roomler /etc/roomler-agent \
-            && sudo touch /etc/roomler-agent/enable-daemon \
+          # The migration SOURCE, seeded on purpose (LEGACY_ETC: the job's env).
+          test ! -e "$LEGACY_ETC" \
+            || { echo "::error::the legacy config folder exists before the migration is seeded"; exit 1; }
+          sudo mv /etc/roomler "$LEGACY_ETC" \
+            && sudo touch "$LEGACY_ETC/enable-daemon" \
             || { echo "::error::could not seed the migration source (the config folder under its legacy name, enable-daemon in it)"; exit 1; }
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
@@ -2303,8 +2309,8 @@ jobs:
           # left behind would be read again by the dual-read gates forever.
           test -f /etc/roomler/enable-daemon \
             || { echo "::error::the marker was not migrated to /etc/roomler"; exit 1; }
-          test ! -d /etc/roomler-agent \
-            || { echo "::error::the legacy /etc/roomler-agent survived the migration"; exit 1; }
+          test ! -d "$LEGACY_ETC" \
+            || { echo "::error::the legacy $LEGACY_ETC survived the migration"; exit 1; }
           test -f /etc/roomler/disable-auto-update \
             || { echo "::error::the migration did not carry the opt-out marker to /etc/roomler"; exit 1; }
           echo "  config dir migrated off the retired name, the opt-out marker with it"
@@ -2392,9 +2398,9 @@ jobs:
           # marker sitting at the legacy path must still be honoured, because
           # reading only the current path would auto-update a Mac whose operator
           # opted out. Deliberate coverage, not an accident of ordering.
-          # RETIRED-NAME-ANCHOR(2): the legacy opt-out path, seeded on purpose.
-          sudo mkdir -p /etc/roomler-agent
-          sudo mv /etc/roomler/disable-auto-update /etc/roomler-agent/disable-auto-update
+          # The legacy opt-out path, seeded on purpose (LEGACY_ETC: the job's env).
+          sudo mkdir -p "$LEGACY_ETC"
+          sudo mv /etc/roomler/disable-auto-update "$LEGACY_ETC/disable-auto-update"
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
           if [ -f "$plist" ]; then
@@ -2409,8 +2415,8 @@ jobs:
           fi
           echo "  opt-out removes the helper"
           # Back at the current path for the steps that follow.
-          sudo mv /etc/roomler-agent/disable-auto-update /etc/roomler/disable-auto-update \
-            && sudo rmdir /etc/roomler-agent \
+          sudo mv "$LEGACY_ETC/disable-auto-update" /etc/roomler/disable-auto-update \
+            && sudo rmdir "$LEGACY_ETC" \
             || { echo "::error::could not move the opt-out marker back to /etc/roomler and remove the legacy folder"; exit 1; }
 
       # A rewrite that fails over a login item of the person's: the script keeps
@@ -2482,7 +2488,7 @@ jobs:
         run: |
           set -euo pipefail
           "$BUNDLE_CHECK"
-          sudo rm -f /etc/roomler/disable-auto-update /etc/roomler-agent/disable-auto-update
+          sudo rm -f /etc/roomler/disable-auto-update
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           test -f /Library/LaunchDaemons/com.roomler.update.plist \
             || { echo "::error::com.roomler.update.plist missing — default install has no updater"; exit 1; }
