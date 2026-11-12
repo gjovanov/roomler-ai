@@ -18,9 +18,10 @@
 //! Renaming that segment to `roomler` must **never** orphan a host's enrolled
 //! `config.toml` (its bearer token) — that's the same class of silent
 //! fleet-drop-off as the MajorUpgrade-drops-env-vars bug. So resolution reads
-//! BOTH: it uses the NEW `roomler` segment when its tree already exists, else
-//! keeps using the OLD `roomler-agent` tree if THAT exists, and only a genuinely
-//! fresh install lands on the new segment. The decision is made once per process
+//! BOTH: it uses the tree that holds the config folder, the NEW `roomler` one
+//! first, else the OLD `roomler-agent` one; only when neither holds one does a
+//! local data folder decide, the same way; and only a genuinely fresh install
+//! lands on the new segment (#3747). The decision is made once per process
 //! (cached) and applied to every directory, so config / logs / crashes on a host
 //! never split across two trees.
 //!
@@ -51,17 +52,22 @@ pub(crate) const OLD_APP: &str = "roomler-agent";
 /// The tree an account's processes use, chosen from that account's folders:
 /// `config_dir` and `data_local_dir` name a tree's config folder and local
 /// data folder by its app segment (`None` where the platform names none), and
-/// `exists` is the filesystem. A tree is present when either folder exists:
-/// the NEW one when it is present, else the OLD one when it is present, else
-/// the NEW one (a fresh install). Pure, so the rule tests on every platform.
+/// `exists` is the filesystem. #3747 — the tree that holds a config folder,
+/// the NEW one first: `config.toml`, the enrollment, is there. Only when
+/// neither tree holds one, the tree that holds a local data folder, the NEW
+/// one first; else the NEW one (a fresh install). Pure, so the rule tests on
+/// every platform.
 fn segment_of(
     config_dir: impl Fn(&str) -> Option<PathBuf>,
     data_local_dir: impl Fn(&str) -> Option<PathBuf>,
     exists: impl Fn(&Path) -> bool,
 ) -> &'static str {
     let found = |dir: Option<PathBuf>| dir.is_some_and(|dir| exists(&dir));
-    let present = |app: &str| found(config_dir(app)) || found(data_local_dir(app));
-    if !present(NEW_APP) && present(OLD_APP) {
+    if found(config_dir(NEW_APP)) {
+        NEW_APP
+    } else if found(config_dir(OLD_APP))
+        || (!found(data_local_dir(NEW_APP)) && found(data_local_dir(OLD_APP)))
+    {
         OLD_APP
     } else {
         NEW_APP
@@ -547,7 +553,9 @@ pub(crate) fn resolve_machine_global(base: &Path) -> PathBuf {
 /// [`project_dirs`]`().data_local_dir()` resolves to for the OWNER of
 /// `profile`, computed from the profile path so a SYSTEM worker can reach the
 /// signed-in person's per-user data (its own `project_dirs` is SYSTEM's).
-/// Windows only, like the workers that need it.
+/// #3747 — the tree is the owner's ([`segment_in_profile`]), never the
+/// calling process's own; the owner's Roaming AppData folder is taken at its
+/// place below `profile`. Windows only, like the workers that need it.
 #[cfg(target_os = "windows")]
 pub fn data_local_dir_in_profile(profile: &Path) -> PathBuf {
     let app_data = profile.join("AppData");
@@ -562,23 +570,48 @@ pub fn data_local_dir_in_profile(profile: &Path) -> PathBuf {
 /// AppData folders are `roaming` and `local`, with `exists` as the filesystem.
 #[cfg(any(target_os = "windows", test))]
 fn data_local_dir_in(roaming: &Path, local: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
-    // RED seam (#3747): master's answer, the calling process's own segment.
-    let _ = (roaming, exists);
-    local.join(ORG).join(app_segment()).join("data")
+    local
+        .join(ORG)
+        .join(segment_in_profile(roaming, Some(local), exists))
+        .join("data")
 }
 
 /// #3747 — the config folder of the account whose Roaming AppData folder is
 /// `roaming` and whose Local AppData folder is `local` (`None` when not
-/// known).
+/// known), in the tree that account's own processes pick
+/// ([`segment_in_profile`]). The service host reads the console user's
+/// enrollment here. `local` changes no config read: the local data folders
+/// decide only where neither tree holds a config folder, and then neither
+/// holds a `config.toml`.
 #[cfg(any(target_os = "windows", test))]
 pub fn config_dir_in_profile(
     roaming: &Path,
     local: Option<&Path>,
     exists: impl Fn(&Path) -> bool,
 ) -> PathBuf {
-    // RED seam (#3747): master's answer, the new tree whatever is there.
-    let _ = (local, exists);
-    roaming.join(ORG).join(NEW_APP).join("config")
+    roaming
+        .join(ORG)
+        .join(segment_in_profile(roaming, local, exists))
+        .join("config")
+}
+
+/// #3747 — the tree the processes of the account whose Roaming and Local
+/// AppData folders are `roaming` and `local` pick for themselves:
+/// [`segment_of`] over that account's folders, laid out as `ProjectDirs` lays
+/// them out on Windows. A path into another account's profile is named
+/// through this, never through the naming process's own choice. `local`
+/// `None` takes that account's local data folders as absent.
+#[cfg(any(target_os = "windows", test))]
+fn segment_in_profile(
+    roaming: &Path,
+    local: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> &'static str {
+    segment_of(
+        |app| Some(roaming.join(ORG).join(app).join("config")),
+        |app| local.map(|local| local.join(ORG).join(app).join("data")),
+        exists,
+    )
 }
 
 /// The SCM-service log directory (`%PROGRAMDATA%\roomler\<segment>\service-logs`).
@@ -810,11 +843,11 @@ fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
 /// ([`kept_in_place`]). They then move in the order given, the config pair
 /// first and by one rename, and a pair whose move fails ends the move: the
 /// pairs before it stay moved, the pairs after it stay in the OLD tree.
-/// The segment choice ([`segment_of`]) keys on the NEW config folder and
-/// the NEW local data folder. The move makes the first only whole, by one
-/// rename, and the second only when the config pair's move did not fail:
-/// the daemon reads the config it had, from the NEW tree or from the OLD
-/// one.
+/// The segment choice ([`segment_of`]) takes the tree that holds a config
+/// folder. The move makes the NEW config folder only whole, by one rename,
+/// and the NEW local data folder only when the config pair's move did not
+/// fail: the daemon reads the config it had, from the NEW tree or from the
+/// OLD one.
 fn migrate_dirs_within(
     root: &Path,
     pairs: &[(PathBuf, PathBuf)],
@@ -1674,9 +1707,12 @@ mod tests {
         let Some(dirs) = project_dirs() else {
             return;
         };
-        // Only meaningful when LocalAppData sits in its default place.
-        let default_local = Path::new(&profile).join("AppData").join("Local");
-        if !dirs.data_local_dir().starts_with(&default_local) {
+        // Only meaningful when the Local and Roaming AppData folders sit in
+        // their default places, where the profile-relative form looks.
+        let app_data = Path::new(&profile).join("AppData");
+        if !dirs.data_local_dir().starts_with(app_data.join("Local"))
+            || !dirs.config_dir().starts_with(app_data.join("Roaming"))
+        {
             return;
         }
         assert_eq!(
