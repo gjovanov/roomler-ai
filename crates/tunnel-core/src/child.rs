@@ -124,9 +124,13 @@ pub fn output_bounded(cmd: &mut Command, deadline: Duration) -> io::Result<Outpu
 ///   end) fails the call, with [`io::ErrorKind::BrokenPipe`] and an
 ///   [`InputNotTaken`] that carries the child's own exit and stderr.
 ///
-/// The child is always reaped before this returns. It blocks the calling
-/// thread: call it from a blocking context, never on an async runtime's
-/// worker.
+/// The child is always reaped before this returns. Once it has exited, the
+/// call waits up to `FEED_GRACE` (2 s) for the thread that wrote its stdin to
+/// say how the write ended, so a call can last `deadline` and 2 s more. The
+/// reap after a kill waits as [`output_bounded`]'s does: a child in an
+/// uninterruptible wait, on a hung network home for instance, holds the call
+/// until the kernel lets it go. It blocks the calling thread: call it from a
+/// blocking context, never on an async runtime's worker.
 pub fn output_bounded_fed(
     cmd: &mut Command,
     stdin: &[u8],
@@ -766,16 +770,23 @@ mod tests {
     }
 
     /// More than `cap` on stdout is refused, not truncated, and the child is
-    /// stopped for it.
+    /// stopped for it: one that never ends by itself is stopped long before
+    /// its deadline.
     #[test]
     fn an_oversize_reply_is_refused() {
+        let started = Instant::now();
         let e = output_bounded_fed(
-            &mut sh("head -c 2000000 /dev/zero"),
+            &mut sh("exec cat /dev/zero"),
             b"",
             Duration::from_secs(10),
             1 << 20,
         )
         .expect_err("over the cap");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         assert_ne!(e.kind(), io::ErrorKind::TimedOut, "{e}");
         assert!(e.to_string().contains("more than 1048576"), "{e}");
     }

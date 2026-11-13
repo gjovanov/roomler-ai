@@ -148,7 +148,7 @@ sequenceDiagram
 | Credentials | set by our own `pre_exec` hook, not by `Command::uid` and `Command::gid` | std empties the group list, and macOS turns an empty list into `[0]`: the child would keep group 0 |
 | Environment | `env_clear()` | the child reads no `HOME` and no knob. Its home is `appdirs::own_home()` (`appdirs.rs:862`), the account database's home for its own uid |
 | Working directory | `/` | a folder of root's, whatever the caller's was |
-| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:363-375`) | the child holds none of root's open files |
+| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:367-379`) | the child holds none of root's open files |
 | Session, umask | `setsid()`, `umask(0o077)` | no controlling terminal; files born private |
 
 The hook allocates nothing and runs, each call checked (a failure is `spawn`'s error, and nothing runs): `setsid()`,
@@ -253,13 +253,13 @@ Today root's own kept copy is written in place, at its final name (`one_row.rs:1
 
 ### Root and the person's child
 
-Every reply is one JSON object with `"v":1`, `version`, `uid`, `gid` and `groups`, plus the verb's fields. It is
-parsed with unknown fields refused.
+Every reply is one JSON object with `"v":1`, `version`, `uid`, `gid` and `groups`, and the verb's answer under the
+verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
 
 | Verb | stdin | Reply | Exit |
 |---|---|---|---|
-| `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path, and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and for the last two whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode; `legacy`: which old copies exist | 0 |
-| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the new config's sha256; whether the plist was removed | 0; 3 when either live file is not the expected bytes (it checks both before it changes either) |
+| `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path (it starts with `/` and does not end with one), and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and for the last two whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode, where a link reads as `not_regular`; `legacy`: the kind of what is at each name an old copy is kept under (`other` with no uid when it could not be looked at) | 0 |
+| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the sha256 of the config it wrote; whether the plist was removed | 0; 3 when either live file is not the expected bytes, or is no longer a regular file (it checks both before it changes either) |
 | `put-back` | the kept bytes and modes of both files | the sha256 of each file written | 0; 4 when `<L>` is not writable |
 | `put-back-legacy` | none | which old copies it moved | 0; 4 as in `--revert` below |
 | all | | | 2: usage, a failed identity check or another version; 4: not writable (stderr: path, owner, mode); 1: any other error |
@@ -274,7 +274,8 @@ parsed with unknown fields refused.
   plus one byte: a FIFO, a device or a huge file is an error, not a wait. Its writes are a temporary file in the same
   folder, `fsync`, `rename`, as `config::save` does. `put-back` makes the plist with its recorded mode less group
   and other write (0644 when none was recorded), and `<L>` 0755 when it is missing: launchd ignores a plist that
-  group or others can write, and the package sets 644 (`postinstall:335-336`).
+  group or others can write, and the package sets 644 (`postinstall:335-336`). It writes the config with its
+  recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
   (`crates/agent-core/src/config.rs:3882-3921`): the same rules, no path, unknown keys noted from the text
   (`note_unknown_keys` reads by path, `:4292-4295`), and no `.prev` repair, which belongs to the person's own agent

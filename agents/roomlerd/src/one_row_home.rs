@@ -14,8 +14,8 @@
 //!
 //! | Verb | stdin | The reply's answer | Exit |
 //! |---|---|---|---|
-//! | `read` | none | `read`: the kind, owner and mode of the home (whether it is a plain absolute path, its device and inode), of `~/Library`, `~/Library/LaunchAgents` and the roomler folder (each also whether it can write there); the folder's segment; the config's and the LaunchAgent plist's bytes, owner and mode, or why not; which copies an older release kept | 0 |
-//! | `convert --expect-config <sha256\|none> --expect-plist <sha256\|none>` | none | `convert`: the new config's sha256, whether the plist was removed | 0; 3 when either live file is not the bytes named (both are checked before either changes) |
+//! | `read` | none | `read`: the kind, owner and mode of the home (whether it is a plain absolute path, its device and inode), of `~/Library`, `~/Library/LaunchAgents` and the roomler folder (each also whether it can write there); the folder's segment; the config's and the LaunchAgent plist's bytes, owner and mode, or why not (a link reads as `not_regular`); the kind of what is at each name an older release kept a copy under | 0 |
+//! | `convert --expect-config <sha256\|none> --expect-plist <sha256\|none>` | none | `convert`: the new config's sha256 (of the bytes it wrote), whether the plist was removed | 0; 3 when either live file is not the bytes named, or is no longer a regular file (both are checked before either changes) |
 //! | `put-back` | [`Kept`]: the kept bytes and modes of both files | `put_back`: the sha256 of each file written | 0; 4 when a folder it writes is not writable |
 //! | `put-back-legacy` | none | `put_back_legacy`: which old copies it renamed back | 0; 4 as `put-back` |
 //! | every verb | | | 2: usage, a failed check of itself, or another version; 4: not writable (stderr: the path, its owner and mode); 1: any other error |
@@ -25,7 +25,7 @@
 //! the verb's answer under the verb's own name. Every type is parsed with
 //! unknown fields refused ([`Reply::parse`] is the parent's reading of it).
 //!
-//! **The child's check of itself**, in [`run`], before it reads its verb's
+//! **The child's check of itself**, in `run`, before it reads its verb's
 //! arguments or any file; each failure is exit 2:
 //!
 //! 1. `umask(0o077)`: what it makes is born private.
@@ -41,7 +41,8 @@
 //!
 //! **Bounds.** A config of [`CONFIG_BOUND`], a plist of [`PLIST_BOUND`], stdin
 //! of [`STDIN_BOUND`]; anything larger is exit 1 (`read` reports it as
-//! `too_large`). A read opens with `O_NONBLOCK` and `O_NOFOLLOW`, checks on the
+//! `too_large`), and so is a new config `convert` would write over its bound,
+//! before anything changes. A read opens with `O_NONBLOCK` and `O_NOFOLLOW`, checks on the
 //! open descriptor that it is a regular file, and reads at most the bound and
 //! one byte: a FIFO, a device or a huge file is an error, never a wait. A
 //! write is a new temporary file in the same folder, `fsync`, its mode set,
@@ -495,7 +496,7 @@ pub struct ReadAnswer {
     pub segment: Segment,
     pub config: Held,
     pub plist: Held,
-    pub legacy: Legacy,
+    pub legacy: LegacyKinds,
 }
 
 /// The home itself.
@@ -531,8 +532,18 @@ pub enum Segment {
     Legacy,
 }
 
-/// The copies an older release kept in the roomler folder:
-/// `config.toml.pre-one-row` and `com.roomler.agent.plist.pre-one-row`.
+/// What `lstat` finds at each name an older release kept its copies under in
+/// the roomler folder (`config.toml.pre-one-row`,
+/// `com.roomler.agent.plist.pre-one-row`): `absent` when there is none,
+/// `other` with no owner when it could not be looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyKinds {
+    pub config: Kind,
+    pub plist: Kind,
+}
+
+/// `put-back-legacy`'s answer: which of those copies it renamed back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Legacy {
@@ -624,11 +635,23 @@ mod base64_opt {
 }
 
 /// What the child writes and how it ends.
-#[derive(Debug)]
 pub struct Outcome {
     pub exit: Exit,
     pub stdout: Vec<u8>,
     pub stderr: String,
+}
+
+/// Never the bytes, as [`Held`]: `read`'s reply carries the config.
+impl std::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Outcome {{ exit: {:?}, stdout: {} bytes, stderr: {:?} }}",
+            self.exit,
+            self.stdout.len(),
+            self.stderr
+        )
+    }
 }
 
 /// Why a verb stopped.
@@ -723,8 +746,11 @@ enum Answer {
 }
 
 /// The child: its check of itself, then the verb. `args` is what follows
-/// `one-row-home` on the command line.
-pub fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
+/// `one-row-home` on the command line. Private: outside this module a verb
+/// is reached only through [`answer_if_asked`], after every check, as the
+/// process itself (`RealMe`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
     // 1. What it makes is born private, whoever started it and however.
     me.umask_private();
     // 2. What the kernel says this process is, before any argument is read.
@@ -786,9 +812,8 @@ pub fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
 }
 
 /// The verb, below the checks. `home` is the account database's home for
-/// `me.uid`, `stdin` what root sent. Private: outside this module the verbs
-/// are reached through [`run`] alone, after every check; the tests here pass
-/// a home of their own.
+/// `me.uid`, `stdin` what root sent. Private, as [`run`] is: the tests here
+/// pass a home of their own.
 fn answer(verb: Verb, home: &Path, me: &Creds, stdin: &[u8], fs: &mut impl Fs) -> Outcome {
     let at = Places::of(home, &*fs);
     // What a verb that ends well still says: the child has no log.
@@ -897,9 +922,9 @@ fn read(at: &Places, fs: &impl Fs) -> ReadAnswer {
         segment: at.segment,
         config: fs.read(&at.config, CONFIG_BOUND),
         plist: fs.read(&at.plist, PLIST_BOUND),
-        legacy: Legacy {
-            config: fs.lstat(&at.legacy_config).kind != Kind::Absent,
-            plist: fs.lstat(&at.legacy_plist).kind != Kind::Absent,
+        legacy: LegacyKinds {
+            config: fs.lstat(&at.legacy_config).kind,
+            plist: fs.lstat(&at.legacy_plist).kind,
         },
     }
 }
@@ -929,6 +954,15 @@ fn live(fs: &impl Fs, path: &Path, bound: usize, want: Expect) -> Result<Option<
                 "{} is not the bytes it was",
                 path.display()
             ))),
+            // A link, a FIFO or a folder where the file was: it changed, as
+            // something where nothing was is under `none`.
+            Held::Unreadable {
+                error: ReadError::NotRegular,
+                ..
+            } => Err(Fail::Changed(format!(
+                "{} is no longer a regular file",
+                path.display()
+            ))),
             unreadable => Err(Fail::Error(format!("{}: {unreadable:?}", path.display()))),
         },
     }
@@ -940,8 +974,9 @@ fn not_writable(fs: &impl Fs, path: &Path) -> Fail {
 
 /// `convert`: both live files checked against what root named, both folders
 /// it changes checked writable, and the new config made from the bytes it
-/// checked, before anything changes; then the plist goes, those bytes are kept
-/// as the config's `.prev` and the new config is written. No file is read
+/// checked and held to its bound, before anything changes; then the plist
+/// goes, those bytes are kept as the config's `.prev` and the new config is
+/// written. The reply's sha256 is of the bytes it wrote: no file is read
 /// again by path. The keys of the outgoing config it could not keep, and a
 /// `.prev` it could not write, go in `said`.
 fn convert(
@@ -969,6 +1004,12 @@ fn convert(
             let (blank, lost) =
                 crate::config::serialise_over(&without_enrollments(&cfg), text, &at.config)
                     .map_err(|e| Fail::Error(format!("{e:#}")))?;
+            // Within the bound root reads, before anything changes.
+            if blank.len() > CONFIG_BOUND {
+                return Err(Fail::Error(format!(
+                    "the new {origin} would be over {CONFIG_BOUND} bytes"
+                )));
+            }
             if !lost.is_empty() {
                 said.push(format!(
                     "keys of {origin} this build does not know were not kept: {}",
@@ -1000,12 +1041,7 @@ fn convert(
             }
             fs.write(&at.config, blank.as_bytes(), 0o600)
                 .map_err(|e| Fail::Error(format!("saving {origin}: {e}")))?;
-            match fs.read(&at.config, CONFIG_BOUND) {
-                Held::Present { bytes, .. } => Some(sha256_hex(&bytes)),
-                other => {
-                    return Err(Fail::Error(format!("{origin} after its save: {other:?}")));
-                }
-            }
+            Some(sha256_hex(blank.as_bytes()))
         }
         None => None,
     };
@@ -1020,16 +1056,19 @@ fn convert(
 fn make_dirs(fs: &mut impl Fs, chain: &[(&Path, u32)]) -> Result<(), Fail> {
     for (dir, mode) in chain {
         let st = fs.lstat(dir);
+        let parent = dir.parent().unwrap_or(dir);
         match st.kind {
             Kind::Dir | Kind::Link => {}
             Kind::Absent => {
-                let parent = dir.parent().unwrap_or(dir);
                 if !fs.writable(parent) {
                     return Err(not_writable(&*fs, parent));
                 }
                 fs.make_dir(dir, *mode)
                     .map_err(|e| Fail::Error(format!("making {}: {e}", dir.display())))?;
             }
+            // It could not be looked at: the folder it is in does not let
+            // the person through.
+            Kind::Other if st.uid.is_none() => return Err(not_writable(&*fs, parent)),
             Kind::File | Kind::Other => {
                 return Err(Fail::Error(format!("{} is not a folder", dir.display())));
             }
@@ -1140,11 +1179,17 @@ pub fn answer_if_asked() {
     if args.get(1).map(OsString::as_os_str) != Some(std::ffi::OsStr::new(VERB)) {
         return;
     }
-    let out = run(&args[2..], &mut RealMe, &mut RealFs);
-    {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(&out.stdout);
-        let _ = stdout.flush();
+    let mut out = run(&args[2..], &mut RealMe, &mut RealFs);
+    let mut stdout = io::stdout().lock();
+    let written = stdout.write_all(&out.stdout).and_then(|()| stdout.flush());
+    drop(stdout);
+    if let Err(e) = written {
+        // 0 says the reply is on stdout: one that did not get there is not
+        // a success.
+        if out.exit == Exit::Done {
+            out.exit = Exit::Error;
+        }
+        out = out.saying(&[format!("the reply could not be written: {e}")]);
     }
     if !out.stderr.is_empty() {
         let _ = writeln!(io::stderr(), "{VERB}: {}", out.stderr);
@@ -1549,6 +1594,15 @@ mod tests {
             self.nodes.insert(path.to_path_buf(), node);
         }
 
+        /// A name `lstat` cannot look at, as where its folder does not let
+        /// the person through: no kind it can tell, no owner, no mode.
+        fn hidden(&mut self, path: &Path) {
+            self.put(path, Kind::Other, 0, 0, Vec::new(), false);
+            if let Some(node) = self.nodes.get_mut(path) {
+                node.readable = false;
+            }
+        }
+
         fn log(&self, what: String) {
             self.calls.borrow_mut().push(what);
         }
@@ -1567,11 +1621,21 @@ mod tests {
     impl Fs for FakeFs {
         fn lstat(&self, path: &Path) -> Stat {
             self.log(format!("lstat {}", path.display()));
-            self.nodes.get(path).map_or(Stat::ABSENT, |n| Stat {
-                kind: n.kind,
-                uid: Some(n.uid),
-                mode: Some(n.mode),
-            })
+            self.nodes
+                .get(path)
+                .map_or(Stat::ABSENT, |n| match (n.kind, n.readable) {
+                    // See `hidden`.
+                    (Kind::Other, false) => Stat {
+                        kind: Kind::Other,
+                        uid: None,
+                        mode: None,
+                    },
+                    _ => Stat {
+                        kind: n.kind,
+                        uid: Some(n.uid),
+                        mode: Some(n.mode),
+                    },
+                })
         }
         fn writable(&self, path: &Path) -> bool {
             self.log(format!("access {}", path.display()));
@@ -1711,6 +1775,8 @@ mod tests {
                 UID,
                 GID,
             ),
+            ("real uid differs", Creds { uid: 0, ..creds() }, UID, GID),
+            ("real gid differs", Creds { gid: 0, ..creds() }, UID, GID),
             ("one more group", other_groups(vec![GID, 12]), UID, GID),
             ("group 0 kept", other_groups(vec![0, GID]), UID, GID),
             ("no group at all", other_groups(vec![]), UID, GID),
@@ -1862,7 +1928,7 @@ mod tests {
 
         let source = include_str!("one_row_home.rs");
         let code = source.split("\nmod tests {").next().unwrap();
-        for word in ["env::var", "getenv", "env!(\"HOME"] {
+        for word in ["env::var", "getenv", "env!(\"HOME", "home_dir"] {
             assert!(
                 !code.contains(word),
                 "the child reads the environment: `{word}`"
@@ -1891,6 +1957,8 @@ mod tests {
     fn read_reports_what_is_there_and_who_owns_it() {
         let (mut fs, at) = a_home();
         fs.file(&at.legacy_config, b"old", 0o600);
+        // A name it cannot look at is reported as that, not as a copy.
+        fs.hidden(&at.legacy_plist);
         fs.put(&at.agents_dir, Kind::Dir, 0, 0o755, Vec::new(), false);
         let out = answer(Verb::Read, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
@@ -1928,9 +1996,9 @@ mod tests {
         assert_eq!(read.segment, Segment::Current);
         assert_eq!(
             read.legacy,
-            Legacy {
-                config: true,
-                plist: false
+            LegacyKinds {
+                config: Kind::File,
+                plist: Kind::Other
             }
         );
         assert!(fs.changes().is_empty(), "{:?}", fs.changes());
@@ -2004,9 +2072,10 @@ mod tests {
     }
 
     /// The new config is made from the bytes `convert` checked, and from
-    /// nothing read later: the config is read through [`Fs::read`] alone, once
-    /// before it is written and once after, for the reply. A key this build
-    /// does not know is kept, and one it cannot keep is said on stderr.
+    /// nothing read later: the config is read through [`Fs::read`] once,
+    /// before it is written, and the reply's sha256 is of the bytes written.
+    /// A key this build does not know is kept, and one it cannot keep is said
+    /// on stderr.
     #[test]
     fn convert_writes_from_the_bytes_it_checked() {
         let (mut fs, at) = a_home();
@@ -2038,7 +2107,12 @@ mod tests {
                 (rest.is_empty() || rest.starts_with(' ')).then_some(what)
             })
             .collect();
-        assert_eq!(on_config, ["read", "write", "read"], "{calls:?}");
+        assert_eq!(on_config, ["read", "write"], "{calls:?}");
+        let convert = Reply::parse(&out.stdout, UID, GID, verb)
+            .unwrap()
+            .convert
+            .unwrap();
+        assert_eq!(convert.config_sha256, Some(sha256_hex(saved.as_bytes())));
     }
 
     /// The outgoing config is kept as its `.prev`, 0600, as a save keeps it.
@@ -2090,6 +2164,13 @@ mod tests {
                     plist: Expect::Absent,
                 },
             ),
+            (
+                "a config where root saw none",
+                Verb::Convert {
+                    config: Expect::Absent,
+                    plist: seen_plist,
+                },
+            ),
         ];
         for (case, verb) in cases {
             let (mut fs, at) = a_home();
@@ -2104,11 +2185,22 @@ mod tests {
         let out = answer(verb, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::Changed, "a config gone: {}", out.stderr);
         assert!(fs.changes().is_empty());
+        // A link, a FIFO or a folder where root saw the config has changed
+        // as well.
+        for kind in [Kind::Link, Kind::Other, Kind::Dir] {
+            let (mut fs, at) = a_home();
+            let verb = shown(&at, &fs);
+            fs.put(&at.config, kind, UID, 0o600, Vec::new(), true);
+            let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+            assert_eq!(out.exit, Exit::Changed, "{kind:?}: {}", out.stderr);
+            assert!(fs.changes().is_empty(), "{kind:?}: {:?}", fs.changes());
+        }
     }
 
     /// A folder it would change that it cannot write is exit 4 before
-    /// anything changes, naming the folder, its owner and its mode; a file
-    /// over its bound or not a file is exit 1, also before anything changes.
+    /// anything changes, naming the folder, its owner and its mode; a config
+    /// over its bound, a new config that would be over it, or a config that
+    /// does not parse is exit 1, also before anything changes.
     #[test]
     fn convert_that_cannot_finish_changes_nothing() {
         let (mut fs, at) = a_home();
@@ -2135,6 +2227,20 @@ mod tests {
         let verb = shown(&at, &fs);
         let out = answer(verb, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::Error, "a config that does not parse");
+        assert!(fs.changes().is_empty(), "{:?}", fs.changes());
+
+        // Within its bound, but the text a save writes over it is not: the
+        // keys a save adds, and the one this build does not know, kept.
+        let (mut fs, at) = a_home();
+        let line = "a_key_this_build_does_not_know = \"\"\n";
+        let fill = "x".repeat(CONFIG_BOUND - ENROLLED.len() - line.len());
+        let config = format!("{ENROLLED}a_key_this_build_does_not_know = \"{fill}\"\n");
+        assert_eq!(config.len(), CONFIG_BOUND);
+        fs.file(&at.config, config.as_bytes(), 0o600);
+        let verb = shown(&at, &fs);
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
+        assert!(out.stderr.contains("would be over"), "{}", out.stderr);
         assert!(fs.changes().is_empty(), "{:?}", fs.changes());
     }
 
@@ -2179,8 +2285,56 @@ mod tests {
         );
         assert_eq!(plist_mode(None), 0o644);
         assert_eq!(plist_mode(Some(0o100664)), 0o644);
+        assert_eq!(plist_mode(Some(0o600)), 0o600);
         assert_eq!(config_mode(None), 0o600);
         assert_eq!(config_mode(Some(0o644)), 0o600);
+        assert_eq!(config_mode(Some(0o400)), 0o400);
+    }
+
+    /// A home with no `~/Library`: the person's process makes it 0700, and
+    /// each folder below it, before each file.
+    #[test]
+    fn put_back_makes_a_missing_library() {
+        let (mut fs, at) = a_home();
+        for path in [
+            &at.config,
+            &at.folder,
+            &at.support,
+            &at.plist,
+            &at.agents_dir,
+            &at.library,
+        ] {
+            fs.nodes.remove(path);
+        }
+        let stdin = kept(Some(b"config"), None, Some(PLIST), None);
+        let out = answer(Verb::PutBack, &at.home, &creds(), &stdin, &mut fs);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        assert_eq!(
+            fs.changes(),
+            [
+                format!("make_dir {} 700", at.library.display()),
+                format!("make_dir {} 755", at.support.display()),
+                format!("make_dir {} 700", at.folder.display()),
+                format!("write {} 600", at.config.display()),
+                format!("make_dir {} 755", at.agents_dir.display()),
+                format!("write {} 644", at.plist.display()),
+            ]
+        );
+    }
+
+    /// A folder on the way that cannot be looked at: the folder it is in
+    /// does not let the person through, so that one is named, exit 4.
+    #[test]
+    fn put_back_through_a_folder_it_cannot_look_at_is_exit_4() {
+        let (mut fs, at) = a_home();
+        fs.nodes.remove(&at.plist);
+        fs.hidden(&at.agents_dir);
+        let stdin = kept(None, None, Some(PLIST), None);
+        let out = answer(Verb::PutBack, &at.home, &creds(), &stdin, &mut fs);
+        assert_eq!(out.exit, Exit::NotWritable, "{}", out.stderr);
+        let named = format!("not writable: {} (", at.library.display());
+        assert!(out.stderr.contains(&named), "{}", out.stderr);
+        assert!(fs.changes().is_empty(), "{:?}", fs.changes());
     }
 
     /// Where the person's folder is gone, the person's process makes it.
@@ -2303,6 +2457,21 @@ mod tests {
         );
     }
 
+    /// The roomler folder not writable: nothing is renamed, and exit 4
+    /// names the folder.
+    #[test]
+    fn put_back_legacy_where_the_folder_is_not_writable_is_exit_4() {
+        let (mut fs, at) = a_home();
+        fs.file(&at.legacy_config, ENROLLED.as_bytes(), 0o600);
+        fs.put(&at.folder, Kind::Dir, 0, 0o755, Vec::new(), false);
+        let out = answer(Verb::PutBackLegacy, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::NotWritable, "{}", out.stderr);
+        let named = format!("not writable: {} (", at.folder.display());
+        assert!(out.stderr.contains(&named), "{}", out.stderr);
+        assert!(fs.changes().is_empty(), "{:?}", fs.changes());
+        assert!(fs.nodes.contains_key(&at.legacy_config));
+    }
+
     fn a_reply() -> Vec<u8> {
         let (mut fs, at) = a_home();
         answer(Verb::Read, &at.home, &creds(), &[], &mut fs).stdout
@@ -2378,13 +2547,64 @@ mod tests {
         assert_eq!(Exit::from_code(5), None);
     }
 
-    /// The real files, on a temporary home (the Linux lanes; macOS compiles
-    /// them). The account checks are not here: they need another account.
+    /// The real files, on a temporary home, and the real check of itself in
+    /// a process of its own (the Linux lanes run these). A check that passes
+    /// needs another account, so the one here is refused.
     #[cfg(unix)]
     mod on_disk {
         use super::*;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::time::{Duration, Instant};
+
+        /// Set in the process [`the_real_check_refuses_an_account_it_was_not_given`]
+        /// starts again from this test binary: that process is the child.
+        const AS_CHILD: &str = "ROOMLER_TEST_ONE_ROW_HOME_CHILD";
+
+        /// The check of itself through `RealMe`: the kernel's ids and group
+        /// list, and `setuid(0)`. It runs in a process of its own, this test
+        /// binary started again, because the umask and the ids are the whole
+        /// process's. Asked for the uid after its own, it is exit 2 with
+        /// nothing written, and its line names the group list the kernel
+        /// gives it; where it is not root, it cannot become root.
+        #[test]
+        fn the_real_check_refuses_an_account_it_was_not_given() {
+            if std::env::var_os(AS_CHILD).is_some() {
+                // SAFETY: reads of this process's own ids.
+                let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
+                let args = os(&child_args(uid.wrapping_add(1).max(1), gid.max(1), Verb::Read)[1..]);
+                let out = run(&args, &mut RealMe, &mut RealFs);
+                let groups = kernel_groups().expect("the kernel's group list");
+                assert_eq!(out.exit, Exit::Refused, "{}", out.stderr);
+                assert!(out.stdout.is_empty());
+                assert!(
+                    out.stderr.contains(&format!("groups {groups:?}, not uid")),
+                    "{} / {groups:?}",
+                    out.stderr
+                );
+                if euid != 0 {
+                    assert!(RealMe.cannot_become_root());
+                }
+                println!("one-row-home-child|refused|{groups:?}");
+                return;
+            }
+            let test =
+                "one_row_home::tests::on_disk::the_real_check_refuses_an_account_it_was_not_given";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(AS_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "the child failed: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                stdout.contains("one-row-home-child|refused|"),
+                "the child did not run the check: {stdout}"
+            );
+        }
 
         fn mode(path: &Path) -> u32 {
             std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
@@ -2446,9 +2666,9 @@ mod tests {
             );
             assert_eq!(
                 read.legacy,
-                Legacy {
-                    config: false,
-                    plist: true
+                LegacyKinds {
+                    config: Kind::Absent,
+                    plist: Kind::File
                 }
             );
             assert_eq!(read.segment, Segment::Current);
@@ -2513,14 +2733,15 @@ mod tests {
                 }
             ));
 
-            // `convert` over the FIFO: an error at once, and nothing changes.
+            // `convert` over the FIFO where root saw a config: changed, at
+            // once, and nothing changes.
             let verb = Verb::Convert {
                 config: Expect::of(Some(ENROLLED.as_bytes())),
                 plist: Expect::Absent,
             };
             let started = Instant::now();
             let out = answer(verb, dir.path(), &creds(), &[], &mut RealFs);
-            assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
+            assert_eq!(out.exit, Exit::Changed, "{}", out.stderr);
             assert!(started.elapsed() < Duration::from_secs(5));
         }
 
