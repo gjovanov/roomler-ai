@@ -1980,6 +1980,107 @@ mod tests {
         // never resurrect the retired name.
         assert_eq!(resolve_machine_global(&base), base.join(NEW_APP));
     }
+
+    /// Set in the child [`a_child_given_another_home_keeps_its_accounts_folders`]
+    /// starts: the child prints what it resolves and writes nothing.
+    const CHILD_3802: &str = "ROOMLER_TEST_3802_CHILD";
+
+    /// Runs this test binary again as a child with `home` as its `HOME`
+    /// (`None`: no `HOME` at all, as launchd starts the root daemon) and
+    /// returns each folder the child resolved: its name, the agent's folder
+    /// ([`project_dirs`]) and `ProjectDirs`' own answer in that same child.
+    fn folders_of_a_child(home: Option<&Path>) -> Vec<(String, PathBuf, PathBuf)> {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "appdirs::tests::a_child_given_another_home_keeps_its_accounts_folders",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_3802, "1");
+        match home {
+            Some(home) => child.env("HOME", home),
+            None => child.env_remove("HOME"),
+        };
+        let out = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "the child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| {
+                // libtest prints the test's name on the same line as its first row.
+                let mut cells = line.split_once("3802|")?.1.split('|');
+                Some((
+                    cells.next()?.to_string(),
+                    PathBuf::from(cells.next()?),
+                    PathBuf::from(cells.next()?),
+                ))
+            })
+            .collect();
+        assert_eq!(rows.len(), 3, "the child printed: {stdout}");
+        rows
+    }
+
+    /// #3802 — a roomlerd process given another account's `HOME` (macOS sudo
+    /// keeps the caller's) takes its folders from the account it runs as: on
+    /// macOS from the home the account database names for it, while
+    /// `ProjectDirs` in that same child follows the `HOME` it was given, which
+    /// shows the child really had another one. With its own `HOME`, or none,
+    /// a child resolves exactly what `ProjectDirs` resolves, so nothing an
+    /// installed Mac reads moves. Everywhere else every answer is
+    /// `ProjectDirs`'. The child only resolves paths: the `HOME` it is given
+    /// stays empty, and nothing is made in the home of whoever runs this.
+    #[test]
+    fn a_child_given_another_home_keeps_its_accounts_folders() {
+        if std::env::var_os(CHILD_3802).is_some() {
+            let ours = project_dirs().expect("the agent's folders");
+            let theirs = ProjectDirs::from(QUALIFIER, ORG, app_segment()).expect("ProjectDirs");
+            for (name, ours, theirs) in [
+                ("config", ours.config_dir(), theirs.config_dir()),
+                ("data", ours.data_dir(), theirs.data_dir()),
+                ("data_local", ours.data_local_dir(), theirs.data_local_dir()),
+            ] {
+                println!("3802|{name}|{}|{}", ours.display(), theirs.display());
+            }
+            return;
+        }
+        let given = tempfile::tempdir().unwrap();
+        let another = folders_of_a_child(Some(given.path()));
+        assert!(
+            std::fs::read_dir(given.path()).unwrap().next().is_none(),
+            "the child wrote into the HOME it was given"
+        );
+        for (name, ours, theirs) in &another {
+            #[cfg(target_os = "macos")]
+            {
+                let account = own_home().expect("the account database names this account's home");
+                assert!(
+                    theirs.starts_with(given.path()),
+                    "{name}: ProjectDirs did not follow the given HOME: {theirs:?}"
+                );
+                assert!(
+                    ours.starts_with(&account) && !ours.starts_with(given.path()),
+                    "{name}: {ours:?} is not in {account:?}, the home of the account the child runs as"
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(ours, theirs, "{name}: the folders moved off ProjectDirs");
+        }
+        #[cfg(unix)]
+        let own = own_home();
+        #[cfg(not(unix))]
+        let own: Option<PathBuf> = None;
+        for home in [own.as_deref(), None] {
+            for (name, ours, theirs) in folders_of_a_child(home) {
+                assert_eq!(ours, theirs, "{name} with HOME {home:?}: a folder moved");
+            }
+        }
+    }
 }
 
 // RETIRED-NAME-ANCHOR-END
