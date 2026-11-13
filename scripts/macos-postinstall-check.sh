@@ -53,13 +53,18 @@ if [ "${1:-}" != --in-container ]; then
     # is the last line as well as docker's status: a docker CLI that is a shim
     # (WSL's is one) can answer 0 for a container that exited 1.
     log=$(mktemp)
-    trap 'rm -f "$log"' EXIT
+    # The inner half runs only beside this run's own token (see below).
+    tokfile=$(mktemp)
+    token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    printf '%s' "$token" >"$tokfile"
+    trap 'rm -f "$log" "$tokfile"' EXIT
     set +e
     docker run --rm --network none \
         -v "$packaging:/src/packaging:ro" \
         -v "$script:/src/postinstall:ro" \
         -v "$here/$(basename "$0"):/src/check.sh:ro" \
-        "$image" bash /src/check.sh --in-container 2>&1 | tee "$log"
+        -v "$tokfile:/src/once-token:ro" \
+        "$image" bash /src/check.sh --in-container "$token" 2>&1 | tee "$log"
     st=${PIPESTATUS[0]}
     set -e
     if [ "$st" = 0 ] && [ "$(tail -n 1 "$log")" = "every case passed" ]; then
@@ -71,9 +76,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # In the container. This half deletes /Library, /Applications and /Users
-# between cases, so it refuses to run anywhere else.
+# between cases, so it refuses to run anywhere but the container this script
+# starts: that one alone holds /src/once-token, the token this run made.
 # ---------------------------------------------------------------------------
-if [ ! -f /.dockerenv ] && [ ! -f /run/.containerenv ]; then
+if [ ! -f /src/once-token ] || [ -z "${2:-}" ] || [ "$(cat /src/once-token)" != "$2" ]; then
     echo "refusing: --in-container runs only inside the container this script starts" >&2
     exit 2
 fi
