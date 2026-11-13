@@ -382,6 +382,11 @@ Three more shapes the registry carries:
   (`crates/modules/conference/src/revoke.rs`, the flow in `docs/real-time.md`). Then chat, the
   record owner and so later in `HOOK_ORDER`, drops the person's room memberships of an org they
   left (`crates/modules/chat/src/membership.rs`).
+- **A deleted room** ends every membership of it at once: chat's room delete calls
+  `core.hooks.room_removed`, AFTER the room and its memberships are gone. Conference, the only
+  holder that keeps anything by the room, ends the call running in it for everyone in it, on
+  whichever pod serves it; the room's member list is gone by then, so the people to tell come
+  from the call's media. The other modules keep the default no-op.
 
 ---
 
