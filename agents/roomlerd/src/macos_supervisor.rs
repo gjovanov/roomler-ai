@@ -526,8 +526,8 @@ pub fn stale_workers(ps: &str, commands: &[String], own_pid: u32) -> Vec<(u32, u
 /// #3802 — `not_theirs` is the person's folder when another account owns it
 /// ([`FolderNotTheirs`]). The worker writes its log and its config there, so
 /// that is the cause whatever the exit, and the reading names the folder and
-/// the one command that gives it back (`move_aside`), never the log the
-/// worker could not write.
+/// what gives it back (`move_aside`), never the log the worker could not
+/// write.
 pub fn gave_up_reason(
     last: Option<WorkerEnd>,
     one_row: bool,
@@ -536,8 +536,7 @@ pub fn gave_up_reason(
     if let Some(f) = not_theirs {
         return format!(
             "the worker cannot write the person's folder {}: uid {} owns it (mode {:o}), \
-             not the person, so the worker's own log is not there either. {}. Then log out \
-             and back in, or restart this daemon: launchctl kickstart -k system/com.roomler.daemon",
+             not the person, so the worker's own log is not there either. {}",
             f.path.display(),
             f.owner,
             f.mode,
@@ -566,39 +565,113 @@ pub fn gave_up_reason(
     .to_string()
 }
 
-/// #3802 — the one command that gives the person's folder back, run as that
-/// person with no `sudo`: move it aside, so their worker makes a new one of
-/// its own. When it holds copies `one-row --revert` reads there and nowhere
-/// else ([`FolderNotTheirs::kept`]), the new folder gets each one back. Every
-/// copy is read as the person before anything moves, so a copy they cannot
-/// read (one the conversion kept of a file of root's, mode 600) moves nothing,
-/// and the revert still finds it where it was.
+/// #3802 — what gives the person's folder back: one line of a POSIX shell
+/// that the person runs as themselves, with no `sudo`. It starts by checking
+/// who runs it, since a fleet exec runs as root and, as root, the folder it
+/// makes would be root's again, so a run by anyone else changes nothing.
+/// Every path is quoted ([`sh_quote`]), and the line holds no `"`, `$` or
+/// backtick, so it also survives `sh -c "…"`.
+///
+/// With nothing the revert reads in it, the line moves it aside and the
+/// worker makes a new one of its own. With copies `one-row --revert` reads
+/// there and nowhere else ([`FolderNotTheirs::kept`]), it builds the new
+/// folder beside the old one with the copies in it, and only then swaps the
+/// two: the `cp` is the read, done as the person before anything moves, and
+/// if the last move fails, the one before it is undone. The two names it
+/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them, and
+/// BSD `mv` never moves the folder INTO a leftover of an earlier round.
+///
+/// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
+/// no command: moving the folder would leave it where the revert does not
+/// look. Nor does a folder that is not a directory.
 fn move_aside(f: &FolderNotTheirs) -> String {
-    let path = f.path.display();
-    if f.kept.is_empty() {
-        return format!("Move it aside as that person: mv '{path}' '{path}.made-by-root'");
+    if !f.is_dir {
+        return "It is not a folder but a link or a file, so this line gives no command for it."
+            .to_string();
     }
+    let cannot: Vec<String> = f
+        .kept
+        .iter()
+        .filter_map(|k| {
+            let (owner, mode) = k.stat.filter(|_| person_cannot_read(f.uid, k.stat))?;
+            Some(format!(
+                "{} (uid {owner}, mode {:o})",
+                k.name.display(),
+                mode & 0o7777
+            ))
+        })
+        .collect();
+    if !cannot.is_empty() {
+        let one = cannot.len() == 1;
+        return format!(
+            "It holds {}, which the person cannot read, and `sudo roomlerd one-row --revert` \
+             reads {} there and nowhere else: if this folder is moved aside, a later revert \
+             would not restore {}, so this line gives no command to move it.",
+            cannot.join(" and "),
+            if one { "it" } else { "them" },
+            if one { "that file" } else { "those files" },
+        );
+    }
+    let path = f.path.display().to_string();
+    let folder = sh_quote(&path);
+    let aside = sh_quote(&format!("{path}.made-by-root-{}", f.stamp));
+    let who = format!(
+        "as that person (uid {0}), not as root: a fleet exec runs as root unless the device's \
+         policy names the person at the screen, and as root this changes nothing: \
+         id -u | grep -qx {0} && ",
+        f.uid
+    );
+    let restart = " Then log out and back in, or restart this daemon: \
+                   launchctl kickstart -k system/com.roomler.daemon";
+    if f.kept.is_empty() {
+        return format!(
+            "Move it aside {who}mv {folder} {aside} (if it fails, nothing moved).{restart}"
+        );
+    }
+    let new = sh_quote(&format!("{path}.new-{}", f.stamp));
+    let into_new = sh_quote(&format!("{path}.new-{}/", f.stamp));
     let names: Vec<String> = f
         .kept
         .iter()
         .map(|k| k.name.display().to_string())
         .collect();
-    let reads: String = names
-        .iter()
-        .map(|n| format!("test -r '{path}/{n}' && "))
-        .collect();
     let copies: String = names
         .iter()
-        .map(|n| format!("'{path}.made-by-root/{n}' "))
+        .map(|n| format!("{} ", sh_quote(&format!("{path}/{n}"))))
         .collect();
     format!(
-        "It holds {}, which `sudo roomlerd one-row --revert` reads there and nowhere else, \
-         so move it aside as that person and copy {} into the new folder: \
-         {reads}mv '{path}' '{path}.made-by-root' && mkdir '{path}' && cp {copies}'{path}/' \
-         (a test that fails moves nothing: that copy is not the person's to read)",
+        "It holds {}, which `sudo roomlerd one-row --revert` reads there and nowhere else, so \
+         build a new folder with {} beside this one and swap the two, {who}mkdir {new} && cp \
+         {copies}{into_new} && mv {folder} {aside} && {{ mv {new} {folder} || mv {aside} \
+         {folder}; }} (nothing moves until the copies are made, and if the last move fails \
+         the one before it is undone).{restart}",
         names.join(" and "),
         if names.len() == 1 { "it" } else { "them" },
     )
+}
+
+/// #3802 — `s` as one word of a POSIX shell: in single quotes, with each `'`
+/// in it written `'\''`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// #3802 — whether what `lstat` read of a kept copy (owner, full mode) says
+/// the person `uid` cannot read it: a regular file of theirs without the
+/// owner's read bit, or another account's with neither the group's nor the
+/// others' read bit (the copy the conversion kept of a config of root's is
+/// root's, mode 600). Anything else, a copy the group or the others may read,
+/// one that is no regular file or one whose read failed, is left to the `cp`,
+/// which reads it as the person before anything moves.
+fn person_cannot_read(uid: u32, stat: Option<(u32, u32)>) -> bool {
+    stat.is_some_and(|(owner, mode)| {
+        mode & 0o170000 == 0o100000
+            && if owner == uid {
+                mode & 0o400 == 0
+            } else {
+                mode & 0o044 == 0
+            }
+    })
 }
 
 /// #3802 — the console person's folder (the one their worker writes its log
@@ -671,6 +744,9 @@ pub fn folder_not_theirs(
 /// the person `uid`, with `lstat` as the filesystem (owner and full mode of a
 /// path, never through a link at its last name), so it tests on every
 /// platform: `None` when the folder cannot be read or that person owns it.
+/// The names of [`kept_for_revert`] are read in it only when the folder's own
+/// read is a directory, so no read goes through a link at the folder: one
+/// `lstat` of each name, no walk.
 pub fn read_person_folder(
     path: std::path::PathBuf,
     uid: u32,
@@ -678,19 +754,23 @@ pub fn read_person_folder(
     lstat: impl Fn(&std::path::Path) -> std::io::Result<(u32, u32)>,
 ) -> Option<FolderNotTheirs> {
     let (owner, mode) = lstat(&path).ok()?;
-    // A name whose read fails for any reason but "not there" counts as held.
-    let kept = kept_for_revert()
-        .into_iter()
-        .filter_map(|name| match lstat(&path.join(&name)) {
-            Ok(stat) => Some(KeptCopy {
-                name,
-                stat: Some(stat),
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => Some(KeptCopy { name, stat: None }),
-        })
-        .collect();
-    folder_not_theirs(path, uid, owner, mode, kept, stamp)
+    let mut folder = folder_not_theirs(path, uid, owner, mode, Vec::new(), stamp)?;
+    if folder.is_dir {
+        // A name whose read fails for any reason but "not there" is held,
+        // unread: the command's `cp` reads it before anything moves.
+        folder.kept = kept_for_revert()
+            .into_iter()
+            .filter_map(|name| match lstat(&folder.path.join(&name)) {
+                Ok(stat) => Some(KeptCopy {
+                    name,
+                    stat: Some(stat),
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => Some(KeptCopy { name, stat: None }),
+            })
+            .collect();
+    }
+    Some(folder)
 }
 
 #[cfg(target_os = "macos")]
