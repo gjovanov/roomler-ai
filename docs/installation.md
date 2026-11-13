@@ -2370,7 +2370,19 @@ console user are skipped and every root row runs as on any install
 | Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:366` |
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:583-586`, `:591`, `:691-694`, `:712`, `:720`, `:733`, `:612`, `:747` |
+| The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
 
+- **No root command writes in the person's folder (#3802).** macOS `sudo` keeps
+  the caller's `HOME`, so on macOS the agent's folders hang off the home that the
+  account database names for the account a process runs as, never `HOME`
+  (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
+  is made by the person's own processes. On a Mac where an earlier root step made
+  it, the screen worker's error names the folder, its owner and its mode, and it
+  reaches `/var/log/roomler/daemon.log`, the root daemon's stderr
+  (`agents/roomlerd/src/app.rs:3856`). The supervisor's give-up line names the
+  same, plus the one command, which the person runs with no `sudo`:
+  `mv '<folder>' '<folder>.made-by-root'`
+  (`agents/roomlerd/src/macos_supervisor.rs:527`, `:692`).
 - **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
   groups; `launchctl asuser` changes only the bootstrap context. `-n` because
   root needs no password and a run by the update helper has no terminal.
