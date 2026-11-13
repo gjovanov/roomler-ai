@@ -989,6 +989,37 @@ async fn adding_a_member_with_a_role_of_another_org_is_not_found() {
     assert!(row_role_ids(&app, &org, &newcomer.id).await.is_none());
 }
 
+/// Positive control for adding a member: `POST …/member` with roles of the org
+/// gives exactly those roles, in the body's order, and exactly their bits.
+#[tokio::test]
+async fn adding_a_member_with_the_orgs_roles_gives_exactly_those_roles() {
+    let app = TestApp::spawn().await;
+    let org = app.seed_tenant("mrid-add-live").await;
+    let moderator = role_id_named(&app, &org, "moderator").await;
+    let devices = mint_role(&app, &org, "devices", permissions::MANAGE_AGENTS).await;
+    let newcomer = outsider(&app, "add-live-newcomer").await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &tenant_url(&org, "/member"),
+        &org.admin.access_token,
+        Some(json!({ "user_id": newcomer.id, "role_ids": [moderator, devices] })),
+    )
+    .await;
+    assert_eq!(status, 201, "the owner adds a member: {body}");
+    assert_eq!(
+        row_role_ids(&app, &org, &newcomer.id).await,
+        Some(vec![moderator.clone(), devices.clone()]),
+        "exactly the roles the body names"
+    );
+    assert_eq!(
+        my_permissions(&app, &org, &newcomer.access_token).await,
+        masks_of(&app, &org, &["moderator", "devices"]).await,
+        "exactly their bits"
+    );
+}
+
 /// An invite cannot carry another org's role, whoever writes it.
 #[tokio::test]
 async fn an_invite_with_a_role_of_another_org_is_not_found() {
@@ -1128,6 +1159,87 @@ async fn registering_with_an_invite_whose_roles_are_all_gone_joins_nothing() {
         "no membership from an invite whose roles are gone"
     );
     assert_eq!(invite_uses(&app, &code).await, 0, "nothing is spent");
+}
+
+/// Positive control for redemption at registration: a new account registering
+/// with a live invite's code joins with exactly the invite's roles, in its
+/// order, holds exactly their bits, and spends the invite once.
+#[tokio::test]
+async fn registering_with_a_live_invite_joins_with_exactly_its_roles() {
+    let app = TestApp::spawn().await;
+    let org = app.seed_tenant("mrid-reg-live").await;
+    let moderator = role_id_named(&app, &org, "moderator").await;
+    let devices = mint_role(
+        &app,
+        &org,
+        "devices",
+        permissions::MANAGE_AGENTS | permissions::REMOTE_CONTROL,
+    )
+    .await;
+    let (status, invite) = call(
+        &app,
+        "POST",
+        &tenant_url(&org, "/invite"),
+        &org.admin.access_token,
+        Some(json!({ "assign_role_ids": [moderator, devices] })),
+    )
+    .await;
+    assert_eq!(status, 201, "the invite: {invite}");
+    let code = invite["code"].as_str().unwrap().to_string();
+
+    let email = "reg-live@outside.test";
+    let password = "Person123!";
+    let resp = app
+        .client
+        .post(app.url("/api/auth/register"))
+        .json(&json!({
+            "email": email,
+            "username": "reg_live",
+            "display_name": "Reg Live",
+            "password": password,
+            "invite_code": code,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "the account is created");
+    // Activate and sign in, the way the fixture does for every account.
+    app.db
+        .collection::<bson::Document>("users")
+        .update_one(
+            doc! { "email": email },
+            doc! { "$set": { "is_verified": true } },
+        )
+        .await
+        .unwrap();
+    let login: Value = app
+        .client
+        .post(app.url("/api/auth/login"))
+        .json(&json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uid = login["user"]["id"].as_str().expect("user id").to_string();
+    let token = login["access_token"].as_str().expect("token").to_string();
+
+    assert_eq!(
+        row_role_ids(&app, &org, &uid).await,
+        Some(vec![moderator.clone(), devices.clone()]),
+        "exactly the invite's roles"
+    );
+    assert_eq!(
+        my_permissions(&app, &org, &token).await,
+        masks_of(&app, &org, &["moderator", "devices"]).await,
+        "exactly their bits"
+    );
+    assert_eq!(
+        invite_uses(&app, &code).await,
+        1,
+        "the invite is spent once"
+    );
 }
 
 /// The role ids a device's stored `policy` (`access_policy`, `exec_policy`,
