@@ -565,21 +565,32 @@ pub fn gave_up_reason(
     .to_string()
 }
 
-/// #3802 — what gives the person's folder back: one line of a POSIX shell
-/// that the person runs as themselves, with no `sudo`. It starts by checking
-/// who runs it, since a fleet exec runs as root and, as root, the folder it
-/// makes would be root's again, so a run by anyone else changes nothing.
-/// Every path is quoted ([`sh_quote`]), and the line holds no `"`, `$` or
+/// #3802 — what gives the person's folder back. macOS renames a folder only
+/// for an account that may write in it, so no command the person runs with
+/// their own rights moves a folder of root's, in any parent (measured on
+/// macOS 15.7: `mv` answers `Permission denied` and moves nothing). Only an
+/// administrator can, with `sudo`, and the line says so in words.
+///
+/// It prints that administrator's command only under the package's rule
+/// (`sudo_line_fits`, `packaging/macos/postinstall:252-266`): the person at
+/// the console is an administrator of this Mac, so they run it for
+/// themselves, and the path names the folder it reads as
+/// ([`FolderNotTheirs::administrator`]); the folder is a real folder of
+/// root's; and the account name is plain ([`plain_account_name`]). Anywhere
+/// else it gives no command, says that an administrator has to move the
+/// folder aside and names the section of the docs ([`INSTALL_DOC`]). Every
+/// path is quoted ([`sh_quote`]), and the command holds no `"`, `$` or
 /// backtick, so it also survives `sh -c "…"`.
 ///
-/// With nothing the revert reads in it, the line moves it aside and the
-/// worker makes a new one of its own. With copies `one-row --revert` reads
-/// there and nowhere else ([`FolderNotTheirs::kept`]), it builds the new
-/// folder beside the old one with the copies in it, and only then swaps the
-/// two: the `cp` is the read, done as the person before anything moves, and
-/// if the last move fails, the one before it is undone. The two names it
-/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them, and
-/// BSD `mv` never moves the folder INTO a leftover of an earlier round.
+/// With nothing the revert reads in it, the command moves it aside and the
+/// worker makes a new one, as the person, at its next start. With copies
+/// `one-row --revert` reads there and nowhere else ([`FolderNotTheirs::kept`]),
+/// the command moves the folder aside, then makes the new one and copies them
+/// into it AS THE PERSON (`sudo -u '#<uid>'`, the form `spawn_worker` runs
+/// the worker with), so it does the same in an administrator's own shell and
+/// as root; if a step after the move fails, the copies are still in the
+/// folder moved aside. The name it makes carries [`FolderNotTheirs::stamp`],
+/// so no earlier print made it.
 ///
 /// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
 /// no command: moving the folder would leave it where the revert does not
@@ -612,42 +623,124 @@ fn move_aside(f: &FolderNotTheirs) -> String {
             if one { "that file" } else { "those files" },
         );
     }
-    let path = f.path.display().to_string();
-    let folder = sh_quote(&path);
-    let aside = sh_quote(&format!("{path}.made-by-root-{}", f.stamp));
-    let who = format!(
-        "as that person (uid {0}), not as root: a fleet exec runs as root unless the device's \
-         policy names the person at the screen, and as root this changes nothing: \
-         id -u | grep -qx {0} && ",
-        f.uid
+    let owner = match f.owner {
+        0 => "root".to_string(),
+        n => format!("uid {n}"),
+    };
+    let only = format!(
+        "Only an administrator of this Mac can move it aside, because macOS lets no other \
+         account rename a folder that {owner} owns."
     );
-    let restart = " Then log out and back in, or restart this daemon: \
-                   launchctl kickstart -k system/com.roomler.daemon";
-    if f.kept.is_empty() {
-        return format!(
-            "Move it aside {who}mv {folder} {aside} (if it fails, nothing moved).{restart}"
-        );
-    }
-    let new = sh_quote(&format!("{path}.new-{}", f.stamp));
-    let into_new = sh_quote(&format!("{path}.new-{}/", f.stamp));
     let names: Vec<String> = f
         .kept
         .iter()
         .map(|k| k.name.display().to_string())
         .collect();
+    let one = names.len() == 1;
+    let holds = if names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " It holds {}, which `sudo roomlerd one-row --revert` reads there and nowhere else",
+            names.join(" and ")
+        )
+    };
+    // Rule 2 of the package's `sudo_line_fits`: the reads say yes, the folder
+    // is root's own and real, and the name is plain.
+    let Some(name) = f
+        .administrator
+        .as_deref()
+        .filter(|n| f.is_dir && f.owner == 0 && plain_account_name(n))
+    else {
+        let copy_back = match names.len() {
+            0 => "",
+            1 => " and copy that file back into a new folder that the person's account makes",
+            _ => " and copy those files back into a new folder that the person's account makes",
+        };
+        return format!(
+            "{only}{holds}{} This line gives no command for it: an administrator of this Mac \
+             has to move it aside{copy_back}; see {INSTALL_DOC}.",
+            if holds.is_empty() { "" } else { "." },
+        );
+    };
+    let path = f.path.display().to_string();
+    let folder = sh_quote(&path);
+    let aside_path = format!("{path}.made-by-root-{}", f.stamp);
+    let aside = sh_quote(&aside_path);
+    let can = format!(" {name} is an administrator of this Mac and can run this: ");
+    let restart = " Then log out and back in, or restart this daemon: \
+                   sudo launchctl kickstart -k system/com.roomler.daemon";
+    if names.is_empty() {
+        return format!(
+            "{only}{can}sudo mv {folder} {aside} (if it fails, nothing moved), and the worker \
+             makes the folder again as the person at its next start.{restart}"
+        );
+    }
+    let as_person = format!("sudo -u '#{}'", f.uid);
     let copies: String = names
         .iter()
-        .map(|n| format!("{} ", sh_quote(&format!("{path}/{n}"))))
+        .map(|n| format!("{} ", sh_quote(&format!("{aside_path}/{n}"))))
         .collect();
+    let into = sh_quote(&format!("{path}/"));
     format!(
-        "It holds {}, which `sudo roomlerd one-row --revert` reads there and nowhere else, so \
-         build a new folder with {} beside this one and swap the two, {who}mkdir {new} && cp \
-         {copies}{into_new} && mv {folder} {aside} && {{ mv {new} {folder} || mv {aside} \
-         {folder}; }} (nothing moves until the copies are made, and if the last move fails \
-         the one before it is undone).{restart}",
-        names.join(" and "),
-        if names.len() == 1 { "it" } else { "them" },
+        "{only}{holds}, so the command copies {} into a new folder that the person's account \
+         makes.{can}sudo mv {folder} {aside} && {as_person} mkdir -p {folder} && {as_person} \
+         cp {copies}{into} (if the move fails, nothing moved; if a step after it fails, {} \
+         still in {aside}).{restart}",
+        if one { "it" } else { "them" },
+        if one { "the copy is" } else { "the copies are" },
     )
+}
+
+/// #3802 — the section of the docs a give-up line names where it prints no
+/// command, in the words of the package's own (`INSTALL_DOC`,
+/// `packaging/macos/postinstall:259`).
+const INSTALL_DOC: &str =
+    "docs/installation.md, section \"Which account each step of the package's script writes as\"";
+
+/// #3802 — an account name a give-up line may print in its sentence and
+/// hand to `dseditgroup`: one or more of `[A-Za-z0-9._-]`.
+fn plain_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// #3802 — the paths half of the package's `sudo_line_fits`
+/// (`packaging/macos/postinstall:262-265`), over what `lstat` read, so it
+/// tests on every platform: whether the path of `folder`, the folder of the
+/// person `uid` whose home the account database names `home`, names the
+/// folder it reads as. The home is an absolute path to a folder, not a link
+/// (not ending in `/`, the package's `/*[!/]`); `<home>/Library` and
+/// `<home>/Library/Application Support` are each a folder of the person's
+/// own, not a link; and the folder is one name inside the last of them. A
+/// path that is not UTF-8 (it could not be printed as it reads) or a read
+/// that fails is a no.
+pub fn path_reads_as_the_folder(
+    uid: u32,
+    home: &std::path::Path,
+    folder: &std::path::Path,
+    lstat: impl Fn(&std::path::Path) -> std::io::Result<(u32, u32)>,
+) -> bool {
+    let (Some(home), Some(folder)) = (home.to_str(), folder.to_str()) else {
+        return false;
+    };
+    if !home.starts_with('/') || home.ends_with('/') {
+        return false;
+    }
+    let library = format!("{home}/Library");
+    let support = format!("{library}/Application Support");
+    let one_name_in_support = folder
+        .strip_prefix(support.as_str())
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'));
+    let is_dir = |mode: u32| mode & 0o170000 == 0o040000;
+    one_name_in_support
+        && lstat(std::path::Path::new(home)).is_ok_and(|(_, mode)| is_dir(mode))
+        && [library, support].iter().all(|p| {
+            lstat(std::path::Path::new(p)).is_ok_and(|(owner, mode)| owner == uid && is_dir(mode))
+        })
 }
 
 /// #3802 — `s` as one word of a POSIX shell: in single quotes, with each `'`
@@ -693,6 +786,12 @@ pub struct FolderNotTheirs {
     /// The UTC second the folder was read: unique for each print, so the
     /// names the command makes beside the folder were never made before.
     pub stamp: String,
+    /// The console person's account name when the reads of the package's
+    /// `sudo_line_fits` all said yes for this folder: that person is an
+    /// administrator of this Mac, and its path names the folder it reads as.
+    /// `None` when any of them said no or did not answer in time: the line
+    /// then gives no command.
+    pub administrator: Option<String>,
 }
 
 /// #3802 — one of [`kept_for_revert`] that the person's folder holds.
@@ -720,7 +819,8 @@ pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
 /// #3802 — [`FolderNotTheirs`] out of what `lstat` read for `path`, the folder
 /// of the person `uid` (its owner and full mode), the copies of
 /// [`kept_for_revert`] found in it and the `stamp` of this read: `None` when
-/// that person owns it.
+/// that person owns it. Its `administrator` is `None`: the supervisor reads
+/// that apart, off its loop's thread.
 pub fn folder_not_theirs(
     path: std::path::PathBuf,
     uid: u32,
@@ -737,6 +837,7 @@ pub fn folder_not_theirs(
         is_dir: mode & 0o170000 == 0o040000,
         kept,
         stamp: stamp.to_string(),
+        administrator: None,
     })
 }
 
@@ -854,6 +955,94 @@ mod imp {
         read_person_folder(path, uid, &stamp, |p| {
             std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode()))
         })
+    }
+
+    /// #3802 — how long the reads behind an administrator's command may take
+    /// at a give-up, all of them together: past it, the line gives none.
+    const ADMIN_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// #3802 — the account name and the home the account database names for
+    /// `uid` (`getpwuid_r`, as `appdirs::account_home` reads the home).
+    /// `None` when there is no entry or its name is not UTF-8.
+    // `appdirs::account_entry` (#3838) replaces this lookup once it is on master.
+    fn name_and_home(uid: u32) -> Option<(String, std::path::PathBuf)> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf: Vec<libc::c_char> = vec![0; 1024];
+        loop {
+            // SAFETY: an all-zero `passwd` is a valid value of a plain C
+            // struct; `getpwuid_r` fills it in.
+            let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut found: *mut libc::passwd = std::ptr::null_mut();
+            // SAFETY: every pointer names memory this frame owns for the
+            // whole call, and `buf.len()` is the length of `buf`, where the
+            // entry's strings are written.
+            let rc = unsafe {
+                libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found)
+            };
+            if rc == libc::ERANGE && buf.len() < 1 << 20 {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 || found.is_null() || entry.pw_name.is_null() || entry.pw_dir.is_null() {
+                return None;
+            }
+            // SAFETY: `pw_name` and `pw_dir` point into `buf`, NUL-terminated
+            // by `getpwuid_r`, and `buf` outlives these borrows.
+            let (name, dir) = unsafe {
+                (
+                    std::ffi::CStr::from_ptr(entry.pw_name),
+                    std::ffi::CStr::from_ptr(entry.pw_dir),
+                )
+            };
+            let home = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+            return Some((name.to_str().ok()?.to_owned(), home));
+        }
+    }
+
+    /// #3802 — the console person's account name when the give-up line may
+    /// print an administrator's command for `f`: the package's
+    /// `sudo_line_fits` (`packaging/macos/postinstall:260-266`). The folder
+    /// is a real folder of root's, the account database names a plain name
+    /// and a home whose paths read as the folder
+    /// ([`path_reads_as_the_folder`]), and `dseditgroup` says that account is
+    /// a member of `admin`. None of it blocks the supervisor's loop: the
+    /// account database and the `lstat`s run on the blocking pool,
+    /// `dseditgroup` is a tokio child with no pipe that is killed when
+    /// dropped, and the whole read stops at [`ADMIN_READ_DEADLINE`]. Anything
+    /// that fails or runs late is `None`: no command. A read only, once per
+    /// give-up.
+    async fn administrator_reads(f: &FolderNotTheirs) -> Option<String> {
+        if !(f.is_dir && f.owner == 0) {
+            return None;
+        }
+        let (uid, folder) = (f.uid, f.path.clone());
+        let read = async move {
+            let paths = tokio::task::spawn_blocking(move || {
+                let (name, home) = name_and_home(uid)?;
+                let fits = plain_account_name(&name)
+                    && path_reads_as_the_folder(uid, &home, &folder, |p| {
+                        std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode()))
+                    });
+                fits.then_some(name)
+            });
+            let Ok(Some(name)) = paths.await else {
+                return None;
+            };
+            let admin = tokio::process::Command::new("/usr/sbin/dseditgroup")
+                .args(["-o", "checkmember", "-m", name.as_str(), "admin"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status()
+                .await
+                .is_ok_and(|s| s.success());
+            admin.then_some(name)
+        };
+        tokio::time::timeout(ADMIN_READ_DEADLINE, read)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Spawn the agent into `uid`'s GUI session, **as that user**.
@@ -1373,7 +1562,11 @@ mod imp {
             // the daemon's whole life.
             if last_action != Some(action) {
                 if matches!(action, Action::GaveUp) {
-                    let not_theirs = uid_now.and_then(person_folder_not_theirs);
+                    let mut not_theirs = uid_now.and_then(person_folder_not_theirs);
+                    // #3802 — bounded and off this thread (`administrator_reads`).
+                    if let Some(f) = not_theirs.as_mut() {
+                        f.administrator = administrator_reads(f).await;
+                    }
                     tracing::error!(
                         console_uid = ?uid_now,
                         fast_exits,
@@ -2329,23 +2522,35 @@ mod tests {
                 Some(WorkerEnd::Signal(9)),
                 None,
             ] {
+                // No read has said yes for it: the cause, and no command.
                 let why = gave_up_reason(end, one_row, Some(&root_made));
                 assert!(
                     why.contains(&format!("folder {}:", path.display())),
                     "{why}"
                 );
                 assert!(why.contains("uid 0 owns it (mode 755)"), "{why}");
+                assert!(why.contains("This line gives no command for it"), "{why}");
+                assert!(!why.contains("sudo") && !why.contains("id -u"), "{why}");
+                // The console person is an administrator of this Mac.
+                let admin = FolderNotTheirs {
+                    administrator: Some("p".to_string()),
+                    ..root_made.clone()
+                };
+                let why = gave_up_reason(end, one_row, Some(&admin));
                 assert!(
                     why.contains(&format!(
-                        "id -u | grep -qx 501 && mv '{0}' '{0}.made-by-root-{STAMP}' ",
+                        "sudo mv '{0}' '{0}.made-by-root-{STAMP}' ",
                         path.display()
                     )),
                     "{why}"
                 );
-                assert!(!why.contains("/logs"), "{why}");
-                assert!(!why.contains("enrollment"), "{why}");
-                // It holds nothing the revert reads: the move is the whole command.
-                assert!(!why.contains("mkdir") && !why.contains("cp '"), "{why}");
+                for why in [&why, &gave_up_reason(end, one_row, Some(&root_made))] {
+                    assert!(!why.contains("/logs"), "{why}");
+                    assert!(!why.contains("enrollment"), "{why}");
+                    // It holds nothing the revert reads: the move is the whole
+                    // command.
+                    assert!(!why.contains("mkdir") && !why.contains("cp '"), "{why}");
+                }
             }
         }
     }
@@ -2361,13 +2566,27 @@ mod tests {
     const ROOTS_600: Option<(u32, u32)> = Some((0, 0o100600));
 
     /// #3802 — the line for a folder of root's at `path` (full `mode`) that
-    /// holds `kept`, each one of [`kept_for_revert`] with what `lstat` read.
-    /// Printed, so the lines are read off a run with `--nocapture`.
+    /// holds `kept`, each one of [`kept_for_revert`] with what `lstat` read,
+    /// on a Mac whose reads all said yes: the console person `p` is an
+    /// administrator of it, and the path names the folder it reads as.
     fn give_up_line(
         case: &str,
         path: &str,
         mode: u32,
         kept: &[(usize, Option<(u32, u32)>)],
+    ) -> String {
+        give_up_line_for(case, path, mode, kept, Some("p"))
+    }
+
+    /// #3802 — the same with what those reads gave: `administrator`, the
+    /// console person's name where they all said yes. Printed, so the lines
+    /// are read off a run with `--nocapture`.
+    fn give_up_line_for(
+        case: &str,
+        path: &str,
+        mode: u32,
+        kept: &[(usize, Option<(u32, u32)>)],
+        administrator: Option<&str>,
     ) -> String {
         let names = kept_for_revert();
         let kept = kept
@@ -2377,7 +2596,10 @@ mod tests {
                 stat: *stat,
             })
             .collect();
-        let folder = folder_not_theirs(path.into(), 501, 0, mode, kept, STAMP).expect("root's");
+        let folder = FolderNotTheirs {
+            administrator: administrator.map(str::to_string),
+            ..folder_not_theirs(path.into(), 501, 0, mode, kept, STAMP).expect("root's")
+        };
         let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
         println!("GIVE-UP [{case}] {why}");
         why
@@ -2391,78 +2613,117 @@ mod tests {
         )
     }
 
-    /// Who runs the command, said in words: a run as root changes nothing.
-    const WHO: &str = "as that person (uid 501), not as root: a fleet exec runs as root \
-                       unless the device's policy names the person at the screen, and as \
-                       root this changes nothing: id -u | grep -qx 501 && ";
+    /// Why no command the person runs with their own rights can move it.
+    const ONLY: &str = "Only an administrator of this Mac can move it aside, because macOS \
+                        lets no other account rename a folder that root owns.";
+    /// Who runs the command: the console person, an administrator of this
+    /// Mac, in the package's words.
+    const WHO: &str = " p is an administrator of this Mac and can run this: ";
     const RESTART: &str = " Then log out and back in, or restart this daemon: \
-                           launchctl kickstart -k system/com.roomler.daemon";
+                           sudo launchctl kickstart -k system/com.roomler.daemon";
+    /// The section of the docs a line with no command names.
+    const DOC: &str = "see docs/installation.md, section \"Which account each step of the \
+                       package's script writes as\".";
+    /// The copies the revert reads, as the command names them.
+    const PLIST: &str = "com.roomler.agent.plist.pre-one-row";
+    const CONFIG: &str = "config.toml.pre-one-row";
 
-    /// #3802 — nothing the revert reads: the person moves the folder aside,
-    /// under a name no earlier print made, and their worker makes a new one.
+    /// #3802 — macOS lets no account but root rename a folder of root's, so
+    /// a command the person runs with their own rights cannot move it: the
+    /// line gives an administrator's `sudo mv`, never a check of who runs it.
+    #[test]
+    fn the_give_up_line_moves_the_folder_with_an_administrators_sudo() {
+        let why = give_up_line("RED: no kept copy", F, 0o40755, &[]);
+        assert!(
+            why.contains(&format!("sudo mv '{F}' '{F}.made-by-root-{STAMP}'")),
+            "{why}"
+        );
+        assert!(!why.contains("id -u"), "{why}");
+        assert!(!why.contains("as that person"), "{why}");
+    }
+
+    /// #3802 — nothing the revert reads: the administrator moves the folder
+    /// aside, under a name no earlier print made, and the person's worker
+    /// makes a new one.
     #[test]
     fn the_give_up_line_for_a_folder_that_holds_no_kept_copy() {
         assert_eq!(
-            give_up_line("no kept copy", F, 0o40755, &[]),
+            give_up_line("fits + no kept copy", F, 0o40755, &[]),
             format!(
-                "{}Move it aside {WHO}mv '{F}' '{F}.made-by-root-{STAMP}' \
-                 (if it fails, nothing moved).{RESTART}",
+                "{}{ONLY}{WHO}sudo mv '{F}' '{F}.made-by-root-{STAMP}' (if it fails, nothing \
+                 moved), and the worker makes the folder again as the person at its next \
+                 start.{RESTART}",
                 cause(F)
             )
         );
     }
 
+    /// #3802 — the line for a folder that holds `copies` (names inside it),
+    /// on a Mac whose reads all said yes: the administrator moves the folder
+    /// aside, and the new folder and the copies in it are made as the person,
+    /// in one `cp` out of the folder moved aside.
+    fn kept_line(path: &str, q: &str, admin: &str, copies: &[&str]) -> String {
+        let aside = format!("{q}.made-by-root-{STAMP}");
+        let from: String = copies.iter().map(|c| format!("'{aside}/{c}' ")).collect();
+        let (it, still) = match copies.len() {
+            1 => ("it", "the copy is"),
+            _ => ("them", "the copies are"),
+        };
+        format!(
+            "{}{ONLY} It holds {}, which `sudo roomlerd one-row --revert` reads there and \
+             nowhere else, so the command copies {it} into a new folder that the person's \
+             account makes. {admin} is an administrator of this Mac and can run this: sudo mv \
+             '{q}' '{aside}' && sudo -u '#501' mkdir -p '{q}' && sudo -u '#501' cp {from}'{q}/' \
+             (if the move fails, nothing moved; if a step after it fails, {still} still in \
+             '{aside}').{RESTART}",
+            cause(path),
+            copies.join(" and "),
+        )
+    }
+
     /// #3802 — the LaunchAgent plist the revert reads there and nowhere else:
-    /// a new folder is built beside the old one with the copy in it, and only
-    /// then are the two swapped, so a step that fails leaves the folder where
-    /// it is with everything in it.
+    /// after the move, the person's account makes the new folder and copies it
+    /// in, and if that fails, the copy is still in the folder moved aside.
     #[test]
     fn the_give_up_line_keeps_the_launch_agent_plist_the_revert_reads() {
+        let why = give_up_line("fits + the plist copy", F, 0o40755, &[(0, THEIRS)]);
         assert_eq!(
-            give_up_line("one kept copy", F, 0o40755, &[(0, THEIRS)]),
+            why,
             format!(
-                "{}It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd one-row \
-                 --revert` reads there and nowhere else, so build a new folder with it beside \
-                 this one and swap the two, {WHO}mkdir '{F}.new-{STAMP}' && cp \
-                 '{F}/com.roomler.agent.plist.pre-one-row' '{F}.new-{STAMP}/' && mv '{F}' \
-                 '{F}.made-by-root-{STAMP}' && {{ mv '{F}.new-{STAMP}' '{F}' || mv \
-                 '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are \
-                 made, and if the last move fails the one before it is undone).{RESTART}",
+                "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd \
+                 one-row --revert` reads there and nowhere else, so the command copies it into \
+                 a new folder that the person's account makes.{WHO}sudo mv '{F}' \
+                 '{F}.made-by-root-{STAMP}' && sudo -u '#501' mkdir -p '{F}' && sudo -u '#501' \
+                 cp '{F}.made-by-root-{STAMP}/com.roomler.agent.plist.pre-one-row' '{F}/' (if \
+                 the move fails, nothing moved; if a step after it fails, the copy is still in \
+                 '{F}.made-by-root-{STAMP}').{RESTART}",
                 cause(F)
             )
         );
+        assert_eq!(why, kept_line(F, F, "p", &[PLIST]));
     }
 
     /// #3802 — the same for the copy of the person's config kept beside it.
     #[test]
     fn the_give_up_line_keeps_the_config_copy_the_revert_reads() {
-        let why = give_up_line("the config copy", F, 0o40755, &[(1, THEIRS)]);
-        assert!(
-            why.contains(&format!(
-                "{WHO}mkdir '{F}.new-{STAMP}' && cp '{F}/config.toml.pre-one-row' \
-                 '{F}.new-{STAMP}/' && mv '{F}' '{F}.made-by-root-{STAMP}' && "
-            )),
-            "{why}"
+        assert_eq!(
+            give_up_line("fits + the config copy", F, 0o40755, &[(1, THEIRS)]),
+            kept_line(F, F, "p", &[CONFIG])
         );
     }
 
-    /// #3802 — both copies go into the new folder, in one `cp`, before
-    /// anything moves.
+    /// #3802 — both copies go into the new folder, in one `cp`, as the
+    /// person.
     #[test]
     fn the_give_up_line_keeps_both_copies_the_revert_reads() {
         assert_eq!(
-            give_up_line("both kept copies", F, 0o40755, &[(0, THEIRS), (1, THEIRS)]),
-            format!(
-                "{}It holds com.roomler.agent.plist.pre-one-row and config.toml.pre-one-row, \
-                 which `sudo roomlerd one-row --revert` reads there and nowhere else, so build \
-                 a new folder with them beside this one and swap the two, {WHO}mkdir \
-                 '{F}.new-{STAMP}' && cp '{F}/com.roomler.agent.plist.pre-one-row' \
-                 '{F}/config.toml.pre-one-row' '{F}.new-{STAMP}/' && mv '{F}' \
-                 '{F}.made-by-root-{STAMP}' && {{ mv '{F}.new-{STAMP}' '{F}' || mv \
-                 '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are \
-                 made, and if the last move fails the one before it is undone).{RESTART}",
-                cause(F)
-            )
+            give_up_line(
+                "fits + both kept copies",
+                F,
+                0o40755,
+                &[(0, THEIRS), (1, THEIRS)]
+            ),
+            kept_line(F, F, "p", &[PLIST, CONFIG])
         );
     }
 
@@ -2508,19 +2769,154 @@ mod tests {
     fn the_give_up_line_quotes_an_apostrophe_in_the_path() {
         let path = "/Users/o'brien/Library/Application Support/live.roomler.roomler";
         let q = r"/Users/o'\''brien/Library/Application Support/live.roomler.roomler";
-        let why = give_up_line("an apostrophe", path, 0o40755, &[(0, THEIRS), (1, THEIRS)]);
-        assert!(why.starts_with(&cause(path)), "{why}");
+        let why = give_up_line_for(
+            "fits + an apostrophe",
+            path,
+            0o40755,
+            &[(0, THEIRS), (1, THEIRS)],
+            Some("obrien"),
+        );
+        assert_eq!(why, kept_line(path, q, "obrien", &[PLIST, CONFIG]));
+        // The apostrophe appears in the shell text only escaped.
+        assert_eq!(why.matches("o'brien").count(), 1, "{why}");
+    }
+
+    /// #3802 — where a read said no or did not answer in time, the line
+    /// gives no command at all: only who can move the folder, what it holds
+    /// that the revert reads, and the section of the docs. The same for a
+    /// folder of another person's (the package prints its line for a folder
+    /// of root's only) and for a name that is not plain.
+    #[test]
+    fn the_give_up_line_gives_no_command_where_the_reads_do_not_fit() {
+        assert_eq!(
+            give_up_line_for("does not fit", F, 0o40755, &[], None),
+            format!(
+                "{}{ONLY} This line gives no command for it: an administrator of this Mac \
+                 has to move it aside; {DOC}",
+                cause(F)
+            )
+        );
+        assert_eq!(
+            give_up_line_for(
+                "does not fit + both kept copies",
+                F,
+                0o40755,
+                &[(0, THEIRS), (1, THEIRS)],
+                None
+            ),
+            format!(
+                "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row and \
+                 config.toml.pre-one-row, which `sudo roomlerd one-row --revert` reads there \
+                 and nowhere else. This line gives no command for it: an administrator of \
+                 this Mac has to move it aside and copy those files back into a new folder \
+                 that the person's account makes; {DOC}",
+                cause(F)
+            )
+        );
+        for name in ["", "p q", "p'q", "p$q", "p\"q", "p`q", "p/q", "p;q"] {
+            let why = give_up_line_for("a name that is not plain", F, 0o40755, &[], Some(name));
+            assert!(
+                why.contains("This line gives no command"),
+                "{name:?}: {why}"
+            );
+            assert!(!why.contains("sudo"), "{name:?}: {why}");
+        }
+        for name in ["p", "p.q", "p_q", "p-q", "P9"] {
+            assert!(plain_account_name(name), "{name:?}");
+        }
+        let folder = FolderNotTheirs {
+            administrator: Some("p".to_string()),
+            ..folder_not_theirs(F.into(), 501, 502, 0o40755, Vec::new(), STAMP).expect("502's")
+        };
+        let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
         assert!(
-            why.contains(&format!(
-                "{WHO}mkdir '{q}.new-{STAMP}' && cp '{q}/com.roomler.agent.plist.pre-one-row' \
-                 '{q}/config.toml.pre-one-row' '{q}.new-{STAMP}/' && mv '{q}' \
-                 '{q}.made-by-root-{STAMP}' && {{ mv '{q}.new-{STAMP}' '{q}' || mv \
-                 '{q}.made-by-root-{STAMP}' '{q}'; }} "
+            why.ends_with(&format!(
+                "uid 502 owns it (mode 755), not the person, so the worker's own log is not \
+                 there either. Only an administrator of this Mac can move it aside, because \
+                 macOS lets no other account rename a folder that uid 502 owns. This line \
+                 gives no command for it: an administrator of this Mac has to move it aside; \
+                 {DOC}"
             )),
             "{why}"
         );
-        // The apostrophe appears in the shell text only escaped.
-        assert_eq!(why.matches("o'brien").count(), 1, "{why}");
+    }
+
+    /// #3802 — the paths half of the package's `sudo_line_fits`, with
+    /// `lstat` injected: the home an absolute path to a folder, not a link;
+    /// its `Library` and `Library/Application Support` folders of the
+    /// person's own, not links; the folder one name inside the last. Any
+    /// other read, or a read that fails, is a no.
+    #[test]
+    fn the_administrators_command_needs_paths_that_read_as_the_folder() {
+        use std::collections::HashMap;
+        const DIR: u32 = 0o40755;
+        const LINK: u32 = 0o120755;
+        let home = "/Users/p";
+        let library = "/Users/p/Library";
+        let support = "/Users/p/Library/Application Support";
+        let fs = |over: &[(&str, Option<(u32, u32)>)]| {
+            let mut fs: HashMap<String, Option<(u32, u32)>> = [
+                (home, Some((501, DIR))),
+                (library, Some((501, DIR))),
+                (support, Some((501, DIR))),
+            ]
+            .into_iter()
+            .map(|(p, s)| (p.to_string(), s))
+            .collect();
+            for (p, s) in over {
+                fs.insert(p.to_string(), *s);
+            }
+            fs
+        };
+        let fits = |home: &str, folder: &str, fs: &HashMap<String, Option<(u32, u32)>>| {
+            path_reads_as_the_folder(501, home.as_ref(), folder.as_ref(), |p| {
+                let p = p.to_str().expect("utf-8").to_string();
+                fs.get(&p)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+        };
+        assert!(fits(home, F, &fs(&[])));
+        // The home: a link, a file, not absolute, ending in `/`, unread. A
+        // home of root's is still a home (the package does not ask).
+        for over in [
+            (home, Some((501, LINK))),
+            (home, Some((501, 0o100644))),
+            (home, None),
+        ] {
+            assert!(!fits(home, F, &fs(&[over])), "{over:?}");
+        }
+        assert!(fits(home, F, &fs(&[(home, Some((0, DIR)))])));
+        assert!(!fits(
+            "Users/p",
+            "Users/p/Library/Application Support/x",
+            &fs(&[])
+        ));
+        assert!(!fits("/Users/p/", F, &fs(&[])));
+        // `Library` and `Application Support`: a link, another account's, a
+        // file, unread.
+        for p in [library, support] {
+            for s in [
+                Some((501, LINK)),
+                Some((0, DIR)),
+                Some((502, DIR)),
+                Some((501, 0o100644)),
+                None,
+            ] {
+                assert!(!fits(home, F, &fs(&[(p, s)])), "{p}: {s:?}");
+            }
+        }
+        // The folder is one name inside `Application Support` of that home.
+        for folder in [
+            "/Users/q/Library/Application Support/live.roomler.roomler",
+            "/Users/p/Library/Application Support",
+            "/Users/p/Library/Application Support/",
+            "/Users/p/Library/Application Support/x/live.roomler.roomler",
+            "/Users/p/Library/Application Supportx/live.roomler.roomler",
+        ] {
+            assert!(!fits(home, folder, &fs(&[])), "{folder}");
+        }
     }
 
     /// #3802 — a link or a file where the folder should be: the cause only,
