@@ -11,13 +11,29 @@
 //! returns [`NoDisplayToOpen`], and `input::open_default` says it through
 //! [`say`].
 //!
-//! Pure but for [`say`]'s one-slot memory, so every test lane compiles it,
-//! whatever the features.
+//! Who is at the screen is read when a session's first line is said. The
+//! desktop brief alone can be a minute old (`desktop_brief::REFRESH`): the
+//! first session after a sign-out still saw the person there and said ERROR
+//! (the 0.4.219 release lab: ERROR 35 s after a sign-out, INFO 88 s after).
+//! The open still fails at once on the input arbiter's thread, which serves
+//! every injector and must never wait for logind (#3830). The session's first
+//! try leaves its line to a thread of its own (`no-display-line`), which asks
+//! the seat through one look in flight (`crate::one_in_flight`, on a
+//! `seat-look` thread), 1.5 s at most, and says the line at the level of what
+//! it saw.
+//! With no answer in time the brief's kind stands, which is the level this
+//! said before, and the line says the seat was not known. A later try in the
+//! session is a DEBUG repeat, unless a read of the seat newer than the line's
+//! shows another kind.
+//!
+//! Pure but for the lines' memory and threads, so every test lane compiles
+//! it, whatever the features.
 #![cfg_attr(
     not(all(target_os = "linux", feature = "enigo-input")),
     allow(dead_code)
 )]
 
+#[cfg(any(target_os = "linux", test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,8 +54,8 @@ pub enum NoDisplay {
 
 impl NoDisplay {
     /// Which kind, from whether this process has a `DISPLAY` and from the
-    /// desktop brief's session class and type (`None` before the brief is
-    /// first read). `None` when `DISPLAY` is set: then the open runs.
+    /// seat's session class and type (`None` before the seat is first read).
+    /// `None` when `DISPLAY` is set: then the open runs.
     pub fn of(display_set: bool, seat: Option<(&str, &str)>) -> Option<NoDisplay> {
         if display_set {
             return None;
@@ -57,6 +73,21 @@ impl NoDisplay {
             NoDisplay::NobodySignedIn => tracing::Level::INFO,
             NoDisplay::ShouldExist => tracing::Level::ERROR,
         }
+    }
+}
+
+impl std::fmt::Display for NoDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoDisplay::NobodySignedIn => {
+                "no X display to open: this process has no DISPLAY, and nobody is signed in at a \
+                 graphical session on this screen"
+            }
+            NoDisplay::ShouldExist => {
+                "no X display to open: this process has no DISPLAY, though a person is signed in \
+                 at this screen or the seat is not known yet"
+            }
+        })
     }
 }
 
@@ -82,58 +113,62 @@ pub fn level_after(kind: NoDisplay, last: Option<NoDisplay>) -> tracing::Level {
 }
 
 /// What `EnigoInjector::new` returns instead of trying an open that cannot
-/// succeed.
+/// succeed: the kind the desktop brief shows, and when that brief began its
+/// read of logind (`None` before the first brief). [`say`] reads the seat
+/// afresh and falls back on this kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoDisplayToOpen(pub NoDisplay);
+pub struct NoDisplayToOpen {
+    pub kind: NoDisplay,
+    pub read: Option<Instant>,
+}
 
 impl std::fmt::Display for NoDisplayToOpen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self.0 {
-            NoDisplay::NobodySignedIn => {
-                "no X display to open: this process has no DISPLAY, and nobody is signed in at a \
-                 graphical session on this screen"
-            }
-            NoDisplay::ShouldExist => {
-                "no X display to open: this process has no DISPLAY, though a person is signed in \
-                 at this screen or the seat is not known yet"
-            }
-        })
+        std::fmt::Display::fmt(&self.kind, f)
     }
 }
 
 impl std::error::Error for NoDisplayToOpen {}
 
-/// The kind an open failed for, read from the error's type, never its text.
+/// What an open failed for, read from the error's type, never its text.
 /// `None` for any other failure, which keeps its own line.
-pub fn kind_of(e: &anyhow::Error) -> Option<NoDisplay> {
-    e.downcast_ref::<NoDisplayToOpen>().map(|n| n.0)
+pub fn kind_of(e: &anyhow::Error) -> Option<NoDisplayToOpen> {
+    e.downcast_ref::<NoDisplayToOpen>().copied()
 }
 
-/// The kind last said in this session.
-static LAST_SAID: Mutex<Option<NoDisplay>> = Mutex::new(None);
-
-/// Say `kind` at its level, or at DEBUG when this session already said it.
-pub fn say(kind: NoDisplay) {
-    let level = {
-        let mut last = LAST_SAID.lock().unwrap_or_else(|e| e.into_inner());
-        let level = level_after(kind, *last);
-        *last = Some(kind);
-        level
-    };
-    let why = NoDisplayToOpen(kind);
-    if level == tracing::Level::ERROR {
-        tracing::error!("input: {why} — input injection disabled (#3787)");
-    } else if level == tracing::Level::INFO {
-        tracing::info!("input: {why} — no input until there is one (#3787)");
-    } else {
-        tracing::debug!("input: still {why}");
-    }
+/// Say that there is no display to open, once a session at its level, and
+/// never wait: the input arbiter's thread calls this, and it serves every
+/// injector. A session's first try leaves its line to a thread of its own,
+/// which looks at the seat (the module's docs).
+pub fn say(missing: NoDisplayToOpen) {
+    #[cfg(target_os = "linux")]
+    LINES.say(
+        Seen {
+            kind: missing.kind,
+            at: missing.read,
+        },
+        seat_now,
+        crate::desktop_brief::refresh_soon,
+        log,
+    );
+    // Only Linux skips an open for a missing display (`EnigoInjector::new`).
+    #[cfg(not(target_os = "linux"))]
+    let _ = missing;
 }
 
 /// A session opened, or an injector did: the next missing display is said at
-/// its own level again.
+/// its own level again, after a look of its own.
 pub fn forget() {
-    *LAST_SAID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    #[cfg(target_os = "linux")]
+    LINES.forget();
+}
+
+/// Wait for the line a missing display left to its own thread, if one is
+/// still coming: for `roomlerd input-smoke`, a one-shot command that exits
+/// right after its open. The daemon never waits for it.
+pub fn wait_for_the_line() {
+    #[cfg(target_os = "linux")]
+    LINES.wait_for_the_line();
 }
 
 /// #3787 — how long a session's first line waits for its look at the seat:
@@ -202,42 +237,68 @@ enum Unanswered {
     Failed(String),
 }
 
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::NotInTime => write!(f, "the seat was not known within {SEAT_LOOK_WAIT:?}"),
+            Unanswered::CannotTell => f.write_str("logind could not tell who is at the seat"),
+            Unanswered::Failed(why) => write!(f, "the look at the seat failed ({why})"),
+        }
+    }
+}
+
 /// A session's first line, from the brief at its first try and the look.
-/// RED (#3787): master's choice, the brief's kind whatever the look found.
+/// A look that answered decides, and the line stands on its read. A look that
+/// ran out of time, could not tell or failed is no reading at all: the
+/// brief's kind stands, the level this said before #3787's look, and the line
+/// stands on the brief's own read, so the look never wins over the brief.
 #[cfg(any(target_os = "linux", test))]
 fn first_line(brief: Seen, look: Asked<Look>) -> (Line, Seen) {
-    let _ = look;
+    let (seen, chosen) = match look {
+        Asked::Answer(Look {
+            at,
+            kind: Some(kind),
+        }) => (Seen { kind, at: Some(at) }, Chosen::Look),
+        Asked::Answer(Look { kind: None, .. }) => (brief, Chosen::NoAnswer(Unanswered::CannotTell)),
+        Asked::Failed(why) => (brief, Chosen::NoAnswer(Unanswered::Failed(why))),
+        Asked::OutOfTime => (brief, Chosen::NoAnswer(Unanswered::NotInTime)),
+    };
     (
         Line::Said {
-            kind: brief.kind,
-            chosen: Chosen::Brief,
+            kind: seen.kind,
+            chosen,
         },
-        brief,
+        seen,
     )
 }
 
 /// A later try in the same session, given the read its last line stood on
-/// and the brief now: `None` is a repeat.
-/// RED (#3787): master's choice, the brief now, however old.
+/// and the brief now: `None` is a repeat. The newer read decides. A brief
+/// read before the line's (the person who signed out, still in a brief read
+/// before the look) changes nothing; one read after it shows what changed
+/// since (a person who signed in). A read with no instant is older than any.
 fn next_line(said: Seen, brief: Seen) -> Option<(Line, Seen)> {
-    let now = brief;
-    (level_after(now.kind, Some(said.kind)) != tracing::Level::DEBUG).then_some((
+    let newer = if brief.at > said.at { brief } else { said };
+    (level_after(newer.kind, Some(said.kind)) != tracing::Level::DEBUG).then_some((
         Line::Said {
-            kind: now.kind,
+            kind: newer.kind,
             chosen: Chosen::Brief,
         },
-        now,
+        newer,
     ))
 }
 
 /// The lines of one session at a time: what it said, the looks at the seat
-/// its first line takes, and how long a first line waits for one. A test
-/// makes its own.
+/// its first line takes (one in flight however many sessions ask), and how
+/// long a first line waits for one. The daemon's is `LINES`; a test makes
+/// its own.
 #[cfg(any(target_os = "linux", test))]
 struct Lines {
     memory: Mutex<Memory>,
     looks: OneInFlight<Look>,
     wait: Duration,
+    /// The thread saying the latest first line, for `input-smoke` to wait for.
+    pending: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// What the session said so far.
@@ -269,11 +330,14 @@ impl Lines {
             }),
             looks: OneInFlight::new(thread_name),
             wait,
+            pending: Mutex::new(None),
         }
     }
 
-    /// One try's line, given the brief at that try.
-    /// RED (#3787): master's lines, said at once from the brief.
+    /// One try's line, given the brief at that try. Never waits: a session's
+    /// first try marks the memory and leaves its line to a thread of its own
+    /// ([`Self::first_line_on_its_own_thread`]). A try while that line waits,
+    /// or one that finds its kind said already, is a DEBUG repeat.
     fn say(
         &'static self,
         brief: Seen,
@@ -281,24 +345,79 @@ impl Lines {
         stale_brief: impl FnOnce() + Send + 'static,
         emit: impl Fn(Line) + Clone + Send + 'static,
     ) {
-        let _ = (lookup, stale_brief, self.wait, &self.looks);
         let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-        let line = match memory.state {
+        let state = memory.state;
+        let line = match state {
+            State::Quiet => {
+                memory.state = State::Looking;
+                let epoch = memory.epoch;
+                drop(memory);
+                self.first_line_on_its_own_thread(epoch, brief, lookup, stale_brief, emit);
+                return;
+            }
+            State::Looking => Line::Waiting,
             State::Said(said) => match next_line(said, brief) {
-                Some((line, now)) => {
-                    memory.state = State::Said(now);
+                Some((line, newer)) => {
+                    memory.state = State::Said(newer);
                     line
                 }
                 None => Line::Repeat(said.kind),
             },
-            State::Quiet | State::Looking => {
-                let (line, seen) = first_line(brief, Asked::OutOfTime);
-                memory.state = State::Said(seen);
-                line
-            }
         };
         drop(memory);
         emit(line);
+    }
+
+    /// The session's first line, said from a thread named `LINE_THREAD`:
+    /// the look's kind within the wait, else the brief's and why. When the
+    /// look saw another kind than the brief, the brief is asked to read again
+    /// (`stale_brief`). Both run on that thread only, never on the caller's,
+    /// which is the input arbiter's.
+    fn first_line_on_its_own_thread(
+        &'static self,
+        epoch: u64,
+        brief: Seen,
+        lookup: impl FnOnce() -> Option<NoDisplay> + Send + 'static,
+        stale_brief: impl FnOnce() + Send + 'static,
+        emit: impl Fn(Line) + Clone + Send + 'static,
+    ) {
+        let emit_here = emit.clone();
+        let spawned = std::thread::Builder::new()
+            .name(LINE_THREAD.into())
+            .spawn(move || {
+                let look = self.looks.ask_blocking(self.wait, move || Look {
+                    at: Instant::now(),
+                    kind: lookup(),
+                });
+                let (line, seen) = first_line(brief, look);
+                self.said(epoch, seen);
+                let disagrees = matches!(
+                    &line,
+                    Line::Said { kind, chosen: Chosen::Look } if *kind != brief.kind
+                );
+                if disagrees {
+                    stale_brief();
+                }
+                emit(line);
+            });
+        match spawned {
+            Ok(thread) => *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread),
+            Err(e) => {
+                let why = format!("no thread to wait for it: {e}");
+                let (line, seen) = first_line(brief, Asked::Failed(why));
+                self.said(epoch, seen);
+                emit_here(line);
+            }
+        }
+    }
+
+    /// The first line of `epoch` stands on `seen`, unless its session has
+    /// gone since.
+    fn said(&self, epoch: u64, seen: Seen) {
+        let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        if memory.epoch == epoch && matches!(memory.state, State::Looking) {
+            memory.state = State::Said(seen);
+        }
     }
 
     /// A session opened: its first try looks again.
@@ -306,6 +425,56 @@ impl Lines {
         let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         memory.epoch = memory.epoch.wrapping_add(1);
         memory.state = State::Quiet;
+    }
+
+    /// Wait for the thread saying the latest first line, if there is one.
+    fn wait_for_the_line(&self) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(line) = pending {
+            let _ = line.join();
+        }
+    }
+}
+
+/// The daemon's lines: their looks run on a thread named `seat-look`.
+#[cfg(target_os = "linux")]
+static LINES: Lines = Lines::new("seat-look", SEAT_LOOK_WAIT);
+
+/// The look itself, on the look's own thread: what is at the screen now,
+/// read from logind as the desktop brief reads it. `None` when logind cannot
+/// tell.
+#[cfg(target_os = "linux")]
+fn seat_now() -> Option<NoDisplay> {
+    let (session, kind) = crate::desktop_brief::seen_now()?;
+    NoDisplay::of(false, Some((session.as_str(), kind.as_str())))
+}
+
+/// The daemon's sink for `LINES`: each line in the journal at its level.
+#[cfg(target_os = "linux")]
+fn log(line: Line) {
+    match line {
+        Line::Said { kind, chosen } => {
+            let unread = match chosen {
+                Chosen::NoAnswer(why) => format!(
+                    "; {why}, so the desktop brief chose this level, and it can be a minute old"
+                ),
+                Chosen::Look | Chosen::Brief => String::new(),
+            };
+            if kind.level() == tracing::Level::ERROR {
+                tracing::error!("input: {kind} — input injection disabled (#3787){unread}");
+            } else {
+                tracing::info!("input: {kind} — no input until there is one (#3787){unread}");
+            }
+        }
+        Line::Repeat(kind) => tracing::debug!("input: still {kind}"),
+        Line::Waiting => tracing::debug!(
+            "input: still no X display to open; this session's first line waits for its look at \
+             the seat (#3787)"
+        ),
     }
 }
 
@@ -376,12 +545,17 @@ mod tests {
     }
 
     /// `open_default` picks the line by the error's type. Any other failure,
-    /// even one worded the same way, keeps master's line.
+    /// even one worded the same way, keeps master's line. The brief's read
+    /// instant travels with the type.
     #[test]
     fn the_kind_is_read_from_the_error_type_never_its_text() {
-        let typed = anyhow::Error::new(NoDisplayToOpen(NoDisplay::NobodySignedIn));
-        assert_eq!(kind_of(&typed), Some(NoDisplay::NobodySignedIn));
-        let worded = anyhow::anyhow!("enigo init: {}", NoDisplayToOpen(NoDisplay::NobodySignedIn));
+        let missing = NoDisplayToOpen {
+            kind: NoDisplay::NobodySignedIn,
+            read: Some(Instant::now()),
+        };
+        let typed = anyhow::Error::new(missing);
+        assert_eq!(kind_of(&typed), Some(missing));
+        let worded = anyhow::anyhow!("enigo init: {missing}");
         assert_eq!(kind_of(&worded), None);
         let enigo = anyhow::anyhow!(
             "enigo init: no connection could be established: (no successful connection)"

@@ -13,6 +13,7 @@
 //! `None` until the first refresh lands, and always off Linux.
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use roomler_ai_remote_control::models::DesktopBrief;
 
@@ -20,7 +21,8 @@ use roomler_ai_remote_control::models::DesktopBrief;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
-static LATEST: Mutex<Option<DesktopBrief>> = Mutex::new(None);
+/// The latest brief, and when the read of logind behind it began.
+static LATEST: Mutex<Option<(Instant, DesktopBrief)>> = Mutex::new(None);
 
 /// Set by [`refresh_soon`]; the refresher waits on it between two reads.
 #[cfg(target_os = "linux")]
@@ -28,6 +30,17 @@ static SOON: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::
 
 /// The latest brief. Never blocks on logind.
 pub fn current() -> Option<DesktopBrief> {
+    LATEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, brief)| brief.clone())
+}
+
+/// #3787 — [`current`], and when the read of logind behind it began: a read
+/// of the seat that began later is the newer one. Never blocks on logind.
+#[cfg(target_os = "linux")]
+pub(crate) fn current_read() -> Option<(Instant, DesktopBrief)> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
@@ -94,6 +107,25 @@ pub fn seen_is_x11() -> bool {
         .is_some_and(|s| s.kind == "x11")
 }
 
+/// #3787 — who is at the screen now, as the brief would carry it: logind's
+/// session class and type of the session a controller would see, `none` for
+/// both when there is none. Read from logind at once, not up to [`REFRESH`]
+/// ago, and nothing else of the brief (its input reach can take an X probe).
+/// `None` when logind cannot tell. ⚠️ Blocks on `loginctl`, which can hang:
+/// only a thread of its own may call it, never an async worker or the input
+/// arbiter (`input::no_display`).
+#[cfg(target_os = "linux")]
+pub(crate) fn seen_now() -> Option<(String, String)> {
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let all = crate::keep_busy::logind::sessions()?;
+    Some(pick::session_and_kind(pick::seen_session(
+        &all,
+        uid == 0,
+        uid,
+    )))
+}
+
 /// Start the refresher (once per process; a second call does nothing).
 pub fn start() {
     #[cfg(target_os = "linux")]
@@ -105,11 +137,14 @@ pub fn start() {
                 .spawn(|| {
                     loop {
                         let prev = current();
+                        // #3787 — when this read of logind began: a look at
+                        // the seat that began later is newer than this brief.
+                        let began = Instant::now();
                         let brief = linux::gather(prev.as_ref());
                         let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
                         // Said once per change, so the journal shows what the
                         // hello and the heartbeat carry.
-                        if latest.as_ref() != Some(&brief) {
+                        if latest.as_ref().map(|(_, last)| last) != Some(&brief) {
                             tracing::info!(
                                 session = %brief.session,
                                 kind = %brief.kind,
@@ -119,7 +154,7 @@ pub fn start() {
                                 "desktop brief (FR-93 P2b)"
                             );
                         }
-                        *latest = Some(brief);
+                        *latest = Some((began, brief));
                         drop(latest);
                         wait_for_the_next_refresh(REFRESH);
                     }
@@ -154,6 +189,16 @@ mod pick {
             all.iter().find(|s| s.uid == uid && graphical(s))
         }
     }
+
+    /// The brief's `session` (logind's class) and `kind` (its type) for the
+    /// session a controller would see: `none` for both with no such session.
+    /// #3787 — the brief and `seen_now` both map it here, so the two agree.
+    pub(super) fn session_and_kind(seen: Option<&Session>) -> (String, String) {
+        (
+            seen.map_or("none", |s| s.class.as_str()).to_string(),
+            seen.map_or("none", |s| s.kind.as_str()).to_string(),
+        )
+    }
 }
 
 /// Is `next` the same desktop as `prev`, all but the input reach?
@@ -176,7 +221,7 @@ fn same_desktop(prev: &DesktopBrief, next: &DesktopBrief) -> bool {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::pick::seen_session;
+    use super::pick::{seen_session, session_and_kind};
     use crate::capture::{CaptureArm, arm_facts, planned_arm, planned_input_route};
     use roomler_ai_remote_control::models::DesktopBrief;
 
@@ -190,13 +235,13 @@ mod linux {
         let seen = sessions
             .as_deref()
             .and_then(|all| seen_session(all, root, uid));
-        let kind = seen.map_or("none", |s| s.kind.as_str()).to_string();
+        let (session, kind) = session_and_kind(seen);
         let facts = arm_facts(sessions.as_deref(), root, uid, kind == "x11");
         let arm = planned_arm(&facts);
         // FR-93 P4 — the RemoteDesktop route that arm would open, if any.
         let route = planned_input_route(&facts);
         let mut next = DesktopBrief {
-            session: seen.map_or("none", |s| s.class.as_str()).to_string(),
+            session,
             kind,
             desktop: seen.and_then(|s| s.desktop.clone()),
             capture_arm: arm.map_or("none", CaptureArm::wire).to_string(),
@@ -281,6 +326,24 @@ mod tests {
             seen_session(&greeter_only, true, 0).map(|x| x.class.as_str()),
             Some("greeter")
         );
+    }
+
+    /// #3787 — the brief and the look at the seat (`seen_now`) map the seen
+    /// session alike: nobody at a desktop is `none` for both, and a greeter is
+    /// its class and type, which `input::no_display` reads as nobody signed in.
+    #[test]
+    fn the_brief_and_the_look_map_the_seen_session_alike() {
+        use super::pick::session_and_kind;
+        let none = ("none".to_string(), "none".to_string());
+        assert_eq!(session_and_kind(None), none);
+        let greeter = s("c1", 120, "greeter", true, "wayland");
+        assert_eq!(
+            session_and_kind(Some(&greeter)),
+            ("greeter".to_string(), "wayland".to_string())
+        );
+        // A text console is no desktop, so it is seen as nobody, as in the brief.
+        let all = vec![s("5", 1000, "user", true, "tty")];
+        assert_eq!(session_and_kind(seen_session(&all, true, 0)), none);
     }
 
     #[test]

@@ -892,7 +892,7 @@ sequenceDiagram
 - **The frame goes through the input arbiter like a key**, so it needs the
   input floor and the session's input permission, as typing does. The injector
   then checks again
-  ([`enigo_backend.rs:300`](../agents/roomlerd/src/input/enigo_backend.rs#L300)):
+  ([`enigo_backend.rs:303`](../agents/roomlerd/src/input/enigo_backend.rs#L303)):
   the policy can change between the hello and the click, and a viewer is not
   trusted to have read the hello.
 - **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
@@ -1656,11 +1656,35 @@ A new session's first event looks at once, from the shortest wait again (`Regran
 
 ⚠️ A root daemon with no `DISPLAY` can never open enigo, so since #3787 its open is not tried. With no `DISPLAY`, x11rb answers `DisplayNotSet` before any I/O, and enigo printed that and `no successful connection` at ERROR on every try. `agents/roomlerd/src/input/no_display.rs` says why instead, once a session:
 
-| Who is at the screen (the desktop brief) | The line |
+| Who is at the screen (a look at the seat for the session's first line) | The line |
 |---|---|
 | known to show nobody at a graphical session: the login screen (`greeter`), no seat (`none`), a text console (`tty`) | INFO `input: no X display to open: … nobody is signed in …` |
-| a person signed in on X11, Wayland or any other session type, or the brief not read yet | ERROR `input: no X display to open: … though a person is signed in …` |
+| a person signed in on X11, Wayland or any other session type, or the seat not known | ERROR `input: no X display to open: … though a person is signed in …` |
 | the same kind again within the session (warm, a first event, each regrant, each keep-busy op) | DEBUG |
+
+Who is at the screen is read when the session's first line is said. The desktop brief alone was not enough: it reads logind once a minute (`REFRESH`, `agents/roomlerd/src/desktop_brief.rs:22`), so for up to a minute after a person signed out it still showed them. The first session at the login screen then said ERROR. The 0.4.219 release lab read ERROR 35 s after a sign-out and INFO 88 s after.
+
+```mermaid
+sequenceDiagram
+    participant A as input-arbiter thread
+    participant L as no-display-line thread
+    participant S as seat-look thread
+    participant B as desktop-brief thread
+    A->>A: the open fails at once: no DISPLAY, the brief's kind and when it read logind
+    A->>L: the session's first try: spawn, and return
+    L->>S: ask the one look in flight, 1.5 s at most
+    S->>S: loginctl: the class and type of the session a controller would see
+    S-->>L: the kind now
+    L->>B: refresh_soon(), when the look and the brief disagree
+    L->>L: the line, at the level of what the look saw
+```
+
+- **The open never waits.** It still fails at once on the input arbiter's thread, which serves every injector, keep busy's 500 ms replies and the control-state broadcasts. The session's first try marks the session's memory and leaves the line to a short `no-display-line` thread (`Lines::say`, `agents/roomlerd/src/input/no_display.rs:340`; the thread, `:375`).
+- **One look in flight.** That thread asks a `OneInFlight` (`ask_blocking`, `agents/roomlerd/src/one_in_flight.rs:192`) whose lookup runs on a `seat-look` thread. The lookup reads logind's sessions and takes the session a controller would see, with the class and type mapped as the brief maps them (`seen_now`, `agents/roomlerd/src/desktop_brief.rs:118`). A text console stays INFO. While logind hangs, however many sessions ask, the look holds one thread (#3796, #3830).
+- **No answer in 1.5 s**, or none at all (logind slow, stopped, hung or missing): the brief's kind stands, which is the level this line had before, and the line says so: `…(#3787); the seat was not known within 1.5s, so the desktop brief chose this level, and it can be a minute old` (`first_line`, `no_display.rs:255`). A look with no answer is no reading of the seat, so it never wins over the brief.
+- **Later tries in the session** are DEBUG, and so is a try while the first line still waits for its look. The kind changes only when a read of the seat newer than the line's shows another kind (`next_line`, `no_display.rs:279`). The brief keeps when its read of logind began (`current_read`, `desktop_brief.rs:43`). A brief read before the look, which still shows the person who signed out, changes nothing. A brief read after it, which shows a person who signed in since, is said at that kind's level. A reading with no read instant counts as older than any other.
+- **The brief catches up.** When the look sees a kind that differs from the brief's, the `no-display-line` thread asks the brief to read again (`refresh_soon`, `desktop_brief.rs:53`). That call sets a flag and wakes the refresher, so it never blocks, and the arbiter's thread never makes it. The hello's `desktop` follows within a heartbeat.
+- `roomlerd input-smoke`, a one-shot command, waits for that line before it goes on (`no_display::wait_for_the_line`). The daemon never does.
 
 With `DISPLAY` set the open runs as before, and a failed one still prints enigo's ERROR lines and warns. The doubling still bounds the regrant tries: about nine in a session's first minute, then one a minute while events arrive.
 
@@ -1897,7 +1921,7 @@ logged in fast 4 times out of 4.
 `caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
 long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
 foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
-from `agents/roomlerd/src/input/enigo_backend.rs:249`), so the letters after it
+from `agents/roomlerd/src/input/enigo_backend.rs:252`), so the letters after it
 take the new state (read with CapsLock toggled twice inside a run of typing,
 `abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
 0.9 s, because the attach was costing about 2.5 ms a character.
