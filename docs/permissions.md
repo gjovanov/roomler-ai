@@ -144,11 +144,20 @@ org-relay grants, so a change of who holds which role reaches the nodes when the
 are recompiled. Every write that changes it (assign, unassign, delete, adding a
 member, an invite's redemption, registration with an invite) calls
 `HookRegistry::org_roles_changed` (`crates/core/src/hooks.rs:346`) after its write.
-The network module's hook (`crates/modules/network/src/membership.rs:85`) re-fans the
-org 750 ms later, one re-fan for a burst of changes, and only while the org's overlay
-ACL is `warn` or `enforce` (`refan_for_role_change`,
-`crates/modules/network/src/routes/overlay_policy.rs:334`): under `off` a role shapes
-nothing. The request never waits for the re-fan.
+The network module's hook (`crates/modules/network/src/membership.rs:82`) re-fans the
+org 750 ms later, and only while the org's overlay ACL is `warn` or `enforce`
+(`refan_for_role_change`, `crates/modules/network/src/routes/overlay_policy.rs:334`):
+under `off` a role shapes nothing. The request never waits for the re-fan.
+
+⚠️ **One re-fan per org at a time** (`RefanQueue`, `membership.rs:130`). A re-fan
+reads on the order of N² rows for an org of N nodes, so runs that overlapped for one
+org would multiply on a shared pod. A change that arrives while a re-fan waits out
+the 750 ms joins it. Changes that arrive while one runs only mark one more run owed:
+the run in progress finishes, then exactly one more starts, whatever the number of
+changes. The mark is cleared before a run reads anything, so every change is
+followed by a run that started after it. A worker that
+panics clears its org's mark as it unwinds (`WorkerMark`, `membership.rs:200`), so
+the next change starts a new one.
 
 ## 2 · The managed roles
 
