@@ -255,15 +255,15 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
   reuse;
 - `impl std::io::Write`: when the UTC date has changed since the last write, it opens `<basename>.<YYYY-MM-DD>`
   with `append_file(.., Seal::Readable)`. Those are `tracing_appender`'s daily names, so `rolling_basenames`, the
-  prune and the log tail read them unchanged (`logging.rs:1060-1062`);
+  prune and the log tail read them unchanged (`logging.rs:1058-1060`);
 - wrapped in `tracing_appender::non_blocking`, as today (`logging.rs:247`);
 - a refusal takes today's fallback for an unusable `service-logs`, the reason logged first (#3073,
   `logging.rs:224-239`).
 
 | Site | Today | After |
 |---|---|---|
-| the prune (`logging.rs:1085-1107`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
-| the panic file (`:1109-1130`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
+| the prune (`logging.rs:1083-1105`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
+| the panic file (`:1107-1128`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
 | the stderr file (`:798-804`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
 | the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:316-328`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |
 | the install outcome (`agents/roomlerd/src/post_install.rs:173-175`, `:190-196`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |

@@ -705,7 +705,7 @@ number is advertised beyond what the current single-worker room is known to carr
 
 **A sweep, not a timer.** A timer lives in the pod that started the call, and a rolling
 deploy restarts pods: the call would outlive its timer and run uncapped. Every pod reads
-the calls in progress every 30 s (`crates/modules/conference/src/meeting_cap.rs:248`) and
+the calls in progress every 30 s (`crates/modules/conference/src/meeting_cap.rs:253`) and
 decides each one with `quota::evaluate_for` on the new `Limit::MeetingMinutes`, read as
 "may it run one more minute?" (`meeting_cap.rs:58`). The comparison stays in the one
 place plan limits are compared, and like the device cap it is **established**: `warn`,

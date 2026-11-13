@@ -29,7 +29,9 @@ Full treatment: **`docs/modular-monolith.md`**. What constrains new work:
    `conference → chat`, `remote → fleet`, `network → fleet`. **Core never calls a
    module** — the inverse flows are hooks core invokes in `hooks::HOOK_ORDER`
    (session holders → lease holders → the record owner), and a failing holder
-   STOPS the cascade. A hook is the *only* way a module reaches "up".
+   STOPS the cascade — except `room_removed`: the room is already gone, so every
+   holder runs and the caller reports each failure. A hook is the *only* way a
+   module reaches "up".
 2. **The composition is gated by a byte-identical baseline.**
    `crates/tests/src/composition_tests.rs` asserts every route with its allowed
    methods, the index plan for both `multi_block` values, and every wire name

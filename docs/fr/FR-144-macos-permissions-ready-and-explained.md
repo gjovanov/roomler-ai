@@ -59,7 +59,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
   Settings button each, and Restart roomlerd (`agents/roomler-desktop/src/front/index.html:102-130`), re-read on
   window focus (`overview.js:656-678`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2402-2409`,
   `agents/roomlerd/src/localapi_state.rs:460-473`). Its Screen Recording read is not live: it stays false after
-  the grant until a restart (`crates/localapi/src/lib.rs:530-542`). No row for prompts 4 or 5, no stale state, no
+  the grant until a restart (`crates/localapi/src/lib.rs:537-549`). No row for prompts 4 or 5, no stale state, no
   "Allowed" state. For its first 30 s after the install it says "Not enrolled yet" (#3700).
 - **The Devices page** (code): "No screen access" and "No input access" chips (`ui/src/components/admin/agentCodecChips.ts:92-115`)
   from the permission words the agent computes once per process (`agents/roomlerd/src/encode/caps.rs:4450-4479`).
@@ -129,7 +129,7 @@ per permission `roomlerd` needs:
 
 | Row, as the person reads it | Without it | Live state from | Button |
 |---|---|---|---|
-| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:530-542`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
+| **See the screen** — Screen & System Audio Recording | "The remote screen is blank." | a fresh `roomlerd` child probe, because the running process's read stays false until a restart (`crates/localapi/src/lib.rs:537-549`); that macOS attributes the child to `roomlerd.app` is to verify in the field | "Open Screen & System Audio Recording" |
 | **Control the mouse and keyboard** — Device Control and Data Access (macOS 27), Accessibility (earlier) | "Clicks and keys from the controller do nothing." | `AXIsProcessTrusted`, live (`tcc.rs:69-71`) | "Open Device Control and Data Access" |
 | **Reach this network** — Local Network | "A controller on the same network connects through the internet or a relay instead of directly." | the agent's own sends: the last result of a multicast or local-address send | "Ask now", then "Open Local Network" once answered |
 | **Show the screen without a monthly question** — the screen-capture reminder | "macOS asks again about every 30 days, and the question covers the screen until someone answers it." | the agent's own record of when it last saw the reminder answered (replayd's own record, if a process of ours may read it: to verify in the field) | "Ask now" (one capture) |
