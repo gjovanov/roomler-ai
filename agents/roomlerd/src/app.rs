@@ -3850,6 +3850,26 @@ fn defer_to_launch_agent() {
     }
 }
 
+/// #3802 — who owns the folder `file` is in and its mode, as `lstat` reads it
+/// (a link at the folder is read as the link), for an error that says why a
+/// write there was refused. Empty when the folder cannot be read, and off Unix.
+fn owner_of_folder(file: &Path) -> String {
+    #[cfg(unix)]
+    if let Some(dir) = file.parent() {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            return format!(
+                " (its folder {} is uid {}'s, mode {:o})",
+                dir.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            );
+        }
+    }
+    let _ = file;
+    String::new()
+}
+
 /// The daemon. `Ok(Some(code))` = it ended through the graceful path a
 /// requested restart (FR-84 D3, `Request::RestartDaemon`) started, and the
 /// process must leave with `code` for its supervisor to relaunch it;
@@ -3931,7 +3951,15 @@ async fn run_cmd(
     if unenrolled && !config_path.exists() {
         let name = roomlerd::machine::hostname().unwrap_or_default();
         let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
-        config::save(config_path, &blank).context("writing the person's config")?;
+        // #3802 — the worker's stderr is the root daemon's (its launchd log),
+        // so the reason names the folder and who owns it, not only the error.
+        config::save(config_path, &blank).with_context(|| {
+            format!(
+                "writing the person's config {}{}",
+                config_path.display(),
+                owner_of_folder(config_path)
+            )
+        })?;
     }
     let mut cfg = config::load(config_path).context("loading config")?;
     // #3116 — every save below, up to the LocalAPI coming up, writes THIS

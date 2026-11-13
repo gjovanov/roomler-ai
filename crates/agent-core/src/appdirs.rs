@@ -860,9 +860,17 @@ fn in_an_installer_step(old: &Path) -> String {
 /// it names no absolute folder.
 #[cfg(unix)]
 pub fn own_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
-    let uid = unsafe { libc::geteuid() };
+    account_home(unsafe { libc::geteuid() })
+}
+
+/// #3802 — the home folder the account database names for `uid`
+/// (`getpwuid_r`), never the environment. `None` when there is no entry or it
+/// names no absolute folder. The macOS supervisor reads the console person's
+/// folder through it ([`macos_config_dir_in_home`]).
+#[cfg(unix)]
+pub fn account_home(uid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
     let mut buf: Vec<libc::c_char> = vec![0; 1024];
     loop {
         // SAFETY: an all-zero `passwd` is a valid value of a plain C struct;

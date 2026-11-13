@@ -518,7 +518,27 @@ pub fn stale_workers(ps: &str, commands: &[String], own_pid: u32) -> Vec<(u32, u
 ///
 /// FR-43 P3a — a worker with no enrollment needs no per-user config, so under
 /// `one_row` that second reading would send a person after the wrong thing.
-pub fn gave_up_reason(last: Option<WorkerEnd>, one_row: bool) -> &'static str {
+///
+/// #3802 — `not_theirs` is the person's folder when another account owns it
+/// ([`FolderNotTheirs`]). The worker writes its log and its config there, so
+/// that is the cause whatever the exit, and the reading names the folder and
+/// the one command that gives it back, never the log the worker could not
+/// write.
+pub fn gave_up_reason(
+    last: Option<WorkerEnd>,
+    one_row: bool,
+    not_theirs: Option<&FolderNotTheirs>,
+) -> String {
+    if let Some(f) = not_theirs {
+        let path = f.path.display();
+        return format!(
+            "the worker cannot write the person's folder {path}: uid {} owns it (mode {:o}), \
+             not the person, so the worker's own log is not there either. Move it aside as \
+             that person: mv '{path}' '{path}.made-by-root'. Then log out and back in, or \
+             restart this daemon: launchctl kickstart -k system/com.roomler.daemon",
+            f.owner, f.mode
+        );
+    }
     match last {
         Some(WorkerEnd::Code(0)) => {
             "each worker exited 0 at once: another roomlerd holds this person's \
@@ -538,6 +558,34 @@ pub fn gave_up_reason(last: Option<WorkerEnd>, one_row: bool) -> &'static str {
              launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
         }
     }
+    .to_string()
+}
+
+/// #3802 — the console person's folder (the one their worker writes its log
+/// and config in) when another account owns it: what `lstat` read, never
+/// through a link at the folder itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderNotTheirs {
+    pub path: std::path::PathBuf,
+    /// The account that owns it.
+    pub owner: u32,
+    /// Its permission bits.
+    pub mode: u32,
+}
+
+/// #3802 — [`FolderNotTheirs`] out of what `lstat` read for `path`, the folder
+/// of the person `uid`: `None` when that person owns it.
+pub fn folder_not_theirs(
+    path: std::path::PathBuf,
+    uid: u32,
+    owner: u32,
+    mode: u32,
+) -> Option<FolderNotTheirs> {
+    (owner != uid).then_some(FolderNotTheirs {
+        path,
+        owner,
+        mode: mode & 0o7777,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -638,6 +686,16 @@ mod imp {
     ///
     /// FR-43 P3a — with `one_row` the worker holds no enrollment. The person's
     /// config still resolves the same way: its session knobs are theirs.
+    /// #3802 — the console person's folder, read with `lstat` (a link at the
+    /// folder is read as the link, never followed), when another account owns
+    /// it. A read only: root changes nothing in a person's home.
+    fn person_folder_not_theirs(uid: u32) -> Option<FolderNotTheirs> {
+        let home = crate::appdirs::account_home(uid)?;
+        let path = crate::appdirs::macos_config_dir_in_home(&home, std::path::Path::exists);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        folder_not_theirs(path, uid, meta.uid(), meta.mode())
+    }
+
     fn spawn_worker(
         uid: u32,
         exe: &std::path::Path,
@@ -1128,6 +1186,7 @@ mod imp {
             // the daemon's whole life.
             if last_action != Some(action) {
                 if matches!(action, Action::GaveUp) {
+                    let not_theirs = uid_now.and_then(person_folder_not_theirs);
                     tracing::error!(
                         console_uid = ?uid_now,
                         fast_exits,
@@ -1135,7 +1194,7 @@ mod imp {
                         last_end = ?last_end,
                         "macOS supervisor: the GUI worker died on arrival too many times — \
                          NOT retrying: {}",
-                        gave_up_reason(last_end, one_row)
+                        gave_up_reason(last_end, one_row, not_theirs.as_ref())
                     );
                 } else {
                     tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
@@ -2031,14 +2090,48 @@ mod tests {
     /// worker had exited 0 on a held lock. The exit code tells them apart.
     #[test]
     fn the_give_up_names_the_lock_when_workers_exit_cleanly() {
-        let lock = gave_up_reason(Some(WorkerEnd::Code(0)), false);
+        let lock = gave_up_reason(Some(WorkerEnd::Code(0)), false, None);
         assert!(lock.contains("single-instance lock"), "{lock}");
         assert!(!lock.contains("enrollment"), "{lock}");
         for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
             assert!(
-                gave_up_reason(end, false).contains("per-user enrollment"),
+                gave_up_reason(end, false, None).contains("per-user enrollment"),
                 "{end:?}"
             );
+        }
+    }
+
+    /// #3802 — a person's folder that a root step made: the give-up names the
+    /// folder, its owner and the one command, under either switch and whatever
+    /// the exit, and never sends the person to the log the worker could not
+    /// write.
+    #[test]
+    fn the_give_up_names_a_folder_another_account_owns() {
+        let path =
+            std::path::PathBuf::from("/Users/p/Library/Application Support/live.roomler.roomler");
+        assert_eq!(folder_not_theirs(path.clone(), 501, 501, 0o40755), None);
+        let root_made = folder_not_theirs(path.clone(), 501, 0, 0o40755).expect("root's");
+        assert_eq!(root_made.mode, 0o755);
+        for one_row in [true, false] {
+            for end in [
+                Some(WorkerEnd::Code(1)),
+                Some(WorkerEnd::Code(0)),
+                Some(WorkerEnd::Signal(9)),
+                None,
+            ] {
+                let why = gave_up_reason(end, one_row, Some(&root_made));
+                assert!(
+                    why.contains(&format!("folder {}:", path.display())),
+                    "{why}"
+                );
+                assert!(why.contains("uid 0 owns it (mode 755)"), "{why}");
+                assert!(
+                    why.contains(&format!("mv '{0}' '{0}.made-by-root'", path.display())),
+                    "{why}"
+                );
+                assert!(!why.contains("/logs"), "{why}");
+                assert!(!why.contains("enrollment"), "{why}");
+            }
         }
     }
 
@@ -2049,13 +2142,13 @@ mod tests {
     fn the_give_up_does_not_blame_an_enrollment_a_worker_never_needed() {
         for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
             assert!(
-                !gave_up_reason(end, true).contains("per-user enrollment"),
+                !gave_up_reason(end, true, None).contains("per-user enrollment"),
                 "{end:?}"
             );
         }
         assert_eq!(
-            gave_up_reason(Some(WorkerEnd::Code(0)), true),
-            gave_up_reason(Some(WorkerEnd::Code(0)), false)
+            gave_up_reason(Some(WorkerEnd::Code(0)), true, None),
+            gave_up_reason(Some(WorkerEnd::Code(0)), false, None)
         );
     }
 }
