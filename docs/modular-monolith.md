@@ -346,7 +346,8 @@ forces a catch-all in every consumer everywhere — too invasive for the existin
 
 Core never calls a module, so the cascades that cross modules are **hooks** core invokes in
 `hooks::HOOK_ORDER`: session holders → lease holders → the record owner. A failing holder stops
-the cascade.
+the cascade, with one exception: a deleted room (`room_removed`) is gone whatever a holder
+answers, so every holder runs and the caller reports each failure.
 
 ```mermaid
 sequenceDiagram
@@ -386,7 +387,9 @@ Three more shapes the registry carries:
   `core.hooks.room_removed`, AFTER the room and its memberships are gone. Conference, the only
   holder that keeps anything by the room, ends the call running in it for everyone in it, on
   whichever pod serves it; the room's member list is gone by then, so the people to tell come
-  from the call's media. The other modules keep the default no-op.
+  from the call's media. The other modules keep the default no-op. It is the one cascade a
+  failing holder does not stop: each holder runs, and the delete, which has happened, answers
+  200 and logs what failed.
 
 ---
 

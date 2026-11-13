@@ -320,7 +320,7 @@ a pipe into it fails and is skipped, and the next `create_transports` drops the 
 `[meetings] pipe_rooms` room survives a worker death with 1/R of its participants cut, instead of all of them.
 
 **Stats and gauges.** `sample_transports` (`room_manager.rs:108`) and the sampler (`media_stats.rs:89`, `:238`) read
-per-participant transports and are unchanged. `media_gauges` (`crates/modules/conference/src/lib.rs:114`) gains
+per-participant transports and are unchanged. `media_gauges` (`crates/modules/conference/src/lib.rs:117`) gains
 `routers` and `pipes` per room, and the `MediaGauges` struct (`:101`) the totals; the cluster status snapshot shows them.
 Pipe transport bytes (`PipeTransport::get_stats`, mediasoup `src/router/pipe_transport.rs:185`) go to the docs as a
 P4 reading, not a sampled series.
