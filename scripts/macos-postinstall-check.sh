@@ -18,15 +18,20 @@
 # loaded fails as it does on a Mac.
 #
 # What it cannot show: real launchd (a drain after a bootout, a latched failed
-# init, the process group a bootout ends), macOS's own tools and its
-# /bin/bash 3.2. The Mac lab reads those on a release candidate.
+# init, the process group a bootout ends), macOS's own tools and Apple's build
+# of /bin/bash. The Mac lab reads those on a release candidate, and CI's macOS
+# runner parses the script with that /bin/bash (`bash -n`).
 #
-# Usage: scripts/macos-postinstall-check.sh [--image IMAGE] [SCRIPT]
+# Usage: scripts/macos-postinstall-check.sh [--image IMAGE] [--bash VERSION] [SCRIPT]
 #   SCRIPT   the post-install script to run. Default: the repo's. An older one
 #            reads how it behaved:
 #              git show origin/master:agents/roomlerd/packaging/macos/postinstall > /tmp/pi
 #              scripts/macos-postinstall-check.sh /tmp/pi
 #   --image  the container image. Default debian:12.
+#   --bash   run the script (only the script) under the bash of the official
+#            image bash:VERSION. `--bash 3.2` is GNU bash 3.2.57, the version
+#            macOS ships as /bin/bash, here a Linux build. Default: the
+#            container's own bash.
 # Needs docker. Exits non-zero when any case fails, and then prints each failed
 # case's calls and output.
 set -euo pipefail
@@ -34,10 +39,12 @@ set -euo pipefail
 if [ "${1:-}" != --in-container ]; then
     image=debian:12
     script=""
+    bash_version=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --image) image="$2"; shift 2 ;;
-            -h|--help) sed -n '3,30p' "$0"; exit 0 ;;
+            --bash) bash_version="$2"; shift 2 ;;
+            -h|--help) sed -n '3,36p' "$0"; exit 0 ;;
             *) script="$1"; shift ;;
         esac
     done
@@ -57,13 +64,24 @@ if [ "${1:-}" != --in-container ]; then
     tokfile=$(mktemp)
     token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     printf '%s' "$token" >"$tokfile"
-    trap 'rm -f "$log" "$tokfile"' EXIT
+    bashdir=$(mktemp -d)
+    trap 'rm -f "$log" "$tokfile"; rm -rf "$bashdir"' EXIT
+    extra=()
+    if [ -n "$bash_version" ]; then
+        # The binary and every library its ldd names, links followed, copied
+        # out of the official image for the container below.
+        docker run --rm --network none -v "$bashdir:/out" "bash:$bash_version" sh -c \
+            'b=$(command -v bash) && cp "$b" /out/bash && for l in $(ldd "$b" | grep -o "/[^ ]*"); do cp "$l" /out/ || exit; done' ||
+            { echo "could not copy bash out of the image bash:$bash_version" >&2; exit 2; }
+        extra=(-v "$bashdir:/opt/postinstall-bash:ro")
+    fi
     set +e
     docker run --rm --network none \
         -v "$packaging:/src/packaging:ro" \
         -v "$script:/src/postinstall:ro" \
         -v "$here/$(basename "$0"):/src/check.sh:ro" \
         -v "$tokfile:/src/once-token:ro" \
+        ${extra[@]+"${extra[@]}"} \
         "$image" bash /src/check.sh --in-container "$token" 2>&1 | tee "$log"
     st=${PIPESTATUS[0]}
     set -e
@@ -84,6 +102,21 @@ if [ ! -f /src/once-token ] || [ -z "${2:-}" ] || [ "$(cat /src/once-token)" != 
     exit 2
 fi
 [ "$(uname -s)" = Linux ] || { echo "refusing: not a Linux container" >&2; exit 2; }
+
+# The shell the script runs under: this image's bash, or with --bash the one
+# copied out (a musl build: its loader goes where the binary looks for it, and
+# finds the rest beside the binary). The checks and stand-ins keep this
+# image's bash.
+POSTINSTALL_BASH=$(command -v bash)
+if [ -x /opt/postinstall-bash/bash ]; then
+    for l in /opt/postinstall-bash/ld-musl-*.so.1; do
+        [ -e "$l" ] || continue
+        cp "$l" "/lib/${l##*/}"
+        printf '/opt/postinstall-bash\n' >"/etc/$(basename "$l" .so.1).path"
+    done
+    POSTINSTALL_BASH=/opt/postinstall-bash/bash
+fi
+echo "the script's shell: $POSTINSTALL_BASH, bash $("$POSTINSTALL_BASH" -c 'echo "$BASH_VERSION"')"
 
 S=/standin
 BIN=$S/bin
@@ -284,7 +317,7 @@ run() {
     PERSONS_BEFORE=$(persons_tree)
     # PackageKit gives package scripts a bare environment and these arguments.
     (cd / && env -i PATH="$BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
-        bash /src/postinstall /tmp/roomler.pkg / / /) >"$OUT" 2>&1
+        "$POSTINSTALL_BASH" /src/postinstall /tmp/roomler.pkg / / /) >"$OUT" 2>&1
     RC=$?
 }
 

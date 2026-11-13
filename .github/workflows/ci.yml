@@ -1357,6 +1357,12 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
+      - name: The post-install script parses under this Mac's /bin/bash (#3783)
+        # Its shebang names /bin/bash, Apple's bash 3.2. The macOS post-install
+        # roads job runs its cases under a Linux build of the same version.
+        run: |
+          /bin/bash -c 'echo "/bin/bash $BASH_VERSION"'
+          /bin/bash -n agents/roomlerd/packaging/macos/postinstall
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Salt the cargo cache key with this job's definition
@@ -2825,3 +2831,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run the post-install script on both roads
         run: bash scripts/macos-postinstall-check.sh
+      - name: Run the post-install script on both roads under bash 3.2, the version macOS ships
+        run: bash scripts/macos-postinstall-check.sh --bash 3.2
