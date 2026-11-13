@@ -5373,7 +5373,7 @@ to-activate, so the browser never sees a bait-and-switch.
   everything on the declined (#3757) and FILES-denied channels. Tests:
   `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17494`), over
   a real channel through the production router, and
-  `files::refused_begin_tests` (`files.rs:12916`).
+  `files::refused_begin_tests` (`files.rs:13078`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
   Downloads for a `dest_path` it will not write: a SYSTEM/root writer
   outside the active user's profile (FR-84 D4), a path that is not a
