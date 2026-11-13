@@ -66,7 +66,7 @@ Sealing closes the write side only. Every reader below keeps working.
 | Folder | Read by | Anchor |
 |---|---|---|
 | `service-logs` | the tray's log view, "Open Logs Folder" and the log tail, as the signed-in person | `agents/roomler-desktop/src/commands.rs:179-190`, `:1916-1921` |
-| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder | `agents/roomlerd/src/app.rs:2290-2300`, `crash_recorder.rs:343-359`, `crash_uploader.rs:18-21` |
+| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder | `agents/roomlerd/src/app.rs:2292-2302`, `crash_recorder.rs:343-359`, `crash_uploader.rs:18-21` |
 | the SystemContext attempt record | Setup, as the person who started it (Users read, `record_aces`) | `machine_tree.rs:537-551` |
 
 ## Design
@@ -284,10 +284,10 @@ above).
 | the SystemContext attempt record (`agents/roomlerd/src/win_service/system_context_attempt.rs:151-155`, `:178-197`) | `create_dir_all(parent)`, `create_fresh(tmp)`, `seal_new_record`, `fs::rename` | `HeldPath` on the machine parent, `write_file(.., Seal::Readable)` |
 | the machine attention file (`crates/agent-core/src/notify.rs:113-138`, `:166-177`, `:210-214`, `:234-244`) | `create_dir_all`, `fs::write`, `remove_file` | `write_file` and `remove_file`, `Seal::Readable`; a person's own attention file in their profile is unchanged |
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
-| the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7461`) reads through the same `HeldPath` (D4) |
-| the machine config's saves (`crates/agent-core/src/config.rs:3781`, `:4461`, `:4647`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
+| the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7463`) reads through the same `HeldPath` (D4) |
+| the machine config's saves (`crates/agent-core/src/config.rs:3781`, `:4483`, `:4669`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
 | the repair's and the adoption's opens (`machine_tree.rs:619-621`, `:859-861`) | `win::open` of the whole path | `HeldPath::walk` |
-| the one-time segment move (`appdirs.rs:673`, `:890`, `:901`, `:999`, `:1114`) | renames and removes by path | per D7 |
+| the one-time segment move (`appdirs.rs:673`, `:933`, `:956`, `:1054`, `:1169`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
 
 ### The kill switch
@@ -454,14 +454,14 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D4. The presence lock's folder**, which sits directly below `%ProgramData%`, outside the machine folder
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
-  reader reads (`app.rs:7461`) for no gain.
+  reader reads (`app.rs:7463`) for no gain.
 - **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1621-1623`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1371-1385`; the earlier anchor
   files' deletes, `exec_service.rs:1279-1292`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
-- **D7. The one-time segment move** (`appdirs.rs:673`, `:890`, `:901`, `:999`, `:1114`). Options: onto a rename by
+- **D7. The one-time segment move** (`appdirs.rs:673`, `:933`, `:956`, `:1054`, `:1169`). Options: onto a rename by
   handle in P3; retire it. **Default: read first** how many Windows devices still keep only the older segment;
   retire the move if none does, else P3 moves it onto a rename by handle.
 - **D8. A gate against a new path-based SYSTEM write.** Options: none; a grep test; clippy's
@@ -471,7 +471,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
   as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
-  drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:566`); without read
+  drains the supervisor's records from that folder (`app.rs:2292-2302`, `crash_recorder.rs:566`); without read
   those records would stay on the device. Only the write side closes.
 
 ## Out of scope

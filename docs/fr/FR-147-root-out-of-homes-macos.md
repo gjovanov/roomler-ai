@@ -144,11 +144,11 @@ sequenceDiagram
 |---|---|---|
 | Program | `/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`, the package's binary (`scripts/install.sh:134`), never `current_exe()`. Started only when `lstat` reads a regular file of uid 0 that group and others cannot write | the binary of root's own tree, whatever path the command was typed by |
 | Arguments | `one-row-home <verb> --uid <uid> --gid <pw_gid> --version <its version> [the verb's]` | the child checks itself against them |
-| Dispatch | read from the raw argv as the first statement of both `main`s (`agents/roomlerd/src/app.rs:1283`, `:1364`), before `answer_stall_watch_cost` (`:1284`, `:1370`), any runtime and AppKit (`:1299-1333`). Synchronous: no tokio, no `logging::init` (`:1588`), no legacy-tree migration (`:1549`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
+| Dispatch | read from the raw argv as the first statement of both `main`s (`agents/roomlerd/src/app.rs:1283`, `:1365`), before `answer_stall_watch_cost` (`:1285`, `:1372`), any runtime and AppKit (`:1300-1334`). Synchronous: no tokio, no `logging::init` (`:1590`), no legacy-tree migration (`:1551`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
 | Credentials | set by our own `pre_exec` hook, not by `Command::uid` and `Command::gid` | std empties the group list, and macOS turns an empty list into `[0]`: the child would keep group 0 |
 | Environment | `env_clear()` | the child reads no `HOME` and no knob. Its home is `appdirs::own_home()` (`appdirs.rs:862`), the account database's home for its own uid |
 | Working directory | `/` | a folder of root's, whatever the caller's was |
-| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:216-228`) | the child holds none of root's open files |
+| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:363-375`) | the child holds none of root's open files |
 | Session, umask | `setsid()`, `umask(0o077)` | no controlling terminal; files born private |
 
 The hook allocates nothing and runs, each call checked (a failure is `spawn`'s error, and nothing runs): `setsid()`,
@@ -193,7 +193,7 @@ with "nothing has changed" (exit 1).
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
 | R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3825's person-run line, built from the child's report (`folder_not_theirs`, `macos_supervisor.rs:724`). P2 replaces it |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
-| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2. Without R4 the worker's first save (`app.rs:3956`) fails after the restart, and the conversion undoes itself |
+| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2. Without R4 the worker's first save (`app.rs:3958`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
@@ -267,7 +267,7 @@ parsed with unknown fields refused.
 - **Bounds.** A config of 256 KiB and a plist of 64 KiB; larger is exit 1. Root sends at most 1 MiB, reads at most
   1 MiB of stdout, and keeps 16 KiB of stderr while draining the rest.
 - **Transport.** `tunnel_core::child::output_bounded_fed(cmd, stdin, deadline, cap)`, new beside `output_bounded`
-  (`child.rs:75-95`, whose stdin is `/dev/null` and whose cap is 16 MiB, `:46`). stdin is written from its own
+  (`child.rs:86-111`, whose stdin is `/dev/null` and whose cap is 16 MiB, `:48`). stdin is written from its own
   thread, then closed, and a broken pipe fails the step. The deadline is 30 s and the cap 1 MiB; at the deadline the
   child is killed and reaped.
 - **The child's reads** open with `O_NONBLOCK`, check that the file is a regular one, and read at most the bound
@@ -276,8 +276,8 @@ parsed with unknown fields refused.
   and other write (0644 when none was recorded), and `<L>` 0755 when it is missing: launchd ignores a plist that
   group or others can write, and the package sets 644 (`postinstall:335-336`).
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:3880-3900`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4231-4234`), and no `.prev` repair, which belongs to the person's own agent
+  (`crates/agent-core/src/config.rs:3880-3919`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4250-4253`), and no `.prev` repair, which belongs to the person's own agent
   (`:3505-3517`). A config that does not parse stops Read, as today (`one_row.rs:1240-1242`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another

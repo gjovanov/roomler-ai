@@ -171,7 +171,7 @@ flowchart TB
     clears close-on-exec on 0 only. The parent drops its copy as soon as `spawn` returns, as the pty's parent drops
     the slave (`pty/unix.rs:278`).
   - The worker sweeps like every long-lived child and every child that runs a caller's code: the repository's
-    guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-25`, `:202-228`),
+    guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-27`, `:349-375`),
     used today by exec (`exec.rs:1811-1816`), the SSH shell (`pty/unix.rs:268-272`), the portal helper
     (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:1845`, `:1858`). It marks every
     descriptor above stderr close-on-exec, so the channel must ride a standard stream or the sweep would close it.
@@ -181,7 +181,7 @@ flowchart TB
     `/dev/null`), so nothing it starts inherits it and no grandchild can hold the lifeline open, the #3080 class
     (inferred design). Root also waits on the worker's pid, so EOF is not its only sign of a death.
   - Tests that hold it (P1): both ends read `FD_CLOEXEC`; a sweeping child started while the pair is live has
-    neither end open, the shape of `child.rs:497-532`; a stand-in for the worker started by the real builder has one
+    neither end open, the shape of `child.rs:644-679`; a stand-in for the worker started by the real builder has one
     socket, on descriptor 0, with the worker end's inode; after the worker's move, a child it starts has no socket;
     killing the worker gives root's end an EOF.
 

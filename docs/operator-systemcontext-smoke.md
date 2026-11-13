@@ -122,7 +122,7 @@ refuses to silently fall back to `%APPDATA%`.
 
 From an elevated prompt it first takes the machine folder and its parent,
 `C:\ProgramData\roomler`, for Administrators (#3609,
-`crates/agent-core/src/config.rs:4597`): the folder's owner and nothing else,
+`crates/agent-core/src/config.rs:4619`): the folder's owner and nothing else,
 and for the parent its owner and what it inherits derived again for that
 owner (`crates/agent-core/src/machine_tree.rs:895`). A person's daemon may have
 made both to stage received files before the service ever ran, and the
@@ -218,7 +218,7 @@ that fails is not run: the device runs as in step 2a, and the service log says
 once which entry fails and why (step 6). The service host and the worker read
 it through one function (`agents/roomlerd/src/win_service/supervisor.rs:976`),
 so they cannot disagree, and a SYSTEM worker never loads a config the check
-refused (`agents/roomlerd/src/app.rs:1842`). `keep-system-context` reads a
+refused (`agents/roomlerd/src/app.rs:1844`). `keep-system-context` reads a
 record that fails as no record, so SystemContext off (`machine_tree.rs:1179`).
 
 The writers make every file they write (`machine_tree.rs:425`): the config's temp file, its
