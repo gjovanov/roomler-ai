@@ -599,7 +599,9 @@ pub fn gave_up_reason(
 ///
 /// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
 /// no command: moving the folder would leave it where the revert does not
-/// look. Nor does a folder that is not a directory.
+/// look. Nor does a folder that is not a directory, nor one that holds a
+/// `config.toml` ([`FolderNotTheirs::holds_config`]): a move would set it
+/// aside with the folder, so the line names it instead.
 fn move_aside(f: &FolderNotTheirs) -> String {
     if !f.is_dir {
         return "It is not a folder but a link or a file, so this line gives no command for it."
@@ -652,7 +654,15 @@ fn move_aside(f: &FolderNotTheirs) -> String {
     };
     // Rule 2 of the package's `sudo_line_fits`: the reads say yes, the folder
     // is root's own and real, and the name is plain.
-    let Ok(name) = administrator_command(f) else {
+    let refused = administrator_command(f);
+    if refused == Err(NoCommand::HoldsConfig) {
+        return format!(
+            "{only} It holds config.toml, and a move would set that file aside with the folder \
+             (with `macos_one_row` off, it is this person's enrollment), so this line gives no \
+             command to move it; see {INSTALL_DOC}."
+        );
+    }
+    let Ok(name) = refused else {
         let copy_back = match names.len() {
             0 => "",
             1 => " and copy that file back into a new folder that the person's account makes",
@@ -723,6 +733,8 @@ pub enum NoCommand {
     UnreadableCopy,
     /// Another account than root owns the folder: its uid.
     NotRoots(u32),
+    /// The folder holds a `config.toml` ([`FolderNotTheirs::holds_config`]).
+    HoldsConfig,
     /// The account reads have not run.
     NotRead,
     /// The account database has no entry for the person's uid, or its name
@@ -756,6 +768,7 @@ impl NoCommand {
                 "the folder holds a kept copy that the person cannot read".to_string()
             }
             NoCommand::NotRoots(uid) => format!("uid {uid} owns the folder, not root"),
+            NoCommand::HoldsConfig => "the folder holds config.toml".to_string(),
             NoCommand::NotRead => "the account reads have not run".to_string(),
             NoCommand::NoAccount => "the account lookup (getpwuid_r) found no entry with a UTF-8 \
                                      name for the person's uid"
@@ -799,6 +812,9 @@ pub fn folder_refuses(f: &FolderNotTheirs) -> Option<NoCommand> {
     }
     if f.owner != 0 {
         return Some(NoCommand::NotRoots(f.owner));
+    }
+    if f.holds_config {
+        return Some(NoCommand::HoldsConfig);
     }
     None
 }
@@ -906,6 +922,12 @@ pub struct FolderNotTheirs {
     pub is_dir: bool,
     /// Which of [`kept_for_revert`] it holds, with what `lstat` read of each.
     pub kept: Vec<KeptCopy>,
+    /// Whether `lstat` found a `config.toml` in it, or could not tell (a read
+    /// that failed for any reason but "not there"). A move would set that
+    /// file aside with the folder, and with `macos_one_row` off it is this
+    /// person's enrollment. The product's own states never put one in a
+    /// folder of root's.
+    pub holds_config: bool,
     /// The UTC second the folder was read: unique for each print, so the
     /// names the command makes beside the folder were never made before.
     pub stamp: String,
@@ -959,6 +981,7 @@ pub fn folder_not_theirs(
         mode: mode & 0o7777,
         is_dir: mode & 0o170000 == 0o040000,
         kept,
+        holds_config: false,
         stamp: stamp.to_string(),
         administrator: Err(NoCommand::NotRead),
     })
@@ -994,6 +1017,12 @@ pub fn read_person_folder(
                 Err(_) => Some(KeptCopy { name, stat: None }),
             })
             .collect();
+        // A read of it that fails for any reason but "not there" counts as
+        // there: no command moves a config it could not rule out.
+        folder.holds_config = match lstat(&folder.path.join("config.toml")) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        };
     }
     Some(folder)
 }
@@ -3079,6 +3108,14 @@ mod tests {
                 "uid 502 owns the folder, not root",
             ),
             (
+                FolderNotTheirs {
+                    holds_config: true,
+                    ..p()
+                },
+                NoCommand::HoldsConfig,
+                "the folder holds config.toml",
+            ),
+            (
                 root(Ok("p q".to_string())),
                 NoCommand::NameNotPlain,
                 "the person's account name is not plain ([A-Za-z0-9._-]+)",
@@ -3314,6 +3351,57 @@ mod tests {
             assert_eq!(asked.into_inner(), vec![dir.clone()], "{mode:o}");
             assert!(!f.is_dir && f.kept.is_empty(), "{mode:o}: {f:?}");
         }
+    }
+
+    /// #3802 — the read takes a `config.toml` in a folder of root's as it
+    /// takes the kept copies, with one `lstat`: "not there" is not held, and
+    /// any other error is held, so no command moves a config it could not
+    /// rule out.
+    #[test]
+    fn the_read_takes_a_config_in_the_folder() {
+        let dir = std::path::PathBuf::from(F);
+        let config = dir.join("config.toml");
+        for (read, holds) in [
+            (Ok((0, 0o100600)), true),
+            (Err(std::io::ErrorKind::PermissionDenied), true),
+            (Err(std::io::ErrorKind::NotFound), false),
+        ] {
+            let lstat = |path: &std::path::Path| -> std::io::Result<(u32, u32)> {
+                if path == dir.as_path() {
+                    Ok((0, 0o40755))
+                } else if path == config.as_path() {
+                    read.map_err(std::io::Error::from)
+                } else {
+                    Err(std::io::ErrorKind::NotFound.into())
+                }
+            };
+            let f = read_person_folder(dir.clone(), 501, STAMP, lstat).expect("root's");
+            assert_eq!(f.holds_config, holds, "{read:?}");
+        }
+    }
+
+    /// #3802 — a folder of root's that holds a `config.toml`: a move would
+    /// set it aside with the folder, and with `macos_one_row` off it is the
+    /// person's enrollment, so the line names it and gives no command, even
+    /// where every read said yes.
+    #[test]
+    fn the_give_up_line_gives_no_command_for_a_folder_that_holds_a_config() {
+        let folder = FolderNotTheirs {
+            holds_config: true,
+            administrator: Ok("p".to_string()),
+            ..folder_not_theirs(F.into(), 501, 0, 0o40755, Vec::new(), STAMP).expect("root's")
+        };
+        let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
+        println!("GIVE-UP [fits + config.toml in the folder] {why}");
+        assert_eq!(
+            why,
+            format!(
+                "{}{ONLY} It holds config.toml, and a move would set that file aside with the \
+                 folder (with `macos_one_row` off, it is this person's enrollment), so this line \
+                 gives no command to move it; {DOC}",
+                cause(F)
+            )
+        );
     }
 
     /// #3802 — the names the give-up keeps are the paths the revert reads in
