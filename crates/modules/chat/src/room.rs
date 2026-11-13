@@ -353,11 +353,13 @@ pub async fn delete(
 
     // The room is gone, and every membership of it with it: what the room held
     // ends now, a call running in it for everyone in it (`conference`'s hook).
-    // Told once the room is gone, so no one can join the room or its call
-    // meanwhile. The delete has happened whatever the hook says, so a failure
-    // there is logged, not answered.
+    // Told once the room is gone, so nothing new is admitted on it meanwhile;
+    // a join or a start already on its way looks again once it has built its
+    // seat or router. The delete has happened whatever the hook says, so a
+    // failure there is logged, not answered: the pod serving the call ends it
+    // on its own once it finds the room's document gone.
     if let Err(e) = state.hooks.room_removed(tid, rid).await {
-        tracing::warn!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+        tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
     }
 
     Ok(Json(serde_json::json!({ "deleted": true })))

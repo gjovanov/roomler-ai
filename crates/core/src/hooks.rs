@@ -215,10 +215,14 @@ pub trait MembershipLifecycle: Send + Sync {
 
     /// The room `room_id` of `tenant_id` was deleted, and every membership of
     /// it went with it. Called AFTER the delete by the room's owner (`chat`),
-    /// so no one can join the room, or anything in it, while a holder ends
-    /// what the room held. The members are gone by then, so a holder ends
-    /// what it keeps by the room: `conference` the call running in it, for
-    /// everyone in it.
+    /// so nothing new is admitted on the room while a holder ends what the
+    /// room held. A join or a start already on its way when the room went can
+    /// still land, so a holder's admission looks again once it has built what
+    /// it admits. The members are gone by then, so a holder ends what it keeps
+    /// by the room: `conference` the call running in it, for everyone in it.
+    /// A holder trusts the caller's pairing of `tenant_id` and `room_id` (the
+    /// caller resolved the room within its org): what it ends may be keyed by
+    /// the room alone, as conference's media is.
     async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
         let _ = (tenant_id, room_id);
         Ok(())

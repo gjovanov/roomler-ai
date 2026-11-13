@@ -471,7 +471,12 @@ pub(crate) async fn handle_media_join(
         if matches!(refusal, media_gate::Refusal::NoRoom)
             && state.room_manager.connection_ids(&rid).is_empty()
         {
-            crate::media_cluster::close_room_here(state, &rid).await;
+            crate::media_cluster::close_room_here(
+                state,
+                &rid,
+                crate::media_cluster::CloseReason::RoomDeleted,
+            )
+            .await;
         }
         refuse_join(state, &user_id, connection_id, rid, &refusal).await;
         return;

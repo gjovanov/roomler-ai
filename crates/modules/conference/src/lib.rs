@@ -37,8 +37,9 @@
 //! core tells this module, which ends the call seats that membership admitted
 //! (`revoke`); when a room is deleted, its call ends for everyone in it.
 //!
-//! The bus handlers (`media.cmd`, `media.leave_user`, …) and the 10 s claim
-//! heartbeat are wired in [`Module::init`] — they need only this state, so the
+//! The bus handlers (`media.cmd`, `media.leave_user`, …) and the 10 s media
+//! heartbeat (the claims, and the reconcile that ends a deleted room's call)
+//! are wired in [`Module::init`] — they need only this state, so the
 //! "registered on the built AppState" step the host used to run is gone.
 
 use std::sync::Arc;
@@ -89,6 +90,10 @@ pub struct ConferenceState {
     /// The per-socket limit on `media:*` frames, for the sockets this pod
     /// holds ([`frame_limit`]).
     pub media_frames: Arc<frame_limit::MediaFrameLimiter>,
+    /// How many heartbeat reads in a row found no document for a room whose
+    /// media this pod serves (`media_cluster::rooms_gone`). Locked only for
+    /// the verdict, never across an await.
+    pub(crate) media_room_misses: Arc<std::sync::Mutex<std::collections::HashMap<ObjectId, u8>>>,
 }
 
 impl std::ops::Deref for ConferenceState {
@@ -175,6 +180,7 @@ impl Module for ConferenceState {
             media_frames: Arc::new(frame_limit::MediaFrameLimiter::from_settings(
                 &settings.meetings,
             )),
+            media_room_misses: Arc::default(),
             core,
         };
         // C-4 — the owner-side bus handlers + the 10 s claim heartbeat.

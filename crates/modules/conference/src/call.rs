@@ -54,11 +54,30 @@ pub async fn call_start(
     // via `media:router_capabilities` on the WS).
     let rtp_capabilities = match crate::media_cluster::resolve_media_route(&state, &rid, true).await
     {
-        crate::media_cluster::MediaRoute::Local { .. } => state
-            .room_manager
-            .create_room(rid)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to create media room: {}", e)))?,
+        crate::media_cluster::MediaRoute::Local { .. } => {
+            let caps =
+                state.room_manager.create_room(rid).await.map_err(|e| {
+                    ApiError::Internal(format!("Failed to create media room: {}", e))
+                })?;
+            // The room may have been deleted while this start was on its way,
+            // after its delete looked for a call to end, and the router built
+            // here would outlive it. Look again now that it exists, as a join
+            // does once its seat exists: a room that is gone takes the router
+            // with it. A read that fails leaves it to the claim heartbeat's
+            // reconcile.
+            if let Err(roomler_ai_services::dao::base::DaoError::NotFound) =
+                state.rooms.base.find_by_id(rid).await
+            {
+                crate::media_cluster::close_room_here(
+                    &state,
+                    &rid,
+                    crate::media_cluster::CloseReason::RoomDeleted,
+                )
+                .await;
+                return Err(roomler_ai_services::dao::base::DaoError::NotFound.into());
+            }
+            caps
+        }
         crate::media_cluster::MediaRoute::Remote(pod) => {
             tracing::info!(room = %rid, owner = %pod, "call/start: conference already owned by another pod");
             serde_json::Value::Null
@@ -351,7 +370,12 @@ pub(crate) async fn settle_call_after_departure(
             tracing::debug!(room = %rid, %e, "call session close failed (last_left)");
         }
         // C-4 — the media island may live on another pod.
-        crate::media_cluster::close_room_everywhere(state, &rid).await;
+        crate::media_cluster::close_room_everywhere(
+            state,
+            &rid,
+            crate::media_cluster::CloseReason::Ended,
+        )
+        .await;
 
         if !member_ids.is_empty() {
             let event = serde_json::json!({
@@ -440,7 +464,12 @@ pub async fn call_end(
     // media:room_closed block was dead code: it read the participant
     // list AFTER removing the room, so the list was always empty — the
     // UI teardown signal is `room:call_ended` below.
-    crate::media_cluster::close_room_everywhere(&state, &rid).await;
+    crate::media_cluster::close_room_everywhere(
+        &state,
+        &rid,
+        crate::media_cluster::CloseReason::Ended,
+    )
+    .await;
 
     // Notify all room members that the call has ended
     let member_ids = state

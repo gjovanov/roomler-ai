@@ -57,19 +57,32 @@ pub async fn resolve_media_route(
     rid: &ObjectId,
     is_join: bool,
 ) -> MediaRoute {
-    if state.room_manager.has_room(rid) {
-        return MediaRoute::Local { create: false };
-    }
-    let Some(dir) = state.cluster_directory.clone() else {
-        return belt_fallback(state, rid, is_join).await;
-    };
-    let key = media_key(&rid.to_hex());
-    match dir.get(&key).await {
+    match try_resolve_media_route(state, rid, is_join).await {
+        Ok(route) => route,
         Err(e) => {
             warn!(room = %rid, %e, "media directory read failed");
             belt_fallback(state, rid, is_join).await
         }
-        Ok(Some(raw)) => {
+    }
+}
+
+/// [`resolve_media_route`], with a directory that cannot be read answered as
+/// the error it is instead of the belt: a close must tell "no pod serves this
+/// room" from "could not tell which pod does" (`close_room_everywhere`).
+async fn try_resolve_media_route(
+    state: &ConferenceState,
+    rid: &ObjectId,
+    is_join: bool,
+) -> Result<MediaRoute, String> {
+    if state.room_manager.has_room(rid) {
+        return Ok(MediaRoute::Local { create: false });
+    }
+    let Some(dir) = state.cluster_directory.clone() else {
+        return Ok(belt_fallback(state, rid, is_join).await);
+    };
+    let key = media_key(&rid.to_hex());
+    Ok(match dir.get(&key).await.map_err(|e| e.to_string())? {
+        Some(raw) => {
             if !dir.is_foreign(&raw) {
                 // Ours (this pod + epoch) with no local room: trust it only
                 // while we still hold the token — otherwise a lazy release
@@ -80,9 +93,9 @@ pub async fn resolve_media_route(
                     .map(|t| *t == raw)
                     .unwrap_or(false)
                 {
-                    return MediaRoute::Local { create: is_join };
+                    return Ok(MediaRoute::Local { create: is_join });
                 }
-                return claim_missing(state, &dir, rid, is_join).await;
+                return Ok(claim_missing(state, &dir, rid, is_join).await);
             }
             match OwnerRecord::parse(&raw) {
                 Some(rec) if rec.pod_id == state.pod.pod_id => {
@@ -98,8 +111,8 @@ pub async fn resolve_media_route(
                 }
             }
         }
-        Ok(None) => claim_missing(state, &dir, rid, is_join).await,
-    }
+        None => claim_missing(state, &dir, rid, is_join).await,
+    })
 }
 
 /// No claim exists: joins may materialize (Mongo-gated + NX-claimed);
@@ -325,63 +338,131 @@ async fn media_error(state: &ConferenceState, connection_id: &str, message: &str
     .await;
 }
 
-/// Close a room's media island wherever it lives (call_end / last-leave
-/// auto-end / a deleted room's call): locally = remove + release; foreign =
-/// `media.close_room` RPC to the owner. Returns the connections whose seats
-/// it closed; none when an owner from before the reply named them answers.
-pub async fn close_room_everywhere(state: &ConferenceState, rid: &ObjectId) -> Vec<String> {
-    if state.room_manager.has_room(rid) {
-        return close_room_here(state, rid).await;
+/// Why a room's media closes, which decides who tells its people what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The call ended (`call/end`, the last one out): the caller tells the
+    /// room's members `room:call_ended` and closes the call's stats record.
+    Ended,
+    /// The room was deleted. Its members and its call id went with it, so
+    /// the pod serving the call tells each connection in it and closes the
+    /// call's stats record by the room (`revoke::deleted_rooms_call_ended`).
+    RoomDeleted,
+}
+
+impl CloseReason {
+    /// The `reason` a `media.close_room` request carries: none for an ended
+    /// call (the body every pod has always sent), `room_deleted` for a
+    /// deleted room.
+    fn wire(self) -> Option<&'static str> {
+        match self {
+            Self::Ended => None,
+            Self::RoomDeleted => Some(crate::revoke::ROOM_DELETED),
+        }
     }
-    match resolve_media_route(state, rid, false).await {
+
+    /// The reason a `media.close_room` request names. One this pod does not
+    /// know closes the room as an ended call, as it did before requests named
+    /// any.
+    fn from_wire(reason: Option<&str>) -> Self {
+        match reason {
+            Some(crate::revoke::ROOM_DELETED) => Self::RoomDeleted,
+            _ => Self::Ended,
+        }
+    }
+}
+
+/// What closing a room's media wherever it lives came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomClose {
+    /// This pod served it: these connections' seats closed here.
+    Here(Vec<String>),
+    /// The pod serving it closed it when asked, and named this many seats
+    /// (none from a pod whose code predates naming them).
+    Owner { pod: String, seats: usize },
+    /// No pod serves its media: there was nothing to close.
+    Nothing,
+    /// Which pod serves it, or that pod itself, could not be reached, so its
+    /// media may still run there. For a deleted room that pod ends the call on
+    /// its own once the room's document is gone (`refresh_media_claims_once`).
+    NotReached(String),
+}
+
+/// Close a room's media island wherever it lives (call_end / last-leave
+/// auto-end / a deleted room's call): locally = [`close_room_here`]; foreign =
+/// `media.close_room` RPC to the owner, naming the reason, so the owner closes
+/// it the same way. A directory that cannot be read, or an owner that does not
+/// answer, is [`RoomClose::NotReached`], never "nothing to close".
+pub async fn close_room_everywhere(
+    state: &ConferenceState,
+    rid: &ObjectId,
+    reason: CloseReason,
+) -> RoomClose {
+    if state.room_manager.has_room(rid) {
+        return RoomClose::Here(close_room_here(state, rid, reason).await);
+    }
+    let route = match try_resolve_media_route(state, rid, false).await {
+        Ok(route) => route,
+        Err(e) => {
+            warn!(room = %rid, %e, "media directory read failed");
+            release_media_claim(state, rid).await;
+            return RoomClose::NotReached(format!("the media directory: {e}"));
+        }
+    };
+    match route {
         MediaRoute::Remote(pod) => {
             let Some(bus) = state.cluster_bus.clone() else {
-                return Vec::new();
+                return RoomClose::NotReached(format!("pod {pod}: no bus to reach it"));
             };
-            match bus
-                .request(
-                    &pod,
-                    "media.close_room",
-                    serde_json::json!({ "room_id": rid.to_hex() }),
-                )
-                .await
-            {
-                Ok(reply) => reply["closed"]
-                    .as_array()
-                    .map(|conns| {
-                        conns
-                            .iter()
-                            .filter_map(|c| c.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+            let mut body = serde_json::json!({ "room_id": rid.to_hex() });
+            if let Some(why) = reason.wire() {
+                body["reason"] = serde_json::Value::from(why);
+            }
+            match bus.request(&pod, "media.close_room", body).await {
+                Ok(reply) => RoomClose::Owner {
+                    seats: reply["closed"].as_array().map_or(0, Vec::len),
+                    pod,
+                },
                 Err(e) => {
                     warn!(room = %rid, %pod, %e, "media.close_room RPC failed — pruning record");
                     if let Some(dir) = state.cluster_directory.clone() {
                         let key = media_key(&rid.to_hex());
                         if let Ok(Some(raw)) = dir.get(&key).await
-                            && OwnerRecord::parse(&raw).map(|r| r.pod_id) == Some(pod)
+                            && OwnerRecord::parse(&raw).map(|r| r.pod_id).as_ref() == Some(&pod)
                         {
                             let _ = dir.release(&key, &raw).await;
                         }
                     }
-                    Vec::new()
+                    RoomClose::NotReached(format!("pod {pod}: {e}"))
                 }
             }
         }
         MediaRoute::Local { .. } => {
             release_media_claim(state, rid).await;
-            Vec::new()
+            RoomClose::Nothing
         }
     }
 }
 
 /// Close a room's media on this pod, the one serving it: every seat's
 /// transports, producers and consumers and the router go, and the claim is
-/// released. Returns the connections that were seated in it.
-pub(crate) async fn close_room_here(state: &ConferenceState, rid: &ObjectId) -> Vec<String> {
+/// released. For a deleted room, each connection that was seated in it hears
+/// so and the call's stats record closes. A deleted room's call ends here
+/// whichever path found it, so they cannot drift: the room delete's hook on
+/// the pod serving the call, the `media.close_room` request it sends that pod
+/// from another, the claim heartbeat's reconcile, and the guards of a join or
+/// a start that raced the delete. Returns the connections that were seated
+/// in it.
+pub(crate) async fn close_room_here(
+    state: &ConferenceState,
+    rid: &ObjectId,
+    reason: CloseReason,
+) -> Vec<String> {
     let closed = state.room_manager.remove_room(rid);
     release_media_claim(state, rid).await;
+    if reason == CloseReason::RoomDeleted {
+        crate::revoke::deleted_rooms_call_ended(state, *rid, &closed).await;
+    }
     closed
 }
 
@@ -486,12 +567,22 @@ pub async fn fold_media_room(state: &ConferenceState, rid: &ObjectId, reason: &s
     }
 }
 
-/// One claim-maintenance pass: lazy-release tokens whose room is gone,
-/// refresh the rest, fold on CONFLICT. Public so tests drive it directly.
+/// One pass of the 10 s media heartbeat: the claim refresh (with a
+/// directory), then the reconcile that ends the call of a room whose document
+/// is gone ([`end_calls_of_rooms_gone`]). Public so tests drive it directly.
 pub async fn refresh_media_claims_once(state: &ConferenceState) {
-    let Some(dir) = state.cluster_directory.clone() else {
-        return;
-    };
+    if let Some(dir) = state.cluster_directory.clone() {
+        refresh_media_claims(state, &dir).await;
+    }
+    end_calls_of_rooms_gone(state).await;
+}
+
+/// The claim refresh: lazy-release tokens whose room is gone, refresh the
+/// rest, fold on CONFLICT; then adopt or fold the tokenless local rooms.
+async fn refresh_media_claims(
+    state: &ConferenceState,
+    dir: &roomler_core::cluster::directory::OwnershipDirectory,
+) {
     let held: Vec<(ObjectId, String)> = state
         .media_claim_tokens
         .iter()
@@ -557,6 +648,112 @@ pub async fn refresh_media_claims_once(state: &ConferenceState) {
             Err(e) => debug!(room = %rid, %e, "orphan media room claim attempt failed"),
         }
     }
+}
+
+/// How many reads in a row must find no document for a room before the pod
+/// serving its media ends its call. Two, a heartbeat apart: one read that
+/// misses a document (a secondary that has not caught up) never ends a live
+/// call.
+pub(crate) const MISSES_TO_END: u8 = 2;
+
+/// How long the reconcile's read of the rooms may take. A slower read counts
+/// as failed, and the heartbeat goes on to its next pass.
+const ROOMS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The reconcile. A room whose document is gone while its media runs here
+/// was deleted, and no word of it ended its call here: the delete's hook
+/// failed or never ran, its request to this pod was lost, or a pod whose code
+/// ends no call served the delete. This pod ends the call itself, the way the
+/// room delete ends it ([`close_room_here`]), once [`MISSES_TO_END`] reads in
+/// a row found no document. "No document" is literal: a room's delete removes
+/// it, and a legacy room that still carries `deleted_at` HAS a document, so
+/// the reconcile leaves its call alone. A read that fails, breaks off or is
+/// late changes nothing.
+async fn end_calls_of_rooms_gone(state: &ConferenceState) {
+    let served: Vec<ObjectId> = state
+        .room_manager
+        .rooms_ref()
+        .iter()
+        .map(|e| *e.key())
+        .collect();
+    let found = if served.is_empty() {
+        Ok(std::collections::HashSet::new())
+    } else {
+        rooms_with_a_document(state, &served).await
+    };
+    if let Err(e) = &found {
+        debug!(rooms = served.len(), %e, "media reconcile: the rooms read failed; nothing changes");
+    }
+    let gone = {
+        let mut misses = state
+            .media_room_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rooms_gone(&mut misses, &served, found.as_ref().ok())
+    };
+    for rid in gone {
+        warn!(room = %rid, "media reconcile: the room of a call served here is gone, ending its call");
+        close_room_here(state, &rid, CloseReason::RoomDeleted).await;
+    }
+}
+
+/// The rooms among `ids` that have a document, read by `_id` in one query.
+/// Only a read that completes counts: a query error, a cursor that breaks off
+/// mid-way and a read slower than [`ROOMS_READ_TIMEOUT`] are each an error,
+/// never "absent".
+async fn rooms_with_a_document(
+    state: &ConferenceState,
+    ids: &[ObjectId],
+) -> Result<std::collections::HashSet<ObjectId>, String> {
+    use futures::TryStreamExt;
+    let ids: Vec<bson::Bson> = ids.iter().copied().map(bson::Bson::ObjectId).collect();
+    let read = async {
+        let cursor = state
+            .db
+            .collection::<bson::Document>("rooms")
+            .find(bson::doc! { "_id": { "$in": ids } })
+            .projection(bson::doc! { "_id": 1 })
+            .await
+            .map_err(|e| e.to_string())?;
+        let docs: Vec<bson::Document> = cursor.try_collect().await.map_err(|e| e.to_string())?;
+        docs.iter()
+            .map(|d| d.get_object_id("_id").map_err(|e| e.to_string()))
+            .collect::<Result<std::collections::HashSet<ObjectId>, String>>()
+    };
+    tokio::time::timeout(ROOMS_READ_TIMEOUT, read)
+        .await
+        .map_err(|_| format!("no answer within {ROOMS_READ_TIMEOUT:?}"))?
+}
+
+/// One read's verdict on the rooms whose media this pod serves, `found` being
+/// those it found a document for, or `None` when the read failed: a failed
+/// read changes nothing. A room the read found starts again from zero misses;
+/// one it did not counts one more, and is gone (returned) on its
+/// [`MISSES_TO_END`]th miss in a row. A room no longer served here is
+/// forgotten.
+pub(crate) fn rooms_gone(
+    misses: &mut std::collections::HashMap<ObjectId, u8>,
+    served: &[ObjectId],
+    found: Option<&std::collections::HashSet<ObjectId>>,
+) -> Vec<ObjectId> {
+    let Some(found) = found else {
+        return Vec::new();
+    };
+    misses.retain(|rid, _| served.contains(rid));
+    let mut gone = Vec::new();
+    for rid in served {
+        if found.contains(rid) {
+            misses.remove(rid);
+            continue;
+        }
+        let count = misses.entry(*rid).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count >= MISSES_TO_END {
+            misses.remove(rid);
+            gone.push(*rid);
+        }
+    }
+    gone
 }
 
 /// Wire the C-4 machinery: bus handlers (owner side) + the claim
@@ -645,41 +842,46 @@ pub fn wire_media_cluster(state: &ConferenceState) {
         });
 
         // media.close_room — call_end/auto-end, or a deleted room's call,
-        // served on a non-owner pod. Replies with the connections it closed,
-        // which a deleted room's teardown tells (`revoke`).
+        // served on a non-owner pod. With `reason: "room_deleted"` this pod
+        // ends the call as the room delete ends it and tells its own people
+        // (`close_room_here`); without one, as an ended call. Replies with the
+        // connections it closed.
         let st = state.clone();
         bus.register("media.close_room", move |body| {
             let st = st.clone();
             Box::pin(async move {
                 let rid = parse_oid(&body, "room_id")?;
-                let conns = close_room_here(&st, &rid).await;
-                let event = serde_json::json!({
-                    "type": "media:room_closed",
-                    "data": { "room_id": rid.to_hex(), "reason": "ended" }
-                });
-                for conn in &conns {
-                    roomler_core::ws::dispatcher::send_to_connection_routed(
-                        &st.ws_storage,
-                        &st.redis_pubsub,
-                        conn,
-                        &event,
-                    )
-                    .await;
+                let reason = CloseReason::from_wire(body.get("reason").and_then(|v| v.as_str()));
+                let conns = close_room_here(&st, &rid, reason).await;
+                if reason == CloseReason::Ended {
+                    let event = serde_json::json!({
+                        "type": "media:room_closed",
+                        "data": { "room_id": rid.to_hex(), "reason": "ended" }
+                    });
+                    for conn in &conns {
+                        roomler_core::ws::dispatcher::send_to_connection_routed(
+                            &st.ws_storage,
+                            &st.redis_pubsub,
+                            conn,
+                            &event,
+                        )
+                        .await;
+                    }
                 }
                 Ok(serde_json::json!({ "ok": true, "closed": conns }))
             })
         });
     }
 
-    if state.cluster_directory.is_some() {
-        let st = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(MEDIA_REFRESH_SECS)).await;
-                refresh_media_claims_once(&st).await;
-            }
-        });
-    }
+    // The heartbeat runs on every pod, a directory or none: the claim refresh
+    // needs one, the reconcile that ends a deleted room's call does not.
+    let st = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(MEDIA_REFRESH_SECS)).await;
+            refresh_media_claims_once(&st).await;
+        }
+    });
 }
 
 /// Owner-side execution of a forwarded command. Re-resolves placement
@@ -758,4 +960,75 @@ fn parse_oid(body: &serde_json::Value, field: &str) -> Result<ObjectId, String> 
         .and_then(|v| v.as_str())
         .and_then(|s| ObjectId::parse_str(s).ok())
         .ok_or_else(|| format!("missing {field}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use bson::oid::ObjectId;
+
+    use super::{CloseReason, MISSES_TO_END, rooms_gone};
+
+    /// The reconcile's verdict, read by read: a room is gone on its second
+    /// miss in a row and not before; a read that finds the room starts its
+    /// count again; a failed read changes nothing, a count included; a room
+    /// no longer served is forgotten; a room that is found is never gone.
+    #[test]
+    fn a_room_is_gone_on_its_second_miss_in_a_row_and_a_failed_read_changes_nothing() {
+        assert_eq!(MISSES_TO_END, 2);
+        let (live, deleted) = (ObjectId::new(), ObjectId::new());
+        let served = [live, deleted];
+        let found_live: HashSet<ObjectId> = HashSet::from([live]);
+        let found_both: HashSet<ObjectId> = HashSet::from([live, deleted]);
+        let mut misses = HashMap::new();
+
+        // A first miss is not enough.
+        assert!(rooms_gone(&mut misses, &served, Some(&found_live)).is_empty());
+        assert_eq!(misses.get(&deleted), Some(&1));
+        assert_eq!(misses.get(&live), None);
+
+        // A failed read changes nothing: no verdict, the count stays.
+        assert!(rooms_gone(&mut misses, &served, None).is_empty());
+        assert_eq!(misses.get(&deleted), Some(&1));
+
+        // A read that finds the room starts it again from zero.
+        assert!(rooms_gone(&mut misses, &served, Some(&found_both)).is_empty());
+        assert_eq!(misses.get(&deleted), None);
+
+        // Two misses in a row: gone, and its count goes with it.
+        assert!(rooms_gone(&mut misses, &served, Some(&found_live)).is_empty());
+        assert_eq!(
+            rooms_gone(&mut misses, &served, Some(&found_live)),
+            vec![deleted]
+        );
+        assert_eq!(misses.get(&deleted), None);
+
+        // A missed room that is no longer served here is forgotten.
+        assert!(rooms_gone(&mut misses, &served, Some(&found_live)).is_empty());
+        assert_eq!(misses.get(&deleted), Some(&1));
+        assert!(rooms_gone(&mut misses, &[live], Some(&found_live)).is_empty());
+        assert!(misses.is_empty(), "{misses:?}");
+
+        // A room every read finds is never gone.
+        for _ in 0..5 {
+            assert!(rooms_gone(&mut misses, &[live], Some(&found_live)).is_empty());
+        }
+        assert!(misses.is_empty(), "{misses:?}");
+    }
+
+    /// The `reason` on the bus: an ended call's request carries none, as every
+    /// pod has always sent it, and a reason this pod does not know closes the
+    /// room as an ended call.
+    #[test]
+    fn a_close_request_names_a_deleted_room_and_nothing_else() {
+        assert_eq!(CloseReason::Ended.wire(), None);
+        assert_eq!(CloseReason::RoomDeleted.wire(), Some("room_deleted"));
+        assert_eq!(
+            CloseReason::from_wire(Some("room_deleted")),
+            CloseReason::RoomDeleted
+        );
+        assert_eq!(CloseReason::from_wire(None), CloseReason::Ended);
+        assert_eq!(CloseReason::from_wire(Some("rehomed")), CloseReason::Ended);
+    }
 }

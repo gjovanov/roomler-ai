@@ -453,20 +453,21 @@ impl StatsDao {
     }
 
     /// Close every open call of a room that was deleted. The room's
-    /// `current_call_id` went with its document, so the call is found by its
-    /// room (the `{tenant_id, room_id, started_at}` index); the `ended_at:
-    /// null` filter leaves a call another closer reached first as it is.
-    /// Returns how many this caller closed.
+    /// `current_call_id` went with its document, and so did its org for the
+    /// pod that finds the room gone on its own (`conference`'s reconcile), so
+    /// the call is found by its room alone, an id no other org's room has:
+    /// among the open calls (the `ended_at` index). The `ended_at: null`
+    /// filter leaves a call another closer reached first as it is. Returns
+    /// how many this caller closed.
     pub async fn close_call_sessions_of_room(
         &self,
-        tenant_id: ObjectId,
         room_id: ObjectId,
         reason: &str,
     ) -> DaoResult<u64> {
         let r = self
             .coll(CALL_SESSIONS)
             .update_many(
-                doc! { "tenant_id": tenant_id, "room_id": room_id, "ended_at": Bson::Null },
+                doc! { "room_id": room_id, "ended_at": Bson::Null },
                 doc! { "$set": { "ended_at": DateTime::now(), "end_reason": reason } },
             )
             .await?;
