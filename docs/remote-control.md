@@ -4396,7 +4396,7 @@ session not yet live, and an external one, end as before FR-138.
 | What ends it | What the device does | Proven by |
 |---|---|---|
 | a stop or a restart | the `Shutdown` arm closes every peer | `arm_shutdown_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2381`); `a_terminal_exit_closes_kept_sessions_too` (`:2912`) |
-| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:6725`) |
+| an update | once the installer is running, the updater sends `true` on the daemon's shutdown watch, which the `Shutdown` arm reads | `an_update_reaches_the_shutdown_that_closes_every_peer` (`agents/roomlerd/src/updater.rs:6922`) |
 | sleep, a resume from suspend | the `Sleep` and `ResumeFromSuspend` arms close every peer. A pause of at least 120 s, measured at the RX deadline, is read as a resume (M2) | `arm_sleep_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2382`); `arm_resume_from_suspend_closes_every_peer` (`:2383`); `the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend` (`:3159`) |
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
@@ -6417,7 +6417,7 @@ wedged.
 
 | Log | Written by | Lives |
 |---|---|---|
-| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:1833`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
+| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2030`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
 | `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
 | `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:629`) | until the next wedge moves it to `msi-wedged.prev.log` |
 
@@ -6560,12 +6560,20 @@ Falls through to the existing `MIN_INSTALLER_BYTES` size floor
 when digest is absent (pre-2024 releases or proxy that doesn't
 yet forward the field).
 
-**`updater::pin_version(tag)`**: fetches a specific release from
-`https://api.github.com/repos/.../releases/tags/<tag>` directly
-(bypasses the roomler-ai proxy because pinning is rare per-agent
-crash-loop recovery, not a fleet-wide poll). Returns the same
-`CheckOutcome::UpdateReady` shape as the regular update path so
-the rest of the install flow composes.
+**`updater::pin_version(tag)`**
+([`agents/roomlerd/src/updater.rs:1828`](../agents/roomlerd/src/updater.rs#L1828)) fetches one
+release by its tag, for the rollback and for an operator's pinned update (`rc:agent.update`). It
+looks the release up in the update feed on roomler.ai first (`/api/agent/latest-release`, or
+`ROOMLERD_UPDATE_URL`), the list the update check reads. Only when the feed cannot name the tag
+does it ask GitHub's by-tag endpoint, `https://api.github.com/repos/.../releases/tags/<tag>`, and
+it logs that fallback (#3818, `release_sources`, `:1674`). A tag can be missing from the feed
+because the feed lists only GitHub's newest page of releases (48 agent releases on 2026-11-13), or
+the feed can be down. A pinned lookup runs on one device, once per crash loop or once per pin, so
+there reaching the release counts for more than a single origin. Before #3818 it asked GitHub
+directly. The daemon's own release for the tray refresh never falls back like this
+([desktop-companion.md §13](desktop-companion.md#13-one-version-the-companion-follows-the-daemon-fr-117)).
+It returns the same `CheckOutcome::UpdateReady` shape as the regular update path, so the rest of
+the install flow composes.
 
 **What a crash loop does**: when `should_rollback` fires (3 crashes
 within 10 min, `last_known_good_version` set and different from the
@@ -6575,7 +6583,7 @@ again. That flag reads "handled" on Windows, where nothing is attempted.
 It is cleared by `record_clean_run_at`, so one sentinel per clean-run
 cycle. The rest depends on whether the installer here can go back at
 all (`updater::ROLLBACK_CAN_DOWNGRADE`,
-[`agents/roomlerd/src/updater.rs:1622`](../agents/roomlerd/src/updater.rs#L1622), #3289):
+[`agents/roomlerd/src/updater.rs:1808`](../agents/roomlerd/src/updater.rs#L1808), #3289):
 
 | Platform | What it does | Read |
 |---|---|---|
