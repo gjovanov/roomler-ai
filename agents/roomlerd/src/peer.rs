@@ -13103,17 +13103,6 @@ fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
     reply.ok()
 }
 
-/// Wire the `files` DC to a per-session file-transfer handler. Strings
-/// carry control frames (`files:begin`/`files:end` + agent replies);
-/// binary frames are chunk payloads appended to the current in-flight
-/// transfer. The handler enforces one active transfer at a time and
-/// replies with `files:accepted` / `files:progress` / `files:complete`
-/// / `files:error` over the same channel.
-///
-/// Public so `crates/tests/src/file_dc_tests.rs` can attach the same
-/// dispatcher to a loopback DC and lock the wire format end-to-end.
-/// The dispatcher itself stays private (free fns below) — only the
-/// wiring entry point is needed across crates.
 /// Multi-user P3 — the FILES-denied handler: every control frame gets an
 /// explicit `files:error` (addressed by the frame's own `id` when present, so
 /// the browser's per-transfer waiter rejects instead of timing out) and
@@ -13154,6 +13143,18 @@ pub fn attach_files_denied(
     on_session_end(&dc, session_end, || async {});
 }
 
+/// Wire the `files` DC to a per-session file-transfer handler. Strings
+/// carry control frames (`files:begin`/`files:end` + agent replies);
+/// binary frames are chunk payloads appended to the current in-flight
+/// transfer. The handler enforces one active transfer at a time and
+/// replies with `files:accepted` / `files:progress` / `files:complete`
+/// / `files:error` over the same channel. #3785 — a refused begin is its
+/// upload's only answer: the chunks and the end behind it get none.
+///
+/// Public so `agents/roomlerd/tests/file_dc.rs` can attach the same
+/// dispatcher to a loopback DC and lock the wire format end-to-end.
+/// The dispatcher itself stays private (free fns below) — only the
+/// wiring entry point is needed across crates.
 pub fn attach_files_handler(
     dc: Arc<RTCDataChannel>,
     session_id: bson::oid::ObjectId,
@@ -13296,6 +13297,12 @@ async fn handle_files_control(
                     .await;
                 }
             }
+        }
+        // #3785 — the end of an upload whose begin this channel refused: the
+        // begin's `files:error` was that upload's answer and the viewer has
+        // settled it, so the end gets none, as its chunks got none.
+        crate::files::FilesIncoming::End { id } if handler.refused_at_begin(&id) => {
+            debug!(%session_id, ?id, "files: the end of an upload whose begin was refused is dropped");
         }
         crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
             Ok((path, bytes)) => {
@@ -17556,5 +17563,86 @@ mod refused_upload_tests {
             "the files:error frames of one refused upload: {heard:?}"
         );
         assert_eq!(heard, vec![over_the_cap("up-1")]);
+    }
+
+    /// A `files:error` for upload `id`, saying `message`.
+    fn error(id: &str, message: &str) -> Value {
+        json!({"t": "files:error", "id": id, "message": message})
+    }
+
+    /// The control: a chunk and an end for an upload this channel never began
+    /// are still answered, each with its own `files:error` as before, and so
+    /// is an end for one never begun after a refused upload.
+    #[tokio::test]
+    async fn an_upload_never_begun_is_still_answered() {
+        let mut pair = served().await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-2"})).await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": OVER_THE_CAP}))
+            .await;
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        pair.ask(&json!({"t": "files:end", "id": "up-3"})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        assert_eq!(
+            heard,
+            vec![
+                error("", "no active transfer"),
+                error("up-2", "no active transfer to end"),
+                over_the_cap("up-1"),
+                error("up-3", "no active transfer to end"),
+            ]
+        );
+    }
+
+    /// A retry: a begin with an id this channel refused runs as a fresh
+    /// begin. Accepted, its chunk lands and its end completes it, and the file
+    /// holds that chunk alone, not the one dropped behind the refusal.
+    #[tokio::test]
+    async fn a_retry_with_a_refused_id_runs_as_a_fresh_begin() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let folder = temp.path().to_string_lossy().into_owned();
+        // Its own id: an accepted begin registers its partial process-wide.
+        let id = format!("up-retry-{}", std::process::id());
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "a.txt", "size": OVER_THE_CAP, "dest_path": folder}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        pair.ask(
+            &json!({"t": "files:begin", "id": id, "name": "a.txt", "size": 3, "dest_path": folder}),
+        )
+        .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"xyz"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        let kinds: Vec<&str> = heard.iter().filter_map(|f| f["t"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["files:error", "files:accepted", "files:complete"],
+            "{heard:?}"
+        );
+        assert_eq!(heard[0], over_the_cap(&id));
+        assert_eq!(heard[2]["id"], id.as_str(), "{heard:?}");
+        assert_eq!(heard[2]["bytes"], 3, "{heard:?}");
+        let placed = std::path::Path::new(heard[2]["path"].as_str().expect("the file's path"));
+        assert_eq!(std::fs::read(placed).expect("the file landed"), b"xyz");
+        assert_eq!(
+            placed.parent().and_then(|p| std::fs::canonicalize(p).ok()),
+            std::fs::canonicalize(temp.path()).ok(),
+            "it landed in the folder asked for"
+        );
     }
 }

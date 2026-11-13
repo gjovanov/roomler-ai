@@ -2146,6 +2146,79 @@ pub(crate) struct OutgoingTransfer {
     pub _active_guard: ActiveTransferGuard,
 }
 
+/// #3785 — how many uploads a files channel remembers refusing, by id: the
+/// last 64, the oldest forgotten first. Each id is one plain name of at most
+/// 128 bytes ([`transfer_id`]), so the list stays within 8 KiB.
+const REFUSED_BEGINS_KEPT: usize = 64;
+
+/// #3785 — the uploads whose `files:begin` this channel refused. The viewer
+/// pumps an upload's chunks and sends its `files:end` right behind its begin,
+/// without waiting for `files:accepted`, so when a small file's begin is
+/// refused, the rest of the file is already on the wire. The refusal is that
+/// upload's one answer: its chunks land nowhere and are not answered
+/// ([`FilesHandler::chunk`]), and neither is its end
+/// ([`FilesHandler::refused_at_begin`]).
+#[derive(Debug, Default)]
+struct RefusedBegins {
+    /// Their ids, oldest first, at most [`REFUSED_BEGINS_KEPT`]. An id that
+    /// is not one plain name is not kept: its end is refused as every entry
+    /// refuses it (#3688).
+    ids: std::collections::VecDeque<String>,
+    /// `Some` while the last begin was refused and no begin or resume has
+    /// come since: the chunks now on the wire, which carry no id, are that
+    /// upload's. It counts the ones dropped; only the first says so.
+    dropping: Option<u64>,
+}
+
+impl RefusedBegins {
+    /// A begin of `id` was answered. Accepted, it takes `id` off the list, so
+    /// a retry runs as a fresh begin. Refused, `id` goes last, and the chunks
+    /// behind it are dropped.
+    fn began(&mut self, id: &str, accepted: bool) {
+        self.ids.retain(|kept| kept != id);
+        if accepted {
+            self.dropping = None;
+            return;
+        }
+        self.dropping = Some(0);
+        if transfer_id(id).is_ok() {
+            if self.ids.len() == REFUSED_BEGINS_KEPT {
+                self.ids.pop_front();
+            }
+            self.ids.push_back(id.to_string());
+        }
+    }
+
+    /// A resume of `id` was answered: the chunks after it are its own,
+    /// whatever its answer, so none is dropped any more. Accepted, it takes
+    /// `id` off the list too, so its end is answered.
+    fn resumed(&mut self, id: &str, accepted: bool) {
+        self.dropping = None;
+        if accepted {
+            self.ids.retain(|kept| kept != id);
+        }
+    }
+
+    /// Whether a chunk arriving now is dropped: it is, behind a refused
+    /// begin. The first one is logged and the rest are counted.
+    fn drops_a_chunk(&mut self) -> bool {
+        let Some(dropped) = self.dropping.as_mut() else {
+            return false;
+        };
+        if *dropped == 0 {
+            tracing::debug!(
+                "files: a chunk behind a refused begin is dropped, and so is the rest of that upload"
+            );
+        }
+        *dropped += 1;
+        true
+    }
+
+    fn refused(&self, id: &str) -> bool {
+        self.ids.iter().any(|kept| kept == id)
+    }
+}
+
 /// Handle on the file-transfer subsystem for one data channel.
 /// Thread-safe — cheap Arc clones are used inside the on_message and
 /// on_close callbacks on the DC.
@@ -2163,6 +2236,9 @@ pub struct FilesHandler {
     /// otherwise start a download after the teardown, whose pump outlives
     /// it (found in review; the clipboard's `stopped` is the same guard).
     ended: Arc<AtomicBool>,
+    /// #3785 — the uploads this channel refused at their begin. A std lock:
+    /// taken and let go between awaits, never held across one.
+    refused: Arc<std::sync::Mutex<RefusedBegins>>,
     /// #3048 — a test's own staging root, standing in for the machine one
     /// ([`staging_root_windows`]), so the split between staging and placing
     /// runs on any machine. `None` = [`partial_dir_for`]'s rule.
@@ -2182,6 +2258,7 @@ impl FilesHandler {
             incoming: Arc::new(Mutex::new(None)),
             outgoing: Arc::new(Mutex::new(None)),
             ended: Arc::new(AtomicBool::new(false)),
+            refused: Arc::default(),
             #[cfg(test)]
             staging_root: None,
         }
@@ -2272,8 +2349,27 @@ impl FilesHandler {
     }
 
     /// [`Self::begin`] as an explicit identity: the seam the root-only tests
-    /// use, since a test runner has nobody at seat0.
+    /// use, since a test runner has nobody at seat0. #3785 — the answer is
+    /// remembered for the chunks and the end behind it ([`RefusedBegins`]).
     pub(crate) async fn begin_as(
+        &self,
+        who: FsAs,
+        id: String,
+        name: String,
+        expected: u64,
+        rel_path: Option<&str>,
+        dest_path: Option<&str>,
+    ) -> Result<PathBuf> {
+        let began = self
+            .start_upload(who, id.clone(), name, expected, rel_path, dest_path)
+            .await;
+        self.refused().began(&id, began.is_ok());
+        began
+    }
+
+    /// [`Self::begin_as`]'s work: checks the upload, stages it, and opens it
+    /// as this channel's one incoming transfer.
+    async fn start_upload(
         &self,
         who: FsAs,
         id: String,
@@ -2511,8 +2607,16 @@ impl FilesHandler {
 
     /// Append binary data to the active incoming transfer. Returns
     /// the total byte count after this append, and whether this
-    /// append crossed a progress-report threshold.
+    /// append crossed a progress-report threshold. #3785 — nothing, for a
+    /// chunk behind a refused begin, which is dropped.
     pub async fn chunk(&self, data: &[u8]) -> Result<Option<ChunkProgress>> {
+        // #3785 — behind a refused begin the chunk is that upload's: it lands
+        // nowhere, not even in an upload left open before it, and gets no
+        // answer, as its begin's `files:error` was the answer.
+        let dropped = self.refused().drops_a_chunk();
+        if dropped {
+            return Ok(None);
+        }
         let mut guard = self.incoming.lock().await;
         let Some(state) = guard.as_mut() else {
             // Chunk arrived without an active transfer. Browser sent
@@ -2851,6 +2955,22 @@ impl FilesHandler {
         Ok(())
     }
 
+    /// #3785 — this channel's refused uploads ([`RefusedBegins`]). A std
+    /// lock: take it, read or decide, and let go before any await.
+    fn refused(&self) -> std::sync::MutexGuard<'_, RefusedBegins> {
+        self.refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// #3785 — whether this channel refused the begin of upload `id`, one of
+    /// its last [`REFUSED_BEGINS_KEPT`] refusals. Its end then gets no answer:
+    /// the begin's `files:error` was that upload's answer, and the viewer has
+    /// settled it. An end for any other upload is answered as before.
+    pub(crate) fn refused_at_begin(&self, id: &str) -> bool {
+        self.refused().refused(id)
+    }
+
     /// rc.19: cancel an in-flight incoming upload. Removes the per-id
     /// staging dir + registry entry. Called from the
     /// `FilesIncoming::Cancel` arm in peer.rs (P2 wiring) when the
@@ -2980,13 +3100,22 @@ impl FilesHandler {
     }
 
     /// [`Self::resume_incoming`] with who a transfer starting now would be
-    /// written as: the seam the tests use.
+    /// written as: the seam the tests use. #3785 — the chunks after a resume
+    /// are its own, whatever its answer, never dropped as a refused begin's.
     pub(crate) async fn resume_incoming_as(
         &self,
         now: FsAs,
         id: &str,
         requested_offset: u64,
     ) -> Result<u64> {
+        let resumed = self.resume_upload(now, id, requested_offset).await;
+        self.refused().resumed(id, resumed.is_ok());
+        resumed
+    }
+
+    /// [`Self::resume_incoming_as`]'s work: finds the partial, checks it, and
+    /// reopens it as this channel's one incoming transfer.
+    async fn resume_upload(&self, now: FsAs, id: &str, requested_offset: u64) -> Result<u64> {
         // #3688 — one plain name, checked before any partial is looked for.
         transfer_id(id)?;
         // Locate meta_path: registry first, then on-demand probe at
@@ -12777,5 +12906,161 @@ mod transfer_id_tests {
         );
         let _ = std::fs::remove_file(&path);
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}
+
+/// #3785 — a files channel's record of the uploads it refused at their begin
+/// ([`RefusedBegins`]), and where the chunks behind a refusal go: nowhere.
+/// What the viewer hears of it is `peer::refused_upload_tests`.
+#[cfg(test)]
+mod refused_begin_tests {
+    use super::*;
+
+    /// One byte over the cap: refused on every OS, before anything is touched.
+    const OVER_THE_CAP: u64 = MAX_TRANSFER_BYTES + 1;
+
+    /// An id of this test's own: an accepted begin registers its partial
+    /// process-wide.
+    fn own_id(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// The bound: the last 64 refused ids, the oldest forgotten first. A kept
+    /// id refused again goes last, an accepted begin takes its id off, and an
+    /// id that is not one plain name is never kept.
+    #[test]
+    fn the_last_64_refused_ids_are_kept_and_the_oldest_forgotten_first() {
+        let mut refused = RefusedBegins::default();
+        for n in 0..=REFUSED_BEGINS_KEPT {
+            refused.began(&format!("up-{n}"), false);
+        }
+        assert_eq!(refused.ids.len(), REFUSED_BEGINS_KEPT);
+        assert!(!refused.refused("up-0"), "the oldest is forgotten");
+        assert!(refused.refused("up-1") && refused.refused("up-64"));
+        refused.began("up-1", false);
+        refused.began("up-65", false);
+        assert!(refused.refused("up-1"), "refused again, it went last");
+        assert!(!refused.refused("up-2"), "the oldest then");
+        refused.began("up-64", true);
+        assert!(
+            !refused.refused("up-64"),
+            "an accepted retry is off the list"
+        );
+        refused.began("../up-66", false);
+        assert!(!refused.refused("../up-66"), "not one plain name");
+        assert_eq!(refused.ids.len(), REFUSED_BEGINS_KEPT - 1);
+    }
+
+    /// The chunks behind a refused begin are dropped up to the next begin or
+    /// resume, every one counted. An accepted begin, or any resume, ends that;
+    /// an accepted resume also takes its id off the list.
+    #[test]
+    fn the_chunks_behind_a_refusal_are_dropped_up_to_the_next_begin_or_resume() {
+        let mut refused = RefusedBegins::default();
+        assert!(!refused.drops_a_chunk(), "nothing refused yet");
+        refused.began("up-1", false);
+        assert!(refused.drops_a_chunk() && refused.drops_a_chunk() && refused.drops_a_chunk());
+        assert_eq!(refused.dropping, Some(3), "only the first is logged");
+        refused.began("up-2", true);
+        assert!(
+            !refused.drops_a_chunk(),
+            "an accepted begin's chunks are its own"
+        );
+        refused.began("up-3", false);
+        refused.resumed("up-0", false);
+        assert!(!refused.drops_a_chunk(), "a resume's chunks are its own");
+        refused.began("up-4", false);
+        refused.resumed("up-4", true);
+        assert!(!refused.drops_a_chunk() && !refused.refused("up-4"));
+    }
+
+    /// A chunk behind a refused begin lands nowhere: not in an upload left
+    /// open before it (a Cancel in the viewer does not tell the device), which
+    /// keeps the count it had. On master it was appended there.
+    #[tokio::test]
+    async fn a_chunk_behind_a_refused_begin_never_lands_in_an_upload_left_open() {
+        let dest = tempfile::tempdir().expect("a temp dir");
+        let folder = dest.path().to_string_lossy().into_owned();
+        let h = FilesHandler::new();
+        let open = own_id("open");
+        h.begin(open.clone(), "a.txt".into(), 6, None, Some(&folder))
+            .await
+            .expect("the upload left open begins");
+        h.chunk(b"abc").await.expect("its first chunk");
+        let refused = h
+            .begin(
+                "up-2".into(),
+                "b.txt".into(),
+                OVER_THE_CAP,
+                None,
+                Some(&folder),
+            )
+            .await;
+        assert!(refused.is_err(), "over the cap");
+        assert!(h.refused_at_begin("up-2"));
+        let answer = h.chunk(b"xyz").await.expect("dropped, not refused");
+        assert!(answer.is_none(), "nothing to answer");
+        let left_open = {
+            let g = h.incoming.lock().await;
+            g.as_ref().map(|s| (s.id.clone(), s.received))
+        };
+        assert_eq!(left_open, Some((open.clone(), 3)), "the chunk landed in it");
+        assert!(h.cancel_incoming(&open).await.expect("cancelled"));
+    }
+
+    /// An accepted resume after a refused begin takes the chunks after it:
+    /// they land, and its end completes it.
+    #[tokio::test]
+    async fn a_resume_after_a_refused_begin_takes_its_chunks() {
+        let dest = tempfile::tempdir().expect("a temp dir");
+        let folder = dest.path().to_string_lossy().into_owned();
+        let h = FilesHandler::new();
+        let id = own_id("resumed");
+        h.begin(id.clone(), "a.txt".into(), 6, None, Some(&folder))
+            .await
+            .expect("it begins");
+        // The channel dropped before any chunk: its partial stays for a resume.
+        h.abort().await;
+        let refused = h
+            .begin("up-2".into(), "b.txt".into(), OVER_THE_CAP, None, None)
+            .await;
+        assert!(refused.is_err(), "over the cap");
+        assert_eq!(h.resume_incoming(&id, 0).await.expect("it resumes"), 0);
+        h.chunk(b"abcdef").await.expect("its chunk");
+        // Six bytes in a six-byte upload: the chunk landed, or the end would
+        // find it short.
+        let (path, bytes) = h.end(&id).await.expect("its end completes it");
+        assert_eq!(
+            (bytes, std::fs::read(&path).unwrap()),
+            (6, b"abcdef".to_vec())
+        );
+    }
+
+    /// The field's refusals are remembered as the cap's is: nobody signed in
+    /// to a Windows service's session (#3048), nobody at seat0 and a seat0
+    /// lookup that did not answer in time on a Linux system install (#3711),
+    /// through `begin_as`, the seam the root-only tests use.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_begin_refused_for_who_is_signed_in_is_remembered_too() {
+        #[cfg(target_os = "windows")]
+        let refusing = [FsAs::Nobody];
+        #[cfg(target_os = "linux")]
+        let refusing = [FsAs::Nobody, FsAs::CannotTell];
+        for who in refusing {
+            let h = FilesHandler::new();
+            let begun = h
+                .begin_as(who.clone(), "up-1".into(), "a.txt".into(), 3, None, None)
+                .await;
+            let why = who.refusal().expect("a refusing identity");
+            assert_eq!(begun.map_err(|e| e.to_string()).err().as_deref(), Some(why));
+            assert!(h.refused_at_begin("up-1"), "{who:?}");
+            assert!(h.chunk(b"abc").await.expect("dropped").is_none(), "{who:?}");
+        }
     }
 }
