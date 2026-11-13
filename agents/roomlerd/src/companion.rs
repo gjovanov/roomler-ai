@@ -66,7 +66,7 @@ pub fn package_needs_sync() -> bool {
 /// than FR-117 and stays either way.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn sync_enabled() -> bool {
-    tunnel_core::env::flag("COMPANION_SYNC", true)
+    tunnel_core::env::flag(SYNC_SWITCH, true)
 }
 
 /// FR-117 P2 — [`refresh_if_stale`] again every [`REFRESH_RETRY`], for as long
@@ -278,15 +278,83 @@ pub(crate) fn too_old_to_connect(
             installed: marker_version(marker),
             minimum: MIN_COMPANION_VERSION.to_string(),
             by_service,
+            retry_off: false,
         }
     })
+}
+
+/// #3814 — is `ROOMLERD_COMPANION_SYNC=0` set where the refresh's retry runs?
+/// `roomler status` then says the tray is replaced only at a start
+/// (`CompanionTooOld::retry_off`). A process reads the switch from its own
+/// environment, so this asks the one the retry reads:
+/// - `by_service` false: this process runs the retry, so `own_switch`
+///   ([`sync_enabled`]).
+/// - `local_system`: the SystemContext worker. The SCM host starts it with the
+///   host's own environment block (`spawn_system_in_session` passes none of
+///   its own), so `own_switch` as well.
+/// - Otherwise: a worker the host started as the person, from the person's own
+///   block (`win_service::supervisor::spawn_in_session`), which leaves the
+///   service's `Environment` value out. So `service_switch`
+///   (`service_sync_enabled`, on Windows), never this process's own.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn retry_off_where_it_runs(
+    by_service: bool,
+    local_system: Option<bool>,
+    own_switch: impl FnOnce() -> bool,
+    service_switch: impl FnOnce() -> bool,
+) -> bool {
+    let enabled = if !by_service || local_system == Some(true) {
+        own_switch()
+    } else {
+        service_switch()
+    };
+    !enabled
+}
+
+/// What [`sync_enabled`] reads, after one of `tunnel_core::env::PREFIXES`.
+const SYNC_SWITCH: &str = "COMPANION_SYNC";
+
+/// #3814 — [`sync_enabled`] over the service's `Environment` value: the switch
+/// under the first of `tunnel_core::env::PREFIXES` it is named with, in any
+/// case (Windows names a variable in any case), read as `flag` reads it. A
+/// value that could not be read (`None`), or one that does not name the
+/// switch, leaves the retry on: `status` never says it is off on a guess.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn sync_enabled_in(service_env: Option<&[(String, String)]>) -> bool {
+    let value = service_env.and_then(|env| {
+        tunnel_core::env::PREFIXES.iter().find_map(|prefix| {
+            let name = format!("{prefix}{SYNC_SWITCH}");
+            env.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v.as_str())
+        })
+    });
+    tunnel_core::env::flag_value(value, true)
+}
+
+/// #3814 — [`sync_enabled_in`] for this install's service, as the SCM host was
+/// given it. The host's environment is fixed from its start, and a stop of the
+/// service ends its worker, so the first read that succeeds stands for this
+/// process's life. A read that fails leaves the retry on, and the next answer
+/// reads again.
+#[cfg(target_os = "windows")]
+fn service_sync_enabled() -> bool {
+    static READ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(enabled) = READ.get() {
+        return *enabled;
+    }
+    match crate::win_service::environment::read_service_env() {
+        Ok(env) => *READ.get_or_init(|| sync_enabled_in(Some(&env))),
+        Err(_) => sync_enabled_in(None),
+    }
 }
 
 /// #3781 — [`too_old_to_connect`] for the companion beside this process, read
 /// fresh on every status answer: on a machine-wide install the service host,
 /// another process, may have just refreshed it. What this process cannot read
 /// counts as reportable, so the field's absence never stands for "could not
-/// tell".
+/// tell". #3814: with whether the retry is off where it runs
+/// ([`retry_off_where_it_runs`]), read only for a tray reported too old.
 #[cfg(target_os = "windows")]
 pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
     if !pipe_refuses_old_companions() {
@@ -303,12 +371,19 @@ pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
         // No folder of its own to look in: a tray of unknown version.
         None => (true, None),
     };
-    too_old_to_connect(
-        exe_present,
-        true,
-        marker.as_deref(),
-        crate::supervision::current() == Some(crate::supervision::Supervision::WindowsScm),
-    )
+    let by_service =
+        crate::supervision::current() == Some(crate::supervision::Supervision::WindowsScm);
+    too_old_to_connect(exe_present, true, marker.as_deref(), by_service).map(|reported| {
+        tunnel_core::localapi::CompanionTooOld {
+            retry_off: retry_off_where_it_runs(
+                by_service,
+                crate::win_identity::own_token_is_local_system(),
+                sync_enabled,
+                service_sync_enabled,
+            ),
+            ..reported
+        }
+    })
 }
 
 /// #3781 — does this daemon's pipe refuse a companion older than
@@ -2664,7 +2739,7 @@ mod nobody_at_the_screen_tests {
 mod too_old_tests {
     use super::{
         MIN_COMPANION_VERSION, NextRefresh, REFRESH_RETRY, RefreshSchedule, next_refresh_wait,
-        retry_refresh, too_old_to_connect,
+        retry_off_where_it_runs, retry_refresh, sync_enabled_in, too_old_to_connect,
     };
     use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
     use std::sync::{Arc, Mutex};
@@ -2849,6 +2924,7 @@ mod too_old_tests {
                 installed: Some("0.4.212".into()),
                 minimum: "0.4.216".into(),
                 by_service: true,
+                retry_off: false,
             })
         );
         let own = too_old_to_connect(true, true, Some("0.4.215"), false).expect("reported");
@@ -2882,6 +2958,92 @@ mod too_old_tests {
             let reported = too_old_to_connect(true, true, marker, true).expect("reported");
             assert_eq!(reported.installed, None, "{marker:?}");
             assert_eq!(reported.minimum, MIN_COMPANION_VERSION);
+        }
+    }
+
+    /// #3814 — `status` reads the switch where the retry runs. A daemon that
+    /// runs the retry itself reads its own, and so does the SystemContext
+    /// worker: the SCM host starts it with the host's own environment block.
+    /// A worker the host starts as the person gets the person's block, which
+    /// leaves the service's `Environment` value out, so it reads that value,
+    /// never its own. So does one whose token cannot be read.
+    #[test]
+    fn the_switch_is_read_where_the_retry_runs() {
+        let service = || -> bool { panic!("the service's value is read") };
+        let own = || -> bool { panic!("its own environment is read") };
+        for local_system in [Some(true), Some(false), None] {
+            assert!(
+                retry_off_where_it_runs(false, local_system, || false, service),
+                "{local_system:?}"
+            );
+            assert!(!retry_off_where_it_runs(
+                false,
+                local_system,
+                || true,
+                service
+            ));
+        }
+        assert!(retry_off_where_it_runs(true, Some(true), || false, service));
+        assert!(!retry_off_where_it_runs(true, Some(true), || true, service));
+        for local_system in [Some(false), None] {
+            assert!(
+                retry_off_where_it_runs(true, local_system, own, || false),
+                "{local_system:?}"
+            );
+            assert!(!retry_off_where_it_runs(true, local_system, own, || true));
+        }
+    }
+
+    /// #3814 — for that worker, the service's `Environment` value says it, in
+    /// `node_env`'s prefix order and read as `sync_enabled` reads the switch.
+    /// Windows names an environment variable in any case.
+    #[test]
+    fn the_services_environment_says_whether_its_retry_is_off() {
+        let on = |entries: &[(&str, &str)]| {
+            let env: Vec<(String, String)> = entries
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            sync_enabled_in(Some(&env))
+        };
+        for value in ["0", "off", "No", " false "] {
+            assert!(
+                !on(&[("Path", "x"), ("ROOMLERD_COMPANION_SYNC", value)]),
+                "{value:?}"
+            );
+        }
+        assert!(!on(&[("roomlerd_companion_sync", "0")]));
+        assert!(!on(&[("ROOMLER_NODE_COMPANION_SYNC", "0")]));
+        assert!(on(&[
+            ("ROOMLERD_COMPANION_SYNC", "1"),
+            ("ROOMLER_NODE_COMPANION_SYNC", "0"),
+        ]));
+        for value in ["1", "", "garbage"] {
+            assert!(on(&[("ROOMLERD_COMPANION_SYNC", value)]), "{value:?}");
+        }
+        // A retired spelling is never read, and a value that names no switch
+        // leaves the retry on.
+        for retired in tunnel_core::env::RETIRED_PREFIXES {
+            let name = format!("{retired}COMPANION_SYNC");
+            assert!(on(&[(name.as_str(), "0")]), "{name}");
+        }
+        assert!(on(&[("ROOMLERD_ENABLE_SYSTEM_SWAP", "1")]));
+        assert!(on(&[]));
+    }
+
+    /// #3814 — a service `Environment` value that cannot be read (no key, no
+    /// access, not a REG_MULTI_SZ) is today's answer: the retry is on, and
+    /// `status` says it is retried. It never says the retry is off on a guess.
+    #[test]
+    fn a_service_environment_that_cannot_be_read_leaves_the_retry_on() {
+        assert!(sync_enabled_in(None));
+        for local_system in [Some(false), None] {
+            assert!(!retry_off_where_it_runs(
+                true,
+                local_system,
+                || false,
+                || sync_enabled_in(None)
+            ));
         }
     }
 }
