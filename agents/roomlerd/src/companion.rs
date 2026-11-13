@@ -3023,7 +3023,10 @@ mod too_old_tests {
         }
         // A retired spelling is never read, and a value that names no switch
         // leaves the retry on.
-        assert!(on(&[("ROOMLER_AGENT_COMPANION_SYNC", "0")]));
+        for retired in tunnel_core::env::RETIRED_PREFIXES {
+            let name = format!("{retired}COMPANION_SYNC");
+            assert!(on(&[(name.as_str(), "0")]), "{name}");
+        }
         assert!(on(&[("ROOMLERD_ENABLE_SYSTEM_SWAP", "1")]));
         assert!(on(&[]));
     }
