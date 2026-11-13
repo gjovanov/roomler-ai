@@ -1328,6 +1328,59 @@ async fn the_pod_serving_a_deleted_rooms_call_tells_its_own_people() {
     member.close(None).await.ok();
 }
 
+/// A media claim record naming `pod`, as that pod's own directory writes one.
+fn claim_record_of(pod: &str) -> String {
+    format!(
+        "{pod}/1/media/{}",
+        bson::DateTime::now().timestamp_millis()
+    )
+}
+
+/// A deleted room's call whose pod answered the close too late, its claim
+/// already gone with the media (it closed the call and answered after the
+/// deadline, or its record ran out with it): nothing is left to close, so
+/// ending what the room held is no failure. The claim here names a pod that
+/// never answers and runs out while the close waits for it.
+#[tokio::test]
+async fn a_close_answered_too_late_after_its_claim_went_is_no_failure() {
+    use roomler_ai_api::cluster::bus::RPC_DEADLINE;
+    let app = TestApp::spawn().await;
+    let (Some(dir), Some(_)) = (
+        app.state.cluster_directory.clone(),
+        app.state.cluster_bus.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let room = bson::oid::ObjectId::new();
+    let key = roomler_ai_api::cluster::directory::media_key(&room.to_hex());
+    let late = format!("late-{}", bson::oid::ObjectId::new().to_hex());
+    let raw = claim_record_of(&late);
+    // It runs out exactly when the close stops waiting for its pod: after
+    // the first read, before the second.
+    assert_eq!(
+        dir.claim_nx(&key, &raw, RPC_DEADLINE.as_secs())
+            .await
+            .unwrap(),
+        ClaimOutcome::Won
+    );
+
+    let started = std::time::Instant::now();
+    let ended = app
+        .state
+        .core
+        .hooks
+        .room_removed(bson::oid::ObjectId::new(), room)
+        .await;
+    let took = started.elapsed();
+    assert!(
+        took >= RPC_DEADLINE,
+        "the close did not wait for the pod the claim named: {took:?}"
+    );
+    ended.expect("a call whose claim went with its media ended");
+    assert_eq!(dir.get(&key).await.unwrap(), None);
+}
+
 // ── C-5: DERP directory + registration-driven rehome ────────────────
 
 /// A DERP network split across pods converges toward the NEWEST

@@ -801,6 +801,56 @@ mod tests {
         assert_eq!(*holder.0.lock().unwrap(), vec![format!("removed {t} {r}")]);
     }
 
+    struct FailsToEnd(&'static str);
+
+    #[async_trait]
+    impl MembershipLifecycle for FailsToEnd {
+        async fn room_removed(&self, _t: ObjectId, _r: ObjectId) -> anyhow::Result<()> {
+            anyhow::bail!("{}", self.0)
+        }
+    }
+
+    /// The room is gone whatever a holder answers, so a holder that fails to
+    /// end what the room held does not stop the holders after it: each runs,
+    /// and the error names every failure, the first first.
+    #[tokio::test]
+    async fn a_holder_that_fails_a_deleted_room_does_not_stop_the_others() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "network",
+            Hooks {
+                membership: Some(Arc::new(FailsToEnd("first"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(Arc::new(FailsToEnd("owner pod unreachable"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "chat",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        let (t, r) = (ObjectId::new(), ObjectId::new());
+        let err = reg.room_removed(t, r).await.unwrap_err().to_string();
+        assert_eq!(
+            *holder.0.lock().unwrap(),
+            vec![format!("removed {t} {r}")],
+            "the holder after the failing ones was not told"
+        );
+        assert_eq!(
+            err,
+            "network: room_removed: first; conference: room_removed: owner pod unreachable"
+        );
+    }
+
     struct FarTurn(Option<bool>);
 
     #[async_trait]
