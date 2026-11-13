@@ -579,8 +579,10 @@ pub fn gave_up_reason(
 /// root's; and the account name is plain ([`plain_account_name`]). Anywhere
 /// else it gives no command, says that an administrator has to move the
 /// folder aside and names the section of the docs ([`INSTALL_DOC`]). Every
-/// path is quoted ([`sh_quote`]), and the command holds no `"`, `$` or
-/// backtick, so it also survives `sh -c "…"`.
+/// path is quoted ([`sh_quote`]), and a folder whose path holds a `"`, `$`,
+/// backtick, `\`, `!` or control character gets no command
+/// ([`path_survives_double_quotes`]), so every command printed also survives
+/// `sh -c "…"`.
 ///
 /// With nothing the revert reads in it, the command moves it aside and the
 /// worker makes a new one, as the person, at its next start. With copies
@@ -735,6 +737,9 @@ pub enum NoCommand {
     NotRoots(u32),
     /// The folder holds a `config.toml` ([`FolderNotTheirs::holds_config`]).
     HoldsConfig,
+    /// The folder's path would not survive `sh -c "…"`
+    /// ([`path_survives_double_quotes`]).
+    PathNotPlain,
     /// The account reads have not run.
     NotRead,
     /// The account database has no entry for the person's uid, or its name
@@ -769,6 +774,9 @@ impl NoCommand {
             }
             NoCommand::NotRoots(uid) => format!("uid {uid} owns the folder, not root"),
             NoCommand::HoldsConfig => "the folder holds config.toml".to_string(),
+            NoCommand::PathNotPlain => "the folder's path holds a double quote, `$`, a backtick, \
+                                        a backslash, `!` or a control character"
+                .to_string(),
             NoCommand::NotRead => "the account reads have not run".to_string(),
             NoCommand::NoAccount => "the account lookup (getpwuid_r) found no entry with a UTF-8 \
                                      name for the person's uid"
@@ -816,7 +824,21 @@ pub fn folder_refuses(f: &FolderNotTheirs) -> Option<NoCommand> {
     if f.holds_config {
         return Some(NoCommand::HoldsConfig);
     }
+    if !f.path.to_str().is_some_and(path_survives_double_quotes) {
+        return Some(NoCommand::PathNotPlain);
+    }
     None
+}
+
+/// #3802 — whether `path`, quoted by [`sh_quote`], also survives
+/// `sh -c "…"`: it holds no `"`, `$`, backtick, `\`, `!` or control
+/// character, which a shell reads in its own way inside double quotes (or
+/// expands from its history). An apostrophe is fine: [`sh_quote`] writes it
+/// `'\''`, which double quotes leave alone.
+fn path_survives_double_quotes(path: &str) -> bool {
+    !path
+        .chars()
+        .any(|c| matches!(c, '"' | '$' | '`' | '\\' | '!') || c.is_control())
 }
 
 /// #3802 — the account name a give-up line names with its administrator's
@@ -3116,6 +3138,15 @@ mod tests {
                 "the folder holds config.toml",
             ),
             (
+                FolderNotTheirs {
+                    path: "/Users/p$q/Library/Application Support/x".into(),
+                    ..p()
+                },
+                NoCommand::PathNotPlain,
+                "the folder's path holds a double quote, `$`, a backtick, a backslash, `!` or a \
+                 control character",
+            ),
+            (
                 root(Ok("p q".to_string())),
                 NoCommand::NameNotPlain,
                 "the person's account name is not plain ([A-Za-z0-9._-]+)",
@@ -3351,6 +3382,40 @@ mod tests {
             assert_eq!(asked.into_inner(), vec![dir.clone()], "{mode:o}");
             assert!(!f.is_dir && f.kept.is_empty(), "{mode:o}: {f:?}");
         }
+    }
+
+    /// #3802 — every command printed survives `sh -c "…"`: a folder whose
+    /// path holds a double quote, `$`, a backtick, a backslash, `!` or a
+    /// control character gets none, where every read said yes. An
+    /// apostrophe is quoted, so it keeps its command.
+    #[test]
+    fn the_give_up_line_gives_no_command_for_a_path_a_shell_reads_otherwise() {
+        let line = |path: &str| {
+            let folder = FolderNotTheirs {
+                administrator: Ok("p".to_string()),
+                ..folder_not_theirs(path.into(), 501, 0, 0o40755, Vec::new(), STAMP)
+                    .expect("root's")
+            };
+            gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder))
+        };
+        for c in ['"', '$', '`', '\\', '!', '\n', '\t', '\u{7f}'] {
+            let path = format!("/Users/p{c}q/Library/Application Support/live.roomler.roomler");
+            assert!(!path_survives_double_quotes(&path), "{c:?}");
+            assert_eq!(
+                line(&path),
+                format!(
+                    "{}{ONLY} This line gives no command for it: an administrator of this Mac \
+                     has to move it aside; {DOC}",
+                    cause(&path)
+                ),
+                "{c:?}"
+            );
+        }
+        let dollar = "/Users/p$q/Library/Application Support/live.roomler.roomler";
+        give_up_line_for("fits + a $ in the path", dollar, 0o40755, &[], Some("p"));
+        let apostrophe = "/Users/o'brien/Library/Application Support/live.roomler.roomler";
+        assert!(path_survives_double_quotes(F) && path_survives_double_quotes(apostrophe));
+        assert!(line(apostrophe).contains("can run this"));
     }
 
     /// #3802 — the read takes a `config.toml` in a folder of root's as it
