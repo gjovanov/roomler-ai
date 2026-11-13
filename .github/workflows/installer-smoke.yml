@@ -1385,8 +1385,6 @@ jobs:
         run: |
           . $env:INSTALLER_RUN
           . $env:PM_CELLS
-          # #3810 RED CONTROL, a throwaway commit to be reverted: wait past this step's timeout.
-          Write-Host "RED control: sleeping 900 s past this step's 6 min timeout"; Start-Sleep -Seconds 900
           $msi = Join-Path $out 'pm-6.msi'
           $log = Join-Path $logDir 'pm-6-repair.log'
           $is3455 = '#3455: the package does not free its own files before InstallFiles on a repair over the running service, so Windows Installer can only replace them at a restart. It is the product''s open bug, not this workflow''s'
