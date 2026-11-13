@@ -432,9 +432,10 @@ fn fs_as_for(
 
 impl FsAs {
     /// Who a transfer starting now writes as, asked on a blocking thread:
-    /// `ConfigSet`'s check of `files_dir` and the status refresh's own
-    /// thread. On a Linux system install it asks seat0 inline, with no time
-    /// limit. #3711 — an async task asks [`Self::for_write`] instead.
+    /// the status refresh's own thread, and a `ConfigSet` of `files_dir` off
+    /// Linux. On a Linux system install it asks seat0 inline, with no time
+    /// limit. #3711 — an async task asks [`Self::for_write`] instead, and
+    /// #3769 — so does that `ConfigSet` there ([`FilesDirSet::check`]).
     pub(crate) fn now() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -1072,9 +1073,14 @@ fn xdg_download_dir(text: &str, home: &std::path::Path) -> Option<PathBuf> {
 /// reason instead of saved and silently ignored. The refusal text is what the
 /// desktop shows verbatim.
 pub fn validate_files_dir_setting(raw: &str) -> Result<PathBuf, String> {
+    validate_files_dir_setting_as(&FsAs::now(), raw)
+}
+
+/// [`validate_files_dir_setting`] for `who`, on this thread, which must be
+/// a blocking one.
+fn validate_files_dir_setting_as(who: &FsAs, raw: &str) -> Result<PathBuf, String> {
     // FR-97 P3d — for whoever a drop would be written as now, and as them:
     // the gate creates the folder and probes a write.
-    let who = FsAs::now();
     let writer = who.writer();
     who.run_here(|| {
         Ok(files_dir::validate(
@@ -1162,20 +1168,57 @@ pub fn effective_files_dir() -> Option<String> {
 /// thread, so the status read right after a change is already the new
 /// answer; everything else reaches it through [`spawn_effective_refresh`].
 pub fn refresh_effective_files_dir() -> Option<String> {
+    refresh_effective_files_dir_as(&FsAs::now())
+}
+
+/// [`refresh_effective_files_dir`] for `who`, on this thread, which must be
+/// a blocking one.
+fn refresh_effective_files_dir_as(who: &FsAs) -> Option<String> {
     let (raw, generation) = configured_files_dir_and_gen();
-    let value = compute_effective_files_dir(raw.as_deref());
+    let value = compute_effective_files_dir(who, raw.as_deref());
+    publish_effective(generation, value.clone(), true);
+    value
+}
+
+/// Cache `value` as the status answer for the configured value of
+/// `generation`. An answer for an OLDER value never replaces one for a newer
+/// value, and #3769 — nor is one published once its value is no longer the
+/// configured one: a slow answer for an earlier set never shows after a
+/// later set saved, even before the later set's own answer lands. `fresh`
+/// false: not an answer yet, so the next status read starts a refresh.
+fn publish_effective(generation: u64, value: Option<String>, fresh: bool) {
     let mut c = EFFECTIVE_FILES_DIR
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // An answer for an OLDER value never replaces one for a newer value.
-    if generation >= c.generation {
+    if generation == FILES_DIR_GEN.load(Ordering::Acquire) && generation >= c.generation {
         *c = EffectiveFilesDir {
             generation,
-            computed_at: Some(std::time::Instant::now()),
-            value: value.clone(),
+            computed_at: fresh.then(std::time::Instant::now),
+            value,
         };
     }
-    value
+}
+
+/// #3769 — while this lives no background refresh starts, one already
+/// running waited out first, so a test sees only the answers it publishes.
+#[cfg(test)]
+struct NoBackgroundRefresh;
+
+#[cfg(test)]
+impl NoBackgroundRefresh {
+    fn hold() -> Self {
+        while EFFECTIVE_REFRESHING.swap(true, Ordering::AcqRel) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for NoBackgroundRefresh {
+    fn drop(&mut self) {
+        EFFECTIVE_REFRESHING.store(false, Ordering::Release);
+    }
 }
 
 /// One background refresh at a time; a read that finds one running simply
@@ -1201,11 +1244,10 @@ fn spawn_effective_refresh() {
     }
 }
 
-fn compute_effective_files_dir(raw: Option<&str>) -> Option<String> {
+fn compute_effective_files_dir(who: &FsAs, raw: Option<&str>) -> Option<String> {
     // FR-97 P3d — for whoever a drop would be written as now, and as them
     // (a blocking thread: the status refresh's own, or `ConfigSet`'s).
-    let who = FsAs::now();
-    who.run_here(|| Ok(compute_effective_files_dir_as(&who, raw)))
+    who.run_here(|| Ok(compute_effective_files_dir_as(who, raw)))
         .unwrap_or_else(|e| {
             tracing::debug!(%e, "files: the effective folder could not be computed as its writer");
             None
@@ -1226,6 +1268,103 @@ fn compute_effective_files_dir_as(who: &FsAs, raw: Option<&str>) -> Option<Strin
     default_download_dir_as(who, false)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// #3769 — one `ConfigSet` of `files_dir` (`localapi_state::config_set`):
+/// whoever a drop would be written as now (FR-97 P3d), asked ONCE and before
+/// the config write lock, and the two checks that need them, FR-84 D4's
+/// set-time gate ([`Self::check`]) and the status answer after the save
+/// ([`Self::refresh_status`]). Neither reads the config file, so neither runs
+/// under its lock: a slow logind or account database, or a home on a slow
+/// disk, holds this set alone, never another config read or write.
+pub(crate) struct FilesDirSet {
+    who: FsAs,
+    /// What this set saved and the generation `set_files_dir` gave it, read
+    /// under the config write lock ([`Self::saved`]).
+    saved: Option<(Option<String>, u64)>,
+}
+
+impl FilesDirSet {
+    /// Who the folder is checked for, then, when `value` names a folder, the
+    /// set-time gate for and as them. `Err` is the refusal, verbatim. A Linux
+    /// system install asks who is at seat0 as a received file does
+    /// ([`FsAs::for_write`]: on a blocking thread, [`SEAT_LOOKUP_WAIT`] at
+    /// most). Windows asks this process's token and the person signed in to
+    /// its session on a blocking thread, as before; macOS asks nothing.
+    pub(crate) async fn check(value: Option<&str>) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        let who = FsAs::for_write().await;
+        #[cfg(not(target_os = "linux"))]
+        let who = tokio::task::spawn_blocking(FsAs::now)
+            .await
+            .map_err(|e| format!("config set task join: {e}"))?;
+        Self::check_as(who, value).await
+    }
+
+    /// [`Self::check`] for `who`. A folder that cannot be checked for anyone
+    /// is refused before anything is touched, in the words its gate would
+    /// use: on Linux a seat0 lookup with no answer in time ([`CANNOT_TELL`]:
+    /// a retry asks again), on a Windows service nobody signed in. A clear
+    /// needs no one and goes through.
+    async fn check_as(who: FsAs, value: Option<&str>) -> Result<Self, String> {
+        if let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(why) = who.refusal() {
+                return Err(why.to_string());
+            }
+            let (gate, raw) = (who.clone(), raw.to_string());
+            on_a_blocking_thread(move || validate_files_dir_setting_as(&gate, &raw))
+                .await
+                .map_err(|e| format!("config set task join: {e}"))??;
+        }
+        Ok(Self { who, saved: None })
+    }
+
+    /// Under the config write lock, right after the save re-seeded the live
+    /// folder (`set_files_dir`): note what this set saved, and its generation.
+    pub(crate) fn saved(&mut self) {
+        self.saved = Some(configured_files_dir_and_gen());
+    }
+
+    /// After the lock: the status answer for what this set saved, for the
+    /// same person, so the read right after the set shows it. It is published
+    /// only while that is still the configured value ([`publish_effective`]).
+    /// With no answer in time for who that is, none is computed: the status
+    /// names no folder yet (the companion shows the default as pending, never
+    /// a folder just cleared), and the next status read asks again.
+    pub(crate) async fn refresh_status(self) {
+        let Some((raw, generation)) = self.saved else {
+            return;
+        };
+        let who = self.who;
+        let _ = on_a_blocking_thread(move || {
+            #[cfg(target_os = "linux")]
+            if matches!(who, FsAs::CannotTell) {
+                publish_effective(generation, None, false);
+                return;
+            }
+            publish_effective(
+                generation,
+                compute_effective_files_dir(&who, raw.as_deref()),
+                true,
+            );
+        })
+        .await;
+    }
+}
+
+/// `f` on a blocking thread, with what a test stood in on this one carried
+/// to it, as [`FsAs::run`] carries it.
+async fn on_a_blocking_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    #[cfg(all(test, target_os = "linux"))]
+    let carried = stand_in::carried();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(all(test, target_os = "linux"))]
+        let _carried = carried.stand();
+        f()
+    })
+    .await
 }
 
 /// Number of in-flight file transfers (incoming uploads + outgoing
@@ -5836,6 +5975,48 @@ mod tests {
         set_files_dir(None);
     }
 
+    /// #3769 — a `ConfigSet` of the files folder publishes its status answer
+    /// after the config write lock, so an earlier set's answer can land after
+    /// a later set saved. It is never published then: the status names the
+    /// earlier folder neither before the later answer lands nor after, and
+    /// ends where the config does.
+    #[tokio::test]
+    async fn an_earlier_files_folder_sets_late_answer_is_never_published() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        let _quiet = NoBackgroundRefresh::hold();
+        set_files_dir(None);
+        let (x, y) = (scratch_drop_dir("late-x"), scratch_drop_dir("late-y"));
+        let (xs, ys) = (
+            x.to_string_lossy().into_owned(),
+            y.to_string_lossy().into_owned(),
+        );
+        // X is checked and saved first, Y after it, as two clients' sets
+        // take the lock one after the other.
+        let mut earlier = FilesDirSet::check_as(FsAs::Daemon, Some(&xs))
+            .await
+            .expect("X passes its gate");
+        set_files_dir(Some(xs.clone()));
+        earlier.saved();
+        let mut later = FilesDirSet::check_as(FsAs::Daemon, Some(&ys))
+            .await
+            .expect("Y passes its gate");
+        set_files_dir(Some(ys.clone()));
+        later.saved();
+        // X's answer lands first, after Y saved: it is not published.
+        earlier.refresh_status().await;
+        assert_ne!(
+            effective_files_dir().as_deref(),
+            Some(xs.as_str()),
+            "the status names X while the config says Y"
+        );
+        later.refresh_status().await;
+        assert_eq!(effective_files_dir().as_deref(), Some(ys.as_str()));
+        assert_eq!(configured_files_dir().as_deref(), Some(ys.as_str()));
+        set_files_dir(None);
+        let _ = std::fs::remove_dir_all(&x);
+        let _ = std::fs::remove_dir_all(&y);
+    }
+
     #[test]
     fn writer_context_describes_this_process() {
         let w = writer_context();
@@ -8630,6 +8811,202 @@ mod seat_user_tests {
             assert_ne!(asked_on, worker, "the lookup ran on the async worker");
         }
 
+        /// #3769 — a daemon's LocalAPI state over a config file of its own,
+        /// as a `ConfigSet` and a `ConfigGet` reach it, and that file.
+        fn a_daemon_with_its_config(
+            dir: &std::path::Path,
+        ) -> (
+            crate::localapi_state::DaemonState,
+            std::path::PathBuf,
+            tokio::sync::watch::Sender<tunnel_core::localapi::OverlayView>,
+        ) {
+            let path = dir.join("config.toml");
+            crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+            let (overlay, view) = tokio::sync::watch::channel(Default::default());
+            let st = crate::localapi_state::DaemonState::new(
+                "aid".into(),
+                "host".into(),
+                tunnel_core::localapi::DaemonMode::Service,
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                view,
+                crate::consent::ConsentBroker::new(
+                    crate::consent::Mode::AutoGrant,
+                    dir.join("consent"),
+                )
+                .unwrap(),
+                None,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            )
+            .with_config_persist(
+                path.clone(),
+                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            );
+            (st, path, overlay)
+        }
+
+        /// #3769 — the drop folder unset again, whatever a test left.
+        struct NoFilesDirAfter;
+
+        impl Drop for NoFilesDirAfter {
+            fn drop(&mut self) {
+                set_files_dir(None);
+            }
+        }
+
+        /// #3769 — a `ConfigSet` of the files folder asks who is at seat0 as
+        /// a received file does, and never under the config write lock. A
+        /// lookup that gives no answer in its wait refuses the set in the
+        /// read's words within that wait, with nothing saved and no folder
+        /// made, and a `ConfigGet` asked meanwhile answers at once, not after
+        /// the lookup. A current-thread runtime has one worker, this test's
+        /// own thread.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_files_folder_set_whose_lookup_is_late_holds_no_config_read() {
+            use tunnel_core::localapi::{LocalApiState, Response};
+            const CANNOT_TELL: &str =
+                "Could not tell who is signed in at this computer's screen. Try again.";
+            if !root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            set_files_dir(None);
+            let _after = NoFilesDirAfter;
+            let dir = tempfile::tempdir().unwrap();
+            let (st, path, _overlay) = a_daemon_with_its_config(dir.path());
+            let (home, person) = nobodys_home();
+            let folder = home.path().join("drops");
+            let spelled = folder.to_string_lossy().into_owned();
+            let seat = at_the_screen(&person, home.path());
+            let _asked = stand_in::seat_asked(move || {
+                std::thread::sleep(SEAT_LOOKUP_WAIT * 2);
+                seat.clone()
+            })
+            .await;
+            let bound = SEAT_LOOKUP_WAIT + std::time::Duration::from_secs(1);
+            let began = std::time::Instant::now();
+            let (set, (read, read_waited)) =
+                tokio::join!(st.config_set("files_dir", Some(&spelled)), async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let asked = std::time::Instant::now();
+                    let read = st.config_entries().await;
+                    (read, asked.elapsed())
+                });
+            let set_waited = began.elapsed();
+            assert!(
+                read_waited < std::time::Duration::from_secs(1),
+                "the ConfigGet waited {read_waited:?}, behind the lookup"
+            );
+            assert!(matches!(read, Response::ConfigEntries(_)), "{read:?}");
+            assert!(set_waited < bound, "the ConfigSet waited {set_waited:?}");
+            match set {
+                Response::Error { message } => assert_eq!(message, CANNOT_TELL),
+                other => panic!("expected the refusal, got {other:?}"),
+            }
+            assert_eq!(
+                crate::config::load(&path).unwrap().files_dir,
+                None,
+                "nothing saved"
+            );
+            assert_eq!(configured_files_dir(), None, "nothing re-seeded");
+            assert!(!folder.exists(), "no folder made");
+        }
+
+        /// #3769 — the control: a lookup that answers in time leaves the set
+        /// checked for and as the person at seat0, as before (FR-97 P3d). The
+        /// folder is saved, live, and made as them, and the `ConfigGet` asked
+        /// meanwhile answers at once too.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_files_folder_set_whose_lookup_answers_in_time_is_checked_as_the_person() {
+            use tunnel_core::localapi::{LocalApiState, Response};
+            if !root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            set_files_dir(None);
+            let _after = NoFilesDirAfter;
+            let dir = tempfile::tempdir().unwrap();
+            let (st, path, _overlay) = a_daemon_with_its_config(dir.path());
+            let (home, person) = nobodys_home();
+            let folder = home.path().join("drops");
+            let spelled = folder.to_string_lossy().into_owned();
+            let seat = at_the_screen(&person, home.path());
+            let _asked = stand_in::seat_asked(move || seat.clone()).await;
+            let (set, (read, read_waited)) =
+                tokio::join!(st.config_set("files_dir", Some(&spelled)), async {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let asked = std::time::Instant::now();
+                    let read = st.config_entries().await;
+                    (read, asked.elapsed())
+                });
+            assert!(
+                read_waited < std::time::Duration::from_secs(1),
+                "the ConfigGet waited {read_waited:?}"
+            );
+            assert!(matches!(read, Response::ConfigEntries(_)), "{read:?}");
+            match set {
+                Response::ConfigUpdated { entry } => {
+                    assert_eq!(entry.value.as_deref(), Some(spelled.as_str()))
+                }
+                other => panic!("expected the folder saved, got {other:?}"),
+            }
+            assert_eq!(
+                crate::config::load(&path).unwrap().files_dir.as_deref(),
+                Some(spelled.as_str()),
+                "saved"
+            );
+            assert_eq!(
+                configured_files_dir().as_deref(),
+                Some(spelled.as_str()),
+                "live for the next drop"
+            );
+            let md = std::fs::metadata(&folder).expect("made at set time");
+            assert_eq!(
+                (md.uid(), md.gid()),
+                (person.uid, person.gid),
+                "made as the person"
+            );
+        }
+
+        /// #3769 — a lookup that fails outright keeps today's answer, at once:
+        /// the daemon writes alone (`FsAs::DaemonAlone`), with no one's
+        /// profile to place the folder in, so the placement rule refuses it in
+        /// its own words, never "Try again".
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_files_folder_set_whose_lookup_failed_keeps_todays_refusal() {
+            use tunnel_core::localapi::{LocalApiState, Response};
+            if !root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            set_files_dir(None);
+            let _after = NoFilesDirAfter;
+            let dir = tempfile::tempdir().unwrap();
+            let (st, path, _overlay) = a_daemon_with_its_config(dir.path());
+            let (home, _person) = nobodys_home();
+            let spelled = home.path().join("drops").to_string_lossy().into_owned();
+            let _asked = stand_in::seat_asked(|| {
+                Seat::CannotTell(
+                    "loginctl show-seat seat0 failed: Unit dbus-org.freedesktop.login1.service \
+                     is masked."
+                        .into(),
+                )
+            })
+            .await;
+            let began = std::time::Instant::now();
+            match st.config_set("files_dir", Some(&spelled)).await {
+                Response::Error { message } => assert!(
+                    message.contains("no active user profile is known right now"),
+                    "{message}"
+                ),
+                other => panic!("expected the placement rule's refusal, got {other:?}"),
+            }
+            let waited = began.elapsed();
+            assert!(waited < SEAT_LOOKUP_WAIT, "waited {waited:?}");
+            assert_eq!(crate::config::load(&path).unwrap().files_dir, None);
+        }
+
         /// The file is born the person's, in their folder, and nothing of the
         /// staging is left. 0.4.143 wrote it `root:root` into `/tmp` (FR-97
         /// §8, P3d's red).
@@ -9100,6 +9477,57 @@ mod seat_user_tests {
         })
         .await;
         assert_eq!(failed, FsAs::DaemonAlone, "a failed lookup, a write");
+    }
+
+    /// #3769 — a `ConfigSet` of the files folder whose seat0 lookup gave no
+    /// answer in time (`FsAs::CannotTell`): a set that names a folder is
+    /// refused in the read's words before anything is touched, and a clear,
+    /// which needs no one, goes through. Its status answer is not computed for
+    /// no one: the status names no folder yet, never the folder just cleared
+    /// (the companion shows the default as pending), and the next status read
+    /// asks again.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_files_folder_set_with_no_one_known_is_refused_and_a_clear_shows_pending() {
+        const CANNOT_TELL: &str =
+            "Could not tell who is signed in at this computer's screen. Try again.";
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        let _quiet = NoBackgroundRefresh::hold();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("drops");
+        let spelled = folder.to_string_lossy().into_owned();
+        let Err(refused) = FilesDirSet::check_as(FsAs::CannotTell, Some(&spelled)).await else {
+            panic!("a folder was checked for no one");
+        };
+        assert_eq!(refused, CANNOT_TELL);
+        assert!(!folder.exists(), "nothing made");
+
+        // The card named the folder that is about to be cleared.
+        set_files_dir(Some(spelled.clone()));
+        publish_effective(
+            FILES_DIR_GEN.load(Ordering::Acquire),
+            Some(spelled.clone()),
+            true,
+        );
+        let mut cleared = FilesDirSet::check_as(FsAs::CannotTell, None)
+            .await
+            .expect("a clear needs no one");
+        set_files_dir(None);
+        cleared.saved();
+        cleared.refresh_status().await;
+        let (generation, computed_at, value) = {
+            let c = EFFECTIVE_FILES_DIR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (c.generation, c.computed_at, c.value.clone())
+        };
+        assert_eq!(value, None, "the cleared folder is not shown");
+        assert_eq!(generation, FILES_DIR_GEN.load(Ordering::Acquire));
+        assert!(
+            computed_at.is_none(),
+            "pending: the next status read asks again"
+        );
+        assert_eq!(configured_files_dir(), None);
     }
 
     /// #3688 — seat0's active uid is read from logind's own record of the
