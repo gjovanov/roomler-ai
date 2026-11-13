@@ -179,11 +179,13 @@ pub trait FleetLifecycle: Send + Sync {
 /// Hooks the owner of a membership invokes when someone stops being a member.
 ///
 /// The host owns org membership (`DELETE …/member/{user_id}`: removed by an
-/// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`).
-/// A module that admitted something on a membership withdraws it here: `network`
-/// the person's tunnel clients in the org, `fleet` the enrollment keys they
-/// minted there, `conference` the call seats they hold (`media:join` admitted
-/// them as a member), `chat` their room memberships.
+/// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`)
+/// and the room itself (`DELETE …/room/{room_id}`, which ends every membership
+/// of the room at once). A module that admitted something on a membership
+/// withdraws it here: `network` the person's tunnel clients in the org, `fleet`
+/// the enrollment keys they minted there, `conference` the call seats they hold
+/// (`media:join` admitted them as a member) and the call of a deleted room,
+/// `chat` their room memberships.
 ///
 /// Invoked AFTER the membership is gone, so nothing can be admitted on it
 /// again while a holder withdraws what it admitted. Idempotent, like every
@@ -208,6 +210,17 @@ pub trait MembershipLifecycle: Send + Sync {
         user_id: ObjectId,
     ) -> anyhow::Result<()> {
         let _ = (tenant_id, room_id, user_id);
+        Ok(())
+    }
+
+    /// The room `room_id` of `tenant_id` was deleted, and every membership of
+    /// it went with it. Called AFTER the delete by the room's owner (`chat`),
+    /// so no one can join the room, or anything in it, while a holder ends
+    /// what the room held. The members are gone by then, so a holder ends
+    /// what it keeps by the room: `conference` the call running in it, for
+    /// everyone in it.
+    async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        let _ = (tenant_id, room_id);
         Ok(())
     }
 
@@ -361,6 +374,17 @@ impl HookRegistry {
             hook.room_member_removed(tenant_id, room_id, user_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("{module}: room_member_removed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Run every `room_removed` hook in order, once the room is gone. A
+    /// failing holder stops the cascade, and the caller reports it.
+    pub async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        for (module, hook) in self.membership_lifecycles() {
+            hook.room_removed(tenant_id, room_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: room_removed: {e}"))?;
         }
         Ok(())
     }
@@ -696,6 +720,11 @@ mod tests {
             self.0.lock().unwrap().push(format!("room {t} {r} {u}"));
             Ok(())
         }
+
+        async fn room_removed(&self, t: ObjectId, r: ObjectId) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("removed {t} {r}"));
+            Ok(())
+        }
     }
 
     struct FailsToWithdraw;
@@ -746,6 +775,26 @@ mod tests {
         assert!(err.to_string().contains("conference: room_member_removed"));
         // The default body withdraws nothing and succeeds.
         reg.org_member_removed(t, u).await.unwrap();
+        reg.room_removed(t, r).await.unwrap();
+    }
+
+    /// A deleted room reaches its holders with the org and the room, and a
+    /// module that registers no membership hook is skipped.
+    #[tokio::test]
+    async fn a_deleted_room_reaches_its_holders() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        reg.register("chat", Hooks::default());
+        let (t, r) = (ObjectId::new(), ObjectId::new());
+        reg.room_removed(t, r).await.unwrap();
+        assert_eq!(*holder.0.lock().unwrap(), vec![format!("removed {t} {r}")]);
     }
 
     struct FarTurn(Option<bool>);

@@ -1155,3 +1155,62 @@ async fn deleting_a_room_leaves_a_call_in_another_room_alone() {
     let heard = next_of(&mut live.host, "media:new_producer").await;
     assert_eq!(heard["data"]["producer_id"], audio.as_str(), "{heard}");
 }
+
+/// The removal finds nothing left to end, and does nothing: for a room whose
+/// call had already ended when it was deleted, and for a second removal of
+/// it. No one hears anything of that room, and a call in another room goes
+/// on.
+#[tokio::test]
+async fn removing_a_room_whose_call_ended_or_a_second_time_tells_no_one() {
+    let app = TestApp::spawn().await;
+    let mut live = live_call(&app, "rdel-again").await;
+    let (tid, room) = (live.tenant.tenant_id.clone(), live.room.clone());
+    let other = live.tenant.rooms[1].id.clone();
+    let admin = live.tenant.admin.access_token.clone();
+
+    // A call in the other room, started and ended before the room goes.
+    assert_eq!(call(&app, &tid, &other, &admin, "start", None).await, 200);
+    let other_call = current_call_id(&app, &other).await;
+    assert_eq!(call(&app, &tid, &other, &admin, "end", None).await, 200);
+    settle(&mut live.host).await;
+    let ended_before = call_record(&app, other_call).await;
+    assert_eq!(
+        ended_before.get_str("end_reason").ok(),
+        Some("ended"),
+        "{ended_before}"
+    );
+
+    assert_eq!(delete_room(&app, &tid, &other, &admin).await, 200);
+    app.state
+        .core
+        .hooks
+        .room_removed(oid(&tid), oid(&other))
+        .await
+        .expect("a second removal finds nothing left to end");
+
+    let heard = settle(&mut live.host).await;
+    let of_other: Vec<&Value> = heard
+        .iter()
+        .filter(|f| f["data"]["room_id"] == other.as_str())
+        .collect();
+    assert!(
+        of_other.is_empty(),
+        "the host heard of a room whose call had ended: {of_other:?}"
+    );
+    assert_eq!(
+        call_record(&app, other_call)
+            .await
+            .get_str("end_reason")
+            .ok(),
+        Some("ended"),
+        "an ended call's record is left as it was closed"
+    );
+    assert!(
+        conf(&app).room_manager.has_room(&oid(&room)),
+        "the live call's router went with another room"
+    );
+    assert_eq!(
+        room_as_host(&app, &live).await["conference_status"],
+        "in_progress"
+    );
+}

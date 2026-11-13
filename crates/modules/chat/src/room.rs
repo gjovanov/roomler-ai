@@ -351,6 +351,15 @@ pub async fn delete(
 
     state.rooms.cascade_delete(tid, rid).await?;
 
+    // The room is gone, and every membership of it with it: what the room held
+    // ends now, a call running in it for everyone in it (`conference`'s hook).
+    // Told once the room is gone, so no one can join the room or its call
+    // meanwhile. The delete has happened whatever the hook says, so a failure
+    // there is logged, not answered.
+    if let Err(e) = state.hooks.room_removed(tid, rid).await {
+        tracing::warn!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+    }
+
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 

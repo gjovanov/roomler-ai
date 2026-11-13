@@ -35,7 +35,7 @@
 //!
 //! And [`Module::hooks`]: when someone's membership of an org or a room ends,
 //! core tells this module, which ends the call seats that membership admitted
-//! (`revoke`).
+//! (`revoke`); when a room is deleted, its call ends for everyone in it.
 //!
 //! The bus handlers (`media.cmd`, `media.leave_user`, …) and the 10 s claim
 //! heartbeat are wired in [`Module::init`] — they need only this state, so the
@@ -261,7 +261,7 @@ impl Module for ConferenceState {
 
     /// The inverse edge: a call seat ends with the membership that admitted
     /// it — the person removed from the org or leaving it, or leaving the
-    /// room ([`revoke`]).
+    /// room — and a deleted room's call ends for everyone in it ([`revoke`]).
     fn hooks(&self) -> roomler_core::Hooks {
         revoke::hooks(self)
     }

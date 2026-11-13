@@ -463,6 +463,16 @@ pub(crate) async fn handle_media_join(
         state
             .room_manager
             .close_participant_of_user(&rid, connection_id, &user_id);
+        // The room itself was deleted while this join was on its way. Its
+        // teardown (`revoke`) ended the call for every seat it found, and a
+        // router this join built after that would outlive the room: no one can
+        // be admitted to a room that is gone, so an empty one goes, with its
+        // claim.
+        if matches!(refusal, media_gate::Refusal::NoRoom)
+            && state.room_manager.connection_ids(&rid).is_empty()
+        {
+            crate::media_cluster::close_room_here(state, &rid).await;
+        }
         refuse_join(state, &user_id, connection_id, rid, &refusal).await;
         return;
     }

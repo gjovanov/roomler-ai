@@ -30,6 +30,14 @@
 //! itself: it asks the gate again once its seat exists
 //! (`ws_media::handle_media_join`), so a seat taken after the withdrawal
 //! looked is closed there.
+//!
+//! A room deleted mid-call ends every membership of it at once, and its call
+//! with them ([`room_deleted`]): `chat` tells conference once the room is gone.
+//! The call ends the way `call/end` ends it, on whichever pod serves it, for
+//! everyone in it: every seat closes, the router goes, the claim is released,
+//! each connection hears `room:call_ended` with `reason: "room_deleted"`, and
+//! the call's stats record closes. The room's member list went with the room,
+//! so the connections to tell come from the call's media itself.
 
 use std::sync::Arc;
 
@@ -46,6 +54,10 @@ pub(crate) const NOT_A_MEMBER: &str = "not_a_member";
 
 /// The bus request that withdraws a person's seats on the pod holding them.
 pub(crate) const WITHDRAW_SEATS: &str = "media.withdraw_seats";
+
+/// The `reason` of the `room:call_ended` a call hears when its room is
+/// deleted, and the `end_reason` its stats record closes with.
+pub(crate) const ROOM_DELETED: &str = "room_deleted";
 
 /// Conference's [`MembershipLifecycle`]: the hook `Module::hooks` registers.
 pub(crate) fn hooks(state: &ConferenceState) -> roomler_core::Hooks {
@@ -79,6 +91,55 @@ impl MembershipLifecycle for MembershipHooks {
     ) -> anyhow::Result<()> {
         room_membership_ended(&self.state, tenant_id, room_id, user_id).await
     }
+
+    async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        room_deleted(&self.state, tenant_id, room_id).await
+    }
+}
+
+/// Room `room_id` of `tenant_id` was deleted, and every membership of it with
+/// it: its call ends for everyone in it, the way `call/end` ends a call, on
+/// whichever pod serves it (`close_room_everywhere`). The people to tell are
+/// the connections in the call's media, because the room's member list is
+/// gone: each hears `room:call_ended` with `reason: "room_deleted"`. Then the
+/// call's stats record closes; its id went with the room's document, so it is
+/// found by the room. A call that already ended, or a second call, finds no
+/// media and no open record, and does nothing.
+async fn room_deleted(
+    state: &ConferenceState,
+    tenant_id: ObjectId,
+    room_id: ObjectId,
+) -> anyhow::Result<()> {
+    let closed = crate::media_cluster::close_room_everywhere(state, &room_id).await;
+    let ended = serde_json::json!({
+        "type": "room:call_ended",
+        "data": { "room_id": room_id.to_hex(), "reason": ROOM_DELETED }
+    });
+    for conn in &closed {
+        roomler_core::ws::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            conn,
+            &ended,
+        )
+        .await;
+    }
+    let calls = if state.settings.stats.enabled {
+        state
+            .stats
+            .close_call_sessions_of_room(tenant_id, room_id, ROOM_DELETED)
+            .await
+            .map_err(|e| anyhow::anyhow!("closing the call's stats record: {e}"))?
+    } else {
+        0
+    };
+    if !closed.is_empty() || calls > 0 {
+        info!(
+            tenant = %tenant_id, room = %room_id, seats = closed.len(), calls,
+            "call ended: its room was deleted"
+        );
+    }
+    Ok(())
 }
 
 /// `user_id` left room `room_id`, or was removed from it: end their seats in

@@ -326,38 +326,63 @@ async fn media_error(state: &ConferenceState, connection_id: &str, message: &str
 }
 
 /// Close a room's media island wherever it lives (call_end / last-leave
-/// auto-end): locally = remove + release; foreign = `media.close_room`
-/// RPC to the owner.
-pub async fn close_room_everywhere(state: &ConferenceState, rid: &ObjectId) {
+/// auto-end / a deleted room's call): locally = remove + release; foreign =
+/// `media.close_room` RPC to the owner. Returns the connections whose seats
+/// it closed; none when an owner from before the reply named them answers.
+pub async fn close_room_everywhere(state: &ConferenceState, rid: &ObjectId) -> Vec<String> {
     if state.room_manager.has_room(rid) {
-        state.room_manager.remove_room(rid);
-        release_media_claim(state, rid).await;
-        return;
+        return close_room_here(state, rid).await;
     }
     match resolve_media_route(state, rid, false).await {
         MediaRoute::Remote(pod) => {
-            if let Some(bus) = state.cluster_bus.clone()
-                && let Err(e) = bus
-                    .request(
-                        &pod,
-                        "media.close_room",
-                        serde_json::json!({ "room_id": rid.to_hex() }),
-                    )
-                    .await
+            let Some(bus) = state.cluster_bus.clone() else {
+                return Vec::new();
+            };
+            match bus
+                .request(
+                    &pod,
+                    "media.close_room",
+                    serde_json::json!({ "room_id": rid.to_hex() }),
+                )
+                .await
             {
-                warn!(room = %rid, %pod, %e, "media.close_room RPC failed — pruning record");
-                if let Some(dir) = state.cluster_directory.clone() {
-                    let key = media_key(&rid.to_hex());
-                    if let Ok(Some(raw)) = dir.get(&key).await
-                        && OwnerRecord::parse(&raw).map(|r| r.pod_id) == Some(pod)
-                    {
-                        let _ = dir.release(&key, &raw).await;
+                Ok(reply) => reply["closed"]
+                    .as_array()
+                    .map(|conns| {
+                        conns
+                            .iter()
+                            .filter_map(|c| c.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(e) => {
+                    warn!(room = %rid, %pod, %e, "media.close_room RPC failed — pruning record");
+                    if let Some(dir) = state.cluster_directory.clone() {
+                        let key = media_key(&rid.to_hex());
+                        if let Ok(Some(raw)) = dir.get(&key).await
+                            && OwnerRecord::parse(&raw).map(|r| r.pod_id) == Some(pod)
+                        {
+                            let _ = dir.release(&key, &raw).await;
+                        }
                     }
+                    Vec::new()
                 }
             }
         }
-        MediaRoute::Local { .. } => release_media_claim(state, rid).await,
+        MediaRoute::Local { .. } => {
+            release_media_claim(state, rid).await;
+            Vec::new()
+        }
     }
+}
+
+/// Close a room's media on this pod, the one serving it: every seat's
+/// transports, producers and consumers and the router go, and the claim is
+/// released. Returns the connections that were seated in it.
+pub(crate) async fn close_room_here(state: &ConferenceState, rid: &ObjectId) -> Vec<String> {
+    let closed = state.room_manager.remove_room(rid);
+    release_media_claim(state, rid).await;
+    closed
 }
 
 /// Release our claim for one room (compare-DEL via the held token).
@@ -619,20 +644,15 @@ pub fn wire_media_cluster(state: &ConferenceState) {
             })
         });
 
-        // media.close_room — call_end/auto-end served on a non-owner pod.
+        // media.close_room — call_end/auto-end, or a deleted room's call,
+        // served on a non-owner pod. Replies with the connections it closed,
+        // which a deleted room's teardown tells (`revoke`).
         let st = state.clone();
         bus.register("media.close_room", move |body| {
             let st = st.clone();
             Box::pin(async move {
                 let rid = parse_oid(&body, "room_id")?;
-                let conns: Vec<String> = st
-                    .room_manager
-                    .rooms_ref()
-                    .get(&rid)
-                    .map(|room| room.participants.iter().map(|p| p.key().clone()).collect())
-                    .unwrap_or_default();
-                st.room_manager.remove_room(&rid);
-                release_media_claim(&st, &rid).await;
+                let conns = close_room_here(&st, &rid).await;
                 let event = serde_json::json!({
                     "type": "media:room_closed",
                     "data": { "room_id": rid.to_hex(), "reason": "ended" }
@@ -646,7 +666,7 @@ pub fn wire_media_cluster(state: &ConferenceState) {
                     )
                     .await;
                 }
-                Ok(serde_json::json!({ "ok": true }))
+                Ok(serde_json::json!({ "ok": true, "closed": conns }))
             })
         });
     }
