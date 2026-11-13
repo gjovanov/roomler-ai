@@ -632,14 +632,17 @@ fn move_aside(f: &FolderNotTheirs) -> String {
             if one { "that file" } else { "those files" },
         );
     }
-    let owner = match f.owner {
-        0 => "root".to_string(),
-        n => format!("uid {n}"),
-    };
-    let only = format!(
-        "Only an administrator of this Mac can move it aside, because macOS lets no other \
-         account rename a folder that {owner} owns."
-    );
+    if f.owner != 0 {
+        // Whether macOS lets the person rename a folder of another account
+        // rests on its mode, so the line claims nothing about that: it is
+        // that account's folder, and no command moves it.
+        return format!(
+            "It is that account's folder, so this line gives no command for it; see \
+             {INSTALL_DOC}."
+        );
+    }
+    let only = "Only an administrator of this Mac can move it aside, because macOS lets no other \
+                account rename a folder that root owns.";
     let names: Vec<String> = f
         .kept
         .iter()
@@ -3078,15 +3081,17 @@ mod tests {
             ..folder_not_theirs(F.into(), 501, 502, 0o40755, Vec::new(), STAMP).expect("502's")
         };
         let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
-        assert!(
-            why.ends_with(&format!(
-                "uid 502 owns it (mode 755), not the person, so the worker's own log is not \
-                 there either. Only an administrator of this Mac can move it aside, because \
-                 macOS lets no other account rename a folder that uid 502 owns. This line \
-                 gives no command for it: an administrator of this Mac has to move it aside; \
-                 {DOC}"
-            )),
-            "{why}"
+        // Another account's folder: whether the person may rename it rests on
+        // its mode, so the line claims nothing about that, and gives no
+        // command (review N10).
+        println!("GIVE-UP [a folder of uid 502] {why}");
+        assert_eq!(
+            why,
+            format!(
+                "the worker cannot write the person's folder {F}: uid 502 owns it (mode 755), \
+                 not the person, so the worker's own log is not there either. It is that \
+                 account's folder, so this line gives no command for it; {DOC}"
+            )
         );
     }
 
