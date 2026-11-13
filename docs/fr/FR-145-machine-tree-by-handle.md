@@ -479,7 +479,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - File-transfer staging (`files.rs:1621-1623` and its pipeline): its own design pass (D5).
 - The person's own daemon's files in their profile, which stay as they are.
 - macOS and Linux.
-- Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1162`).
+- Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1177`).
 - Uninstall: the MSIs remove no tree of the machine folder (`agents/roomlerd/wix/main.wxs:355` removes only the
   Start-menu subfolder, and `agents/roomlerd/wix-perMachine/main.wxs` removes none).
 - The clean-up's removal of the SCM service and of the Scheduled Tasks.
