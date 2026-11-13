@@ -26,8 +26,9 @@
 //! each renaming the other's fresh copy under a live companion. A per-user
 //! task daemon owns `%LOCALAPPDATA%\Programs\Roomler` and refreshes itself.
 //! Running companions are found by the path they were started from and
-//! stopped by pid before the swap (`win_service::companion_procs`), never by
-//! image name. Failures are always skip-and-retry-next-start, never fatal.
+//! stopped by pid (`win_service::companion_procs`), never by image name, and
+//! only once the new EXE is in place (#3824): a swap that fails leaves the
+//! running tray running. Failures are always skip-and-retry, never fatal.
 
 // FR-27: unconditional now — `ensure_running` has a real body on every
 // platform, where before this module was Windows-only.
@@ -120,6 +121,12 @@ const FAST_REFRESH_WAITS: [std::time::Duration; 6] = [
     minutes(15),
 ];
 
+/// #3824 — the waits while a tray this process's refresh stopped is not
+/// running again ([`TrayLost`]): 1, 5 and 15 minutes, or the schedule's own
+/// wait when that is shorter; after them, the schedule. Each refresh tries to
+/// start the tray, so a lost tray is tried again within a minute.
+const LOST_TRAY_WAITS: [std::time::Duration; 3] = [minutes(1), minutes(5), minutes(15)];
+
 const fn minutes(n: u64) -> std::time::Duration {
     std::time::Duration::from_secs(n * 60)
 }
@@ -158,10 +165,12 @@ fn marker_version(marker: Option<&str>) -> Option<String> {
 }
 
 /// #3781 — the retry loop's memory: how many refreshes it has made in a row
-/// while the companion read too old to connect.
+/// while the companion read too old to connect, and (#3824) while a tray
+/// this process stopped was not running again.
 #[derive(Debug, Default)]
 pub(crate) struct RefreshSchedule {
     tries: u32,
+    lost_tries: u32,
 }
 
 /// #3781 — one wait of the retry loop, as [`RefreshSchedule::next`] plans it.
@@ -183,11 +192,19 @@ impl RefreshSchedule {
     /// once per wait, so the loop logs at most one line per wait. A marker
     /// that reads current starts the fast waits over for the next time one
     /// reads too old.
-    pub(crate) fn next(&mut self, marker: Option<&str>, _tray_lost: bool) -> NextRefresh {
+    pub(crate) fn next(&mut self, marker: Option<&str>, tray_lost: bool) -> NextRefresh {
         let too_old = predates_min_companion(marker);
-        let wait = next_refresh_wait(marker, self.tries);
+        let mut wait = next_refresh_wait(marker, self.tries);
+        if tray_lost && let Some(&sooner) = LOST_TRAY_WAITS.get(self.lost_tries as usize) {
+            wait = wait.min(sooner);
+        }
         self.tries = if too_old {
             self.tries.saturating_add(1)
+        } else {
+            0
+        };
+        self.lost_tries = if tray_lost {
+            self.lost_tries.saturating_add(1)
         } else {
             0
         };
@@ -1010,8 +1027,11 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
 /// process was created. A failed start, or nobody signed in to start it for,
 /// is an error that [`ensure_running`] logs, and the prompt has no surface.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn started_outcome(_start: TrayStart) -> Result<EnsureOutcome> {
-    Ok(EnsureOutcome::Started)
+fn started_outcome(start: TrayStart) -> Result<EnsureOutcome> {
+    match start {
+        TrayStart::Started { .. } => Ok(EnsureOutcome::Started),
+        not_started => Err(anyhow::anyhow!("{}", not_started.describe())),
+    }
 }
 
 /// Which spawn shape this process needs. Mirrors the probe `app.rs` does for
@@ -1992,24 +2012,49 @@ impl SwapOutcome {
     }
 }
 
-/// #1686 — the companion swap in the only order that can never leave a
-/// companion dead, or a live image renamed:
+/// #1686, #3824 — the tray swap, in the order that never stops a tray before
+/// the new EXE is in place:
 ///
-/// 1. stage the new copy beside the old one — a failure here touches nothing;
-/// 2. stop every running companion (verified per handle);
-/// 3. if ANY could not be stopped, abort: renaming a live image aside is how
-///    #1686 started, and a survivor would keep the single-instance lock anyway;
-/// 4. only now rename old → `.old` and new → installed;
-/// 5. respawn if something was running — the NEW one on success, the OLD one
-///    on every abort after step 2 (a person's tray is never left gone).
+/// 1. stage the new copy beside the installed one;
+/// 2. rename the installed EXE aside while a tray runs from it: NTFS renames a
+///    running image (`win_service::companion_procs`' test measures it). What
+///    refuses is an ACL, a handle without `FILE_SHARE_DELETE`, or endpoint
+///    protection;
+/// 3. rename the new copy into place. A failure in 1-3 puts back what moved
+///    and stops nothing: the tray runs on, and the retry tries again. Until
+///    #3824 the tray was stopped first, and a refused rename, with its start
+///    from the old EXE refused as well, left the person with none;
+/// 4. only now stop the running trays, found by the path they were started
+///    from, which no rename changes (#1686);
+/// 5. one that would not stop keeps the single-instance lock: put the old EXE
+///    back over the new one, which nothing runs, start what was stopped, and
+///    leave the marker, so the retry tries again;
+/// 6. else write the marker, start what was stopped, and remove the old copy.
+///
+/// A stop whose start does not bring the tray back marks it lost, and a start
+/// that works forgets that ([`TrayLost`]).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // exercised by `swap_tests` everywhere
-pub(crate) fn swap<O: SwapOps>(ops: &mut O, _lost: &TrayLost) -> SwapOutcome {
+pub(crate) fn swap<O: SwapOps>(ops: &mut O, lost: &TrayLost) -> SwapOutcome {
+    let gave_up = |reason: String| SwapOutcome::Aborted {
+        reason,
+        stopped: Vec::new(),
+        start: None,
+    };
     if let Err(e) = ops.stage() {
-        return SwapOutcome::Aborted {
-            reason: format!("staging the new companion failed: {e:#}"),
-            stopped: Vec::new(),
-            start: None,
+        return gave_up(format!("staging the new companion failed: {e:#}"));
+    }
+    if let Err(e) = ops.rename_old_aside() {
+        ops.discard_new();
+        return gave_up(format!("moving the old companion aside failed: {e:#}"));
+    }
+    if let Err(e) = ops.promote_new() {
+        let failed = format!("putting the new companion in place failed: {e:#}");
+        let reason = match ops.restore_old() {
+            Ok(()) => failed,
+            Err(back) => format!("{failed}; putting the old one back failed too: {back:#}"),
         };
+        ops.discard_new();
+        return gave_up(reason);
     }
     let pids = ops.running();
     let stopped = if pids.is_empty() {
@@ -2017,44 +2062,41 @@ pub(crate) fn swap<O: SwapOps>(ops: &mut O, _lost: &TrayLost) -> SwapOutcome {
     } else {
         ops.stop(&pids)
     };
-    // Put back what this swap stopped, from whatever EXE is installed.
-    let abort = |ops: &mut O, reason: String, stopped: Vec<u32>| {
-        ops.discard_new();
-        let start = (!stopped.is_empty()).then(|| ops.start());
-        SwapOutcome::Aborted {
+    if stopped.len() != pids.len() {
+        let survived = format!(
+            "could not stop every running companion (running {pids:?}, stopped {stopped:?})"
+        );
+        let reason = match ops.restore_old() {
+            Ok(()) => survived,
+            Err(back) => format!("{survived}; putting the old one back failed: {back:#}"),
+        };
+        let start = start_stopped(ops, &stopped, lost);
+        return SwapOutcome::Aborted {
             reason,
             stopped,
             start,
-        }
-    };
-    if stopped.len() != pids.len() {
-        return abort(
-            ops,
-            format!(
-                "could not stop every running companion (running {pids:?}, stopped {stopped:?})"
-            ),
-            stopped,
-        );
-    }
-    if let Err(e) = ops.rename_old_aside() {
-        return abort(
-            ops,
-            format!("moving the old companion aside failed: {e:#}"),
-            stopped,
-        );
-    }
-    if let Err(e) = ops.promote_new() {
-        let _ = ops.restore_old();
-        return abort(
-            ops,
-            format!("putting the new companion in place failed: {e:#}"),
-            stopped,
-        );
+        };
     }
     ops.write_marker();
-    let start = (!stopped.is_empty()).then(|| ops.start());
+    let start = start_stopped(ops, &stopped, lost);
     ops.remove_old();
     SwapOutcome::Swapped { stopped, start }
+}
+
+/// #3824 — start what the swap stopped, and record whether that brought the
+/// tray back.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn start_stopped<O: SwapOps>(ops: &mut O, stopped: &[u32], lost: &TrayLost) -> Option<TrayStart> {
+    if stopped.is_empty() {
+        return None;
+    }
+    let start = ops.start();
+    if matches!(start, TrayStart::Started { .. }) {
+        lost.clear();
+    } else {
+        lost.set();
+    }
+    Some(start)
 }
 
 /// #3824 — what a start of the tray came to. The refresh's line and the
@@ -2072,7 +2114,7 @@ pub(crate) enum TrayStart {
     Failed(String),
 }
 
-#[allow(dead_code)] // RED (#3824): the fix's lines read it
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl TrayStart {
     /// What came of it, for a log line.
     fn describe(&self) -> String {
@@ -2105,7 +2147,7 @@ pub(crate) struct TrayLost {
     failed_tries: std::sync::atomic::AtomicU32,
 }
 
-#[allow(dead_code)] // RED (#3824): the fix sets and clears it
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl TrayLost {
     pub(crate) const fn new() -> Self {
         Self {
@@ -2147,7 +2189,7 @@ static TRAY_LOST: TrayLost = TrayLost::new();
 /// #3824 — the refresh's line for a swap. One renderer, tested, so a start
 /// that failed is a warning with its error, and "respawned" is said only of a
 /// start that worked.
-#[allow(dead_code)] // RED (#3824): the fix renders `TrayNotBack`
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefreshLine {
     /// INFO `desktop companion refreshed`, with `tray=`: what became of it.
@@ -2164,16 +2206,33 @@ pub(crate) enum RefreshLine {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn refresh_line(outcome: &SwapOutcome) -> RefreshLine {
     match outcome {
-        SwapOutcome::Swapped { stopped, .. } => RefreshLine::Refreshed {
-            tray: format!("respawned={}", !stopped.is_empty()),
+        SwapOutcome::Swapped { start: None, .. } => RefreshLine::Refreshed {
+            tray: "none was running".to_string(),
         },
-        SwapOutcome::Aborted {
-            reason, stopped, ..
-        } => RefreshLine::Skipped {
-            error: format!(
-                "{reason} (the old companion is untouched; respawned it: {})",
-                !stopped.is_empty()
-            ),
+        SwapOutcome::Swapped {
+            start: Some(started @ TrayStart::Started { .. }),
+            ..
+        } => RefreshLine::Refreshed {
+            tray: format!("respawned ({})", started.describe()),
+        },
+        SwapOutcome::Swapped {
+            start: Some(not_started),
+            ..
+        } => RefreshLine::TrayNotBack {
+            error: not_started.describe(),
+        },
+        SwapOutcome::Aborted { reason, start, .. } => RefreshLine::Skipped {
+            error: match start {
+                None => format!("{reason} (no tray was stopped)"),
+                Some(started @ TrayStart::Started { .. }) => format!(
+                    "{reason} (the tray it had stopped was respawned: {})",
+                    started.describe()
+                ),
+                Some(not_started) => format!(
+                    "{reason} (the tray it had stopped could not be started again: {})",
+                    not_started.describe()
+                ),
+            },
         },
     }
 }
@@ -2192,7 +2251,7 @@ pub(crate) enum LostTrayStart {
 }
 
 /// #3824 — the line for a try to bring back a lost tray.
-#[allow(dead_code)] // RED (#3824): the fix renders it
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LostTrayLine {
     /// INFO `desktop companion is back after a refresh stopped it`, with
@@ -2205,30 +2264,77 @@ pub(crate) enum LostTrayLine {
 }
 
 /// #3824 — after a refresh pass, start a tray an earlier pass stopped and
-/// could not start again.
+/// could not start again. Nothing at all when none was lost: a tray the
+/// person quit, or one that never ran, stays as it is. Nothing either when
+/// this pass stopped a tray: its own start has tried already, or marked the
+/// tray lost. A start that works, or a tray seen running, forgets the loss;
+/// anything else leaves it for the next pass.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn restore_lost_tray(
-    _pass_stopped_a_tray: bool,
-    _lost: &TrayLost,
-    _start: impl FnOnce() -> LostTrayStart,
+    pass_stopped_a_tray: bool,
+    lost: &TrayLost,
+    start: impl FnOnce() -> LostTrayStart,
 ) -> Option<LostTrayLine> {
-    None
+    if pass_stopped_a_tray || !lost.is_set() {
+        return None;
+    }
+    let back = |how: String| {
+        lost.clear();
+        Some(LostTrayLine::Back { how })
+    };
+    let still_down = |why: String| {
+        Some(LostTrayLine::StillDown {
+            why,
+            first: lost.failed_try(),
+        })
+    };
+    match start() {
+        LostTrayStart::Running => back("one is running again".to_string()),
+        LostTrayStart::Tried(started @ TrayStart::Started { .. }) => {
+            back(format!("started again ({})", started.describe()))
+        }
+        LostTrayStart::NotSetToStart => still_down(
+            "it is not set to start at sign-in here (no `Roomler Desktop` Run value)".to_string(),
+        ),
+        LostTrayStart::Tried(not_started) => still_down(not_started.describe()),
+    }
 }
 
-/// #3824 — the name to move the installed EXE aside to.
+/// #3824 — how many `…exe.old.<n>` names a swap tries after `…exe.old`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const ASIDE_NAMES: u32 = 8;
+
+/// #3824 — the name to move the installed EXE aside to: `old` when `free`
+/// says it is free (it may free it), else the first free `old.<n>`. A copy
+/// still mapped by a tray, or held by a scanner, refuses a delete and a
+/// replace onto it alike, and used to fail the next swap's rename. `None`
+/// when every name is held.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn free_aside_name(
     old: &std::path::Path,
     mut free: impl FnMut(&std::path::Path) -> bool,
 ) -> Option<std::path::PathBuf> {
-    let _ = free(old);
-    Some(old.to_path_buf())
+    std::iter::once(old.to_path_buf())
+        .chain((1..=ASIDE_NAMES).map(|n| {
+            let mut name = old.as_os_str().to_os_string();
+            name.push(format!(".{n}"));
+            std::path::PathBuf::from(name)
+        }))
+        .find(|name| free(name))
 }
 
-/// #3824 — is `name` a copy a swap moved aside to `base`?
+/// #3824 — is `name` a copy a swap moved aside to `base` (`base` itself or
+/// `base.<n>`)? Never the version marker, the staged `.new` or the EXE.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn is_aside_name(name: &str, base: &str) -> bool {
-    name.eq_ignore_ascii_case(base)
+    let (name, base) = (name.to_ascii_lowercase(), base.to_ascii_lowercase());
+    match name.strip_prefix(base.as_str()) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix('.')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
 }
 
 #[cfg(target_os = "windows")]
