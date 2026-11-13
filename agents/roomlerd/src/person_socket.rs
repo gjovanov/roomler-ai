@@ -376,35 +376,103 @@ fn person_at_the_seat() -> Option<u32> {
 /// [`POLL`], so a person who switched away still holds an open connection
 /// until the next look, and must not change settings that are the next
 /// person's by then.
+///
+/// #3796 — on Linux the lookup is logind's, another process, which may not
+/// answer (a stopped logind). It is asked as a received file's is: one
+/// lookup in flight ([`PERSON_AT_SEAT0`]), each check waiting
+/// `files::SEAT_LOOKUP_WAIT` at most. With no answer in that time, who is
+/// at the seat is not known yet, and the change is refused with the
+/// try-again text (`AtTheSeat::NotKnownYet`). A Mac looks at `/dev/console`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub async fn at_the_seat_now(uid: u32) -> bool {
-    // #3796 — asked here, on the thread a test stood the lookup in on.
-    #[cfg(all(test, target_os = "linux"))]
-    let stood_in = stand_in::lookup_now();
-    tokio::task::spawn_blocking(move || {
-        #[cfg(all(test, target_os = "linux"))]
-        if let Some(lookup) = stood_in {
-            return lookup();
+pub async fn at_the_seat_now(uid: u32) -> tunnel_core::localapi::AtTheSeat {
+    #[cfg(target_os = "linux")]
+    {
+        // Asked here, on the thread a test stood the lookup in on.
+        #[cfg(test)]
+        if let Some(stood) = stand_in::lookup_now() {
+            let lookup = stood.lookup;
+            let asked = stood
+                .flight
+                .ask(crate::files::SEAT_LOOKUP_WAIT, move || lookup())
+                .await;
+            return seat_for(uid, asked);
         }
-        person_at_the_seat()
-    })
-    .await
-    .ok()
-    .flatten()
-        == Some(uid)
+        seat_for(
+            uid,
+            PERSON_AT_SEAT0
+                .ask(crate::files::SEAT_LOOKUP_WAIT, person_at_the_seat)
+                .await,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let at_seat = tokio::task::spawn_blocking(person_at_the_seat)
+            .await
+            .ok()
+            .flatten();
+        if at_seat == Some(uid) {
+            tunnel_core::localapi::AtTheSeat::Yes
+        } else {
+            tunnel_core::localapi::AtTheSeat::No
+        }
+    }
+}
+
+/// #3796 — the one lookup of who is at seat0 in flight for the person
+/// socket's checks ([`at_the_seat_now`]), on a thread named `seat0-person`.
+/// Its 5 s poll ([`run`]) asks on its own, one look at a time.
+#[cfg(target_os = "linux")]
+static PERSON_AT_SEAT0: crate::one_in_flight::OneInFlight<Option<u32>> =
+    crate::one_in_flight::OneInFlight::new("seat0-person");
+
+/// #3796 — what a check answers for `uid` from what the lookup gave it.
+#[cfg(target_os = "linux")]
+fn seat_for(
+    uid: u32,
+    asked: crate::one_in_flight::Asked<Option<u32>>,
+) -> tunnel_core::localapi::AtTheSeat {
+    use crate::one_in_flight::Asked;
+    use tunnel_core::localapi::AtTheSeat;
+    match asked {
+        Asked::Answer(at_seat) if at_seat == Some(uid) => AtTheSeat::Yes,
+        Asked::Answer(_) => AtTheSeat::No,
+        // As before: a lookup that failed names nobody at the seat.
+        Asked::Failed(why) => {
+            tracing::warn!(%why, "person socket: the seat lookup failed — nobody at the seat");
+            AtTheSeat::No
+        }
+        Asked::OutOfTime => {
+            tracing::warn!(
+                uid,
+                wait = ?crate::files::SEAT_LOOKUP_WAIT,
+                "person socket: who is at the seat gave no answer in time — a change is refused, try again"
+            );
+            AtTheSeat::NotKnownYet
+        }
+    }
 }
 
 /// #3796 — who is at the seat, as the person socket's check asks it, stood in
-/// on one thread: the lookup itself runs where the real one runs, so a test
-/// sees how long a `ConfigSet` waits for it, and how many lookups began.
+/// on one thread: the lookup itself runs where the real one runs, in a flight
+/// of the stand-in's own, so a test sees how long a `ConfigSet` waits for it,
+/// and how many lookups began.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod stand_in {
+    use crate::one_in_flight::OneInFlight;
     use std::sync::{Arc, Mutex, PoisonError};
 
     /// The lookup stood in: the uid of the person at the seat, or nobody.
     type Asked = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
 
-    static ASKED: Mutex<Option<(std::thread::ThreadId, Asked)>> = Mutex::new(None);
+    /// The lookup stood in on a thread, with its own lookup in flight.
+    pub(super) struct StoodLookup {
+        pub(super) lookup: Asked,
+        pub(super) flight: Arc<OneInFlight<Option<u32>>>,
+    }
+
+    type Stands = (std::thread::ThreadId, Asked, Arc<OneInFlight<Option<u32>>>);
+
+    static ASKED: Mutex<Option<Stands>> = Mutex::new(None);
 
     /// The tests that stand the lookup in take turns.
     static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -426,19 +494,25 @@ pub(crate) mod stand_in {
         lookup: impl Fn() -> Option<u32> + Send + Sync + 'static,
     ) -> Stood {
         let turn = TURN.lock().await;
-        *ASKED.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((std::thread::current().id(), Arc::new(lookup)));
+        *ASKED.lock().unwrap_or_else(PoisonError::into_inner) = Some((
+            std::thread::current().id(),
+            Arc::new(lookup),
+            Arc::new(OneInFlight::new("seat0-person")),
+        ));
         Stood { _turn: turn }
     }
 
     /// The lookup stood in for this thread, if there is one.
-    pub(super) fn lookup_now() -> Option<Asked> {
+    pub(super) fn lookup_now() -> Option<StoodLookup> {
         ASKED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .filter(|(thread, _)| *thread == std::thread::current().id())
-            .map(|(_, asked)| asked.clone())
+            .filter(|(thread, _, _)| *thread == std::thread::current().id())
+            .map(|(_, lookup, flight)| StoodLookup {
+                lookup: lookup.clone(),
+                flight: flight.clone(),
+            })
     }
 }
 

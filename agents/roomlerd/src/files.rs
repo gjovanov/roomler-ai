@@ -56,6 +56,8 @@ use tokio::sync::Mutex;
 use tunnel_core::env::node_env_os;
 
 use crate::files_dir;
+#[cfg(target_os = "linux")]
+use crate::one_in_flight::{Asked, OneInFlight};
 
 /// #3688 — a received file's staging on Linux, held by handles.
 #[cfg(target_os = "linux")]
@@ -323,7 +325,8 @@ pub(crate) enum FsAs {
     /// [`CANNOT_TELL`], never as if nobody were there. #3711 — so is a
     /// received file whose lookup ran out of its time ([`Seat::OutOfTime`]);
     /// one whose lookup failed outright takes [`Self::DaemonAlone`], as with
-    /// nobody.
+    /// nobody. #3796 — and so is every blocking asker's ([`Self::now`]) on a
+    /// timeout: the status refresh then shows the folder pending.
     #[cfg(target_os = "linux")]
     CannotTell,
 }
@@ -353,9 +356,10 @@ const NOBODY_AT_THE_SCREEN: &str = "Nobody is signed in at this computer's scree
 /// seat0 could not be told: the seat0 lookup failed, or did not answer in
 /// time ([`SEAT_LOOKUP_WAIT`]). Not nobody: a retry may well find them.
 /// #3711 — and why a received file is refused when the lookup did not
-/// answer in time.
+/// answer in time. #3796 — the LocalAPI's own words, which a `ConfigSet`
+/// over the person socket gets then too: one text.
 #[cfg(target_os = "linux")]
-const CANNOT_TELL: &str = "Could not tell who is signed in at this computer's screen. Try again.";
+const CANNOT_TELL: &str = tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN;
 
 /// #3048 — said when a step would be taken for someone other than the person
 /// a transfer, or a listing (#3669), began for: they signed out, or another
@@ -433,23 +437,26 @@ fn fs_as_for(
 impl FsAs {
     /// Who a transfer starting now writes as, asked on a blocking thread:
     /// the status refresh's own thread, and a `ConfigSet` of `files_dir` off
-    /// Linux. On a Linux system install it asks seat0 inline, with no time
-    /// limit. #3711 — an async task asks [`Self::for_write`] instead, and
+    /// Linux. #3711 — an async task asks [`Self::for_write`] instead, and
     /// #3769 — so does that `ConfigSet` there ([`FilesDirSet::check`]).
+    /// #3796 — on a Linux system install it asks seat0 as they do: through
+    /// the one lookup in flight ([`SEAT0`]), [`SEAT_LOOKUP_WAIT`] at most. No
+    /// answer in that time is [`Self::CannotTell`], never the daemon alone:
+    /// the status refresh shows the folder pending, and the set-time check
+    /// (`validate_files_dir_setting`) refuses with the try-again text.
     pub(crate) fn now() -> Self {
         #[cfg(target_os = "linux")]
         {
             let (root, switch_on) = linux_process();
-            // #3796 — asked here, on the thread a test stood it in on, or
-            // carried it to (a status refresh's).
-            #[cfg(test)]
-            let stood_in = stand_in::lookup_now();
-            linux_fs_as(root, switch_on, false, move || {
+            linux_fs_as(root, switch_on, false, || {
+                // Asked here, on the thread a test stood it in on, or
+                // carried it to (a status refresh's).
                 #[cfg(test)]
-                if let Some(stood) = stood_in {
-                    return stood.ask();
+                if let Some(stood) = stand_in::lookup_now() {
+                    let flight = stood.flight.clone();
+                    return seat_within_blocking(&flight, SEAT_LOOKUP_WAIT, move || stood.ask());
                 }
-                seat_now()
+                seat_within_blocking(&SEAT0, SEAT_LOOKUP_WAIT, seat_now)
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -501,21 +508,26 @@ impl FsAs {
     /// #3688, #3711 — who a read, or a write, starting now acts as on Linux,
     /// from this process and who is at seat0 ([`linux_fs_as_within`]). A
     /// test stands in the lookup on its thread (`stand_in::seat`,
-    /// `stand_in::seat_asked`).
+    /// `stand_in::seat_asked`), with a lookup in flight of its own. #3796 —
+    /// every other caller asks through the one in flight ([`SEAT0`]).
     #[cfg(target_os = "linux")]
     async fn at_seat0(reading: bool) -> Self {
         let (root, switch_on) = linux_process();
         // Asked here, on the thread a test stood it in on.
         #[cfg(test)]
-        let stood_in = stand_in::lookup_now();
-        linux_fs_as_within(root, switch_on, reading, SEAT_LOOKUP_WAIT, move || {
-            #[cfg(test)]
-            if let Some(stood) = stood_in {
-                return stood.ask();
-            }
-            seat_now()
-        })
-        .await
+        if let Some(stood) = stand_in::lookup_now() {
+            let flight = stood.flight.clone();
+            return linux_fs_as_within(
+                root,
+                switch_on,
+                reading,
+                &flight,
+                SEAT_LOOKUP_WAIT,
+                move || stood.ask(),
+            )
+            .await;
+        }
+        linux_fs_as_within(root, switch_on, reading, &SEAT0, SEAT_LOOKUP_WAIT, seat_now).await
     }
 
     /// #3048 — on Windows, the person signed in to this process's session
@@ -982,20 +994,21 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
 
 /// #3688, #3711 — [`linux_fs_as`] from an async task, a read's or a write's:
 /// `lookup` is asked only when it is needed (a root daemon, the switch on),
-/// on a blocking thread and `wait` at most ([`seat_within`]). logind and the
+/// through `flight` and `wait` at most ([`seat_within`]). logind and the
 /// account database are other processes, and either may hang.
 #[cfg(target_os = "linux")]
 async fn linux_fs_as_within(
     root: bool,
     switch_on: bool,
     reading: bool,
+    flight: &OneInFlight<Seat>,
     wait: std::time::Duration,
     lookup: impl FnOnce() -> Seat + Send + 'static,
 ) -> FsAs {
     if !(root && switch_on) {
         return FsAs::Daemon;
     }
-    let seat = seat_within(wait, lookup).await;
+    let seat = seat_within(flight, wait, lookup).await;
     linux_fs_as(root, switch_on, reading, move || seat)
 }
 
@@ -1006,28 +1019,58 @@ async fn linux_fs_as_within(
 /// timer of their own in the viewer: their wait only delays the offer.
 /// #3711 — a received file's lookup waits as long, at `files:begin`,
 /// `files:resume` (which the viewer gives 10 s) and the startup sweep (which
-/// signalling waits for).
+/// signalling waits for). #3796 — and so do the status refresh, the set-time
+/// check ([`FsAs::now`]) and the person socket's check that its caller is
+/// still at the seat (`person_socket::at_the_seat_now`).
 #[cfg(target_os = "linux")]
-const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+pub(crate) const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// #3688 — `lookup` on a blocking thread, given `wait` at most: a wedged
+/// #3796 — the one seat0 lookup in flight (logind, then the account
+/// database), on a thread named `seat0-lookup`: every read, received file,
+/// files folder's set and status refresh that asks while it runs waits on it,
+/// within its own wait, and none starts another
+/// ([`crate::one_in_flight`]'s rules).
+#[cfg(target_os = "linux")]
+static SEAT0: OneInFlight<Seat> = OneInFlight::new("seat0-lookup");
+
+/// #3688 — `lookup` off the async worker, given `wait` at most: a wedged
 /// logind or account lookup never stalls an async worker. One that fails
 /// cannot tell who is at the screen ([`Seat::CannotTell`]); #3711 — one past
-/// its time does not know yet ([`Seat::OutOfTime`]), and finishes on its own
-/// thread, so the account database's own caches (SSSD's, nscd's) hold its
-/// answer for the next lookup.
+/// its time does not know yet ([`Seat::OutOfTime`]). #3796 — through
+/// `flight` ([`SEAT0`], or a test's): a lookup that is late keeps the only
+/// thread it holds, which every later caller waits on rather than starting
+/// a lookup of its own. Each caller takes the answer of a lookup that began
+/// at or after it asked, so a late answer reaches no one.
 #[cfg(target_os = "linux")]
 async fn seat_within(
+    flight: &OneInFlight<Seat>,
     wait: std::time::Duration,
     lookup: impl FnOnce() -> Seat + Send + 'static,
 ) -> Seat {
-    match tokio::time::timeout(wait, tokio::task::spawn_blocking(lookup)).await {
-        Ok(Ok(seat)) => seat,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "files: the seat0 lookup failed — who is at seat0 is not known");
-            Seat::CannotTell(format!("the seat0 lookup failed: {e}"))
+    seat_from(flight.ask(wait, lookup).await, wait)
+}
+
+/// #3796 — [`seat_within`] on a blocking thread: the status refresh's own,
+/// and the set-time check's ([`FsAs::now`]).
+#[cfg(target_os = "linux")]
+fn seat_within_blocking(
+    flight: &OneInFlight<Seat>,
+    wait: std::time::Duration,
+    lookup: impl FnOnce() -> Seat + Send + 'static,
+) -> Seat {
+    seat_from(flight.ask_blocking(wait, lookup), wait)
+}
+
+/// What a caller of [`seat_within`] takes from the lookup in flight.
+#[cfg(target_os = "linux")]
+fn seat_from(asked: Asked<Seat>, wait: std::time::Duration) -> Seat {
+    match asked {
+        Asked::Answer(seat) => seat,
+        Asked::Failed(why) => {
+            tracing::warn!(%why, "files: the seat0 lookup failed — who is at seat0 is not known");
+            Seat::CannotTell(format!("the seat0 lookup failed: {why}"))
         }
-        Err(_) => {
+        Asked::OutOfTime => {
             tracing::warn!(
                 ?wait,
                 "files: the seat0 lookup did not answer in time — who is at seat0 is not known yet"
@@ -1155,8 +1198,12 @@ const EFFECTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// default ladder's known-folder lookups, possibly a Downloads redirected to
 /// a share that is offline right now. So this answers from a cache and, when
 /// the cached answer is older than [`EFFECTIVE_TTL`] or was computed for a
-/// previous value, refreshes it on a background thread. `None` only before
-/// the first refresh has landed (`set_files_dir` at startup starts one).
+/// previous value, refreshes it on a background thread. `None` before the
+/// first refresh has landed (`set_files_dir` at startup starts one), and on
+/// a Linux system install while who a drop would be written as is not known
+/// yet (#3769's set, #3796's refresh): the companion shows the folder
+/// pending then. #3796 — the read never waits for that lookup, whatever it
+/// does.
 pub fn effective_files_dir() -> Option<String> {
     let current = FILES_DIR_GEN.load(Ordering::Acquire);
     let (value, fresh) = {
@@ -1174,17 +1221,27 @@ pub fn effective_files_dir() -> Option<String> {
 }
 
 /// Compute the status answer now and cache it. BLOCKING (token, disk,
-/// known-folder lookups): the daemon's `ConfigSet` runs it on its blocking
-/// thread, so the status read right after a change is already the new
-/// answer; everything else reaches it through [`spawn_effective_refresh`].
+/// known-folder lookups, and on a Linux system install the seat0 lookup,
+/// [`SEAT_LOOKUP_WAIT`] at most since #3796): the background refresh's own
+/// thread runs it ([`spawn_effective_refresh`]). A `ConfigSet` of the folder
+/// publishes its own answer for the person it checked
+/// ([`FilesDirSet::refresh_status`], #3769).
 pub fn refresh_effective_files_dir() -> Option<String> {
     refresh_effective_files_dir_as(&FsAs::now())
 }
 
 /// [`refresh_effective_files_dir`] for `who`, on this thread, which must be
-/// a blocking one.
+/// a blocking one. #3796 — with no answer in time for who that is
+/// ([`FsAs::CannotTell`]: the seat0 lookup still running), none is computed:
+/// the status names no folder, so the companion shows the default with its
+/// folder pending (#3795's shape), and the next status read asks again.
 fn refresh_effective_files_dir_as(who: &FsAs) -> Option<String> {
     let (raw, generation) = configured_files_dir_and_gen();
+    #[cfg(target_os = "linux")]
+    if matches!(who, FsAs::CannotTell) {
+        publish_effective(generation, None, false);
+        return None;
+    }
     let value = compute_effective_files_dir(who, raw.as_deref());
     publish_effective(generation, value.clone(), true);
     value
@@ -1232,7 +1289,11 @@ impl Drop for NoBackgroundRefresh {
 }
 
 /// One background refresh at a time; a read that finds one running simply
-/// returns the cached answer.
+/// returns the cached answer. #3796 — on a Linux system install a refresh
+/// waits for who is at seat0 [`SEAT_LOOKUP_WAIT`] at most: with no answer
+/// in that time it publishes the folder as pending and ends, so the card
+/// never keeps a folder for someone who may have left, and the next read
+/// starts another refresh, which waits on the same lookup in flight.
 fn spawn_effective_refresh() {
     if EFFECTIVE_REFRESHING.swap(true, Ordering::AcqRel) {
         return;
@@ -5284,6 +5345,8 @@ pub(crate) mod stand_in {
     use super::FsAs;
     #[cfg(target_os = "linux")]
     use super::Seat;
+    #[cfg(target_os = "linux")]
+    use crate::one_in_flight::OneInFlight;
     #[cfg(target_os = "windows")]
     use crate::win_identity::PersonToken;
     use std::path::Path;
@@ -5346,6 +5409,10 @@ pub(crate) mod stand_in {
         seat: Seat,
         stays_for: Option<u32>,
         asked: Option<Asked>,
+        /// #3796 — the stand-in's own lookup in flight, so a lookup a test
+        /// holds up never holds up the tests beside it, whose lookups go
+        /// through the daemon's ([`super::SEAT0`]).
+        flight: std::sync::Arc<OneInFlight<Seat>>,
     }
 
     /// #3711 — a seat0 lookup stood in: it runs on whatever thread the real
@@ -5399,6 +5466,7 @@ pub(crate) mod stand_in {
             seat: Seat::CannotTell("a stood-in lookup".into()),
             stays_for: None,
             asked: Some(std::sync::Arc::new(lookup)),
+            flight: std::sync::Arc::new(OneInFlight::new("seat0-lookup")),
         });
         SeatStoodIn { _turn: turn }
     }
@@ -5411,16 +5479,19 @@ pub(crate) mod stand_in {
             seat,
             stays_for,
             asked: None,
+            flight: std::sync::Arc::new(OneInFlight::new("seat0-lookup")),
         });
         SeatStoodIn { _turn: turn }
     }
 
     /// The seat0 lookup stood in for a thread: a seat stood in answers at
-    /// once; a lookup stood in ([`seat_asked`]) runs.
+    /// once; a lookup stood in ([`seat_asked`]) runs, through the
+    /// stand-in's own lookup in flight.
     #[cfg(target_os = "linux")]
     #[derive(Clone)]
     pub(super) struct StoodLookup {
         asked: Asked,
+        pub(super) flight: std::sync::Arc<OneInFlight<Seat>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -5457,7 +5528,10 @@ pub(crate) mod stand_in {
                 std::sync::Arc::new(move || seat.clone())
             }
         };
-        Some(StoodLookup { asked })
+        Some(StoodLookup {
+            asked,
+            flight: stood.flight.clone(),
+        })
     }
 
     /// While this lives, the seat0 lookup carried here is stood in on this
@@ -8902,7 +8976,9 @@ mod seat_user_tests {
         /// refuses the upload and the resume in the read's words, and the
         /// sweep sweeps nothing: nothing is touched, root's own default folder
         /// included. A current-thread runtime has one worker, this test's own
-        /// thread.
+        /// thread. #3796 — the lookup `files:begin` started is still running
+        /// when the other two ask, and they wait on it: one lookup between
+        /// the three.
         #[tokio::test(flavor = "current_thread")]
         async fn a_lookup_past_its_time_refuses_a_received_file_at_every_entry_point() {
             const CANNOT_TELL: &str =
@@ -8921,7 +8997,8 @@ mod seat_user_tests {
                 let asked_on = asked_on.clone();
                 move || {
                     asked_on.lock().unwrap().push(std::thread::current().id());
-                    std::thread::sleep(SEAT_LOOKUP_WAIT * 2);
+                    // Past all three entry points' waits, one after another.
+                    std::thread::sleep(SEAT_LOOKUP_WAIT * 4);
                     Seat::Nobody("seat0 has no active session".into())
                 }
             })
@@ -8969,7 +9046,11 @@ mod seat_user_tests {
             assert!(waited < bound, "the startup sweep waited {waited:?}");
             assert_eq!(swept, (0, 0), "nothing swept");
 
-            assert_eq!(asked_on.lock().unwrap().len(), 3, "each asked once");
+            assert_eq!(
+                asked_on.lock().unwrap().len(),
+                1,
+                "one lookup, which all three waited on"
+            );
             assert!(
                 !home.downloads().exists(),
                 "nothing was made in root's own default folder"
@@ -9915,13 +9996,15 @@ mod seat_user_tests {
         const CANNOT_TELL: &str =
             "Could not tell who is signed in at this computer's screen. Try again.";
         let wait = std::time::Duration::from_millis(20);
-        let slow = seat_within(wait, || {
+        // #3796 — each through a lookup in flight of its own.
+        let flight = || OneInFlight::new("seat0-lookup");
+        let slow = seat_within(&flight(), wait, || {
             std::thread::sleep(std::time::Duration::from_millis(400));
             Seat::Root
         })
         .await;
         assert_eq!(slow, Seat::OutOfTime(wait), "a lookup past its time");
-        let broke = seat_within(std::time::Duration::from_secs(5), || -> Seat {
+        let broke = seat_within(&flight(), std::time::Duration::from_secs(5), || -> Seat {
             panic!("a seat0 lookup that fails")
         })
         .await;
@@ -9929,7 +10012,7 @@ mod seat_user_tests {
             matches!(broke, Seat::CannotTell(_)),
             "a lookup that failed: {broke:?}"
         );
-        let quick = seat_within(std::time::Duration::from_secs(5), || Seat::Root).await;
+        let quick = seat_within(&flight(), std::time::Duration::from_secs(5), || Seat::Root).await;
         assert_eq!(quick, Seat::Root);
 
         let not_asked =
@@ -10042,6 +10125,8 @@ mod seat_user_tests {
         let worker = std::thread::current().id();
         let wait = std::time::Duration::from_millis(100);
         let lookup_takes = std::time::Duration::from_secs(3);
+        // #3796 — each through a lookup in flight of its own.
+        let flight = || OneInFlight::new("seat0-lookup");
         for reading in [false, true] {
             let asked_on = std::sync::Arc::new(std::sync::Mutex::new(None));
             let slow = {
@@ -10053,7 +10138,7 @@ mod seat_user_tests {
                 }
             };
             let began = std::time::Instant::now();
-            let who = linux_fs_as_within(true, true, reading, wait, slow).await;
+            let who = linux_fs_as_within(true, true, reading, &flight(), wait, slow).await;
             let waited = began.elapsed();
             // The lookup's thread names itself as it starts.
             let asked_on = (0..500)
@@ -10078,9 +10163,10 @@ mod seat_user_tests {
         }
         // The controls: inside its wait the lookup's answer stands, and a
         // lookup that failed outright leaves a write the daemon's, alone.
-        let in_time = linux_fs_as_within(true, true, false, lookup_takes, || Seat::Root).await;
+        let in_time =
+            linux_fs_as_within(true, true, false, &flight(), lookup_takes, || Seat::Root).await;
         assert_eq!(in_time, FsAs::Daemon, "root at the screen, in time");
-        let failed = linux_fs_as_within(true, true, false, lookup_takes, || {
+        let failed = linux_fs_as_within(true, true, false, &flight(), lookup_takes, || {
             Seat::CannotTell("getpwnam_r(ana): the account database did not answer".into())
         })
         .await;
