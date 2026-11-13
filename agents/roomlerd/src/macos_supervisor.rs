@@ -522,21 +522,22 @@ pub fn stale_workers(ps: &str, commands: &[String], own_pid: u32) -> Vec<(u32, u
 /// #3802 — `not_theirs` is the person's folder when another account owns it
 /// ([`FolderNotTheirs`]). The worker writes its log and its config there, so
 /// that is the cause whatever the exit, and the reading names the folder and
-/// the one command that gives it back, never the log the worker could not
-/// write.
+/// the one command that gives it back (`move_aside`), never the log the
+/// worker could not write.
 pub fn gave_up_reason(
     last: Option<WorkerEnd>,
     one_row: bool,
     not_theirs: Option<&FolderNotTheirs>,
 ) -> String {
     if let Some(f) = not_theirs {
-        let path = f.path.display();
         return format!(
-            "the worker cannot write the person's folder {path}: uid {} owns it (mode {:o}), \
-             not the person, so the worker's own log is not there either. Move it aside as \
-             that person: mv '{path}' '{path}.made-by-root'. Then log out and back in, or \
-             restart this daemon: launchctl kickstart -k system/com.roomler.daemon",
-            f.owner, f.mode
+            "the worker cannot write the person's folder {}: uid {} owns it (mode {:o}), \
+             not the person, so the worker's own log is not there either. {}. Then log out \
+             and back in, or restart this daemon: launchctl kickstart -k system/com.roomler.daemon",
+            f.path.display(),
+            f.owner,
+            f.mode,
+            move_aside(f)
         );
     }
     match last {
@@ -559,6 +560,37 @@ pub fn gave_up_reason(
         }
     }
     .to_string()
+}
+
+/// #3802 — the one command that gives the person's folder back, run as that
+/// person with no `sudo`: move it aside, so their worker makes a new one of
+/// its own. When it holds copies `one-row --revert` reads there and nowhere
+/// else ([`FolderNotTheirs::kept`]), the new folder gets each one back. Every
+/// copy is read as the person before anything moves, so a copy they cannot
+/// read (one the conversion kept of a file of root's, mode 600) moves nothing,
+/// and the revert still finds it where it was.
+fn move_aside(f: &FolderNotTheirs) -> String {
+    let path = f.path.display();
+    if f.kept.is_empty() {
+        return format!("Move it aside as that person: mv '{path}' '{path}.made-by-root'");
+    }
+    let names: Vec<String> = f.kept.iter().map(|k| k.display().to_string()).collect();
+    let reads: String = names
+        .iter()
+        .map(|n| format!("test -r '{path}/{n}' && "))
+        .collect();
+    let copies: String = names
+        .iter()
+        .map(|n| format!("'{path}.made-by-root/{n}' "))
+        .collect();
+    format!(
+        "It holds {}, which `sudo roomlerd one-row --revert` reads there and nowhere else, \
+         so move it aside as that person and copy {} into the new folder: \
+         {reads}mv '{path}' '{path}.made-by-root' && mkdir '{path}' && cp {copies}'{path}/' \
+         (a test that fails moves nothing: that copy is not the person's to read)",
+        names.join(" and "),
+        if names.len() == 1 { "it" } else { "them" },
+    )
 }
 
 /// #3802 — the console person's folder (the one their worker writes its log
@@ -705,12 +737,23 @@ mod imp {
     /// config still resolves the same way: its session knobs are theirs.
     /// #3802 — the console person's folder, read with `lstat` (a link at the
     /// folder is read as the link, never followed), when another account owns
-    /// it. A read only: root changes nothing in a person's home.
+    /// it, and which of [`kept_for_revert`] it holds: an `lstat` of each of
+    /// those names, no walk. A read only: root changes nothing in a person's
+    /// home.
     fn person_folder_not_theirs(uid: u32) -> Option<FolderNotTheirs> {
         let home = crate::appdirs::account_home(uid)?;
         let path = crate::appdirs::macos_config_dir_in_home(&home, std::path::Path::exists);
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        folder_not_theirs(path, uid, meta.uid(), meta.mode(), Vec::new())
+        // A name whose read fails for any reason but "not there" counts as
+        // held: the command then reads it as the person before moving anything.
+        let kept = kept_for_revert()
+            .into_iter()
+            .filter(|name| match std::fs::symlink_metadata(path.join(name)) {
+                Ok(_) => true,
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            })
+            .collect();
+        folder_not_theirs(path, uid, meta.uid(), meta.mode(), kept)
     }
 
     fn spawn_worker(
