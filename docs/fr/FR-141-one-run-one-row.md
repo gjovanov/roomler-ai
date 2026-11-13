@@ -131,7 +131,7 @@ P0 decides its shape. What the code already gives: the root half's hardware id a
 (`orchestrator_unix.rs:832-862`). What it lacks on a Mac: any look at the root daemon before the enroll
 (`root_identity.rs:67-79`). The privileged half runs as root and can read the root's config as
 `root_config_says` does (`install.sh:985-989`), and the root daemon's `Status` already reports `gui_worker.one_row`
-(`crates/localapi/src/lib.rs:482`, `:515-527`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
+(`crates/localapi/src/lib.rs:482`, `:522-534`). So a one-row or supervised Mac is told apart, and the wizard enrolls no
 person's half on it and says why.
 
 ### 4. The terminal and the web dialog (P4)

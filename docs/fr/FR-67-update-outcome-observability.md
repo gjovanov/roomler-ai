@@ -123,11 +123,11 @@ flowchart LR
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:566`; `NodeStatus.last_install`, `:476` |
+| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:573`; `NodeStatus.last_install`, `:476` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1450`), its pure half `summarize` (`:1469`) |
 | The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4256`) |
-| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:995`) |
-| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2958`), printed under `version` (`:2548`) |
+| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:1002`) |
+| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2966`), printed under `version` (`:2556`) |
 
 - ⚠️ **Read on every answer, never cached at startup.** On Windows the MSI
   starts the new service while the watcher is still waiting on msiexec, so

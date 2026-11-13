@@ -1341,7 +1341,7 @@ them. The worker says so once at its start: `logging: this console has no window
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:2345`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:2378`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
@@ -1440,20 +1440,20 @@ write, the console keeps them too. One line moved:
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
 and `basename` (`crates/agent-core/src/logging.rs:111`, `:117`), and the appender, the prune
-(`rolling_basenames`, `crates/agent-core/src/logging.rs:1060`) and the `--source` reader
-(`newest_service_log`, `crates/agent-core/src/logging.rs:987`) all read it, so netd's dated
+(`rolling_basenames`, `crates/agent-core/src/logging.rs:1058`) and the `--source` reader
+(`newest_service_log`, `crates/agent-core/src/logging.rs:992`) all read it, so netd's dated
 files age out too. Two transports do not return this log yet, and each needs a wire change:
 the RC data channel's `logs:fetch` reads only the serving process's own `roomlerd.log*`
 (`agents/roomlerd/src/logs_fetch.rs:52`), and an installer step starts no log upload (a
 follow-up of #3230).
 
-`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1782`) pins the folder and
+`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1780`) pins the folder and
 the names, the prune and the source. It runs a failing step in a child with stdout on `NUL`,
 as under msiexec, and finds its start line, all 20,000 of its lines, its answer and its whole
-error chain in the file (`crates/agent-core/src/logging.rs:1956`); run with a console, the same
-step shows what it always showed (`crates/agent-core/src/logging.rs:1986`). A daemon's `init`,
+error chain in the file (`crates/agent-core/src/logging.rs:1989`); run with a console, the same
+step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
-INFO, not TRACE (`crates/agent-core/src/logging.rs:2029`). The Windows lane runs the module
+INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1698`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7845`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7878`)
@@ -1919,7 +1919,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3203`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2458,13 +2458,13 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5069`).
+(`crates/localapi/src/lib.rs:5077`).
 
 The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3203`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
 read-only and refuses to set by name (`localapi::person_may`, `:3341`). Whether
 the console user should flip those from the app is the decision left open on
@@ -2845,10 +2845,12 @@ with `installed`, `needs` and `next_try_in_min`.
 ```
 
 A tray with no marker reads `version UNKNOWN (no version marker)` instead. Restarting the service
-retries at once. When the log shows the swap refused (`desktop companion refresh skipped`, with
+retries at once. The log the last line names is the service's own (`roomlerd-service.log`), where
+the refresh writes. When it shows the swap refused (`desktop companion refresh skipped`, with
 access denied or a file in use), allowing Roomler to replace `roomler-desktop.exe` in its install
-folder ends it. `ROOMLERD_COMPANION_SYNC=0` turns the retry off, the faster one with it. The
-mechanics:
+folder ends it. `ROOMLERD_COMPANION_SYNC=0` turns the retry off, the faster one with it, and the
+second line then reads `Roomler replaces it only at a start: its automatic retry is off
+(ROOMLERD_COMPANION_SYNC=0)`. The refresh at a start stays on. The mechanics:
 [`desktop-companion.md` §13.2](desktop-companion.md#132-a-tray-too-old-for-its-daemon-windows-3781).
 
 ## Verifying what you install
