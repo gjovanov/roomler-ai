@@ -123,7 +123,7 @@ say:
 The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:612`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
-a record older than that (`never_reported`, `:557`).
+a record older than that (`never_reported`, `:622`).
 
 > ⚠️ **Three states must stay apart, and they do by construction.** A daemon
 > that predates the field sends no `last_install` key, and the CLI prints
@@ -201,7 +201,7 @@ $ roomler status
   `.last_install`. The line sits right under `version` — the record and the
   binary it produced, together — and is printed only when the daemon reports
   the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2556`;
-  the sentence per word, `last_install_line`, `:2887`).
+  the sentence per word, `last_install_line`, `:2966`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
   called from `run_cmd`, `agents/roomlerd/src/app.rs:4256`). `journalctl -u

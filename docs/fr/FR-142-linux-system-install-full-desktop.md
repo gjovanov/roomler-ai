@@ -208,7 +208,7 @@ flowchart TB
 - **What the worker accepts from root**: open or close a source; input events; clipboard read and write; a layout
   token; a display mode. Only while root's guard is `Open` for the worker's session (inferred).
 - **Why that boundary**: a process running as the person can already call the person socket (`crates/localapi/src/lib.rs:3390`,
-  `:4440-4466`) and, as the same uid, can reach the worker's memory (inferred). So the worker is trusted as much as
+  `:4657-4683`) and, as the same uid, can reach the worker's memory (inferred). So the worker is trusted as much as
   the person's account and no more: what it says is the person's claim, and it can never decide anything root's
   gates own.
 

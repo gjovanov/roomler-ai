@@ -1128,7 +1128,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
-  administrator's command (`not_on_the_person_socket_for_key`, `:3487`).
+  administrator's command (`not_on_the_person_socket_for_key`, `:3536`).
 
 The recording verbs (P2e) are the second widening past the safety surface, and
 **Stop** is safety on its own: without `RecordStop` the host could not end a remote

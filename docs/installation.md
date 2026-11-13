@@ -2517,7 +2517,7 @@ socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
 (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3205`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
-read-only and refuses to set by name (`localapi::person_may`, `:3341`). Whether
+read-only and refuses to set by name (`localapi::person_may`, `:3390`). Whether
 the console user should flip those from the app is the decision left open on
 #2871; until it is taken, they stay with `sudo`.
 
