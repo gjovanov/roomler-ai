@@ -123,6 +123,25 @@ async fn list_in_row(app: &TestApp, seeded: &SeededTenant, user: &SeededUser, ro
         .unwrap();
 }
 
+/// Make the stored policy `policy_id` name `role_id` as its one subject,
+/// directly in its row, so the test controls which role a stored rule names.
+/// The forward reads policies on every request, so the next one sees it.
+async fn name_role_in_policy(app: &TestApp, policy_id: &str, role_id: &str) {
+    let updated = app
+        .db
+        .collection::<bson::Document>(roomler_ai_remote_control::models::TunnelPolicy::COLLECTION)
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(policy_id).unwrap() },
+            doc! { "$set": { "subjects": [{
+                "kind": "role_id",
+                "id": ObjectId::parse_str(role_id).unwrap(),
+            }] } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.matched_count, 1, "the stored policy {policy_id}");
+}
+
 /// A grant of `127.0.0.1:port` on every device of the org to `subjects`.
 fn grant(name: &str, subjects: Value, port: u16) -> Value {
     json!({
@@ -451,12 +470,16 @@ async fn a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here()
     set_role(&app, &here, &ours, &holder.id, true).await;
     set_role(&app, &here, &doomed, &holder.id, true).await;
 
-    owner_creates(
+    // A policy write takes only this org's roles, so a rule naming another
+    // org's role is a stored one: written here naming one of ours, then made
+    // to name theirs in the row. It keeps loading and never matches.
+    let foreign_rule = owner_creates(
         &app,
         &here,
-        grant("another org's role", role_subject(&theirs), 9001),
+        grant("another org's role", role_subject(&ours), 9001),
     )
     .await;
+    name_role_in_policy(&app, &foreign_rule, &theirs).await;
     owner_creates(&app, &here, grant("our role", role_subject(&ours), 9002)).await;
     owner_creates(
         &app,

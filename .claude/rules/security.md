@@ -42,6 +42,15 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   stays any member's: every node receives it anyway. ⚠️ The forward reads no bit, and
   must not: the policy IS the grant, made for people who hold none
   (security-baseline.md §3).
+- **A member's roles are the org's own, read where a rule is evaluated.** Only the
+  ids of a membership row that are `roles` rows of THAT org count: read them through
+  `TenantDao::get_member_permissions` (the bits), `member_live_role_ids` (one member)
+  or the overlay's `CompileRoles` (a compile), never a row's raw `role_ids`. Every
+  write accepts only the org's roles, `ADMINISTRATOR` included: member rows 404,
+  policies 400 (`guards::require_org_roles`, which accepts back the ids a policy
+  already stores). ⚠️ A failed read is an empty role set, never an allow. ⚠️ Never
+  prune a stored role id from a policy: an empty role allow-list is unrestricted
+  (permissions.md §1).
 - **A removed thing answers nothing** (#3327). `BaseDao::find_by_id_in_tenant`
   answers live rows only, and a soft delete matches a live row only. The
   tombstone-inclusive `find_any_by_id_in_tenant` is a `disallowed-methods` entry in

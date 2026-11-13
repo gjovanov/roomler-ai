@@ -750,22 +750,16 @@ async fn auto_accept_invite(
         ));
     }
 
-    // Determine roles
-    let role_ids = if invite.assign_role_ids.is_empty() {
-        let member_role = state
-            .tenants
-            .get_role_by_name(invite.tenant_id, "member")
-            .await?;
-        vec![member_role.id.unwrap()]
-    } else {
-        invite.assign_role_ids.clone()
-    };
+    // The invite's roles that its org still has (the same rule as the accept
+    // route, through the same helper).
+    let role_ids = super::invite::redeemed_role_ids(state, &invite).await?;
 
     // Add the user to the tenant
     state
         .tenants
         .add_member(invite.tenant_id, user_id, role_ids, Some(invite.inviter_id))
         .await?;
+    state.hooks.org_roles_changed(invite.tenant_id).await;
 
     // Increment use count
     state

@@ -25,6 +25,7 @@ flowchart TB
         MEMB["Tenant membership"]
         OBJ["Object-level scoping — resolve WITHIN the tenant"]
         PERM["Permission bits + managed-role reconcile"]
+        ROLES["A member's roles — the org's own, read where a rule is evaluated"]
     end
     subgraph plane["Data-plane guards"]
         AGENT["Agent token → row status-checked on every use"]
@@ -299,13 +300,56 @@ all**, so anyone could join any private room in any org and receive its WS
 fan-out. `room::update`/`delete` now require `MANAGE_CHANNELS` (they were
 member-only, so any guest could archive or cascade-delete a channel).
 
+### A member's roles are the org's own, read where a rule is evaluated
+
+A role is a group of people inside one org, and an id in a membership row only
+points at it. **Every gate counts the ids of a member's row that are `roles` rows
+of the org it decides for, read at that decision**, and nothing else. The
+permission mask (`TenantDao::get_member_permissions`) and every rule that names a
+role (the tunnel forward, the overlay ACL, a device's remote-control, SSH and exec
+allow-lists) read through one filter, `TenantDao::org_roles_among`
+(`crates/services/src/dao/tenant.rs:660`). Each reader, each writer and the delete
+are in [permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used).
+
+- **Scoped to the org like any id.** A role of another org never satisfies a rule
+  here and never grants a bit here, whatever a membership row lists.
+- **Read where it is used.** Nothing caches a member's roles at an enrollment, a
+  socket's connect or a session's start. A role taken back or deleted stops
+  counting at the next decision, and a change of roles re-fans the org's overlay
+  while its ACL is `warn` or `enforce`.
+- **Written only from the org, for every caller.** `ADMINISTRATOR` passes the
+  permission-bit check of a grant, never the lookup. Assigning a role, adding a
+  member and creating an invite resolve each role in the org (404 otherwise); a
+  policy write that adds a role id the org does not have is a 400
+  `Unknown role id`; an invite gives at redemption only the roles its org still has.
+- **Deleting a role takes it from its holders**: the role row goes, then its id is
+  pulled from the org's membership rows (`RoleDao::delete`,
+  `crates/services/src/dao/role.rs:114`).
+- ⚠️ **The read-time filter stays, with the writes checked too.** It is the half no
+  write path can get around, and a membership row can still list an id the org no
+  longer has (a pull that failed, an assign that raced a delete). Such an id is
+  inert, so correctness needs no migration.
+- ⚠️ **Default-deny.** A failed read, a non-member and a missing role all give an
+  empty role set: role entries do not match, the failure is logged at WARN, and
+  every other subject kind is decided as before. A failed read never becomes an
+  allow.
+- ⚠️ **An empty role set is not an empty allow-list.** On a device's policies an
+  allow-list with no entries means no restriction by role. So a stored role id is
+  never pruned, on a write or on a role's delete: removing the last one would turn
+  "nobody by role" into "everybody". A policy write accepts back the ids it already
+  stores, because the editors send them on every save.
+
+`crates/tests/src/member_role_ids_tests.rs` pins each reader, each writer and the
+delete, with a positive control that every member keeps the permissions their roles
+give.
+
 ### A tunnel policy is a grant: `MANAGE_AGENTS`, reads included
 
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
 (`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:800`; the
-overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:139`).
+overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:150`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
 

@@ -935,9 +935,21 @@ fn validate_policy_input(
     Ok(())
 }
 
+/// The role ids a policy's `RoleId` subjects name.
+fn subject_role_ids(subjects: &[PolicySubject]) -> Vec<ObjectId> {
+    subjects
+        .iter()
+        .filter_map(|s| match s {
+            PolicySubject::RoleId { role_id } => Some(*role_id),
+            _ => None,
+        })
+        .collect()
+}
+
 /// POST /api/tenant/{tenant_id}/tunnel-policy — create a new policy.
 /// `MANAGE_AGENTS`, decided before the body is validated
-/// ([`tunnel_policy_manager`]).
+/// ([`tunnel_policy_manager`]). A role subject names a role of this org, or
+/// the body is a 400 (`require_org_roles`).
 pub async fn create_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -946,6 +958,8 @@ pub async fn create_tunnel_policy(
 ) -> Result<(StatusCode, Json<TunnelPolicyResponse>), ApiError> {
     let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     validate_policy_input(&body.name, &body.subjects, &body.targets, &body.allowlist)?;
+    roomler_core::guards::require_org_roles(&state, tid, &subject_role_ids(&body.subjects), &[])
+        .await?;
 
     let policy = state
         .tunnel_policies
@@ -1021,7 +1035,18 @@ pub async fn update_tunnel_policy(
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     // Resolve the target LIVE before touching it — a removed policy is a 404
     // whatever the body says, like a bogus or foreign id.
-    state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
+    let stored = state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
+    // A role subject names a role of this org; one the stored policy already
+    // names is accepted back (`require_org_roles`).
+    if let Some(s) = &body.subjects {
+        roomler_core::guards::require_org_roles(
+            &state,
+            tid,
+            &subject_role_ids(s),
+            &subject_role_ids(&stored.subjects),
+        )
+        .await?;
+    }
     // Validate only the fields that ARE being updated.
     if let Some(n) = &body.name
         && n.trim().is_empty()

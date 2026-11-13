@@ -369,18 +369,18 @@ pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
 /// FR-138 P2b (A1) — whether a delegable message about a session is served by
 /// the daemon instead of crossing: a session the daemon's own table holds,
 /// attached or kept, is the daemon's, and a worker that attached since must not
-/// be handed its `Terminate` or `Ice`. Only with the switch on: off, the gate
-/// is byte for byte what it was.
-pub(crate) fn served_by_daemon(switch_on: bool, daemon_holds: bool) -> bool {
-    switch_on && daemon_holds
+/// be handed its `Terminate` or `Ice`. Only while the table is `keeping`
+/// (P4-0): otherwise, the switch on alone included, the gate is what it was.
+pub(crate) fn served_by_daemon(keeping: bool, daemon_holds: bool) -> bool {
+    keeping && daemon_holds
 }
 
-/// FR-138 P2b (A2) — whether a delegated session's params say `keepable`: the
-/// device's switch on this connection, an attached worker that said
-/// [`KEEP_DELEGATED`], and not an external session, which is never kept
-/// (FR-138 D3). Anything else is served as today.
-pub(crate) fn session_keepable(switch_on: bool, worker_keeps: bool, external: bool) -> bool {
-    switch_on && worker_keeps && !external
+/// FR-138 P2b (A2) — whether a delegated session's params say `keepable`: a
+/// window open on this connection (P4-0: the switch alone is not enough), an
+/// attached worker that said [`KEEP_DELEGATED`], and not an external session,
+/// never kept (FR-138 D3). Anything else is served as today.
+pub(crate) fn session_keepable(window_open: bool, worker_keeps: bool, external: bool) -> bool {
+    window_open && worker_keeps && !external
 }
 
 /// FR-138 P2b (A1) — the session a delegable server message is about.
@@ -2889,8 +2889,8 @@ mod tests {
 
     /// FR-138 P2b (R12, A2) — a delegated session is said `keepable` only to a
     /// worker that said `keep-delegated` (by equality: a near miss is not the
-    /// word), only with the switch on, and never for an external session; and
-    /// this build's worker says the word.
+    /// word), only with a window open (P4-0), and never for an external
+    /// session; and this build's worker says the word.
     #[tokio::test]
     async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
         assert_eq!(
@@ -2900,9 +2900,9 @@ mod tests {
         );
         assert!(
             session_keepable(true, true, false),
-            "switch on, a P2b worker"
+            "a window open, a P2b worker"
         );
-        assert!(!session_keepable(false, true, false), "switch off");
+        assert!(!session_keepable(false, true, false), "no window open");
         assert!(
             !session_keepable(true, false, false),
             "an older worker, or none"
@@ -3377,10 +3377,10 @@ mod routing_tests {
         assert!(!k.is_empty() && k != "?", "got {k}");
     }
 
-    /// FR-138 P2b (R2, A1) — with the switch on, a delegable message about a
-    /// session the daemon's own table holds is the daemon's, and never crosses
-    /// to a worker that attached since: its `Terminate` or `Ice` would go to a
-    /// process that never held the peer.
+    /// FR-138 P2b (R2, A1) — while the daemon's table keeps (P4-0), a delegable
+    /// message about a session the daemon's own table holds is the daemon's,
+    /// and never crosses to a worker that attached since: its `Terminate` or
+    /// `Ice` would go to a process that never held the peer.
     #[test]
     fn p2b_a_session_the_daemon_holds_is_served_there_with_the_switch_on() {
         assert!(
@@ -3395,7 +3395,7 @@ mod routing_tests {
 
     /// FR-138 P2b (a6's amendment) — with the switch off the gate is today's: a
     /// `Terminate` for a session the daemon holds still crosses, as on master.
-    /// A guard, so it passes before the implementation and after it.
+    /// A guard, so it passes before the implementation and after it (P4-0 too).
     #[test]
     fn p2b_with_the_switch_off_the_gate_is_todays() {
         assert!(!served_by_daemon(false, true), "off, it still crosses");

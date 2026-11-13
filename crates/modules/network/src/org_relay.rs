@@ -59,8 +59,8 @@ use tunnel_core::policy::{OverlayPeerRef, OverlaySource, evaluate_overlay};
 
 use crate::NetworkState;
 use crate::overlay::{
-    NodeIdentity, PolicyLoad, current_node, pair_key, send_to_node, send_to_node_ref, try_load_acl,
-    try_overlay_source_of,
+    CompileRoles, NodeIdentity, PolicyLoad, current_node, pair_key, send_to_node, send_to_node_ref,
+    try_load_acl, try_overlay_source_of,
 };
 use roomler_core::net::is_global_unicast;
 
@@ -407,14 +407,17 @@ async fn plan_mint(
             warn!(%tenant_id, %e, "org-relay: policies unreadable; refusing");
             D::PolicyUnreadable
         })?;
-    let req_src = try_overlay_source_of(state, requester).await.map_err(|e| {
+    let roles = CompileRoles::new(tenant_id);
+    let req_src = try_overlay_source_of(state, requester, &roles).await.map_err(|e| {
         warn!(%tenant_id, node = %req_id, %e, "org-relay: requester identity unreadable; refusing");
         D::PolicyUnreadable
     })?;
-    let peer_src = try_overlay_source_of(state, peer).await.map_err(|e| {
-        warn!(%tenant_id, node = %peer_id, %e, "org-relay: peer identity unreadable; refusing");
-        D::PolicyUnreadable
-    })?;
+    let peer_src = try_overlay_source_of(state, peer, &roles)
+        .await
+        .map_err(|e| {
+            warn!(%tenant_id, node = %peer_id, %e, "org-relay: peer identity unreadable; refusing");
+            D::PolicyUnreadable
+        })?;
     let approved = state
         .fleet
         .agents
@@ -822,6 +825,7 @@ pub async fn reconcile_acl(state: &NetworkState, tenant_id: ObjectId) {
             return;
         }
     };
+    let roles = CompileRoles::new(tenant_id);
     let live: Vec<OrgRelaySession> = state
         .org_relay
         .sessions
@@ -846,7 +850,7 @@ pub async fn reconcile_acl(state: &NetworkState, tenant_id: ObjectId) {
                 granted = false;
                 break;
             };
-            let src: OverlaySource = match try_overlay_source_of(state, &node).await {
+            let src: OverlaySource = match try_overlay_source_of(state, &node, &roles).await {
                 Ok(src) => src,
                 Err(_) => continue, // unreadable identity: not evidence of revocation
             };

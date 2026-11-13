@@ -223,7 +223,7 @@ Four requirements, all in P0:
    `rc:overlay.relay_session` message keyed by node id. ⚠️ `RelayStrategyWire` derives
    **`Copy`** (`:1985`); a `session` payload would break that derive and ripple through
    `netmap.rs:92`, `relay_link.rs:1148-1151` and three by-value returns at
-   `overlay.rs:1931/1952/2030` — and would also change the JSON from a string tag to a map.
+   `overlay.rs:1934/1952/2030` — and would also change the JSON from a string tag to a map.
 4. A test decoding `"org-relay"` against a **pre-FR-19 `NetmapPeer` shape**.
 
 ---
@@ -369,8 +369,8 @@ Verdict machinery to extend, verified against master:
 | what | anchor |
 |---|---|
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
-| …delegating to the pure decision | `overlay.rs:2020` `relay_verdict_core` |
-| Measured caps supersede presence | `overlay.rs:1969-1978` (in `verdict_from_nodes`, `:1948`) |
+| …delegating to the pure decision | `overlay.rs:2024` `relay_verdict_core` |
+| Measured caps supersede presence | `overlay.rs:1972-1981` (in `verdict_from_nodes`, `:1951`) |
 | Wire verdict enum | `crates/remote_control/src/signaling.rs:3457` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1125` `relay_strategy` |
 
@@ -423,13 +423,13 @@ the first:
 
 ⚠️ **"Fail closed" is not implementable through the API the first draft prescribed.**
 `load_acl` returns `AclCtx` — **not** `Result` — and its error path returns `AclCtx::off()`,
-logging *"failing OPEN"* (`overlay.rs:1846-1849`, `:1862`). That is byte-identical to a
+logging *"failing OPEN"* (`overlay.rs:1848-1851`, `:1864`). That is byte-identical to a
 tenant that genuinely has ACLs disabled, so a caller shaped like the existing precedent
 (`overlay.rs:726-750`) takes the "no ACL configured" branch on a Mongo blip and **grants**,
 while its author believes it fails closed. Required: a `try_load_acl(…) -> Result<AclCtx, _>`
 for the new gate, with the two existing callers keeping their posture via an explicit
 `.unwrap_or_else(|_| AclCtx::off())` — which also turns their fail-open into a visible
-decision. Same for `overlay_source_of` (`overlay.rs:1869`), which swallows both errors
+decision. Same for `overlay_source_of` (`overlay.rs:1871`), which swallows both errors
 (`.ok()` → `owner_user_id: None`; `unwrap_or_default()` → empty roles), silently failing to
 match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_every_silent_drop`.
 
@@ -470,7 +470,7 @@ The bullets below describe the design *once #888 lands*:
 **Rate limiting.** ⚠️ `handle_overlay_relay_request` has **none** — `crates/api/src/ws/overlay.rs`
 contains zero `RateLimiter` references. Both precedents this FR claims equivalence with do
 enforce one, deliberately after the identity gates so refusals are attributable:
-`agent_exec.rs:322` (30/min) and `agent_ssh.rs:541` (20/min). `CLAUDE.md` records why:
+`agent_exec.rs:332` (30/min) and `agent_ssh.rs:551` (20/min). `CLAUDE.md` records why:
 *"The HTTP `tower_governor` is per-IP and never saw the device-originated
 `rc:rpc.request` / `rc:ssh.request` WS legs, so those had no ceiling at all."* A mint is
 another device-originated WS leg and is **more** expensive, because it writes state onto a
@@ -709,7 +709,7 @@ device has N per-tenant rows with independently-set names; resolving from any ot
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.
 It does: the name is the one this network's netmap gives the relay node
 (`crates/tunnel-core/src/overlay/runtime.rs:3062`, `:4240`), and the netmap takes it from that
-network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:2867-2871`). A
+network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:2925-2929`). A
 relay node missing from the map shows as its node id in hex.
 
 ### 9. Where the code goes — implementation map
@@ -724,7 +724,7 @@ Verified against `origin/master`, 2026-08-28.
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
-| Netmap shaping | `overlay.rs:2058` `shape_peer` |
+| Netmap shaping | `overlay.rs:2062` `shape_peer` |
 | Wire model | `crates/remote_control/src/signaling.rs:3477` `NetmapPeer`; `:3455` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:315` `sweep_carrier_health` |
