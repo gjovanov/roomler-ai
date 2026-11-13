@@ -26,8 +26,9 @@
 //! each renaming the other's fresh copy under a live companion. A per-user
 //! task daemon owns `%LOCALAPPDATA%\Programs\Roomler` and refreshes itself.
 //! Running companions are found by the path they were started from and
-//! stopped by pid before the swap (`win_service::companion_procs`), never by
-//! image name. Failures are always skip-and-retry-next-start, never fatal.
+//! stopped by pid (`win_service::companion_procs`), never by image name, and
+//! only once the new EXE is in place (#3824): a swap that fails leaves the
+//! running tray running. Failures are always skip-and-retry, never fatal.
 
 // FR-27: unconditional now — `ensure_running` has a real body on every
 // platform, where before this module was Windows-only.
@@ -78,11 +79,15 @@ pub(crate) fn sync_enabled() -> bool {
 ///
 /// #3781 — sooner while the companion is too old to connect to this daemon
 /// ([`RefreshSchedule`]), and one log line per wait while it is.
+///
+/// #3824 — sooner too while a tray this process's refresh stopped is not
+/// running again ([`TrayLost`]): each refresh tries to start it.
 #[cfg(target_os = "windows")]
 pub async fn refresh_periodically(respawn: RespawnContext) {
     retry_refresh(
         sync_enabled,
         sibling_marker,
+        || TRAY_LOST.is_set(),
         || refresh_if_stale(respawn),
         |next| {
             tracing::warn!(
@@ -115,6 +120,12 @@ const FAST_REFRESH_WAITS: [std::time::Duration; 6] = [
     minutes(15),
     minutes(15),
 ];
+
+/// #3824 — the waits while a tray this process's refresh stopped is not
+/// running again ([`TrayLost`]): 1, 5 and 15 minutes, or the schedule's own
+/// wait when that is shorter; after them, the schedule. Each refresh tries to
+/// start the tray, so a lost tray is tried again within a minute.
+const LOST_TRAY_WAITS: [std::time::Duration; 3] = [minutes(1), minutes(5), minutes(15)];
 
 const fn minutes(n: u64) -> std::time::Duration {
     std::time::Duration::from_secs(n * 60)
@@ -154,10 +165,12 @@ fn marker_version(marker: Option<&str>) -> Option<String> {
 }
 
 /// #3781 — the retry loop's memory: how many refreshes it has made in a row
-/// while the companion read too old to connect.
+/// while the companion read too old to connect, and (#3824) while a tray
+/// this process stopped was not running again.
 #[derive(Debug, Default)]
 pub(crate) struct RefreshSchedule {
     tries: u32,
+    lost_tries: u32,
 }
 
 /// #3781 — one wait of the retry loop, as [`RefreshSchedule::next`] plans it.
@@ -174,15 +187,24 @@ pub(crate) struct NextRefresh {
 }
 
 impl RefreshSchedule {
-    /// The next wait, from the version marker as it reads now. Called once
-    /// per wait, so the loop logs at most one line per wait. A marker that
-    /// reads current starts the fast waits over for the next time one reads
-    /// too old.
-    pub(crate) fn next(&mut self, marker: Option<&str>) -> NextRefresh {
+    /// The next wait, from the version marker as it reads now and whether a
+    /// tray this process stopped is still not running (`tray_lost`). Called
+    /// once per wait, so the loop logs at most one line per wait. A marker
+    /// that reads current starts the fast waits over for the next time one
+    /// reads too old.
+    pub(crate) fn next(&mut self, marker: Option<&str>, tray_lost: bool) -> NextRefresh {
         let too_old = predates_min_companion(marker);
-        let wait = next_refresh_wait(marker, self.tries);
+        let mut wait = next_refresh_wait(marker, self.tries);
+        if tray_lost && let Some(&sooner) = LOST_TRAY_WAITS.get(self.lost_tries as usize) {
+            wait = wait.min(sooner);
+        }
         self.tries = if too_old {
             self.tries.saturating_add(1)
+        } else {
+            0
+        };
+        self.lost_tries = if tray_lost {
+            self.lost_tries.saturating_add(1)
         } else {
             0
         };
@@ -213,15 +235,20 @@ pub(crate) fn next_refresh_wait(marker: Option<&str>, tries: u32) -> std::time::
 /// tokio's paused clock. One [`RefreshSchedule::next`] per wait, so one line
 /// per wait while the companion is too old to connect, and never one per
 /// tick: there is none.
+///
+/// #3824 — `lost` says whether a tray this process's refresh stopped is still
+/// not running ([`TrayLost`]); the refresh itself tries to start it.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) async fn retry_refresh<E, M, R, F, L>(
+pub(crate) async fn retry_refresh<E, M, K, R, F, L>(
     mut enabled: E,
     mut marker: M,
+    mut lost: K,
     mut refresh: R,
     mut log: L,
 ) where
     E: FnMut() -> bool,
     M: FnMut() -> Option<String>,
+    K: FnMut() -> bool,
     R: FnMut() -> F,
     F: std::future::Future<Output = ()>,
     L: FnMut(&NextRefresh),
@@ -229,10 +256,10 @@ pub(crate) async fn retry_refresh<E, M, R, F, L>(
     let mut schedule = RefreshSchedule::default();
     loop {
         // `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster
-        // one with it: the old period, no refresh, and no line saying one is
-        // coming.
+        // ones with it (#3824's for a lost tray too): the old period, no
+        // refresh, and no line saying one is coming.
         let next = if enabled() {
-            schedule.next(marker().as_deref())
+            schedule.next(marker().as_deref(), lost())
         } else {
             schedule = RefreshSchedule::default();
             NextRefresh {
@@ -993,8 +1020,18 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     // launched INTO the interactive session, which is exactly what the
     // update-respawn path already does.
     let ctx = respawn_context_for_self();
-    respawn_desktop(ctx, &dest);
-    Ok(EnsureOutcome::Started)
+    started_outcome(start_desktop(ctx, &dest, &[]))
+}
+
+/// #3824 — the consent path's verdict on a start: `Started` only when the
+/// process was created. A failed start, or nobody signed in to start it for,
+/// is an error that [`ensure_running`] logs, and the prompt has no surface.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn started_outcome(start: TrayStart) -> Result<EnsureOutcome> {
+    match start {
+        TrayStart::Started { .. } => Ok(EnsureOutcome::Started),
+        not_started => Err(anyhow::anyhow!("{}", not_started.describe())),
+    }
 }
 
 /// Which spawn shape this process needs. Mirrors the probe `app.rs` does for
@@ -1747,10 +1784,24 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
 
 /// Entry point — spawn-and-forget from daemon startup. Never fails the
 /// caller; every error path logs and returns (retry on next start).
+///
+/// #3824 — then, in every pass that stopped no tray (nothing to swap, a swap
+/// with none running, one that gave up before any stop, a failed download),
+/// a tray an earlier pass stopped and could not start again is started
+/// ([`restore_lost_tray`]).
 pub async fn refresh_if_stale(respawn: RespawnContext) {
     #[cfg(target_os = "windows")]
-    if let Err(e) = refresh_inner(respawn).await {
-        tracing::warn!(error = %format!("{e:#}"), "desktop companion refresh skipped");
+    {
+        let pass = refresh_inner(respawn).await;
+        let stopped_a_tray = matches!(&pass, Ok(Some(swapped)) if swapped.stopped_a_tray());
+        match pass {
+            Ok(Some(swapped)) => log_refresh(&swapped),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "desktop companion refresh skipped")
+            }
+        }
+        bring_back_lost_tray(respawn, stopped_a_tray).await;
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1769,8 +1820,10 @@ pub async fn refresh_if_stale(respawn: RespawnContext) {
     }
 }
 
+/// One refresh: `Ok(None)` when there is nothing to swap, the swap's outcome
+/// when it ran, an error when it could not start (the release, the download).
 #[cfg(target_os = "windows")]
-async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
+async fn refresh_inner(respawn: RespawnContext) -> Result<Option<SwapOutcome>> {
     let own_version = env!("CARGO_PKG_VERSION");
     let exe_dir = std::env::current_exe()
         .context("locating own exe")?
@@ -1786,7 +1839,7 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
         .ok()
         .map(|s| s.trim().to_string());
     if dest.exists() && recorded.as_deref() == Some(own_version) {
-        return Ok(());
+        return Ok(None);
     }
     tracing::info!(
         own = own_version,
@@ -1811,102 +1864,197 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
         .await
         .with_context(|| format!("downloading {}", asset.name))?;
 
-    // #1686 — the swap, in the order `swap` pins (see there), on the blocking
-    // pool: it stops processes and waits for them.
+    // #1686, #3824 — the swap, in the order `swap` pins (see there), on the
+    // blocking pool: it stops processes and waits for them.
     let outcome = tokio::task::spawn_blocking(move || {
         let mut ops = FsSwap {
             new: exe_dir.join(NEW_SUFFIX),
             old: exe_dir.join(OLD_SUFFIX),
+            aside: None,
             staged,
             dest,
             marker,
             version: own_version,
             respawn,
         };
-        swap(&mut ops)
+        swap(&mut ops, &TRAY_LOST)
     })
     .await
     .context("the companion swap task")?;
-    match outcome {
-        SwapOutcome::Swapped { respawned, stopped } => {
-            tracing::info!(
-                version = own_version,
-                respawned,
-                ?stopped,
-                "desktop companion refreshed"
-            );
-            Ok(())
+    Ok(Some(outcome))
+}
+
+/// #3824 — the refresh's line for a swap, as [`refresh_line`] renders it.
+/// The prefixes are the ones the lab kits grep.
+#[cfg(target_os = "windows")]
+fn log_refresh(outcome: &SwapOutcome) {
+    let version = env!("CARGO_PKG_VERSION");
+    let stopped = outcome.stopped();
+    match refresh_line(outcome) {
+        RefreshLine::Refreshed { tray } => {
+            tracing::info!(version, ?stopped, tray = %tray, "desktop companion refreshed")
         }
-        SwapOutcome::Aborted {
-            reason,
-            respawned_old,
-        } => {
-            anyhow::bail!(
-                "{reason} (the old companion is untouched; respawned it: {respawned_old})"
-            )
+        RefreshLine::TrayNotBack { error } => tracing::warn!(
+            version,
+            ?stopped,
+            error = %error,
+            "desktop companion refreshed, but the tray could not be started again"
+        ),
+        RefreshLine::Skipped { error } => {
+            tracing::warn!(error = %error, "desktop companion refresh skipped")
         }
     }
 }
 
-/// #1686 — what the companion swap does to the disk and to running processes,
-/// behind a seam so `swap`'s ORDER is tested on every platform.
+/// #3824 — after a pass that stopped no tray, start one an earlier pass lost
+/// ([`restore_lost_tray`]). One read of a flag when none was lost.
+#[cfg(target_os = "windows")]
+async fn bring_back_lost_tray(respawn: RespawnContext, pass_stopped_a_tray: bool) {
+    if !TRAY_LOST.is_set() {
+        return;
+    }
+    let Some(dest) = sibling_desktop() else {
+        return;
+    };
+    // A registry read, a process list and a start: the blocking pool.
+    let line = tokio::task::spawn_blocking(move || {
+        restore_lost_tray(pass_stopped_a_tray, &TRAY_LOST, || {
+            start_lost_tray(respawn, &dest)
+        })
+    })
+    .await;
+    const STILL_DOWN: &str =
+        "desktop companion is still not running after a refresh stopped it; it is tried again";
+    match line {
+        Ok(Some(LostTrayLine::Back { how })) => tracing::info!(
+            how = %how,
+            "desktop companion is back after a refresh stopped it"
+        ),
+        Ok(Some(LostTrayLine::StillDown { why, first: true })) => {
+            tracing::warn!(why = %why, "{STILL_DOWN}")
+        }
+        Ok(Some(LostTrayLine::StillDown { why, first: false })) => {
+            tracing::debug!(why = %why, "{STILL_DOWN}")
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "desktop companion: the lost tray's start did not run")
+        }
+    }
+}
+
+/// #1686, #3824 — what the tray swap does to the disk and to running
+/// processes, behind a seam so `swap`'s ORDER is tested on every platform.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) trait SwapOps {
-    /// Copy the new EXE in BESIDE the old one (`…exe.new`); the old one and
-    /// every running companion are still untouched.
+    /// Copy the new EXE in BESIDE the installed one (`…exe.new`); the
+    /// installed one and every running tray are untouched.
     fn stage(&mut self) -> Result<()>;
-    /// Running companions (pids) started from the installed path.
+    /// Installed EXE → `…exe.old`, or the first free `…exe.old.<n>` when a
+    /// copy an earlier swap left there cannot be removed.
+    fn rename_old_aside(&mut self) -> Result<()>;
+    /// `…exe.new` → installed EXE (same directory: an atomic rename).
+    fn promote_new(&mut self) -> Result<()>;
+    /// The EXE moved aside → installed EXE (rollback), over the new one when
+    /// that is in place.
+    fn restore_old(&mut self) -> Result<()>;
+    /// Remove `…exe.new`.
+    fn discard_new(&mut self);
+    /// Running trays (pids) started from the installed path, whatever their
+    /// file has been renamed to since.
     fn running(&mut self) -> Vec<u32>;
     /// Stop those pids — each re-verified on the handle that kills it — and
     /// return the ones confirmed exited.
     fn stop(&mut self, pids: &[u32]) -> Vec<u32>;
-    /// Installed EXE → `…exe.old`.
-    fn rename_old_aside(&mut self) -> Result<()>;
-    /// `…exe.new` → installed EXE (same directory: an atomic rename).
-    fn promote_new(&mut self) -> Result<()>;
-    /// `…exe.old` → installed EXE (rollback).
-    fn restore_old(&mut self);
-    /// Remove `…exe.new`.
-    fn discard_new(&mut self);
     fn write_marker(&mut self);
-    /// Start the companion at the installed path (whichever EXE is there).
-    fn respawn(&mut self);
-    /// Remove `…exe.old`, best-effort.
+    /// Start the tray at the installed path (whichever EXE is there), as the
+    /// refresh always has: no arguments.
+    fn start(&mut self) -> TrayStart;
+    /// Remove the copies moved aside, best-effort: this swap's, and any an
+    /// earlier swap left.
     fn remove_old(&mut self);
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SwapOutcome {
+    /// The new EXE is installed, and the marker names it.
     Swapped {
-        respawned: bool,
+        /// The trays this swap stopped: every one that ran.
         stopped: Vec<u32>,
+        /// Their start; `None` when none was stopped.
+        start: Option<TrayStart>,
     },
-    /// Nothing changed on disk. `respawned_old` = companions this swap had
-    /// already stopped were started again, from the old EXE.
+    /// The marker is as it was, and so is the installed EXE unless `reason`
+    /// says putting it back failed.
     Aborted {
         reason: String,
-        respawned_old: bool,
+        /// The trays it stopped before it gave up.
+        stopped: Vec<u32>,
+        /// Their start; `None` when none was stopped.
+        start: Option<TrayStart>,
     },
 }
 
-/// #1686 — the companion swap in the only order that can never leave a
-/// companion dead, or a live image renamed:
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl SwapOutcome {
+    /// The trays the swap stopped.
+    pub(crate) fn stopped(&self) -> &[u32] {
+        match self {
+            Self::Swapped { stopped, .. } | Self::Aborted { stopped, .. } => stopped,
+        }
+    }
+
+    /// Did the swap stop a tray? Its own start then decided whether the tray
+    /// is lost ([`TrayLost`]).
+    pub(crate) fn stopped_a_tray(&self) -> bool {
+        !self.stopped().is_empty()
+    }
+}
+
+/// #1686, #3824 — the tray swap, in the order that never stops a tray before
+/// the new EXE is in place:
 ///
-/// 1. stage the new copy beside the old one — a failure here touches nothing;
-/// 2. stop every running companion (verified per handle);
-/// 3. if ANY could not be stopped, abort: renaming a live image aside is how
-///    #1686 started, and a survivor would keep the single-instance lock anyway;
-/// 4. only now rename old → `.old` and new → installed;
-/// 5. respawn if something was running — the NEW one on success, the OLD one
-///    on every abort after step 2 (a person's tray is never left gone).
+/// 1. stage the new copy beside the installed one;
+/// 2. rename the installed EXE aside while a tray runs from it: NTFS renames a
+///    running image (`win_service::companion_procs`' test measures it). What
+///    refuses is an ACL, a handle without `FILE_SHARE_DELETE`, or endpoint
+///    protection;
+/// 3. rename the new copy into place. A failure in 1-3 puts back what moved
+///    and stops nothing: the tray runs on, and the retry tries again. Until
+///    #3824 the tray was stopped first, and a refused rename, with its start
+///    from the old EXE refused as well, left the person with none;
+/// 4. only now stop the running trays, found by the path they were started
+///    from, which no rename changes (#1686);
+/// 5. one that would not stop keeps the single-instance lock: put the old EXE
+///    back over the new one, which nothing runs, start what was stopped, and
+///    leave the marker, so the retry tries again;
+/// 6. else write the marker, start what was stopped, and remove the old copy.
+///
+/// A stop whose start does not bring the tray back marks it lost, and a start
+/// that works forgets that ([`TrayLost`]).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // exercised by `swap_tests` everywhere
-pub(crate) fn swap<O: SwapOps>(ops: &mut O) -> SwapOutcome {
+pub(crate) fn swap<O: SwapOps>(ops: &mut O, lost: &TrayLost) -> SwapOutcome {
+    let gave_up = |reason: String| SwapOutcome::Aborted {
+        reason,
+        stopped: Vec::new(),
+        start: None,
+    };
     if let Err(e) = ops.stage() {
-        return SwapOutcome::Aborted {
-            reason: format!("staging the new companion failed: {e:#}"),
-            respawned_old: false,
+        return gave_up(format!("staging the new companion failed: {e:#}"));
+    }
+    if let Err(e) = ops.rename_old_aside() {
+        ops.discard_new();
+        return gave_up(format!("moving the old companion aside failed: {e:#}"));
+    }
+    if let Err(e) = ops.promote_new() {
+        let failed = format!("putting the new companion in place failed: {e:#}");
+        let reason = match ops.restore_old() {
+            Ok(()) => failed,
+            Err(back) => format!("{failed}; putting the old one back failed too: {back:#}"),
         };
+        ops.discard_new();
+        return gave_up(reason);
     }
     let pids = ops.running();
     let stopped = if pids.is_empty() {
@@ -1914,49 +2062,279 @@ pub(crate) fn swap<O: SwapOps>(ops: &mut O) -> SwapOutcome {
     } else {
         ops.stop(&pids)
     };
-    // Put back what this swap stopped, from whatever EXE is installed.
-    let abort = |ops: &mut O, reason: String, stopped: &[u32]| {
-        ops.discard_new();
-        let respawn = !stopped.is_empty();
-        if respawn {
-            ops.respawn();
-        }
-        SwapOutcome::Aborted {
-            reason,
-            respawned_old: respawn,
-        }
-    };
     if stopped.len() != pids.len() {
-        return abort(
-            ops,
-            format!(
-                "could not stop every running companion (running {pids:?}, stopped {stopped:?})"
-            ),
-            &stopped,
+        let survived = format!(
+            "could not stop every running companion (running {pids:?}, stopped {stopped:?})"
         );
-    }
-    if let Err(e) = ops.rename_old_aside() {
-        return abort(
-            ops,
-            format!("moving the old companion aside failed: {e:#}"),
-            &stopped,
-        );
-    }
-    if let Err(e) = ops.promote_new() {
-        ops.restore_old();
-        return abort(
-            ops,
-            format!("putting the new companion in place failed: {e:#}"),
-            &stopped,
-        );
+        let reason = match ops.restore_old() {
+            Ok(()) => survived,
+            Err(back) => format!("{survived}; putting the old one back failed: {back:#}"),
+        };
+        let start = start_stopped(ops, &stopped, lost);
+        return SwapOutcome::Aborted {
+            reason,
+            stopped,
+            start,
+        };
     }
     ops.write_marker();
-    let respawned = !stopped.is_empty();
-    if respawned {
-        ops.respawn();
-    }
+    let start = start_stopped(ops, &stopped, lost);
     ops.remove_old();
-    SwapOutcome::Swapped { respawned, stopped }
+    SwapOutcome::Swapped { stopped, start }
+}
+
+/// #3824 — start what the swap stopped, and record whether that brought the
+/// tray back.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn start_stopped<O: SwapOps>(ops: &mut O, stopped: &[u32], lost: &TrayLost) -> Option<TrayStart> {
+    if stopped.is_empty() {
+        return None;
+    }
+    let start = ops.start();
+    if matches!(start, TrayStart::Started { .. }) {
+        lost.clear();
+    } else {
+        lost.set();
+    }
+    Some(start)
+}
+
+/// #3824 — what a start of the tray came to. The refresh's line and the
+/// consent prompt's verdict read it, so neither says a tray started when none
+/// did.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrayStart {
+    /// The process was created: its pid, and its session when known.
+    Started { pid: u32, session: Option<u32> },
+    /// Nobody is signed in where it would start: a service starts the tray
+    /// for the person at the console.
+    NobodySignedIn,
+    /// The start failed, and why (`CreateProcessAsUserW … (err 5)`).
+    Failed(String),
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl TrayStart {
+    /// What came of it, for a log line.
+    fn describe(&self) -> String {
+        match self {
+            Self::Started {
+                pid,
+                session: Some(session),
+            } => format!("pid {pid}, session {session}"),
+            Self::Started { pid, session: None } => format!("pid {pid}"),
+            Self::NobodySignedIn => "nobody is signed in at this computer's screen".to_string(),
+            Self::Failed(e) => e.clone(),
+        }
+    }
+}
+
+/// #3824 — a tray this process's refresh stopped and could not start again.
+///
+/// Set when a swap stopped the tray and its start did not bring it back
+/// (nobody signed in to start it for counts); forgotten when a start works or
+/// a tray is seen running. Only while it is set does the refresh start a tray
+/// that is not running: a tray the person quit, or one that never ran, stays
+/// as it is. In memory, on purpose: after a restart the sign-in start (the
+/// `Roomler Desktop` Run value) owns the tray.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Default)]
+pub(crate) struct TrayLost {
+    lost: std::sync::atomic::AtomicBool,
+    /// Tries since it was lost that did not bring it back: the first one is
+    /// a warn line, the rest debug.
+    failed_tries: std::sync::atomic::AtomicU32,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl TrayLost {
+    pub(crate) const fn new() -> Self {
+        Self {
+            lost: std::sync::atomic::AtomicBool::new(false),
+            failed_tries: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A swap stopped the tray, and its start did not bring it back.
+    fn set(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.failed_tries.store(0, SeqCst);
+        self.lost.store(true, SeqCst);
+    }
+
+    /// A start worked, or a tray is running.
+    fn clear(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.lost.store(false, SeqCst);
+        self.failed_tries.store(0, SeqCst);
+    }
+
+    /// One more try that did not bring it back: `true` for the first.
+    fn failed_try(&self) -> bool {
+        self.failed_tries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+    }
+}
+
+/// This process's [`TrayLost`].
+#[cfg(target_os = "windows")]
+static TRAY_LOST: TrayLost = TrayLost::new();
+
+/// #3824 — the refresh's line for a swap. One renderer, tested, so a start
+/// that failed is a warning with its error, and "respawned" is said only of a
+/// start that worked.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshLine {
+    /// INFO `desktop companion refreshed`, with `tray=`: what became of it.
+    Refreshed { tray: String },
+    /// WARN `desktop companion refreshed, but the tray could not be started
+    /// again`, with `error=`.
+    TrayNotBack { error: String },
+    /// WARN `desktop companion refresh skipped`, with `error=`: why, then
+    /// what became of the tray.
+    Skipped { error: String },
+}
+
+/// #3824 — [`RefreshLine`] for a swap's outcome.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn refresh_line(outcome: &SwapOutcome) -> RefreshLine {
+    match outcome {
+        SwapOutcome::Swapped { start: None, .. } => RefreshLine::Refreshed {
+            tray: "none was running".to_string(),
+        },
+        SwapOutcome::Swapped {
+            start: Some(started @ TrayStart::Started { .. }),
+            ..
+        } => RefreshLine::Refreshed {
+            tray: format!("respawned ({})", started.describe()),
+        },
+        SwapOutcome::Swapped {
+            start: Some(not_started),
+            ..
+        } => RefreshLine::TrayNotBack {
+            error: not_started.describe(),
+        },
+        SwapOutcome::Aborted { reason, start, .. } => RefreshLine::Skipped {
+            error: match start {
+                None => format!("{reason} (no tray was stopped)"),
+                Some(started @ TrayStart::Started { .. }) => format!(
+                    "{reason} (the tray it had stopped was respawned: {})",
+                    started.describe()
+                ),
+                Some(not_started) => format!(
+                    "{reason} (the tray it had stopped could not be started again: {})",
+                    not_started.describe()
+                ),
+            },
+        },
+    }
+}
+
+/// #3824 — what a try to bring back a lost tray found or did.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LostTrayStart {
+    /// A tray runs in the session it would start in.
+    Running,
+    /// No `Roomler Desktop` Run value for this install: the tray is not set
+    /// to start at sign-in, so it is not started either.
+    NotSetToStart,
+    /// The start, or nobody signed in to start it for.
+    Tried(TrayStart),
+}
+
+/// #3824 — the line for a try to bring back a lost tray.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LostTrayLine {
+    /// INFO `desktop companion is back after a refresh stopped it`, with
+    /// `how=`.
+    Back { how: String },
+    /// `desktop companion is still not running after a refresh stopped it;
+    /// it is tried again`, with `why=`: WARN for the first try that did not
+    /// bring it back, DEBUG for the rest.
+    StillDown { why: String, first: bool },
+}
+
+/// #3824 — after a refresh pass, start a tray an earlier pass stopped and
+/// could not start again. Nothing at all when none was lost: a tray the
+/// person quit, or one that never ran, stays as it is. Nothing either when
+/// this pass stopped a tray: its own start has tried already, or marked the
+/// tray lost. A start that works, or a tray seen running, forgets the loss;
+/// anything else leaves it for the next pass.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn restore_lost_tray(
+    pass_stopped_a_tray: bool,
+    lost: &TrayLost,
+    start: impl FnOnce() -> LostTrayStart,
+) -> Option<LostTrayLine> {
+    if pass_stopped_a_tray || !lost.is_set() {
+        return None;
+    }
+    let back = |how: String| {
+        lost.clear();
+        Some(LostTrayLine::Back { how })
+    };
+    let still_down = |why: String| {
+        Some(LostTrayLine::StillDown {
+            why,
+            first: lost.failed_try(),
+        })
+    };
+    match start() {
+        LostTrayStart::Running => back("one is running again".to_string()),
+        LostTrayStart::Tried(started @ TrayStart::Started { .. }) => {
+            back(format!("started again ({})", started.describe()))
+        }
+        LostTrayStart::NotSetToStart => still_down(
+            "it is not set to start at sign-in here (no `Roomler Desktop` Run value)".to_string(),
+        ),
+        LostTrayStart::Tried(not_started) => still_down(not_started.describe()),
+    }
+}
+
+/// #3824 — how many `…exe.old.<n>` names a swap tries after `…exe.old`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const ASIDE_NAMES: u32 = 8;
+
+/// #3824 — the name to move the installed EXE aside to: `old` when `free`
+/// says it is free (it may free it), else the first free `old.<n>`. A copy
+/// still mapped by a tray, or held by a scanner, refuses a delete and a
+/// replace onto it alike, and used to fail the next swap's rename. `None`
+/// when every name is held.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn free_aside_name(
+    old: &std::path::Path,
+    mut free: impl FnMut(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    std::iter::once(old.to_path_buf())
+        .chain((1..=ASIDE_NAMES).map(|n| {
+            let mut name = old.as_os_str().to_os_string();
+            name.push(format!(".{n}"));
+            std::path::PathBuf::from(name)
+        }))
+        .find(|name| free(name))
+}
+
+/// #3824 — is `name` a copy a swap moved aside to `base` (`base` itself or
+/// `base.<n>`)? Never the version marker, the staged `.new` or the EXE.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn is_aside_name(name: &str, base: &str) -> bool {
+    let (name, base) = (name.to_ascii_lowercase(), base.to_ascii_lowercase());
+    match name.strip_prefix(base.as_str()) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix('.')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1964,7 +2342,10 @@ struct FsSwap {
     staged: std::path::PathBuf,
     dest: std::path::PathBuf,
     new: std::path::PathBuf,
+    /// `…exe.old`: the first name the installed EXE is moved aside to.
     old: std::path::PathBuf,
+    /// Where this swap moved it, once it has.
+    aside: Option<std::path::PathBuf>,
     marker: std::path::PathBuf,
     version: &'static str,
     respawn: RespawnContext,
@@ -1977,6 +2358,37 @@ impl SwapOps for FsSwap {
         std::fs::copy(&self.staged, &self.new)
             .map(|_| ())
             .context("copying the new desktop EXE beside the installed one")
+    }
+    fn rename_old_aside(&mut self) -> Result<()> {
+        if !self.dest.exists() {
+            return Ok(());
+        }
+        // A copy an earlier swap left is usually free by now. One that is not
+        // (a tray that would not stop still runs from it, a scanner holds it)
+        // refuses a delete and a replace onto it alike: the next free name.
+        let aside = free_aside_name(&self.old, |p| {
+            !p.exists() || std::fs::remove_file(p).is_ok()
+        })
+        .context("no free name to move the desktop EXE aside to")?;
+        std::fs::rename(&self.dest, &aside).context("renaming the desktop EXE aside")?;
+        self.aside = Some(aside);
+        Ok(())
+    }
+    fn promote_new(&mut self) -> Result<()> {
+        std::fs::rename(&self.new, &self.dest).context("renaming the new desktop EXE into place")
+    }
+    fn restore_old(&mut self) -> Result<()> {
+        let Some(aside) = self.aside.take() else {
+            return Ok(());
+        };
+        if let Err(e) = std::fs::rename(&aside, &self.dest) {
+            self.aside = Some(aside);
+            return Err(e).context("renaming the old desktop EXE back into place");
+        }
+        Ok(())
+    }
+    fn discard_new(&mut self) {
+        let _ = std::fs::remove_file(&self.new);
     }
     fn running(&mut self) -> Vec<u32> {
         crate::win_service::companion_procs::find(&self.dest)
@@ -1991,43 +2403,37 @@ impl SwapOps for FsSwap {
             std::time::Duration::from_secs(10),
         )
     }
-    fn rename_old_aside(&mut self) -> Result<()> {
-        // A `.old` from an earlier cycle: its process (if it had one) was
-        // started from the installed path, so `running`/`stop` above found and
-        // stopped it — the file is free now.
-        let _ = std::fs::remove_file(&self.old);
-        if self.dest.exists() {
-            std::fs::rename(&self.dest, &self.old).context("renaming the desktop EXE aside")?;
-        }
-        Ok(())
-    }
-    fn promote_new(&mut self) -> Result<()> {
-        std::fs::rename(&self.new, &self.dest).context("renaming the new desktop EXE into place")
-    }
-    fn restore_old(&mut self) {
-        if self.old.exists() {
-            let _ = std::fs::rename(&self.old, &self.dest);
-        }
-    }
-    fn discard_new(&mut self) {
-        let _ = std::fs::remove_file(&self.new);
-    }
     fn write_marker(&mut self) {
         if let Err(e) = std::fs::write(&self.marker, format!("{}\n", self.version)) {
             tracing::warn!(error = %e, "could not write desktop version marker");
         }
     }
-    fn respawn(&mut self) {
-        respawn_desktop(self.respawn, &self.dest);
+    fn start(&mut self) -> TrayStart {
+        start_desktop(self.respawn, &self.dest, &[])
     }
     fn remove_old(&mut self) {
-        // A stopped process may take a moment to release its image; a few
-        // short retries, then leave it for the next cycle.
-        for _ in 0..3 {
-            if std::fs::remove_file(&self.old).is_ok() || !self.old.exists() {
-                break;
+        // The tray just stopped may take a moment to release its image: a few
+        // short retries, then the next swap's sweep.
+        if let Some(aside) = &self.aside {
+            for _ in 0..3 {
+                if std::fs::remove_file(aside).is_ok() || !aside.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        // The copies earlier swaps left, best-effort.
+        let Some(entries) = self.dest.parent().and_then(|d| std::fs::read_dir(d).ok()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| is_aside_name(name, OLD_SUFFIX))
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -2079,76 +2485,187 @@ pub(crate) fn desktop_running_in_session(session: u32) -> bool {
     })
 }
 
+/// Start the tray at `dest` with `args`: from a service, into the console
+/// session as its person; from the person's own daemon, a plain detached
+/// start. Says what came of it and logs nothing: the caller's line does
+/// (#3824).
 #[cfg(target_os = "windows")]
-fn respawn_desktop(respawn: RespawnContext, dest: &std::path::Path) {
+fn start_desktop(respawn: RespawnContext, dest: &std::path::Path, args: &[&str]) -> TrayStart {
     match respawn {
         // FR-84 D6 / #1035 — NOT `std::process::Command`: that passes
         // `bInheritHandles = TRUE`, and a companion lives for months holding
         // whatever this daemon had marked inheritable at the spawn instant.
         RespawnContext::UserSession => {
-            match crate::win_service::companion_spawn::spawn_detached_no_inherit(dest, &[]) {
-                Ok(pid) => tracing::info!(pid, "desktop companion respawned (user session)"),
-                Err(e) => tracing::warn!(error = %e, "desktop companion respawn failed"),
+            match crate::win_service::companion_spawn::spawn_detached_no_inherit(dest, args) {
+                Ok(pid) => TrayStart::Started {
+                    pid,
+                    session: crate::win_service::companion_spawn::own_session_id(),
+                },
+                Err(e) => TrayStart::Failed(format!("{e:#}")),
             }
         }
         RespawnContext::SystemService => {
             use crate::win_service::supervisor;
-            let Some(session_id) = supervisor::active_console_session_id() else {
-                tracing::info!(
-                    "no active interactive session; desktop starts on next manual launch"
-                );
-                return;
+            let Some(session) = supervisor::active_console_session_id() else {
+                return TrayStart::NobodySignedIn;
             };
-            match supervisor::query_user_token(session_id) {
+            match supervisor::query_user_token(session) {
                 Ok(Some(token)) => {
                     // SAFETY: `token` is a live user token from
                     // WTSQueryUserToken, held for the duration of the call.
-                    match unsafe { supervisor::spawn_in_session(token.raw(), dest, &[]) } {
-                        Ok(_) => {
-                            tracing::info!(session_id, "desktop companion respawned in session")
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "desktop companion session respawn failed")
-                        }
+                    let child = unsafe { supervisor::spawn_in_session(token.raw(), dest, args) };
+                    match child {
+                        Ok(child) => TrayStart::Started {
+                            pid: child.pid,
+                            session: Some(session),
+                        },
+                        Err(e) => TrayStart::Failed(format!("{e:#}")),
                     }
                 }
-                Ok(None) => tracing::info!(
-                    session_id,
-                    "no user token for active session; desktop starts on next login"
-                ),
-                Err(e) => tracing::warn!(error = %e, "query_user_token failed for desktop respawn"),
+                Ok(None) => TrayStart::NobodySignedIn,
+                Err(e) => TrayStart::Failed(format!("{e:#}")),
             }
         }
     }
 }
 
-/// #1686 — the companion swap's ORDER, on every platform (the Windows ops
-/// themselves are exercised by `win_service::companion_procs`' tests, which run
-/// only where Windows does).
+/// #3824 — start a tray this process's refresh stopped and could not start
+/// again: where someone is signed in, none runs, and the tray is set to start
+/// at sign-in. With `--autostart`, as the sign-in start does, so a person who
+/// switched that off sees nothing (`decide_startup` exits).
+#[cfg(target_os = "windows")]
+fn start_lost_tray(respawn: RespawnContext, dest: &std::path::Path) -> LostTrayStart {
+    use roomler_node_core::companion_autostart::AUTOSTART_ARG;
+    let Some(session) = signed_in_session(respawn) else {
+        return LostTrayStart::Tried(TrayStart::NobodySignedIn);
+    };
+    if desktop_running_in_session(session) {
+        return LostTrayStart::Running;
+    }
+    if !set_to_start_at_sign_in(dest) {
+        return LostTrayStart::NotSetToStart;
+    }
+    LostTrayStart::Tried(start_desktop(respawn, dest, &[AUTOSTART_ARG]))
+}
+
+/// The session a start would go to, when someone is signed in there: the
+/// console session's person for a service, the daemon's own session for a
+/// daemon that runs as the person.
+#[cfg(target_os = "windows")]
+fn signed_in_session(respawn: RespawnContext) -> Option<u32> {
+    use crate::win_service::{companion_spawn, supervisor};
+    match respawn {
+        RespawnContext::SystemService => {
+            let session = supervisor::active_console_session_id()?;
+            matches!(supervisor::query_user_token(session), Ok(Some(_))).then_some(session)
+        }
+        // Session 0 is services' session: nothing there is visible.
+        RespawnContext::UserSession => companion_spawn::own_session_id().filter(|s| *s != 0),
+    }
+}
+
+/// Is the tray set to start at sign-in: a `Roomler Desktop` Run value in the
+/// hive this install owns? `HKLM` for a machine-wide install, present while
+/// the device's switch is on (a person's own opt-out is `--autostart`'s to
+/// honour); `HKCU` for a per-user one, gone once its person opted out.
+#[cfg(target_os = "windows")]
+fn set_to_start_at_sign_in(dest: &std::path::Path) -> bool {
+    use roomler_node_core::companion_autostart::{
+        InstallScope, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME, program_files_dirs,
+        registry::{Hive, read_value},
+        windows_scope_for_exe,
+    };
+    let hive = match windows_scope_for_exe(dest, &program_files_dirs()) {
+        InstallScope::Machine => Hive::LocalMachine,
+        InstallScope::User => Hive::CurrentUser,
+    };
+    matches!(
+        read_value(hive, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME),
+        Ok(Some(command)) if !command.trim().is_empty()
+    )
+}
+
+/// #1686, #3824 — the tray swap's ORDER, a tray lost to a failed start, and
+/// the lines the refresh logs, on every platform (the Windows ops themselves
+/// are exercised by `win_service::companion_procs`' tests, which run only
+/// where Windows does).
 #[cfg(test)]
 mod swap_tests {
-    use super::{SwapOps, SwapOutcome, swap};
+    use super::{
+        EnsureOutcome, LostTrayLine, LostTrayStart, RefreshLine, SwapOps, SwapOutcome, TrayLost,
+        TrayStart, free_aside_name, is_aside_name, refresh_line, restore_lost_tray,
+        started_outcome, swap,
+    };
     use anyhow::{Result, anyhow};
+    use std::path::{Path, PathBuf};
 
-    #[derive(Default)]
+    const DENIED: &str = "Access is denied. (os error 5)";
+
+    fn started() -> TrayStart {
+        TrayStart::Started {
+            pid: 100,
+            session: Some(1),
+        }
+    }
+
+    /// The release lab's respawn failure (#3824).
+    fn refused() -> TrayStart {
+        TrayStart::Failed(
+            r"CreateProcessAsUserW(C:\Program Files\Roomler\roomler-desktop.exe) failed (err 5)"
+                .to_string(),
+        )
+    }
+
     struct Mock {
         calls: Vec<&'static str>,
         stage_fails: bool,
+        aside_fails: bool,
+        promote_fails: bool,
+        restore_fails: bool,
         running: Vec<u32>,
         /// `None` = stop everything asked.
         stops_only: Option<Vec<u32>>,
-        aside_fails: bool,
-        promote_fails: bool,
+        start: TrayStart,
+    }
+
+    impl Default for Mock {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                stage_fails: false,
+                aside_fails: false,
+                promote_fails: false,
+                restore_fails: false,
+                running: Vec::new(),
+                stops_only: None,
+                start: started(),
+            }
+        }
+    }
+
+    fn fails(fail: bool, why: &str) -> Result<()> {
+        if fail { Err(anyhow!("{why}")) } else { Ok(()) }
     }
 
     impl SwapOps for Mock {
         fn stage(&mut self) -> Result<()> {
             self.calls.push("stage");
-            if self.stage_fails {
-                Err(anyhow!("disk full"))
-            } else {
-                Ok(())
-            }
+            fails(self.stage_fails, "disk full")
+        }
+        fn rename_old_aside(&mut self) -> Result<()> {
+            self.calls.push("rename_old_aside");
+            fails(self.aside_fails, DENIED)
+        }
+        fn promote_new(&mut self) -> Result<()> {
+            self.calls.push("promote_new");
+            fails(self.promote_fails, DENIED)
+        }
+        fn restore_old(&mut self) -> Result<()> {
+            self.calls.push("restore_old");
+            fails(self.restore_fails, DENIED)
+        }
+        fn discard_new(&mut self) {
+            self.calls.push("discard_new");
         }
         fn running(&mut self) -> Vec<u32> {
             self.calls.push("running");
@@ -2158,200 +2675,510 @@ mod swap_tests {
             self.calls.push("stop");
             self.stops_only.clone().unwrap_or_else(|| pids.to_vec())
         }
-        fn rename_old_aside(&mut self) -> Result<()> {
-            self.calls.push("rename_old_aside");
-            if self.aside_fails {
-                Err(anyhow!("sharing violation"))
-            } else {
-                Ok(())
-            }
-        }
-        fn promote_new(&mut self) -> Result<()> {
-            self.calls.push("promote_new");
-            if self.promote_fails {
-                Err(anyhow!("access denied"))
-            } else {
-                Ok(())
-            }
-        }
-        fn restore_old(&mut self) {
-            self.calls.push("restore_old");
-        }
-        fn discard_new(&mut self) {
-            self.calls.push("discard_new");
-        }
         fn write_marker(&mut self) {
             self.calls.push("write_marker");
         }
-        fn respawn(&mut self) {
-            self.calls.push("respawn");
+        fn start(&mut self) -> TrayStart {
+            self.calls.push("start");
+            self.start.clone()
         }
         fn remove_old(&mut self) {
             self.calls.push("remove_old");
         }
     }
 
+    /// #3824: the tray is stopped only once the new EXE is in place (NTFS
+    /// renames a running image aside), then started again.
     #[test]
-    fn a_running_companion_is_stopped_before_any_rename_and_respawned_after() {
+    fn a_running_tray_is_stopped_only_after_the_new_exe_is_in_place() {
+        let lost = TrayLost::default();
         let mut m = Mock {
             running: vec![7, 9],
             ..Default::default()
         };
-        let out = swap(&mut m);
+        let out = swap(&mut m, &lost);
         assert_eq!(
             out,
             SwapOutcome::Swapped {
-                respawned: true,
-                stopped: vec![7, 9]
+                stopped: vec![7, 9],
+                start: Some(started())
             }
         );
         assert_eq!(
             m.calls,
             [
                 "stage",
-                "running",
-                "stop",
                 "rename_old_aside",
                 "promote_new",
+                "running",
+                "stop",
                 "write_marker",
-                "respawn",
+                "start",
                 "remove_old"
             ]
         );
+        assert!(!lost.is_set());
     }
 
+    /// A first run (a wizard-placed EXE with no marker), or a tray the person
+    /// quit: none runs, so none is stopped, none is started, and none counts
+    /// as lost (the post-install launcher owns the first launch).
     #[test]
-    fn nothing_running_swaps_without_a_respawn() {
+    fn a_swap_with_no_tray_running_starts_none() {
+        let lost = TrayLost::default();
         let mut m = Mock::default();
+        let out = swap(&mut m, &lost);
         assert_eq!(
-            swap(&mut m),
+            out,
             SwapOutcome::Swapped {
-                respawned: false,
-                stopped: vec![]
+                stopped: vec![],
+                start: None
             }
         );
-        assert!(!m.calls.contains(&"stop") && !m.calls.contains(&"respawn"));
+        assert!(!m.calls.contains(&"stop") && !m.calls.contains(&"start"));
+        assert!(!lost.is_set());
+        assert_eq!(
+            restore_lost_tray(out.stopped_a_tray(), &lost, || unreachable!(
+                "no tray was lost"
+            )),
+            None
+        );
     }
 
-    /// A failed copy leaves everything as it was — and, before this ordering,
-    /// the companion had already been killed by then and was never respawned.
+    /// A failed copy leaves everything as it was.
     #[test]
-    fn a_failed_stage_touches_nothing_and_kills_nothing() {
+    fn a_failed_stage_touches_nothing_and_stops_nothing() {
+        let lost = TrayLost::default();
         let mut m = Mock {
             stage_fails: true,
             running: vec![7],
             ..Default::default()
         };
-        let out = swap(&mut m);
-        assert!(matches!(
-            out,
-            SwapOutcome::Aborted {
-                respawned_old: false,
-                ..
-            }
-        ));
+        let out = swap(&mut m, &lost);
+        assert!(!out.stopped_a_tray(), "{out:?}");
+        assert!(matches!(out, SwapOutcome::Aborted { start: None, .. }));
         assert_eq!(m.calls, ["stage"]);
     }
 
-    /// Renaming a LIVE image aside is how #1686 began: if any companion
-    /// survives the stop, nothing is renamed — and the ones that were stopped
-    /// are started again, from the old EXE still installed.
+    /// #3824, the release lab's case: the rename aside refused (a deny ACE
+    /// there; a scanner's handle or endpoint protection in the field). The
+    /// tray used to be stopped by then, and its start from the old EXE
+    /// failed. Now it is left running, and nothing is started.
     #[test]
-    fn a_companion_that_would_not_stop_aborts_before_any_rename() {
-        let mut m = Mock {
-            running: vec![7, 9],
-            stops_only: Some(vec![7]),
-            ..Default::default()
-        };
-        let out = swap(&mut m);
-        assert!(matches!(
-            out,
-            SwapOutcome::Aborted {
-                respawned_old: true,
-                ..
-            }
-        ));
-        assert_eq!(
-            m.calls,
-            ["stage", "running", "stop", "discard_new", "respawn"]
-        );
-        assert!(!m.calls.contains(&"rename_old_aside"));
-    }
-
-    #[test]
-    fn a_failed_move_aside_respawns_the_old_companion() {
+    fn a_refused_rename_aside_leaves_the_running_tray_running() {
+        let lost = TrayLost::default();
         let mut m = Mock {
             running: vec![7],
             aside_fails: true,
             ..Default::default()
         };
-        let out = swap(&mut m);
-        assert!(matches!(
-            out,
-            SwapOutcome::Aborted {
-                respawned_old: true,
-                ..
-            }
-        ));
-        assert_eq!(
-            m.calls,
-            [
-                "stage",
-                "running",
-                "stop",
-                "rename_old_aside",
-                "discard_new",
-                "respawn"
-            ]
+        let out = swap(&mut m, &lost);
+        assert_eq!(m.calls, ["stage", "rename_old_aside", "discard_new"]);
+        let SwapOutcome::Aborted {
+            reason,
+            stopped,
+            start,
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert!(
+            reason.starts_with("moving the old companion aside failed: Access is denied"),
+            "{reason}"
         );
+        assert_eq!((stopped, start), (vec![], None));
+        assert!(!lost.is_set());
     }
 
+    /// A promote that fails puts the old EXE back, and the tray, never
+    /// stopped, runs on.
     #[test]
-    fn a_failed_promote_restores_the_old_exe_then_respawns_it() {
+    fn a_failed_promote_puts_the_old_exe_back_and_leaves_the_tray_running() {
+        let lost = TrayLost::default();
         let mut m = Mock {
             running: vec![7],
             promote_fails: true,
             ..Default::default()
         };
-        let out = swap(&mut m);
-        assert!(matches!(
-            out,
-            SwapOutcome::Aborted {
-                respawned_old: true,
-                ..
-            }
-        ));
+        let out = swap(&mut m, &lost);
         assert_eq!(
             m.calls,
             [
                 "stage",
-                "running",
-                "stop",
                 "rename_old_aside",
                 "promote_new",
                 "restore_old",
-                "discard_new",
-                "respawn"
+                "discard_new"
             ]
+        );
+        assert!(!out.stopped_a_tray(), "{out:?}");
+        assert!(matches!(out, SwapOutcome::Aborted { start: None, .. }));
+    }
+
+    /// Both renames refused: no EXE at the installed path until the retry,
+    /// and the line says so. The tray still runs from the copy moved aside.
+    #[test]
+    fn a_put_back_that_fails_is_said() {
+        let lost = TrayLost::default();
+        let mut m = Mock {
+            running: vec![7],
+            promote_fails: true,
+            restore_fails: true,
+            ..Default::default()
+        };
+        let out = swap(&mut m, &lost);
+        let SwapOutcome::Aborted {
+            reason, stopped, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert!(
+            reason.contains("; putting the old one back failed too: Access is denied"),
+            "{reason}"
+        );
+        assert!(stopped.is_empty() && !m.calls.contains(&"stop"));
+    }
+
+    /// A tray that would not stop keeps the single-instance lock: the old EXE
+    /// goes back over the new one, which nothing runs, what was stopped is
+    /// started again, and the marker is left for the retry.
+    #[test]
+    fn a_tray_that_would_not_stop_gets_the_old_exe_back() {
+        let lost = TrayLost::default();
+        let mut m = Mock {
+            running: vec![7, 9],
+            stops_only: Some(vec![7]),
+            ..Default::default()
+        };
+        let out = swap(&mut m, &lost);
+        assert_eq!(
+            m.calls,
+            [
+                "stage",
+                "rename_old_aside",
+                "promote_new",
+                "running",
+                "stop",
+                "restore_old",
+                "start"
+            ]
+        );
+        let SwapOutcome::Aborted {
+            reason,
+            stopped,
+            start,
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert!(
+            reason.starts_with("could not stop every running companion"),
+            "{reason}"
+        );
+        assert_eq!((stopped, start), (vec![7], Some(started())));
+        assert!(!lost.is_set());
+    }
+
+    /// #3824: a tray the swap stopped and could not start again is lost, and
+    /// so is one stopped with nobody signed in to start it for. A start that
+    /// works forgets it.
+    #[test]
+    fn a_failed_start_after_a_stop_marks_the_tray_lost() {
+        let lost = TrayLost::default();
+        let mut m = Mock {
+            running: vec![7],
+            start: refused(),
+            ..Default::default()
+        };
+        assert_eq!(
+            swap(&mut m, &lost),
+            SwapOutcome::Swapped {
+                stopped: vec![7],
+                start: Some(refused())
+            }
+        );
+        assert!(lost.is_set(), "a stop whose start failed");
+
+        let nobody = TrayLost::default();
+        let mut m = Mock {
+            running: vec![7],
+            start: TrayStart::NobodySignedIn,
+            ..Default::default()
+        };
+        swap(&mut m, &nobody);
+        assert!(nobody.is_set(), "nobody signed in to start it for");
+
+        let mut m = Mock {
+            running: vec![7],
+            ..Default::default()
+        };
+        swap(&mut m, &lost);
+        assert!(!lost.is_set(), "a start that works forgets it");
+    }
+
+    /// #3824, the issue's second point: after a failed start, the next pass
+    /// that stops no tray (here a swap with none running) starts it. Once the
+    /// tray is back, a later pass starts none: the person may quit it.
+    #[test]
+    fn a_tray_lost_to_a_failed_start_is_started_by_the_next_pass() {
+        let lost = TrayLost::default();
+        let mut first = Mock {
+            running: vec![7],
+            start: refused(),
+            ..Default::default()
+        };
+        swap(&mut first, &lost);
+        let mut retry = Mock::default();
+        let out = swap(&mut retry, &lost);
+        let line = restore_lost_tray(out.stopped_a_tray(), &lost, || {
+            LostTrayStart::Tried(started())
+        });
+        assert_eq!(
+            line,
+            Some(LostTrayLine::Back {
+                how: "started again (pid 100, session 1)".to_string()
+            })
+        );
+        assert!(!lost.is_set());
+        assert_eq!(
+            restore_lost_tray(false, &lost, || unreachable!("a quit tray stays quit")),
+            None
         );
     }
 
-    /// Nothing was running and a rename failed: nothing to put back.
+    /// #3824, the field case after the fix: the swap lands and its start
+    /// fails, so the marker reads current and the passes after it have
+    /// nothing to swap. Each tries the start, with one warning; a tray seen
+    /// running ends the tries.
     #[test]
-    fn an_abort_with_nothing_stopped_respawns_nothing() {
+    fn a_pass_with_nothing_to_swap_tries_the_lost_tray_until_it_runs() {
+        let lost = TrayLost::default();
+        swap(
+            &mut Mock {
+                running: vec![7],
+                start: refused(),
+                ..Default::default()
+            },
+            &lost,
+        );
+        let still_down = |line: Option<LostTrayLine>| match line {
+            Some(LostTrayLine::StillDown { why, first }) => (why, first),
+            other => panic!("{other:?}"),
+        };
+        let (why, first) = still_down(restore_lost_tray(false, &lost, || {
+            LostTrayStart::Tried(refused())
+        }));
+        assert!(first && why.contains("(err 5)"), "{why}");
+        let (why, first) = still_down(restore_lost_tray(false, &lost, || {
+            LostTrayStart::Tried(TrayStart::NobodySignedIn)
+        }));
+        assert!(!first && why.contains("nobody is signed in"), "{why}");
+        let (why, first) = still_down(restore_lost_tray(false, &lost, || {
+            LostTrayStart::NotSetToStart
+        }));
+        assert!(!first && why.contains("not set to start"), "{why}");
+        assert!(lost.is_set());
+        // The person signs in, and the sign-in start brings it back.
+        assert_eq!(
+            restore_lost_tray(false, &lost, || LostTrayStart::Running),
+            Some(LostTrayLine::Back {
+                how: "one is running again".to_string()
+            })
+        );
+        assert!(!lost.is_set());
+        assert_eq!(
+            restore_lost_tray(false, &lost, || unreachable!("forgotten")),
+            None
+        );
+    }
+
+    /// A pass that stopped a tray leaves the tray to its own start: no second
+    /// start, and no second warning, in the same pass.
+    #[test]
+    fn a_pass_that_stopped_a_tray_tries_no_second_start() {
+        let lost = TrayLost::default();
         let mut m = Mock {
-            promote_fails: true,
+            running: vec![7],
+            start: refused(),
             ..Default::default()
         };
-        let out = swap(&mut m);
-        assert!(matches!(
-            out,
+        let out = swap(&mut m, &lost);
+        assert!(out.stopped_a_tray() && lost.is_set());
+        assert_eq!(
+            restore_lost_tray(out.stopped_a_tray(), &lost, || unreachable!(
+                "one start a pass"
+            )),
+            None
+        );
+    }
+
+    /// #3824: the line says whether the start worked, and "respawned" only
+    /// when it did. It used to read `respawned it: true` after a failed one.
+    #[test]
+    fn the_refresh_line_never_says_respawned_after_a_failed_start() {
+        for outcome in [
+            SwapOutcome::Swapped {
+                stopped: vec![7],
+                start: Some(refused()),
+            },
+            SwapOutcome::Swapped {
+                stopped: vec![7],
+                start: Some(TrayStart::NobodySignedIn),
+            },
             SwapOutcome::Aborted {
-                respawned_old: false,
-                ..
+                reason: "could not stop every running companion (running [7, 9], stopped [7])"
+                    .to_string(),
+                stopped: vec![7],
+                start: Some(refused()),
+            },
+        ] {
+            let line = refresh_line(&outcome);
+            assert!(!format!("{line:?}").contains("respawned"), "{line:?}");
+        }
+        assert_eq!(
+            refresh_line(&SwapOutcome::Swapped {
+                stopped: vec![7],
+                start: Some(refused())
+            }),
+            RefreshLine::TrayNotBack {
+                error: r"CreateProcessAsUserW(C:\Program Files\Roomler\roomler-desktop.exe) failed (err 5)"
+                    .to_string()
             }
-        ));
-        assert!(!m.calls.contains(&"respawn"));
+        );
+    }
+
+    /// #3824: what the line says became of the tray, in each case.
+    #[test]
+    fn the_refresh_line_says_what_became_of_the_tray() {
+        assert_eq!(
+            refresh_line(&SwapOutcome::Swapped {
+                stopped: vec![7],
+                start: Some(started())
+            }),
+            RefreshLine::Refreshed {
+                tray: "respawned (pid 100, session 1)".to_string()
+            }
+        );
+        assert_eq!(
+            refresh_line(&SwapOutcome::Swapped {
+                stopped: vec![],
+                start: None
+            }),
+            RefreshLine::Refreshed {
+                tray: "none was running".to_string()
+            }
+        );
+        assert_eq!(
+            refresh_line(&SwapOutcome::Aborted {
+                reason: format!("moving the old companion aside failed: {DENIED}"),
+                stopped: vec![],
+                start: None
+            }),
+            RefreshLine::Skipped {
+                error: format!(
+                    "moving the old companion aside failed: {DENIED} (no tray was stopped)"
+                )
+            }
+        );
+        assert_eq!(
+            refresh_line(&SwapOutcome::Aborted {
+                reason: "could not stop every running companion (running [7, 9], stopped [7])"
+                    .to_string(),
+                stopped: vec![7],
+                start: Some(started())
+            }),
+            RefreshLine::Skipped {
+                error: "could not stop every running companion (running [7, 9], stopped [7]) \
+                        (the tray it had stopped was respawned: pid 100, session 1)"
+                    .to_string()
+            }
+        );
+        let RefreshLine::Skipped { error } = refresh_line(&SwapOutcome::Aborted {
+            reason: "could not stop every running companion (running [7, 9], stopped [7])"
+                .to_string(),
+            stopped: vec![7],
+            start: Some(refused()),
+        }) else {
+            panic!("a skip")
+        };
+        assert!(
+            error.ends_with(
+                "(the tray it had stopped could not be started again: \
+                 CreateProcessAsUserW(C:\\Program Files\\Roomler\\roomler-desktop.exe) failed (err 5))"
+            ),
+            "{error}"
+        );
+    }
+
+    /// #3824: the consent prompt is told a tray started only when one did; it
+    /// then reports `no_prompt_surface` instead of waiting out its window.
+    #[test]
+    fn ensure_says_started_only_after_a_start_that_worked() {
+        assert_eq!(
+            started_outcome(started()).expect("a start that worked"),
+            EnsureOutcome::Started
+        );
+        let e = started_outcome(refused())
+            .expect_err("a failed start")
+            .to_string();
+        assert!(e.contains("(err 5)"), "{e}");
+        let e = started_outcome(TrayStart::NobodySignedIn)
+            .expect_err("nobody to start it for")
+            .to_string();
+        assert!(e.contains("nobody is signed in"), "{e}");
+    }
+
+    /// #3824: a copy an earlier swap left that cannot be removed (a tray or a
+    /// scanner still holds it, so a delete and a replace onto it are both
+    /// refused) does not block the swap: the next free name takes this one.
+    #[test]
+    fn the_old_exe_goes_aside_under_the_first_free_name() {
+        let old = Path::new(r"C:\Program Files\Roomler\roomler-desktop.exe.old");
+        let numbered = |n: u32| PathBuf::from(format!("{}.{n}", old.display()));
+        assert_eq!(free_aside_name(old, |_| true), Some(old.to_path_buf()));
+        let held = [old.to_path_buf(), numbered(1)];
+        assert_eq!(
+            free_aside_name(old, |p| !held.iter().any(|h| h == p)),
+            Some(numbered(2))
+        );
+        let mut asked = Vec::new();
+        assert_eq!(
+            free_aside_name(old, |p| {
+                asked.push(p.to_path_buf());
+                false
+            }),
+            None,
+            "every name held: the swap stops nothing and says why"
+        );
+        assert_eq!(asked.first(), Some(&old.to_path_buf()));
+        assert_eq!(asked.last(), Some(&numbered(8)));
+    }
+
+    /// The sweep takes the copies moved aside, never the marker, the staged
+    /// copy or the installed EXE.
+    #[test]
+    fn only_copies_moved_aside_are_swept() {
+        let base = "roomler-desktop.exe.old";
+        for name in [
+            "roomler-desktop.exe.old",
+            "ROOMLER-DESKTOP.EXE.OLD",
+            "roomler-desktop.exe.old.1",
+            "roomler-desktop.exe.old.12",
+        ] {
+            assert!(is_aside_name(name, base), "{name}");
+        }
+        for name in [
+            "roomler-desktop.exe",
+            "roomler-desktop.exe.version",
+            "roomler-desktop.exe.new",
+            "roomler-desktop.exe.old.",
+            "roomler-desktop.exe.old.x",
+            "roomler-desktop.exe.old.1.bak",
+            "roomler-desktop.exe.older",
+        ] {
+            assert!(!is_aside_name(name, base), "{name}");
+        }
     }
 }
 
@@ -2800,19 +3627,79 @@ mod too_old_tests {
     fn the_schedule_starts_over_when_the_tray_reads_current_again() {
         let mut s = RefreshSchedule::default();
         let minutes = |n: &NextRefresh| n.wait.as_secs() / 60;
-        let first = s.next(Some("0.4.212"));
+        let first = s.next(Some("0.4.212"), false);
         assert_eq!(
             (minutes(&first), first.too_old, first.installed.as_deref()),
             (2, true, Some("0.4.212"))
         );
-        assert_eq!(minutes(&s.next(Some("0.4.212"))), 5);
-        let current = s.next(Some("0.4.218"));
+        assert_eq!(minutes(&s.next(Some("0.4.212"), false)), 5);
+        let current = s.next(Some("0.4.218"), false);
         assert_eq!((minutes(&current), current.too_old), (240, false));
-        let again = s.next(None);
+        let again = s.next(None, false);
         assert_eq!(
             (minutes(&again), again.too_old, again.installed),
             (2, true, None)
         );
+    }
+
+    /// #3824: while a tray this process stopped is not running again, the
+    /// next refresh comes after 1, 5 and 15 minutes, then on the schedule.
+    /// Without one, the waits are today's.
+    #[test]
+    fn a_lost_tray_is_tried_again_after_1_5_and_15_minutes_then_on_the_schedule() {
+        let waits = |marker: Option<&str>, lost: &[bool]| -> Vec<u64> {
+            let mut s = RefreshSchedule::default();
+            lost.iter()
+                .map(|&lost| s.next(marker, lost).wait.as_secs() / 60)
+                .collect()
+        };
+        let current = Some("0.4.221");
+        assert_eq!(waits(current, &[true; 5]), [1, 5, 15, 240, 240]);
+        assert_eq!(waits(current, &[false; 5]), [240; 5], "today's period");
+        // Too old to connect as well: the sooner of the two schedules.
+        assert_eq!(
+            waits(Some("0.4.212"), &[true; 8]),
+            [1, 5, 10, 15, 15, 15, 240, 240]
+        );
+        assert_eq!(
+            waits(Some("0.4.212"), &[false; 8]),
+            [2, 5, 10, 15, 15, 15, 240, 240],
+            "today's fast waits"
+        );
+        // Back, then lost again: the waits start over.
+        assert_eq!(waits(current, &[true, true, false, true]), [1, 5, 240, 1]);
+    }
+
+    /// #3824: the loop tries a lost tray within a minute, then 5 and 15
+    /// minutes later, then on the normal period.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_tries_a_lost_tray_within_a_minute_then_at_5_and_15() {
+        let refreshes = Arc::new(AtomicU32::new(0));
+        let task = tokio::spawn(retry_refresh(
+            || true,
+            || Some("0.4.221".to_string()),
+            || true,
+            {
+                let refreshes = refreshes.clone();
+                move || {
+                    refreshes.fetch_add(1, SeqCst);
+                    std::future::ready(())
+                }
+            },
+            |_: &NextRefresh| {},
+        ));
+        let tries = || refreshes.load(SeqCst);
+        tokio::time::sleep(MINUTE + Duration::from_secs(1)).await;
+        assert_eq!(tries(), 1, "within a minute");
+        tokio::time::sleep(5 * MINUTE).await;
+        assert_eq!(tries(), 2, "5 minutes later");
+        tokio::time::sleep(15 * MINUTE).await;
+        assert_eq!(tries(), 3, "15 minutes after that");
+        tokio::time::sleep(239 * MINUTE).await;
+        assert_eq!(tries(), 3, "then the normal period");
+        tokio::time::sleep(2 * MINUTE).await;
+        assert_eq!(tries(), 4);
+        task.abort();
     }
 
     /// The pin for the log: ONE line per wait while the tray is too old, each
@@ -2829,6 +3716,7 @@ mod too_old_tests {
                 let marker = marker.clone();
                 move || marker.lock().unwrap().clone()
             },
+            || false,
             {
                 let refreshes = refreshes.clone();
                 move || {
@@ -2886,8 +3774,9 @@ mod too_old_tests {
         task.abort();
     }
 
-    /// `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster one
-    /// with it: no refresh, and no line saying one is coming.
+    /// `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster ones
+    /// with it, a lost tray's (#3824) too: no refresh, and no line saying one
+    /// is coming.
     #[tokio::test(start_paused = true)]
     async fn with_the_switch_off_nothing_is_refreshed_or_logged() {
         let refreshes = Arc::new(AtomicU32::new(0));
@@ -2895,6 +3784,7 @@ mod too_old_tests {
         let task = tokio::spawn(retry_refresh(
             || false,
             || Some("0.4.212".to_string()),
+            || true,
             {
                 let refreshes = refreshes.clone();
                 move || {
