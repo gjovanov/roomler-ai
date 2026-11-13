@@ -4887,6 +4887,11 @@ fn drop_folder_with(writer: &files_dir::Writer) -> Result<(PathBuf, bool)> {
 /// (`staging::may_receive`). Root's home is its account's, and must pass
 /// root's rule too ([`own_home_and_downloads`]). It was the temp dir: on a
 /// server, root's was `/tmp`.
+///
+/// #3734 — an XDG folder that fails and is `~/Downloads` itself (a link to
+/// it too: the same folder on the same mount, `staging::same_folder`) is
+/// refused at once, in the fallback's words: trying `~/Downloads` could only
+/// refuse it again, after a line saying it was being tried.
 #[cfg(target_os = "linux")]
 fn default_download_dir(log: bool) -> Result<PathBuf> {
     let uid = own_euid();
@@ -4896,15 +4901,25 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
     };
     let (home, xdg) = own_home_and_downloads();
     if let Some(xdg) = xdg {
+        // #3734 — `~/Downloads`, opened as the fallback opens it, when it is
+        // the very folder `held` holds.
+        let downloads_itself = |held: &std::fs::File| {
+            let downloads = home.as_ref().ok()?.join("Downloads");
+            let its = staging::open_folder(&downloads).ok()?;
+            staging::same_folder(held, &its).then_some(downloads)
+        };
         match staging::open_folder(&xdg) {
             Ok(held) => match staging::may_receive(&held, uid, strict) {
                 Ok(()) => return Ok(xdg),
-                Err(why) if log => tracing::warn!(
-                    folder = %xdg.display(),
-                    %why,
-                    "files: the XDG Downloads folder cannot receive files — trying ~/Downloads"
-                ),
-                Err(_) => {}
+                Err(why) => match downloads_itself(&held) {
+                    Some(downloads) => return Err(cannot(&downloads, &why)),
+                    None if log => tracing::warn!(
+                        folder = %xdg.display(),
+                        %why,
+                        "files: the XDG Downloads folder cannot receive files — trying ~/Downloads"
+                    ),
+                    None => {}
+                },
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) if log => tracing::warn!(
@@ -10997,6 +11012,153 @@ CAN_GRAPHICAL=0
                 asks(),
                 Err(cannot_receive(&dl, writable_by_others())),
                 "a link to a folder every account can write"
+            );
+        }
+
+        /// #3734 — an XDG Downloads folder that is `~/Downloads` itself (its
+        /// `user-dirs.dirs` names `$HOME/Downloads`, as a desktop's does), and
+        /// that cannot receive files, is refused once, in the words the viewer
+        /// was shown before, and nothing is logged for it. Before, a line said
+        /// the fallback was trying `~/Downloads`, the very folder just refused,
+        /// which was then refused again. The begin's own line is the refusal's
+        /// one.
+        #[tokio::test]
+        async fn an_xdg_downloads_that_is_downloads_itself_is_refused_once() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            assert_eq!(
+                own_home_and_downloads().1,
+                Some(dl.clone()),
+                "the XDG Downloads folder is ~/Downloads"
+            );
+            chmod(&dl, 0o777);
+            let refused: Result<PathBuf, String> = Err(cannot_receive(&dl, writable_by_others()));
+            let log = crate::peer::files_log_tests::Logged::start(tracing::Level::WARN);
+            let got = download_dir().map_err(|e| e.to_string());
+            let logged = log.text();
+            drop(log);
+            assert_eq!(got, refused, "refused, in the viewer's words as before");
+            assert!(
+                !logged.contains("trying ~/Downloads"),
+                "no fallback to the folder just refused: {logged}"
+            );
+            assert_eq!(
+                logged, "",
+                "nothing logged: the begin's line is the refusal's one"
+            );
+            let h = FilesHandler::new();
+            let begun = h
+                .begin_as(
+                    FsAs::Daemon,
+                    tid("xdg-is-dl"),
+                    "a.txt".into(),
+                    2,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string());
+            assert_eq!(begun, refused, "and an upload is refused in them");
+        }
+
+        /// Name `value` (`$HOME/…`) as the XDG Downloads folder in the home's
+        /// `~/.config/user-dirs.dirs`: its writer's own plain file that nobody
+        /// else may write, as root's must be to be read.
+        fn xdg_downloads_named(home: &OwnHome, value: &str) {
+            let config = home.path().join(".config");
+            std::fs::create_dir_all(&config).unwrap();
+            let file = config.join("user-dirs.dirs");
+            std::fs::write(&file, format!("XDG_DOWNLOAD_DIR=\"{value}\"\n")).unwrap();
+            chmod(&file, 0o644);
+        }
+
+        /// #3734 — an XDG Downloads folder that is a link to `~/Downloads` is
+        /// `~/Downloads` itself: the folder decides, not its path. It cannot
+        /// receive files, so it is refused once, in the words the viewer was
+        /// shown before (they name `~/Downloads`), and nothing is logged for
+        /// it.
+        #[tokio::test]
+        async fn an_xdg_downloads_that_links_to_downloads_is_refused_once() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, false);
+            let dl = home.downloads();
+            let link = home.path().join("dl-link");
+            std::os::unix::fs::symlink(&dl, &link).unwrap();
+            xdg_downloads_named(&home, "$HOME/dl-link");
+            assert_eq!(
+                own_home_and_downloads().1,
+                Some(link.clone()),
+                "the XDG Downloads folder is the link"
+            );
+            chmod(&dl, 0o777);
+            let log = crate::peer::files_log_tests::Logged::start(tracing::Level::WARN);
+            let got = download_dir().map_err(|e| e.to_string());
+            let logged = log.text();
+            drop(log);
+            assert_eq!(
+                got,
+                Err(cannot_receive(&dl, writable_by_others())),
+                "refused, in the viewer's words as before"
+            );
+            assert_eq!(
+                logged, "",
+                "no fallback to the folder just refused: {logged}"
+            );
+        }
+
+        /// #3734, the control — an XDG Downloads folder elsewhere that cannot
+        /// receive files still falls back to `~/Downloads`, which receives the
+        /// upload, and says so once, as before. So does one that does not open
+        /// (a file in its place).
+        #[tokio::test]
+        async fn an_xdg_downloads_elsewhere_that_cannot_receive_still_falls_back() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, false);
+            let dl = home.downloads();
+            let xdg = home.path().join("xdg-dl");
+            std::fs::create_dir(&xdg).unwrap();
+            chmod(&xdg, 0o777);
+            xdg_downloads_named(&home, "$HOME/xdg-dl");
+            assert_eq!(
+                own_home_and_downloads().1,
+                Some(xdg.clone()),
+                "the XDG Downloads folder is another folder"
+            );
+            let resolved = || {
+                let log = crate::peer::files_log_tests::Logged::start(tracing::Level::WARN);
+                let got = download_dir().map_err(|e| e.to_string());
+                let logged = log.text();
+                drop(log);
+                (got, logged)
+            };
+            let (got, logged) = resolved();
+            assert_eq!(got, Ok(dl.clone()), "it falls back to ~/Downloads");
+            assert_eq!(
+                logged
+                    .matches("the XDG Downloads folder cannot receive files — trying ~/Downloads")
+                    .count(),
+                1,
+                "and says so, once: {logged}"
+            );
+            let h = FilesHandler::new();
+            let id = tid("xdg-elsewhere");
+            h.begin_as(FsAs::Daemon, id.clone(), "a.txt".into(), 2, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"hi").await.expect("chunk");
+            let (placed, _) = h.end(&id).await.expect("end");
+            assert_eq!(placed, dl.join("a.txt"), "an upload lands there");
+            std::fs::remove_dir(&xdg).unwrap();
+            std::fs::write(&xdg, b"not a folder").unwrap();
+            let (got, logged) = resolved();
+            assert_eq!(got, Ok(dl.clone()), "one that does not open falls back too");
+            assert_eq!(
+                logged
+                    .matches("the XDG Downloads folder does not open — trying ~/Downloads")
+                    .count(),
+                1,
+                "and says so, once: {logged}"
             );
         }
 
