@@ -909,6 +909,8 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
             } => {
                 // #3164 — a new session's first event asks the OS afresh.
                 regrant.session_opened();
+                // #3787 — and its first missing display is said at its level.
+                super::no_display::forget();
                 state.open(session, name, can_input, mode_hint, Instant::now());
                 sinks.insert(
                     session,
@@ -1190,7 +1192,8 @@ fn refresh_with(
     } else if regrant.reopen(inj.has_permission(), Instant::now(), os_grants) {
         tracing::info!(
             "input: this injector has no permission — opening it again, no restart needed (#3164, \
-             #2066). A failed open warns right after this line; no warning means it worked."
+             #2066). A failed open says why right after this line, except a missing display this \
+             session already reported (#3787); otherwise no line means it worked."
         );
         *injector = None;
     }

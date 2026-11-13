@@ -140,5 +140,8 @@ display, `/dev/uinput` or a grant no longer kills input until a restart
 (`docs/remote-control.md` §6.1b).
 ⚠️ Off macOS each try is a real open and each failure warns, so the wait doubles up to a
 minute. Don't shorten it: a root daemon with no `DISPLAY` never gets an injector.
+⚠️ That daemon's try opens nothing (#3787): `input/no_display.rs` says why once a session,
+at INFO with nobody signed in at the screen and at ERROR when someone is. The kind is read
+from the error's TYPE (`NoDisplayToOpen`), never from enigo's text.
 ⚠️ `has_permission()` must stay true for any backend that works. This retry drops
 whatever reports false.
