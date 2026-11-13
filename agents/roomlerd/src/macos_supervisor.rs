@@ -708,6 +708,27 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// #3802 — the console person's folder, read with `lstat` (a link at the
+    /// folder is read as the link, never followed), when another account owns
+    /// it, and which of [`kept_for_revert`] it holds: an `lstat` of each of
+    /// those names, no walk. A read only: root changes nothing in a person's
+    /// home.
+    fn person_folder_not_theirs(uid: u32) -> Option<FolderNotTheirs> {
+        let home = crate::appdirs::account_home(uid)?;
+        let path = crate::appdirs::macos_config_dir_in_home(&home, std::path::Path::exists);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        // A name whose read fails for any reason but "not there" counts as
+        // held: the command then reads it as the person before moving anything.
+        let kept = kept_for_revert()
+            .into_iter()
+            .filter(|name| match std::fs::symlink_metadata(path.join(name)) {
+                Ok(_) => true,
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            })
+            .collect();
+        folder_not_theirs(path, uid, meta.uid(), meta.mode(), kept)
+    }
+
     /// Spawn the agent into `uid`'s GUI session, **as that user**.
     ///
     /// ⚠️ `launchctl asuser <uid> <cmd>` joins the user's Mach bootstrap
@@ -735,27 +756,6 @@ mod imp {
     ///
     /// FR-43 P3a — with `one_row` the worker holds no enrollment. The person's
     /// config still resolves the same way: its session knobs are theirs.
-    /// #3802 — the console person's folder, read with `lstat` (a link at the
-    /// folder is read as the link, never followed), when another account owns
-    /// it, and which of [`kept_for_revert`] it holds: an `lstat` of each of
-    /// those names, no walk. A read only: root changes nothing in a person's
-    /// home.
-    fn person_folder_not_theirs(uid: u32) -> Option<FolderNotTheirs> {
-        let home = crate::appdirs::account_home(uid)?;
-        let path = crate::appdirs::macos_config_dir_in_home(&home, std::path::Path::exists);
-        let meta = std::fs::symlink_metadata(&path).ok()?;
-        // A name whose read fails for any reason but "not there" counts as
-        // held: the command then reads it as the person before moving anything.
-        let kept = kept_for_revert()
-            .into_iter()
-            .filter(|name| match std::fs::symlink_metadata(path.join(name)) {
-                Ok(_) => true,
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            })
-            .collect();
-        folder_not_theirs(path, uid, meta.uid(), meta.mode(), kept)
-    }
-
     fn spawn_worker(
         uid: u32,
         exe: &std::path::Path,
