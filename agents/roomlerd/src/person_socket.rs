@@ -378,11 +378,68 @@ fn person_at_the_seat() -> Option<u32> {
 /// person's by then.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn at_the_seat_now(uid: u32) -> bool {
-    tokio::task::spawn_blocking(person_at_the_seat)
-        .await
-        .ok()
-        .flatten()
+    // #3796 — asked here, on the thread a test stood the lookup in on.
+    #[cfg(all(test, target_os = "linux"))]
+    let stood_in = stand_in::lookup_now();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(lookup) = stood_in {
+            return lookup();
+        }
+        person_at_the_seat()
+    })
+    .await
+    .ok()
+    .flatten()
         == Some(uid)
+}
+
+/// #3796 — who is at the seat, as the person socket's check asks it, stood in
+/// on one thread: the lookup itself runs where the real one runs, so a test
+/// sees how long a `ConfigSet` waits for it, and how many lookups began.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod stand_in {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// The lookup stood in: the uid of the person at the seat, or nobody.
+    type Asked = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
+
+    static ASKED: Mutex<Option<(std::thread::ThreadId, Asked)>> = Mutex::new(None);
+
+    /// The tests that stand the lookup in take turns.
+    static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// While this lives, the person socket's check asks the lookup stood in,
+    /// on the thread that stood it in.
+    pub(crate) struct Stood {
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Stood {
+        fn drop(&mut self) {
+            *ASKED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Stand `lookup` in for who is at the seat, on this thread only.
+    pub(crate) async fn person_at_the_seat(
+        lookup: impl Fn() -> Option<u32> + Send + Sync + 'static,
+    ) -> Stood {
+        let turn = TURN.lock().await;
+        *ASKED.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((std::thread::current().id(), Arc::new(lookup)));
+        Stood { _turn: turn }
+    }
+
+    /// The lookup stood in for this thread, if there is one.
+    pub(super) fn lookup_now() -> Option<Asked> {
+        ASKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(thread, _)| *thread == std::thread::current().id())
+            .map(|(_, asked)| asked.clone())
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
