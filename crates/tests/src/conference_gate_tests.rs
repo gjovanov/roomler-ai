@@ -1277,6 +1277,90 @@ async fn a_room_removed_again_after_its_call_ended_ends_nothing_twice() {
     .await;
 }
 
+/// Where a deleted room's teardown stands, as [`SlowTeardown`] says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    Untold,
+    Running(ObjectId),
+    Done(ObjectId),
+}
+
+/// The module id [`SlowTeardown`] registers under. `saas` holds no membership
+/// hook, so nothing is replaced, and it runs last in `HOOK_ORDER`, after
+/// conference and chat.
+const SLOW_UNDER: &str = "saas";
+
+/// A holder of a deleted room whose teardown takes `takes`, longer than the
+/// delete waits for it. It says when it starts and when it has run to its end.
+struct SlowTeardown {
+    takes: Duration,
+    stage: tokio::sync::watch::Sender<Teardown>,
+}
+
+#[async_trait::async_trait]
+impl roomler_core::MembershipLifecycle for SlowTeardown {
+    async fn room_removed(&self, _tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        self.stage.send_replace(Teardown::Running(room_id));
+        tokio::time::sleep(self.takes).await;
+        self.stage.send_replace(Teardown::Done(room_id));
+        Ok(())
+    }
+}
+
+/// A room delete whose teardown outlasts the delete's bound
+/// (`ROOM_REMOVED_BOUND`, 5 s, in chat's room delete): the delete answers 200
+/// at the bound, without waiting for the rest, and the teardown is not cut off
+/// there: it runs on to its end in a task of its own. A delete that awaited
+/// its hook inline would answer only once the teardown ended; one that dropped
+/// the hook at the bound (a plain timeout around it) would stop the teardown
+/// half-way, as with a router removed whose people nobody told.
+#[tokio::test]
+async fn a_room_delete_answers_at_its_bound_and_its_teardown_runs_on() {
+    let bound = Duration::from_secs(5);
+    let takes = bound + Duration::from_secs(4);
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("rdel-slow").await;
+    let room = tenant.rooms[1].id.clone();
+    let (stage, mut seen) = tokio::sync::watch::channel(Teardown::Untold);
+    app.state.core.hooks.register(
+        SLOW_UNDER,
+        roomler_core::Hooks {
+            membership: Some(std::sync::Arc::new(SlowTeardown { takes, stage })),
+            ..Default::default()
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let status = delete_room(&app, &tenant.tenant_id, &room, &tenant.admin.access_token).await;
+    let took = started.elapsed();
+    assert_eq!(status, 200, "the admin deletes the room");
+    assert!(
+        took >= bound,
+        "the delete did not wait for its teardown: {took:?}"
+    );
+    // The delete's own reads and writes come before the bound starts; the
+    // rest is slack for a loaded runner, well short of the teardown's end.
+    assert!(
+        took < bound + Duration::from_secs(2),
+        "the delete waited for its teardown past its bound: {took:?}"
+    );
+    let now = *seen.borrow();
+    assert_eq!(
+        now,
+        Teardown::Running(oid(&room)),
+        "the teardown is still running when the delete answers"
+    );
+
+    let ended = tokio::time::timeout(takes, seen.wait_for(|s| matches!(s, Teardown::Done(_))))
+        .await
+        .map(|done| done.map(|s| *s));
+    assert_eq!(
+        ended.ok().and_then(Result::ok),
+        Some(Teardown::Done(oid(&room))),
+        "the teardown was cut off at the delete's bound"
+    );
+}
+
 /// Delete `room`'s document and nothing else: the room is gone and no one
 /// told conference, as when a delete's request died after the delete or a pod
 /// whose code ends no call served it.

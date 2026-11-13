@@ -1337,9 +1337,10 @@ fn claim_record_of(pod: &str) -> String {
 /// deleted: the room's claim names a pod no one runs, while app1 serves the
 /// call and app2 holds the member's socket. The delete, which app2 serves,
 /// still answers 200, within its bound, once it has waited out the bus
-/// deadline for that pod; its hook could not end the call, so no one hears
-/// of it yet and app1 still serves it. app1's reconcile ends it afterwards,
-/// for both sockets, with its claim and its stats record.
+/// deadline for that pod; its hook could not end the call's media, so no one
+/// hears of it yet and app1 still serves it, though the hook has closed the
+/// call's stats record by the room already. app1's reconcile ends the call
+/// afterwards, for both sockets, with its claim.
 #[tokio::test]
 async fn a_room_deleted_while_the_pod_serving_its_call_cannot_be_reached_ends_it_afterwards() {
     use roomler_ai_api::cluster::bus::RPC_DEADLINE;
@@ -1354,7 +1355,10 @@ async fn a_room_deleted_while_the_pod_serving_its_call_cannot_be_reached_ends_it
 
     // The claim now names a pod no one runs. app1 holds that record as its
     // own, so its claim refresh neither folds the call nor gives the record
-    // up while the test runs.
+    // up while the test runs. The two writes are one Redis round trip apart:
+    // a refresh of app1's landing between them finds a record that is not its
+    // token, in either order of the two, and folds the call (about one run in
+    // ten thousand; no order closes that gap without a seam in the refresh).
     let key = roomler_ai_api::cluster::directory::media_key(&room_id);
     let unreachable = format!("gone-{}", bson::oid::ObjectId::new().to_hex());
     let raw = claim_record_of(&unreachable);
@@ -1445,10 +1449,11 @@ async fn a_close_answered_too_late_after_its_claim_went_is_no_failure() {
     let key = roomler_ai_api::cluster::directory::media_key(&room.to_hex());
     let late = format!("late-{}", bson::oid::ObjectId::new().to_hex());
     let raw = claim_record_of(&late);
-    // It runs out exactly when the close stops waiting for its pod: after
-    // the first read, before the second.
+    // It runs out while the close waits for its pod: half the bus deadline
+    // after it was set, so about a second after the close's first read finds
+    // it and about a second before the second read looks again.
     assert_eq!(
-        dir.claim_nx(&key, &raw, RPC_DEADLINE.as_secs())
+        dir.claim_nx(&key, &raw, RPC_DEADLINE.as_secs() / 2)
             .await
             .unwrap(),
         ClaimOutcome::Won
