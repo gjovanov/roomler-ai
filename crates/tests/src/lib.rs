@@ -228,6 +228,11 @@ mod magic_dns_permission_tests;
 /// FR-115 P5 — the meeting-length cap: warned at 55, ended at 60, once.
 #[cfg(test)]
 mod meeting_cap_tests;
+/// A member's roles are the org's own roles their row lists, read where a
+/// rule is evaluated; role ids are written only from the org's roles; a
+/// deleted role leaves its holders.
+#[cfg(test)]
+mod member_role_ids_tests;
 #[cfg(test)]
 mod member_tests;
 #[cfg(test)]

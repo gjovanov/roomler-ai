@@ -154,6 +154,48 @@ pub async fn get_invite_info(
     }))
 }
 
+/// The roles an invite gives at redemption: those it names that are still
+/// roles of its org, in its order. An invite that names none gives the org's
+/// `member` role. Both redemption paths read it (this route and registration
+/// with an invite code, `auth::auto_accept_invite`).
+///
+/// An invite whose named roles are ALL gone is refused with 409 rather than
+/// turned into another grant: falling back to `member` would give the person a
+/// role the inviter did not choose, and joining with no role would leave a
+/// member nobody meant to make. Nothing is spent; the inviter sends a new one.
+pub(crate) async fn redeemed_role_ids(
+    state: &Core,
+    invite: &roomler_ai_db::models::Invite,
+) -> Result<Vec<ObjectId>, ApiError> {
+    if invite.assign_role_ids.is_empty() {
+        let member_role = state
+            .tenants
+            .get_role_by_name(invite.tenant_id, "member")
+            .await?;
+        return Ok(vec![member_role.id.ok_or_else(|| {
+            ApiError::Internal("the member role has no _id".to_string())
+        })?]);
+    }
+    let org = state
+        .tenants
+        .org_role_ids_among(invite.tenant_id, &invite.assign_role_ids)
+        .await?;
+    let kept: Vec<ObjectId> = invite
+        .assign_role_ids
+        .iter()
+        .copied()
+        .filter(|r| org.contains(r))
+        .collect();
+    if kept.is_empty() {
+        return Err(ApiError::Conflict(
+            "The role this invitation gives no longer exists in the organization: ask for a new \
+             invitation"
+                .to_string(),
+        ));
+    }
+    Ok(kept)
+}
+
 /// POST /api/invite/{code}/accept — accept invite (requires auth)
 pub async fn accept_invite(
     State(state): State<Core>,
@@ -202,16 +244,7 @@ pub async fn accept_invite(
         }
     }
 
-    // Determine roles to assign (default to "member" role if none specified)
-    let role_ids = if invite.assign_role_ids.is_empty() {
-        let member_role = state
-            .tenants
-            .get_role_by_name(invite.tenant_id, "member")
-            .await?;
-        vec![member_role.id.unwrap()]
-    } else {
-        invite.assign_role_ids.clone()
-    };
+    let role_ids = redeemed_role_ids(&state, &invite).await?;
 
     // Add the user to the tenant
     state
@@ -223,6 +256,7 @@ pub async fn accept_invite(
             Some(invite.inviter_id),
         )
         .await?;
+    state.hooks.org_roles_changed(invite.tenant_id).await;
 
     // Atomically increment the use count
     state
@@ -561,6 +595,7 @@ pub async fn add_member(
         .tenants
         .add_member(tid, user_id, role_ids, Some(auth.user_id))
         .await?;
+    state.hooks.org_roles_changed(tid).await;
 
     Ok((
         StatusCode::CREATED,

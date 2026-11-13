@@ -210,6 +210,19 @@ pub trait MembershipLifecycle: Send + Sync {
         let _ = (tenant_id, room_id, user_id);
         Ok(())
     }
+
+    /// Who holds which role in the org `tenant_id` changed, or a role of it
+    /// was deleted: called AFTER the write, by every writer of a member's
+    /// roles (assign, unassign, delete, a member added with roles, an invite
+    /// redeemed). A holder that compiled role-scoped rules ahead of their use
+    /// recompiles them.
+    ///
+    /// ⚠️ It must return at once and cannot fail the write that already
+    /// happened: an implementation schedules its work (and coalesces a
+    /// burst), it never does it inline.
+    async fn org_roles_changed(&self, tenant_id: ObjectId) {
+        let _ = tenant_id;
+    }
 }
 
 /// What one module registers: the hook traits it implements.
@@ -324,6 +337,16 @@ impl HookRegistry {
                 .map_err(|e| anyhow::anyhow!("{module}: org_member_removed: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Tell every holder that who holds which role in `tenant_id` changed
+    /// ([`MembershipLifecycle::org_roles_changed`]), after the write. Each
+    /// holder only schedules its work, so this returns at once and never
+    /// fails the request that made the change.
+    pub async fn org_roles_changed(&self, tenant_id: ObjectId) {
+        for (_, hook) in self.membership_lifecycles() {
+            hook.org_roles_changed(tenant_id).await;
+        }
     }
 
     /// Run every `room_member_removed` hook in order, once the membership is

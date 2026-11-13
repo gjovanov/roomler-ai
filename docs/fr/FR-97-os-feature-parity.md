@@ -224,7 +224,7 @@ prevent, and the guard re-asserts it on every tick.
   although every agent row has one (`models.rs:1917`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
-  (`crates/modules/network/src/overlay.rs:2912`). A client accepts any peer whose fanned routes hold `/0`
+  (`crates/modules/network/src/overlay.rs:2970`). A client accepts any peer whose fanned routes hold `/0`
   (`route_guard.rs:303-304`). So an exit that stops offering, on any OS, stays an exit in its clients' netmaps until
   an admin un-approves it. ⚠️ A device-side fix alone cannot close the black hole.
 
@@ -306,7 +306,7 @@ and the consent chain's fallbacks.
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:1428`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
-| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:271-295`, `:1092-1099`) | P6e |
+| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:271-295`, `:1096-1103`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1013-1022` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3720`, `session_end.rs:220`) | P4d |
@@ -422,7 +422,7 @@ flowchart TB
   0.4.134 too):* our adapter comes up not forwarding, because after a crash it is recreated with its old setting
   where the boot purge could not reach it; and the ledger records our WinNAT instances so the purge removes the
   one a crash leaves. The WinNAT reason now names Hyper-V.
-- **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2651`). The approval stays stored, because a
+- **Server.** Fan `approved_routes ∩ advertised_routes` (`overlay.rs:2708`). The approval stays stored, because a
   flapping join must not cost an admin's decision, but it takes effect only while the device still offers the route.
   An agent older than P0b keeps advertising what it always did, so the intersection changes nothing for it.
 - **Admin UI.** An OS chip on the routes row (`OverlayNodeResponse` gains `os`, read from `Agent.os`), and the

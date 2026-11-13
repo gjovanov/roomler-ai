@@ -181,7 +181,7 @@ is kept unless all three are on:
 Production runs the window at 60 s, with a scope that names a few test devices (FR-138's P3).
 Whatever the setting says, the server announces at most 120 s (`MAX_WINDOW_SECS`,
 `crates/modules/fleet/src/resume_scope.rs:377`), and the device keeps a peer no longer than that
-either (`WINDOW_CAP`, `agents/roomlerd/src/session_table.rs:62`).
+either (`WINDOW_CAP`, `agents/roomlerd/src/session_table.rs:70`).
 
 ⚠️ **The `PUT` replaces the whole list.** Read the list first and send it back with your change: a
 list of one entry leaves exactly one device or org in the scope. An id that names no org or device

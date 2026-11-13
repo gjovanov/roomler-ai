@@ -29,6 +29,9 @@
 //!
 //! [`end_tunnel_client`]: crate::routes::tunnel::end_tunnel_client
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{Json, extract::State};
 use bson::{Bson, Document, doc, oid::ObjectId};
@@ -48,13 +51,44 @@ pub(crate) const ALERT: &str = "membership_tunnel_end";
 /// The reason the overlay releases of a membership's end are logged with.
 const REASON: &str = "member_removed";
 
+/// How long a role change waits before its re-fan starts, so a burst of
+/// changes to one org (an admin assigning a role to several people) costs one
+/// re-fan, not one each.
+const ROLES_REFAN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Network's [`MembershipLifecycle`]: the hook `Module::hooks` registers.
 pub struct MembershipHooks {
     pub state: NetworkState,
+    /// The overlay re-fans role changes ask for, at most one per org at a time
+    /// ([`MembershipLifecycle::org_roles_changed`]).
+    roles_refan: RefanQueue,
+}
+
+impl MembershipHooks {
+    pub fn new(state: NetworkState) -> Self {
+        Self {
+            state,
+            roles_refan: RefanQueue::new(ROLES_REFAN_DEBOUNCE),
+        }
+    }
 }
 
 #[async_trait]
 impl MembershipLifecycle for MembershipHooks {
+    /// Who holds which role in the org changed: re-fan its overlay so the
+    /// nodes stop (or start) matching role-scoped rules now, not at their next
+    /// reconnect. Scheduled, never inline, and never two at once for one org
+    /// ([`RefanQueue`]).
+    async fn org_roles_changed(&self, tenant_id: ObjectId) {
+        let state = self.state.clone();
+        self.roles_refan.request(tenant_id, move |tenant| {
+            let state = state.clone();
+            async move {
+                crate::routes::overlay_policy::refan_for_role_change(&state, tenant).await;
+            }
+        });
+    }
+
     async fn org_member_removed(
         &self,
         tenant_id: ObjectId,
@@ -70,6 +104,114 @@ impl MembershipLifecycle for MembershipHooks {
         }
         // Never `Err`: see the module doc.
         Ok(())
+    }
+}
+
+/// The overlay re-fans role changes ask for: **at most one per org at a time**,
+/// and none lost.
+///
+/// The first change for an org starts a worker for it. The worker waits the
+/// debounce, clears the org's "one more run" flag and runs the re-fan. A change
+/// that arrives while the worker waits or runs only sets the flag, so any
+/// number of changes during a run cost one more run after it. The flag is
+/// cleared BEFORE the run reads anything, so every change is followed by a run
+/// that started after it. The worker leaves only when a run ends with the flag
+/// unset, and it removes the org's mark under the same lock as that check, so a
+/// change after that point starts a new worker.
+///
+/// One re-fan of an org reads on the order of N² rows for N nodes, so runs
+/// overlapping for one org would multiply that load on a shared pod.
+///
+/// ⚠️ The mutex is held for one map operation at a time, never across an
+/// await. A worker that panics or is cancelled clears its org's mark in a drop
+/// guard ([`WorkerMark`]), so the next change starts a new worker instead of
+/// finding the org stuck behind a dead one.
+#[derive(Clone)]
+pub(crate) struct RefanQueue {
+    /// org → "one more run is owed". An org is present while its worker lives.
+    orgs: Arc<std::sync::Mutex<HashMap<ObjectId, bool>>>,
+    debounce: std::time::Duration,
+}
+
+impl RefanQueue {
+    pub(crate) fn new(debounce: std::time::Duration) -> Self {
+        Self {
+            orgs: Arc::default(),
+            debounce,
+        }
+    }
+
+    fn orgs(&self) -> std::sync::MutexGuard<'_, HashMap<ObjectId, bool>> {
+        self.orgs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ask for a run of `refan` for `org`; returns at once. The run starts
+    /// after the debounce, and never while another run for `org` is going.
+    pub(crate) fn request<F, Fut>(&self, org: ObjectId, refan: F)
+    where
+        F: Fn(ObjectId) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        {
+            let mut orgs = self.orgs();
+            if let Some(owed) = orgs.get_mut(&org) {
+                *owed = true;
+                return;
+            }
+            orgs.insert(org, false);
+        }
+        let queue = self.clone();
+        tokio::spawn(async move {
+            let mut mark = WorkerMark {
+                orgs: queue.orgs.clone(),
+                org,
+                left: false,
+            };
+            loop {
+                tokio::time::sleep(queue.debounce).await;
+                queue.orgs().insert(org, false);
+                refan(org).await;
+                let again = {
+                    let mut orgs = queue.orgs();
+                    let owed = orgs.get(&org).copied().unwrap_or(false);
+                    if !owed {
+                        orgs.remove(&org);
+                    }
+                    owed
+                };
+                if !again {
+                    mark.left = true;
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Whether `org` has a worker (waiting or running).
+    #[cfg(test)]
+    fn busy(&self, org: ObjectId) -> bool {
+        self.orgs().contains_key(&org)
+    }
+}
+
+/// Removes an org's mark when its worker ends without leaving itself (a re-fan
+/// that panicked, or a task the runtime dropped): the next change for the org
+/// then starts a new worker.
+struct WorkerMark {
+    orgs: Arc<std::sync::Mutex<HashMap<ObjectId, bool>>>,
+    org: ObjectId,
+    /// Set by the worker when it removed its own mark.
+    left: bool,
+}
+
+impl Drop for WorkerMark {
+    fn drop(&mut self) {
+        if !self.left {
+            self.orgs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.org);
+        }
     }
 }
 
@@ -482,4 +624,158 @@ async fn stale_pairs(state: &NetworkState, limit: usize) -> Result<Vec<StalePair
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod refan_queue_tests {
+    //! [`RefanQueue`] with a probe re-fan instead of the overlay: it counts its
+    //! runs and the most that ran at once, and can be held until released.
+
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bson::oid::ObjectId;
+    use tokio::sync::watch;
+
+    use super::RefanQueue;
+
+    type Run = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    #[derive(Clone)]
+    struct Probe {
+        runs: Arc<AtomicUsize>,
+        running: Arc<AtomicUsize>,
+        most_at_once: Arc<AtomicUsize>,
+        /// A run waits here until this reads `true`.
+        gate: Arc<watch::Sender<bool>>,
+    }
+
+    impl Probe {
+        fn new(open: bool) -> Self {
+            Self {
+                runs: Arc::default(),
+                running: Arc::default(),
+                most_at_once: Arc::default(),
+                gate: Arc::new(watch::channel(open).0),
+            }
+        }
+
+        fn open(&self) {
+            self.gate.send_replace(true);
+        }
+
+        fn runs(&self) -> usize {
+            self.runs.load(Ordering::SeqCst)
+        }
+
+        fn refan(&self) -> impl Fn(ObjectId) -> Run + Send + 'static {
+            let p = self.clone();
+            move |_org| {
+                let p = p.clone();
+                Box::pin(async move {
+                    p.runs.fetch_add(1, Ordering::SeqCst);
+                    let now = p.running.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.most_at_once.fetch_max(now, Ordering::SeqCst);
+                    let mut gate = p.gate.subscribe();
+                    let _ = gate.wait_for(|open| *open).await;
+                    p.running.fetch_sub(1, Ordering::SeqCst);
+                })
+            }
+        }
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// A burst of changes while a re-fan runs costs exactly one more run after
+    /// it, and two runs for one org never overlap.
+    #[tokio::test]
+    async fn a_burst_during_a_run_costs_one_more_run_and_runs_never_overlap() {
+        let queue = RefanQueue::new(Duration::from_millis(5));
+        let org = ObjectId::new();
+        let probe = Probe::new(false);
+        queue.request(org, probe.refan());
+        until("the first run starts", || probe.runs() == 1).await;
+        for _ in 0..50 {
+            queue.request(org, probe.refan());
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(probe.runs(), 1, "no second run while the first is held");
+        probe.open();
+        until("the org is idle", || !queue.busy(org)).await;
+        assert_eq!(probe.runs(), 2, "fifty changes during a run cost one more");
+        assert_eq!(probe.most_at_once.load(Ordering::SeqCst), 1);
+    }
+
+    /// Changes that arrive during the debounce join the run it starts.
+    #[tokio::test]
+    async fn changes_during_the_debounce_join_one_run() {
+        let queue = RefanQueue::new(Duration::from_millis(50));
+        let org = ObjectId::new();
+        let probe = Probe::new(true);
+        for _ in 0..20 {
+            queue.request(org, probe.refan());
+        }
+        until("the org is idle", || !queue.busy(org)).await;
+        assert_eq!(probe.runs(), 1);
+    }
+
+    /// A change after the worker left starts a new one: nothing is missed.
+    #[tokio::test]
+    async fn a_change_after_a_run_ended_starts_a_new_run() {
+        let queue = RefanQueue::new(Duration::from_millis(5));
+        let org = ObjectId::new();
+        let probe = Probe::new(true);
+        queue.request(org, probe.refan());
+        until("the first run ends", || !queue.busy(org)).await;
+        queue.request(org, probe.refan());
+        until("the second run ends", || !queue.busy(org)).await;
+        assert_eq!(probe.runs(), 2);
+    }
+
+    /// Two orgs do not wait for each other.
+    #[tokio::test]
+    async fn two_orgs_run_side_by_side() {
+        let queue = RefanQueue::new(Duration::from_millis(5));
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        let held = Probe::new(false);
+        let free = Probe::new(true);
+        queue.request(a, held.refan());
+        until("org a's run starts", || held.runs() == 1).await;
+        queue.request(b, free.refan());
+        until("org b's run ends", || !queue.busy(b)).await;
+        assert_eq!(free.runs(), 1, "org b ran while org a's run was held");
+        assert!(queue.busy(a));
+        held.open();
+        until("org a is idle", || !queue.busy(a)).await;
+    }
+
+    fn a_refan_that_panics() {
+        panic!("a re-fan that panics (expected in this test)");
+    }
+
+    /// A re-fan that panics does not leave the org stuck: the next change runs.
+    #[tokio::test]
+    async fn a_run_that_panics_leaves_the_org_free() {
+        let queue = RefanQueue::new(Duration::from_millis(5));
+        let org = ObjectId::new();
+        queue.request(org, |_org| -> Run {
+            Box::pin(async { a_refan_that_panics() })
+        });
+        until("the panicked worker clears its mark", || !queue.busy(org)).await;
+        let probe = Probe::new(true);
+        queue.request(org, probe.refan());
+        until("the org is idle", || !queue.busy(org)).await;
+        assert_eq!(probe.runs(), 1);
+    }
 }

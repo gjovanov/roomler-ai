@@ -88,7 +88,7 @@ the relay node for the member.
 
 ⚠️ **An unreadable policy set is a refusal, never a grant.** The mint reads policies
 through `try_load_acl`
-([`overlay.rs:2413`](../crates/modules/network/src/overlay.rs#L2413)), which returns
+([`overlay.rs:2417`](../crates/modules/network/src/overlay.rs#L2417)), which returns
 `Result`. The older `load_acl` fails open, byte-identical to "no ACL configured", and a
 gate written against it would have granted on a Mongo blip. `PolicyUnreadable` is its
 own deny reason, so a blip is never mistaken for a policy decision.
@@ -112,7 +112,7 @@ three relay frames when they arrive on a secondary org's socket
 
 ## The mint — what the server decides
 
-`maybe_mint` ([`org_relay.rs:544`](../crates/modules/network/src/org_relay.rs#L544))
+`maybe_mint` ([`org_relay.rs:547`](../crates/modules/network/src/org_relay.rs#L547))
 runs on every `rc:overlay.relay_request` and never delays the TURN grant that frame
 also asks for.
 
@@ -279,7 +279,7 @@ the relay and both members, and each one writes a `revoke` row:
 | trigger | reason | code |
 |---|---|---|
 | the org switched peer relays off | `mode_off` | `revoke_tenant` |
-| a policy edit no longer grants a member the relay | `acl_revoked` | `reconcile_acl` ([`org_relay.rs:815`](../crates/modules/network/src/org_relay.rs#L815)) |
+| a policy edit no longer grants a member the relay | `acl_revoked` | `reconcile_acl` ([`org_relay.rs:818`](../crates/modules/network/src/org_relay.rs#L818)) |
 | the relay's approval was cleared | `policy_revoked` | `revoke_relay_agent` |
 | a party was removed from the overlay | `device_removed` / `device_left` | `revoke_node` |
 
@@ -386,7 +386,7 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 
 | piece | where |
 |---|---|
-| the mint: gates, ranking, session, push | [`crates/modules/network/src/org_relay.rs`](../crates/modules/network/src/org_relay.rs) — `plan_mint` `:377`, `maybe_mint` `:544`, revoke `:742`–`:815` |
+| the mint: gates, ranking, session, push | [`crates/modules/network/src/org_relay.rs`](../crates/modules/network/src/org_relay.rs) — `plan_mint` `:377`, `maybe_mint` `:547`, revoke `:745`–`:818` |
 | admin routes + approval policy | [`crates/modules/network/src/routes/peer_relay.rs`](../crates/modules/network/src/routes/peer_relay.rs) |
 | modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2110`–`:2284` |
 | wire framing and shape rules | [`orgrelay/wire.rs`](../crates/tunnel-core/src/overlay/orgrelay/wire.rs) |

@@ -749,8 +749,9 @@ async fn handle_overlay_join(
     // `removes` rather than mere omission: omitting a peer (or shipping
     // `reachable: false`) is a no-op against an already-installed peer — only
     // the removes branch tears down the WG peer, its route and its carrier.
+    let fan_roles = CompileRoles::new(self_node.tenant_id);
     for peer in all.iter().filter(|n| n.id != self_node.id) {
-        let peer_src = overlay_source_of(state, peer).await;
+        let peer_src = overlay_source_of(state, peer, &fan_roles).await;
         // The shaped peer here is the JOINER, whose identity we already have.
         let joiner_ingress = acl.enforcing().then_some(&joiner_src);
         // U2 — this recipient's edge is `peer → self_node` (the joiner).
@@ -1129,7 +1130,8 @@ async fn handle_overlay_relay_request(
     // decorative. Enforced only in `Enforce` mode; `Warn` logs and grants.
     let acl = load_acl(state, self_node.tenant_id).await;
     if !matches!(acl.mode, OverlayAclMode::Off) {
-        let src = overlay_source_of(state, &self_node).await;
+        let src =
+            overlay_source_of(state, &self_node, &CompileRoles::new(self_node.tenant_id)).await;
         // FR-97 P0b — the same offered set the netmap fans.
         let routes = peer.effective_routes();
         let access = evaluate_overlay(
@@ -1916,10 +1918,11 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
         }
     };
     let acl = load_acl(state, node.tenant_id).await;
+    let roles = CompileRoles::new(node.tenant_id);
     // P4 — the fanned node is the SHAPED peer for every recipient, so its
     // identity is resolved once, not per recipient.
     let node_src = if acl.enforcing() {
-        Some(overlay_source_of(state, node).await)
+        Some(overlay_source_of(state, node, &roles).await)
     } else {
         None
     };
@@ -1937,7 +1940,7 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
     let reverse = reachable && node.supports_server_relay_strategy;
     let (node_recip_src, peer_reach) = if reverse {
         (
-            Some(overlay_source_of(state, node).await),
+            Some(overlay_source_of(state, node, &roles).await),
             reachability(state, &peers).await,
         )
     } else {
@@ -1945,7 +1948,7 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
     };
     let mut reverse_rows: Vec<NetmapPeer> = Vec::new();
     for peer in peers.iter().filter(|p| p.id != node.id) {
-        let src = overlay_source_of(state, peer).await;
+        let src = overlay_source_of(state, peer, &roles).await;
         // U2 — the edge is `recipient=peer → this fanned node`; both full
         // rows are in hand, so stamp the server verdict onto the shaped peer.
         let verdict = server_relay_verdict(state, peer, node);
@@ -2015,8 +2018,9 @@ async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64,
 /// [`fan_upsert_shaped`] maintains on ordinary changes.
 async fn fan_pair_verdicts(state: &NetworkState, a: &OverlayNode, b: &OverlayNode) {
     let acl = load_acl(state, a.tenant_id).await;
-    let a_src = overlay_source_of(state, a).await;
-    let b_src = overlay_source_of(state, b).await;
+    let roles = CompileRoles::new(a.tenant_id);
+    let a_src = overlay_source_of(state, a, &roles).await;
+    let b_src = overlay_source_of(state, b, &roles).await;
     let reach = reachability(state, std::slice::from_ref(b)).await;
     let epoch = next_epoch();
     // Toward `a`: b's row, stamped with the a→b verdict. The requester `a`
@@ -2465,6 +2469,7 @@ pub async fn load_acl(state: &NetworkState, tenant_id: ObjectId) -> AclCtx {
 pub async fn try_overlay_source_of(
     state: &NetworkState,
     node: &OverlayNode,
+    roles: &CompileRoles,
 ) -> Result<OverlaySource, DaoError> {
     let owner_user_id = match &node.node_ref {
         NodeRef::Agent { agent_id } => {
@@ -2485,15 +2490,63 @@ pub async fn try_overlay_source_of(
                 .owner_user_id
         }
     };
-    let role_ids = state
-        .tenants
-        .member_role_ids(node.tenant_id, owner_user_id)
-        .await?;
+    let role_ids = roles.member_roles(state, node, owner_user_id).await?;
     Ok(OverlaySource {
         node_id: node.id.unwrap_or_default(),
         owner_user_id: Some(owner_user_id),
         role_ids,
     })
+}
+
+/// The roles one overlay compile matches `RoleId` selectors against: the
+/// org's role ids, read on first use and reused for every node the compile
+/// resolves, intersected with each node owner's membership row.
+///
+/// A compile (a node's full netmap, a delta fan, the DERP allow table, a relay
+/// decision) asks once per node, and the org's role set is the same for all of
+/// them, so this costs one `roles` query per compile rather than one per node.
+/// The compile is the point of use: a role deleted, or taken from someone,
+/// stops matching at the next compile, and a role change re-fans the org
+/// (`crate::membership`'s `org_roles_changed`). A failed read is not kept:
+/// the next node asks again.
+///
+/// ⚠️ An id in a member's row that is no role of the org (deleted since, or
+/// another org's) never matches here. That is the read-time half of the rule,
+/// and the half no write path can get around.
+pub struct CompileRoles {
+    tenant_id: ObjectId,
+    org: tokio::sync::OnceCell<roomler_ai_services::dao::tenant::OrgRoleIds>,
+}
+
+impl CompileRoles {
+    /// A compile over the nodes of `tenant_id`.
+    pub fn new(tenant_id: ObjectId) -> Self {
+        Self {
+            tenant_id,
+            org: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The roles `owner` holds in the compile's org, as `RoleId` selectors
+    /// see them. A node of another org (never in one compile, by
+    /// construction) holds none here rather than borrowing this org's set.
+    async fn member_roles(
+        &self,
+        state: &NetworkState,
+        node: &OverlayNode,
+        owner: ObjectId,
+    ) -> Result<Vec<ObjectId>, DaoError> {
+        if node.tenant_id != self.tenant_id {
+            warn!(node = %node.id.unwrap_or_default(), compile = %self.tenant_id,
+                "overlay acl: a node of another org in this compile; role-scoped rules will not match it");
+            return Ok(Vec::new());
+        }
+        let org = self
+            .org
+            .get_or_try_init(|| state.tenants.org_role_ids(self.tenant_id))
+            .await?;
+        state.tenants.member_live_role_ids_in(org, owner).await
+    }
 }
 
 /// [`try_overlay_source_of`] for NETMAP shaping: degrades instead of failing —
@@ -2503,7 +2556,11 @@ pub async fn try_overlay_source_of(
 /// Each swallowed error is LOGGED. Before FR-19 this was `.ok()` and
 /// `unwrap_or_default()`: a scoped rule silently failing to match, with no
 /// trace to explain a peer that vanished from a netmap.
-pub async fn overlay_source_of(state: &NetworkState, node: &OverlayNode) -> OverlaySource {
+pub async fn overlay_source_of(
+    state: &NetworkState,
+    node: &OverlayNode,
+    roles: &CompileRoles,
+) -> OverlaySource {
     let node_id = node.id.unwrap_or_default();
     let owner = match &node.node_ref {
         NodeRef::Agent { agent_id } => state
@@ -2529,7 +2586,7 @@ pub async fn overlay_source_of(state: &NetworkState, node: &OverlayNode) -> Over
         }
     };
     let role_ids = match owner_user_id {
-        Some(uid) => match state.tenants.member_role_ids(node.tenant_id, uid).await {
+        Some(uid) => match roles.member_roles(state, node, uid).await {
             Ok(roles) => roles,
             Err(e) => {
                 warn!(%node_id, %e,
@@ -2776,14 +2833,15 @@ pub async fn shape_full_netmap(
     reach: &HashMap<ObjectId, bool>,
 ) -> ShapedNetmap {
     let acl = load_acl(state, self_node.tenant_id).await;
-    let self_src = overlay_source_of(state, self_node).await;
+    let roles = CompileRoles::new(self_node.tenant_id);
+    let self_src = overlay_source_of(state, self_node, &roles).await;
     let mut peers: Vec<NetmapPeer> = Vec::new();
     for n in all.iter().filter(|n| n.id != self_node.id) {
         // P4 — resolving the peer's own identity costs up to 2 reads, so do it
         // ONLY when the tenant is enforcing and the rules will actually ship.
         // An `off`/`warn` tenant's join path is unchanged.
         let peer_src = if acl.enforcing() {
-            Some(overlay_source_of(state, n).await)
+            Some(overlay_source_of(state, n, &roles).await)
         } else {
             None
         };
