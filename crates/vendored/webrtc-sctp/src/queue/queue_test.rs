@@ -427,11 +427,16 @@ async fn test_pending_queue_selection_persistence() -> Result<()> {
 #[tokio::test]
 async fn test_pending_queue_append() -> Result<()> {
     let pq = PendingQueue::new();
-    pq.append(vec![
-        make_data_chunk(0, false, NO_FRAGMENT),
-        make_data_chunk(1, false, NO_FRAGMENT),
-        make_data_chunk(3, false, NO_FRAGMENT),
-    ])
+    // roomler (#3755): `append` takes the write loop's wake.
+    let (wake, _woken) = tokio::sync::mpsc::channel(1);
+    pq.append(
+        vec![
+            make_data_chunk(0, false, NO_FRAGMENT),
+            make_data_chunk(1, false, NO_FRAGMENT),
+            make_data_chunk(3, false, NO_FRAGMENT),
+        ],
+        &wake,
+    )
     .await;
     assert_eq!(pq.get_num_bytes(), 30, "total bytes mismatch");
     assert_eq!(pq.len(), 3, "len mismatch");

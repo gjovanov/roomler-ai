@@ -3,6 +3,8 @@ use std::sync::atomic::Ordering;
 
 use portable_atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::{Mutex, Semaphore};
+// roomler (#3755): a write that waits for room wakes the write loop first.
+use tokio::sync::{mpsc, SemaphorePermit, TryAcquireError};
 use util::sync::RwLock;
 
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
@@ -145,10 +147,17 @@ impl PendingQueue {
     /// Appends chunks to the back of the pending queue. False when the queue
     /// was closed (#3716) before they got their permits.
     ///
+    /// roomler (#3755): `wake` is the association's write loop, woken before
+    /// the append waits for room ([`Self::take_room`]).
+    ///
     /// # Panics
     ///
     /// If it's a mix of unordered and ordered chunks.
-    pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) -> bool {
+    pub(crate) async fn append(
+        &self,
+        chunks: Vec<ChunkPayloadData>,
+        wake: &mpsc::Sender<()>,
+    ) -> bool {
         if chunks.is_empty() {
             return true;
         }
@@ -156,15 +165,12 @@ impl PendingQueue {
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
 
         if total_user_data_len >= self.append_large_at {
-            self.append_large(chunks).await
+            self.append_large(chunks, wake).await
         } else {
             let _sem_lock = self.semaphore_lock.lock().await;
-            let permits = self
-                .semaphore
-                .acquire_many(total_user_data_len as u32)
-                .await;
-            // roomler (#3716): closed by the association's close; was an unwrap.
-            let Ok(permits) = permits else {
+            // roomler (#3755): `take_room`, which wakes the write loop if it waits.
+            // roomler (#3716): `None` = closed by the association's close; was an unwrap.
+            let Some(permits) = self.take_room(total_user_data_len, wake).await else {
                 return false;
             };
             permits.forget();
@@ -173,17 +179,34 @@ impl PendingQueue {
         }
     }
 
+    /// roomler (#3755): permits for `n` bytes, or `None` once the queue was
+    /// closed (#3716). An append that must wait for room wakes the write loop
+    /// first: only the loop, sending what is queued, makes room, and on an
+    /// association with nothing in flight nothing else wakes it (an ack, a
+    /// timer, the end of an append). A message larger than the room left waited
+    /// there forever, its first chunks queued and never sent.
+    async fn take_room(&self, n: usize, wake: &mpsc::Sender<()>) -> Option<SemaphorePermit<'_>> {
+        match self.semaphore.try_acquire_many(n as u32) {
+            Ok(permits) => Some(permits),
+            Err(TryAcquireError::Closed) => None,
+            Err(TryAcquireError::NoPermits) => {
+                let _ = wake.try_send(());
+                self.semaphore.acquire_many(n as u32).await.ok()
+            }
+        }
+    }
+
     // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) -> bool {
+    async fn append_large(&self, chunks: Vec<ChunkPayloadData>, wake: &mpsc::Sender<()>) -> bool {
         // lock this for the whole duration
         let _sem_lock = self.semaphore_lock.lock().await;
 
         for chunk in chunks.into_iter() {
             let user_data_len = chunk.user_data.len();
-            let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // roomler (#3716): closed by the association's close; was an unwrap.
+            // roomler (#3755): `take_room`, which wakes the write loop if it waits.
+            // roomler (#3716): `None` = closed by the association's close; was an unwrap.
             // The chunks queued so far are the association's to drop.
-            let Ok(permits) = permits else {
+            let Some(permits) = self.take_room(user_data_len, wake).await else {
                 return false;
             };
             permits.forget();

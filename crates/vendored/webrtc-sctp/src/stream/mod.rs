@@ -502,7 +502,12 @@ impl Stream {
         // NOTE: append is used here instead of push in order to prevent chunks interlacing.
         // roomler (#3716): false = the association closed while this write
         // waited in flow control; it is let go with an error, not kept forever.
-        if !self.pending_queue.append(chunks).await {
+        // roomler (#3755): the queue wakes the write loop if it waits for room.
+        if !self
+            .pending_queue
+            .append(chunks, &self.awake_write_loop_ch)
+            .await
+        {
             return Err(Error::ErrPayloadDataStateNotExist);
         }
 
