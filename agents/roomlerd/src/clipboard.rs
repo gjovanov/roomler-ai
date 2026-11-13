@@ -2002,6 +2002,50 @@ mod mac_gate_tests {
     }
 }
 
+/// #3733 — a clipboard for a test of the channel's handler, with nothing on
+/// the host behind it: its worker takes every write except one of the text
+/// `refused`, which it answers with an error, and holds nothing, so every read
+/// finds the clipboard empty.
+#[cfg(test)]
+impl Clipboard {
+    pub(crate) fn for_tests(refused: &'static str) -> Self {
+        let (tx, rx) = std_mpsc::channel::<ClipboardCmd>();
+        thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    ClipboardCmd::Write { text, reply } => {
+                        let _ = reply.send(if text == refused {
+                            Err(anyhow::anyhow!("the test's clipboard refused it"))
+                        } else {
+                            Ok(())
+                        });
+                    }
+                    ClipboardCmd::WriteImage { reply, .. }
+                    | ClipboardCmd::WriteHtml { reply, .. }
+                    | ClipboardCmd::WriteNative { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    ClipboardCmd::Read { reply } => {
+                        let _ = reply.send(Ok(String::new()));
+                    }
+                    ClipboardCmd::ReadImage { reply } => {
+                        let _ = reply.send(Ok(None));
+                    }
+                    ClipboardCmd::ReadHtml { reply } => {
+                        let _ = reply.send(Ok(None));
+                    }
+                    ClipboardCmd::ReadNative { reply } => {
+                        let _ = reply.send(Ok(None));
+                    }
+                    ClipboardCmd::Watch { .. } | ClipboardCmd::Unwatch { .. } => {}
+                    ClipboardCmd::Shutdown => return,
+                }
+            }
+        });
+        Self { tx }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
