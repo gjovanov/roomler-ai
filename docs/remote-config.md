@@ -439,8 +439,9 @@ is not it (`DeviceSwitch`, `crates/modules/fleet/src/remote_config.rs:100`;
 `crates/tests/src/rc_resume_tests.rs:516`). Until FR-138's AC6 it was dropped
 unread with the body's other unknown keys (`rest`,
 `crates/modules/fleet/src/remote_config.rs:59`), and the push answered 200 as if it
-had taken. Set it on the device
-(`roomler config set rc_sessions_survive_reattach true`, then `roomler restart`).
+had taken. It is on by default since FR-138 P4-1, and changes nothing until the server announces a window.
+Turn it off on the device (`roomler config set rc_sessions_survive_reattach off`, then
+`roomler restart`); `roomler config clear` returns it to the default, on.
 The fleet is staged server-side instead, through the resume scope, which a platform
 admin keeps
 ([deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138)).

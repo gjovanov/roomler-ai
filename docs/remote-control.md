@@ -881,7 +881,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:120`](../agents/roomlerd/src/input/sas.rs#L120)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:7056`](../agents/roomlerd/src/signaling.rs#L7056)),
+  announcement ([`signaling.rs:7130`](../agents/roomlerd/src/signaling.rs#L7130)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -3621,7 +3621,7 @@ its peer, pumps, input, banner, idle clock and recording run on, and the next co
 
 | Switch | Default | Where it is read |
 |---|---|---|
-| `rc_sessions_survive_reattach` in the config, or `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`. Device-side: `DesiredConfig` has no such field, so no push sets it | off | once per connection (`survive_enabled`, `agents/roomlerd/src/session_table.rs:100`). On, the hello says `rc-resume` (`apply_resume_word`, `:129`), and so does every heartbeat that re-announces the caps. A loop that holds the delegation host, a supervised Mac's daemon, reads it as every loop does since P2b: its delegated sessions are kept by the GUI worker on its orders, and one it cannot keep it does not claim (`connection_keeps`, `:115`; §11.16.1) |
+| `rc_sessions_survive_reattach` in the config, or `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`. Device-side: `DesiredConfig` has no such field, so no push sets it | on, since P4-1: only `0`, `false`, `no` or `off` turns it off, and an empty or unknown value is on. Off on one device: `roomler config set rc_sessions_survive_reattach off`, then a restart | once per connection (`survive_enabled`, `agents/roomlerd/src/session_table.rs:100`). On, the hello says `rc-resume` (`apply_resume_word`, `:129`), and so does every heartbeat that re-announces the caps. A loop that holds the delegation host, a supervised Mac's daemon, reads it as every loop does since P2b: its delegated sessions are kept by the GUI worker on its orders, and one it cannot keep it does not claim (`connection_keeps`, `:115`; §11.16.1) |
 
 On, the device still keeps nothing until the server it speaks to announces a window, `rc:agent.resume_window {secs}`
 (`set_window`, `agents/roomlerd/src/session_table.rs:1385`). The device caps it at 120 s (`WINDOW_CAP`, `:70`), a
@@ -3634,7 +3634,7 @@ announced and has not withdrawn, read at the moment of each decision (`window_op
 `agents/roomlerd/src/session_table.rs:1369`): the server's end said peer to peer (C1, below), and on a supervised
 Mac a delegated session offered `keepable`, its record, and the daemon serving a session it holds (§11.16.1, A1 to
 A3). A device the resume scope does not cover is announced no window, so with its switch on it behaves exactly as
-with it off, and the scope alone stages the fleet once the switch's default is on (FR-138 P4). The tests compare the
+with it off, and the scope alone stages the fleet, the switch's default being on since P4-1. The tests compare the
 two on what can be seen of a session (its peer's closes, what it said on its control channel, the end hook, the
 lines, what is kept, what the server hears after the next hello, what the GUI worker is told), for a window never
 announced, one announced as 0, and one withdrawn: at each of the seventeen arms
@@ -4378,7 +4378,7 @@ with an agent release. Every pairing behaves as before FR-138, or ends the sessi
 
 | Older or off | What a socket loss or a roll does | Proven by |
 |---|---|---|
-| The device says no `rc-resume`: a release before P2a, or its switch off | The server announces no window and ends the session at the loss as `agent_disconnect`, as before. With its switch off the device also ignores a window it is told, and every exit closes every peer as `close_all_peers` did | `a_device_without_the_verb_ends_its_session_at_the_socket_loss_as_today` (`crates/tests/src/rc_resume_claim_tests.rs:601`); `with_the_switch_off_every_arm_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2471`); `the_switch_off_at_the_next_connection_closes_what_was_kept` (`:2931`); `the_resume_word_follows_the_switch_by_equality` (`:2998`) |
+| The device says no `rc-resume`: a release before P2a, a release before P4-1 whose switch was never set (off was its default), or its switch turned off | The server announces no window and ends the session at the loss as `agent_disconnect`, as before. With its switch off the device also ignores a window it is told, and every exit closes every peer as `close_all_peers` did | `a_device_without_the_verb_ends_its_session_at_the_socket_loss_as_today` (`crates/tests/src/rc_resume_claim_tests.rs:601`); `with_the_switch_off_every_arm_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2471`); `the_switch_off_at_the_next_connection_closes_what_was_kept` (`:2931`); `the_resume_word_follows_the_switch_by_equality` (`:2998`) |
 | The server's window is 0, its default, or the server predates FR-138 | No window and no `resume_secs`: the device keeps nothing, the page never holds, and a socket loss of either end ends the session as before. At window 0 a claim is refused, a rejoin is dropped, and nothing reads or writes a row no hub holds | `with_the_window_at_zero_a_socket_loss_ends_as_today_and_a_dead_pods_row_stays` (`crates/tests/src/rc_resume_claim_tests.rs:855`); `with_the_window_at_zero_the_viewers_side_is_as_today` (`crates/tests/src/rc_resume_rejoin_tests.rs:827`); `at_window_zero_the_new_wire_changes_nothing` (`crates/tests/src/rc_resume_tests.rs:382`); `with_no_window_every_arm_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2487`); "without resume_secs, the page is today's" (`ui/src/__tests__/composables/useRemoteControl.hold.spec.ts:725`) |
 | The device is outside the scope, or taken out of it | As window 0, for that device. Taking it out tells its live connection 0, so its next loss ends its sessions, and a session it had already kept is refused at its claim, or closes at its own deadline. With its switch on it then behaves as with its switch off (P4-0): every exit closes as before, the server's end closes the peer at once, and a supervised Mac makes no record of a delegated session. A scope the server cannot read at the hello announces no window either | `a_device_outside_the_scope_ends_its_session_as_today_and_its_claim_is_refused` (`crates/tests/src/rc_resume_claim_tests.rs:639`); `a_window_withdrawn_keeps_nothing_at_the_next_exit` (`agents/roomlerd/src/session_table.rs:2503`); `a_scope_change_reaches_a_device_on_the_other_pod` (`crates/tests/src/rc_resume_sweep_tests.rs:303`); `p4_0_with_no_window_every_arm_ends_as_with_the_switch_off` (`agents/roomlerd/src/session_table.rs:4564`); `p4_0_with_no_window_the_servers_end_closes_at_once_as_off` (`:4636`); `p4_0_with_no_window_the_delegation_host_is_the_switch_off` (`:4792`); `a_scope_that_cannot_be_read_at_the_hello_announces_no_window` (`crates/tests/src/rc_resume_claim_tests.rs:1348`) |
 | The page predates P1c | It ignores `resume_secs` and `rc:session.detached` and never rejoins. The device's claim resumes the session, which waits the window for a viewer and then ends `controller_hangup`, marked `limit: hold_expired`. The page's own socket loss holds the session the same way, and its next request, which names nothing in `replaces`, reaps the held one as the same person's | `a_resume_its_viewer_never_rejoins_ends_marked_hold_expired` (`crates/tests/src/rc_resume_ends_tests.rs:610`); `a_held_session_never_costs_its_own_viewer_the_slot` (`crates/tests/src/rc_resume_rejoin_tests.rs:393`), its second half |
@@ -6497,7 +6497,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2683`](../crates/agent-core/src/config.rs#L2683))
+([`crates/agent-core/src/config.rs:2634`](../crates/agent-core/src/config.rs#L2634))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |
