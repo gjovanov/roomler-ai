@@ -1097,6 +1097,108 @@ async fn a_room_leave_on_one_pod_withdraws_the_seat_the_other_pod_holds() {
     member.close(None).await.ok();
 }
 
+/// The id of the call running in `room_id`, read from the room's document
+/// before the room goes (the id goes with it).
+async fn current_call_id(app: &TestApp, room_id: &str) -> bson::oid::ObjectId {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let found = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .find_one(bson::doc! { "_id": rid })
+        .await
+        .unwrap()
+        .expect("the room exists");
+    found
+        .get_object_id("current_call_id")
+        .unwrap_or_else(|_| panic!("a call is running in the room: {found}"))
+}
+
+/// `call_across_pods`' room is deleted by a request `via` serves: the call
+/// ends on both pods. Both sockets hear it ended (the member's is on app2,
+/// its seat on app1), neither pod keeps a router, seat or claim of it, and
+/// its stats record closes.
+async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp) {
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(app1, app2).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+    let call_id = current_call_id(app1, &room_id).await;
+
+    let resp = via
+        .auth_delete(
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the admin deletes the room");
+
+    for (who, ws) in [("the host", &mut host), ("the member", &mut member)] {
+        let ended = next_frame_of(ws, "room:call_ended").await;
+        assert_eq!(ended["data"]["room_id"], room_id.as_str(), "{who}: {ended}");
+        assert_eq!(ended["data"]["reason"], "room_deleted", "{who}: {ended}");
+    }
+    for (pod, app) in [("app1", app1), ("app2", app2)] {
+        assert!(
+            !conf(app).room_manager.has_room(&rid),
+            "{pod} kept the call's router"
+        );
+        assert!(
+            !conf(app).media_claim_tokens.contains_key(&rid),
+            "{pod} still holds the call's claim"
+        );
+    }
+    assert_eq!(
+        conf(app1).room_manager.get_connection_room(&conn),
+        None,
+        "the owner pod still seats the member"
+    );
+    let key = roomler_ai_api::cluster::directory::media_key(&room_id);
+    let dir = app1.state.cluster_directory.clone().unwrap();
+    assert_eq!(
+        dir.get(&key).await.unwrap(),
+        None,
+        "the call's claim outlived its room"
+    );
+    let record = app1
+        .db
+        .collection::<bson::Document>("call_sessions")
+        .find_one(bson::doc! { "_id": call_id })
+        .await
+        .unwrap()
+        .expect("the call has a stats record");
+    assert_eq!(
+        record.get_str("end_reason").ok(),
+        Some("room_deleted"),
+        "the call's stats record: {record}"
+    );
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// A room deleted on the pod that serves its call ends the call there, and
+/// tells the socket the other pod holds.
+#[tokio::test]
+async fn a_room_deleted_on_the_pod_serving_its_call_ends_the_call_on_both_pods() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    delete_the_call_room_via(&app1, &app1, &app2).await;
+}
+
+/// A room deleted on the pod that does NOT serve its call ends the call on
+/// the pod that does.
+#[tokio::test]
+async fn a_room_deleted_on_the_other_pod_ends_its_call_on_the_pod_serving_it() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    delete_the_call_room_via(&app2, &app1, &app2).await;
+}
+
 // ── C-5: DERP directory + registration-driven rehome ────────────────
 
 /// A DERP network split across pods converges toward the NEWEST
