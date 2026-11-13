@@ -562,7 +562,9 @@ flowchart TD
     S -->|"SYSTEM"| C{"someone signed in<br/>at the console?"}
     C -->|yes| U["ConsoleUser:<br/>that person's own token"]
     C -->|"no: the console shows<br/>its sign-in screen"| LS["refused: login_screen<br/>(decision 6)"]
-    S -->|"root (Linux)"| L{"someone signed in at the<br/>active graphical session?<br/>(a person, not the greeter)"}
+    S -->|"root (Linux)"| K{"did the console lookup<br/>answer in time?<br/>(3 s at most, #3830)"}
+    K -->|"no: logind did not answer"| NK["refused: not confirmed<br/>(Refusal::NotKnownYet,<br/>never 'nobody')"]
+    K -->|yes| L{"someone signed in at the<br/>active graphical session?<br/>(a person, not the greeter)"}
     L -->|yes| SU["SessionUser: their uid, gid<br/>and groups, in their session"]
     L -->|no| V{"its own virtual desktop,<br/>or the synthetic source?"}
     V -->|yes| N["nobody: a REMOTE recording<br/>records unattended (P1f);<br/>a local one is refused"]
@@ -624,9 +626,10 @@ into the daemon's log: a service has no stderr of its own to share.
   refuses `no_frame`, which is how P2e found every start failing on that
   desktop, local and remote. A Wayland session stays out of this: its display
   would be Xwayland's, and capture refuses that empty root. The answer is
-  reused for 5 s, since the
-  Recordings view polls every second while a recording runs; the unattended
-  guards ask fresh.
+  reused for 5 s, since the Recordings view polls every second while a
+  recording runs; the unattended guards ask fresh. The walk never runs on the
+  daemon's async runtime, and an answer that does not come in time is never
+  "nobody" ("Who is at the screen, without holding up the daemon", below).
 - ⚠️ **A login screen is not "nobody" (decision 6, `Refusal::LoginScreen`).**
   It shows account names, a person may be standing at it, and nothing on it
   can say that a recording runs. So a SYSTEM or root daemon at its login
@@ -695,6 +698,70 @@ into the daemon's log: a service has no stderr of its own to share.
   person and as root, `pointer: in_frame`, with GNOME's own sharing indicator
   up. On **KDE Wayland** it opens its own ScreenCast portal session, so the
   portal may ask the person first (P0's restore-token question, not read).
+
+### Who is at the screen, without holding up the daemon (#3830)
+
+On a Linux system install, "who is signed in" is several `loginctl` processes,
+and logind answers each one over D-Bus with a 25 s timeout. A stopped or hung
+logind used to stall the daemon's whole async runtime through this lookup. It
+ran on a runtime worker and held a lock while it waited. The heartbeat's
+`record_caps()` then queued behind that lock on the worker that drove the
+timers and the sockets. The daemon logged `runtime canary: a 10 ms timer woke
+late`, and every remote-control session dropped. The lookup is now built so
+that cannot happen:
+
+```mermaid
+flowchart LR
+    T["the tray's record_status,<br/>the heartbeat's record_caps()"] -->|"shown: never waits"| M["the last answer<br/>(stamped with when its<br/>lookup began)"]
+    D["a local start, the folder,<br/>a listing, a delete"] -->|"decided: at most 5 s old,<br/>else wait 3 s at most"| F
+    P["P1f: a remote start's checks,<br/>the watch over an<br/>unattended recording"] -->|"fresh: wait 3 s at most"| F["the one lookup in flight<br/>(thread console-lookup)"]
+    M -.->|"older than 5 s:<br/>start one, wait for nothing"| F
+    F -->|"loginctl walks"| L["logind"]
+    F -->|"the lookup's own thread<br/>stores its answer"| M
+```
+
+- **It runs on a thread of its own, one lookup at a time**, never on an async
+  worker. The recording code uses `one_in_flight::Remembered`
+  (`one_in_flight.rs:282`), over #3796's `OneInFlight` (`launch::unix::CONSOLE`,
+  `recording/launch.rs:1563`). However many callers ask while a lookup hangs,
+  only that one lookup's thread waits.
+- **No lock is held across `loginctl`.** The lookup's own thread stores its
+  answer, stamped with when the lookup began, so a lookup that hung answers
+  for the moment it asked. The answer still lands when nobody waits for it
+  any more.
+- **Each caller reads it one of three ways**, by what it does with the
+  answer:
+
+| Read | Who | Waits | With no answer in time |
+|---|---|---|---|
+| **Shown** (`launch::decide_now`, `recording/launch.rs:328`) | the state the tray and the Recordings view poll (`record_status`); what the device advertises (the hello and the heartbeat's `record_caps()`); the remote precheck | never. It takes the last answer, however old, and starts a lookup when that answer is older than 5 s | the last answer stands. Before the first one, the state reads `available: false` with the words below. The device still advertises `available`, a capability, as at a login screen, so the viewer's Record control does not come and go with logind |
+| **Decided** (`launch::decide`, `recording/launch.rs:339`) | a local start; the folder (`record --where`); a listing and a delete done as the person | an answer at most 5 s old, else the lookup's, 3 s at most | refused with `Refusal::NotKnownYet`: "Could not tell who is signed in at this computer's screen. Try again." The files and the person socket use the same sentence for the same cause |
+| **Fresh** (`launch::decide_fresh`, `recording/launch.rs:364`, P1f) | a remote start's decision; the check before the host is asked; the launch re-check; the watch over an UNATTENDED recording | only a lookup that began after the question, 3 s at most | not confirmed, never "nobody". A start is refused, `unavailable` on the wire with the words. An unattended recording stops `session_changed`, as it does when someone signs in |
+
+- ⚠️ **A timeout is never "nobody".** `Seat::NotKnownYet`
+  (`recording/launch.rs:1492`) is an answer of its own. The decision table
+  reads it before the login screen and before "nobody"
+  (`recording/launch.rs:219`), and `shows_a_screen` counts it as a screen
+  someone may be at, whatever the recorder could reach
+  (`recording/launch.rs:1549`). `Seat::Unknown`, a `loginctl` that cannot run
+  at all, is unchanged. The wait is `CONSOLE_LOOKUP_WAIT`
+  (`recording/launch.rs:1468`).
+- **An attended recording is never asked.** The watch over a remote recording
+  asks who is signed in only while the recording is unattended: `follow`
+  (`recording/remote.rs:2127`), and `grace_watch` for a detached recording
+  (`recording/remote.rs:430`). A local recording has no watch at all. So a
+  person's own recording, or a recording of their screen with the banner up,
+  runs on through a hung logind. logind cannot switch sessions while it hangs.
+- **The launch is off the runtime too.** Launching the recorder as the person
+  finds their session with the same `loginctl` walk
+  (`launch::unix::spawn_session_user`) and their account through NSS
+  (`exec::drop_to_std`). So `launch::spawn` runs on a blocking thread, for a
+  start (`recording/manager.rs:704`) and for `record --where`
+  (`recording/manager.rs:1038`). No timeout surrounds it: a recorder spawned
+  after its caller had given up would run with nothing holding it.
+- The answer is primed when the recorder's supervisor is built
+  (`RecordingManager::new`, `recording/manager.rs:176`), so the first status
+  after a daemon start already has one.
 
 ## 7. roomler-desktop — the Recordings view and the tray (P2b)
 
@@ -1029,7 +1096,7 @@ sequenceDiagram
 |---|---|
 | `not_granted` | the session's grant lacks RECORD |
 | `disabled_on_device` | the owner's switch is off, read at the moment of asking and again after the prompt |
-| `unavailable` | there is nobody to record as (the kill switch; a macOS root daemon, which has no screen), or the session was handed to a macOS GUI worker by a daemon older than P1e-mac, which sent no record context |
+| `unavailable` | there is nobody to record as (the kill switch; a macOS root daemon, which has no screen); who is signed in could not be told in time (#3830: logind did not answer, `detail` says so, and a retry asks again); or the session was handed to a macOS GUI worker by a daemon older than P1e-mac, which sent no record context |
 | `login_screen` | the device is at its login screen (decision 6): Windows' sign-in screen, a Linux greeter or root's own desktop. Refused before the host is asked; `detail` says it. The device still advertises `available`, and records once someone signs in |
 | `audio_unsupported` | computer audio was asked for and this device cannot record it at all (a build without `audio`; a Mac before FR-97 P2a), whatever the owner set — named ahead of the owner's gate, since no setting fixes it, with the words in `detail` (#1760, §9). Additive on the wire: a viewer older than the code shows it as itself |
 | `audio_not_allowed` | computer audio was asked for and the owner has not allowed it |
@@ -1159,7 +1226,12 @@ a banner:
 ⚠️ All three ask the system who is signed in FRESH. Linux caches that answer
 for 5 s for the status polls, and a cached "nobody" read twice within
 milliseconds is one observation: review found the launch re-check a no-op on
-the cache, before the check was made fresh.
+the cache, before the check was made fresh. Since #3830 each one waits 3 s at
+most for its answer, off the async runtime, and an answer not had in that time
+is NOT CONFIRMED, never the cached one. The start is refused `unavailable`,
+and an unattended recording already running stops `session_changed`, as it
+does when someone signs in (§6, "Who is at the screen, without holding up the
+daemon").
 
 ⚠️ **A login screen is never unattended (decision 6).** A display manager's
 greeter, root's own desktop, and Windows' sign-in screen all show a screen a
@@ -1385,7 +1457,7 @@ sequenceDiagram
 |---|---|---|
 | The record context crosses | `delegate.rs:431` (`SessionParams::record`), `signaling.rs:4352` (sent AFTER the consent mode is resolved), `signaling.rs:3271` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1108`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
 | The row says what the worker can do | `delegate_worker.rs:106` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1555` (`effective_record`), `signaling.rs:2719` (the heartbeat, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
-| An OFF is live | `remote.rs:591` (`subscribe_gates`), `delegate_worker.rs:594-611` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
+| An OFF is live | `remote.rs:600` (`subscribe_gates`), `delegate_worker.rs:594-611` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:1468` (noted where the grant crosses), `delegate.rs:2071` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:728`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
@@ -1823,6 +1895,8 @@ the music in the preview.
 | `tests/control_dc_record.rs`, download (P3b-2) | the controller lists its recording, downloads it whole (bytes equal to the file, `sha256` equal to the file's) and resumed from the middle (only the rest sent, the same whole-file `sha256`); `bad_name`, `bad_offset` and `not_found` said by name; both transfers reported `downloaded` with their bytes; a second controller of the same device lists nothing and gets `not_found` for the name | same step, `--test control_dc_record` |
 | `tests/control_dc_record.rs`, unattended (P1f); `tests/recorder.rs`; `recording::launch::unix` | a service with nobody signed in refuses a LOCAL start, then records a remote session with NO indicator surface at all (companion down, session unlisted), says `unattended: true`, and writes into the daemon's own folder (0700 on unix), never the person's `record_dir`. When someone signs in, it stops `session_changed` (red without the watch: it ran on, bannerless), and the controller still lists and downloads it. A fresh ask for who is signed in sees a sign-in the 5 s cache would hide (red when `fresh` is ignored). The identity is decided once: a remote start decided unattended is refused when someone is signed in by the time the recorder launches (red without the check) | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`) |
 | `tests/control_dc_record.rs`, a login screen (decision 6); `recording::launch` | a device at its login screen still advertises `available` and `remote`, refuses a local start, and refuses a remote one `login_screen` with the words, reported as a refusal, before the host is asked (no prompt stands), and with nothing at all to show a banner still `login_screen`, never an unattended recording, no file anywhere. An unattended recording stops `session_changed` when a login screen comes up, and at that login screen the controller still lists and downloads it. The decision table: SYSTEM or root at a login screen is `LoginScreen`, someone signed in wins over it, an identity that is not the service's never asks. The Linux seat (from review): any ACTIVE graphical session counts, whoever's, read from `loginctl`'s own output (a greeter, a Wayland greeter; not a text console, not an inactive desktop); a `loginctl` that cannot be asked is `Unknown`, never `Empty`; the whole `shows_a_screen` table (a greeter refuses whatever the recorder could reach; an empty or unknown seat refuses with a `DISPLAY` or DRM; the host's own virtual desktop and the synthetic source never refuse). A login screen found at the launch re-check is `StartError::Unavailable(LoginScreen)`, `login_screen` on the wire. Red, each on its own: the login screen read as nobody (it records unattended), the early refusal removed (the prompt stands), the code folded into `unavailable`, the capability tied to who is signed in (nothing advertised), the watch stopping only for a sign-in (it runs on), the unattended folder listed only while unattended recording is possible (the file leaves the list), the reach ignored, the second walk skipped | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`, `--lib recording::`) |
+| `recording::remote` console-lookup tests and `recording::launch` (#3830), Linux | the `loginctl` walk is stood in (`launch::unix::StandIn`), and the manager decides as a root daemon. With the lookup held: on a two-worker runtime, the status, the caps, a listing, a local start and the fresh check ask again and again while a 10 ms timer still wakes within 500 ms, and one lookup is in flight; the status and the caps answer within 500 ms from a worker, the caps still `available`; after a cached "nobody", the fresh check and the launch re-check answer `NotKnownYet` within their wait, never the cached answer. With a lookup that answers, a person, a greeter and an empty seat decide as before. The table: not told in time refuses `NotKnownYet` ahead of the login screen, with the files' sentence. Red at master on the first three (`a_console_lookup_that_never_answers_delays_no_timer`, `the_status_and_the_caps_answer_while_the_console_lookup_hangs`, `a_fresh_check_with_no_answer_in_time_is_not_confirmed`): the lock held across the lookup on a worker | "Test the recorder (FR-85)" (`--lib recording::`) |
+| `one_in_flight` `Remembered` unit tests (#3830), every OS | `now` never waits and starts one lookup, and an answer nobody waited for still lands; past its window the last answer stands while one refresh hangs; `current` takes its window and past it waits for a lookup; `fresh` never takes the stored answer; a hung lookup holds no async worker (a 10 ms timer on a two-worker runtime) | every `--lib` lane (`one_in_flight::`) |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `a_recorder_being_available_is_not_permission_to_record` (P3c-2); `rc:recording.activity` owned by `remote`. "What the server holds" (§10): `a_recording_activity_row_holds_no_content` and `a_recording_activity_frame_carries_the_claim_and_nothing_else`. Red, each on its own: a field added to the row, an array under an existing key, a field added to the frame | same |
 | `delegate::params_tests` (P1e-mac) | `the_mac_relay_carries_no_sound_choice`: a `microphone` or `audio` written into the frame that hands a session to a Mac's worker is dropped. Red with a `microphone` field added to `DelegatedRecord` | every unfiltered `--lib` run |
 | `tests/control_dc_record.rs`, the banner first (P3d) | `a_slow_banner_still_records_and_comes_first`: a companion whose first read comes 1.5 s late still records, the viewer told `announcing`, and not until a poll after that read. `a_companion_that_never_reads_is_refused`: `no_indicator_surface`, "did not answer", the mark taken down, no recorder. Red with the wait gone, with no turn after the first read, and with a silent companion let through | "Test the recorder (FR-85)" |

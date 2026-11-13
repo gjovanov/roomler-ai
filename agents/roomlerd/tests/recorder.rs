@@ -1779,7 +1779,7 @@ mod process {
         use roomlerd::recording::launch::{self, Identity};
         use tokio::io::AsyncBufReadExt;
         let parent = launch::describe_self();
-        let expected = launch::decide().expect("a test run is never refused");
+        let expected = launch::decide().await.expect("a test run is never refused");
         let whoami = |identity: Identity| async move {
             let l = launch::spawn(
                 identity,
@@ -1854,7 +1854,7 @@ mod process {
         use tunnel_core::localapi::{RecordStartOpts, Response};
 
         let _serial = MANAGER_TESTS.lock().await;
-        let identity = launch::decide().expect("a test run is never refused");
+        let identity = launch::decide().await.expect("a test run is never refused");
         let dir = scratch();
         let out = dir.path().join("Recordings");
         let cfg_path = dir.path().join("config.toml");
