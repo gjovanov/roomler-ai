@@ -5896,7 +5896,7 @@ async fn handle_server_msg(
             // would be an identity nobody asked for (see `exec::RunAs`).
             if via_service && !cfg!(windows) {
                 warn!(
-                    %request_id, %caller,
+                    %request_id, ?caller,
                     "rc:rpc.exec via the SYSTEM service refused — not a Windows device"
                 );
                 let _ = outbound_tx
@@ -5925,7 +5925,7 @@ async fn handle_server_msg(
                 None => crate::exec::RunAs::Daemon,
                 Some(Ok((who, _))) => who,
                 Some(Err(why)) => {
-                    warn!(%request_id, %caller, %why, "rc:rpc.exec refused — unknown run_as");
+                    warn!(%request_id, ?caller, %why, "rc:rpc.exec refused — unknown run_as");
                     let _ = outbound_tx
                         .send(ClientMsg::RpcResult {
                             request_id,
@@ -5945,7 +5945,7 @@ async fn handle_server_msg(
             // this is the atomic and not the startup snapshot.
             if !remote_cfg.exec_enabled() {
                 warn!(
-                    %request_id, %caller,
+                    %request_id, ?caller,
                     "rc:rpc.exec refused — exec_enabled is off on this device"
                 );
                 // Always answer. A caller is blocked on this; silence would
@@ -6098,7 +6098,7 @@ async fn handle_server_msg(
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
                 let outcome = if !decision.granted() {
-                    warn!(%request_id, %caller, ?decision, "rc:rpc.exec denied at the device");
+                    warn!(%request_id, ?caller, ?decision, "rc:rpc.exec denied at the device");
                     crate::exec::ExecOutcome {
                         error: Some(format!(
                             "the operator at this device did not approve the command ({decision:?})"
@@ -6114,11 +6114,11 @@ async fn handle_server_msg(
                     // withdraws the command so a late claim cannot run it.
                     match crate::exec_service::ring(&request_id).await {
                         Ok(()) => {
-                            info!(%request_id, %caller, "rc:rpc.exec handed to the SYSTEM service");
+                            info!(%request_id, ?caller, "rc:rpc.exec handed to the SYSTEM service");
                             return;
                         }
                         Err(e) => {
-                            warn!(%request_id, %caller, %e, "rc:rpc.exec: the SYSTEM service did not take it");
+                            warn!(%request_id, ?caller, %e, "rc:rpc.exec: the SYSTEM service did not take it");
                             crate::exec::ExecOutcome {
                                 error: Some(e),
                                 ..Default::default()

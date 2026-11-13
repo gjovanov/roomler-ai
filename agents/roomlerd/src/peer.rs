@@ -1218,7 +1218,7 @@ impl AgentPeer {
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
-            info!(session = %session_id, %label, "data channel opened");
+            info!(session = %session_id, ?label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
             let native_dims_for_dc = native_dims_for_dc.clone();
@@ -10714,7 +10714,7 @@ fn attach_input_handler(
             let parsed: input::InputMsg = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(%e, "input: parse failed");
+                    debug!(e = ?e.to_string(), "input: parse failed");
                     return;
                 }
             };
@@ -11023,7 +11023,7 @@ fn attach_control_handler(
             let val: serde_json::Value = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(%session_id, %e, "control: malformed JSON, dropped");
+                    debug!(%session_id, e = ?e.to_string(), "control: malformed JSON, dropped");
                     return;
                 }
             };
@@ -11983,7 +11983,7 @@ fn cursor_scale_from_dims(native_dims: u64, encoded_dims: u64) -> (f32, f32) {
 fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let label = dc.label().to_string();
     dc.on_message(Box::new(move |msg| {
-        debug!(%session_id, %label, bytes = msg.data.len(), "DC msg (unhandled)");
+        debug!(%session_id, ?label, bytes = msg.data.len(), "DC msg (unhandled)");
         // FR-101 P4b-2 — a view-only session's input channel lands here: what
         // it sends is never injected, but the person sending it is present,
         // and the idle limit must not end their session under them.
@@ -12070,6 +12070,18 @@ fn attach_clipboard_handler(
         warn!(%session_id, "clipboard: init failed — DC will no-op");
         return;
     };
+    attach_clipboard(dc, session_id, cb, session_end);
+}
+
+/// #3733 — [`attach_clipboard_handler`] past its two gates, moved here as it
+/// was: the channel's handlers on `cb`. A test hands it a clipboard of its own.
+#[cfg(feature = "clipboard")]
+fn attach_clipboard(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    cb: crate::clipboard::Clipboard,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
     // rc.44 — per-session reassembler for `clipboard:write-chunk`
     // envelopes. Shared across all on_message callbacks via the Arc.
     // Browser-side chunker is bounded at 14 KB per envelope; this
@@ -12155,7 +12167,7 @@ fn attach_clipboard_handler(
                     rx.frame(&msg.data)
                 };
                 if let Err(reason) = res {
-                    debug!(%session_id, %reason, "clipboard: dropped binary frame");
+                    debug!(%session_id, ?reason, "clipboard: dropped binary frame");
                 }
                 return;
             }
@@ -12167,7 +12179,7 @@ fn attach_clipboard_handler(
             let parsed = match parsed {
                 Ok(p) => p,
                 Err(e) => {
-                    debug!(%session_id, %e, "clipboard: unparseable JSON");
+                    debug!(%session_id, e = ?e.to_string(), "clipboard: unparseable JSON");
                     return;
                 }
             };
@@ -12220,13 +12232,13 @@ fn attach_clipboard_handler(
                     };
                     match outcome {
                         crate::clipboard::WriteChunkOutcome::Pending => {
-                            debug!(%session_id, id=%id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
+                            debug!(%session_id, id=?id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
                         }
                         crate::clipboard::WriteChunkOutcome::Complete(full_text) => {
                             let bytes = full_text.len();
                             match cb.write(full_text).await {
                                 Ok(()) => {
-                                    info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
+                                    info!(%session_id, id=?id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
                                     tally_clipboard(session_id, TransferDirection::ToHost, bytes);
                                     // v2 ack, keyed by the chunk id the
                                     // browser already assigns. Old UIs
@@ -12241,7 +12253,7 @@ fn attach_clipboard_handler(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(%session_id, id=%id, %e, "clipboard: chunked write failed");
+                                    warn!(%session_id, id=?id, %e, "clipboard: chunked write failed");
                                     let reply = serde_json::json!({
                                         "t": "clipboard:error",
                                         "message": format!("{e}"),
@@ -12254,7 +12266,7 @@ fn attach_clipboard_handler(
                             }
                         }
                         crate::clipboard::WriteChunkOutcome::Rejected(reason) => {
-                            warn!(%session_id, id=%id, %reason, "clipboard: chunk rejected");
+                            warn!(%session_id, id=?id, ?reason, "clipboard: chunk rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12543,10 +12555,10 @@ fn attach_clipboard_handler(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, w, h, bytes, "clipboard: image write begin")
+                            debug!(%session_id, ?id, w, h, bytes, "clipboard: image write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: image begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: image begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12569,10 +12581,10 @@ fn attach_clipboard_handler(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, html_bytes, text_bytes, "clipboard: html write begin")
+                            debug!(%session_id, ?id, html_bytes, text_bytes, "clipboard: html write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: html begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: html begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12596,10 +12608,10 @@ fn attach_clipboard_handler(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
+                            debug!(%session_id, ?id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: native begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: native begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12681,7 +12693,7 @@ async fn finish_rich_write(
             "bytes": bytes,
         }),
         Err(message) => {
-            warn!(%session_id, id, %message, "clipboard: rich write failed");
+            warn!(%session_id, id, ?message, "clipboard: rich write failed");
             serde_json::json!({
                 "t": "clipboard:error",
                 "message": message,
@@ -17209,6 +17221,25 @@ mod files_channel_tests {
 
     impl Pair {
         pub(super) async fn open(permissions: Permissions, served: FilesChannel) -> Self {
+            // The production router, as `AgentPeer`'s `on_data_channel` calls it.
+            Self::open_with("files", |device, session_end| {
+                attach_files(
+                    device,
+                    bson::oid::ObjectId::new(),
+                    permissions,
+                    served,
+                    session_end,
+                )
+            })
+            .await
+        }
+
+        /// #3733 — a channel named `label`, whose device end `attach` takes
+        /// with the session's end, before the channel opens.
+        pub(super) async fn open_with(
+            label: &str,
+            attach: impl FnOnce(Arc<RTCDataChannel>, &CancellationToken),
+        ) -> Self {
             let pc = || async {
                 Arc::new(
                     APIBuilder::new()
@@ -17220,9 +17251,9 @@ mod files_channel_tests {
             };
             let (viewer_pc, device_pc) = (pc().await, pc().await);
             let viewer = viewer_pc
-                .create_data_channel("files", None)
+                .create_data_channel(label, None)
                 .await
-                .expect("a files channel");
+                .expect("a data channel");
             let (heard_tx, heard) = mpsc::unbounded_channel();
             viewer.on_message(Box::new(move |msg| {
                 let heard_tx = heard_tx.clone();
@@ -17268,22 +17299,15 @@ mod files_channel_tests {
                 .expect("the answer");
             let device = tokio::time::timeout(Duration::from_secs(30), dc_rx)
                 .await
-                .expect("the files channel never reached the device")
+                .expect("the channel never reached the device")
                 .expect("the channel's sender");
-            // The production router, as `AgentPeer`'s `on_data_channel` calls it.
             let session_end = CancellationToken::new();
-            attach_files(
-                device,
-                bson::oid::ObjectId::new(),
-                permissions,
-                served,
-                &session_end,
-            );
+            attach(device, &session_end);
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             while viewer.ready_state() != RTCDataChannelState::Open {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "the viewer's files channel never opened"
+                    "the viewer's {label} channel never opened"
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -17643,6 +17667,227 @@ mod refused_upload_tests {
             placed.parent().and_then(|p| std::fs::canonicalize(p).ok()),
             std::fs::canonicalize(temp.path()).ok(),
             "it landed in the folder asked for"
+        );
+    }
+}
+
+/// #3733 — on every data channel, text a viewer sent (an id, a channel's name,
+/// a frame's type), and a reason or an error built from it, is logged with
+/// Debug escaping: a line break in it never starts a log line of its own.
+/// [`files_log_tests`] is the files channel's. Each test sends over a real
+/// channel, in this process, to the production handler. At the end of the
+/// file, so no line above moves.
+#[cfg(test)]
+mod wire_text_log_tests {
+    use super::files_channel_tests::Pair;
+    use super::files_log_tests::Logged;
+    use super::*;
+    #[cfg(feature = "clipboard")]
+    use serde_json::Value;
+    use serde_json::json;
+
+    /// What the viewer's text says after its line break: no log line may start
+    /// with it.
+    const SECOND: &str = "SECOND LINE";
+
+    /// The log lines that start with [`SECOND`], and each `(what, escaped)`
+    /// whose line, the first that says `what`, does not hold `escaped`: every
+    /// line a line break from the viewer broke.
+    fn broken<'a>(text: &'a str, expected: &[(&'a str, &str)]) -> Vec<&'a str> {
+        let started = text.lines().filter(|line| line.starts_with(SECOND));
+        let unescaped = expected
+            .iter()
+            .filter(|(what, escaped)| {
+                let line = text.lines().find(|line| line.contains(what));
+                !line.is_some_and(|line| line.contains(escaped))
+            })
+            .map(|(what, _)| *what);
+        started.chain(unescaped).collect()
+    }
+
+    /// The clipboard channel, with a host clipboard that takes what it is
+    /// given: a chunked write (one chunk, one out of order, one written, one
+    /// the host refuses), an image, an HTML and a native write begun and
+    /// refused, a binary frame past its image's length, a native write ended
+    /// short, and a frame whose type holds the line break. Each of their log
+    /// lines holds the id, the reason or the error escaped, and the viewer
+    /// hears every answer as before, with its ids as it sent them.
+    #[cfg(feature = "clipboard")]
+    #[tokio::test]
+    async fn a_viewers_clipboard_ids_never_start_a_log_line_of_their_own() {
+        const REFUSED: &str = "the host refuses this text";
+        let log = Logged::start(tracing::Level::DEBUG);
+        let mut pair = Pair::open_with("clipboard", |dc, session_end| {
+            let cb = crate::clipboard::Clipboard::for_tests(REFUSED);
+            attach_clipboard(dc, bson::oid::ObjectId::new(), cb, session_end)
+        })
+        .await;
+        let chunk = "c1\nSECOND LINE from a chunk id";
+        let written = "c2\nSECOND LINE from a written id";
+        let refused = "c3\nSECOND LINE from a refused id";
+        let image = "i1\nSECOND LINE from an image id";
+        let refused_image = "i2\nSECOND LINE from a refused image id";
+        let html = "h1\nSECOND LINE from an html id";
+        let refused_html = "h2\nSECOND LINE from a refused html id";
+        let native = "n1\nSECOND LINE from a native id";
+        let refused_native = "n2\nSECOND LINE from a refused native id";
+        for frame in [
+            json!({"t": "clipboard:write-chunk", "id": chunk, "seq": 0, "text": "ab", "last": false}),
+            json!({"t": "clipboard:write-chunk", "id": chunk, "seq": 7, "text": "cd", "last": false}),
+            json!({"t": "clipboard:write-chunk", "id": written, "seq": 0, "text": "fits", "last": true}),
+            json!({"t": "clipboard:write-chunk", "id": refused, "seq": 0, "text": REFUSED, "last": true}),
+            json!({"t": "clipboard:img-begin", "id": image, "w": 1, "h": 1, "bytes": 4, "format": "png"}),
+        ] {
+            pair.ask(&frame).await;
+        }
+        pair.viewer
+            .send(&Bytes::from_static(b"12345"))
+            .await
+            .expect("the frame went out");
+        for frame in [
+            json!({"t": "clipboard:img-begin", "id": refused_image, "w": 1, "h": 1, "bytes": 4, "format": "gif"}),
+            json!({"t": "clipboard:html-begin", "id": html, "html_bytes": 2, "text_bytes": 0}),
+            json!({"t": "clipboard:html-begin", "id": refused_html, "html_bytes": 0, "text_bytes": 0}),
+            json!({"t": "clipboard:native-begin", "id": native, "rtf_bytes": 2, "html_bytes": 0, "text_bytes": 0}),
+            json!({"t": "clipboard:native-end", "id": native}),
+            json!({"t": "clipboard:x\nSECOND LINE from a type"}),
+            json!({"t": "clipboard:native-begin", "id": refused_native, "rtf_bytes": 0, "html_bytes": 0, "text_bytes": 0}),
+        ] {
+            pair.ask(&frame).await;
+        }
+        // The channel answers in order, so the last answer comes after every
+        // line above is logged.
+        let heard = pair.heard(7).await;
+        pair.close().await;
+        let text = log.text();
+
+        let error = |id: &str, message: &str| -> Value {
+            json!({"t": "clipboard:error", "message": message, "id": id})
+        };
+        assert_eq!(
+            heard,
+            vec![
+                error(chunk, "clipboard chunk seq mismatch — expected 1, got 7"),
+                json!({"t": "clipboard:write-ack", "id": written, "bytes": 4}),
+                error(refused, "the test's clipboard refused it"),
+                error(
+                    refused_image,
+                    "unsupported clipboard image format \"gif\" (png only)"
+                ),
+                error(
+                    refused_html,
+                    &format!(
+                        "clipboard html payload 0 bytes outside the (0, {}] cap",
+                        crate::clipboard::CLIPBOARD_HTML_MAX_BYTES
+                    )
+                ),
+                error(
+                    native,
+                    "rich transfer n1\nSECOND LINE from a native id ended at 0 of 2 declared bytes"
+                ),
+                error(
+                    refused_native,
+                    &format!(
+                        "clipboard native payload 0 bytes outside the (0, {}] cap",
+                        crate::clipboard::CLIPBOARD_NATIVE_MAX_BYTES
+                    )
+                ),
+            ],
+            "what the viewer hears"
+        );
+        let broken = broken(
+            &text,
+            &[
+                (
+                    "clipboard: chunk accepted, awaiting more",
+                    r"c1\nSECOND LINE from a chunk id",
+                ),
+                (
+                    "clipboard: chunk rejected",
+                    r"c1\nSECOND LINE from a chunk id",
+                ),
+                (
+                    "clipboard: wrote chunked payload to host",
+                    r"c2\nSECOND LINE from a written id",
+                ),
+                (
+                    "clipboard: chunked write failed",
+                    r"c3\nSECOND LINE from a refused id",
+                ),
+                (
+                    "clipboard: image write begin",
+                    r"i1\nSECOND LINE from an image id",
+                ),
+                (
+                    "clipboard: dropped binary frame",
+                    r"i1\nSECOND LINE from an image id overflowed its declared length",
+                ),
+                (
+                    "clipboard: image begin rejected",
+                    r"i2\nSECOND LINE from a refused image id",
+                ),
+                (
+                    "clipboard: html write begin",
+                    r"h1\nSECOND LINE from an html id",
+                ),
+                (
+                    "clipboard: html begin rejected",
+                    r"h2\nSECOND LINE from a refused html id",
+                ),
+                (
+                    "clipboard: replacing dangling rich transfer",
+                    r"h1\nSECOND LINE from an html id",
+                ),
+                (
+                    "clipboard: native write begin",
+                    r"n1\nSECOND LINE from a native id",
+                ),
+                (
+                    "clipboard: rich write failed",
+                    r"n1\nSECOND LINE from a native id ended at 0 of 2 declared bytes",
+                ),
+                (
+                    "clipboard: unparseable JSON",
+                    r"clipboard:x\nSECOND LINE from a type",
+                ),
+                (
+                    "clipboard: native begin rejected",
+                    r"n2\nSECOND LINE from a refused native id",
+                ),
+            ],
+        );
+        assert!(
+            broken.is_empty(),
+            "lines a line break from the viewer broke: {broken:#?}\n{text}"
+        );
+    }
+
+    /// A channel the viewer named with a line break, given the handler every
+    /// channel of a name the device does not serve gets ([`attach_log_only`]):
+    /// the line that says a message came holds the name escaped.
+    #[tokio::test]
+    async fn a_channels_name_never_starts_a_log_line_of_its_own() {
+        const UNHANDLED: &str = "DC msg (unhandled)";
+        let log = Logged::start(tracing::Level::DEBUG);
+        let pair = Pair::open_with("odd\nSECOND LINE from a channel's name", |dc, _| {
+            attach_log_only(dc, bson::oid::ObjectId::new())
+        })
+        .await;
+        pair.ask(&json!({"t": "anything"})).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !log.text().contains(UNHANDLED) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pair.close().await;
+        let text = log.text();
+
+        let broken = broken(
+            &text,
+            &[(UNHANDLED, r"odd\nSECOND LINE from a channel's name")],
+        );
+        assert!(
+            broken.is_empty(),
+            "lines a line break from the viewer broke: {broken:#?}\n{text}"
         );
     }
 }

@@ -678,11 +678,33 @@ check still builds no path from it. The viewer's own ids
 `files:get-folder`) names no path and is only echoed back. Pinned by
 `files::transfer_id_tests`, one test per entry.
 
-The files channel's handler (`peer::handle_files_control`, the download pumps
-and a folder download's walk) logs what a viewer sends (an id, a name, a path,
-a request id), and any error that may quote it, with Debug escaping (`?`), so a
-line break in it stays inside its own log line. Only an upload's id that passed
-`transfer_id` is logged as it is. Pinned by `peer::files_log_tests`.
+### What a viewer sends is escaped in the device's log (#3688, #3733)
+
+A viewer chooses every string it sends on a session's data channels, the
+channel's own name included, and the daemon's log writes one event a line. So
+on every channel the session's peer routes (`on_data_channel`,
+`agents/roomlerd/src/peer.rs:1219`: input, control, cursor, clipboard, files,
+record, privacy, video-bytes, and a channel of any other name), a string the
+viewer sent, and a reason or an error built from one, is logged with Debug
+escaping (`?`), so a line break or another control character in it stays inside
+its own log line. A parse error counts: serde quotes a `t` it does not know as
+it came, so every channel logs one as `e = ?e.to_string()`. A `&str` field
+logged bare prints through `str`'s Debug, which escapes too. A string is logged
+as it is only after a check of its own shape:
+
+| Logged as it is | The check it passed |
+|---|---|
+| an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11553`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10890`) |
+
+The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
+host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
+logged as they are. Text the server relays from a person follows the same rule:
+a fleet RPC command's `caller`, the server's name for who asked (their display
+name, or `name (via device)`). Pinned by `peer::files_log_tests` (the files
+channel) and `peer::wire_text_log_tests` (the clipboard channel, and a channel
+named with a line break).
 
 ### A received file's folders are its writer's own (#3688)
 
