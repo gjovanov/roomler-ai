@@ -522,7 +522,27 @@ pub fn stale_workers(ps: &str, commands: &[String], own_pid: u32) -> Vec<(u32, u
 ///
 /// FR-43 P3a — a worker with no enrollment needs no per-user config, so under
 /// `one_row` that second reading would send a person after the wrong thing.
-pub fn gave_up_reason(last: Option<WorkerEnd>, one_row: bool) -> &'static str {
+///
+/// #3802 — `not_theirs` is the person's folder when another account owns it
+/// ([`FolderNotTheirs`]). The worker writes its log and its config there, so
+/// that is the cause whatever the exit, and the reading names the folder and
+/// what gives it back (`move_aside`), never the log the worker could not
+/// write.
+pub fn gave_up_reason(
+    last: Option<WorkerEnd>,
+    one_row: bool,
+    not_theirs: Option<&FolderNotTheirs>,
+) -> String {
+    if let Some(f) = not_theirs {
+        return format!(
+            "the worker cannot write the person's folder {}: uid {} owns it (mode {:o}), \
+             not the person, so the worker's own log is not there either. {}",
+            f.path.display(),
+            f.owner,
+            f.mode,
+            move_aside(f)
+        );
+    }
     match last {
         Some(WorkerEnd::Code(0)) => {
             "each worker exited 0 at once: another roomlerd holds this person's \
@@ -542,6 +562,215 @@ pub fn gave_up_reason(last: Option<WorkerEnd>, one_row: bool) -> &'static str {
              launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
         }
     }
+    .to_string()
+}
+
+/// #3802 — what gives the person's folder back: one line of a POSIX shell
+/// that the person runs as themselves, with no `sudo`. It starts by checking
+/// who runs it, since a fleet exec runs as root and, as root, the folder it
+/// makes would be root's again, so a run by anyone else changes nothing.
+/// Every path is quoted ([`sh_quote`]), and the line holds no `"`, `$` or
+/// backtick, so it also survives `sh -c "…"`.
+///
+/// With nothing the revert reads in it, the line moves it aside and the
+/// worker makes a new one of its own. With copies `one-row --revert` reads
+/// there and nowhere else ([`FolderNotTheirs::kept`]), it builds the new
+/// folder beside the old one with the copies in it, and only then swaps the
+/// two: the `cp` is the read, done as the person before anything moves, and
+/// if the last move fails, the one before it is undone. The two names it
+/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them, and
+/// BSD `mv` never moves the folder INTO a leftover of an earlier round.
+///
+/// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
+/// no command: moving the folder would leave it where the revert does not
+/// look. Nor does a folder that is not a directory.
+fn move_aside(f: &FolderNotTheirs) -> String {
+    if !f.is_dir {
+        return "It is not a folder but a link or a file, so this line gives no command for it."
+            .to_string();
+    }
+    let cannot: Vec<String> = f
+        .kept
+        .iter()
+        .filter_map(|k| {
+            let (owner, mode) = k.stat.filter(|_| person_cannot_read(f.uid, k.stat))?;
+            Some(format!(
+                "{} (uid {owner}, mode {:o})",
+                k.name.display(),
+                mode & 0o7777
+            ))
+        })
+        .collect();
+    if !cannot.is_empty() {
+        let one = cannot.len() == 1;
+        return format!(
+            "It holds {}, which the person cannot read, and `sudo roomlerd one-row --revert` \
+             reads {} there and nowhere else: if this folder is moved aside, a later revert \
+             would not restore {}, so this line gives no command to move it.",
+            cannot.join(" and "),
+            if one { "it" } else { "them" },
+            if one { "that file" } else { "those files" },
+        );
+    }
+    let path = f.path.display().to_string();
+    let folder = sh_quote(&path);
+    let aside = sh_quote(&format!("{path}.made-by-root-{}", f.stamp));
+    let who = format!(
+        "as that person (uid {0}), not as root: a fleet exec runs as root unless the device's \
+         policy names the person at the screen, and as root this changes nothing: \
+         id -u | grep -qx {0} && ",
+        f.uid
+    );
+    let restart = " Then log out and back in, or restart this daemon: \
+                   launchctl kickstart -k system/com.roomler.daemon";
+    if f.kept.is_empty() {
+        return format!(
+            "Move it aside {who}mv {folder} {aside} (if it fails, nothing moved).{restart}"
+        );
+    }
+    let new = sh_quote(&format!("{path}.new-{}", f.stamp));
+    let into_new = sh_quote(&format!("{path}.new-{}/", f.stamp));
+    let names: Vec<String> = f
+        .kept
+        .iter()
+        .map(|k| k.name.display().to_string())
+        .collect();
+    let copies: String = names
+        .iter()
+        .map(|n| format!("{} ", sh_quote(&format!("{path}/{n}"))))
+        .collect();
+    format!(
+        "It holds {}, which `sudo roomlerd one-row --revert` reads there and nowhere else, so \
+         build a new folder with {} beside this one and swap the two, {who}mkdir {new} && cp \
+         {copies}{into_new} && mv {folder} {aside} && {{ mv {new} {folder} || mv {aside} \
+         {folder}; }} (nothing moves until the copies are made, and if the last move fails \
+         the one before it is undone).{restart}",
+        names.join(" and "),
+        if names.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// #3802 — `s` as one word of a POSIX shell: in single quotes, with each `'`
+/// in it written `'\''`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// #3802 — whether what `lstat` read of a kept copy (owner, full mode) says
+/// the person `uid` cannot read it: a regular file of theirs without the
+/// owner's read bit, or another account's with neither the group's nor the
+/// others' read bit (the copy the conversion kept of a config of root's is
+/// root's, mode 600). Anything else, a copy the group or the others may read,
+/// one that is no regular file or one whose read failed, is left to the `cp`,
+/// which reads it as the person before anything moves.
+fn person_cannot_read(uid: u32, stat: Option<(u32, u32)>) -> bool {
+    stat.is_some_and(|(owner, mode)| {
+        mode & 0o170000 == 0o100000
+            && if owner == uid {
+                mode & 0o400 == 0
+            } else {
+                mode & 0o044 == 0
+            }
+    })
+}
+
+/// #3802 — the console person's folder (the one their worker writes its log
+/// and config in) when another account owns it: what `lstat` read, never
+/// through a link at the folder itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderNotTheirs {
+    pub path: std::path::PathBuf,
+    /// The person, whose worker cannot write it.
+    pub uid: u32,
+    /// The account that owns it.
+    pub owner: u32,
+    /// Its permission bits.
+    pub mode: u32,
+    /// Whether `lstat` read a directory there (not a link, not a file).
+    pub is_dir: bool,
+    /// Which of [`kept_for_revert`] it holds, with what `lstat` read of each.
+    pub kept: Vec<KeptCopy>,
+    /// The UTC second the folder was read: unique for each print, so the
+    /// names the command makes beside the folder were never made before.
+    pub stamp: String,
+}
+
+/// #3802 — one of [`kept_for_revert`] that the person's folder holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptCopy {
+    /// Its name inside the folder.
+    pub name: std::path::PathBuf,
+    /// Its owner and full mode as `lstat` read them; `None` when that read
+    /// failed for any reason but "not there".
+    pub stat: Option<(u32, u32)>,
+}
+
+/// #3802 — the files `sudo roomlerd one-row --revert` reads back from the
+/// person's folder, and from nowhere else (`one_row::revert_plan`): the
+/// LaunchAgent plist the conversion moved there, and the copy of the person's
+/// config it kept beside their config. Names, inside that folder.
+pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
+    use crate::one_row::{AGENT_PLIST, kept_path};
+    [
+        kept_path(std::path::Path::new(AGENT_PLIST)),
+        kept_path(std::path::Path::new("config.toml")),
+    ]
+}
+
+/// #3802 — [`FolderNotTheirs`] out of what `lstat` read for `path`, the folder
+/// of the person `uid` (its owner and full mode), the copies of
+/// [`kept_for_revert`] found in it and the `stamp` of this read: `None` when
+/// that person owns it.
+pub fn folder_not_theirs(
+    path: std::path::PathBuf,
+    uid: u32,
+    owner: u32,
+    mode: u32,
+    kept: Vec<KeptCopy>,
+    stamp: &str,
+) -> Option<FolderNotTheirs> {
+    (owner != uid).then(|| FolderNotTheirs {
+        path,
+        uid,
+        owner,
+        mode: mode & 0o7777,
+        is_dir: mode & 0o170000 == 0o040000,
+        kept,
+        stamp: stamp.to_string(),
+    })
+}
+
+/// #3802 — the read that fills [`FolderNotTheirs`] for the folder `path` of
+/// the person `uid`, with `lstat` as the filesystem (owner and full mode of a
+/// path, never through a link at its last name), so it tests on every
+/// platform: `None` when the folder cannot be read or that person owns it.
+/// The names of [`kept_for_revert`] are read in it only when the folder's own
+/// read is a directory, so no read goes through a link at the folder: one
+/// `lstat` of each name, no walk.
+pub fn read_person_folder(
+    path: std::path::PathBuf,
+    uid: u32,
+    stamp: &str,
+    lstat: impl Fn(&std::path::Path) -> std::io::Result<(u32, u32)>,
+) -> Option<FolderNotTheirs> {
+    let (owner, mode) = lstat(&path).ok()?;
+    let mut folder = folder_not_theirs(path, uid, owner, mode, Vec::new(), stamp)?;
+    if folder.is_dir {
+        // A name whose read fails for any reason but "not there" is held,
+        // unread: the command's `cp` reads it before anything moves.
+        folder.kept = kept_for_revert()
+            .into_iter()
+            .filter_map(|name| match lstat(&folder.path.join(&name)) {
+                Ok(stat) => Some(KeptCopy {
+                    name,
+                    stat: Some(stat),
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => Some(KeptCopy { name, stat: None }),
+            })
+            .collect();
+    }
+    Some(folder)
 }
 
 #[cfg(target_os = "macos")]
@@ -613,6 +842,18 @@ mod imp {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// #3802 — the console person's folder when another account owns it,
+    /// read by [`read_person_folder`] with `lstat`, stamped with this UTC
+    /// second. A read only: root changes nothing in a person's home.
+    fn person_folder_not_theirs(uid: u32) -> Option<FolderNotTheirs> {
+        let home = crate::appdirs::account_home(uid)?;
+        let path = crate::appdirs::macos_config_dir_in_home(&home, std::path::Path::exists);
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        read_person_folder(path, uid, &stamp, |p| {
+            std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode()))
+        })
     }
 
     /// Spawn the agent into `uid`'s GUI session, **as that user**.
@@ -1132,6 +1373,7 @@ mod imp {
             // the daemon's whole life.
             if last_action != Some(action) {
                 if matches!(action, Action::GaveUp) {
+                    let not_theirs = uid_now.and_then(person_folder_not_theirs);
                     tracing::error!(
                         console_uid = ?uid_now,
                         fast_exits,
@@ -1139,7 +1381,7 @@ mod imp {
                         last_end = ?last_end,
                         "macOS supervisor: the GUI worker died on arrival too many times — \
                          NOT retrying: {}",
-                        gave_up_reason(last_end, one_row)
+                        gave_up_reason(last_end, one_row, not_theirs.as_ref())
                     );
                 } else {
                     tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
@@ -2053,15 +2295,355 @@ mod tests {
     /// worker had exited 0 on a held lock. The exit code tells them apart.
     #[test]
     fn the_give_up_names_the_lock_when_workers_exit_cleanly() {
-        let lock = gave_up_reason(Some(WorkerEnd::Code(0)), false);
+        let lock = gave_up_reason(Some(WorkerEnd::Code(0)), false, None);
         assert!(lock.contains("single-instance lock"), "{lock}");
         assert!(!lock.contains("enrollment"), "{lock}");
         for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
             assert!(
-                gave_up_reason(end, false).contains("per-user enrollment"),
+                gave_up_reason(end, false, None).contains("per-user enrollment"),
                 "{end:?}"
             );
         }
+    }
+
+    /// #3802 — a person's folder that a root step made: the give-up names the
+    /// folder, its owner and the one command, under either switch and whatever
+    /// the exit, and never sends the person to the log the worker could not
+    /// write.
+    #[test]
+    fn the_give_up_names_a_folder_another_account_owns() {
+        let path =
+            std::path::PathBuf::from("/Users/p/Library/Application Support/live.roomler.roomler");
+        assert_eq!(
+            folder_not_theirs(path.clone(), 501, 501, 0o40755, Vec::new(), STAMP),
+            None
+        );
+        let root_made =
+            folder_not_theirs(path.clone(), 501, 0, 0o40755, Vec::new(), STAMP).expect("root's");
+        assert_eq!(root_made.mode, 0o755);
+        assert!(root_made.is_dir);
+        for one_row in [true, false] {
+            for end in [
+                Some(WorkerEnd::Code(1)),
+                Some(WorkerEnd::Code(0)),
+                Some(WorkerEnd::Signal(9)),
+                None,
+            ] {
+                let why = gave_up_reason(end, one_row, Some(&root_made));
+                assert!(
+                    why.contains(&format!("folder {}:", path.display())),
+                    "{why}"
+                );
+                assert!(why.contains("uid 0 owns it (mode 755)"), "{why}");
+                assert!(
+                    why.contains(&format!(
+                        "id -u | grep -qx 501 && mv '{0}' '{0}.made-by-root-{STAMP}' ",
+                        path.display()
+                    )),
+                    "{why}"
+                );
+                assert!(!why.contains("/logs"), "{why}");
+                assert!(!why.contains("enrollment"), "{why}");
+                // It holds nothing the revert reads: the move is the whole command.
+                assert!(!why.contains("mkdir") && !why.contains("cp '"), "{why}");
+            }
+        }
+    }
+
+    /// #3802 — the person's folder in these tests. Its path always holds a
+    /// space ("Application Support").
+    const F: &str = "/Users/p/Library/Application Support/live.roomler.roomler";
+    /// The UTC second of the read, in the names the command makes beside it.
+    const STAMP: &str = "20261113T101502Z";
+    /// What `lstat` reads of a kept copy that is the person's own, mode 644.
+    const THEIRS: Option<(u32, u32)> = Some((501, 0o100644));
+    /// A copy the conversion kept of a file of root's, mode 600.
+    const ROOTS_600: Option<(u32, u32)> = Some((0, 0o100600));
+
+    /// #3802 — the line for a folder of root's at `path` (full `mode`) that
+    /// holds `kept`, each one of [`kept_for_revert`] with what `lstat` read.
+    /// Printed, so the lines are read off a run with `--nocapture`.
+    fn give_up_line(
+        case: &str,
+        path: &str,
+        mode: u32,
+        kept: &[(usize, Option<(u32, u32)>)],
+    ) -> String {
+        let names = kept_for_revert();
+        let kept = kept
+            .iter()
+            .map(|(i, stat)| KeptCopy {
+                name: names[*i].clone(),
+                stat: *stat,
+            })
+            .collect();
+        let folder = folder_not_theirs(path.into(), 501, 0, mode, kept, STAMP).expect("root's");
+        let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
+        println!("GIVE-UP [{case}] {why}");
+        why
+    }
+
+    /// The cause every line starts with, for the folder `path` of root's.
+    fn cause(path: &str) -> String {
+        format!(
+            "the worker cannot write the person's folder {path}: uid 0 owns it (mode 755), \
+             not the person, so the worker's own log is not there either. "
+        )
+    }
+
+    /// Who runs the command, said in words: a run as root changes nothing.
+    const WHO: &str = "as that person (uid 501), not as root: a fleet exec runs as root \
+                       unless the device's policy names the person at the screen, and as \
+                       root this changes nothing: id -u | grep -qx 501 && ";
+    const RESTART: &str = " Then log out and back in, or restart this daemon: \
+                           launchctl kickstart -k system/com.roomler.daemon";
+
+    /// #3802 — nothing the revert reads: the person moves the folder aside,
+    /// under a name no earlier print made, and their worker makes a new one.
+    #[test]
+    fn the_give_up_line_for_a_folder_that_holds_no_kept_copy() {
+        assert_eq!(
+            give_up_line("no kept copy", F, 0o40755, &[]),
+            format!(
+                "{}Move it aside {WHO}mv '{F}' '{F}.made-by-root-{STAMP}' \
+                 (if it fails, nothing moved).{RESTART}",
+                cause(F)
+            )
+        );
+    }
+
+    /// #3802 — the LaunchAgent plist the revert reads there and nowhere else:
+    /// a new folder is built beside the old one with the copy in it, and only
+    /// then are the two swapped, so a step that fails leaves the folder where
+    /// it is with everything in it.
+    #[test]
+    fn the_give_up_line_keeps_the_launch_agent_plist_the_revert_reads() {
+        assert_eq!(
+            give_up_line("one kept copy", F, 0o40755, &[(0, THEIRS)]),
+            format!(
+                "{}It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd one-row \
+                 --revert` reads there and nowhere else, so build a new folder with it beside \
+                 this one and swap the two, {WHO}mkdir '{F}.new-{STAMP}' && cp \
+                 '{F}/com.roomler.agent.plist.pre-one-row' '{F}.new-{STAMP}/' && mv '{F}' \
+                 '{F}.made-by-root-{STAMP}' && {{ mv '{F}.new-{STAMP}' '{F}' || mv \
+                 '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are \
+                 made, and if the last move fails the one before it is undone).{RESTART}",
+                cause(F)
+            )
+        );
+    }
+
+    /// #3802 — the same for the copy of the person's config kept beside it.
+    #[test]
+    fn the_give_up_line_keeps_the_config_copy_the_revert_reads() {
+        let why = give_up_line("the config copy", F, 0o40755, &[(1, THEIRS)]);
+        assert!(
+            why.contains(&format!(
+                "{WHO}mkdir '{F}.new-{STAMP}' && cp '{F}/config.toml.pre-one-row' \
+                 '{F}.new-{STAMP}/' && mv '{F}' '{F}.made-by-root-{STAMP}' && "
+            )),
+            "{why}"
+        );
+    }
+
+    /// #3802 — both copies go into the new folder, in one `cp`, before
+    /// anything moves.
+    #[test]
+    fn the_give_up_line_keeps_both_copies_the_revert_reads() {
+        assert_eq!(
+            give_up_line("both kept copies", F, 0o40755, &[(0, THEIRS), (1, THEIRS)]),
+            format!(
+                "{}It holds com.roomler.agent.plist.pre-one-row and config.toml.pre-one-row, \
+                 which `sudo roomlerd one-row --revert` reads there and nowhere else, so build \
+                 a new folder with them beside this one and swap the two, {WHO}mkdir \
+                 '{F}.new-{STAMP}' && cp '{F}/com.roomler.agent.plist.pre-one-row' \
+                 '{F}/config.toml.pre-one-row' '{F}.new-{STAMP}/' && mv '{F}' \
+                 '{F}.made-by-root-{STAMP}' && {{ mv '{F}.new-{STAMP}' '{F}' || mv \
+                 '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are \
+                 made, and if the last move fails the one before it is undone).{RESTART}",
+                cause(F)
+            )
+        );
+    }
+
+    /// #3802 — a kept copy the person cannot read (the conversion's copy of a
+    /// config of root's, mode 600): the line says so and what moving the
+    /// folder would cost, and gives no command that cannot succeed.
+    #[test]
+    fn the_give_up_line_names_a_kept_copy_the_person_cannot_read() {
+        assert_eq!(
+            give_up_line(
+                "an unreadable copy",
+                F,
+                0o40755,
+                &[(0, THEIRS), (1, ROOTS_600)]
+            ),
+            format!(
+                "{}It holds config.toml.pre-one-row (uid 0, mode 600), which the person cannot \
+                 read, and `sudo roomlerd one-row --revert` reads it there and nowhere else: if \
+                 this folder is moved aside, a later revert would not restore that file, so \
+                 this line gives no command to move it.",
+                cause(F)
+            )
+        );
+        // Only a copy `lstat` says they cannot read: the person's own without
+        // the owner's read bit, or another account's with no group or other
+        // read bit. Anything else is read by the `cp` before anything moves.
+        for (stat, cannot) in [
+            (Some((501, 0o100200)), true),
+            (Some((0, 0o100640)), false),
+            (Some((0, 0o100604)), false),
+            (Some((0, 0o120755)), false),
+            (None, false),
+        ] {
+            let why = give_up_line("which copies", F, 0o40755, &[(1, stat)]);
+            assert_eq!(why.contains("cannot read"), cannot, "{stat:?}: {why}");
+            assert_eq!(why.contains(" && "), !cannot, "{stat:?}: {why}");
+        }
+    }
+
+    /// #3802 — every path is quoted for a POSIX shell, an apostrophe in the
+    /// home included.
+    #[test]
+    fn the_give_up_line_quotes_an_apostrophe_in_the_path() {
+        let path = "/Users/o'brien/Library/Application Support/live.roomler.roomler";
+        let q = r"/Users/o'\''brien/Library/Application Support/live.roomler.roomler";
+        let why = give_up_line("an apostrophe", path, 0o40755, &[(0, THEIRS), (1, THEIRS)]);
+        assert!(why.starts_with(&cause(path)), "{why}");
+        assert!(
+            why.contains(&format!(
+                "{WHO}mkdir '{q}.new-{STAMP}' && cp '{q}/com.roomler.agent.plist.pre-one-row' \
+                 '{q}/config.toml.pre-one-row' '{q}.new-{STAMP}/' && mv '{q}' \
+                 '{q}.made-by-root-{STAMP}' && {{ mv '{q}.new-{STAMP}' '{q}' || mv \
+                 '{q}.made-by-root-{STAMP}' '{q}'; }} "
+            )),
+            "{why}"
+        );
+        // The apostrophe appears in the shell text only escaped.
+        assert_eq!(why.matches("o'brien").count(), 1, "{why}");
+    }
+
+    /// #3802 — a link or a file where the folder should be: the cause only,
+    /// and no command at all.
+    #[test]
+    fn the_give_up_line_for_a_folder_that_is_not_a_directory() {
+        for (case, mode) in [
+            ("not a directory: a link", 0o120755),
+            ("not a directory: a file", 0o100755),
+        ] {
+            assert_eq!(
+                give_up_line(case, F, mode, &[]),
+                format!(
+                    "{}It is not a folder but a link or a file, so this line gives no command \
+                     for it.",
+                    cause(F)
+                )
+            );
+        }
+    }
+
+    /// #3802 — the read that fills the kept copies, with `lstat` injected: a
+    /// name it reads is held with what it read, "not there" is not held, and
+    /// any other error is held unread (the `cp` reads it before anything
+    /// moves). A folder the person owns, or one it cannot read, is no answer.
+    #[test]
+    fn the_read_holds_what_lstat_finds_in_a_folder_of_roots() {
+        let [plist, config] = kept_for_revert();
+        let dir = std::path::PathBuf::from(F);
+        let (p, c) = (dir.join(&plist), dir.join(&config));
+        let lstat = |path: &std::path::Path| -> std::io::Result<(u32, u32)> {
+            if path == dir.as_path() {
+                Ok((0, 0o40755))
+            } else if path == p.as_path() {
+                Ok((501, 0o100644))
+            } else if path == c.as_path() {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        };
+        let f = read_person_folder(dir.clone(), 501, STAMP, lstat).expect("root's");
+        assert_eq!(
+            f.kept,
+            vec![
+                KeptCopy {
+                    name: plist,
+                    stat: Some((501, 0o100644))
+                },
+                KeptCopy {
+                    name: config,
+                    stat: None
+                },
+            ]
+        );
+        assert_eq!(
+            (f.uid, f.owner, f.mode, f.is_dir, f.stamp.as_str()),
+            (501, 0, 0o755, true, STAMP)
+        );
+        let empty = |path: &std::path::Path| -> std::io::Result<(u32, u32)> {
+            if path == dir.as_path() {
+                Ok((0, 0o40755))
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        };
+        let f = read_person_folder(dir.clone(), 501, STAMP, empty).expect("root's");
+        assert_eq!(f.kept, Vec::new());
+        assert_eq!(
+            read_person_folder(dir.clone(), 501, STAMP, |_| Ok((501, 0o40755))),
+            None
+        );
+        assert_eq!(
+            read_person_folder(
+                dir,
+                501,
+                STAMP,
+                |_| Err(std::io::ErrorKind::NotFound.into())
+            ),
+            None
+        );
+    }
+
+    /// #3802 — a link or a file at the folder is read as itself and nothing
+    /// is read through it, so no read goes past a link at the folder.
+    #[test]
+    fn the_read_never_goes_through_a_link_at_the_folder() {
+        let dir = std::path::PathBuf::from(F);
+        for mode in [0o120755, 0o100644] {
+            let asked = std::cell::RefCell::new(Vec::new());
+            let lstat = |path: &std::path::Path| -> std::io::Result<(u32, u32)> {
+                asked.borrow_mut().push(path.to_path_buf());
+                Ok(if path == dir.as_path() {
+                    (0, mode)
+                } else {
+                    (501, 0o100644)
+                })
+            };
+            let f = read_person_folder(dir.clone(), 501, STAMP, lstat).expect("root's");
+            assert_eq!(asked.into_inner(), vec![dir.clone()], "{mode:o}");
+            assert!(!f.is_dir && f.kept.is_empty(), "{mode:o}: {f:?}");
+        }
+    }
+
+    /// #3802 — the names the give-up keeps are the paths the revert reads in
+    /// the person's folder (`one_row::revert_plan`).
+    #[test]
+    fn the_copies_the_give_up_keeps_are_the_ones_the_revert_reads() {
+        let dir = std::path::PathBuf::from("/u/F");
+        let person = crate::one_row::Person {
+            user: "p".into(),
+            uid: 501,
+            home: "/u".into(),
+            dir: dir.clone(),
+            config: None,
+            has_plist: true,
+        };
+        let [plist, config] = kept_for_revert();
+        assert_eq!(dir.join(plist), person.plist_aside());
+        assert_eq!(
+            dir.join(config),
+            crate::one_row::kept_path(&person.config_path())
+        );
     }
 
     /// FR-43 P3a — a worker with no enrollment cannot be missing one, so the
@@ -2071,13 +2653,13 @@ mod tests {
     fn the_give_up_does_not_blame_an_enrollment_a_worker_never_needed() {
         for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
             assert!(
-                !gave_up_reason(end, true).contains("per-user enrollment"),
+                !gave_up_reason(end, true, None).contains("per-user enrollment"),
                 "{end:?}"
             );
         }
         assert_eq!(
-            gave_up_reason(Some(WorkerEnd::Code(0)), true),
-            gave_up_reason(Some(WorkerEnd::Code(0)), false)
+            gave_up_reason(Some(WorkerEnd::Code(0)), true, None),
+            gave_up_reason(Some(WorkerEnd::Code(0)), false, None)
         );
     }
 }

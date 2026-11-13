@@ -155,7 +155,7 @@ jobs:
           function Save-InstallerEvidence([string]$Label, [string]$Dir = $InstallerEvidence) {
             $to = Join-Path $Dir ('evidence-' + ($Label -replace '[^A-Za-z0-9._-]+', '-'))
             New-Item -ItemType Directory -Path $to -Force | Out-Null
-            $procs = @(Get-CimInstance Win32_Process | Sort-Object ProcessId)
+            $procs = @(Get-CimInstance Win32_Process -OperationTimeoutSec 60 | Sort-Object ProcessId)
             $procs | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate |
               Export-Csv -NoTypeInformation -Encoding utf8 -Path (Join-Path $to 'processes.csv')
             $procs | Where-Object { $_.Name -match '^(msiexec|roomler)' } |
@@ -231,6 +231,8 @@ jobs:
           '@ | Set-Content -LiteralPath $runner -Encoding utf8
           'INSTALLER_RUN=' + $runner | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "installer runner: $runner"
+          # #3810 — the evidence step reads the System events since this moment.
+          'JOB_STARTED_UTC=' + [DateTime]::UtcNow.ToString('o') | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # #3754 — the negative control of the deadline above: an endless process
       # with an endless child of its own is ended and reported within its limit,
@@ -1078,9 +1080,52 @@ jobs:
         # uninstall are the next two steps (#3754). No MSI log may hold a
         # carried value.
         # Negative control: on master the v2 cell fails (the entries are gone).
+        #
+        # #3810 — a timeout of its own, well under the job's: it passes in 82 to
+        # 152 s, and one installer run may still reach its 300 s deadline and
+        # report itself first. A step that never returns then fails here, and
+        # "Save the evidence of a failure" runs.
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # #3810 — the service this step installs is opted out of the live update
+          # channel from its FIRST start, as the per-User daemon is (#3774). Its
+          # updater runs in the worker it spawns, and the worker gets the console
+          # user's environment built fresh from the registry at each spawn
+          # (`EnvBlock::for_token`, no inheritance, win_service/supervisor.rs),
+          # never the service's own Environment: only the host reads that, and it
+          # cannot hold an entry before the MSI creates the service. The machine
+          # environment is in that block from the first spawn, for the whole job.
+          [Environment]::SetEnvironmentVariable('ROOMLERD_AUTO_UPDATE', '0', 'Machine')
+          Write-Host "machine environment: ROOMLERD_AUTO_UPDATE=$([Environment]::GetEnvironmentVariable('ROOMLERD_AUTO_UPDATE', 'Machine'))"
+          $firstStart = [DateTime]::UtcNow
+          # What the service's processes logged about their updater since $since:
+          # an armed updater fails the step, the opt-out's line is printed.
+          function Assert-UpdateOptOut([string]$label, [datetime]$since) {
+            $dirs = @("$env:ProgramData\roomler", "$env:LOCALAPPDATA\roomler", "$env:SystemRoot\System32\config\systemprofile\AppData\Local\roomler") |
+              Where-Object { Test-Path -LiteralPath $_ }
+            $hits = @()
+            foreach ($i in 1..30) {
+              $hits = @(Get-ChildItem -LiteralPath $dirs -Recurse -File -Filter '*.log*' -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTimeUtc -ge $since } |
+                Select-String -SimpleMatch -Pattern 'auto-updater armed', 'auto-update disabled', 'auto-update opted out' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Line -match '^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s' -and [datetime]::Parse($Matches[1]).ToUniversalTime() -ge $since })
+              if ($hits) { break }
+              Start-Sleep -Seconds 1
+            }
+            $hits | ForEach-Object { Write-Host "${label}: $($_.Path): $($_.Line.Trim())" }
+            if (@($hits | Where-Object { $_.Line -like '*auto-updater armed*' })) {
+              throw "${label}: a process of the per-Machine service armed its auto-updater: it can reach the live update channel"
+            }
+            if (-not $hits) {
+              Write-Host "::warning title=no updater decision (#3810)::${label}: no log of the per-Machine service says how its updater started. The worker's starts:"
+              Get-ChildItem "$env:ProgramData\roomler\roomler\service-logs" -Filter 'roomlerd-service.log*' -ErrorAction SilentlyContinue |
+                Select-String -SimpleMatch -Pattern 'spawned worker', 'worker exited' | Select-Object -Last 6 | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+              return
+            }
+            Write-Host "${label}: the per-Machine service does not reach the live update channel"
+          }
           $out = Join-Path $env:RUNNER_TEMP 'pm-msi'
           $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           New-Item -ItemType Directory -Path $out, $logDir -Force | Out-Null
@@ -1259,7 +1304,7 @@ jobs:
           [System.Diagnostics.Process]::EnterDebugMode()
           function Start-SlowStop([int]$holdMs) {
             # The host's pid, fresh: every restart of the service is a new host.
-            $hostPid = (Get-CimInstance Win32_Service -Filter "Name='Roomler'").ProcessId
+            $hostPid = (Get-CimInstance Win32_Service -Filter "Name='Roomler'" -OperationTimeoutSec 30).ProcessId
             if (-not $hostPid) { throw 'slow stop: the Roomler service has no host process' }
             # The supervisor thread is spawned a moment after RUNNING (the
             # firewall prep runs first): look for it for a while.
@@ -1272,6 +1317,7 @@ jobs:
           try {
             Invoke-Msi '/i' (Join-Path $out 'pm-1.msi') (Join-Path $logDir 'pm-1.log') 'ENABLE_SYSTEM_CONTEXT=1'
             Assert-Mode 'v1, installed with =1' $true '0.0.1.1'
+            Assert-UpdateOptOut 'v1, the first start' $firstStart
             Set-Entries
             Assert-Carried 'v1, set by set-service-env-var' $true
             # #3115 — THE regression cell for the field case: a reinstall of the
@@ -1332,7 +1378,9 @@ jobs:
       # REINSTALLMODE=a` it takes REBOOT=ReallySuppress, and the server's own
       # Command Line in the log has to show it. A repair that still needs a
       # restart then ends 3010 with its log: that is #3455, the product's half.
+      # #3810 — it passes in 3 to 4 s; 6 min leaves its one 300 s deadline room.
       - name: "A repair over the running per-Machine service never restarts Windows, and keeps the mode and the entries (#3754, #3455)"
+        timeout-minutes: 6
         shell: pwsh
         run: |
           . $env:INSTALLER_RUN
@@ -1362,7 +1410,9 @@ jobs:
           Assert-Mode 'v6, repaired' $false '0.0.6.1'
           Assert-Carried 'v6, repaired' $true
 
+      # #3810 — it passes in 1 to 2 s; 6 min leaves its one 300 s deadline room.
       - name: "The per-Machine uninstall removes the service and its Environment, and no MSI log holds a carried value (#3375)"
+        timeout-minutes: 6
         shell: pwsh
         run: |
           . $env:INSTALLER_RUN
@@ -1401,6 +1451,10 @@ jobs:
         #
         # Negative control: on master the per-User asserts fail, because
         # master's MSI still registers the pre-P1 name.
+        #
+        # #3810 — it passes in 38 to 56 s. 10 min leaves one installer deadline
+        # of 300 s room to report itself; the downloads have a bound of their own.
+        timeout-minutes: 10
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1431,7 +1485,7 @@ jobs:
             if ($a.Count -ne 1) { throw "$($rel.tag_name): want one $flavour MSI, found $($a.Count)" }
             $dst = Join-Path $out "$($rel.tag_name)-$flavour.msi"
             if (-not (Test-Path $dst)) {
-              Invoke-WebRequest -UseBasicParsing -Uri $a[0].browser_download_url -OutFile $dst
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $a[0].browser_download_url -OutFile $dst
             }
             $want = ([string]$a[0].digest -replace '^sha256:', '').ToLower()
             $got = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
@@ -1597,13 +1651,33 @@ jobs:
       # cleans up: every process with its image path, and the service's and the
       # per-User daemon's logs. A failed installer run has saved its own already.
       # On a cancel too: a job that hit its limit is a failure for its reader.
+      # #3810 — and what names a lost machine: the boot time, the System events
+      # 1074 (a restart something asked for), 41 (a restart with no clean
+      # shutdown) and 6008 (an unexpected shutdown) since the job began, and the
+      # service's state. Every per-Machine step has a timeout of its own, well
+      # under the job's, so a step that never returns is ended by the runner and
+      # this step runs. A job that STILL sits to the job's 40 min, with this step
+      # never run, proves the runner itself was gone (Windows restarted, the
+      # network was lost or the runner's process was ended), not a wait in a step.
       - name: Save the evidence of a failure (#3754)
         if: failure() || cancelled()
+        timeout-minutes: 5
         shell: pwsh
         run: |
           if (-not $env:INSTALLER_RUN -or -not (Test-Path -LiteralPath $env:INSTALLER_RUN)) { Write-Host 'no installer runner: nothing ran'; exit 0 }
           . $env:INSTALLER_RUN
           Save-InstallerEvidence 'job-end'
+          $to = Join-Path $InstallerEvidence 'evidence-job-end'
+          $since = if ($env:JOB_STARTED_UTC) { [datetime]::Parse($env:JOB_STARTED_UTC).ToUniversalTime() } else { [DateTime]::UtcNow.AddHours(-1) }
+          $boot = (Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 60).LastBootUpTime.ToUniversalTime()
+          "boot $($boot.ToString('o')); the job began $($since.ToString('o')); now $([DateTime]::UtcNow.ToString('o')) (UTC)" |
+            Tee-Object -FilePath (Join-Path $to 'boot.txt') | Write-Host
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1074, 41, 6008; StartTime = $since } -ErrorAction SilentlyContinue)
+          @("System events 1074, 41 and 6008 since the job began: $($events.Count)") +
+            @($events | ForEach-Object { "$($_.TimeCreated.ToUniversalTime().ToString('o')) id=$($_.Id) $($_.ProviderName): $($_.Message -replace '\s+', ' ')" }) |
+            Tee-Object -FilePath (Join-Path $to 'system-events.txt') | Write-Host
+          (Get-Service Roomler -ErrorAction SilentlyContinue | Format-List Name, Status, StartType | Out-String).Trim() |
+            Tee-Object -FilePath (Join-Path $to 'service.txt') | Write-Host
 
       - name: Upload MSI logs on failure
         if: failure() || cancelled()

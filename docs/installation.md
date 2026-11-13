@@ -1262,7 +1262,7 @@ checks its imports with a negative control, and checks that it carries the
 payload's signature (`.github/workflows/release-agent.yml:2202`). `ROOMLER_TEST_CA_FAIL=capture` or
 `=restore` (`main.wxs:561`) fails one of the two on purpose; installer-smoke uses
 it to show an upgrade completing through either failure
-(`.github/workflows/installer-smoke.yml:1040`). Its only effect is that nothing is
+(`.github/workflows/installer-smoke.yml:1042`). Its only effect is that nothing is
 carried.
 
 ```mermaid
@@ -2383,7 +2383,45 @@ console user are skipped and every root row runs as on any install
 | Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:366` |
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:583-586`, `:591`, `:691-694`, `:712`, `:720`, `:733`, `:612`, `:747` |
+| The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
 
+- **No root command writes in the person's folder (#3802).** macOS `sudo` keeps
+  the caller's `HOME`, so on macOS the agent's folders hang off the home that the
+  account database names for the account a process runs as, never `HOME`
+  (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
+  is made by the person's own processes. On a Mac where an earlier root step made
+  it, the screen worker's config write fails with an error that names the folder,
+  its owner and its mode (`agents/roomlerd/src/app.rs:3856`, `:3958`). That error
+  ends the worker's `main`, which prints it on stderr, and the worker's stderr is
+  the root daemon's, `/var/log/roomler/daemon.log`: the supervisor sets only the
+  worker's stdin (`agents/roomlerd/src/macos_supervisor.rs:938`) and closes no
+  descriptor up to stderr (`:921`), and the daemon's plist names that file
+  (`agents/roomlerd/packaging/macos/com.roomler.daemon.plist:74-75`). The worker's
+  tracing lines go to its stdout, which that plist sends to `/dev/null` (`:72-73`).
+  The supervisor's give-up line names the same folder, owner and mode, plus one
+  line of shell, which the person runs with no `sudo`
+  (`agents/roomlerd/src/macos_supervisor.rs:531`, `:587`, `:850`, read by
+  `:750`). It starts with `id -u | grep -qx <uid> &&`, so a run as root, which
+  is what a fleet exec is, changes nothing: as root the new folder would be
+  root's again. Every path in it is quoted for a POSIX shell. `<stamp>` is the
+  UTC second of the give-up, so no name it makes is a leftover of an earlier
+  round:
+  - When the folder holds neither copy that `sudo roomlerd one-row --revert`
+    reads back from it: `mv '<folder>' '<folder>.made-by-root-<stamp>'`.
+  - When it holds `com.roomler.agent.plist.pre-one-row` or
+    `config.toml.pre-one-row`, which the revert reads there and nowhere else
+    (`agents/roomlerd/src/one_row.rs:913-921`), the new folder is built first and
+    the two are swapped last: `mkdir '<folder>.new-<stamp>' && cp
+    '<folder>/<copy>' '<folder>.new-<stamp>/' && mv '<folder>'
+    '<folder>.made-by-root-<stamp>' && { mv '<folder>.new-<stamp>' '<folder>' ||
+    mv '<folder>.made-by-root-<stamp>' '<folder>'; }`. The `cp` reads each copy
+    as the person before anything moves, so a step that fails leaves the folder
+    where it is with everything in it.
+  - When `lstat` says the person cannot read a copy (the conversion keeps a
+    config's copy mode 600 and owned as the original, `one_row.rs:1347-1357`, so
+    the copy of a file of root's), the line names it and says that a later
+    revert would not restore it if the folder were moved, and gives no command.
+    Nor does it give one for a folder that is not a directory.
 - **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
   groups; `launchctl asuser` changes only the bootstrap context. `-n` because
   root needs no password and a run by the update helper has no terminal.
@@ -2492,7 +2530,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:645`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:886`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -2519,9 +2557,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:713`, `:585`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:665`, `:713`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:882`, `:503`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:525`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:954`, `:814`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:665`, `:713`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1123`, `:503`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:531`). A person's folder that another account owns comes first, whatever the end, with the line of shell that gives it back, or the reason it gives none (#3802, `:587`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -2600,8 +2638,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:940`, `:889`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:680` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1181`, `:1130`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:921` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
