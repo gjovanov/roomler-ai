@@ -234,11 +234,24 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1385`).
+- every self-update, and the daemon's own refresh of its companion (`download_asset`,
+  `agents/roomlerd/src/updater.rs:1400`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
 (`scripts/install.ps1:173`).
+
+**The release itself is looked up through roomler.ai** (`GET /api/agent/latest-release`, or
+`ROOMLERD_UPDATE_URL`). Only the bytes come from GitHub's download hosts:
+
+| Lookup | Asks | GitHub's API, `api.github.com` |
+|---|---|---|
+| the update check (`check_once`) | the feed | only when roomler.ai cannot answer (`fetch_latest_release`) |
+| the Windows tray refresh, the Linux companion's sync: the daemon's own release (#3818) | the feed, for the exact tag `agent-v<own>` | never. When roomler.ai cannot answer, they skip and retry |
+| a crash-loop rollback, an operator's pinned update (`pin_version`) | the feed first | by tag, only when the feed cannot name the release (one older than the feed's page, or the feed down), logged |
+
+So a daemon host that reaches roomler.ai needs `github.com` and `release-assets.githubusercontent.com`,
+and not `api.github.com`.
 
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
@@ -1155,7 +1168,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1731`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1928`) launches `msiexec /i … /qn` elevated
 (`:2051`, `:2451`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:409`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -1216,7 +1229,7 @@ Windows compares environment names, and is added where there is none. The
 exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
 both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 `carry.rs:37`). The installer decides the switch: the updater passes
-`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:1992`),
+`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2189`),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
@@ -1671,7 +1684,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2155`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2352`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -2491,7 +2504,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:641`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:645`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -2518,9 +2531,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:709`, `:581`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:665`, `:713`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:878`, `:499`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:521`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:713`, `:585`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:665`, `:713`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:882`, `:503`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:525`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -2599,8 +2612,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:936`, `:885`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:676` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:940`, `:889`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:680` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
@@ -2730,7 +2743,7 @@ when one is needed (FR-27).
 |---|---|
 | `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. A per-user Linux daemon cannot write `/usr`: there a root update helper (`roomler-update.service`) installs, and the daemon restarts onto the new binary once nothing it serves would be cut (FR-96). Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version. On a Windows service install the post-install watcher's last act is to **settle** the `Roomler` service: it waits out a stop still in flight, starts the service when it reads STOPPED, and trusts RUNNING only after 15 s unbroken. Windows Installer's Restart Manager can stop the freshly installed service *after* the install has finished, and a single `sc start` answers 1056 ("already running") for a service that is still stopping (#2711). `last-install.json` records what it saw (`service Roomler: running (1 start; seen StopPending→Stopped→Running)`). The watcher writes its verdict without `println!` (#2934, #2935): an update driven by `roomler exec … self-update` leaves it the exec's stdout, whose reader is gone by then, and the panic that followed was filed as an agent crash |
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin): since FR-97 P6b the release's `.asc` is checked against the pinned key on every OS, and Linux and macOS install too, the tarball or (where dpkg owns the binary) the `.deb` ([`tunnel-install.md` §10](tunnel-install.md)). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
-| `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686). A refresh that fails is retried every 4 h, and within minutes while the tray is too old to connect ([below](#a-tray-older-than-its-daemon-windows-3781)) |
+| `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — looks its own release up in the update feed on roomler.ai, never at GitHub's API (#3818, [above](#enrollment--what-every-path-does)), downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686). A refresh that fails is retried every 4 h, and within minutes while the tray is too old to connect ([below](#a-tray-older-than-its-daemon-windows-3781)) |
 | wizard | Fetch-latest by nature; `setup-v<V>` is cut with every `agent-v<V>` (the lockstep job in `release-agent.yml`) |
 
 ### macOS: an update with nobody signed in (#3783)
@@ -2806,7 +2819,7 @@ session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
 daemon, which holds the SSH server and the exec channel, and the script reloads
 it. On the signed-in road it always did; on the login-window road it does since
 #3783. To update a Mac from afar, send the fleet's update order, which has the
-agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3306`,
+agent touch the helper's trigger file (`agents/roomlerd/src/updater.rs:3503`,
 `WatchPaths` in `com.roomler.update.plist:61`) so that the update helper runs
 the install, or install over macOS Remote Login. The lab drives its macOS cells
 that way.

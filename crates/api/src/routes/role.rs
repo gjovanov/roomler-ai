@@ -73,15 +73,18 @@ pub(crate) fn check_grant(held: u64, current: u64, requested: u64) -> Result<(),
 /// Unknown or cross-tenant ids are refused rather than skipped — the lookup is
 /// tenant-scoped, so a silent skip would let a caller reference a role the
 /// check never sees.
+///
+/// ⚠️ Every id is resolved IN the org for every caller, ADMINISTRATOR
+/// included: only the bit check below lets an ADMINISTRATOR through
+/// ([`check_grant`]), never the lookup. A role of another org, or one this
+/// org no longer has, is a 404 whoever asks, so it never lands in a member
+/// row here.
 pub(crate) async fn check_grant_roles(
     state: &Core,
     tenant_id: ObjectId,
     held: u64,
     role_ids: &[ObjectId],
 ) -> Result<(), ApiError> {
-    if role_ids.is_empty() || held & permissions::ADMINISTRATOR != 0 {
-        return Ok(());
-    }
     let mut requested = 0u64;
     for rid in role_ids {
         let role = state
@@ -222,7 +225,10 @@ pub async fn delete(
 
     require_manage_roles(&state, tid, auth.user_id).await?;
 
-    state.roles.delete(rid, tid).await?;
+    // Deletes the role, then takes it from its holders (`RoleDao::delete`).
+    if state.roles.delete(rid, tid).await? {
+        state.hooks.org_roles_changed(tid).await;
+    }
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -250,6 +256,8 @@ pub async fn assign(
     check_grant_roles(&state, tid, held, &[rid]).await?;
 
     state.tenants.assign_role(tid, uid, rid).await?;
+    // After the write: compiled role-scoped rules (the overlay ACL) follow it.
+    state.hooks.org_roles_changed(tid).await;
 
     Ok(Json(serde_json::json!({ "assigned": true })))
 }
@@ -269,6 +277,7 @@ pub async fn unassign(
     require_manage_roles(&state, tid, auth.user_id).await?;
 
     state.tenants.remove_role(tid, uid, rid).await?;
+    state.hooks.org_roles_changed(tid).await;
 
     Ok(Json(serde_json::json!({ "removed": true })))
 }

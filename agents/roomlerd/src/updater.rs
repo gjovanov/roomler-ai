@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Self-update against GitHub Releases.
+//! Self-update against the release feed.
 //!
-//! Polls `https://api.github.com/repos/gjovanov/roomler-ai/releases/latest`
-//! every ~6 h, compares the release tag to the running binary's
-//! `CARGO_PKG_VERSION`, and — when newer — downloads the platform-
+//! Reads the update feed on roomler.ai ([`DEFAULT_PROXY_URL`], a cached copy
+//! of GitHub's release list) every 4 h, compares the newest tag to the running
+//! binary's `CARGO_PKG_VERSION`, and — when newer — downloads the platform-
 //! appropriate installer (MSI / .deb / .pkg) and spawns it detached.
 //!
 //! Scope: the agent exits after spawning the installer so the installer
@@ -14,9 +14,9 @@
 //! minute of the install (Windows, the registration's one-shot starts,
 //! #3292) or immediately (Restart=on-failure on Linux, KeepAlive on macOS).
 //!
-//! Trust model: we assume GitHub-over-TLS is sufficient for now. No
-//! signature check beyond the MSI's cargo-wix / codesign identity
-//! (which the OS verifies at install time).
+//! Trust model: the feed is not a trust anchor. `download_asset` checks
+//! whose bytes they are (Authenticode and the publisher, or the pinned `.asc`)
+//! and which release they are (`artifact_version`) before anything runs.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -31,9 +31,9 @@ pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 /// Default proxy endpoint that caches GitHub's releases response on
 /// the roomler-ai API server. Eliminates the per-IP GitHub rate
 /// limit (60 req/hr unauth) that bites fleets of agents behind one
-/// NAT. Override via `ROOMLERD_UPDATE_URL` env var for self-
-/// hosted deployments or to bypass the proxy in dev. When the proxy
-/// is unreachable we fall back to direct GitHub.
+/// NAT. Override via `ROOMLERD_UPDATE_URL` env var for self-hosted
+/// deployments or in dev. The update check falls back to direct GitHub
+/// when it is unreachable; a lookup by tag follows `release_sources`.
 pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release";
 
 /// How often `run_periodic` wakes up and checks for a newer release.
@@ -877,7 +877,7 @@ fn pick_linux_asset<'a>(
 /// landed. Always pull the full list and let `pick_latest_release`
 /// apply our own filter (draft=false + tag prefix + parseable).
 async fn fetch_latest_release() -> Result<GithubRelease> {
-    let proxy_url = node_env("UPDATE_URL").unwrap_or_else(|| DEFAULT_PROXY_URL.to_string());
+    let proxy_url = update_feed_url();
     // Proxy first — handles rate limiting, returns the same JSON shape
     // as GitHub's /releases endpoint (slimmed to fields we read).
     match fetch_releases_from(&proxy_url).await {
@@ -894,6 +894,21 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
     // but fine for occasional use when the proxy is offline.
     let github_url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases?per_page=30");
     fetch_releases_from(&github_url).await
+}
+
+/// The update feed's URL, read where the update check reads it:
+/// `ROOMLERD_UPDATE_URL` when set, else [`DEFAULT_PROXY_URL`].
+fn update_feed_url() -> String {
+    update_feed_url_from(node_env("UPDATE_URL"))
+}
+
+/// [`update_feed_url`] from the override as read, so a test needs no
+/// environment. A blank override counts as none: a lookup that asks the feed
+/// alone would otherwise fail on every try.
+fn update_feed_url_from(over: Option<String>) -> String {
+    over.map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROXY_URL.to_string())
 }
 
 async fn fetch_releases_from(url: &str) -> Result<GithubRelease> {
@@ -1387,7 +1402,11 @@ fn discard_download(path: &std::path::Path) {
 /// (`agent-v0.3.0-rc.458`). It is not decoration: the artifact has to
 /// self-identify as that release or it is discarded — see
 /// [`crate::artifact_version`] for the downgrade this closes.
+///
+/// An asset's name must be a plain file name ([`plain_file_name`]); any other
+/// is refused before anything is downloaded or written.
 pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -> Result<PathBuf> {
+    let file_name = plain_file_name(&asset.name)?;
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
@@ -1428,7 +1447,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
         );
     }
     let dir = stage_dir().context("creating the staging dir")?;
-    let path = dir.join(&asset.name);
+    let path = dir.join(file_name);
     write_installer(&path, &bytes).context("writing installer to disk")?;
 
     // Publisher check — the anchor the serving channel cannot forge. Whatever
@@ -1552,6 +1571,23 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
     Ok(path)
 }
 
+/// An asset's name must be a plain file name: exactly one normal path
+/// component, with no separator of either kind, no colon and no control
+/// character.
+fn plain_file_name(name: &str) -> Result<&str> {
+    use std::path::{Component, Path};
+    let mut parts = Path::new(name).components();
+    let one_normal = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(only)), None) if only == std::ffi::OsStr::new(name)
+    );
+    let odd_char = name.contains(|c: char| matches!(c, '/' | '\\' | ':') || c.is_control());
+    if !one_normal || odd_char {
+        bail!("refusing the asset {name:?}: an asset's name must be a plain file name");
+    }
+    Ok(name)
+}
+
 /// Verify a payload's SHA256 against a `"<algo>:<hex>"` formatted
 /// digest string (GitHub's convention as of late 2024). Returns
 /// `Err` on mismatch, unsupported algorithm, or malformed digest.
@@ -1581,21 +1617,175 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch a specific release by tag from GitHub. Bypasses the
-/// roomler-ai proxy because pinning is rare (per-agent crash-loop
-/// recovery, not a fleet-wide poll), so the proxy's per-IP rate-
-/// limit insulation isn't needed and the round-trip via our backend
-/// would just add latency to a path that's already on the slow side
-/// of the agent's failure recovery.
+/// #3818 — what a release is looked up FOR, which decides where
+/// ([`release_sources`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseLookup {
+    /// This daemon's OWN release, `agent-v<CARGO_PKG_VERSION>`: the Windows
+    /// tray refresh (`companion::refresh_inner`) and the Linux companion's
+    /// package sync (`companion::package_sync`), both through
+    /// [`fetch_release_by_tag`].
+    Own,
+    /// A PINNED release, through [`pin_version`]: the crash-loop rollback's
+    /// last known good version, or an operator's pin.
+    Pinned,
+}
+
+/// #3818 — one place a release can be looked up by its tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseSource {
+    /// The update feed (`/api/agent/latest-release` on roomler.ai, or
+    /// `ROOMLERD_UPDATE_URL`): the list of releases the update check reads,
+    /// searched for the tag.
+    Feed(String),
+    /// GitHub's by-tag endpoint, unauthenticated: that one release.
+    GithubByTag(String),
+}
+
+impl ReleaseSource {
+    /// The URL this source asks.
+    pub(crate) fn url(&self) -> &str {
+        match self {
+            Self::Feed(url) | Self::GithubByTag(url) => url,
+        }
+    }
+
+    /// What a log line or an error calls this source.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Feed(_) => "the update feed",
+            Self::GithubByTag(_) => "GitHub by tag",
+        }
+    }
+}
+
+/// #3818 — where a lookup of `tag` asks, in order: the first source that
+/// names the release wins. `feed` is the update feed ([`update_feed_url`]).
+///
+/// - [`ReleaseLookup::Own`] asks the feed alone. Every device asks for its own
+///   release at every release, and behind a corporate network's shared egress
+///   address GitHub's unauthenticated per-address limit refused that call
+///   (403). A lookup that fails is the caller's skip-and-retry.
+/// - [`ReleaseLookup::Pinned`] asks the feed, then GitHub by tag. The feed
+///   lists the newest releases only (the server's cache of GitHub's first
+///   page), and a pinned lookup runs on one device, once per crash loop or per
+///   operator's pin, where reaching the release counts for more than one
+///   origin.
+pub(crate) fn release_sources(lookup: ReleaseLookup, feed: &str, tag: &str) -> Vec<ReleaseSource> {
+    let feed = ReleaseSource::Feed(feed.to_string());
+    match lookup {
+        ReleaseLookup::Own => vec![feed],
+        ReleaseLookup::Pinned => vec![
+            feed,
+            ReleaseSource::GithubByTag(github_release_by_tag_url(tag)),
+        ],
+    }
+}
+
+/// GitHub's by-tag endpoint for `tag`.
+fn github_release_by_tag_url(tag: &str) -> String {
+    format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}")
+}
+
+/// #3818 — this daemon's OWN release by its tag, `agent-v<CARGO_PKG_VERSION>`,
+/// for the Windows tray refresh (`companion::refresh_inner`) and the Linux
+/// companion's package sync (`companion::package_sync`): looked up in the
+/// update feed alone ([`ReleaseLookup::Own`]), never at GitHub's API. An error
+/// is the caller's to log, and its retry's to clear.
 pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
-    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
+    fetch_release_from(
+        &release_sources(ReleaseLookup::Own, &update_feed_url(), tag),
+        tag,
+    )
+    .await
+}
+
+/// #3818 — look `tag` up in `sources`, in order; the first that names the
+/// release wins. A source that cannot is logged when another follows it (the
+/// pinned lookup's fallback), and the last one's error is the lookup's, after
+/// the earlier ones' (each named by its source).
+async fn fetch_release_from(sources: &[ReleaseSource], tag: &str) -> Result<GithubRelease> {
+    let mut earlier: Vec<String> = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        let found = match source {
+            ReleaseSource::Feed(url) => fetch_release_in_feed(url, tag).await,
+            ReleaseSource::GithubByTag(url) => fetch_github_release(url, tag).await,
+        };
+        let e = match found {
+            Ok(release) => return Ok(release),
+            Err(e) => e,
+        };
+        let Some(next) = sources.get(i + 1) else {
+            if earlier.is_empty() {
+                return Err(e);
+            }
+            earlier.push(source.label().to_string());
+            return Err(e.context(earlier.join("; ")));
+        };
+        tracing::info!(
+            %tag,
+            source = source.label(),
+            next = next.label(),
+            next_url = %next.url(),
+            error = %format!("{e:#}"),
+            "release lookup: a source could not name the release; asking the next"
+        );
+        earlier.push(format!("{}: {e:#}", source.label()));
+    }
+    bail!("no source to look release {tag} up in")
+}
+
+/// #3818 — the release tagged exactly `tag` in the update feed at `url`. A
+/// draft never counts.
+async fn fetch_release_in_feed(url: &str, tag: &str) -> Result<GithubRelease> {
+    let releases = fetch_feed(url).await?;
+    pick_release_by_tag(releases, tag)
+        .ok_or_else(|| anyhow::anyhow!("release {tag} is not in the update feed {url}"))
+}
+
+/// #3818 — every release the update feed at `url` lists. Its errors keep the
+/// updater's split: a transport failure stays a `reqwest::Error` in the chain
+/// ([`is_transport_failure`]), and an HTTP status is a verdict.
+async fn fetch_feed(url: &str) -> Result<Vec<GithubRelease>> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
     let resp = client
-        .get(&url)
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET the update feed {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("the update feed {url} answered {status}");
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("parsing the update feed {url}"))
+}
+
+/// #3818 — the release tagged exactly `tag` in a feed's list, never a draft.
+pub(crate) fn pick_release_by_tag(
+    releases: Vec<GithubRelease>,
+    tag: &str,
+) -> Option<GithubRelease> {
+    releases
+        .into_iter()
+        .find(|release| !release.draft && release.tag_name == tag)
+}
+
+/// One release from GitHub's by-tag endpoint at `url`.
+async fn fetch_github_release(url: &str, tag: &str) -> Result<GithubRelease> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building reqwest client")?;
+    let resp = client
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -1619,7 +1809,12 @@ pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
 
 /// Pin to a specific release tag. Used by the rollback path when
 /// the crash-loop detector decides the current version is broken
-/// and the last known-good version should be reinstalled.
+/// and the last known-good version should be reinstalled, and by an
+/// operator's pinned update (`rc:agent.update`).
+///
+/// #3818 — the release is looked up in the update feed first, and at
+/// GitHub's by-tag endpoint only when the feed cannot name it
+/// (`ReleaseLookup::Pinned`).
 ///
 /// Returns `CheckOutcome::UpdateReady` with an installer path on
 /// success — caller spawns the installer. Returns `Skipped` on any
@@ -1627,11 +1822,13 @@ pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
 /// running (broken rollback is better than a hard exit because
 /// "the rollback recovery itself failed").
 ///
-/// Network errors fold into `Skipped` like the rest of the
-/// updater paths so a flaky link can't crash the agent.
+/// Network errors fold into `Unreachable`, verdicts into `Skipped`
+/// (`failed`), like the rest of the updater paths, so a flaky link
+/// can't crash the agent.
 pub async fn pin_version(tag: &str) -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
-    let release = match fetch_release_by_tag(tag).await {
+    let sources = release_sources(ReleaseLookup::Pinned, &update_feed_url(), tag);
+    let release = match fetch_release_from(&sources, tag).await {
         Ok(r) => r,
         Err(e) => return failed(&format!("pin fetch {tag}"), e),
     };
@@ -6753,6 +6950,430 @@ mod tests {
             "the installer is running: the daemon is told to shut down"
         );
         assert!(exits, "and the update loop ends");
+    }
+
+    // ── #3818: where a release is looked up by its tag ──
+
+    /// The tag the field case asked for, in the agent-v0.4.218 push.
+    const TAG_3818: &str = "agent-v0.4.218";
+
+    fn urls_of(sources: &[ReleaseSource]) -> Vec<String> {
+        sources.iter().map(|s| s.url().to_string()).collect()
+    }
+
+    /// #3818 — the tray refresh, and the Linux companion's package sync, look
+    /// the daemon's own release up in the update feed on roomler.ai, the origin
+    /// the update check already reads, and nowhere else. They asked GitHub's
+    /// API by tag, unauthenticated, from every device at every release, and
+    /// behind a corporate network's shared egress GitHub answered 403.
+    #[test]
+    fn the_tray_refresh_looks_its_release_up_on_roomler_ai_alone() {
+        let urls = urls_of(&release_sources(
+            ReleaseLookup::Own,
+            &update_feed_url_from(None),
+            TAG_3818,
+        ));
+        assert_eq!(urls, ["https://roomler.ai/api/agent/latest-release"]);
+        assert!(
+            urls.iter().all(|u| !u.contains("api.github.com")),
+            "no api.github.com anywhere in the refresh's lookup: {urls:?}"
+        );
+    }
+
+    /// #3818 — a deployment that overrides the update feed
+    /// (`ROOMLERD_UPDATE_URL`) has the tray's release looked up there, as its
+    /// update check is.
+    #[test]
+    fn the_tray_refresh_reads_an_overridden_update_feed() {
+        let feed = update_feed_url_from(Some(
+            "https://feed.example/api/agent/latest-release".to_string(),
+        ));
+        assert_eq!(
+            urls_of(&release_sources(ReleaseLookup::Own, &feed, TAG_3818)),
+            ["https://feed.example/api/agent/latest-release"]
+        );
+    }
+
+    /// #3818 — a pinned release (the crash-loop rollback's, an operator's) is
+    /// looked up on roomler.ai first. GitHub's by-tag endpoint follows it only
+    /// as the fallback, for a tag the feed cannot name.
+    #[test]
+    fn a_pinned_release_is_looked_up_on_roomler_ai_first() {
+        let sources = release_sources(ReleaseLookup::Pinned, &update_feed_url_from(None), TAG_3818);
+        assert_eq!(
+            urls_of(&sources),
+            [
+                "https://roomler.ai/api/agent/latest-release",
+                "https://api.github.com/repos/gjovanov/roomler-ai/releases/tags/agent-v0.4.218",
+            ]
+        );
+    }
+
+    /// #3818 — a blank override is no override: the own-release lookup asks the
+    /// feed alone, so a blank URL would fail it on every try.
+    #[test]
+    fn a_blank_feed_override_counts_as_none() {
+        for blank in ["", "   "] {
+            assert_eq!(
+                update_feed_url_from(Some(blank.to_string())),
+                DEFAULT_PROXY_URL
+            );
+        }
+        assert_eq!(
+            update_feed_url_from(Some(" https://feed.example/x ".to_string())),
+            "https://feed.example/x"
+        );
+    }
+
+    /// #3818 — a stand-in for an HTTP endpoint on 127.0.0.1: every request is
+    /// answered with `status` and `body`, and its request line is kept.
+    struct FakeEndpoint {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeEndpoint {
+        async fn start(path: &str, status: &'static str, body: String) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}{path}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&head)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    log.lock().unwrap().push(line);
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            Self { url, seen }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// A URL nothing listens on: a port that was just free.
+    fn nothing_listens_at(path: &str) -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}{path}")
+    }
+
+    const FEED_PATH: &str = "/api/agent/latest-release";
+
+    /// A release as `/api/agent/latest-release` lists one: the per-Machine
+    /// MSI and the desktop companion's EXE, each with GitHub's download URL
+    /// and a digest.
+    fn release_value(tag: &str, draft: bool) -> serde_json::Value {
+        let version = tag.trim_start_matches("agent-v");
+        let asset = |name: String| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url":
+                    format!("https://github.com/gjovanov/roomler-ai/releases/download/{tag}/{name}"),
+                "size": 16_000_000,
+                "digest": format!("sha256:{}", "ab".repeat(32)),
+            })
+        };
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": draft,
+            "prerelease": false,
+            "published_at": "2026-11-12T17:00:00Z",
+            "assets": [
+                asset(format!("roomlerd-{version}-perMachine-x86_64-pc-windows-msvc.msi")),
+                asset(format!("roomler-desktop-{version}-x86_64-pc-windows-msvc.exe")),
+            ],
+        })
+    }
+
+    /// The update feed's answer: these releases, newest first.
+    fn feed_json(releases: &[(&str, bool)]) -> String {
+        serde_json::Value::Array(
+            releases
+                .iter()
+                .map(|(tag, draft)| release_value(tag, *draft))
+                .collect(),
+        )
+        .to_string()
+    }
+
+    /// The pinned lookup's sources, in `release_sources`' order, with GitHub's
+    /// by-tag endpoint swapped for `by_tag`: nothing here reaches GitHub.
+    fn pinned_sources(feed: &str, by_tag: &str, tag: &str) -> Vec<ReleaseSource> {
+        release_sources(ReleaseLookup::Pinned, feed, tag)
+            .into_iter()
+            .map(|source| match source {
+                ReleaseSource::GithubByTag(_) => ReleaseSource::GithubByTag(by_tag.to_string()),
+                feed => feed,
+            })
+            .collect()
+    }
+
+    /// #3818 — the feed names the release of the tag asked for, with the assets
+    /// the refresh picks from, their download URLs and their digests as the feed
+    /// lists them. One request, to the feed.
+    #[tokio::test]
+    async fn the_feed_names_the_release_of_its_tag_with_its_assets() {
+        let feed = FakeEndpoint::start(
+            FEED_PATH,
+            "200 OK",
+            feed_json(&[("agent-v0.4.218", false), ("agent-v0.4.217", false)]),
+        )
+        .await;
+        let tag = "agent-v0.4.217";
+        let release = fetch_release_from(&release_sources(ReleaseLookup::Own, &feed.url, tag), tag)
+            .await
+            .expect("the feed lists it");
+        assert_eq!(release.tag_name, tag);
+        let desktop = release
+            .assets
+            .iter()
+            .find(|a| a.name == "roomler-desktop-0.4.217-x86_64-pc-windows-msvc.exe")
+            .expect("the desktop companion's EXE");
+        assert_eq!(
+            desktop.browser_download_url,
+            "https://github.com/gjovanov/roomler-ai/releases/download/agent-v0.4.217/\
+             roomler-desktop-0.4.217-x86_64-pc-windows-msvc.exe"
+        );
+        assert_eq!(
+            desktop.digest.as_deref(),
+            Some(format!("sha256:{}", "ab".repeat(32)).as_str())
+        );
+        assert_eq!(feed.requests(), [format!("GET {FEED_PATH} HTTP/1.1")]);
+    }
+
+    /// #3818 — a tag the feed lacks (an older release, a build never released,
+    /// a bare version) or lists only as a draft is an error that names the tag
+    /// and the feed: a verdict, not a transport failure.
+    #[tokio::test]
+    async fn a_tag_the_feed_lacks_is_an_error_naming_the_tag_and_the_feed() {
+        let feed = FakeEndpoint::start(
+            FEED_PATH,
+            "200 OK",
+            feed_json(&[("agent-v0.4.218", false), ("agent-v0.4.150", true)]),
+        )
+        .await;
+        for tag in ["agent-v0.4.150", "agent-v0.4.149", "0.4.218"] {
+            let e = fetch_release_from(&release_sources(ReleaseLookup::Own, &feed.url, tag), tag)
+                .await
+                .expect_err(tag);
+            let text = format!("{e:#}");
+            assert!(
+                text.contains(&format!(
+                    "release {tag} is not in the update feed {}",
+                    feed.url
+                )),
+                "{text}"
+            );
+            assert!(
+                matches!(failed("fetch", e), CheckOutcome::Skipped(_)),
+                "a verdict"
+            );
+        }
+        assert_eq!(
+            feed.requests().len(),
+            3,
+            "one request a lookup, to the feed"
+        );
+    }
+
+    /// #3818 — when roomler.ai cannot answer, the own-release lookup is an error
+    /// and asks nothing else: the tray refresh logs `desktop companion refresh
+    /// skipped` and its retry tries again, as it did when GitHub refused. A 503
+    /// is a verdict; a refused connection is a transport failure.
+    #[tokio::test]
+    async fn an_unavailable_feed_is_an_error_and_the_own_lookup_asks_nothing_else() {
+        let down = FakeEndpoint::start(FEED_PATH, "503 Service Unavailable", "{}".into()).await;
+        let sources = release_sources(ReleaseLookup::Own, &down.url, TAG_3818);
+        assert_eq!(sources, [ReleaseSource::Feed(down.url.clone())]);
+        let e = fetch_release_from(&sources, TAG_3818)
+            .await
+            .expect_err("a 503");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(&format!("the update feed {} answered 503", down.url)),
+            "{text}"
+        );
+        assert!(!is_transport_failure(&e), "{text}");
+        assert_eq!(down.requests().len(), 1);
+
+        let gone = nothing_listens_at(FEED_PATH);
+        let e = fetch_release_from(
+            &release_sources(ReleaseLookup::Own, &gone, TAG_3818),
+            TAG_3818,
+        )
+        .await
+        .expect_err("nothing listens");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(&format!("GET the update feed {gone}")),
+            "{text}"
+        );
+        assert!(is_transport_failure(&e), "{text}");
+        assert!(matches!(failed("fetch", e), CheckOutcome::Unreachable(_)));
+    }
+
+    /// #3818 — the pinned lookup takes the feed's answer when the feed lists the
+    /// tag, and only then leaves GitHub alone. A tag the feed lacks, or a feed
+    /// that answers 503, is asked of GitHub by tag, once.
+    #[tokio::test]
+    async fn a_pinned_lookup_asks_github_only_when_the_feed_cannot_name_the_tag() {
+        let old = "agent-v0.4.150";
+        let feed =
+            FakeEndpoint::start(FEED_PATH, "200 OK", feed_json(&[("agent-v0.4.218", false)])).await;
+        let by_tag = FakeEndpoint::start(
+            "/releases/tags/agent-v0.4.150",
+            "200 OK",
+            release_value(old, false).to_string(),
+        )
+        .await;
+
+        let r = fetch_release_from(&pinned_sources(&feed.url, &by_tag.url, TAG_3818), TAG_3818)
+            .await
+            .expect("in the feed");
+        assert_eq!(r.tag_name, TAG_3818);
+        assert!(by_tag.requests().is_empty(), "GitHub is not asked");
+
+        let r = fetch_release_from(&pinned_sources(&feed.url, &by_tag.url, old), old)
+            .await
+            .expect("from GitHub by tag");
+        assert_eq!(r.tag_name, old);
+        assert_eq!(
+            by_tag.requests(),
+            ["GET /releases/tags/agent-v0.4.150 HTTP/1.1"]
+        );
+        assert_eq!(
+            feed.requests().len(),
+            2,
+            "the feed is asked first, each time"
+        );
+
+        let down = FakeEndpoint::start(FEED_PATH, "503 Service Unavailable", "{}".into()).await;
+        let r = fetch_release_from(&pinned_sources(&down.url, &by_tag.url, old), old)
+            .await
+            .expect("from GitHub by tag");
+        assert_eq!(r.tag_name, old);
+        assert_eq!(down.requests().len(), 1);
+        assert_eq!(by_tag.requests().len(), 2);
+    }
+
+    /// #3818 — when neither source names the tag, the error says what each
+    /// answered, the feed first, and the last answer decides the outcome: a
+    /// rate-limited GitHub is a verdict, so the rollback raises its sentinel
+    /// with the reason.
+    #[tokio::test]
+    async fn a_pinned_lookup_that_finds_nothing_names_both_answers() {
+        let old = "agent-v0.4.150";
+        let feed =
+            FakeEndpoint::start(FEED_PATH, "200 OK", feed_json(&[("agent-v0.4.218", false)])).await;
+        let refused = FakeEndpoint::start(
+            "/releases/tags/agent-v0.4.150",
+            "403 Forbidden",
+            "{}".into(),
+        )
+        .await;
+        let e = fetch_release_from(&pinned_sources(&feed.url, &refused.url, old), old)
+            .await
+            .expect_err("neither names it");
+        let text = format!("{e:#}");
+        let feed_part = format!(
+            "the update feed: release {old} is not in the update feed {}",
+            feed.url
+        );
+        let github_part = format!("GitHub by tag: GitHub returned 403 Forbidden for tag {old}");
+        assert!(
+            text.contains(&feed_part) && text.contains(&github_part),
+            "{text}"
+        );
+        assert!(
+            text.find(&feed_part) < text.find(&github_part),
+            "the feed's answer first: {text}"
+        );
+        assert!(matches!(failed("pin fetch", e), CheckOutcome::Skipped(_)));
+    }
+
+    /// An asset's name must be a plain file name. Every name a release
+    /// publishes is one; a name with a separator, or with `..`, is refused.
+    #[test]
+    fn an_asset_name_must_be_a_plain_file_name() {
+        for name in [
+            "roomlerd-0.4.218-x86_64-pc-windows-msvc.msi",
+            "roomlerd-0.4.218-perMachine-x86_64-pc-windows-msvc.msi",
+            "roomler-desktop-0.4.218-x86_64-pc-windows-msvc.exe",
+            "roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            "roomler-desktop-0.4.218-aarch64-unknown-linux-gnu.rpm",
+            "roomlerd-0.4.218-x86_64-unknown-linux-gnu.tar.gz",
+            "roomlerd-0.4.218-aarch64-apple-darwin.pkg",
+        ] {
+            assert_eq!(plain_file_name(name).ok(), Some(name), "{name}");
+        }
+        for name in [
+            "sub/roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            r"sub\roomlerd-0.4.218-x86_64-pc-windows-msvc.msi",
+            "/roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            "..",
+            "../roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            r"..\roomler-desktop-0.4.218-x86_64-pc-windows-msvc.exe",
+            "",
+            ".",
+            "roomlerd-0.4.218.msi:x",
+            "roomlerd-0.4.218\n.deb",
+        ] {
+            let e = plain_file_name(name).expect_err(name);
+            assert!(
+                format!("{e:#}").contains("an asset's name must be a plain file name"),
+                "{name:?}: {e:#}"
+            );
+        }
+    }
+
+    /// The name is refused before the download is asked for: nothing listens
+    /// at the asset's URL here, so a request would have failed as a connect
+    /// error instead.
+    #[tokio::test]
+    async fn a_name_that_is_not_plain_is_refused_before_any_download() {
+        for name in [
+            "sub/roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            "../roomlerd-0.4.218-x86_64-pc-windows-msvc.msi",
+        ] {
+            let asset = GithubAsset {
+                name: name.to_string(),
+                browser_download_url: nothing_listens_at("/asset"),
+                size: 0,
+                digest: None,
+            };
+            let e = download_asset(&asset, TAG_3818).await.expect_err(name);
+            let text = format!("{e:#}");
+            assert!(
+                text.contains("an asset's name must be a plain file name"),
+                "{name}: {text}"
+            );
+            assert!(!is_transport_failure(&e), "not even attempted: {text}");
+        }
     }
 }
 // RETIRED-NAME-ANCHOR-END

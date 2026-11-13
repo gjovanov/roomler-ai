@@ -872,6 +872,25 @@ display names, OS and version; machine ids, owner ids and keys never leave the
 server. Detail and the negative-control test:
 [desktop-companion.md](desktop-companion.md) §6.
 
+### A rule that names a role
+
+An overlay ACL rule can name its sources by role (`RoleId`). A node matches such a
+rule through its owner: the roles the owner holds in the node's org, as that org has
+them when the rule is compiled
+([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)).
+Each compile (a node's netmap, a delta fan, the DERP allow table, an org-relay
+decision) reads the org's role ids once and reuses them for every node it resolves
+(`CompileRoles`, `crates/modules/network/src/overlay.rs:2516`), so a role the org
+has deleted, or one of another org, never matches.
+
+When someone is given a role or loses one, or a role is deleted, the org's nodes are
+re-fanned about 750 ms later, one re-fan for a burst of changes, while the org's ACL
+is `warn` or `enforce` (`refan_for_role_change`,
+`crates/modules/network/src/routes/overlay_policy.rs:334`). Under `off` a role shapes
+nothing, so nothing is re-fanned. A node whose owner's roles cannot be read matches
+no role rule, with a WARN (`overlay acl: roles unreadable; role-scoped rules will not
+match this node`), and an org-relay grant that needs them is refused.
+
 ---
 
 ## 8. Failure handling

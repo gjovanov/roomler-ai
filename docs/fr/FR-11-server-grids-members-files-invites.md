@@ -59,7 +59,7 @@ decision).
   `users.find_by_email` (`dao/user.rs:105-110` — the address is a *proven
   reservation*, so adding by it is adding a verified account). Unknown
   address → 404 with "no account with that address — use Invites". Gate
-  unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:441`).
+  unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:475`).
 - **Remove** (NEW — no route exists today, verified): `DELETE
   /tenant/{tid}/member/{user_id}` on the member router (`lib.rs:167-172`),
   gated on **`KICK_MEMBERS`** (`role.rs:35` — defined, never consumed until
