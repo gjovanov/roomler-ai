@@ -652,11 +652,7 @@ fn move_aside(f: &FolderNotTheirs) -> String {
     };
     // Rule 2 of the package's `sudo_line_fits`: the reads say yes, the folder
     // is root's own and real, and the name is plain.
-    let Some(name) = f
-        .administrator
-        .as_deref()
-        .filter(|n| f.is_dir && f.owner == 0 && plain_account_name(n))
-    else {
+    let Ok(name) = administrator_command(f) else {
         let copy_back = match names.len() {
             0 => "",
             1 => " and copy that file back into a new folder that the person's account makes",
@@ -711,6 +707,117 @@ fn move_aside(f: &FolderNotTheirs) -> String {
 /// `packaging/macos/postinstall:259`).
 const INSTALL_DOC: &str =
     "docs/installation.md, section \"Which account each step of the package's script writes as\"";
+
+/// #3802 — how long the reads behind an administrator's command may take
+/// at a give-up, all of them together: past it, the line gives none.
+pub const ADMIN_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// #3802 — why a give-up line gives no administrator's command: what the
+/// folder's own read says, the account read that said no, or the deadline.
+/// The supervisor logs its [`NoCommand::why`] once, beside the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoCommand {
+    /// `lstat` read a link or a file at the folder.
+    NotADirectory,
+    /// The folder holds a kept copy the person cannot read.
+    UnreadableCopy,
+    /// Another account than root owns the folder: its uid.
+    NotRoots(u32),
+    /// The account reads have not run.
+    NotRead,
+    /// The account database has no entry for the person's uid, or its name
+    /// is not UTF-8.
+    NoAccount,
+    /// The account name is not plain ([`plain_account_name`]).
+    NameNotPlain,
+    /// The paths of the home do not read as the folder
+    /// ([`path_reads_as_the_folder`]).
+    PathsDoNotRead,
+    /// The account read's task ended without an answer.
+    LookupFailed,
+    /// `dseditgroup` could not be started: the error.
+    AdminCheckDidNotRun(String),
+    /// `dseditgroup` did not confirm that the person is a member of
+    /// `admin`: its exit code, `None` when a signal ended it.
+    NotAdministrator(Option<i32>),
+    /// The reads did not answer within [`ADMIN_READ_DEADLINE`].
+    TimedOut,
+}
+
+impl NoCommand {
+    /// The words the supervisor logs for it: which read refused the
+    /// command, or that the deadline ran out.
+    pub fn why(&self) -> String {
+        match self {
+            NoCommand::NotADirectory => {
+                "the folder's own lstat reads a link or a file, not a directory".to_string()
+            }
+            NoCommand::UnreadableCopy => {
+                "the folder holds a kept copy that the person cannot read".to_string()
+            }
+            NoCommand::NotRoots(uid) => format!("uid {uid} owns the folder, not root"),
+            NoCommand::NotRead => "the account reads have not run".to_string(),
+            NoCommand::NoAccount => "the account lookup (getpwuid_r) found no entry with a UTF-8 \
+                                     name for the person's uid"
+                .to_string(),
+            NoCommand::NameNotPlain => {
+                "the person's account name is not plain ([A-Za-z0-9._-]+)".to_string()
+            }
+            NoCommand::PathsDoNotRead => "the person's home is not a folder, or its Library or \
+                                          Library/Application Support is not a folder of their \
+                                          own (a link, another account's, or unread), or the \
+                                          folder is not one name inside it"
+                .to_string(),
+            NoCommand::LookupFailed => {
+                "the account lookup's task ended without an answer".to_string()
+            }
+            NoCommand::AdminCheckDidNotRun(e) => format!("dseditgroup could not run: {e}"),
+            NoCommand::NotAdministrator(code) => format!(
+                "dseditgroup does not confirm that the person is a member of admin ({})",
+                match code {
+                    Some(code) => format!("exit {code}"),
+                    None => "ended by a signal".to_string(),
+                }
+            ),
+            NoCommand::TimedOut => format!(
+                "the reads did not answer within {} s",
+                ADMIN_READ_DEADLINE.as_secs()
+            ),
+        }
+    }
+}
+
+/// #3802 — what the folder's own read says against an administrator's
+/// command, before any read of the account: `None` when it leaves the
+/// command to the account reads.
+pub fn folder_refuses(f: &FolderNotTheirs) -> Option<NoCommand> {
+    if !f.is_dir {
+        return Some(NoCommand::NotADirectory);
+    }
+    if f.kept.iter().any(|k| person_cannot_read(f.uid, k.stat)) {
+        return Some(NoCommand::UnreadableCopy);
+    }
+    if f.owner != 0 {
+        return Some(NoCommand::NotRoots(f.owner));
+    }
+    None
+}
+
+/// #3802 — the account name a give-up line names with its administrator's
+/// command for `f`, or why it gives none: the folder's own read first
+/// ([`folder_refuses`]), then the account reads
+/// ([`FolderNotTheirs::administrator`]). The line's text and the
+/// supervisor's log both read it, so they never disagree.
+pub fn administrator_command(f: &FolderNotTheirs) -> Result<&str, NoCommand> {
+    if let Some(no) = folder_refuses(f) {
+        return Err(no);
+    }
+    match &f.administrator {
+        Ok(name) if plain_account_name(name) => Ok(name),
+        Ok(_) => Err(NoCommand::NameNotPlain),
+        Err(no) => Err(no.clone()),
+    }
+}
 
 /// #3802 — an account name a give-up line may print in its sentence and
 /// hand to `dseditgroup`: one or more of `[A-Za-z0-9._-]`.
@@ -805,9 +912,9 @@ pub struct FolderNotTheirs {
     /// The console person's account name when the reads of the package's
     /// `sudo_line_fits` all said yes for this folder: that person is an
     /// administrator of this Mac, and its path names the folder it reads as.
-    /// `None` when any of them said no or did not answer in time: the line
-    /// then gives no command.
-    pub administrator: Option<String>,
+    /// Otherwise the read that said no, or that they did not answer in time:
+    /// the line then gives no command.
+    pub administrator: Result<String, NoCommand>,
 }
 
 /// #3802 — one of [`kept_for_revert`] that the person's folder holds.
@@ -853,7 +960,7 @@ pub fn folder_not_theirs(
         is_dir: mode & 0o170000 == 0o040000,
         kept,
         stamp: stamp.to_string(),
-        administrator: None,
+        administrator: Err(NoCommand::NotRead),
     })
 }
 
@@ -974,10 +1081,6 @@ mod imp {
         })
     }
 
-    /// #3802 — how long the reads behind an administrator's command may take
-    /// at a give-up, all of them together: past it, the line gives none.
-    const ADMIN_READ_DEADLINE: Duration = Duration::from_secs(5);
-
     /// #3802 — the account name and the home the account database names for
     /// `uid` (`getpwuid_r`, as `appdirs::account_home` reads the home).
     /// `None` when there is no entry or its name is not UTF-8.
@@ -1026,40 +1129,70 @@ mod imp {
     /// account database and the `lstat`s run on the blocking pool,
     /// `dseditgroup` is a tokio child with no pipe that is killed when
     /// dropped, and the whole read stops at [`ADMIN_READ_DEADLINE`]. Anything
-    /// that fails or runs late is `None`: no command. A read only, once per
-    /// give-up.
-    async fn administrator_reads(f: &FolderNotTheirs) -> Option<String> {
-        if !(f.is_dir && f.owner == 0) {
-            return None;
+    /// that fails or runs late is the [`NoCommand`] that names it: no
+    /// command. A read only, once per give-up, and none at all for a folder
+    /// whose own read already refuses the command ([`folder_refuses`]).
+    async fn administrator_reads(f: &FolderNotTheirs) -> Result<String, NoCommand> {
+        administrator_reads_within(f, ADMIN_READ_DEADLINE).await
+    }
+
+    /// [`administrator_reads`] with its deadline given, so a test can run
+    /// it out.
+    async fn administrator_reads_within(
+        f: &FolderNotTheirs,
+        deadline: Duration,
+    ) -> Result<String, NoCommand> {
+        if let Some(no) = folder_refuses(f) {
+            return Err(no);
         }
         let (uid, folder) = (f.uid, f.path.clone());
         let read = async move {
-            let paths = tokio::task::spawn_blocking(move || {
-                let (name, home) = name_and_home(uid)?;
-                let fits = plain_account_name(&name)
-                    && path_reads_as_the_folder(uid, &home, &folder, |p| {
-                        std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode()))
-                    });
-                fits.then_some(name)
-            });
-            let Ok(Some(name)) = paths.await else {
-                return None;
+            let name = match tokio::task::spawn_blocking(move || account_reads(uid, &folder)).await
+            {
+                Ok(Ok(name)) => name,
+                Ok(Err(no)) => return Err(no),
+                Err(_) => return Err(NoCommand::LookupFailed),
             };
-            let admin = tokio::process::Command::new("/usr/sbin/dseditgroup")
-                .args(["-o", "checkmember", "-m", name.as_str(), "admin"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status()
-                .await
-                .is_ok_and(|s| s.success());
-            admin.then_some(name)
+            is_administrator(&name).await.map(|()| name)
         };
-        tokio::time::timeout(ADMIN_READ_DEADLINE, read)
+        tokio::time::timeout(deadline, read)
             .await
-            .ok()
-            .flatten()
+            .unwrap_or(Err(NoCommand::TimedOut))
+    }
+
+    /// #3802 — the account half of [`administrator_reads`], on the blocking
+    /// pool: the account database names a plain name for `uid` and a home
+    /// whose paths read as `folder` ([`path_reads_as_the_folder`]).
+    fn account_reads(uid: u32, folder: &std::path::Path) -> Result<String, NoCommand> {
+        let (name, home) = name_and_home(uid).ok_or(NoCommand::NoAccount)?;
+        if !plain_account_name(&name) {
+            return Err(NoCommand::NameNotPlain);
+        }
+        let lstat = |p: &std::path::Path| std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode()));
+        if !path_reads_as_the_folder(uid, &home, folder, lstat) {
+            return Err(NoCommand::PathsDoNotRead);
+        }
+        Ok(name)
+    }
+
+    /// #3802 — whether `dseditgroup` says the account `name` is a member of
+    /// `admin` (the package's question): a child with no pipe, killed when
+    /// dropped. Bounded by its caller.
+    async fn is_administrator(name: &str) -> Result<(), NoCommand> {
+        let status = tokio::process::Command::new("/usr/sbin/dseditgroup")
+            .args(["-o", "checkmember", "-m", name, "admin"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await
+            .map_err(|e| NoCommand::AdminCheckDidNotRun(e.to_string()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(NoCommand::NotAdministrator(status.code()))
+        }
     }
 
     /// Spawn the agent into `uid`'s GUI session, **as that user**.
@@ -1593,6 +1726,15 @@ mod imp {
                          NOT retrying: {}",
                         gave_up_reason(last_end, one_row, not_theirs.as_ref())
                     );
+                    // #3802 — why that line gives no administrator's command:
+                    // the read that refused it, or the deadline. Once.
+                    if let Some(Err(no)) = not_theirs.as_ref().map(administrator_command) {
+                        tracing::info!(
+                            "macOS supervisor: the give-up line gives no administrator's \
+                             command: {}",
+                            no.why()
+                        );
+                    }
                 } else {
                     tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
                 }
@@ -2562,7 +2704,7 @@ mod tests {
                 assert!(!why.contains("sudo") && !why.contains("id -u"), "{why}");
                 // The console person is an administrator of this Mac.
                 let admin = FolderNotTheirs {
-                    administrator: Some("p".to_string()),
+                    administrator: Ok("p".to_string()),
                     ..root_made.clone()
                 };
                 let why = gave_up_reason(end, one_row, Some(&admin));
@@ -2626,7 +2768,7 @@ mod tests {
             })
             .collect();
         let folder = FolderNotTheirs {
-            administrator: administrator.map(str::to_string),
+            administrator: administrator.map(str::to_string).ok_or(NoCommand::NotRead),
             ..folder_not_theirs(path.into(), 501, 0, mode, kept, STAMP).expect("root's")
         };
         let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
@@ -2881,7 +3023,7 @@ mod tests {
             assert!(plain_account_name(name), "{name:?}");
         }
         let folder = FolderNotTheirs {
-            administrator: Some("p".to_string()),
+            administrator: Ok("p".to_string()),
             ..folder_not_theirs(F.into(), 501, 502, 0o40755, Vec::new(), STAMP).expect("502's")
         };
         let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
@@ -2895,6 +3037,103 @@ mod tests {
             )),
             "{why}"
         );
+    }
+
+    /// #3802 — when the line gives no administrator's command, the
+    /// supervisor logs why, once: the folder's own read first, then the
+    /// account read that said no, or the deadline. The words, exactly, and
+    /// the line agrees: no command for each of them.
+    #[test]
+    fn the_log_names_why_the_line_gives_no_command() {
+        let root = |administrator: Result<String, NoCommand>| FolderNotTheirs {
+            administrator,
+            ..folder_not_theirs(F.into(), 501, 0, 0o40755, Vec::new(), STAMP).expect("root's")
+        };
+        let p = || root(Ok("p".to_string()));
+        assert_eq!(administrator_command(&p()), Ok("p"));
+        let unreadable = vec![KeptCopy {
+            name: kept_for_revert()[1].clone(),
+            stat: ROOTS_600,
+        }];
+        let os_error = "No such file or directory (os error 2)".to_string();
+        let cases = [
+            (
+                FolderNotTheirs {
+                    is_dir: false,
+                    ..p()
+                },
+                NoCommand::NotADirectory,
+                "the folder's own lstat reads a link or a file, not a directory",
+            ),
+            (
+                FolderNotTheirs {
+                    kept: unreadable,
+                    ..p()
+                },
+                NoCommand::UnreadableCopy,
+                "the folder holds a kept copy that the person cannot read",
+            ),
+            (
+                FolderNotTheirs { owner: 502, ..p() },
+                NoCommand::NotRoots(502),
+                "uid 502 owns the folder, not root",
+            ),
+            (
+                root(Ok("p q".to_string())),
+                NoCommand::NameNotPlain,
+                "the person's account name is not plain ([A-Za-z0-9._-]+)",
+            ),
+            (
+                root(Err(NoCommand::NotRead)),
+                NoCommand::NotRead,
+                "the account reads have not run",
+            ),
+            (
+                root(Err(NoCommand::NoAccount)),
+                NoCommand::NoAccount,
+                "the account lookup (getpwuid_r) found no entry with a UTF-8 name for the \
+                 person's uid",
+            ),
+            (
+                root(Err(NoCommand::PathsDoNotRead)),
+                NoCommand::PathsDoNotRead,
+                "the person's home is not a folder, or its Library or Library/Application \
+                 Support is not a folder of their own (a link, another account's, or unread), \
+                 or the folder is not one name inside it",
+            ),
+            (
+                root(Err(NoCommand::LookupFailed)),
+                NoCommand::LookupFailed,
+                "the account lookup's task ended without an answer",
+            ),
+            (
+                root(Err(NoCommand::AdminCheckDidNotRun(os_error.clone()))),
+                NoCommand::AdminCheckDidNotRun(os_error),
+                "dseditgroup could not run: No such file or directory (os error 2)",
+            ),
+            (
+                root(Err(NoCommand::NotAdministrator(Some(67)))),
+                NoCommand::NotAdministrator(Some(67)),
+                "dseditgroup does not confirm that the person is a member of admin (exit 67)",
+            ),
+            (
+                root(Err(NoCommand::NotAdministrator(None))),
+                NoCommand::NotAdministrator(None),
+                "dseditgroup does not confirm that the person is a member of admin (ended by a \
+                 signal)",
+            ),
+            (
+                root(Err(NoCommand::TimedOut)),
+                NoCommand::TimedOut,
+                "the reads did not answer within 5 s",
+            ),
+        ];
+        for (f, no, why) in cases {
+            assert_eq!(administrator_command(&f), Err(no.clone()), "{f:?}");
+            assert_eq!(no.why(), why);
+            let line = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&f));
+            assert!(!line.contains("can run this"), "{f:?}: {line}");
+        }
     }
 
     /// #3802 — the paths half of the package's `sudo_line_fits`, with
