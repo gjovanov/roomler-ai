@@ -317,6 +317,11 @@ slept() { [ "$(cat "$STATE/clock")" = "$1" ] || fail "slept $(cat "$STATE/clock"
 slept_at_most() { [ "$(cat "$STATE/clock")" -le "$1" ] || fail "slept $(cat "$STATE/clock") s, more than $1 s"; }
 is_the_payloads() { cmp -s "$RES/$(basename "$1")" "$1" || fail "$1 is not this payload's plist"; }
 absent() { [ ! -e "$1" ] || fail "$1 is still there"; }
+# The job is the one the case loaded: nothing booted it out or started another.
+same_job() {
+    [ "$(cat "$STATE/loaded/$(printf '%s' "$1" | tr '/' '_')" 2>/dev/null)" = "$(printf '\tstate = %s' "$2")" ] ||
+        fail "$1 is not the job the case loaded"
+}
 persons_untouched() { [ "$(persons_tree)" = "$PERSONS_BEFORE" ] || fail "something under /Users changed"; }
 
 done_case() {
@@ -471,7 +476,9 @@ daemon_reloaded
 helper_left_running
 done_case
 
-start "login window, the helper's state cannot be read: it is left as it is, and the log says so"
+# Unread, the helper gets a bootstrap and no bootout. launchd refuses the
+# bootstrap of a loaded job and leaves that job as it is.
+start "login window, the helper's state cannot be read and it runs this install: it is not booted out, and the log says so"
 login_window_two_rows
 loaded system/com.roomler.update running
 print_fails_after system/com.roomler.update 0
@@ -479,9 +486,23 @@ run
 rc_is 0
 daemon_reloaded
 not_called "$HELPER_OUT"
-not_called "$HELPER_IN"
+times_called 1 "$HELPER_IN"
 loaded_now system/com.roomler.update
-said "WARNING: the update helper's state could not be read, so it is left as it is: launchctl print exited 5: Unexpected error: 5: Input/output error"
+same_job system/com.roomler.update running
+said "WARNING: the update helper's state could not be read, so it is not booted out: launchctl print exited 5: Unexpected error: 5: Input/output error"
+said "launchctl bootstrap did not load it either: Bootstrap failed: 37: Operation already in progress"
+done_case
+
+# A Mac whose helper is never loaded gets no updates.
+start "login window, the helper's state cannot be read and it is not loaded: the bootstrap loads it"
+login_window_two_rows
+unloaded system/com.roomler.update
+print_fails_after system/com.roomler.update 0
+run
+rc_is 0
+daemon_reloaded
+helper_bootstrapped
+said "Its state could not be read first (launchctl print exited 5: Unexpected error: 5: Input/output error); it was not loaded, and now it is."
 done_case
 
 # --- N5: opted out of auto-update ---------------------------------------------

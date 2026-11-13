@@ -654,7 +654,10 @@ UPDATE_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.update.plist"
 #   idle        loaded and not running
 #   not-loaded  launchctl says there is no such service
 #   unread      `launchctl print` failed otherwise (its answer: HELPER_READ_ERR)
-# Only `idle` lets the script boot the job out (#3783). launchctl's whole
+# Only `idle` lets the script boot the job out (#3783). Where the helper is
+# wanted, `unread` gets the bootstrap alone: it loads a helper that was not
+# loaded and is refused for one that is, so it never ends a running job.
+# launchctl's whole
 # answer is read first, then matched: piped into `grep -q`, which exits at the
 # match, a launchctl still writing died of SIGPIPE, and under pipefail a
 # running job read as not running. A print that failed read that way too.
@@ -723,9 +726,19 @@ if [ ! -f /etc/roomler/disable-auto-update ] && [ ! -f /etc/roomler-agent/disabl
         fi
         ;;
       *)
-        # It may be running this install, so it is not booted out.
-        echo "WARNING: the update helper's state could not be read, so it is left as it is: $HELPER_READ_ERR"
-        echo "  Its refreshed plist applies at its next load. Read it with: sudo launchctl print system/com.roomler.update"
+        # Unread: it may be running this install, so it is not booted out.
+        # A bootstrap ends nothing that runs. It loads a helper that was not
+        # loaded, since a Mac whose helper is never loaded gets no updates,
+        # and launchd refuses it for a loaded one, which keeps its job.
+        if UPDATE_ERR=$(launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>&1); then
+          echo "roomler update helper installed (unattended self-update, log: /var/log/roomler/update.log)"
+          echo "  Its state could not be read first ($HELPER_READ_ERR); it was not loaded, and now it is."
+        else
+          echo "WARNING: the update helper's state could not be read, so it is not booted out: $HELPER_READ_ERR"
+          echo "  launchctl bootstrap did not load it either: $UPDATE_ERR"
+          echo "  If it is loaded, it keeps its job, and its refreshed plist applies at its next load."
+          echo "  Read it with: sudo launchctl print system/com.roomler.update"
+        fi
         ;;
     esac
   fi
