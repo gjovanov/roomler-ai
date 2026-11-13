@@ -592,7 +592,10 @@ pub fn gave_up_reason(
 /// reach stops the command with everything where it was, where the revert
 /// still finds it, and if the last move fails the one before it is undone. It
 /// does the same in an administrator's own shell and as root. The names it
-/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them.
+/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them, and
+/// each command starts with `sudo test ! -e` of the name it moves the folder
+/// to: a second run of the same line does nothing, where BSD `mv` would move
+/// the live folder INTO the one the first run made.
 ///
 /// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
 /// no command: moving the folder would leave it where the revert does not
@@ -669,7 +672,11 @@ fn move_aside(f: &FolderNotTheirs) -> String {
     let folder = sh_quote(&path);
     let aside_path = format!("{path}.made-by-root-{}", f.stamp);
     let aside = sh_quote(&aside_path);
-    let can = format!(" {name} is an administrator of this Mac and can run this: ");
+    // Run a second time, the line does nothing: the name it moves the folder
+    // to is there by then.
+    let can = format!(
+        " {name} is an administrator of this Mac and can run this: sudo test ! -e {aside} && "
+    );
     let restart = " Then log out and back in, or restart this daemon: \
                    sudo launchctl kickstart -k system/com.roomler.daemon";
     if names.is_empty() {
@@ -2660,12 +2667,31 @@ mod tests {
         assert_eq!(
             give_up_line("fits + no kept copy", F, 0o40755, &[]),
             format!(
-                "{}{ONLY}{WHO}sudo mv '{F}' '{F}.made-by-root-{STAMP}' (if it fails, nothing \
-                 moved), and the worker makes the folder again as the person at its next \
-                 start.{RESTART}",
+                "{}{ONLY}{WHO}sudo test ! -e '{F}.made-by-root-{STAMP}' && sudo mv '{F}' \
+                 '{F}.made-by-root-{STAMP}' (if it fails, nothing moved), and the worker makes \
+                 the folder again as the person at its next start.{RESTART}",
                 cause(F)
             )
         );
+    }
+
+    /// #3802 — a second run of the same printed line does nothing: each
+    /// command starts with a test that the name it moves the folder to is
+    /// not there yet. Without it, BSD `mv` would move the live folder INTO
+    /// the one the first run made.
+    #[test]
+    fn the_give_up_line_does_nothing_when_it_is_run_a_second_time() {
+        let guard = format!("{WHO}sudo test ! -e '{F}.made-by-root-{STAMP}' && sudo ");
+        for kept in [
+            &[][..],
+            &[(0, THEIRS)],
+            &[(1, THEIRS)],
+            &[(0, THEIRS), (1, THEIRS)],
+        ] {
+            let why = give_up_line("which commands", F, 0o40755, kept);
+            assert_eq!(why.matches(guard.as_str()).count(), 1, "{kept:?}: {why}");
+            assert_eq!(why.matches("sudo test").count(), 1, "{kept:?}: {why}");
+        }
     }
 
     /// #3802 — the line for a folder that holds `copies` (names inside it),
@@ -2685,8 +2711,9 @@ mod tests {
         format!(
             "{}{ONLY} It holds {}, which `sudo roomlerd one-row --revert` reads there and \
              nowhere else, so the command copies {it} into a new folder that the person's \
-             account makes. {admin} is an administrator of this Mac and can run this: sudo -u \
-             '#501' mkdir '{new}' && sudo -u '#501' cp {from}'{new}/' && sudo mv '{q}' \
+             account makes. {admin} is an administrator of this Mac and can run this: sudo test \
+             ! -e '{aside}' && sudo -u '#501' mkdir '{new}' && sudo -u '#501' cp {from}'{new}/' \
+             && sudo mv '{q}' \
              '{aside}' && {{ sudo mv '{new}' '{q}' || sudo mv '{aside}' '{q}'; }} (nothing moves \
              until the copies are made, and if the last move fails the one before it is \
              undone).{RESTART}",
@@ -2706,8 +2733,9 @@ mod tests {
             format!(
                 "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd \
                  one-row --revert` reads there and nowhere else, so the command copies it into \
-                 a new folder that the person's account makes.{WHO}sudo -u '#501' mkdir \
-                 '{F}.new-{STAMP}' && sudo -u '#501' cp \
+                 a new folder that the person's account makes.{WHO}sudo test ! -e \
+                 '{F}.made-by-root-{STAMP}' && sudo -u '#501' mkdir '{F}.new-{STAMP}' && sudo -u \
+                 '#501' cp \
                  '{F}/com.roomler.agent.plist.pre-one-row' '{F}.new-{STAMP}/' && sudo mv '{F}' \
                  '{F}.made-by-root-{STAMP}' && {{ sudo mv '{F}.new-{STAMP}' '{F}' || sudo mv \
                  '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are made, \
