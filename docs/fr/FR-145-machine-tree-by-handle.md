@@ -32,7 +32,7 @@ Anchors are master `84a93e740` (2026-11-12). Everything below is code, read in t
 | A crash record the service's supervisor writes | `create_dir_all` of `machine_global_dir()\crashes`; `<ts>-<pid>.json.tmp` created, written and flushed by path; `fs::rename` by path | `crates/agent-core/src/crash_recorder.rs:213-214`, `:275-293`, `:314-317` |
 | A record that does not parse | `create_dir_all(crashes\malformed)`, `fs::rename` by path | `crash_recorder.rs:424-433` |
 | The uploader, after a verdict | `std::fs::remove_file` of the sidecar's path | `agents/roomlerd/src/crash_uploader.rs:123`, `:135`, `:354-355` |
-| The service logs | `create_dir_all(service-logs)`; `tracing_appender`'s daily appender opens `<basename>.<date>` by path at start, and again at every rotation | `crates/agent-core/src/logging.rs:227-238`, `:1042-1046` |
+| The service logs | `create_dir_all(service-logs)`; `tracing_appender`'s daily appender opens `<basename>.<date>` by path at start, and again at every rotation | `crates/agent-core/src/logging.rs:227-238`, `:1044-1048` |
 | The prune, the panic file, the stderr file | `read_dir` and `remove_file(entry.path())`; `fs::write(panic-<pid>-<ts>.log)`; an `OpenOptions` create-and-append | `logging.rs:1082-1104`, `:1124-1127`, `:795-801` |
 | The clean-up's per-Machine arm | for both segments, `path.exists()`, then `remove_dir_all` of `<ProgramData>\roomler\<segment>\service-logs` | `agents/roomlerd/src/install_cleanup.rs:577-605` |
 | The clean-up's per-user arm | each of the four trees checked by path (`appdirs::link_below`, `link_inside`), then removed by path in a second step | `install_cleanup.rs:462-471`, `:514-532` |
@@ -455,7 +455,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
   reader reads (`app.rs:7461`) for no gain.
-- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1544-1546`). Options: in this FR; a design pass of
+- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1621-1623`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1371-1385`; the earlier anchor
@@ -476,7 +476,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 
 ## Out of scope
 
-- File-transfer staging (`files.rs:1544-1546` and its pipeline): its own design pass (D5).
+- File-transfer staging (`files.rs:1621-1623` and its pipeline): its own design pass (D5).
 - The person's own daemon's files in their profile, which stay as they are.
 - macOS and Linux.
 - Folders SYSTEM makes for itself outside the machine folder, such as the updater's staging (`updater.rs:1162`).

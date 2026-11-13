@@ -2801,9 +2801,11 @@ pub trait LocalApiState: Send + Sync {
     /// Asked fresh by the person-at-the-device socket before it applies a
     /// `ConfigSet` ([`Scope::Person`]): its listener follows the seat on a
     /// poll, so a connection can outlive its person's turn at the seat.
+    /// #3796 — or not known yet ([`AtTheSeat::NotKnownYet`]): a daemon that
+    /// asks other processes, which may not answer, waits a bounded time.
     /// Default: no — a daemon that cannot say changes nothing there.
-    async fn at_the_seat_now(&self, _uid: u32) -> bool {
-        false
+    async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+        AtTheSeat::No
     }
     /// Remote-control sessions awaiting an operator consent decision (P2b).
     /// Default: none — so existing impls / mocks and the read-only contract are
@@ -3543,13 +3545,35 @@ fn not_on_the_person_socket_for_key(key: &str) -> Response {
     }
 }
 
+/// #3796 — whether a uid is the person at this device's seat right now, as
+/// the daemon could tell it in time ([`LocalApiState::at_the_seat_now`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtTheSeat {
+    /// That uid is the person at the seat.
+    Yes,
+    /// Someone else, nobody, or a daemon that cannot say.
+    No,
+    /// Who is at the seat gave no answer within the daemon's wait (logind
+    /// stopped, say): not known yet. A `ConfigSet` is refused with
+    /// [`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`], which asks for a retry, never
+    /// as if the person had left.
+    NotKnownYet,
+}
+
+/// #3711, #3796 — the answer when who is signed in at this computer's screen
+/// is not known in time on a Linux system install: a read, a received file
+/// and a files folder's set (`roomlerd`'s `files::CANNOT_TELL`), and a
+/// `ConfigSet` over the person-at-the-device socket. A retry asks again.
+pub const CANNOT_TELL_WHO_IS_AT_THE_SCREEN: &str =
+    "Could not tell who is signed in at this computer's screen. Try again.";
+
 /// #2871 (review) — is the peer of a person-socket connection the person at
 /// the seat RIGHT NOW ([`LocalApiState::at_the_seat_now`])? A peer the kernel
 /// said nothing about never is.
-async fn still_at_the_seat(state: &dyn LocalApiState, peer: &ClientPeer) -> bool {
+async fn still_at_the_seat(state: &dyn LocalApiState, peer: &ClientPeer) -> AtTheSeat {
     match peer.uid {
         Some(uid) => state.at_the_seat_now(uid).await,
-        None => false,
+        None => AtTheSeat::No,
     }
 }
 
@@ -3748,12 +3772,16 @@ where
                 // the seat on a poll, so a connection can outlive its person's
                 // turn there, and these settings are the person AT the seat's.
                 // Root is root on every endpoint.
-                Ok(Request::ConfigSet { key, .. })
-                    if scope.is_person()
-                        && !peer.is_root()
-                        && !still_at_the_seat(state, &peer).await =>
-                {
-                    not_at_the_seat_now(&key)
+                Ok(Request::ConfigSet { key, value }) if scope.is_person() && !peer.is_root() => {
+                    match still_at_the_seat(state, &peer).await {
+                        AtTheSeat::Yes => state.config_set(&key, value.as_deref()).await,
+                        AtTheSeat::No => not_at_the_seat_now(&key),
+                        // #3796 — not known in time: a retry asks again
+                        // (#3711: a timeout refuses), never "the seat changed".
+                        AtTheSeat::NotKnownYet => Response::Error {
+                            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+                        },
+                    }
                 }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
@@ -6506,8 +6534,8 @@ mod tests {
         /// Whoever asks is at the seat here: the tests that use this mock are
         /// about other gates. The seat check has its own states (`SeatAt`,
         /// `NoSeat`).
-        async fn at_the_seat_now(&self, _uid: u32) -> bool {
-            true
+        async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+            AtTheSeat::Yes
         }
         fn consent_pending(&self) -> Vec<ConsentRequest> {
             vec![ConsentRequest {
@@ -9146,8 +9174,31 @@ mod tests {
         fn flows(&self) -> Vec<FlowInfo> {
             Mock.flows()
         }
-        async fn at_the_seat_now(&self, uid: u32) -> bool {
-            self.0 == Some(uid)
+        async fn at_the_seat_now(&self, uid: u32) -> AtTheSeat {
+            if self.0 == Some(uid) {
+                AtTheSeat::Yes
+            } else {
+                AtTheSeat::No
+            }
+        }
+    }
+
+    /// #3796 — a daemon that could not tell in time who is at the seat: its
+    /// lookup gave no answer within its wait.
+    struct SeatNotKnownYet;
+    #[async_trait]
+    impl LocalApiState for SeatNotKnownYet {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
+            AtTheSeat::NotKnownYet
         }
     }
 
@@ -9224,6 +9275,52 @@ mod tests {
         assert!(!matches!(&r, Response::Error { message } if message.contains("was not changed")));
         // And the safety surface is served without asking.
         let r = ask_state_scoped_as(SeatAt(None), SEAT, ana, r#"{"t":"status"}"#).await;
+        assert!(matches!(r, Response::Status(_)), "{r:?}");
+    }
+
+    /// #3796 — a daemon that cannot tell in time who is at the seat (its
+    /// lookup of logind gave no answer within its wait) refuses a `ConfigSet`
+    /// over the person socket with the try-again text, in the words a read or
+    /// a received file gets then (#3711: a timeout refuses). Never "the seat
+    /// changed": the person may well still be there. Root, the daemon's own
+    /// endpoint and the safety surface are not asked.
+    #[tokio::test]
+    async fn a_seat_not_known_in_time_refuses_a_person_socket_set_with_try_again() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let line = r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"off"}}"#;
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana.clone(), line).await;
+        let Response::Error { message } = &r else {
+            panic!("a set with no answer in time: {r:?}")
+        };
+        assert_eq!(
+            message,
+            "Could not tell who is signed in at this computer's screen. Try again."
+        );
+        assert_eq!(message, CANNOT_TELL_WHO_IS_AT_THE_SCREEN);
+        // Root on the person socket is not asked: the change reaches the state
+        // (which has no config surface: its own error).
+        let root = ClientPeer {
+            uid: Some(0),
+            gid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, line).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("not supported")),
+            "{r:?}"
+        );
+        // The daemon's own endpoint never asks the seat.
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana.clone(), line).await;
+        assert!(
+            !matches!(&r, Response::Error { message } if message == CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+            "{r:?}"
+        );
+        // And the safety surface is served without asking.
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana, r#"{"t":"status"}"#).await;
         assert!(matches!(r, Response::Status(_)), "{r:?}");
     }
 
@@ -9628,9 +9725,9 @@ mod tests {
                 self.0.fetch_add(1, SeqCst);
                 Response::ConfigEntries(Vec::new())
             }
-            async fn at_the_seat_now(&self, _uid: u32) -> bool {
+            async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
                 self.0.fetch_add(1, SeqCst);
-                true
+                AtTheSeat::Yes
             }
         }
 

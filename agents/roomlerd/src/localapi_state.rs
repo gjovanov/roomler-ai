@@ -2156,7 +2156,9 @@ impl LocalApiState for DaemonState {
     /// #2871 (review) — is `uid` the person at this device's seat right now
     /// ([`crate::person_socket::at_the_seat_now`])? The person socket asks
     /// before it applies a config change. Only Linux and macOS serve one.
-    async fn at_the_seat_now(&self, uid: u32) -> bool {
+    /// #3796 — on Linux it is asked `files::SEAT_LOOKUP_WAIT` at most, and
+    /// may not be known yet.
+    async fn at_the_seat_now(&self, uid: u32) -> tunnel_core::localapi::AtTheSeat {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             crate::person_socket::at_the_seat_now(uid).await
@@ -2164,7 +2166,7 @@ impl LocalApiState for DaemonState {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = uid;
-            false
+            tunnel_core::localapi::AtTheSeat::No
         }
     }
 
