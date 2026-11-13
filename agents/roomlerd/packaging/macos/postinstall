@@ -643,24 +643,38 @@ fi
 # THIS script is a grandchild of that very job, and booting it kills the
 # whole process group — `installer` included, mid-payload. A running helper
 # is left alone and a changed plist takes effect at its next load; only an
-# idle one is re-cycled (below). `update_helper_running` is the one test.
+# idle one is re-cycled (below). `read_update_helper` is the one reading.
 # ---------------------------------------------------------------------------
 UPDATE_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist"
 UPDATE_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.update.plist"
 
-# Is the helper's job RUNNING now (an update in flight, so the job is this
-# script's own ancestor)? launchctl's whole answer is read first, then
-# matched. #3783: it used to be piped into `grep -q`, which exits at the
-# match; a launchctl still writing then dies of SIGPIPE, and under
-# `set -o pipefail` the failed pipeline read as "not running", the one wrong
-# answer here, since it boots out the job running this install. A job that
-# is not loaded prints nothing, which reads as not running, as before.
-update_helper_running() {
-  UPDATE_STATE=$(launchctl print system/com.roomler.update 2>/dev/null || true)
-  case "$UPDATE_STATE" in
-    *"state = running"*) return 0 ;;
-  esac
-  return 1
+# The helper's job, read once into HELPER_STATE:
+#   running     loaded and running: an update is in flight, and the job is
+#               this script's own ancestor
+#   idle        loaded and not running
+#   not-loaded  launchctl says there is no such service
+#   unread      `launchctl print` failed otherwise (its answer: HELPER_READ_ERR)
+# Only `idle` lets the script boot the job out (#3783). launchctl's whole
+# answer is read first, then matched: piped into `grep -q`, which exits at the
+# match, a launchctl still writing died of SIGPIPE, and under pipefail a
+# running job read as not running. A print that failed read that way too.
+read_update_helper() {
+  HELPER_READ_ERR=""
+  if UPDATE_STATE=$(launchctl print system/com.roomler.update 2>&1); then
+    case "$UPDATE_STATE" in
+      *"state = running"*) HELPER_STATE=running ;;
+      *) HELPER_STATE=idle ;;
+    esac
+  else
+    helper_rc=$?
+    case "$helper_rc:$UPDATE_STATE" in
+      113:* | *"Could not find service"*) HELPER_STATE=not-loaded ;;
+      *)
+        HELPER_STATE=unread
+        HELPER_READ_ERR="launchctl print exited $helper_rc: $UPDATE_STATE"
+        ;;
+    esac
+  fi
 }
 
 # FR-46 — dual-read, and note the SENSE: this is an OPT-OUT. Reading only the
@@ -675,20 +689,22 @@ if [ ! -f /etc/roomler/disable-auto-update ] && [ ! -f /etc/roomler-agent/disabl
     cp "$UPDATE_PLIST_SOURCE" "$UPDATE_PLIST_TARGET"
     chown root:wheel "$UPDATE_PLIST_TARGET"
     chmod 644 "$UPDATE_PLIST_TARGET"
-    if launchctl print system/com.roomler.update >/dev/null 2>&1; then
-      # Loaded already. If it is RUNNING it is our own ancestor (this very
-      # install) and must not be touched — booting the job kills the whole
-      # process group, `installer` included. If it is IDLE, re-cycle it:
-      # launchd LATCHES a "failed init" on a job whose spawn ever failed
-      # (field 2026-08-26: a trigger raced a pkg's atomic bundle shove, the
-      # executable was transiently absent, and from then on EVERY wake was
-      # an instant synthetic exit(78) with "already handled failed init,
-      # ignoring" — the updater was dead until a manual bootout). A
-      # bootout+bootstrap clears the latch AND applies the refreshed plist,
-      # so every install ends with a provably-armed updater.
-      if update_helper_running; then
+    # Loaded and RUNNING: it is our own ancestor (this very install) and must
+    # not be touched — booting the job kills the whole process group,
+    # `installer` included. Loaded and IDLE: re-cycle it. launchd LATCHES a
+    # "failed init" on a job whose spawn ever failed (field 2026-08-26: a
+    # trigger raced a pkg's atomic bundle shove, the executable was
+    # transiently absent, and from then on EVERY wake was an instant
+    # synthetic exit(78) with "already handled failed init, ignoring" — the
+    # updater was dead until a manual bootout). A bootout+bootstrap clears
+    # the latch AND applies the refreshed plist, so every install ends with a
+    # provably-armed updater.
+    read_update_helper
+    case "$HELPER_STATE" in
+      running)
         echo "roomler update helper is running (this very install) — leaving it; plist applies at its next load"
-      else
+        ;;
+      idle)
         launchctl bootout system/com.roomler.update 2>/dev/null || true
         if UPDATE_ERR=$(launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>&1); then
           echo "roomler update helper re-cycled (refreshed plist live; any failed-init latch cleared)"
@@ -696,16 +712,22 @@ if [ ! -f /etc/roomler/disable-auto-update ] && [ ! -f /etc/roomler-agent/disabl
           echo "WARNING: update helper bootout+bootstrap failed: $UPDATE_ERR"
           echo "  Re-arm by hand: sudo launchctl bootstrap system $UPDATE_PLIST_TARGET"
         fi
-      fi
-    else
-      if UPDATE_ERR=$(launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>&1); then
-        echo "roomler update helper installed (unattended self-update, log: /var/log/roomler/update.log)"
-      else
-        echo "roomler update helper installed, but launchctl bootstrap failed:"
-        echo "  $UPDATE_ERR"
-        echo "  It will load at next boot. Until then updates are manual."
-      fi
-    fi
+        ;;
+      not-loaded)
+        if UPDATE_ERR=$(launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>&1); then
+          echo "roomler update helper installed (unattended self-update, log: /var/log/roomler/update.log)"
+        else
+          echo "roomler update helper installed, but launchctl bootstrap failed:"
+          echo "  $UPDATE_ERR"
+          echo "  It will load at next boot. Until then updates are manual."
+        fi
+        ;;
+      *)
+        # It may be running this install, so it is not booted out.
+        echo "WARNING: the update helper's state could not be read, so it is left as it is: $HELPER_READ_ERR"
+        echo "  Its refreshed plist applies at its next load. Read it with: sudo launchctl print system/com.roomler.update"
+        ;;
+    esac
   fi
 else
   if [ -f "$UPDATE_PLIST_TARGET" ]; then
@@ -723,23 +745,30 @@ else
     # far longer than this and still falls through to the announce path, so the
     # ancestor protection is unchanged; a transiently-waking one is now
     # actually removed, which is what the marker asked for.
-    helper_idle=0
     i=0
     while [ "$i" -lt 10 ]; do
-      if ! update_helper_running; then
-        helper_idle=1
-        break
-      fi
+      read_update_helper
+      [ "$HELPER_STATE" = running ] || break
       i=$((i + 1))
       sleep 1
     done
-    if [ "$helper_idle" -eq 1 ]; then
-      launchctl bootout system/com.roomler.update 2>/dev/null || true
-      echo "roomler update helper REMOVED — /etc/roomler/disable-auto-update is set."
-    else
-      echo "roomler update helper opt-out recorded; the loaded job unloads at next boot"
-      echo "  (still running after 10s — an update is in flight and the job is our ancestor)"
-    fi
+    case "$HELPER_STATE" in
+      idle)
+        launchctl bootout system/com.roomler.update 2>/dev/null || true
+        echo "roomler update helper REMOVED — /etc/roomler/disable-auto-update is set."
+        ;;
+      not-loaded)
+        echo "roomler update helper REMOVED — /etc/roomler/disable-auto-update is set."
+        ;;
+      running)
+        echo "roomler update helper opt-out recorded; the loaded job unloads at next boot"
+        echo "  (still running after 10s — an update is in flight and the job is our ancestor)"
+        ;;
+      *)
+        echo "roomler update helper opt-out recorded; the loaded job unloads at next boot"
+        echo "  WARNING: its state could not be read, so it was not booted out: $HELPER_READ_ERR"
+        ;;
+    esac
     echo "  This Mac will no longer self-update; new releases must be installed by hand:"
     echo "    curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon …"
   else

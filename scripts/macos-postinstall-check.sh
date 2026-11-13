@@ -111,6 +111,14 @@ done
 case "$sub" in
     print)
         f=$(job "$1")
+        # print-fails/<job> holds how many answers launchctl still gives before
+        # its prints of that job fail for a reason other than "no such service".
+        pf="$state/print-fails/$(basename "$f")"
+        if [ -f "$pf" ]; then
+            left=$(cat "$pf")
+            [ "$left" -gt 0 ] || { echo "Unexpected error: 5: Input/output error" >&2; exit 5; }
+            echo $((left - 1)) >"$pf"
+        fi
         [ -f "$f" ] || { echo "Could not find service \"${1##*/}\" in domain" >&2; exit 113; }
         if [ -f "$state/in-pieces/$(basename "$f")" ]; then
             # In pieces, as a launchctl whose answer outgrows one buffer writes
@@ -238,6 +246,8 @@ in_pieces() { mkdir -p "$STATE/in-pieces"; : >"$STATE/in-pieces/$(printf '%s' "$
 # The job stays in its domain for N seconds of the script's sleeps after its
 # bootout, and a bootstrap meanwhile fails as it does during a drain.
 lingers() { mkdir -p "$STATE/linger"; echo "$2" >"$STATE/linger/$(printf '%s' "$1" | tr '/' '_')"; }
+# launchctl answers N prints of this job, then fails each one (not with "no such service").
+print_fails_after() { mkdir -p "$STATE/print-fails"; echo "$2" >"$STATE/print-fails/$(printf '%s' "$1" | tr '/' '_')"; }
 marker() { mkdir -p /etc/roomler && touch "/etc/roomler/$1"; }
 enrolled() { mkdir -p /etc/roomler && printf '%s\n' "${1:-}" >/etc/roomler/config.toml; }
 # What an earlier install left: both LaunchDaemons, older than this payload's.
@@ -318,6 +328,18 @@ DAEMON_IN="launchctl bootstrap system $LD/com.roomler.daemon.plist"
 HELPER_OUT="launchctl bootout system/com.roomler.update"
 HELPER_IN="launchctl bootstrap system $LD/com.roomler.update.plist"
 
+# The root half's calls, in order, on a two-row Mac whose helper is idle. Both
+# roads make them; the signed-in road makes the person's half before them.
+ROOT_HALF_CALLS=$(cat <<EOF
+launchctl bootout system/com.roomler.daemon
+launchctl print system/com.roomler.daemon
+launchctl bootstrap system $LD/com.roomler.daemon.plist
+launchctl print system/com.roomler.update
+launchctl bootout system/com.roomler.update
+launchctl bootstrap system $LD/com.roomler.update.plist
+EOF
+)
+
 # The root half's checks for an update of a two-row Mac: the daemon is
 # reloaded on this payload's plist, and the helper re-armed the same way.
 daemon_reloaded() {
@@ -390,6 +412,11 @@ helper_recycled
 in_order "$DAEMON_IN" "$HELPER_OUT"
 # Nothing lingered, so nothing waited.
 slept 0
+# The same lines in the same order as the signed-in road's root half.
+[ "$(cat "$CALLS")" = "$ROOT_HALF_CALLS" ] || {
+    fail "the calls differ from the root half of the signed-in road's record:"
+    diff <(printf '%s\n' "$ROOT_HALF_CALLS") "$CALLS" | sed 's/^/    /' || true
+}
 done_case
 
 start "login window, helper not loaded: an update bootstraps it, with no bootout"
@@ -424,6 +451,31 @@ rc_is 0
 persons_half_skipped
 daemon_reloaded
 helper_left_running
+done_case
+
+# The helper is booted out only on a reading that it is loaded and idle. A
+# print that fails (for a reason other than "no such service") is no reading.
+start "login window, helper running, launchctl answers once and then fails: still never booted out"
+login_window_two_rows
+loaded system/com.roomler.update running
+print_fails_after system/com.roomler.update 1
+run
+rc_is 0
+daemon_reloaded
+helper_left_running
+done_case
+
+start "login window, the helper's state cannot be read: it is left as it is, and the log says so"
+login_window_two_rows
+loaded system/com.roomler.update running
+print_fails_after system/com.roomler.update 0
+run
+rc_is 0
+daemon_reloaded
+not_called "$HELPER_OUT"
+not_called "$HELPER_IN"
+loaded_now system/com.roomler.update
+said "WARNING: the update helper's state could not be read, so it is left as it is: launchctl print exited 5: Unexpected error: 5: Input/output error"
 done_case
 
 # --- N5: opted out of auto-update ---------------------------------------------
@@ -464,6 +516,33 @@ not_called "$HELPER_OUT"
 loaded_now system/com.roomler.update
 absent "$LD/com.roomler.update.plist"
 said "the loaded job unloads at next boot"
+done_case
+
+start "login window, opted out, the helper's state cannot be read: it is not booted out"
+login_window_two_rows
+marker disable-auto-update
+loaded system/com.roomler.update running
+print_fails_after system/com.roomler.update 0
+run
+rc_is 0
+daemon_reloaded
+not_called "$HELPER_OUT"
+loaded_now system/com.roomler.update
+absent "$LD/com.roomler.update.plist"
+said "WARNING: its state could not be read, so it was not booted out"
+done_case
+
+start "login window, opted out, helper not loaded: the plist goes, and nothing is booted out"
+login_window_two_rows
+marker disable-auto-update
+unloaded system/com.roomler.update
+run
+rc_is 0
+daemon_reloaded
+not_called "$HELPER_OUT"
+not_called "$HELPER_IN"
+absent "$LD/com.roomler.update.plist"
+said "roomler update helper REMOVED"
 done_case
 
 # --- the daemon's opt-in means the same at the login window --------------------
@@ -592,9 +671,12 @@ said "$LD/com.roomler.daemon.plist"
 done_case
 
 # --- N3: the signed-in road, as it was -----------------------------------------
-# Every call, in order, of an update on a signed-in two-row Mac. It is the
-# record of the script before #3783 (agent-v0.4.217): the change made both
-# roads share the root half and left this road as it was.
+# Every call, in order, of an update on a signed-in two-row Mac: the person's
+# half, then the root half (ROOT_HALF_CALLS, above). It is the record of the
+# script before #3783 (agent-v0.4.217) but for one line: that script read the
+# helper's state twice, a print to see that it was loaded and a print to see
+# whether it ran, and this one reads it once (the review's S2). The change made
+# both roads share the root half and left this road as it was.
 SIGNED_IN_CALLS=$(cat <<EOF
 sudo -n -u #501 -- /bin/mkdir -p $LA
 sudo -n -u #501 -- /bin/cp $RES/com.roomler.agent.plist $LA/com.roomler.agent.plist
@@ -611,13 +693,7 @@ launchctl print gui/501/com.roomler.desktop
 launchctl bootstrap gui/501 $LA/com.roomler.desktop.plist
 launchctl print gui/501/com.roomler.desktop
 launchctl print gui/501/com.roomler.desktop
-launchctl bootout system/com.roomler.daemon
-launchctl print system/com.roomler.daemon
-launchctl bootstrap system $LD/com.roomler.daemon.plist
-launchctl print system/com.roomler.update
-launchctl print system/com.roomler.update
-launchctl bootout system/com.roomler.update
-launchctl bootstrap system $LD/com.roomler.update.plist
+$ROOT_HALF_CALLS
 EOF
 )
 
