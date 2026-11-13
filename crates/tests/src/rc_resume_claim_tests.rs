@@ -1338,3 +1338,98 @@ async fn a_resumed_session_keeps_the_maximum_length_it_went_live_under() {
     let r = wait_row(&app2, sid, "the row ends", ended).await;
     assert_eq!(end_reason(&r), Some("idle_timeout"), "{r}");
 }
+
+/// Off is today, three (FR-138 P4-0): a resume scope the server cannot read at
+/// the hello announces no window, though it would cover the device, and the
+/// session then ends at the socket loss as it always has, never kept on a
+/// guess. Once the scope reads again, the device's next hello is announced its
+/// window: the positive control.
+#[tokio::test]
+async fn a_scope_that_cannot_be_read_at_the_hello_announces_no_window() {
+    let app = one(WINDOW).await;
+    let seeded = app.seed_tenant("fr138unread").await;
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-unread").await;
+    unreadable_scope(&app).await;
+
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    assert!(
+        next_of(&mut agent, "rc:agent.resume_window", QUIET)
+            .await
+            .is_none(),
+        "no window from a scope that cannot be read"
+    );
+    let (mut ctl, sid) = go_live(&app, &seeded.admin.access_token, agent_id, &mut agent).await;
+    wait_row(&app, sid, "the session goes live", open).await;
+    drop_socket(agent).await;
+    let end = next_of(&mut ctl, "rc:terminate", WITHIN)
+        .await
+        .expect("the viewer is told the session ended, as today");
+    assert_eq!(end["reason"], "agent_disconnect", "{end}");
+    let r = wait_row(&app, sid, "the row ends as today", ended).await;
+    assert_eq!(end_reason(&r), Some("agent_disconnect"), "{r}");
+    assert!(!r.contains_key("detached_at"), "{r}");
+
+    readable_scope_all(&app).await;
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    let window = next_of(&mut agent, "rc:agent.resume_window", WITHIN)
+        .await
+        .expect("a window once the scope reads");
+    assert_eq!(window["secs"], WINDOW, "{window}");
+}
+
+/// The resume scope's collection replaced by a view whose pipeline fails on
+/// every read. Its one row is `all`, so a read that worked would cover every
+/// device.
+async fn unreadable_scope(app: &TestApp) {
+    use roomler_ai_services::dao::rc_resume_scope::RC_RESUME_SCOPE;
+    const SOURCE: &str = "fr138_unreadable_scope";
+    app.db
+        .collection::<Document>(RC_RESUME_SCOPE)
+        .drop()
+        .await
+        .expect("the scope's collection drops");
+    app.db
+        .collection::<Document>(SOURCE)
+        .insert_one(doc! { "kind": "all", "zero": 0 })
+        .await
+        .expect("the row the view fails on");
+    // A field, not a constant, so the division fails on each read, never at
+    // the view's creation; in a `$match`, so no projection can skip it.
+    app.db
+        .run_command(doc! {
+            "create": RC_RESUME_SCOPE,
+            "viewOn": SOURCE,
+            "pipeline": [ { "$match": { "$expr": { "$gt": [ { "$divide": [1, "$zero"] }, 0 ] } } } ],
+        })
+        .await
+        .expect("the failing view");
+    assert!(
+        app.state
+            .fleet()
+            .rc_resume_scope
+            .covers(ObjectId::new(), ObjectId::new())
+            .await
+            .is_err(),
+        "the hello's read of the scope fails"
+    );
+}
+
+/// The view gone, and the scope `all` again, as a collection.
+async fn readable_scope_all(app: &TestApp) {
+    use roomler_ai_services::dao::rc_resume_scope::RC_RESUME_SCOPE;
+    app.db
+        .collection::<Document>(RC_RESUME_SCOPE)
+        .drop()
+        .await
+        .expect("the view drops");
+    scope_all(app).await;
+    assert!(
+        app.state
+            .fleet()
+            .rc_resume_scope
+            .covers(ObjectId::new(), ObjectId::new())
+            .await
+            .expect("the scope reads"),
+        "`all` covers every device"
+    );
+}

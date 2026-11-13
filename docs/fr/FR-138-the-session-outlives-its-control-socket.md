@@ -256,8 +256,8 @@ rules:
   session it holds, attached or detached (a kick, the maximum length, a refused claim), the session stops serving
   at once, says `rc:ended` with the same reason and limit on its control channel, and closes after the grace. Its
   viewer may not have rejoined since a resume, and to a viewer a peer that just dies reads as a drop, which it
-  redials: on an owner's or an auto-consent device that would undo the kick. With the switch off the end closes the
-  peer at once, as today.
+  redials: on an owner's or an auto-consent device that would undo the kick. With the switch off, or with no window
+  announced on the connection (P4-0), the end closes the peer at once, as today.
 - **Every sender a session holds is one handle, re-pointed and never owned.** Today a peer's sender is the
   connection's (`AgentPeer::outbound`, `peer.rs:299`), and its callbacks take their own clones of it at creation: the
   ICE-candidate handler (`peer.rs:884`), the state handler that sends `Terminate` on `Failed` (`:943`, the send at
@@ -292,8 +292,8 @@ rules:
   orders drive (P2b, `docs/remote-control.md` §11.16.1). The server's end of such a session is one of those orders
   too, so it reaches the peer while the worker's own socket redials, and the end of the channel between them ends
   them all, however it ends. With the switch on, a loop that holds the delegation host
-  says `rc-resume` as every loop does, and a server's end for a session the daemon serves itself no longer crosses
-  to the worker. A delegated session it cannot keep (an older worker's, or one with no worker attached) it does not
+  says `rc-resume` as every loop does, and once a window is announced (P4-0) it keeps delegated sessions and a
+  server's end for a session the daemon serves itself no longer crosses to the worker. A delegated session it cannot keep (an older worker's, or one with no worker attached) it does not
   claim, and the server ends that one at the hello.
 
 The P2a-2 rules, with their anchors, are in `docs/remote-control.md` §11.16.
@@ -626,7 +626,7 @@ switches sit in the control path, so each carries its retire condition here inst
 | **P2a-2** | The device's fixes from P2a's independent review: the server's end said on the control channel before the close (C1's device part), a dead peer never kept or resumed (M1), a Windows resume from suspend read at the RX deadline (M2), the kept sessions left to their deadline by a connection that ends before its window (M3), ends and claim answers never lost to a full queue (L7), the setup serving the kept sessions (L8), a kept session's activity reaching the audit (L9), a kept session's `no_video` end named so (L10), and no `rc-resume` from a loop that holds the delegation host (L11) | `session_table.rs`, `signaling.rs`, `peer.rs` | the same switch, off | A unit test per finding, written first, fails at master on its assertion | They pass. With the switch off the loop is P2a's | With the switch |
 | **P2b** | The supervised Mac: the daemon claims a delegated session in a record that holds no peer, the GUI worker keeps and closes its peer on a second table, and the daemon's orders (`Detached`, `Resumed`, `Close`, and the server's end as `Ended`) and the claim's answer reach the worker on the delegation channel, served while the worker's own socket is down; a channel end closes the worker's delegated sessions, since the daemon ends each as `error`. Both ends must say so (`keep-delegated` in the worker's caps, `keepable` in each session's params), so an older one on either side gets today's path. A loop that holds the delegation host says `rc-resume` with the switch on (L11 lifted) | `delegate.rs`, `delegate_worker.rs`, `session_table.rs`, `signaling.rs` | the same switch | P3's read on a supervised Mac: its delegated session ends while P2a's own sessions survive | It survives too | With the switch |
 | **P3** | The field flip: production's window at 60, and the resume scope naming at least two hosts of each OS class, standing-consent devices and test guests only, with the agent switch set on there | config, and the scope | a host taken out of the scope, which withdraws its window at once; the window back to 0 for the fleet (it lands with the pods it rolls); the switch off on a device | P0's read | §6's roll reads AC1–AC4 and AC9 | — |
-| **P4** | The fleet, staged server-side (D4): the agent's default flips on in one release, then the scope widens class by class until it reads `all` | an agent release, and the scope | a class taken out of the scope, at once; the switch, per device; the window, for the fleet | The scope's hosts against the rest in one roll | AC7: a week of rolls with no `agent_disconnect` end inside a promote run on hosts in the scope | — |
+| **P4** | The fleet, staged server-side (D4). First P4-0: every behaviour the switch gated alone (the server's end said peer to peer, a supervised Mac's delegated record, the daemon serving a session it holds) waits for an announced window, and the root's switch binds the GUI worker, so a device the scope does not cover behaves as with its switch off. Then the agent's default flips on in one release, and the scope widens class by class until it reads `all` | an agent release, and the scope | a class taken out of the scope, at once; the switch, per device; the window, for the fleet | The scope's hosts against the rest in one roll | AC7: a week of rolls with no `agent_disconnect` end inside a promote run on hosts in the scope | — |
 | **Docs** | §7's AC8: `docs/remote-control.md`, `docs/multi-pod-scale-out.md`, `docs/deployment.md`, the operator docs for both switches, the index row | docs | none | — | Written with each phase; the field numbers come with P3 | — |
 
 ⚠️ **Either half alone is inert, by construction.** The agent keeps nothing unless its server announced it a window,
