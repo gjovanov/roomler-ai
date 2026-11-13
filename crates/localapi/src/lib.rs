@@ -510,6 +510,13 @@ pub struct CompanionTooOld {
     /// process: its tries are in `roomler logs --source service`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub by_service: bool,
+    /// #3814 — `ROOMLERD_COMPANION_SYNC=0` is set where the refresh runs, so
+    /// the tray is replaced only at a start and never retried. `false` is
+    /// left out, so a status without the switch reads as before. A daemon
+    /// that predates the field never sends it, and an older CLI ignores it:
+    /// both print the retry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_off: bool,
 }
 
 /// FR-43 P3c — what [`NodeStatus::gui_worker`] reports.
@@ -7966,6 +7973,7 @@ mod tests {
                 installed: Some("0.4.212".into()),
                 minimum: "0.4.216".into(),
                 by_service: true,
+                retry_off: false,
             }),
             ..st.clone()
         };
@@ -7983,6 +7991,7 @@ mod tests {
             installed: None,
             minimum: "0.4.216".into(),
             by_service: false,
+            retry_off: false,
         };
         let json = serde_json::to_string(&unknown).unwrap();
         assert_eq!(json, r#"{"minimum":"0.4.216"}"#);
@@ -7998,6 +8007,67 @@ mod tests {
             connected: bool,
         }
         let older: OlderReader = serde_json::from_str(&wire).unwrap();
+        assert_eq!((older.name.as_str(), older.connected), ("h", true));
+    }
+
+    /// #3814 — `retry_off` is additive both ways. `false` is left out, so a
+    /// status without the switch is what 0.4.218 sends; absent reads as
+    /// `false`; `true` round-trips; and a reader from before the field (a
+    /// 0.4.218 CLI's `CompanionTooOld`, or a `NodeStatus` from before
+    /// `companion_too_old`, as tunnel-v0.4.215's) parses a status that
+    /// carries it.
+    #[test]
+    fn companion_too_old_retry_off_is_additive_both_ways() {
+        let before = r#"{"installed":"0.4.212","minimum":"0.4.216","by_service":true}"#;
+        let read: CompanionTooOld = serde_json::from_str(before).unwrap();
+        assert!(!read.retry_off, "absent reads as the retry on");
+        assert_eq!(serde_json::to_string(&read).unwrap(), before);
+
+        let off = CompanionTooOld {
+            retry_off: true,
+            ..read
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(
+            json,
+            r#"{"installed":"0.4.212","minimum":"0.4.216","by_service":true,"retry_off":true}"#
+        );
+        assert_eq!(serde_json::from_str::<CompanionTooOld>(&json).unwrap(), off);
+
+        /// `CompanionTooOld` as a 0.4.218 CLI reads it.
+        #[derive(Deserialize)]
+        struct Before3814 {
+            installed: Option<String>,
+            minimum: String,
+            #[serde(default)]
+            by_service: bool,
+        }
+        let b: Before3814 = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (b.installed.as_deref(), b.minimum.as_str(), b.by_service),
+            (Some("0.4.212"), "0.4.216", true)
+        );
+
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let status = NodeStatus {
+            companion_too_old: Some(off.clone()),
+            ..serde_json::from_str::<NodeStatus>(old).unwrap()
+        };
+        let wire = serde_json::to_string(&status).unwrap();
+        assert!(wire.contains(r#""retry_off":true"#), "{wire}");
+        assert_eq!(
+            serde_json::from_str::<NodeStatus>(&wire)
+                .unwrap()
+                .companion_too_old,
+            Some(off)
+        );
+        /// `NodeStatus` as a CLI from before `companion_too_old` reads it.
+        #[derive(Deserialize)]
+        struct Before3781 {
+            name: String,
+            connected: bool,
+        }
+        let older: Before3781 = serde_json::from_str(&wire).unwrap();
         assert_eq!((older.name.as_str(), older.connected), ("h", true));
     }
 

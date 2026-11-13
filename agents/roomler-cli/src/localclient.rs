@@ -4769,6 +4769,7 @@ mod devices_tests {
             installed: Some("0.4.212".into()),
             minimum: "0.4.216".into(),
             by_service: true,
+            retry_off: false,
         };
         assert_eq!(
             tray_lines(&c),
@@ -4795,6 +4796,37 @@ mod devices_tests {
             "version UNKNOWN (no version marker): one older than 0.4.216 cannot connect to this \
              daemon"
         );
+    }
+
+    /// #3814 — with `ROOMLERD_COMPANION_SYNC=0` set where the refresh runs,
+    /// the second line says the retry is off and names the switch. The
+    /// refresh at a start stays on, so the other three lines do not change.
+    #[test]
+    fn the_tray_lines_say_when_the_retry_is_off() {
+        let mut c = localapi::CompanionTooOld {
+            installed: Some("0.4.212".into()),
+            minimum: "0.4.216".into(),
+            by_service: true,
+            retry_off: false,
+        };
+        let retried = tray_lines(&c);
+        c.retry_off = true;
+        let off = tray_lines(&c);
+        assert_eq!(
+            off[1],
+            "Roomler replaces it only at a start: its automatic retry is off \
+             (ROOMLERD_COMPANION_SYNC=0)"
+        );
+        assert!(!off[1].contains("retrying"), "{}", off[1]);
+        assert_eq!(
+            [&off[0], &off[2], &off[3]],
+            [&retried[0], &retried[2], &retried[3]]
+        );
+
+        c.by_service = false;
+        let own = tray_lines(&c);
+        assert_eq!(own[1], off[1]);
+        assert_eq!(own[2], "To retry now: restart roomlerd");
     }
 
     /// FR-55 AC6 — `config set power_policy` on a Mac prints the daemon's own

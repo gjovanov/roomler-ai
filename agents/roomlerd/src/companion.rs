@@ -278,8 +278,27 @@ pub(crate) fn too_old_to_connect(
             installed: marker_version(marker),
             minimum: MIN_COMPANION_VERSION.to_string(),
             by_service,
+            retry_off: false,
         }
     })
+}
+
+/// RED (#3814): master reads the switch nowhere for `roomler status`. The fix
+/// wires these two into `too_old_here`.
+#[cfg(test)]
+pub(crate) fn retry_off_where_it_runs(
+    _by_service: bool,
+    _local_system: Option<bool>,
+    _own_switch: impl FnOnce() -> bool,
+    _service_switch: impl FnOnce() -> bool,
+) -> bool {
+    false
+}
+
+/// RED (#3814): see [`retry_off_where_it_runs`].
+#[cfg(test)]
+pub(crate) fn sync_enabled_in(_service_env: Option<&[(String, String)]>) -> bool {
+    true
 }
 
 /// #3781 — [`too_old_to_connect`] for the companion beside this process, read
@@ -2664,7 +2683,7 @@ mod nobody_at_the_screen_tests {
 mod too_old_tests {
     use super::{
         MIN_COMPANION_VERSION, NextRefresh, REFRESH_RETRY, RefreshSchedule, next_refresh_wait,
-        retry_refresh, too_old_to_connect,
+        retry_off_where_it_runs, retry_refresh, sync_enabled_in, too_old_to_connect,
     };
     use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
     use std::sync::{Arc, Mutex};
@@ -2849,6 +2868,7 @@ mod too_old_tests {
                 installed: Some("0.4.212".into()),
                 minimum: "0.4.216".into(),
                 by_service: true,
+                retry_off: false,
             })
         );
         let own = too_old_to_connect(true, true, Some("0.4.215"), false).expect("reported");
@@ -2882,6 +2902,89 @@ mod too_old_tests {
             let reported = too_old_to_connect(true, true, marker, true).expect("reported");
             assert_eq!(reported.installed, None, "{marker:?}");
             assert_eq!(reported.minimum, MIN_COMPANION_VERSION);
+        }
+    }
+
+    /// #3814 — `status` reads the switch where the retry runs. A daemon that
+    /// runs the retry itself reads its own, and so does the SystemContext
+    /// worker: the SCM host starts it with the host's own environment block.
+    /// A worker the host starts as the person gets the person's block, which
+    /// leaves the service's `Environment` value out, so it reads that value,
+    /// never its own. So does one whose token cannot be read.
+    #[test]
+    fn the_switch_is_read_where_the_retry_runs() {
+        let service = || -> bool { panic!("the service's value is read") };
+        let own = || -> bool { panic!("its own environment is read") };
+        for local_system in [Some(true), Some(false), None] {
+            assert!(
+                retry_off_where_it_runs(false, local_system, || false, service),
+                "{local_system:?}"
+            );
+            assert!(!retry_off_where_it_runs(
+                false,
+                local_system,
+                || true,
+                service
+            ));
+        }
+        assert!(retry_off_where_it_runs(true, Some(true), || false, service));
+        assert!(!retry_off_where_it_runs(true, Some(true), || true, service));
+        for local_system in [Some(false), None] {
+            assert!(
+                retry_off_where_it_runs(true, local_system, own, || false),
+                "{local_system:?}"
+            );
+            assert!(!retry_off_where_it_runs(true, local_system, own, || true));
+        }
+    }
+
+    /// #3814 — for that worker, the service's `Environment` value says it, in
+    /// `node_env`'s prefix order and read as `sync_enabled` reads the switch.
+    /// Windows names an environment variable in any case.
+    #[test]
+    fn the_services_environment_says_whether_its_retry_is_off() {
+        let on = |entries: &[(&str, &str)]| {
+            let env: Vec<(String, String)> = entries
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            sync_enabled_in(Some(&env))
+        };
+        for value in ["0", "off", "No", " false "] {
+            assert!(
+                !on(&[("Path", "x"), ("ROOMLERD_COMPANION_SYNC", value)]),
+                "{value:?}"
+            );
+        }
+        assert!(!on(&[("roomlerd_companion_sync", "0")]));
+        assert!(!on(&[("ROOMLER_NODE_COMPANION_SYNC", "0")]));
+        assert!(on(&[
+            ("ROOMLERD_COMPANION_SYNC", "1"),
+            ("ROOMLER_NODE_COMPANION_SYNC", "0"),
+        ]));
+        for value in ["1", "", "garbage"] {
+            assert!(on(&[("ROOMLERD_COMPANION_SYNC", value)]), "{value:?}");
+        }
+        // A retired spelling is never read, and a value that names no switch
+        // leaves the retry on.
+        assert!(on(&[("ROOMLER_AGENT_COMPANION_SYNC", "0")]));
+        assert!(on(&[("ROOMLERD_ENABLE_SYSTEM_SWAP", "1")]));
+        assert!(on(&[]));
+    }
+
+    /// #3814 — a service `Environment` value that cannot be read (no key, no
+    /// access, not a REG_MULTI_SZ) is today's answer: the retry is on, and
+    /// `status` says it is retried. It never says the retry is off on a guess.
+    #[test]
+    fn a_service_environment_that_cannot_be_read_leaves_the_retry_on() {
+        assert!(sync_enabled_in(None));
+        for local_system in [Some(false), None] {
+            assert!(!retry_off_where_it_runs(
+                true,
+                local_system,
+                || false,
+                || sync_enabled_in(None)
+            ));
         }
     }
 }

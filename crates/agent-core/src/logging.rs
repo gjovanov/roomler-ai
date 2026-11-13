@@ -1856,6 +1856,41 @@ mod tests {
             assert_eq!(newest_service_log(dir, "nope"), None);
         }
 
+        /// #3814 — `service` is the SCM host's log alone, as the CLI's help and the
+        /// tray's "Service host" say, even when another role in the folder wrote
+        /// since. The SystemContext worker logs here as `roomlerd.log`, which
+        /// `daemon` reads from it, and it is the busier process. `roomler status`'s
+        /// `--source service` read the worker's file, which holds none of the host's
+        /// lines about the tray.
+        #[test]
+        fn the_service_source_reads_the_hosts_log_whoever_wrote_last() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let host_before = dir.join("roomlerd-service.log.2026-11-11");
+            let host = dir.join("roomlerd-service.log.2026-11-12");
+            let worker = dir.join("roomlerd.log.2026-11-12");
+            let netd = dir.join("roomlerd-netd.log.2026-11-12");
+            let installer = dir.join("roomlerd-installer.log.2026-11-12");
+            for file in [&host_before, &host, &worker, &netd, &installer] {
+                std::fs::write(file, b"x").unwrap();
+            }
+            let written_ago = |file: &Path, secs: u64| {
+                let at = SystemTime::now() - Duration::from_secs(secs);
+                let f = std::fs::File::options().write(true).open(file).unwrap();
+                f.set_modified(at).unwrap();
+            };
+            written_ago(&host_before, 7_200);
+            written_ago(&host, 3_600);
+            assert_eq!(newest_service_log(dir, "service"), Some(host.clone()));
+
+            // With no file of the host's, nothing: never another role's.
+            for file in [&host_before, &host] {
+                std::fs::remove_file(file).unwrap();
+            }
+            assert_eq!(newest_service_log(dir, "service"), None);
+            assert_eq!(newest_service_log(dir, "installer"), Some(installer));
+        }
+
         /// A per-Machine custom action's step that fails: its start, a burst of the
         /// lines it logs (as many as `CHILD` says), its answer, its end with the
         /// whole chain, then the exit, which waits for nothing. Nothing after `init`
