@@ -1493,6 +1493,10 @@ flowchart TD
 - With `ROOMLERD_COMPANION_SYNC=0` set where the refresh runs, the second line reads
   `Roomler replaces it only at a start: its automatic retry is off (ROOMLERD_COMPANION_SYNC=0)`
   (#3814). The refresh at a start stays on with the switch, so the other three lines stand.
+- A worker that runs as the person reads the switch from the service's `Environment` value,
+  where it is documented to go. A machine-wide system variable `ROOMLERD_COMPANION_SYNC=0` also
+  turns the host's retry off, but such a worker's hint keeps the retry's wording: the safe
+  direction.
 - The fields are additive: an older daemon sends none, an older CLI ignores them, and
   `status --json` carries them as `companion_too_old`, with `retry_off` only when it is true.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster one with it,
