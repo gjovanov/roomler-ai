@@ -906,8 +906,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// is its own active rolling log):
 /// * `daemon`  — [`active_log_path`] (role-correct: a SystemContext
 ///   worker resolves its service-logs file);
-/// * `service` — the newest SCM-host/service file in the machine-global
-///   `service-logs` dir (Windows; elsewhere = the daemon log);
+/// * `service` — the newest SCM host log (`roomlerd-service.log`) in the
+///   machine-global `service-logs` dir (Windows; elsewhere = the daemon log),
+///   never the SystemContext worker's file beside it, which `daemon` reads;
 /// * `installer` — #3230: the newest file of the per-Machine MSI's own steps,
 ///   in the same dir (Windows only: no other package runs them);
 /// * `panic`   — the newest `panic-*` dump across the log dirs.
@@ -978,26 +979,23 @@ fn newest_file_matching(dirs: &[PathBuf], pred: impl Fn(&str) -> bool) -> Option
     best.map(|(_, p)| p)
 }
 
-/// #3230 — the newest rolling log in a `service-logs` dir of the processes a
-/// tail source names: `service` the SCM host's or the SystemContext worker's,
-/// `installer` the per-Machine MSI's own steps'. The basenames are
-/// [`ServiceLogRole::basename`]'s. Compiled everywhere, so its test runs on
-/// every lane; only Windows has such a dir to read.
+/// #3230 — the newest rolling log in a `service-logs` dir of the process a tail
+/// source names: `service` the SCM host's, `installer` the per-Machine MSI's own
+/// steps'. The basenames are [`ServiceLogRole::basename`]'s. Compiled everywhere,
+/// so its test runs on every lane; only Windows has such a dir to read.
+///
+/// #3814 — `service` took the newer of the host's file and the SystemContext
+/// worker's, which logs here under the daemon's basename. The worker is the
+/// busier process, so its file nearly always won, and the tray hint's
+/// `roomler logs --source service` showed none of the host's lines.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn newest_service_log(dir: &Path, source: &str) -> Option<PathBuf> {
-    const SERVICE: [&str; 2] = [
-        ServiceLogRole::Host.basename(),
-        ServiceLogRole::Worker.basename(),
-    ];
-    const INSTALLER: [&str; 1] = [ServiceLogRole::Installer.basename()];
-    let bases: &[&str] = match source {
-        "service" => &SERVICE,
-        "installer" => &INSTALLER,
+    let base = match source {
+        "service" => ServiceLogRole::Host.basename(),
+        "installer" => ServiceLogRole::Installer.basename(),
         _ => return None,
     };
-    newest_file_matching(&[dir.to_path_buf()], |name| {
-        bases.iter().any(|base| name.starts_with(base))
-    })
+    newest_file_matching(&[dir.to_path_buf()], |name| name.starts_with(base))
 }
 
 /// S2 — read the last ≤`cap` bytes of `path` as lossy UTF-8, starting on
@@ -1840,7 +1838,7 @@ mod tests {
         }
 
         /// `roomler logs --source installer`, which a Fleet RPC exec runs, reads the
-        /// installer log; `service` keeps reading the host's and the worker's.
+        /// installer log; `service` keeps reading the host's.
         #[test]
         fn the_installer_source_reads_the_installer_log() {
             let tmp = tempfile::tempdir().unwrap();

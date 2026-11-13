@@ -2494,7 +2494,8 @@ pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
 /// too old to connect to it, Roomler replaces it by itself and when, the one
 /// command that retries now and the one that says why it failed. Those are
 /// the service's when the machine-wide service refreshes the tray, and this
-/// daemon's own when it does that itself.
+/// daemon's own when it does that itself. #3814: with the switch set where
+/// the refresh runs, that the tray is replaced only at a start.
 fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
     let first = match &c.installed {
         Some(v) => format!(
@@ -2518,11 +2519,18 @@ fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
             "roomler logs --grep \"desktop companion\"",
         )
     };
-    vec![
-        first,
+    // #3814 — `ROOMLERD_COMPANION_SYNC=0` turns the retry off. The refresh at
+    // a start stays, so a restart still retries now.
+    let replaced = if c.retry_off {
+        "Roomler replaces it only at a start: its automatic retry is off \
+         (ROOMLERD_COMPANION_SYNC=0)"
+    } else {
         "Roomler replaces it by itself, retrying every few minutes for an hour after a start, \
          then every 4 h"
-            .to_string(),
+    };
+    vec![
+        first,
+        replaced.to_string(),
         format!("To retry now: {retry}"),
         format!("Why it failed: {why}"),
     ]

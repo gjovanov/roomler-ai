@@ -270,7 +270,15 @@ pub fn node_env(suffix: &str) -> Option<String> {
 /// this parser was about to land; new gates use this, existing gates keep
 /// their in-place parsers until touched.
 pub fn flag(suffix: &str, default: bool) -> bool {
-    match node_env(suffix) {
+    flag_value(node_env(suffix).as_deref(), default)
+}
+
+/// [`flag`]'s test of a value already read, for a knob read from somewhere
+/// other than this process's environment (#3814: a Windows service's
+/// `Environment` value, which a worker the service starts as the person does
+/// not inherit). `None` is `default`.
+pub fn flag_value(value: Option<&str>, default: bool) -> bool {
+    match value {
         Some(v) => {
             let t = v.trim();
             if default {

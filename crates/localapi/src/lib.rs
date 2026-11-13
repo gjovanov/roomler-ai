@@ -1589,7 +1589,8 @@ pub enum Request {
     ExternalPasswordStatus,
     /// S2 — read the tail of one of the daemon's log files. `source` is
     /// `daemon` (this process's active rolling log), `service` (the
-    /// machine-global SCM host log), or `panic` (the newest panic dump).
+    /// machine-global SCM host log), `installer` (Windows: the per-Machine
+    /// MSI's own steps, #3230), or `panic` (the newest panic dump).
     /// `max_bytes` is clamped daemon-side (≤64 KiB) — bounded response,
     /// poll-based follow (no streaming). Returns [`Response::LogTail`].
     TailLog {
