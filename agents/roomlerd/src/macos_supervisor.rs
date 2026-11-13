@@ -2740,6 +2740,20 @@ mod tests {
             folder_not_theirs(path.clone(), 501, 0, 0o40755, Vec::new(), STAMP).expect("root's");
         assert_eq!(root_made.mode, 0o755);
         assert!(root_made.is_dir);
+        assert_eq!(path.to_str(), Some(F));
+        // The same two lines whatever the exit and the switch: never the log
+        // the worker could not write, never an enrollment.
+        let does_not_fit = format!(
+            "{}{ONLY} This line gives no command for it: an administrator of this Mac has to \
+             move it aside; {DOC}",
+            cause(F)
+        );
+        let moves = format!(
+            "{}{ONLY}{WHO}sudo test ! -e '{F}.made-by-root-{STAMP}' && sudo mv '{F}' \
+             '{F}.made-by-root-{STAMP}' (if it fails, nothing moved), and the worker makes the \
+             folder again as the person at its next start.{RESTART}",
+            cause(F)
+        );
         for one_row in [true, false] {
             for end in [
                 Some(WorkerEnd::Code(1)),
@@ -2748,34 +2762,23 @@ mod tests {
                 None,
             ] {
                 // No read has said yes for it: the cause, and no command.
-                let why = gave_up_reason(end, one_row, Some(&root_made));
-                assert!(
-                    why.contains(&format!("folder {}:", path.display())),
-                    "{why}"
+                assert_eq!(
+                    gave_up_reason(end, one_row, Some(&root_made)),
+                    does_not_fit,
+                    "{end:?} {one_row}"
                 );
-                assert!(why.contains("uid 0 owns it (mode 755)"), "{why}");
-                assert!(why.contains("This line gives no command for it"), "{why}");
-                assert!(!why.contains("sudo") && !why.contains("id -u"), "{why}");
-                // The console person is an administrator of this Mac.
+                // The console person is an administrator of this Mac. It
+                // holds nothing the revert reads: the move is the whole
+                // command.
                 let admin = FolderNotTheirs {
                     administrator: Ok("p".to_string()),
                     ..root_made.clone()
                 };
-                let why = gave_up_reason(end, one_row, Some(&admin));
-                assert!(
-                    why.contains(&format!(
-                        "sudo mv '{0}' '{0}.made-by-root-{STAMP}' ",
-                        path.display()
-                    )),
-                    "{why}"
+                assert_eq!(
+                    gave_up_reason(end, one_row, Some(&admin)),
+                    moves,
+                    "{end:?} {one_row}"
                 );
-                for why in [&why, &gave_up_reason(end, one_row, Some(&root_made))] {
-                    assert!(!why.contains("/logs"), "{why}");
-                    assert!(!why.contains("enrollment"), "{why}");
-                    // It holds nothing the revert reads: the move is the whole
-                    // command.
-                    assert!(!why.contains("mkdir") && !why.contains("cp '"), "{why}");
-                }
             }
         }
     }
@@ -3067,12 +3070,32 @@ mod tests {
         );
         for name in ["", "p q", "p'q", "p$q", "p\"q", "p`q", "p/q", "p;q"] {
             let why = give_up_line_for("a name that is not plain", F, 0o40755, &[], Some(name));
-            assert!(
-                why.contains("This line gives no command"),
-                "{name:?}: {why}"
+            assert_eq!(
+                why,
+                format!(
+                    "{}{ONLY} This line gives no command for it: an administrator of this Mac \
+                     has to move it aside; {DOC}",
+                    cause(F)
+                ),
+                "{name:?}"
             );
-            assert!(!why.contains("sudo"), "{name:?}: {why}");
         }
+        assert_eq!(
+            give_up_line_for(
+                "does not fit + one kept copy",
+                F,
+                0o40755,
+                &[(0, THEIRS)],
+                None
+            ),
+            format!(
+                "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd \
+                 one-row --revert` reads there and nowhere else. This line gives no command for \
+                 it: an administrator of this Mac has to move it aside and copy that file back \
+                 into a new folder that the person's account makes; {DOC}",
+                cause(F)
+            )
+        );
         for name in ["p", "p.q", "p_q", "p-q", "P9"] {
             assert!(plain_account_name(name), "{name:?}");
         }
