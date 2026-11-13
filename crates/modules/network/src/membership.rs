@@ -29,6 +29,9 @@
 //!
 //! [`end_tunnel_client`]: crate::routes::tunnel::end_tunnel_client
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{Json, extract::State};
 use bson::{Bson, Document, doc, oid::ObjectId};
@@ -48,13 +51,58 @@ pub(crate) const ALERT: &str = "membership_tunnel_end";
 /// The reason the overlay releases of a membership's end are logged with.
 const REASON: &str = "member_removed";
 
+/// How long a role change waits before its re-fan starts, so a burst of
+/// changes to one org (an admin assigning a role to several people) costs one
+/// re-fan, not one each.
+const ROLES_REFAN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Network's [`MembershipLifecycle`]: the hook `Module::hooks` registers.
 pub struct MembershipHooks {
     pub state: NetworkState,
+    /// The orgs with a role re-fan scheduled that has not started yet
+    /// ([`MembershipLifecycle::org_roles_changed`]). A plain mutex, held only
+    /// for an insert or a remove, never across an await.
+    roles_refan_pending: Arc<std::sync::Mutex<HashSet<ObjectId>>>,
+}
+
+impl MembershipHooks {
+    pub fn new(state: NetworkState) -> Self {
+        Self {
+            state,
+            roles_refan_pending: Arc::default(),
+        }
+    }
 }
 
 #[async_trait]
 impl MembershipLifecycle for MembershipHooks {
+    /// Who holds which role in the org changed: re-fan its overlay so the
+    /// nodes stop (or start) matching role-scoped rules now, not at their next
+    /// reconnect. Scheduled, never inline: a change while a re-fan is pending
+    /// joins it, and the pending mark is cleared BEFORE the re-fan reads
+    /// anything, so a change after that point schedules its own and none is
+    /// missed.
+    async fn org_roles_changed(&self, tenant_id: ObjectId) {
+        let first = self
+            .roles_refan_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tenant_id);
+        if !first {
+            return;
+        }
+        let state = self.state.clone();
+        let pending = self.roles_refan_pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(ROLES_REFAN_DEBOUNCE).await;
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&tenant_id);
+            crate::routes::overlay_policy::refan_for_role_change(&state, tenant_id).await;
+        });
+    }
+
     async fn org_member_removed(
         &self,
         tenant_id: ObjectId,

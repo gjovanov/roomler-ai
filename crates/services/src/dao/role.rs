@@ -2,18 +2,22 @@
 // Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::Role;
+use roomler_ai_db::models::{Role, TenantMember};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
 pub struct RoleDao {
     pub base: BaseDao<Role>,
+    /// The membership rows a deleted role's id is pulled from
+    /// ([`Self::delete`]).
+    members: BaseDao<TenantMember>,
 }
 
 impl RoleDao {
     pub fn new(db: &Database) -> Self {
         Self {
             base: BaseDao::new(db, Role::COLLECTION),
+            members: BaseDao::new(db, TenantMember::COLLECTION),
         }
     }
 
@@ -94,9 +98,22 @@ impl RoleDao {
             .await
     }
 
+    /// Delete one of `tenant_id`'s roles, and take it from everyone who holds
+    /// it there.
+    ///
+    /// The role is looked up IN the org, so another org's role is a 404 like
+    /// no role at all. The row goes first, then the id is pulled from the
+    /// org's membership rows. The order is the safe one: once the row is gone
+    /// the id counts nowhere, because every reader keeps only the org's live
+    /// roles (`TenantDao::member_live_role_ids`), so a pull that fails (logged)
+    /// or a concurrent assign that lands after it leaves an id that grants
+    /// nothing and matches no rule. Rules and policies that name the role are
+    /// left as they are, on purpose: an empty role allow-list means "no
+    /// restriction by role", so pruning the last id would widen them. They
+    /// keep the id, and it matches nobody.
     pub async fn delete(&self, role_id: ObjectId, tenant_id: ObjectId) -> DaoResult<bool> {
         // Prevent deleting default/managed roles
-        let role = self.base.find_by_id(role_id).await?;
+        let role = self.base.find_by_id_in_tenant(tenant_id, role_id).await?;
         if role.is_default || role.is_managed {
             return Err(DaoError::Forbidden(
                 "Cannot delete default or managed roles".into(),
@@ -108,7 +125,24 @@ impl RoleDao {
             .collection()
             .delete_one(doc! { "_id": role_id, "tenant_id": tenant_id })
             .await?;
-        Ok(result.deleted_count > 0)
+        let deleted = result.deleted_count > 0;
+        if deleted {
+            match self
+                .members
+                .update_many(
+                    doc! { "tenant_id": tenant_id, "role_ids": role_id },
+                    doc! { "$pull": { "role_ids": role_id } },
+                )
+                .await
+            {
+                Ok(n) => tracing::info!(%tenant_id, %role_id, holders = n,
+                    "role deleted and taken from its holders"),
+                Err(e) => tracing::warn!(%tenant_id, %role_id, %e,
+                    "role deleted, but its id could not be pulled from the members' rows; \
+                     it counts nowhere (roles are read live)"),
+            }
+        }
+        Ok(deleted)
     }
 
     // FR-82 — `seed_defaults` lived here: a SECOND set of managed-role

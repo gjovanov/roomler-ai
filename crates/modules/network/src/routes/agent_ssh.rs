@@ -1001,6 +1001,15 @@ pub async fn set_policy(
         account: body.account.clone(),
         consent_mode: body.consent_mode,
     };
+    // Roles of this org only; an id the stored policy already names is
+    // accepted back (`require_org_roles`).
+    roomler_core::guards::require_org_roles(
+        &state,
+        tid,
+        &policy.allowed_role_ids,
+        &agent.ssh_policy.allowed_role_ids,
+    )
+    .await?;
     state
         .fleet
         .agents

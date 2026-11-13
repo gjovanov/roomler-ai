@@ -991,6 +991,15 @@ pub async fn set_policy(
         shells: body.shells.clone(),
         run_as,
     };
+    // Roles of this org only; an id the stored policy already names is
+    // accepted back (`require_org_roles`).
+    roomler_core::guards::require_org_roles(
+        &state,
+        tid,
+        &policy.allowed_role_ids,
+        &agent.exec_policy.allowed_role_ids,
+    )
+    .await?;
     state
         .agents
         .update_exec_policy(tid, agent.id.unwrap_or_default(), &policy)

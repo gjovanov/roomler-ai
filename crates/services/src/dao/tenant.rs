@@ -514,6 +514,9 @@ impl TenantDao {
         Ok(groups)
     }
 
+    /// A new membership holding `role_ids`. `NotFound` when any of them is not
+    /// a role of `tenant_id`, whoever the caller is: a member row only ever
+    /// gets roles of its own org ([`Self::require_org_roles`]).
     pub async fn add_member(
         &self,
         tenant_id: ObjectId,
@@ -521,6 +524,7 @@ impl TenantDao {
         role_ids: Vec<ObjectId>,
         invited_by: Option<ObjectId>,
     ) -> DaoResult<TenantMember> {
+        self.require_org_roles(tenant_id, &role_ids).await?;
         let now = DateTime::now();
         let member = TenantMember {
             id: None,
@@ -606,12 +610,20 @@ impl TenantDao {
         Ok(n > 0)
     }
 
+    /// Give `user_id` the role `role_id` in `tenant_id`. `NotFound` when the
+    /// role is not one of `tenant_id`'s, whoever the caller is
+    /// ([`Self::require_org_roles`]).
+    ///
+    /// A role deleted between this check and the write leaves its id in the
+    /// row; that id counts nowhere, because every reader keeps only the org's
+    /// live roles ([`Self::org_roles_among`]).
     pub async fn assign_role(
         &self,
         tenant_id: ObjectId,
         user_id: ObjectId,
         role_id: ObjectId,
     ) -> DaoResult<bool> {
+        self.require_org_roles(tenant_id, &[role_id]).await?;
         self.members
             .update_one(
                 doc! { "tenant_id": tenant_id, "user_id": user_id },
@@ -662,6 +674,19 @@ impl TenantDao {
         self.roles
             .find_many(doc! { "tenant_id": tenant_id }, None)
             .await
+    }
+
+    /// `NotFound` unless every id in `ids` is a role of `tenant_id`: the check
+    /// both member-row writers ([`Self::add_member`], [`Self::assign_role`])
+    /// make for every caller, so a role of another org, or one this org no
+    /// longer has, never lands in a member row.
+    async fn require_org_roles(&self, tenant_id: ObjectId, ids: &[ObjectId]) -> DaoResult<()> {
+        let org = self.org_role_ids_among(tenant_id, ids).await?;
+        if ids.iter().all(|id| org.contains(id)) {
+            Ok(())
+        } else {
+            Err(DaoError::NotFound)
+        }
     }
 
     /// The ids among `ids` that are roles of `tenant_id`, for a writer that
