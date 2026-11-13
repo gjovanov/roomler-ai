@@ -154,6 +154,10 @@ pub struct RecordingManager {
     /// ms ([`GRACE_POLL`]). A test lengthens it to put a second recording
     /// between two looks, which the grace must never stop.
     grace_poll_ms: AtomicU64,
+    /// #3830 (tests) — decide as a Linux root daemon whose console lookup is
+    /// this stand-in ([`launch::unix::StandIn`]).
+    #[cfg(all(test, target_os = "linux"))]
+    console_stand_in: Option<launch::unix::StandIn>,
 }
 
 /// FR-85 P3b-3 — how often the grace looks at a detached recording.
@@ -182,7 +186,17 @@ impl RecordingManager {
             unattended_dir: None,
             reattach_grace: REATTACH_GRACE,
             grace_poll_ms: AtomicU64::new(GRACE_POLL.as_millis() as u64),
+            #[cfg(all(test, target_os = "linux"))]
+            console_stand_in: None,
         }
+    }
+
+    /// #3830 — decide as a Linux root daemon whose console lookup is
+    /// `stand_in`: the tests that hold a lookup up.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_console_stand_in(mut self, stand_in: launch::unix::StandIn) -> Self {
+        self.console_stand_in = Some(stand_in);
+        self
     }
 
     /// FR-85 P3b-3 — how often the grace looks at a detached recording.
@@ -340,6 +354,12 @@ impl RecordingManager {
             .identity_override
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        #[cfg(all(test, target_os = "linux"))]
+        if overridden.is_none()
+            && let Some(stand_in) = &self.console_stand_in
+        {
+            return stand_in.decide(fresh);
+        }
         overridden.unwrap_or_else(if fresh {
             launch::decide_fresh
         } else {

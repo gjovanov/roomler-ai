@@ -106,6 +106,13 @@ pub enum Refusal {
     RootDaemon,
     /// `ROOMLERD_RECORDING=0`: the device's own kill switch.
     SwitchedOff,
+    /// #3830 — SYSTEM or root, and who is signed in at the screen could not
+    /// be told in time: the console lookup gave no answer within its wait (a
+    /// stopped or hung logind), or could not run. Not confirmed, so neither a
+    /// person to record as nor nobody: a start is refused, and a running
+    /// UNATTENDED recording stops as it does when someone signs in. A retry
+    /// asks again.
+    NotKnownYet,
 }
 
 impl Refusal {
@@ -142,6 +149,9 @@ impl Refusal {
                 "recording is switched off on this device (ROOMLERD_RECORDING=0 in the \
                  service's environment)"
             }
+            // The files and the person socket's words for the same cause
+            // (#3711, #3796): one sentence for one cause.
+            Self::NotKnownYet => tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN,
         }
     }
 }
@@ -1499,6 +1509,48 @@ pub(crate) mod unix {
                 .map(|s| s.uid);
             classify(person, any_graphical_session)
         })
+    }
+
+    /// #3830 — the console lookup stood in, for the tests that hold one up:
+    /// the `loginctl` walk is `lookup`, and everything above it is the
+    /// daemon's own. A manager given one
+    /// (`RecordingManager::with_console_stand_in`) decides as a Linux root
+    /// daemon whose console lookup this is, whatever this test process is.
+    #[cfg(test)]
+    pub(crate) struct StandIn {
+        cache: ConsoleCache,
+        lookup: std::sync::Arc<dyn Fn() -> Seat + Send + Sync>,
+    }
+
+    #[cfg(test)]
+    impl StandIn {
+        /// `lookup` in place of the walk. `wait`: how long a caller that
+        /// must have an answer waits for it.
+        pub(crate) fn new(
+            lookup: impl Fn() -> Seat + Send + Sync + 'static,
+            wait: Duration,
+        ) -> Self {
+            let _ = wait;
+            Self {
+                cache: ConsoleCache::new(),
+                lookup: std::sync::Arc::new(lookup),
+            }
+        }
+
+        /// Who a recorder launched now would run as: a root daemon's
+        /// decision from this lookup, with no display or scanout of its own.
+        pub(crate) fn decide(&self, fresh: bool) -> Result<super::Identity, super::Refusal> {
+            let seat = self.cache.get(fresh, || (self.lookup)());
+            super::decide_from(super::Facts {
+                windows: false,
+                linux: true,
+                service_account: true,
+                above_medium: false,
+                console_session: None,
+                console_uid: seat.person(),
+                login_screen: shows_a_screen(seat, Reach::default()),
+            })
+        }
     }
 
     /// The pure half of [`seat`]: `person` is the uid at the active

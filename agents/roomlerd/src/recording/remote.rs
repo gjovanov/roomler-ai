@@ -623,16 +623,25 @@ async fn fresh_remote_identity(m: &'static Arc<RecordingManager>) -> Result<Iden
 fn identity_refusal(r: Refusal) -> (&'static str, Option<String>) {
     let code = match r {
         Refusal::LoginScreen => "login_screen",
-        Refusal::NoConsoleUser | Refusal::RootDaemon | Refusal::SwitchedOff => "unavailable",
+        Refusal::NoConsoleUser
+        | Refusal::RootDaemon
+        | Refusal::SwitchedOff
+        | Refusal::NotKnownYet => "unavailable",
     };
     (code, Some(r.message().into()))
 }
 
 /// What this device advertises in `AgentCaps.record` right now.
 pub fn advertised() -> Vec<String> {
+    advertised_by(manager().map(Arc::as_ref))
+}
+
+/// [`advertised`], for `m` as the recorder that serves a remote session: the
+/// daemon's own ([`install`]), or a test's.
+pub(crate) fn advertised_by(m: Option<&RecordingManager>) -> Vec<String> {
     advertise(
         gates(),
-        manager().is_some_and(|m| m.available_remote()),
+        m.is_some_and(|m| m.available_remote()),
         super::system_audio_supported(),
     )
 }
@@ -2213,6 +2222,7 @@ mod tests {
             Refusal::NoConsoleUser,
             Refusal::RootDaemon,
             Refusal::SwitchedOff,
+            Refusal::NotKnownYet,
         ] {
             assert_eq!(
                 identity_refusal(r),
@@ -2728,5 +2738,356 @@ mod tests {
             "an OFF must reach a recording in progress"
         );
         assert_eq!(gates(), Gates::default());
+    }
+}
+
+/// #3830 — the console lookup held up: what the daemon shows, decides and
+/// watches while logind does not answer. The `loginctl` walk is stood in
+/// (`launch::unix::StandIn`) and the manager decides as a Linux root daemon;
+/// everything above the walk is the daemon's own. Each probe runs as a task on
+/// a multi-thread runtime like the daemon's and is waited for from the test's
+/// own thread, so a probe that holds a worker cannot also hold up its verdict.
+#[cfg(all(test, target_os = "linux"))]
+mod console_lookup_tests {
+    use super::*;
+    use crate::recording::launch::unix::{Seat, StandIn};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, PoisonError};
+    use tunnel_core::localapi::{RecordStartOpts, Response};
+
+    /// How long a caller that must have an answer waits for the stood-in
+    /// lookup, as the daemon's callers wait for logind.
+    const WAIT: Duration = Duration::from_millis(300);
+    /// What "at once" may take on a busy CI runner: the bar #3830 sets for
+    /// `roomler status` while logind is paused.
+    const AT_ONCE: Duration = Duration::from_millis(500);
+
+    /// Lookups, counted as they begin. The first `quick` answer at once; every
+    /// later one holds until the gate opens, as a stopped logind holds
+    /// `loginctl`.
+    #[derive(Clone, Default)]
+    struct Held(Arc<HeldState>);
+
+    #[derive(Default)]
+    struct HeldState {
+        open: StdMutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Held {
+        fn lookup(
+            &self,
+            quick: usize,
+            first: Seat,
+            then: Seat,
+        ) -> impl Fn() -> Seat + Send + Sync + 'static {
+            let held = self.clone();
+            move || {
+                if held.0.began.fetch_add(1, Ordering::SeqCst) < quick {
+                    return first;
+                }
+                let open = held.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    held.0
+                        .opened
+                        .wait_while(open, |open| !*open)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                then
+            }
+        }
+
+        fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held,
+    /// and the runtime declared before it can shut down.
+    struct OpenedAtTheEnd(Held);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// A manager that decides as a Linux root daemon whose console lookup is
+    /// `lookup`, for the rest of the test binary's life: the remote path takes
+    /// a `'static` one.
+    fn manager_over(
+        lookup: impl Fn() -> Seat + Send + Sync + 'static,
+    ) -> &'static Arc<RecordingManager> {
+        Box::leak(Box::new(Arc::new(
+            RecordingManager::new(
+                PathBuf::from("does-not-exist-so-a-spawn-would-fail"),
+                PathBuf::from("does-not-exist.toml"),
+            )
+            .with_console_stand_in(StandIn::new(lookup, WAIT)),
+        )))
+    }
+
+    /// A runtime like the daemon's: more than one worker, timers and I/O.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// `probe`, run as a task on `rt`: its answer and how long it took,
+    /// waited for `within` at most from THIS thread.
+    fn on_a_worker<T: Send + 'static>(
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+        probe: impl Future<Output = T> + Send + 'static,
+    ) -> Result<(T, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(async move {
+            let answer = probe.await;
+            let _ = tx.send((answer, asked.elapsed()));
+        });
+        rx.recv_timeout(within)
+            .map_err(|_| format!("no answer within {within:?}"))
+    }
+
+    fn initiator() -> RemoteInitiator {
+        RemoteInitiator {
+            session_id: ObjectId::new(),
+            controller_user_id: ObjectId::new(),
+            controller_name: "Tester".into(),
+        }
+    }
+
+    /// #3830 — a console lookup that never answers holds up no worker. While
+    /// it hangs, the status the tray polls (`record_status`), the caps the
+    /// heartbeat sends (`record_caps()`), a listing and a local start (what is
+    /// decided) and P1f's fresh check (what the watch over an unattended
+    /// recording asks every second) all ask, again and again, from tasks on a
+    /// two-worker runtime, and a 10 ms timer beside them still wakes on time:
+    /// the runtime canary's own measure (`runtime_canary.rs`). And the hang
+    /// holds one lookup, however many ask.
+    ///
+    /// Red before #3830: the first caller held the console cache's mutex
+    /// across the lookup on its worker, the next blocked on that mutex on the
+    /// other, and no worker was left to drive the timer.
+    #[test]
+    fn a_console_lookup_that_never_answers_delays_no_timer() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let m = manager_over(held.lookup(0, Seat::Empty, Seat::Person(1000)));
+        // What is shown: one reader per worker, and one more.
+        for _ in 0..3 {
+            rt.spawn(async move {
+                for _ in 0..1_000 {
+                    let _ = m.status();
+                    let _ = advertised_by(Some(Arc::as_ref(m)));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+        // What is decided.
+        rt.spawn(async move {
+            for _ in 0..1_000 {
+                let _ = m.list().await;
+                let _ = m.start(RecordStartOpts::default()).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        // What P1f's watch asks.
+        rt.spawn(async move {
+            for _ in 0..1_000 {
+                let _ = fresh_remote_identity(m).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let tick = Duration::from_millis(10);
+        let late = on_a_worker(&rt, Duration::from_secs(10), async move {
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            worst
+        });
+        let began = held.began();
+        let (worst, _) = late.expect("a 10 ms timer kept waking while the console lookup hung");
+        assert!(
+            worst < AT_ONCE,
+            "a 10 ms timer woke {worst:?} late while the console lookup hung"
+        );
+        assert_eq!(began, 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3830 — the status the tray polls (`record_status`) and the caps the
+    /// heartbeat sends (`record_caps()`, which is `advertised()`) answer at
+    /// once while the console lookup hangs, asked from a worker. With no
+    /// answer had yet, the status says who is signed in cannot be told, and
+    /// the caps still say `available`: a capability, not who is at the screen
+    /// (as at a login screen, decision 6), so the viewer's Record control does
+    /// not come and go with logind.
+    ///
+    /// Red before #3830: both waited on the lookup for as long as logind did
+    /// not answer.
+    #[test]
+    fn the_status_and_the_caps_answer_while_the_console_lookup_hangs() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let m = manager_over(held.lookup(0, Seat::Empty, Seat::Person(1000)));
+        let available = RecordCap::Available.wire().to_string();
+        // The first asks start the lookup; the later ones find it hanging.
+        for _ in 0..3 {
+            let (status, took) = on_a_worker(&rt, AT_ONCE * 4, async move { m.status() })
+                .expect("the status answers while the console lookup hangs");
+            assert!(took < AT_ONCE, "the status took {took:?}");
+            match status {
+                Response::Recording(st) => {
+                    assert!(!st.available, "{st:?}");
+                    assert_eq!(
+                        st.unavailable_reason.as_deref(),
+                        Some(Refusal::NotKnownYet.message()),
+                        "{st:?}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            let (caps, took) = on_a_worker(&rt, AT_ONCE * 4, async move {
+                advertised_by(Some(Arc::as_ref(m)))
+            })
+            .expect("the caps answer while the console lookup hangs");
+            assert!(took < AT_ONCE, "the caps took {took:?}");
+            assert!(caps.contains(&available), "{caps:?}");
+        }
+        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3830 — FR-85 P1f's guards ask who is signed in afresh, and a fresh
+    /// check with no answer in time is NOT CONFIRMED: never the answer had
+    /// before it, never "nobody". The last answer here was "no session, and no
+    /// screen the recorder could reach" (an unattended recording could start),
+    /// and then logind stops answering.
+    /// - The check a remote start decides on before it skips the indicator,
+    ///   which is also what the watch over an unattended recording asks every
+    ///   tick (`fresh_remote_identity`), answers `NotKnownYet` within its wait:
+    ///   the start is refused `unavailable`, and the watch reads it as it reads
+    ///   a sign-in, so it stops the recording.
+    /// - The launch re-check refuses the start, by that name.
+    ///
+    /// Red before #3830: a fresh check waited on the lookup for as long as
+    /// logind did not answer, and the launch re-check did so on a worker.
+    #[test]
+    fn a_fresh_check_with_no_answer_in_time_is_not_confirmed() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let m = manager_over(held.lookup(1, Seat::Empty, Seat::Empty));
+        let bound = WAIT + Duration::from_secs(1);
+        let (first, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(m)).expect("a check logind answers");
+        assert_eq!(
+            first,
+            Ok(Identity::Unattended),
+            "nobody, and no screen: unattended"
+        );
+
+        let (fresh, took) = on_a_worker(&rt, bound, fresh_remote_identity(m))
+            .expect("a fresh check answers within its wait while the console lookup hangs");
+        assert_eq!(
+            fresh,
+            Err(Refusal::NotKnownYet),
+            "not confirmed: never the cached nobody"
+        );
+        assert!(took >= WAIT, "it answered in {took:?}, before its wait");
+        // A start refuses it on the wire; the watch (`follow`, `grace_watch`)
+        // stops on anything but `Ok(Unattended)`.
+        assert_eq!(identity_refusal(Refusal::NotKnownYet).0, "unavailable");
+
+        let (started, _) = on_a_worker(&rt, bound, async move {
+            m.start_remote(initiator(), false, Identity::Unattended)
+                .await
+        })
+        .expect("the launch re-check answers within its wait while the console lookup hangs");
+        assert!(
+            matches!(started, Err(StartError::Unavailable(Refusal::NotKnownYet))),
+            "{started:?}"
+        );
+        assert_eq!(
+            held.began(),
+            2,
+            "the held lookup, and only it, since the first"
+        );
+    }
+
+    /// #3830 — with a console lookup that answers, every decision stands as
+    /// before: the recorder runs as the person signed in, a login screen
+    /// refuses (a local start, and a remote one at the launch re-check, by its
+    /// own name) while the device still advertises `available`, and with no
+    /// session and no screen a remote recording runs unattended while a local
+    /// one is refused. The control for the tests above: green before #3830 and
+    /// after.
+    #[test]
+    fn with_a_console_lookup_that_answers_every_decision_stands() {
+        let rt = runtime();
+        let bound = WAIT + Duration::from_secs(1);
+        let start_locally = |m: &'static Arc<RecordingManager>| async move {
+            match m.start(RecordStartOpts::default()).await {
+                Response::Error { message } => message,
+                other => panic!("a local start went ahead: {other:?}"),
+            }
+        };
+
+        let person = manager_over(|| Seat::Person(1000));
+        let (who, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(person)).expect("a person: answered");
+        assert_eq!(who, Ok(Identity::SessionUser { uid: 1000 }));
+        let (status, _) =
+            on_a_worker(&rt, bound, async move { person.status() }).expect("a status: answered");
+        assert!(
+            matches!(status, Response::Recording(ref st) if st.available),
+            "{status:?}"
+        );
+
+        let greeter = manager_over(|| Seat::NoPerson);
+        let (who, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(greeter)).expect("a greeter: answered");
+        assert_eq!(who, Err(Refusal::LoginScreen));
+        let (refused, _) =
+            on_a_worker(&rt, bound, start_locally(greeter)).expect("a local start: answered");
+        assert_eq!(refused, Refusal::LoginScreen.message());
+        let (started, _) = on_a_worker(&rt, bound, async move {
+            greeter
+                .start_remote(initiator(), false, Identity::Unattended)
+                .await
+        })
+        .expect("a remote start: answered");
+        assert!(
+            matches!(started, Err(StartError::Unavailable(Refusal::LoginScreen))),
+            "{started:?}"
+        );
+        assert!(
+            advertised_by(Some(Arc::as_ref(greeter)))
+                .contains(&RecordCap::Available.wire().to_string()),
+            "a login screen still advertises `available`"
+        );
+
+        let nobody = manager_over(|| Seat::Empty);
+        let (who, _) =
+            on_a_worker(&rt, bound, fresh_remote_identity(nobody)).expect("nobody: answered");
+        assert_eq!(who, Ok(Identity::Unattended));
+        let (refused, _) =
+            on_a_worker(&rt, bound, start_locally(nobody)).expect("a local start: answered");
+        assert_eq!(refused, Refusal::NoConsoleUser.message());
     }
 }
