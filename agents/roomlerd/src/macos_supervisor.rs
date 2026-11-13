@@ -571,20 +571,37 @@ pub struct FolderNotTheirs {
     pub owner: u32,
     /// Its permission bits.
     pub mode: u32,
+    /// Which of [`kept_for_revert`] it holds, by name.
+    pub kept: Vec<std::path::PathBuf>,
+}
+
+/// #3802 — the files `sudo roomlerd one-row --revert` reads back from the
+/// person's folder, and from nowhere else (`one_row::revert_plan`): the
+/// LaunchAgent plist the conversion moved there, and the copy of the person's
+/// config it kept beside their config. Names, inside that folder.
+pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
+    use crate::one_row::{AGENT_PLIST, kept_path};
+    [
+        kept_path(std::path::Path::new(AGENT_PLIST)),
+        kept_path(std::path::Path::new("config.toml")),
+    ]
 }
 
 /// #3802 — [`FolderNotTheirs`] out of what `lstat` read for `path`, the folder
-/// of the person `uid`: `None` when that person owns it.
+/// of the person `uid`, and the names of [`kept_for_revert`] found in it:
+/// `None` when that person owns it.
 pub fn folder_not_theirs(
     path: std::path::PathBuf,
     uid: u32,
     owner: u32,
     mode: u32,
+    kept: Vec<std::path::PathBuf>,
 ) -> Option<FolderNotTheirs> {
     (owner != uid).then_some(FolderNotTheirs {
         path,
         owner,
         mode: mode & 0o7777,
+        kept,
     })
 }
 
@@ -693,7 +710,7 @@ mod imp {
         let home = crate::appdirs::account_home(uid)?;
         let path = crate::appdirs::macos_config_dir_in_home(&home, std::path::Path::exists);
         let meta = std::fs::symlink_metadata(&path).ok()?;
-        folder_not_theirs(path, uid, meta.uid(), meta.mode())
+        folder_not_theirs(path, uid, meta.uid(), meta.mode(), Vec::new())
     }
 
     fn spawn_worker(
@@ -2109,8 +2126,12 @@ mod tests {
     fn the_give_up_names_a_folder_another_account_owns() {
         let path =
             std::path::PathBuf::from("/Users/p/Library/Application Support/live.roomler.roomler");
-        assert_eq!(folder_not_theirs(path.clone(), 501, 501, 0o40755), None);
-        let root_made = folder_not_theirs(path.clone(), 501, 0, 0o40755).expect("root's");
+        assert_eq!(
+            folder_not_theirs(path.clone(), 501, 501, 0o40755, Vec::new()),
+            None
+        );
+        let root_made =
+            folder_not_theirs(path.clone(), 501, 0, 0o40755, Vec::new()).expect("root's");
         assert_eq!(root_made.mode, 0o755);
         for one_row in [true, false] {
             for end in [
@@ -2131,8 +2152,94 @@ mod tests {
                 );
                 assert!(!why.contains("/logs"), "{why}");
                 assert!(!why.contains("enrollment"), "{why}");
+                // It holds nothing the revert reads: the move is the whole command.
+                assert!(!why.contains("test -r") && !why.contains("cp '"), "{why}");
             }
         }
+    }
+
+    /// #3802 — the give-up of a folder of root's at `/u/F` that holds `kept`.
+    fn give_up_holding(kept: &[std::path::PathBuf]) -> String {
+        let kept = kept.to_vec();
+        let folder = folder_not_theirs("/u/F".into(), 501, 0, 0o40755, kept).expect("root's");
+        gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder))
+    }
+
+    /// #3802 — `one-row --revert` reads the LaunchAgent plist back from the
+    /// person's folder and from nowhere else, and says nothing when it is not
+    /// there. So the command keeps it in the folder the worker gets: it reads
+    /// the copy as the person first, so a copy they cannot read moves nothing,
+    /// and the move it makes is the only one.
+    #[test]
+    fn the_give_up_keeps_the_launch_agent_plist_the_revert_reads() {
+        let [plist, _] = kept_for_revert();
+        let why = give_up_holding(&[plist]);
+        assert!(
+            why.contains(
+                "test -r '/u/F/com.roomler.agent.plist.pre-one-row' \
+                 && mv '/u/F' '/u/F.made-by-root' && mkdir '/u/F' \
+                 && cp '/u/F.made-by-root/com.roomler.agent.plist.pre-one-row' '/u/F/'"
+            ),
+            "{why}"
+        );
+        assert_eq!(why.matches("mv '").count(), 1, "{why}");
+        assert!(why.contains("one-row --revert"), "{why}");
+    }
+
+    /// #3802 — the same for the copy of the person's config the conversion kept
+    /// beside it, which the revert also reads only there.
+    #[test]
+    fn the_give_up_keeps_the_config_copy_the_revert_reads() {
+        let [_, config] = kept_for_revert();
+        let why = give_up_holding(&[config]);
+        assert!(
+            why.contains(
+                "test -r '/u/F/config.toml.pre-one-row' \
+                 && mv '/u/F' '/u/F.made-by-root' && mkdir '/u/F' \
+                 && cp '/u/F.made-by-root/config.toml.pre-one-row' '/u/F/'"
+            ),
+            "{why}"
+        );
+        assert_eq!(why.matches("mv '").count(), 1, "{why}");
+    }
+
+    /// #3802 — both copies: each is read before anything moves, and both go back.
+    #[test]
+    fn the_give_up_keeps_both_copies_the_revert_reads() {
+        let [plist, config] = kept_for_revert();
+        let why = give_up_holding(&[plist, config]);
+        assert!(
+            why.contains(
+                "test -r '/u/F/com.roomler.agent.plist.pre-one-row' \
+                 && test -r '/u/F/config.toml.pre-one-row' \
+                 && mv '/u/F' '/u/F.made-by-root' && mkdir '/u/F' \
+                 && cp '/u/F.made-by-root/com.roomler.agent.plist.pre-one-row' \
+                 '/u/F.made-by-root/config.toml.pre-one-row' '/u/F/'"
+            ),
+            "{why}"
+        );
+        assert_eq!(why.matches("mv '").count(), 1, "{why}");
+    }
+
+    /// #3802 — the names the give-up keeps are the paths the revert reads in
+    /// the person's folder (`one_row::revert_plan`).
+    #[test]
+    fn the_copies_the_give_up_keeps_are_the_ones_the_revert_reads() {
+        let dir = std::path::PathBuf::from("/u/F");
+        let person = crate::one_row::Person {
+            user: "p".into(),
+            uid: 501,
+            home: "/u".into(),
+            dir: dir.clone(),
+            config: None,
+            has_plist: true,
+        };
+        let [plist, config] = kept_for_revert();
+        assert_eq!(dir.join(plist), person.plist_aside());
+        assert_eq!(
+            dir.join(config),
+            crate::one_row::kept_path(&person.config_path())
+        );
     }
 
     /// FR-43 P3a — a worker with no enrollment cannot be missing one, so the
