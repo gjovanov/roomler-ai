@@ -231,7 +231,7 @@ test of root or of a display variable (code):
 | consent prompt | the companion or the desktop's own | the companion, by design | `.claude/rules/remote-desktop.md` | left out |
 
 So the gap is the three features and the desktops the spec named; nothing else a system install lacks was found.
-Not read: recording's session launch beyond `recording/launch.rs:1424-1431`, and which session the sound helper
+Not read: recording's session launch beyond `recording/launch.rs:1524-1531`, and which session the sound helper
 picks.
 
 ### Capability changes while connected

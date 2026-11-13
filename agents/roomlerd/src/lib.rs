@@ -157,7 +157,7 @@ pub mod unenrolled;
 pub(crate) mod media_share;
 pub mod notify;
 /// #3796 — one blocking lookup of a kind in flight at a time, its answer shared
-/// by whoever asks while it runs: a Linux system install's seat0 lookups.
+/// by whoever asks while it runs: seat0's lookups, and #3830's console lookup.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod one_in_flight;
 /// FR-43 P3c — `sudo roomlerd one-row`: a two-row Mac becomes one row.

@@ -3560,10 +3560,10 @@ pub enum AtTheSeat {
     NotKnownYet,
 }
 
-/// #3711, #3796 — the answer when who is signed in at this computer's screen
-/// is not known in time on a Linux system install: a read, a received file
-/// and a files folder's set (`roomlerd`'s `files::CANNOT_TELL`), and a
-/// `ConfigSet` over the person-at-the-device socket. A retry asks again.
+/// #3711, #3796, #3830 — the answer when who is signed in at this computer's
+/// screen is not known in time on a Linux system install: a read, a received
+/// file, a files folder's set (`files::CANNOT_TELL`), a recording's start
+/// (`Refusal::NotKnownYet`) and a `ConfigSet` over the person socket. A retry asks again.
 pub const CANNOT_TELL_WHO_IS_AT_THE_SCREEN: &str =
     "Could not tell who is signed in at this computer's screen. Try again.";
 
