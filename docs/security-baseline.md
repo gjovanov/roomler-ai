@@ -504,8 +504,11 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   row is gone (`crates/modules/conference/src/revoke.rs`). A join on its way at that
   moment asks the gate again once its seat exists. ⚠️ A new way to lose a membership (a
   room kick, a deleted account) calls the hook too, after the row is gone, or the seats it
-  admitted outlive it. A room deleted mid-call does not call it yet: that call runs on
-  until its people hang up. `docs/real-time.md` has the flow.
+  admitted outlive it. A room deleted mid-call ends every membership of it, and its whole
+  call with them: `chat`'s room delete calls the hook's `room_removed` once the room is
+  gone, and the pod serving the call ends it for everyone in it. That pod also ends it on its own when it
+  finds the room's document gone in two reconcile reads in a row, so a lost word cannot
+  keep the call alive. `docs/real-time.md` has the flow.
 - **A room membership ends with the org membership.** Every room fan-out (messages,
   edits, reactions, pins, typing, mentions) reaches the people holding a row in
   `room_members`, so the same hook, run after the org membership row is gone, drops the

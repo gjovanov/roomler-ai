@@ -255,24 +255,24 @@ impl RoomManager {
         Ok(serde_json::to_value(caps)?)
     }
 
-    /// Removes a room and all its media state.
-    pub fn remove_room(&self, room_id: &ObjectId) -> bool {
-        if let Some((_, room)) = self.rooms.remove(room_id) {
-            // Clean up connection_rooms mappings
-            let conn_ids: Vec<String> = room
-                .participants
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            for cid in conn_ids {
-                self.connection_rooms.remove(&cid);
-            }
-            // Dropping the room closes the router and all transports/producers/consumers
-            info!(?room_id, "mediasoup room removed");
-            true
-        } else {
-            false
+    /// Removes a room and all its media state. Returns the connections that
+    /// were seated in it, none when there was no such room.
+    pub fn remove_room(&self, room_id: &ObjectId) -> Vec<String> {
+        let Some((_, room)) = self.rooms.remove(room_id) else {
+            return Vec::new();
+        };
+        // Clean up connection_rooms mappings
+        let conn_ids: Vec<String> = room
+            .participants
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for cid in &conn_ids {
+            self.connection_rooms.remove(cid);
         }
+        // Dropping the room closes the router and all transports/producers/consumers
+        info!(?room_id, "mediasoup room removed");
+        conn_ids
     }
 
     pub fn has_room(&self, room_id: &ObjectId) -> bool {

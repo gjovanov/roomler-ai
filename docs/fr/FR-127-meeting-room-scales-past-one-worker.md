@@ -126,14 +126,14 @@ for the same reason `ingress_rules` keeps `None` apart from `Some([])`. Applying
 - `consume` (`room_manager.rs:389`): for a video consumer, `ConsumerOptions.paused = !wanted` when `view` is `Some`; the
   resume at `:436-440` runs only for a wanted or legacy consumer, and never for audio-off.
 - A view names a producer whose consumer does not exist yet (the client learns producer ids from `media:new_producer`,
-  `ws_media.rs:441-460` and `:579-603`, before it consumes): the set is kept and applied when the consumer is created.
+  `ws_media.rs:441-460` and `:594-618`, before it consumes): the set is kept and applied when the consumer is created.
 - A server cap, `[meetings] view_max` (default 49, the UI's own maximum, `useConferenceLayout.ts:393-394`): a report
   longer than the cap is truncated in the order sent. P5 may lower it with the plan caps; it is a load guard, not a policy.
 
 **The owner's pause and the viewer's pause are different states, in mediasoup too.** FR-30 P4's pause is
 `Producer::pause()` (`room_manager.rs:477`), which the worker mirrors into every consumer's `producer_paused`
 (`Consumer::producer_paused()`, mediasoup `src/router/consumer.rs:1015`). The viewer's pause is `Consumer::pause()`
-(`:1116`), a separate flag (`Consumer::paused()`, `:1009`). `media:consumer_created.producer_paused` (`ws_media.rs:683`)
+(`:1116`), a separate flag (`Consumer::paused()`, `:1009`). `media:consumer_created.producer_paused` (`ws_media.rs:698`)
 and the `media:producer_paused` event (`:753-769`) keep reading the **producer**; `media:view` only ever drives the
 consumer's own flag. So AC2 holds by construction: a viewer hiding a tile changes nothing another viewer can see, and an
 owner's pause reaches every viewer whatever their view says. ⚠️ With P3's piped producers this stays true only if
@@ -320,7 +320,7 @@ a pipe into it fails and is skipped, and the next `create_transports` drops the 
 `[meetings] pipe_rooms` room survives a worker death with 1/R of its participants cut, instead of all of them.
 
 **Stats and gauges.** `sample_transports` (`room_manager.rs:108`) and the sampler (`media_stats.rs:89`, `:238`) read
-per-participant transports and are unchanged. `media_gauges` (`crates/modules/conference/src/lib.rs:109`) gains
+per-participant transports and are unchanged. `media_gauges` (`crates/modules/conference/src/lib.rs:117`) gains
 `routers` and `pipes` per room, and the `MediaGauges` struct (`:101`) the totals; the cluster status snapshot shows them.
 Pipe transport bytes (`PipeTransport::get_stats`, mediasoup `src/router/pipe_transport.rs:185`) go to the docs as a
 P4 reading, not a sampled series.

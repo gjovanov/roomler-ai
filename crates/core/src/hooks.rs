@@ -179,11 +179,13 @@ pub trait FleetLifecycle: Send + Sync {
 /// Hooks the owner of a membership invokes when someone stops being a member.
 ///
 /// The host owns org membership (`DELETE …/member/{user_id}`: removed by an
-/// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`).
-/// A module that admitted something on a membership withdraws it here: `network`
-/// the person's tunnel clients in the org, `fleet` the enrollment keys they
-/// minted there, `conference` the call seats they hold (`media:join` admitted
-/// them as a member), `chat` their room memberships.
+/// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`)
+/// and the room itself (`DELETE …/room/{room_id}`, which ends every membership
+/// of the room at once). A module that admitted something on a membership
+/// withdraws it here: `network` the person's tunnel clients in the org, `fleet`
+/// the enrollment keys they minted there, `conference` the call seats they hold
+/// (`media:join` admitted them as a member) and the call of a deleted room,
+/// `chat` their room memberships.
 ///
 /// Invoked AFTER the membership is gone, so nothing can be admitted on it
 /// again while a holder withdraws what it admitted. Idempotent, like every
@@ -208,6 +210,24 @@ pub trait MembershipLifecycle: Send + Sync {
         user_id: ObjectId,
     ) -> anyhow::Result<()> {
         let _ = (tenant_id, room_id, user_id);
+        Ok(())
+    }
+
+    /// The room `room_id` of `tenant_id` was deleted, and every membership of
+    /// it went with it. Called AFTER the delete by the room's owner (`chat`),
+    /// so nothing new is admitted on the room while a holder ends what the
+    /// room held. A join or a start already on its way when the room went can
+    /// still land, so a holder's admission looks again once it has built what
+    /// it admits. The members are gone by then, so a holder ends what it keeps
+    /// by the room: `conference` the call running in it, for everyone in it.
+    /// A holder trusts the caller's pairing of `tenant_id` and `room_id` (the
+    /// caller resolved the room within its org): what it ends may be keyed by
+    /// the room alone, as conference's media is. Unlike the other cascades, a
+    /// holder that answers an error does not stop the ones after it: the room
+    /// is gone either way ([`HookRegistry::room_removed`]). A holder that
+    /// panics does stop them: no unwind is caught.
+    async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        let _ = (tenant_id, room_id);
         Ok(())
     }
 
@@ -363,6 +383,26 @@ impl HookRegistry {
                 .map_err(|e| anyhow::anyhow!("{module}: room_member_removed: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Run every `room_removed` hook in order, once the room is gone. The room
+    /// is gone whatever a holder answers, so a holder that answers an error
+    /// does not stop the others: every holder runs, and the caller reports
+    /// what failed, the first failure first. A panic is not caught: it ends
+    /// the run where it happens (chat's room delete runs this in a task of its
+    /// own, and logs the panic).
+    pub async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        for (module, hook) in self.membership_lifecycles() {
+            if let Err(e) = hook.room_removed(tenant_id, room_id).await {
+                failed.push(format!("{module}: room_removed: {e}"));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(failed.join("; ")))
+        }
     }
 
     /// Run every `agent_removed` hook in order. The first lease a holder
@@ -696,6 +736,11 @@ mod tests {
             self.0.lock().unwrap().push(format!("room {t} {r} {u}"));
             Ok(())
         }
+
+        async fn room_removed(&self, t: ObjectId, r: ObjectId) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("removed {t} {r}"));
+            Ok(())
+        }
     }
 
     struct FailsToWithdraw;
@@ -746,6 +791,76 @@ mod tests {
         assert!(err.to_string().contains("conference: room_member_removed"));
         // The default body withdraws nothing and succeeds.
         reg.org_member_removed(t, u).await.unwrap();
+        reg.room_removed(t, r).await.unwrap();
+    }
+
+    /// A deleted room reaches its holders with the org and the room, and a
+    /// module that registers no membership hook is skipped.
+    #[tokio::test]
+    async fn a_deleted_room_reaches_its_holders() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        reg.register("chat", Hooks::default());
+        let (t, r) = (ObjectId::new(), ObjectId::new());
+        reg.room_removed(t, r).await.unwrap();
+        assert_eq!(*holder.0.lock().unwrap(), vec![format!("removed {t} {r}")]);
+    }
+
+    struct FailsToEnd(&'static str);
+
+    #[async_trait]
+    impl MembershipLifecycle for FailsToEnd {
+        async fn room_removed(&self, _t: ObjectId, _r: ObjectId) -> anyhow::Result<()> {
+            anyhow::bail!("{}", self.0)
+        }
+    }
+
+    /// The room is gone whatever a holder answers, so a holder that fails to
+    /// end what the room held does not stop the holders after it: each runs,
+    /// and the error names every failure, the first first.
+    #[tokio::test]
+    async fn a_holder_that_fails_a_deleted_room_does_not_stop_the_others() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "network",
+            Hooks {
+                membership: Some(Arc::new(FailsToEnd("first"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(Arc::new(FailsToEnd("owner pod unreachable"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "chat",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        let (t, r) = (ObjectId::new(), ObjectId::new());
+        let err = reg.room_removed(t, r).await.unwrap_err().to_string();
+        assert_eq!(
+            *holder.0.lock().unwrap(),
+            vec![format!("removed {t} {r}")],
+            "the holder after the failing ones was not told"
+        );
+        assert_eq!(
+            err,
+            "network: room_removed: first; conference: room_removed: owner pod unreachable"
+        );
     }
 
     struct FarTurn(Option<bool>);

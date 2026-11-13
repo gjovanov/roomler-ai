@@ -117,7 +117,7 @@ JSON messages, `{"type": "...", ...}`.
 |---|---|
 | `message:create` / `update` / `delete` / `reaction` | Live chat |
 | `call:message:create` | In-call chat |
-| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list. A `call_ended` the plan's meeting-length cap caused carries `reason: "plan_limit"`, `max_minutes` and `plan` |
+| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list. A `call_ended` the plan's meeting-length cap caused carries `reason: "plan_limit"`, `max_minutes` and `plan`. One sent because a person's membership ended carries `reason: "not_a_member"` and goes to each of their connections whose seat closed; one sent because the room was deleted carries `reason: "room_deleted"` and goes to each connection seated in the call's media, since the room's member list went with it ([below](#a-room-deleted-mid-call-ends-its-call)) |
 | `room:call_ending_soon` | FR-115 P5 — the plan's meeting-length cap (Free: 60 minutes) warns the room's members five minutes before it ends the meeting: `ends_at` (epoch ms), `max_minutes`, `plan`. Shown only to those in that call |
 | `typing:start` | Typing indicators |
 | `notification:new` / `notification:unread_count` | Notification bell |
@@ -167,12 +167,13 @@ sequenceDiagram
 
 | Moment | Where | What happens |
 |---|---|---|
-| Join | `ConferenceView.vue:607`, `stores/rooms.ts:194` `callConnectionId`, `:200` `joinCall`; server `call.rs:133`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:184`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
-| Leave | `rooms.ts:209` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Join | `ConferenceView.vue:607`, `stores/rooms.ts:194` `callConnectionId`, `:200` `joinCall`; server `call.rs:152`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:184`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:209` `leaveCall`, `call.rs:225`, `finalize_call_leave_db` (`call.rs:302`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
 | Socket close | `ws_media.rs:83` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:134`), and the same leave runs naming the socket (`:141`) |
 | A miss | `dao/room.rs:960`, the close itself `close_sessions` (`:1028`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
-| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:275`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:286`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+| Room deleted | `crates/modules/chat/src/room.rs:364`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
 What a leave naming connection C may close:
 
@@ -236,7 +237,7 @@ flowchart LR
 
 | Command | Requires | Checked |
 |---|---|---|
-| `media:join` | What `call/join` checks: a member of the **room's** tenant (read from the room, never from the frame), the room's visibility, and an open call session for **this** connection, or one with no connection id (an older client). A session opened for another socket of the same person does not count | `media_gate.rs:114` `admit_join`, the session by `dao/room.rs:1108` `has_open_call_session`. Before placement (`ws_media.rs:166`), so a refused join claims no room and builds no router, and again on the pod that seats the connection, the owner of a forwarded join (`media_cluster.rs:701`) |
+| `media:join` | What `call/join` checks: a member of the **room's** tenant (read from the room, never from the frame), the room's visibility, and an open call session for **this** connection, or one with no connection id (an older client). A session opened for another socket of the same person does not count | `media_gate.rs:114` `admit_join`, the session by `dao/room.rs:1108` `has_open_call_session`. Before placement (`ws_media.rs:166`), so a refused join claims no room and builds no router, and again on the pod that seats the connection, the owner of a forwarded join (`media_cluster.rs:982`) |
 | every other `media:*` | This connection's seat in the room's media, as this user: a participant entry that only an admitted join creates | `media_gate.rs:151` `seat`, by `room_manager.rs:1086` `holds_seat`, in `dispatch_media_local` (`ws_media.rs:247`) on the pod that runs the command, so a forwarded command is checked at the owner, where the seats are |
 
 - The handlers take the gate's proof, a `JoinPass` or a `Seat`, never a bare room, user or
@@ -246,7 +247,7 @@ flowchart LR
   (`media_gate.rs:35`). Only join, produce and consume answer at all, as they answered
   their failures before; the reason goes to the log.
 - `media:play_audio` plays only a live file of the call's own room, in the room's tenant,
-  and each playback carries its own `playback_id` (`ws_media.rs:1011`).
+  and each playback carries its own `playback_id` (`ws_media.rs:1026`).
 - `GET /api/cluster/status`, which lists every live meeting room on a pod, is for platform
   admins only (`crates/api/src/routes/cluster.rs:23`).
 
@@ -262,8 +263,10 @@ The gate checks membership once, at `media:join`. The seat it admits lasts only 
 that membership: when someone is removed from the org or leaves it, or leaves the room, any
 seat they hold in a call of that org or room goes at once, on whichever pod serves the call.
 The membership's owner tells `conference` through core's `MembershipLifecycle` hook
-(`crates/core/src/hooks.rs:192`), after the membership row is gone, so nothing can be
-admitted on it again while the seats are withdrawn.
+(`crates/core/src/hooks.rs:194`), after the membership row is gone, so nothing can be
+admitted on it again while the seats are withdrawn. A room deleted mid-call ends every
+membership of it at once, and so its whole call
+([below](#a-room-deleted-mid-call-ends-its-call)).
 
 ```mermaid
 sequenceDiagram
@@ -285,12 +288,13 @@ sequenceDiagram
 
 | Trigger | Told by | What ends |
 |---|---|---|
-| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:111`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
-| Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:238`, `room_member_removed` | their seats in that room's call (`revoke.rs:88`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:312` `settle_call_after_departure`) |
+| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:246`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
+| Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:239`, `room_member_removed` | their seats in that room's call (`revoke.rs:223`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:331` `settle_call_after_departure`) |
+| The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:384`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
-- The seats close on the pod that holds them (`revoke.rs:180` `withdraw_seats_here`), reached
-  over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:156`,
-  `media_cluster.rs:612`). A pod that answers no withdrawal is presumed gone, and its media
+- The seats close on the pod that holds them (`revoke.rs:315` `withdraw_seats_here`), reached
+  over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:291`,
+  `media_cluster.rs:882`). A pod that answers no withdrawal is presumed gone, and its media
   with it; the failure is logged.
 - `room:call_ended` is what the web client already reads as "this call is over for you"
   (`ui/src/stores/ws.ts:349`): it tears the call down, with no client change.
@@ -316,6 +320,120 @@ their camera closes, they are off the participant list and the count, and their 
 nothing more); `the_last_participant_leaving_the_room_ends_its_call`.
 `cluster_tests::an_org_removal_on_one_pod_withdraws_the_seat_the_other_pod_holds` and
 `a_room_leave_on_one_pod_withdraws_the_seat_the_other_pod_holds`.
+
+### A room deleted mid-call ends its call
+
+Deleting a room (`DELETE /api/tenant/{tenant_id}/room/{room_id}`, `MANAGE_CHANNELS`) ends
+every membership of it at once: `cascade_delete` (`dao/room.rs:348`) removes the room's
+document and its `room_members` rows, and the call sessions those rows held go with them.
+The call running in the room ends with them, for everyone in it, on whichever pod serves
+it. `chat` tells `conference` through `MembershipLifecycle::room_removed`
+(`crates/core/src/hooks.rs:229`) once the room is gone
+(`crates/modules/chat/src/room.rs:384`).
+
+```mermaid
+sequenceDiagram
+    participant D as room delete (chat), on the pod the request reached
+    participant H as core.hooks
+    participant C as conference (revoke.rs)
+    participant O as the pod serving the call
+    participant P as each connection seated in the call
+    D->>D: cascade_delete: the room, its memberships, their call sessions
+    D->>H: room_removed
+    H->>C: MembershipLifecycle
+    C->>O: media.close_room, reason room_deleted (or locally, when this pod serves the call)
+    O->>O: close every seat's transports, producers, consumers, the router, release the claim
+    O->>P: room:call_ended, reason room_deleted
+    O->>O: close the call's stats record, by the room
+    Note over O: no word of the delete reached it: two reconcile reads in a row find no room document, and the same teardown runs
+```
+
+- **The order: the delete first, then the hook.** Every admission reads the room's document
+  (`media_gate.rs:127`), so once it is gone nothing new is admitted while the call ends. A
+  join or a start already on its way when the room went looks again once it has built its
+  seat or its router (`ws_media.rs:466`, `call.rs:62`), and a room that is gone takes an
+  empty router with it.
+- **One teardown.** Whatever finds a deleted room's call ends it in `close_room_here`
+  (`media_cluster.rs:475`), the way `call/end` ends a call: every seat's transports,
+  producers and consumers close, the router goes and the claim is released. The release
+  waits at most `CLAIM_RELEASE_BOUND`, 2 s: a Redis link lost without a reset parks a
+  command with no answer, and the people are told all the same, while the record's own
+  30 s TTL ends the claim. Each connection
+  that was seated hears `room:call_ended` with `reason: "room_deleted"` (`revoke.rs:170`
+  `deleted_rooms_call_ended`), and the call's stats record closes by the room
+  (`dao/stats.rs:462`), because the room's `current_call_id` went with its document. The
+  member list went too, so the connections to tell come from the call's media, and they are
+  told wherever their sockets are (`send_to_connection_routed`).
+- **The other pod.** A delete that reaches the pod not serving the call asks the one serving
+  it over the bus: `media.close_room` with `reason: "room_deleted"` (`media_cluster.rs:397`
+  `close_room_everywhere`, handled at `:898`). The hook awaits one directory read, at most
+  one request whose reply waits at most `RPC_DEADLINE`, 2 s
+  (`crates/core/src/cluster/bus.rs:41`), a second read and a release when no reply comes,
+  and one update of the stats record.
+- **The delete waits a bounded time.** The hook runs in a task of its own, and the delete
+  waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:342`),
+  well above the slowest healthy teardown. Past the bound (a Redis or Mongo node lost
+  without a reset hangs a read without end), or when the client hangs up, the delete
+  answers and the teardown goes on: it is never cut off between a router removed and its
+  people told. The task itself logs how the teardown ended, so a failure past the bound is
+  still seen: an error names each holder that failed, and a teardown that ends after the
+  delete answered says how long it took.
+- **The pod serving the call ends it on its own** when no word of the delete reached it: the
+  hook failed, its request was lost, or a pod whose code ends no call served the delete. Its
+  reconcile (`end_calls_of_rooms_gone`, `media_cluster.rs:704`), a loop of its own every
+  `MEDIA_REFRESH_SECS` = 10 s (`:934`), apart from the claim heartbeat so that neither
+  waits for the other, reads the documents of the rooms it serves media for, and a room
+  with no document in `MISSES_TO_END` = 2 reads in a row (`:680`) is gone: its call ends
+  through the same teardown, within about 20 s. Only a read that completes counts: one that
+  fails, breaks off or takes longer than 5 s (`:684`) changes nothing, and from the third
+  failed read in a row (`FAILED_READS_TO_WARN`, `:688`) each one is a warning, so a
+  reconcile that cannot read shows in the log. "No document" is literal: a legacy room that
+  still carries `deleted_at` has a document, and its call is left alone. The reconcile runs
+  on every pod, whether or not it has a cluster directory.
+- **The delete answers 200 whatever the hook says**, since the room is gone. When the pod
+  serving the call could not be reached (`RoomClose::NotReached`, `media_cluster.rs:377`),
+  the hook fails, the delete logs it as an error with the org and the room, and that pod
+  ends the call itself as above. When no reply comes in time, the claim is read again
+  (`media_cluster.rs:434`): a claim gone with the media means that pod closed the call and
+  answered late, and nothing failed (`RoomClose::Owner` with no seats); a claim that still
+  names it, as a crashed pod's does until its record runs out, is pruned and stays a
+  failure. Every holder of `room_removed` runs even when one before it fails
+  (`crates/core/src/hooks.rs:394`), and the error names each failure. A stats record that
+  does not close behind the reconcile or a guard of a join or a start is closed by the stats
+  rollup's orphan sweep as `stale_reset` within 15 minutes (`maintenance.rs:63`
+  `close_orphaned_call_state`, each cycle at `crates/api/src/stats_rollup.rs:633`).
+- **It is idempotent.** A call that already ended, or a second `room_removed`, finds no
+  media and no open record: nothing closes and nobody hears anything.
+- **During a roll**, a pod on the previous image that serves the call takes the request as
+  an ended call: its seats, router and claim go, but its people hear nothing until that pod
+  is replaced. A request with no `reason`, as the previous image sends, closes the room as
+  an ended call, as before.
+- The web client reads `room:call_ended` as "this call is over for you" whatever its reason
+  (`ui/src/stores/ws.ts:349`), so a deleted room needs no client change.
+
+**Tests.** `conference_gate_tests`: `deleting_a_room_mid_call_ends_its_call_for_everyone_in_it`,
+`deleting_a_room_leaves_a_call_in_another_room_alone` (the deleted room has no call, and
+the call's people are members of it),
+`removing_a_room_whose_call_ended_or_a_second_time_tells_no_one`,
+`a_room_removed_again_after_its_call_ended_ends_nothing_twice`,
+`a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it`,
+`a_router_left_for_a_room_already_gone_is_reaped` and
+`a_room_delete_answers_at_its_bound_and_its_teardown_runs_on` (a holder that outlasts the
+bound: the delete answers at the bound and the holder still runs to its end; it fails both
+with the hook awaited inline and with a plain timeout around it). `cluster_tests`:
+`a_room_deleted_on_the_pod_serving_its_call_ends_the_call_on_both_pods`,
+`a_room_deleted_on_the_other_pod_ends_its_call_on_the_pod_serving_it`,
+`a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it_across_pods`,
+`the_pod_serving_a_deleted_rooms_call_tells_its_own_people`,
+`a_room_deleted_while_the_pod_serving_its_call_cannot_be_reached_ends_it_afterwards` (the
+delete answers within the bound, and the reconcile ends the call) and
+`a_close_answered_too_late_after_its_claim_went_is_no_failure`. The two-miss rule and the
+close request's reason are unit tests in `media_cluster::tests`, and every holder running
+past a failing one is `hooks::tests::a_holder_that_fails_a_deleted_room_does_not_stop_the_others`.
+The guards of a join and a start that raced the delete have no test of their own: reaching
+either needs the room to go between two reads inside one request, which no test can time
+without a seam in production code. What they miss, the reconcile reaps within two passes
+(`a_router_left_for_a_room_already_gone_is_reaped`).
 
 ### A socket's `media:*` frames are limited
 
@@ -383,8 +501,8 @@ sequenceDiagram
 | Message | Change | Where |
 |---|---|---|
 | `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:434` |
-| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:589`, `meeting_levers` at `:798` |
-| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:287`, the handler at `:815`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
+| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:604`, `meeting_levers` at `:813` |
+| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:287`, the handler at `:830`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
 
 It is dispatched where `media:consume` is — through the C-4 placement gate — so a viewer
 whose socket is on the other pod reaches the owner's participant state over `media.cmd`
@@ -514,7 +632,7 @@ more packets than one worker carries without it.
 **Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
 consumers held back by their viewers' views, never the owner's FR-30 pause
 (`crates/api/src/cluster/metrics.rs:88`, from `MediaGauges::video_paused_total`,
-`crates/modules/conference/src/lib.rs:120`) — and each row of `media_rooms_detail` its
+`crates/modules/conference/src/lib.rs:128`) — and each row of `media_rooms_detail` its
 `video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
 two that follow it (simulcast, a room piped across workers), are in the FR's §3.0.

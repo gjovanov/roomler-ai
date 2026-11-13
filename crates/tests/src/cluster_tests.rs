@@ -1097,6 +1097,384 @@ async fn a_room_leave_on_one_pod_withdraws_the_seat_the_other_pod_holds() {
     member.close(None).await.ok();
 }
 
+/// The id of the call running in `room_id`, read from the room's document
+/// before the room goes (the id goes with it).
+async fn current_call_id(app: &TestApp, room_id: &str) -> bson::oid::ObjectId {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let found = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .find_one(bson::doc! { "_id": rid })
+        .await
+        .unwrap()
+        .expect("the room exists");
+    found
+        .get_object_id("current_call_id")
+        .unwrap_or_else(|_| panic!("a call is running in the room: {found}"))
+}
+
+/// `call_across_pods`' room is deleted by a request `via` serves: the call
+/// ends on both pods. Both sockets hear it ended (the member's is on app2,
+/// its seat on app1), neither pod keeps a router, seat or claim of it, and
+/// its stats record closes.
+async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp) {
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(app1, app2).await;
+    let call_id = current_call_id(app1, &room_id).await;
+
+    let resp = via
+        .auth_delete(
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the admin deletes the room");
+
+    assert_deleted_rooms_call_ended(app1, app2, &room_id, call_id, &mut host, &mut member, &conn)
+        .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// Every frame `ws` receives within `ms` milliseconds.
+async fn frames_within(ws: &mut UserWs, ms: u64) -> Vec<serde_json::Value> {
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
+        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(msg.to_text().unwrap_or("")) {
+            seen.push(frame);
+        }
+    }
+    seen
+}
+
+/// Delete the room's document and nothing else: the room is gone and no one
+/// told conference, as when a delete's request died after the delete, a pod
+/// whose code ends no call served it, or its word to the owner was lost.
+async fn delete_room_document(app: &TestApp, room_id: &str) {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let gone = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .delete_one(bson::doc! { "_id": rid })
+        .await
+        .unwrap();
+    assert_eq!(gone.deleted_count, 1, "the room's document was there");
+}
+
+/// The call of the deleted room `room_id` (served by app1, the member's socket
+/// on app2) ended for everyone in it: each socket hears it once, with
+/// `reason: "room_deleted"`; neither pod keeps its router or a claim, the
+/// owner seats no one, the shared claim record is gone, and its stats record
+/// closed.
+async fn assert_deleted_rooms_call_ended(
+    app1: &TestApp,
+    app2: &TestApp,
+    room_id: &str,
+    call_id: bson::oid::ObjectId,
+    host: &mut UserWs,
+    member: &mut UserWs,
+    conn: &str,
+) {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    for (who, ws) in [("the host", &mut *host), ("the member", &mut *member)] {
+        let ended = next_frame_of(ws, "room:call_ended").await;
+        assert_eq!(ended["data"]["room_id"], room_id, "{who}: {ended}");
+        assert_eq!(ended["data"]["reason"], "room_deleted", "{who}: {ended}");
+    }
+    for (who, ws) in [("the host", &mut *host), ("the member", &mut *member)] {
+        let again: Vec<serde_json::Value> = frames_within(ws, 1500)
+            .await
+            .into_iter()
+            .filter(|f| f["type"] == "room:call_ended")
+            .collect();
+        assert!(again.is_empty(), "{who} heard it twice: {again:?}");
+    }
+    for (pod, app) in [("app1", app1), ("app2", app2)] {
+        assert!(
+            !conf(app).room_manager.has_room(&rid),
+            "{pod} kept the call's router"
+        );
+        assert!(
+            !conf(app).media_claim_tokens.contains_key(&rid),
+            "{pod} still holds the call's claim"
+        );
+    }
+    assert_eq!(
+        conf(app1).room_manager.get_connection_room(conn),
+        None,
+        "the owner pod still seats the member"
+    );
+    let key = roomler_ai_api::cluster::directory::media_key(room_id);
+    let dir = app1.state.cluster_directory.clone().unwrap();
+    assert_eq!(
+        dir.get(&key).await.unwrap(),
+        None,
+        "the call's claim outlived its room"
+    );
+    let record = app1
+        .db
+        .collection::<bson::Document>("call_sessions")
+        .find_one(bson::doc! { "_id": call_id })
+        .await
+        .unwrap()
+        .expect("the call has a stats record");
+    assert_eq!(
+        record.get_str("end_reason").ok(),
+        Some("room_deleted"),
+        "the call's stats record: {record}"
+    );
+}
+
+/// A room deleted on the pod that serves its call ends the call there, and
+/// tells the socket the other pod holds.
+#[tokio::test]
+async fn a_room_deleted_on_the_pod_serving_its_call_ends_the_call_on_both_pods() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    delete_the_call_room_via(&app1, &app1, &app2).await;
+}
+
+/// A room deleted on the pod that does NOT serve its call ends the call on
+/// the pod that does.
+#[tokio::test]
+async fn a_room_deleted_on_the_other_pod_ends_its_call_on_the_pod_serving_it() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    delete_the_call_room_via(&app2, &app1, &app2).await;
+}
+
+/// The room's document goes while app1 serves its call and app2 holds the
+/// member's socket, and nothing tells conference. app1, the pod serving the
+/// call, ends it on its own once two of its reconcile reads in a row found no
+/// document: for both sockets, and with its claim.
+#[tokio::test]
+async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it_across_pods() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (_tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    let call_id = current_call_id(&app1, &room_id).await;
+
+    delete_room_document(&app1, &room_id).await;
+    for _ in 0..2 {
+        roomler_ai_mod_conference::media_cluster::end_calls_of_rooms_gone(conf(&app1)).await;
+    }
+
+    assert_deleted_rooms_call_ended(
+        &app1,
+        &app2,
+        &room_id,
+        call_id,
+        &mut host,
+        &mut member,
+        &conn,
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// The pod serving a deleted room's call, asked over the bus to close it for
+/// that reason (what a deleting pod that does not serve the call sends), tells
+/// its own people itself: both sockets hear that the call ended, once, and the
+/// pod that asked says nothing to anyone.
+#[tokio::test]
+async fn the_pod_serving_a_deleted_rooms_call_tells_its_own_people() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (_tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    let call_id = current_call_id(&app1, &room_id).await;
+
+    delete_room_document(&app1, &room_id).await;
+    let reply = app2
+        .state
+        .cluster_bus
+        .clone()
+        .unwrap()
+        .request(
+            &app1.state.pod.pod_id,
+            "media.close_room",
+            serde_json::json!({ "room_id": room_id, "reason": "room_deleted" }),
+        )
+        .await
+        .expect("the pod serving the call answers");
+    assert_eq!(reply["ok"], true, "{reply}");
+
+    assert_deleted_rooms_call_ended(
+        &app1,
+        &app2,
+        &room_id,
+        call_id,
+        &mut host,
+        &mut member,
+        &conn,
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// A media claim record naming `pod`, as that pod's own directory writes one.
+fn claim_record_of(pod: &str) -> String {
+    format!("{pod}/1/media/{}", bson::DateTime::now().timestamp_millis())
+}
+
+/// The pod serving a deleted room's call cannot be reached when the room is
+/// deleted: the room's claim names a pod no one runs, while app1 serves the
+/// call and app2 holds the member's socket. The delete, which app2 serves,
+/// still answers 200, within its bound, once it has waited out the bus
+/// deadline for that pod; its hook could not end the call's media, so no one
+/// hears of it yet and app1 still serves it, though the hook has closed the
+/// call's stats record by the room already. app1's reconcile ends the call
+/// afterwards, for both sockets, with its claim.
+#[tokio::test]
+async fn a_room_deleted_while_the_pod_serving_its_call_cannot_be_reached_ends_it_afterwards() {
+    use roomler_ai_api::cluster::bus::RPC_DEADLINE;
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let Some(dir) = app1.state.cluster_directory.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    let call_id = current_call_id(&app1, &room_id).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+
+    // The claim now names a pod no one runs. app1 holds that record as its
+    // own, so its claim refresh neither folds the call nor gives the record
+    // up while the test runs. The two writes are one Redis round trip apart:
+    // a refresh of app1's landing between them finds a record that is not its
+    // token, in either order of the two, and folds the call (about one run in
+    // ten thousand; no order closes that gap without a seam in the refresh).
+    let key = roomler_ai_api::cluster::directory::media_key(&room_id);
+    let unreachable = format!("gone-{}", bson::oid::ObjectId::new().to_hex());
+    let raw = claim_record_of(&unreachable);
+    dir.claim_lww(&key, &raw).await.unwrap();
+    conf(&app1).media_claim_tokens.insert(rid, raw);
+
+    let started = std::time::Instant::now();
+    let resp = app2
+        .auth_delete(
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the delete answers whatever its hook says"
+    );
+    assert!(
+        took >= RPC_DEADLINE,
+        "the delete did not wait for the pod its claim names: {took:?}"
+    );
+    // It answers within its bound, `ROOM_REMOVED_BOUND` (5 s) in chat's room
+    // delete, plus the delete's own reads and writes: a pod that never
+    // answers holds it no longer. The hook alone takes about `RPC_DEADLINE`
+    // here; the rest is slack for a loaded runner.
+    let room_removed_bound = std::time::Duration::from_secs(5);
+    assert!(
+        took < room_removed_bound + std::time::Duration::from_secs(5),
+        "the delete did not answer within its bound: {took:?}"
+    );
+
+    // The hook could not end the call: no one has heard of it, and app1
+    // still serves it.
+    for (who, ws) in [("the host", &mut host), ("the member", &mut member)] {
+        let heard: Vec<serde_json::Value> = frames_within(ws, 500)
+            .await
+            .into_iter()
+            .filter(|f| f["type"] == "room:call_ended")
+            .collect();
+        assert!(
+            heard.is_empty(),
+            "{who} heard the call end before the pod serving it knew: {heard:?}"
+        );
+    }
+    assert!(
+        conf(&app1).room_manager.has_room(&rid),
+        "the call ended though no one reached the pod serving it"
+    );
+
+    for _ in 0..2 {
+        roomler_ai_mod_conference::media_cluster::end_calls_of_rooms_gone(conf(&app1)).await;
+    }
+    assert_deleted_rooms_call_ended(
+        &app1,
+        &app2,
+        &room_id,
+        call_id,
+        &mut host,
+        &mut member,
+        &conn,
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// A deleted room's call whose pod answered the close too late, its claim
+/// already gone with the media (it closed the call and answered after the
+/// deadline, or its record ran out with it): nothing is left to close, so
+/// ending what the room held is no failure. The claim here names a pod that
+/// never answers and runs out while the close waits for it.
+#[tokio::test]
+async fn a_close_answered_too_late_after_its_claim_went_is_no_failure() {
+    use roomler_ai_api::cluster::bus::RPC_DEADLINE;
+    let app = TestApp::spawn().await;
+    let (Some(dir), Some(_)) = (
+        app.state.cluster_directory.clone(),
+        app.state.cluster_bus.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let room = bson::oid::ObjectId::new();
+    let key = roomler_ai_api::cluster::directory::media_key(&room.to_hex());
+    let late = format!("late-{}", bson::oid::ObjectId::new().to_hex());
+    let raw = claim_record_of(&late);
+    // It runs out while the close waits for its pod: half the bus deadline
+    // after it was set, so about a second after the close's first read finds
+    // it and about a second before the second read looks again.
+    assert_eq!(
+        dir.claim_nx(&key, &raw, RPC_DEADLINE.as_secs() / 2)
+            .await
+            .unwrap(),
+        ClaimOutcome::Won
+    );
+
+    let started = std::time::Instant::now();
+    let ended = app
+        .state
+        .core
+        .hooks
+        .room_removed(bson::oid::ObjectId::new(), room)
+        .await;
+    let took = started.elapsed();
+    assert!(
+        took >= RPC_DEADLINE,
+        "the close did not wait for the pod the claim named: {took:?}"
+    );
+    ended.expect("a call whose claim went with its media ended");
+    assert_eq!(dir.get(&key).await.unwrap(), None);
+}
+
 // ── C-5: DERP directory + registration-driven rehome ────────────────
 
 /// A DERP network split across pods converges toward the NEWEST
