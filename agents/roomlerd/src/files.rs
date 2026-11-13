@@ -11000,6 +11000,53 @@ CAN_GRAPHICAL=0
             );
         }
 
+        /// #3734 — an XDG Downloads folder that is `~/Downloads` itself (its
+        /// `user-dirs.dirs` names `$HOME/Downloads`, as a desktop's does), and
+        /// that cannot receive files, is refused once, in the words the viewer
+        /// was shown before, and nothing is logged for it. Before, a line said
+        /// the fallback was trying `~/Downloads`, the very folder just refused,
+        /// which was then refused again. The begin's own line is the refusal's
+        /// one.
+        #[tokio::test]
+        async fn an_xdg_downloads_that_is_downloads_itself_is_refused_once() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            assert_eq!(
+                own_home_and_downloads().1,
+                Some(dl.clone()),
+                "the XDG Downloads folder is ~/Downloads"
+            );
+            chmod(&dl, 0o777);
+            let refused: Result<PathBuf, String> = Err(cannot_receive(&dl, writable_by_others()));
+            let log = crate::peer::files_log_tests::Logged::start(tracing::Level::WARN);
+            let got = download_dir().map_err(|e| e.to_string());
+            let logged = log.text();
+            drop(log);
+            assert_eq!(got, refused, "refused, in the viewer's words as before");
+            assert!(
+                !logged.contains("trying ~/Downloads"),
+                "no fallback to the folder just refused: {logged}"
+            );
+            assert_eq!(
+                logged, "",
+                "nothing logged: the begin's line is the refusal's one"
+            );
+            let h = FilesHandler::new();
+            let begun = h
+                .begin_as(
+                    FsAs::Daemon,
+                    tid("xdg-is-dl"),
+                    "a.txt".into(),
+                    2,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string());
+            assert_eq!(begun, refused, "and an upload is refused in them");
+        }
+
         /// R2 — the daemon's staging is made with explicit modes, so it passes
         /// its own checks under any umask (a per-user daemon on Ubuntu runs
         /// under 0002): `.roomler-partial` and `<id>` 0700, `meta.json` 0600,
