@@ -329,6 +329,17 @@ pub async fn update(
     Ok(Json(serde_json::json!({ "updated": true })))
 }
 
+/// How long a room delete waits for what the room held to end
+/// (`room_removed`) before it answers. The slowest healthy teardown, a call
+/// another pod serves, costs a directory read, a bus request whose reply
+/// waits at most 2 s (`cluster::bus::RPC_DEADLINE`), a second read and a
+/// release, and one write of the call's stats record: well inside 5 s. A
+/// Redis or Mongo node lost without a reset hangs a read without end; the
+/// delete answers anyway, the teardown runs on in its own task, and the pod
+/// serving the call ends it on its own once it finds the room's document
+/// gone.
+pub const ROOM_REMOVED_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub async fn delete(
     State(state): State<ChatState>,
     auth: AuthUser,
@@ -358,8 +369,27 @@ pub async fn delete(
     // seat or router. The delete has happened whatever the hook says, so a
     // failure there is logged, not answered: the pod serving the call ends it
     // on its own once it finds the room's document gone.
-    if let Err(e) = state.hooks.room_removed(tid, rid).await {
-        tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+    //
+    // The teardown runs in a task of its own and the delete waits for it at
+    // most `ROOM_REMOVED_BOUND`: one that outlasts the bound, or a client that
+    // hangs up, never cuts it off half-way (a router already removed whose
+    // people were not yet told would be told by no one).
+    let hooks = state.clone();
+    let teardown = tokio::spawn(async move { hooks.hooks.room_removed(tid, rid).await });
+    match tokio::time::timeout(ROOM_REMOVED_BOUND, teardown).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held panicked");
+        }
+        Err(_) => {
+            tracing::error!(
+                tenant = %tid, room = %rid, bound = ?ROOM_REMOVED_BOUND,
+                "room delete: ending what the room held is still running; the delete answers, the teardown goes on"
+            );
+        }
     }
 
     Ok(Json(serde_json::json!({ "deleted": true })))

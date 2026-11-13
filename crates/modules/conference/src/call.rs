@@ -63,8 +63,8 @@ pub async fn call_start(
             // after its delete looked for a call to end, and the router built
             // here would outlive it. Look again now that it exists, as a join
             // does once its seat exists: a room that is gone takes the router
-            // with it. A read that fails leaves it to the claim heartbeat's
-            // reconcile.
+            // with it. A read that fails leaves it to the reconcile
+            // (`media_cluster::end_calls_of_rooms_gone`).
             if let Err(roomler_ai_services::dao::base::DaoError::NotFound) =
                 state.rooms.base.find_by_id(rid).await
             {

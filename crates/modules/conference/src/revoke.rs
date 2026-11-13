@@ -40,8 +40,9 @@
 //! so the connections to tell come from the call's media itself, and the pod
 //! serving the call tells them, whichever pod the delete reached
 //! (`media_cluster::close_room_here`). A call that no word of the delete
-//! reached ends on that pod all the same: its claim heartbeat finds the room's
-//! document gone in two reads in a row and ends the call the same way.
+//! reached ends on that pod all the same: its reconcile, a 10 s loop of its
+//! own, finds the room's document gone in two reads in a row and ends the call
+//! the same way.
 
 use std::sync::Arc;
 
@@ -111,9 +112,11 @@ impl MembershipLifecycle for MembershipHooks {
 /// that already ended, or a second removal, finds no media and no open
 /// record, and does nothing.
 ///
-/// An `Err` when the pod serving the call could not be reached: the delete
-/// stands, and that pod ends the call on its own once the room's document is
-/// gone (the claim heartbeat's reconcile, `media_cluster`).
+/// An `Err` when the pod serving the call could not be reached, or the stats
+/// record would not close, naming each that failed: the delete stands, the
+/// pod serving the call ends it on its own once the room's document is gone
+/// (the reconcile, `media_cluster::end_calls_of_rooms_gone`), and a record
+/// left open is closed by the rollup's orphan sweep.
 async fn room_deleted(
     state: &ConferenceState,
     tenant_id: ObjectId,
@@ -121,14 +124,23 @@ async fn room_deleted(
 ) -> anyhow::Result<()> {
     use crate::media_cluster::{CloseReason, RoomClose, close_room_everywhere};
     let outcome = close_room_everywhere(state, &room_id, CloseReason::RoomDeleted).await;
-    let calls = close_call_record_of_deleted_room(state, room_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("closing the call's stats record: {e}"))?;
-    match outcome {
-        RoomClose::NotReached(why) => Err(anyhow::anyhow!(
+    let record = close_call_record_of_deleted_room(state, room_id).await;
+    let mut failed = Vec::new();
+    if let RoomClose::NotReached(why) = &outcome {
+        failed.push(format!(
             "the call's media could not be closed where it runs ({why}); that pod ends it \
              once the room's document is gone"
-        )),
+        ));
+    }
+    if let Err(e) = &record {
+        failed.push(format!("closing the call's stats record: {e}"));
+    }
+    if !failed.is_empty() {
+        return Err(anyhow::anyhow!(failed.join("; ")));
+    }
+    let calls = record.unwrap_or(0);
+    match outcome {
+        RoomClose::NotReached(_) => Ok(()),
         RoomClose::Owner { pod, seats } => {
             info!(
                 tenant = %tenant_id, room = %room_id, %pod, seats, calls,
@@ -150,8 +162,11 @@ async fn room_deleted(
 /// A deleted room's call, whose media just closed on this pod (the one that
 /// served it, `close_room_here`), has ended for everyone in it: each of
 /// `closed` hears `room:call_ended` with `reason: "room_deleted"`, and the
-/// call's stats record closes. A record that does not close is logged here,
-/// and the room delete's own hook closes it again.
+/// call's stats record closes. A record that does not close is logged here.
+/// When the room delete's hook brought the call here, the hook closes the
+/// record again; behind the reconcile or a guard of a join or a start nothing
+/// follows, and the rollup's orphan sweep closes it as `stale_reset` within
+/// 15 minutes (`maintenance::close_orphaned_call_state`).
 pub(crate) async fn deleted_rooms_call_ended(
     state: &ConferenceState,
     room_id: ObjectId,

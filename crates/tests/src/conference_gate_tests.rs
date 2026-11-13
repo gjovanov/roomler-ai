@@ -1290,18 +1290,20 @@ async fn delete_room_document(app: &TestApp, room: &str) {
     assert_eq!(gone.deleted_count, 1, "the room's document was there");
 }
 
-/// Two passes of the claim heartbeat on `app`, the pod's own 10 s beat.
-async fn two_heartbeats(app: &TestApp) {
+/// Two passes of the reconcile on `app`, the pod's own 10 s loop. Nothing
+/// else runs: the claim refresh is a loop of its own.
+async fn two_reconciles(app: &TestApp) {
     for _ in 0..2 {
-        roomler_ai_mod_conference::media_cluster::refresh_media_claims_once(conf(app)).await;
+        roomler_ai_mod_conference::media_cluster::end_calls_of_rooms_gone(conf(app)).await;
     }
 }
 
 /// A call runs here while its room's document goes, and nothing tells
-/// conference. The pod serving the call ends it on its own once two heartbeats
-/// in a row found no document: each participant's socket hears that it ended
-/// because its room was deleted, no seat, router or claim of it is left, and
-/// its stats record closes. A call whose room is still there is left alone.
+/// conference. The pod serving the call ends it on its own once two reconcile
+/// reads in a row found no document: each participant's socket hears that it
+/// ended because its room was deleted, no seat, router or claim of it is left,
+/// and its stats record closes. A call whose room is still there is left
+/// alone.
 #[tokio::test]
 async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it() {
     let app = TestApp::spawn().await;
@@ -1313,7 +1315,7 @@ async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it() {
     let kept_call = current_call_id(&app, &kept.room).await;
 
     delete_room_document(&app, &room).await;
-    two_heartbeats(&app).await;
+    two_reconciles(&app).await;
 
     for (who, peer) in [("the host", &mut gone.host), ("the member", &mut m.peer)] {
         let ended = next_of(peer, "room:call_ended").await;
@@ -1354,7 +1356,10 @@ async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it() {
         conf(&app).room_manager.get_connection_room(&kept.host.conn),
         Some(kept_rid)
     );
-    assert!(conf(&app).media_claim_tokens.contains_key(&kept_rid));
+    // A claim exists only where there is a directory (Redis) to hold it.
+    if app.state.cluster_directory.is_some() {
+        assert!(conf(&app).media_claim_tokens.contains_key(&kept_rid));
+    }
     let kept_record = call_record(&app, kept_call).await;
     assert!(
         !matches!(kept_record.get("ended_at"), Some(bson::Bson::DateTime(_))),
@@ -1368,8 +1373,9 @@ async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it() {
 
 /// A router this pod built for a room that is already gone, with no one in it
 /// and no claim behind it (a `call/start` whose room was deleted while it was
-/// on its way builds one after the delete looked): the claim heartbeat does
-/// not adopt it for good, it reaps it, with whatever claim it took.
+/// on its way builds one after the delete looked): the claim heartbeat adopts
+/// it, and the reconcile does not let it stay, it reaps it, with the claim the
+/// heartbeat took.
 #[tokio::test]
 async fn a_router_left_for_a_room_already_gone_is_reaped() {
     let app = TestApp::spawn().await;
@@ -1380,7 +1386,14 @@ async fn a_router_left_for_a_room_already_gone_is_reaped() {
         .await
         .expect("a router builds");
 
-    two_heartbeats(&app).await;
+    roomler_ai_mod_conference::media_cluster::refresh_media_claims_once(conf(&app)).await;
+    if app.state.cluster_directory.is_some() {
+        assert!(
+            conf(&app).media_claim_tokens.contains_key(&ghost),
+            "the claim heartbeat adopts a tokenless router"
+        );
+    }
+    two_reconciles(&app).await;
 
     assert_no_media_left(&app, &ghost.to_hex(), &[]).await;
 }
