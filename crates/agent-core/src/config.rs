@@ -3880,29 +3880,48 @@ fn parse_failure(raw: &str, e: &toml::de::Error) -> String {
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
+    parse_raw(&raw, &path.display().to_string())
+}
+
+/// FR-147 — a config's text, parsed by [`try_load`]'s rules, for a reader
+/// that holds the bytes and not the file: `sudo roomlerd one-row` parses what
+/// a person's own process read in that person's home. `origin` names the
+/// text in errors and log lines in place of a path. The keys this build does
+/// not know are noted from the text itself. No `.prev` repair: that rewrite
+/// ([`load`]'s) belongs to the file's own agent.
+pub fn parse_text(raw: &str, origin: &str) -> Result<AgentConfig> {
+    let cfg = parse_raw(raw, origin)?;
+    if let Some(keys) = unknown_keys_said(raw) {
+        tracing::warn!(
+            origin = %origin,
+            keys = %keys,
+            "config keys this build does not know: ignored here, and kept in the file through every save"
+        );
+    }
+    Ok(cfg)
+}
+
+/// What [`try_load`] does with the text it read, `origin` standing for its
+/// path: every reader parses through here.
+fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
     // An all-NUL file of the correct length is the signature of a power loss
     // between `rename` and the data reaching disk. `toml` reports it as a
     // parse error at line 1, which reads like a hand-edit typo; name it.
     if !raw.is_empty() && raw.bytes().all(|b| b == 0) {
         anyhow::bail!(
             "config at {} is {} bytes of NUL (truncated by an unclean shutdown)",
-            path.display(),
+            origin,
             raw.len()
         );
     }
-    let mut cfg: AgentConfig = toml::from_str(&raw).map_err(|e| {
-        anyhow::anyhow!(
-            "parsing config at {}: {}",
-            path.display(),
-            parse_failure(&raw, &e)
-        )
-    })?;
+    let mut cfg: AgentConfig = toml::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("parsing config at {}: {}", origin, parse_failure(raw, &e)))?;
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
     for (field, was) in cfg.secure_server_urls() {
         tracing::warn!(
-            path = %path.display(),
+            path = %origin,
             field = %field,
             was = %was,
             "a plaintext server URL in the config is read as TLS; set \
@@ -4233,18 +4252,9 @@ fn note_unknown_keys(path: &PathBuf) {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
-    let Some(unknown) = unknown_keys(&raw) else {
+    let Some(keys) = unknown_keys_said(&raw) else {
         return;
     };
-    let keys = unknown
-        .iter()
-        .map(|s| dotted(s))
-        .filter(|k| !is_retired_key(k))
-        .collect::<Vec<_>>();
-    if keys.is_empty() {
-        return;
-    }
-    let keys = keys.join(", ");
     {
         let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
         if noted.iter().any(|(p, k)| p == path && *k == keys) {
@@ -4257,6 +4267,18 @@ fn note_unknown_keys(path: &PathBuf) {
         keys = %keys,
         "config keys this build does not know: ignored here, and kept in the file through every save"
     );
+}
+
+/// The keys in `raw` this build does not know, the retired ones left out,
+/// joined for one log line. `None` when there are none, or `raw` does not
+/// parse as a config.
+fn unknown_keys_said(raw: &str) -> Option<String> {
+    let keys = unknown_keys(raw)?
+        .iter()
+        .map(|s| dotted(s))
+        .filter(|k| !is_retired_key(k))
+        .collect::<Vec<_>>();
+    (!keys.is_empty()).then(|| keys.join(", "))
 }
 
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
@@ -4845,6 +4867,45 @@ machine_id = "mid"
 machine_name = "devbox"
 "#
         .to_string()
+    }
+
+    /// FR-147 — `parse_text` is `try_load` without the file: the same config
+    /// from the same text, the same TLS rule, a key this build does not know
+    /// still ignored, and nothing read or written beside it.
+    #[test]
+    fn parse_text_reads_what_try_load_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = format!(
+            "{}\nnot_a_key_of_this_build = 1\n",
+            minimal_toml().replace("https://roomler.ai", "http://roomler.example")
+        );
+        std::fs::write(&path, &text).unwrap();
+        let from_file = try_load(&path).expect("try_load");
+        let from_text = parse_text(&text, "the person's config").expect("parse_text");
+        assert_eq!(
+            toml::to_string(&from_text).unwrap(),
+            toml::to_string(&from_file).unwrap()
+        );
+        assert!(
+            from_text.server_url.starts_with("https://roomler.example"),
+            "{}",
+            from_text.server_url
+        );
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "parse_text left nothing beside the file");
+    }
+
+    /// Its errors name `origin`, never a path, and keep `try_load`'s words:
+    /// the NUL signature, and a parse error by line with no quoted text.
+    #[test]
+    fn parse_text_names_its_origin_in_its_errors() {
+        let nul = format!("{:#}", parse_text("\0\0\0\0", "uid 501's config").unwrap_err());
+        assert!(nul.contains("uid 501's config is 4 bytes of NUL"), "{nul}");
+        let broken = "server_url = \"https://roomler.ai\"\nagent_token = \"secret-value\n";
+        let said = format!("{:#}", parse_text(broken, "uid 501's config").unwrap_err());
+        assert!(said.starts_with("parsing config at uid 501's config: TOML parse error at line"), "{said}");
+        assert!(!said.contains("secret-value"), "{said}");
     }
 
     /// Locks the devbox incident (2026-08-12): an unclean shutdown left
