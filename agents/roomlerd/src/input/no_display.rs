@@ -456,6 +456,7 @@ fn seat_now() -> Option<NoDisplay> {
 /// The daemon's sink for `LINES`: each line in the journal at its level.
 #[cfg(target_os = "linux")]
 fn log(line: Line) {
+    let level = line.level();
     match line {
         Line::Said { kind, chosen } => {
             let unread = match chosen {
@@ -464,7 +465,7 @@ fn log(line: Line) {
                 ),
                 Chosen::Look | Chosen::Brief => String::new(),
             };
-            if kind.level() == tracing::Level::ERROR {
+            if level == tracing::Level::ERROR {
                 tracing::error!("input: {kind} — input injection disabled (#3787){unread}");
             } else {
                 tracing::info!("input: {kind} — no input until there is one (#3787){unread}");

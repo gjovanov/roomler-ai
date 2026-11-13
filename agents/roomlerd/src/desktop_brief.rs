@@ -39,7 +39,7 @@ pub fn current() -> Option<DesktopBrief> {
 
 /// #3787 — [`current`], and when the read of logind behind it began: a read
 /// of the seat that began later is the newer one. Never blocks on logind.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
 pub(crate) fn current_read() -> Option<(Instant, DesktopBrief)> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
