@@ -133,6 +133,14 @@ fi
 # So: bootout, WAIT until the service actually leaves the domain (bounded),
 # then bootstrap with retries. Used for all three launchd replacements below.
 # The last attempt's error text is left in BOOTSTRAP_ERR for the caller.
+#
+# The bound outlasts launchd's own: a job that ignores the bootout's SIGTERM
+# gets SIGKILL when its exit timeout runs out, launchd's default of 20 s (none
+# of our plists sets ExitTimeOut; scripts/macos-postinstall-check.sh fails if
+# one does). At 15 s, such a daemon was still draining when the bootstraps ran
+# out, and stayed unloaded with nobody at the keyboard (#3783). A job that is
+# gone ends the wait at once, so the usual update is no slower.
+DRAIN_WAIT_MAX=30
 BOOTSTRAP_ERR=""
 replace_launchd_service() {
   domain="$1"; label="$2"; plist="$3"
@@ -140,7 +148,7 @@ replace_launchd_service() {
   waited=0
   while launchctl print "$domain/$label" >/dev/null 2>&1; do
     waited=$((waited + 1))
-    [ "$waited" -ge 15 ] && break
+    [ "$waited" -ge "$DRAIN_WAIT_MAX" ] && break
     sleep 1
   done
   attempt=0

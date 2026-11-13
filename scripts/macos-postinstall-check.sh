@@ -100,6 +100,14 @@ echo "launchctl $*" >>/standin/calls
 state=/standin/state
 job() { printf '%s/loaded/%s' "$state" "$(printf '%s' "$1" | tr '/' '_')"; }
 sub=${1:-}; shift || true
+# The clock is the sum of the script's sleeps (see the sleep stand-in). A job
+# booted out while it lingers stays in the domain until the clock reaches the
+# time in draining/<job>, as a job draining after launchd's SIGTERM does.
+clock=$(cat "$state/clock")
+for d in "$state"/draining/*; do
+    [ -f "$d" ] || continue
+    [ "$clock" -lt "$(cat "$d")" ] || rm -f "$state/loaded/$(basename "$d")" "$d"
+done
 case "$sub" in
     print)
         f=$(job "$1")
@@ -126,12 +134,20 @@ case "$sub" in
     bootout)
         f=$(job "$1")
         [ -f "$f" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
-        rm -f "$f"
+        if [ -f "$state/linger/$(basename "$f")" ]; then
+            mkdir -p "$state/draining"
+            echo $((clock + $(cat "$state/linger/$(basename "$f")"))) >"$state/draining/$(basename "$f")"
+        else
+            rm -f "$f"
+        fi
         ;;
     bootstrap)
         label=$(basename "$2" .plist)
         f=$(job "$1/$label")
         if [ -f "$state/fail-bootstrap-$label" ]; then
+            echo "Bootstrap failed: 5: Input/output error" >&2; exit 5
+        fi
+        if [ -f "$state/draining/$(basename "$f")" ]; then
             echo "Bootstrap failed: 5: Input/output error" >&2; exit 5
         fi
         [ -f "$2" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }
@@ -162,8 +178,15 @@ for tool in pkill pgrep; do
     printf '#!/bin/bash\necho "%s $*" >>/standin/calls\nexit 1\n' "$tool" >"$BIN/$tool"
 done
 
-# The script's waits are bounded loops around `sleep`; here they need no time.
-printf '#!/bin/bash\nexit 0\n' >"$BIN/sleep"
+# The script's waits are bounded loops around `sleep`. Here a sleep takes no
+# time and adds its whole seconds to a clock instead, which a lingering job
+# (`lingers` below) and `slept` read. The script sees less time pass than on a
+# Mac, where every launchctl call takes some too.
+cat >"$BIN/sleep" <<'EOF'
+#!/bin/bash
+c=$(cat /standin/state/clock)
+echo $((c + ${1%%.*})) >/standin/state/clock
+EOF
 
 # The script names these two by full path. `sudo -n -u '#<uid>' -- cmd …`
 # runs cmd as that uid and its primary group, as on a Mac.
@@ -203,6 +226,7 @@ fresh_mac() {
     cp /src/packaging/com.roomler.*.plist "$RES/"
     chown -R tester /Users/tester
     echo 1000 >"$STATE/pid"
+    echo 0 >"$STATE/clock"
     : >"$CALLS"
 }
 
@@ -211,6 +235,9 @@ loaded() { printf '\tstate = %s\n' "$2" >"$STATE/loaded/$(printf '%s' "$1" | tr 
 unloaded() { rm -f "$STATE/loaded/$(printf '%s' "$1" | tr '/' '_')"; }
 # launchctl writes its answer about this job in pieces (see the stand-in).
 in_pieces() { mkdir -p "$STATE/in-pieces"; : >"$STATE/in-pieces/$(printf '%s' "$1" | tr '/' '_')"; }
+# The job stays in its domain for N seconds of the script's sleeps after its
+# bootout, and a bootstrap meanwhile fails as it does during a drain.
+lingers() { mkdir -p "$STATE/linger"; echo "$2" >"$STATE/linger/$(printf '%s' "$1" | tr '/' '_')"; }
 marker() { mkdir -p /etc/roomler && touch "/etc/roomler/$1"; }
 enrolled() { mkdir -p /etc/roomler && printf '%s\n' "${1:-}" >/etc/roomler/config.toml; }
 # What an earlier install left: both LaunchDaemons, older than this payload's.
@@ -265,7 +292,13 @@ in_order() {
     b=$(grep -nxF -- "$2" "$CALLS" | tail -1 | cut -d: -f1)
     [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ] || fail "not in this order: $1, then $2"
 }
-loaded_now() { [ -f "$STATE/loaded/$(printf '%s' "$1" | tr '/' '_')" ] || fail "$1 is not loaded at the end"; }
+# A job still draining is on its way out, not loaded.
+loaded_now() {
+    j=$(printf '%s' "$1" | tr '/' '_')
+    [ -f "$STATE/loaded/$j" ] && [ ! -f "$STATE/draining/$j" ] || fail "$1 is not loaded at the end"
+}
+slept() { [ "$(cat "$STATE/clock")" = "$1" ] || fail "slept $(cat "$STATE/clock") s, not $1 s"; }
+slept_at_most() { [ "$(cat "$STATE/clock")" -le "$1" ] || fail "slept $(cat "$STATE/clock") s, more than $1 s"; }
 is_the_payloads() { cmp -s "$RES/$(basename "$1")" "$1" || fail "$1 is not this payload's plist"; }
 absent() { [ ! -e "$1" ] || fail "$1 is still there"; }
 persons_untouched() { [ "$(persons_tree)" = "$PERSONS_BEFORE" ] || fail "something under /Users changed"; }
@@ -355,6 +388,8 @@ persons_half_skipped
 daemon_reloaded
 helper_recycled
 in_order "$DAEMON_IN" "$HELPER_OUT"
+# Nothing lingered, so nothing waited.
+slept 0
 done_case
 
 start "login window, helper not loaded: an update bootstraps it, with no bootout"
@@ -505,6 +540,44 @@ times_called 5 "$DAEMON_IN"
 said "WARNING: daemon bootstrap failed after retries: Bootstrap failed: 5: Input/output error"
 said "Start it by hand: sudo launchctl bootstrap system $LD/com.roomler.daemon.plist"
 helper_recycled
+done_case
+
+# --- N7: a daemon that hangs on shutdown ---------------------------------------
+# launchd answers the bootout with SIGTERM and kills the job with SIGKILL when
+# its exit timeout runs out (20 s by default). This one leaves the domain 5 s
+# after that. Before #3783's review the wait gave up at 15 s and the bootstraps
+# at 22 s, and the daemon stayed unloaded.
+start "login window, the daemon hangs on shutdown: it is loaded again once launchd has killed it"
+login_window_two_rows
+lingers system/com.roomler.daemon 25
+run
+rc_is 0
+persons_half_skipped
+daemon_reloaded
+not_said "WARNING: daemon bootstrap failed"
+# The wait ended when the daemon was gone, not at its bound.
+slept 25
+helper_recycled
+done_case
+
+start "login window, the daemon never leaves its domain: the wait is bounded, and the install goes on"
+login_window_two_rows
+lingers system/com.roomler.daemon 1000
+run
+rc_is 0
+times_called 5 "$DAEMON_IN"
+said "WARNING: daemon bootstrap failed after retries: Bootstrap failed: 5: Input/output error"
+slept_at_most 40
+helper_recycled
+done_case
+
+# The wait above outlasts launchd's default exit timeout, the one that applies
+# while no plist sets its own.
+start "the jobs the script replaces set no ExitTimeOut of their own"
+for j in daemon agent desktop; do
+    ! grep -q '<key>ExitTimeOut</key>' "/src/packaging/com.roomler.$j.plist" ||
+        fail "com.roomler.$j.plist sets ExitTimeOut: the post-install's DRAIN_WAIT_MAX must outlast it"
+done
 done_case
 
 start "login window: a plist that cannot be copied stops the script before any bootout"
