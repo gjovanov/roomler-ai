@@ -877,7 +877,7 @@ fn pick_linux_asset<'a>(
 /// landed. Always pull the full list and let `pick_latest_release`
 /// apply our own filter (draft=false + tag prefix + parseable).
 async fn fetch_latest_release() -> Result<GithubRelease> {
-    let proxy_url = node_env("UPDATE_URL").unwrap_or_else(|| DEFAULT_PROXY_URL.to_string());
+    let proxy_url = update_feed_url();
     // Proxy first — handles rate limiting, returns the same JSON shape
     // as GitHub's /releases endpoint (slimmed to fields we read).
     match fetch_releases_from(&proxy_url).await {
@@ -894,6 +894,18 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
     // but fine for occasional use when the proxy is offline.
     let github_url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases?per_page=30");
     fetch_releases_from(&github_url).await
+}
+
+/// The update feed's URL, read where the update check reads it:
+/// `ROOMLERD_UPDATE_URL` when set, else [`DEFAULT_PROXY_URL`].
+fn update_feed_url() -> String {
+    update_feed_url_from(node_env("UPDATE_URL"))
+}
+
+/// [`update_feed_url`] from the override as read, so a test needs no
+/// environment.
+fn update_feed_url_from(over: Option<String>) -> String {
+    over.unwrap_or_else(|| DEFAULT_PROXY_URL.to_string())
 }
 
 async fn fetch_releases_from(url: &str) -> Result<GithubRelease> {
@@ -1581,6 +1593,48 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
     Ok(())
 }
 
+/// #3818 — what a release is looked up FOR, which decides where
+/// ([`release_sources`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseLookup {
+    /// This daemon's OWN release, `agent-v<CARGO_PKG_VERSION>`: the Windows
+    /// tray refresh (`companion::refresh_inner`) and the Linux companion's
+    /// package sync (`companion::package_sync`), both through
+    /// [`fetch_release_by_tag`].
+    Own,
+    /// A PINNED release, through [`pin_version`]: the crash-loop rollback's
+    /// last known good version, or an operator's pin.
+    Pinned,
+}
+
+/// #3818 — one place a release can be looked up by its tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseSource {
+    /// GitHub's by-tag endpoint, unauthenticated: that one release.
+    GithubByTag(String),
+}
+
+impl ReleaseSource {
+    /// The URL this source asks.
+    pub(crate) fn url(&self) -> &str {
+        match self {
+            Self::GithubByTag(url) => url,
+        }
+    }
+}
+
+/// #3818 — where a lookup of `tag` asks, in order: the first source that
+/// names the release wins. `feed` is the update feed ([`update_feed_url`]).
+pub(crate) fn release_sources(lookup: ReleaseLookup, feed: &str, tag: &str) -> Vec<ReleaseSource> {
+    let _ = (lookup, feed);
+    vec![ReleaseSource::GithubByTag(github_release_by_tag_url(tag))]
+}
+
+/// GitHub's by-tag endpoint for `tag`.
+fn github_release_by_tag_url(tag: &str) -> String {
+    format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}")
+}
+
 /// Fetch a specific release by tag from GitHub. Bypasses the
 /// roomler-ai proxy because pinning is rare (per-agent crash-loop
 /// recovery, not a fleet-wide poll), so the proxy's per-IP rate-
@@ -1588,14 +1642,38 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
 /// would just add latency to a path that's already on the slow side
 /// of the agent's failure recovery.
 pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
-    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
+    fetch_release_from(
+        &release_sources(ReleaseLookup::Own, &update_feed_url(), tag),
+        tag,
+    )
+    .await
+}
+
+/// #3818 — look `tag` up in `sources`, in order; the first that names the
+/// release wins, and the last one's error is the lookup's.
+async fn fetch_release_from(sources: &[ReleaseSource], tag: &str) -> Result<GithubRelease> {
+    let mut last = None;
+    for source in sources {
+        let found = match source {
+            ReleaseSource::GithubByTag(_) => fetch_github_release(source.url(), tag).await,
+        };
+        match found {
+            Ok(release) => return Ok(release),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no source to look release {tag} up in")))
+}
+
+/// One release from GitHub's by-tag endpoint at `url`.
+async fn fetch_github_release(url: &str, tag: &str) -> Result<GithubRelease> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
     let resp = client
-        .get(&url)
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -1631,7 +1709,8 @@ pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
 /// updater paths so a flaky link can't crash the agent.
 pub async fn pin_version(tag: &str) -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
-    let release = match fetch_release_by_tag(tag).await {
+    let sources = release_sources(ReleaseLookup::Pinned, &update_feed_url(), tag);
+    let release = match fetch_release_from(&sources, tag).await {
         Ok(r) => r,
         Err(e) => return failed(&format!("pin fetch {tag}"), e),
     };
@@ -6753,6 +6832,63 @@ mod tests {
             "the installer is running: the daemon is told to shut down"
         );
         assert!(exits, "and the update loop ends");
+    }
+
+    // ── #3818: where a release is looked up by its tag ──
+
+    /// The tag the field case asked for, in the agent-v0.4.218 push.
+    const TAG_3818: &str = "agent-v0.4.218";
+
+    fn urls_of(sources: &[ReleaseSource]) -> Vec<String> {
+        sources.iter().map(|s| s.url().to_string()).collect()
+    }
+
+    /// #3818 — the tray refresh, and the Linux companion's package sync, look
+    /// the daemon's own release up in the update feed on roomler.ai, the origin
+    /// the update check already reads, and nowhere else. They asked GitHub's
+    /// API by tag, unauthenticated, from every device at every release, and
+    /// behind a corporate network's shared egress GitHub answered 403.
+    #[test]
+    fn the_tray_refresh_looks_its_release_up_on_roomler_ai_alone() {
+        let urls = urls_of(&release_sources(
+            ReleaseLookup::Own,
+            &update_feed_url_from(None),
+            TAG_3818,
+        ));
+        assert_eq!(urls, ["https://roomler.ai/api/agent/latest-release"]);
+        assert!(
+            urls.iter().all(|u| !u.contains("api.github.com")),
+            "no api.github.com anywhere in the refresh's lookup: {urls:?}"
+        );
+    }
+
+    /// #3818 — a deployment that overrides the update feed
+    /// (`ROOMLERD_UPDATE_URL`) has the tray's release looked up there, as its
+    /// update check is.
+    #[test]
+    fn the_tray_refresh_reads_an_overridden_update_feed() {
+        let feed = update_feed_url_from(Some(
+            "https://feed.example/api/agent/latest-release".to_string(),
+        ));
+        assert_eq!(
+            urls_of(&release_sources(ReleaseLookup::Own, &feed, TAG_3818)),
+            ["https://feed.example/api/agent/latest-release"]
+        );
+    }
+
+    /// #3818 — a pinned release (the crash-loop rollback's, an operator's) is
+    /// looked up on roomler.ai first. GitHub's by-tag endpoint follows it only
+    /// as the fallback, for a tag the feed cannot name.
+    #[test]
+    fn a_pinned_release_is_looked_up_on_roomler_ai_first() {
+        let sources = release_sources(ReleaseLookup::Pinned, &update_feed_url_from(None), TAG_3818);
+        assert_eq!(
+            urls_of(&sources),
+            [
+                "https://roomler.ai/api/agent/latest-release",
+                "https://api.github.com/repos/gjovanov/roomler-ai/releases/tags/agent-v0.4.218",
+            ]
+        );
     }
 }
 // RETIRED-NAME-ANCHOR-END
