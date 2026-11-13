@@ -1749,7 +1749,7 @@ mod svc {
             }
         };
         info!(
-            %request_id, caller = %claimed.caller, run_as = ran_as,
+            %request_id, caller = ?claimed.caller, run_as = ran_as,
             "exec-service: running a command for the server"
         );
         tokio::spawn(run_and_post(anchor, claimed, run_as, ran_as));

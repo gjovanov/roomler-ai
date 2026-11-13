@@ -996,7 +996,7 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: SessionCtx) {
                     tokio::spawn(h.get(id, name, offset));
                 }
                 Ok(Incoming::Cancel { id }) => h.cancel(&id),
-                Err(e) => warn!(session = %h.ctx.session_id, %e, "record DC: unparseable message"),
+                Err(e) => warn!(session = %h.ctx.session_id, e = ?e.to_string(), "record DC: unparseable message"),
             }
         })
     }));
@@ -1815,7 +1815,7 @@ impl Handler {
         }
         match outcome {
             Ok(sent) => {
-                info!(session = %self.ctx.session_id, %name, offset, sent, "record: download sent");
+                info!(session = %self.ctx.session_id, ?name, offset, sent, "record: download sent");
                 self.report(
                     RecordingActivityKind::Downloaded,
                     Some(name),

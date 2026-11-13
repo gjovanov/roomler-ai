@@ -2410,7 +2410,7 @@ impl FilesHandler {
                 Err(e) => {
                     tracing::warn!(
                         dest_path = dp,
-                        %e,
+                        e = ?e.to_string(),
                         "files: dest_path rejected; falling back to Downloads"
                     );
                     drop_folder_for(&who).await?
