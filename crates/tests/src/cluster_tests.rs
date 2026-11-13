@@ -1119,7 +1119,6 @@ async fn current_call_id(app: &TestApp, room_id: &str) -> bson::oid::ObjectId {
 /// its stats record closes.
 async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp) {
     let (tenant, room_id, mut host, mut member, conn) = call_across_pods(app1, app2).await;
-    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
     let call_id = current_call_id(app1, &room_id).await;
 
     let resp = via
@@ -1132,10 +1131,66 @@ async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp)
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "the admin deletes the room");
 
-    for (who, ws) in [("the host", &mut host), ("the member", &mut member)] {
+    assert_deleted_rooms_call_ended(app1, app2, &room_id, call_id, &mut host, &mut member, &conn)
+        .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// Every frame `ws` receives within `ms` milliseconds.
+async fn frames_within(ws: &mut UserWs, ms: u64) -> Vec<serde_json::Value> {
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
+        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(msg.to_text().unwrap_or("")) {
+            seen.push(frame);
+        }
+    }
+    seen
+}
+
+/// Delete the room's document and nothing else: the room is gone and no one
+/// told conference, as when a delete's request died after the delete, a pod
+/// whose code ends no call served it, or its word to the owner was lost.
+async fn delete_room_document(app: &TestApp, room_id: &str) {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let gone = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .delete_one(bson::doc! { "_id": rid })
+        .await
+        .unwrap();
+    assert_eq!(gone.deleted_count, 1, "the room's document was there");
+}
+
+/// The call of the deleted room `room_id` (served by app1, the member's socket
+/// on app2) ended for everyone in it: each socket hears it once, with
+/// `reason: "room_deleted"`; neither pod keeps its router or a claim, the
+/// owner seats no one, the shared claim record is gone, and its stats record
+/// closed.
+async fn assert_deleted_rooms_call_ended(
+    app1: &TestApp,
+    app2: &TestApp,
+    room_id: &str,
+    call_id: bson::oid::ObjectId,
+    host: &mut UserWs,
+    member: &mut UserWs,
+    conn: &str,
+) {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    for (who, ws) in [("the host", &mut *host), ("the member", &mut *member)] {
         let ended = next_frame_of(ws, "room:call_ended").await;
-        assert_eq!(ended["data"]["room_id"], room_id.as_str(), "{who}: {ended}");
+        assert_eq!(ended["data"]["room_id"], room_id, "{who}: {ended}");
         assert_eq!(ended["data"]["reason"], "room_deleted", "{who}: {ended}");
+    }
+    for (who, ws) in [("the host", &mut *host), ("the member", &mut *member)] {
+        let again: Vec<serde_json::Value> = frames_within(ws, 1500)
+            .await
+            .into_iter()
+            .filter(|f| f["type"] == "room:call_ended")
+            .collect();
+        assert!(again.is_empty(), "{who} heard it twice: {again:?}");
     }
     for (pod, app) in [("app1", app1), ("app2", app2)] {
         assert!(
@@ -1148,11 +1203,11 @@ async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp)
         );
     }
     assert_eq!(
-        conf(app1).room_manager.get_connection_room(&conn),
+        conf(app1).room_manager.get_connection_room(conn),
         None,
         "the owner pod still seats the member"
     );
-    let key = roomler_ai_api::cluster::directory::media_key(&room_id);
+    let key = roomler_ai_api::cluster::directory::media_key(room_id);
     let dir = app1.state.cluster_directory.clone().unwrap();
     assert_eq!(
         dir.get(&key).await.unwrap(),
@@ -1171,8 +1226,6 @@ async fn delete_the_call_room_via(via: &TestApp, app1: &TestApp, app2: &TestApp)
         Some("room_deleted"),
         "the call's stats record: {record}"
     );
-    host.close(None).await.ok();
-    member.close(None).await.ok();
 }
 
 /// A room deleted on the pod that serves its call ends the call there, and
@@ -1197,6 +1250,82 @@ async fn a_room_deleted_on_the_other_pod_ends_its_call_on_the_pod_serving_it() {
         return;
     }
     delete_the_call_room_via(&app2, &app1, &app2).await;
+}
+
+/// The room's document goes while app1 serves its call and app2 holds the
+/// member's socket, and nothing tells conference. app1, the pod serving the
+/// call, ends it on its own once two of its heartbeats in a row found no
+/// document: for both sockets, and with its claim.
+#[tokio::test]
+async fn a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it_across_pods() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (_tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    let call_id = current_call_id(&app1, &room_id).await;
+
+    delete_room_document(&app1, &room_id).await;
+    for _ in 0..2 {
+        roomler_ai_mod_conference::media_cluster::refresh_media_claims_once(conf(&app1)).await;
+    }
+
+    assert_deleted_rooms_call_ended(
+        &app1,
+        &app2,
+        &room_id,
+        call_id,
+        &mut host,
+        &mut member,
+        &conn,
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// The pod serving a deleted room's call, asked over the bus to close it for
+/// that reason (what a deleting pod that does not serve the call sends), tells
+/// its own people itself: both sockets hear that the call ended, once, and the
+/// pod that asked says nothing to anyone.
+#[tokio::test]
+async fn the_pod_serving_a_deleted_rooms_call_tells_its_own_people() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (_tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    let call_id = current_call_id(&app1, &room_id).await;
+
+    delete_room_document(&app1, &room_id).await;
+    let reply = app2
+        .state
+        .cluster_bus
+        .clone()
+        .unwrap()
+        .request(
+            &app1.state.pod.pod_id,
+            "media.close_room",
+            serde_json::json!({ "room_id": room_id, "reason": "room_deleted" }),
+        )
+        .await
+        .expect("the pod serving the call answers");
+    assert_eq!(reply["ok"], true, "{reply}");
+
+    assert_deleted_rooms_call_ended(
+        &app1,
+        &app2,
+        &room_id,
+        call_id,
+        &mut host,
+        &mut member,
+        &conn,
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
 }
 
 // ── C-5: DERP directory + registration-driven rehome ────────────────
