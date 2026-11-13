@@ -585,12 +585,14 @@ pub fn gave_up_reason(
 /// With nothing the revert reads in it, the command moves it aside and the
 /// worker makes a new one, as the person, at its next start. With copies
 /// `one-row --revert` reads there and nowhere else ([`FolderNotTheirs::kept`]),
-/// the command moves the folder aside, then makes the new one and copies them
-/// into it AS THE PERSON (`sudo -u '#<uid>'`, the form `spawn_worker` runs
-/// the worker with), so it does the same in an administrator's own shell and
-/// as root; if a step after the move fails, the copies are still in the
-/// folder moved aside. The name it makes carries [`FolderNotTheirs::stamp`],
-/// so no earlier print made it.
+/// the command stages first and moves last: the person's account
+/// (`sudo -u '#<uid>'`, the form `spawn_worker` runs the worker with) makes a
+/// new folder beside it and copies them into it, and only then is the folder
+/// moved aside and the new one put in its place. So a copy the person cannot
+/// reach stops the command with everything where it was, where the revert
+/// still finds it, and if the last move fails the one before it is undone. It
+/// does the same in an administrator's own shell and as root. The names it
+/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them.
 ///
 /// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
 /// no command: moving the folder would leave it where the revert does not
@@ -676,19 +678,24 @@ fn move_aside(f: &FolderNotTheirs) -> String {
              makes the folder again as the person at its next start.{restart}"
         );
     }
+    // Staged first, moved last: the copies are made, as the person, before
+    // anything moves, so a `cp` that fails leaves every file where the revert
+    // reads it.
     let as_person = format!("sudo -u '#{}'", f.uid);
+    let new_path = format!("{path}.new-{}", f.stamp);
+    let new = sh_quote(&new_path);
     let copies: String = names
         .iter()
-        .map(|n| format!("{} ", sh_quote(&format!("{aside_path}/{n}"))))
+        .map(|n| format!("{} ", sh_quote(&format!("{path}/{n}"))))
         .collect();
-    let into = sh_quote(&format!("{path}/"));
+    let into = sh_quote(&format!("{new_path}/"));
     format!(
         "{only}{holds}, so the command copies {} into a new folder that the person's account \
-         makes.{can}sudo mv {folder} {aside} && {as_person} mkdir -p {folder} && {as_person} \
-         cp {copies}{into} (if the move fails, nothing moved; if a step after it fails, {} \
-         still in {aside}).{restart}",
+         makes.{can}{as_person} mkdir {new} && {as_person} cp {copies}{into} && sudo mv \
+         {folder} {aside} && {{ sudo mv {new} {folder} || sudo mv {aside} {folder}; }} \
+         (nothing moves until the copies are made, and if the last move fails the one before \
+         it is undone).{restart}",
         if one { "it" } else { "them" },
-        if one { "the copy is" } else { "the copies are" },
     )
 }
 
@@ -755,7 +762,9 @@ fn sh_quote(s: &str) -> String {
 /// others' read bit (the copy the conversion kept of a config of root's is
 /// root's, mode 600). Anything else, a copy the group or the others may read,
 /// one that is no regular file or one whose read failed, is left to the `cp`,
-/// which reads it as the person before anything moves.
+/// which reads it as the person before anything moves: the command stages
+/// first and moves last, so a `cp` that fails (a folder the person cannot
+/// enter, say) leaves everything where it was.
 fn person_cannot_read(uid: u32, stat: Option<(u32, u32)>) -> bool {
     stat.is_some_and(|(owner, mode)| {
         mode & 0o170000 == 0o100000
@@ -858,7 +867,8 @@ pub fn read_person_folder(
     let mut folder = folder_not_theirs(path, uid, owner, mode, Vec::new(), stamp)?;
     if folder.is_dir {
         // A name whose read fails for any reason but "not there" is held,
-        // unread: the command's `cp` reads it before anything moves.
+        // unread: the command's `cp` reads it before anything moves, and a
+        // `cp` that fails stops the command with everything where it was.
         folder.kept = kept_for_revert()
             .into_iter()
             .filter_map(|name| match lstat(&folder.path.join(&name)) {
@@ -2659,31 +2669,35 @@ mod tests {
     }
 
     /// #3802 — the line for a folder that holds `copies` (names inside it),
-    /// on a Mac whose reads all said yes: the administrator moves the folder
-    /// aside, and the new folder and the copies in it are made as the person,
-    /// in one `cp` out of the folder moved aside.
+    /// on a Mac whose reads all said yes: staged first, moved last. The
+    /// person's account makes a new folder beside it and copies them in, out
+    /// of the folder before it moves; then the folder is moved aside and the
+    /// new one put in its place, and if that last move fails the one before
+    /// it is undone.
     fn kept_line(path: &str, q: &str, admin: &str, copies: &[&str]) -> String {
         let aside = format!("{q}.made-by-root-{STAMP}");
-        let from: String = copies.iter().map(|c| format!("'{aside}/{c}' ")).collect();
-        let (it, still) = match copies.len() {
-            1 => ("it", "the copy is"),
-            _ => ("them", "the copies are"),
+        let new = format!("{q}.new-{STAMP}");
+        let from: String = copies.iter().map(|c| format!("'{q}/{c}' ")).collect();
+        let it = match copies.len() {
+            1 => "it",
+            _ => "them",
         };
         format!(
             "{}{ONLY} It holds {}, which `sudo roomlerd one-row --revert` reads there and \
              nowhere else, so the command copies {it} into a new folder that the person's \
-             account makes. {admin} is an administrator of this Mac and can run this: sudo mv \
-             '{q}' '{aside}' && sudo -u '#501' mkdir -p '{q}' && sudo -u '#501' cp {from}'{q}/' \
-             (if the move fails, nothing moved; if a step after it fails, {still} still in \
-             '{aside}').{RESTART}",
+             account makes. {admin} is an administrator of this Mac and can run this: sudo -u \
+             '#501' mkdir '{new}' && sudo -u '#501' cp {from}'{new}/' && sudo mv '{q}' \
+             '{aside}' && {{ sudo mv '{new}' '{q}' || sudo mv '{aside}' '{q}'; }} (nothing moves \
+             until the copies are made, and if the last move fails the one before it is \
+             undone).{RESTART}",
             cause(path),
             copies.join(" and "),
         )
     }
 
     /// #3802 — the LaunchAgent plist the revert reads there and nowhere else:
-    /// after the move, the person's account makes the new folder and copies it
-    /// in, and if that fails, the copy is still in the folder moved aside.
+    /// the person's account copies it into a new folder before anything
+    /// moves, so a `cp` that fails leaves it where the revert reads it.
     #[test]
     fn the_give_up_line_keeps_the_launch_agent_plist_the_revert_reads() {
         let why = give_up_line("fits + the plist copy", F, 0o40755, &[(0, THEIRS)]);
@@ -2692,11 +2706,12 @@ mod tests {
             format!(
                 "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd \
                  one-row --revert` reads there and nowhere else, so the command copies it into \
-                 a new folder that the person's account makes.{WHO}sudo mv '{F}' \
-                 '{F}.made-by-root-{STAMP}' && sudo -u '#501' mkdir -p '{F}' && sudo -u '#501' \
-                 cp '{F}.made-by-root-{STAMP}/com.roomler.agent.plist.pre-one-row' '{F}/' (if \
-                 the move fails, nothing moved; if a step after it fails, the copy is still in \
-                 '{F}.made-by-root-{STAMP}').{RESTART}",
+                 a new folder that the person's account makes.{WHO}sudo -u '#501' mkdir \
+                 '{F}.new-{STAMP}' && sudo -u '#501' cp \
+                 '{F}/com.roomler.agent.plist.pre-one-row' '{F}.new-{STAMP}/' && sudo mv '{F}' \
+                 '{F}.made-by-root-{STAMP}' && {{ sudo mv '{F}.new-{STAMP}' '{F}' || sudo mv \
+                 '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are made, \
+                 and if the last move fails the one before it is undone).{RESTART}",
                 cause(F)
             )
         );
@@ -2749,7 +2764,8 @@ mod tests {
         );
         // Only a copy `lstat` says they cannot read: the person's own without
         // the owner's read bit, or another account's with no group or other
-        // read bit. Anything else is read by the `cp` before anything moves.
+        // read bit. Anything else is read by the `cp` before anything moves,
+        // and a `cp` that fails stops the command with everything in place.
         for (stat, cannot) in [
             (Some((501, 0o100200)), true),
             (Some((0, 0o100640)), false),
