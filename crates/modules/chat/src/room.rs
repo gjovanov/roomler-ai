@@ -9,6 +9,7 @@ use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
+use tracing::Instrument;
 
 use crate::ChatState;
 use roomler_ai_db::models::role::permissions;
@@ -374,15 +375,34 @@ pub async fn delete(
     // most `ROOM_REMOVED_BOUND`: one that outlasts the bound, or a client that
     // hangs up, never cuts it off half-way (a router already removed whose
     // people were not yet told would be told by no one).
-    let hooks = state.clone();
-    let teardown = tokio::spawn(async move { hooks.hooks.room_removed(tid, rid).await });
+    // The task logs how the teardown ended itself, so an end past the bound,
+    // after the delete answered, is still seen.
+    let hooks = state.hooks.clone();
+    let teardown = tokio::spawn(
+        async move {
+            let started = std::time::Instant::now();
+            match hooks.room_removed(tid, rid).await {
+                Err(e) => {
+                    tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+                }
+                Ok(()) if started.elapsed() >= ROOM_REMOVED_BOUND => {
+                    tracing::info!(
+                        tenant = %tid, room = %rid, took = ?started.elapsed(),
+                        "room delete: ending what the room held finished after the delete answered"
+                    );
+                }
+                Ok(()) => {}
+            }
+        }
+        .in_current_span(),
+    );
     match tokio::time::timeout(ROOM_REMOVED_BOUND, teardown).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => {
-            tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.is_panic() => {
+            tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held panicked");
         }
         Ok(Err(e)) => {
-            tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held panicked");
+            tracing::warn!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held was cancelled");
         }
         Err(_) => {
             tracing::error!(

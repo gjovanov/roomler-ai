@@ -379,7 +379,7 @@ pub enum RoomClose {
     Here(Vec<String>),
     /// The pod serving it closed it when asked, and named this many seats
     /// (none from a pod whose code predates naming them, and none when its
-    /// answer came too late but its claim is gone with the media).
+    /// answer came too late and no claim names the room any more).
     Owner { pod: String, seats: usize },
     /// No pod serves its media: there was nothing to close.
     Nothing,
@@ -424,24 +424,27 @@ pub async fn close_room_everywhere(
                     seats: reply["closed"].as_array().map_or(0, Vec::len),
                     pod,
                 },
-                // No answer in time: read the claim again. Gone, it went with
-                // the media (the owner closed it and answered late, or its
-                // record ran out with it): there is nothing left to close. Still
-                // naming that pod, it is pruned, and the media may still run
-                // there.
+                // No answer in time: read the claim again. Gone, no pod serves
+                // the room as far as the directory knows: the owner closed it
+                // and answered late, or its record ran out or was pruned while
+                // it may still serve it (its next refresh claims it again, and
+                // a deleted room's call it ends on its own,
+                // `end_calls_of_rooms_gone`). Still naming that pod, it is
+                // pruned, and the media may still run there.
                 Err(e) => {
+                    warn!(room = %rid, %pod, %e, "media.close_room RPC failed; reading the claim again");
                     let Some(dir) = state.cluster_directory.clone() else {
                         return RoomClose::NotReached(format!("pod {pod}: {e}"));
                     };
                     let key = media_key(&rid.to_hex());
                     match dir.get(&key).await {
                         Ok(None) => {
-                            info!(room = %rid, %pod, %e, "media.close_room had no answer in time, and the claim is gone with the media");
+                            info!(room = %rid, %pod, "no claim names the room on reading again: counted as closed by that pod");
                             RoomClose::Owner { pod, seats: 0 }
                         }
                         Ok(Some(raw)) => {
                             if OwnerRecord::parse(&raw).map(|r| r.pod_id).as_ref() == Some(&pod) {
-                                warn!(room = %rid, %pod, %e, "media.close_room RPC failed — pruning record");
+                                info!(room = %rid, %pod, "pruning the claim of the pod that did not answer");
                                 let _ = dir.release(&key, &raw).await;
                             }
                             RoomClose::NotReached(format!("pod {pod}: {e}"))
@@ -475,12 +478,26 @@ pub(crate) async fn close_room_here(
     reason: CloseReason,
 ) -> Vec<String> {
     let closed = state.room_manager.remove_room(rid);
-    release_media_claim(state, rid).await;
+    if tokio::time::timeout(CLAIM_RELEASE_BOUND, release_media_claim(state, rid))
+        .await
+        .is_err()
+    {
+        warn!(
+            room = %rid, bound = ?CLAIM_RELEASE_BOUND,
+            "media claim release had no answer in time; the record's TTL ends the claim"
+        );
+    }
     if reason == CloseReason::RoomDeleted {
         crate::revoke::deleted_rooms_call_ended(state, *rid, &closed).await;
     }
     closed
 }
+
+/// How long [`close_room_here`] waits for the claim's release, so the people
+/// of a closed room are told whatever Redis does: a link lost without a reset
+/// parks a command with no answer. The token is already dropped by then, so
+/// nothing refreshes the record, and its TTL (`MEDIA_TTL_SECS`) ends it.
+const CLAIM_RELEASE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Release our claim for one room (compare-DEL via the held token).
 pub async fn release_media_claim(state: &ConferenceState, rid: &ObjectId) {

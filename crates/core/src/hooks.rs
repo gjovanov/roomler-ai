@@ -223,8 +223,9 @@ pub trait MembershipLifecycle: Send + Sync {
     /// A holder trusts the caller's pairing of `tenant_id` and `room_id` (the
     /// caller resolved the room within its org): what it ends may be keyed by
     /// the room alone, as conference's media is. Unlike the other cascades, a
-    /// holder that fails does not stop the ones after it: the room is gone
-    /// either way ([`HookRegistry::room_removed`]).
+    /// holder that answers an error does not stop the ones after it: the room
+    /// is gone either way ([`HookRegistry::room_removed`]). A holder that
+    /// panics does stop them: no unwind is caught.
     async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
         let _ = (tenant_id, room_id);
         Ok(())
@@ -385,9 +386,11 @@ impl HookRegistry {
     }
 
     /// Run every `room_removed` hook in order, once the room is gone. The room
-    /// is gone whatever a holder answers, so a failing holder does not stop
-    /// the others: every holder runs, and the caller reports what failed, the
-    /// first failure first.
+    /// is gone whatever a holder answers, so a holder that answers an error
+    /// does not stop the others: every holder runs, and the caller reports
+    /// what failed, the first failure first. A panic is not caught: it ends
+    /// the run where it happens (chat's room delete runs this in a task of its
+    /// own, and logs the panic).
     pub async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
         let mut failed = Vec::new();
         for (module, hook) in self.membership_lifecycles() {
