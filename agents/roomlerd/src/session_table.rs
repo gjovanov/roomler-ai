@@ -44,7 +44,7 @@
 //! each wait for a window this connection's server announced and has not
 //! withdrawn ([`SessionTable::window_open`]). So a device the resume scope does
 //! not cover, or no longer covers, behaves exactly as with the switch off, and
-//! the scope alone stages the fleet once the switch's default is on.
+//! the scope alone stages the fleet, the switch's default being on (P4-1).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -92,13 +92,13 @@ const PENDING_CAP: usize = 64;
 const SAY_BUDGET: Duration = Duration::from_secs(2);
 
 /// The device's switch: `rc_sessions_survive_reattach` in the config, or
-/// `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`. Default off. Device-side and not
-/// pushable: `DesiredConfig` has no such field. Read once per connection. On,
-/// it says `rc-resume` and changes nothing else until a window is announced
-/// (P4-0). A supervised Mac's GUI worker reads the root's value
-/// (`macos_supervisor::WORKER_ENV_FORWARD`).
+/// `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`. Default ON (P4-1): only `0`, `false`,
+/// `no` or `off` turns it off, and an empty or unknown value is on. Device-side,
+/// never pushable (`DesiredConfig` has no such field), read once per connection.
+/// On, it says `rc-resume` and changes nothing else until a window is announced
+/// (P4-0). A supervised Mac's GUI worker reads the root's (`WORKER_ENV_FORWARD`).
 pub(crate) fn survive_enabled() -> bool {
-    tunnel_core::env::flag("RC_SESSIONS_SURVIVE_REATTACH", false)
+    tunnel_core::env::flag("RC_SESSIONS_SURVIVE_REATTACH", true)
 }
 
 /// Whether this connection builds sessions it may keep: the switch.

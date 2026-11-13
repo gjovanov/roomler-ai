@@ -728,7 +728,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-138: keep a live remote-control session through the loss of the control socket (a server roll, a path that drops) instead of closing it with the socket, until the server answers its claim on the next connection, for the window the server announces at most (capped at 120 s). Default OFF; on, it still keeps nothing unless the server announced a window. A stop, an update, sleep, rc:goodbye, a key rotation or a refused token still close every session, and kept sessions count against rc_max_sessions. Device-only: never pushable through remote config. Env: ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH. Restart required.",
+        description: "FR-138: keep a live remote-control session through the loss of the control socket (a server roll, a path that drops) instead of closing it with the socket, until the server answers its claim on the next connection, for the window the server announces at most (capped at 120 s). Default ON (FR-138 P4-1): only off, false, no or 0 turns it off, and a cleared, empty or unknown value is on. On, it keeps nothing and changes nothing unless the server announced a window, so the server's resume scope decides. To turn it off on one device: set it to off. A stop, an update, sleep, rc:goodbye, a key rotation or a refused token still close every session, and kept sessions count against rc_max_sessions. Device-only: never pushable through remote config. Env: ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH. Restart required.",
     },
     KeyMeta {
         key: "overlay_warm_relay",

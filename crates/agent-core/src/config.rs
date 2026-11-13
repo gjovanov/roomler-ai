@@ -635,7 +635,7 @@ pub struct AgentConfig {
     /// FR-138 — keep a live remote-control session's peer through the loss of
     /// the control socket, for the window the server announces (capped at
     /// 120 s), instead of closing it with the socket
-    /// (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`). Built-in default: OFF. See
+    /// (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`). Built-in default: ON (P4-1). See
     /// `rc_sessions_survive_reattach` in the config surface.
     #[serde(default)]
     pub rc_sessions_survive_reattach: Option<bool>,
