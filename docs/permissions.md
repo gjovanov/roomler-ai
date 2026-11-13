@@ -143,7 +143,7 @@ The overlay ACL is compiled into each node's netmap, the DERP allow table and th
 org-relay grants, so a change of who holds which role reaches the nodes when they
 are recompiled. Every write that changes it (assign, unassign, delete, adding a
 member, an invite's redemption, registration with an invite) calls
-`HookRegistry::org_roles_changed` (`crates/core/src/hooks.rs:365`) after its write.
+`HookRegistry::org_roles_changed` (`crates/core/src/hooks.rs:366`) after its write.
 The network module's hook (`crates/modules/network/src/membership.rs:82`) re-fans the
 org 750 ms later, and only while the org's overlay ACL is `warn` or `enforce`
 (`refan_for_role_change`, `crates/modules/network/src/routes/overlay_policy.rs:334`):
