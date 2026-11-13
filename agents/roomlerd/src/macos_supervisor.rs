@@ -549,7 +549,7 @@ pub fn gave_up_reason(
              single-instance lock, and it is not a worker this supervisor can identify \
              (a hand-run `roomlerd run`, say). Find it with: pgrep -lU <uid> roomlerd. \
              Once it is gone, restart this daemon: \
-             launchctl kickstart -k system/com.roomler.daemon"
+             sudo launchctl kickstart -k system/com.roomler.daemon"
         }
         _ if one_row => {
             "this worker holds no enrollment, so the cause is not a per-user config: read how \
@@ -559,7 +559,7 @@ pub fn gave_up_reason(
         _ => {
             "almost always this Mac has no per-user enrollment: the worker runs AS the \
              console user and loads THAT user's config. Check with: \
-             launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
+             sudo launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
         }
     }
     .to_string()
@@ -2503,14 +2503,26 @@ mod tests {
 
     /// The 10-26 MacBook gave up naming "no per-user enrollment" while every
     /// worker had exited 0 on a held lock. The exit code tells them apart.
+    ///
+    /// #3802 — both commands need root (a person's `launchctl kickstart` of
+    /// a system job answers "Operation not permitted", and `asuser` is
+    /// root's), so each is printed with `sudo`.
     #[test]
     fn the_give_up_names_the_lock_when_workers_exit_cleanly() {
         let lock = gave_up_reason(Some(WorkerEnd::Code(0)), false, None);
-        assert!(lock.contains("single-instance lock"), "{lock}");
-        assert!(!lock.contains("enrollment"), "{lock}");
+        assert_eq!(
+            lock,
+            "each worker exited 0 at once: another roomlerd holds this person's single-instance \
+             lock, and it is not a worker this supervisor can identify (a hand-run `roomlerd \
+             run`, say). Find it with: pgrep -lU <uid> roomlerd. Once it is gone, restart this \
+             daemon: sudo launchctl kickstart -k system/com.roomler.daemon"
+        );
         for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
-            assert!(
-                gave_up_reason(end, false, None).contains("per-user enrollment"),
+            assert_eq!(
+                gave_up_reason(end, false, None),
+                "almost always this Mac has no per-user enrollment: the worker runs AS the \
+                 console user and loads THAT user's config. Check with: sudo launchctl asuser \
+                 <uid> sudo -u '#<uid>' roomlerd caps",
                 "{end:?}"
             );
         }
