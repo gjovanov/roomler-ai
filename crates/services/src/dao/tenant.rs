@@ -43,6 +43,38 @@ impl RoleReconcileGroup {
     }
 }
 
+/// The role ids one org has, read in one query ([`TenantDao::org_role_ids`])
+/// by a caller that resolves many of the org's members in one pass. Only
+/// [`TenantDao::org_role_ids`] makes one, so it always names the org it was
+/// read for, and [`TenantDao::member_live_role_ids_in`] reads the member row
+/// of that same org.
+#[derive(Debug, Clone)]
+pub struct OrgRoleIds {
+    tenant_id: ObjectId,
+    ids: std::collections::HashSet<ObjectId>,
+}
+
+impl OrgRoleIds {
+    /// The org these ids are the roles of.
+    pub fn tenant_id(&self) -> ObjectId {
+        self.tenant_id
+    }
+
+    /// The ids of `listed` (a member row of this org) that are roles of the
+    /// org, in `listed`'s order: the same filter
+    /// [`TenantDao::member_live_role_ids`] applies, for a caller that already
+    /// holds the member rows (the members list).
+    pub fn live_among(&self, listed: Vec<ObjectId>) -> Vec<ObjectId> {
+        keep_listed(listed, &self.ids)
+    }
+}
+
+/// `listed`, kept to the ids in `live`, in `listed`'s order: the filter both
+/// live-role reads apply, so they cannot drift apart.
+fn keep_listed(listed: Vec<ObjectId>, live: &std::collections::HashSet<ObjectId>) -> Vec<ObjectId> {
+    listed.into_iter().filter(|id| live.contains(id)).collect()
+}
+
 impl TenantDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -602,6 +634,56 @@ impl TenantDao {
             .await
     }
 
+    /// The `roles` rows of `tenant_id` among `ids`, in one query (none for an
+    /// empty list).
+    ///
+    /// ⚠️ **The one rule every reader of a member's roles applies**: a role
+    /// counts in org T only if it is a role row OF T, read now. A member row
+    /// can list an id that is no role of T (one deleted since it was given, or
+    /// one written before writes were checked), and filtering here, at the
+    /// point of use, is what no write path can bypass. Both
+    /// [`Self::get_member_permissions`] (the permission bits) and
+    /// [`Self::member_live_role_ids`] (role-scoped rules) read through it, so
+    /// the two can never disagree on which roles a member holds.
+    async fn org_roles_among(&self, tenant_id: ObjectId, ids: &[ObjectId]) -> DaoResult<Vec<Role>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.roles
+            .find_many(doc! { "tenant_id": tenant_id, "_id": { "$in": ids } }, None)
+            .await
+    }
+
+    /// Every `roles` row of `tenant_id`, in one query: [`Self::org_roles_among`]
+    /// for a caller that resolves many members of the org at once
+    /// ([`Self::org_role_ids`], [`Self::members_with_permission`]). The same
+    /// rule: only the org's own role rows count.
+    async fn org_roles(&self, tenant_id: ObjectId) -> DaoResult<Vec<Role>> {
+        self.roles
+            .find_many(doc! { "tenant_id": tenant_id }, None)
+            .await
+    }
+
+    /// The ids among `ids` that are roles of `tenant_id`, for a writer that
+    /// must refuse (or drop) any other: one query, none for an empty list.
+    pub async fn org_role_ids_among(
+        &self,
+        tenant_id: ObjectId,
+        ids: &[ObjectId],
+    ) -> DaoResult<std::collections::HashSet<ObjectId>> {
+        Ok(self
+            .org_roles_among(tenant_id, ids)
+            .await?
+            .into_iter()
+            .filter_map(|r| r.id)
+            .collect())
+    }
+
+    /// The member's permission mask in `tenant_id`: the OR of the masks of the
+    /// roles they hold THERE ([`Self::org_roles_among`]). A listed id that is
+    /// no role of this org adds no bit: another org's role never grants a
+    /// permission here, and a deleted role grants none anywhere.
+    /// `NotAMember` when the person has no membership row.
     pub async fn get_member_permissions(
         &self,
         tenant_id: ObjectId,
@@ -613,19 +695,17 @@ impl TenantDao {
             .await?
             .ok_or(DaoError::NotAMember)?;
 
-        let roles = self
-            .roles
-            .find_many(doc! { "_id": { "$in": &member.role_ids } }, None)
-            .await?;
+        let roles = self.org_roles_among(tenant_id, &member.role_ids).await?;
 
         let combined = roles.iter().fold(0u64, |acc, r| acc | r.permissions);
         Ok(combined)
     }
 
-    /// The role ids a member holds in a tenant (empty if not a member). Used by
-    /// the remote-control session gate to test `access_policy.allowed_role_ids`
-    /// overlap without re-deriving the combined permission bitfield.
-    pub async fn member_role_ids(
+    /// The role ids a member's row lists, stale ones included (empty if not a
+    /// member). Private on purpose: what a rule may match is
+    /// [`Self::member_live_role_ids`], and a reader handed the raw list would
+    /// let a deleted role, or another org's, satisfy a rule that names it.
+    async fn listed_role_ids(
         &self,
         tenant_id: ObjectId,
         user_id: ObjectId,
@@ -638,34 +718,52 @@ impl TenantDao {
             .unwrap_or_default())
     }
 
-    /// The role ids a member holds in a tenant that the tenant has (#3635):
-    /// the ids [`Self::member_role_ids`] lists, kept only where a role row of
-    /// `tenant_id` exists, in the row's order. Empty when the user is not a
-    /// member or holds no role, so a caller matching role subjects against it
-    /// matches none of them.
+    /// The roles a member holds in a tenant, as role-scoped rules must see
+    /// them: the ids the member's row lists, kept only where a role row of
+    /// `tenant_id` exists ([`Self::org_roles_among`]), in the row's order.
+    /// Empty when the user is not a member or holds no role of the org, so a
+    /// caller matching role subjects against it matches none of them.
     ///
-    /// The tunnel forward gate reads it on every forward request, so a role
-    /// counts only in the org that owns it, and only while that org has it.
+    /// Every gate that matches a role subject reads it at the point of use:
+    /// the tunnel forward (#3635), the overlay ACL, the remote-control access
+    /// policy (at a session request and at a resume), the SSH and exec
+    /// allow-lists. A role counts only in the org that owns it, and only while
+    /// that org has it.
     pub async fn member_live_role_ids(
         &self,
         tenant_id: ObjectId,
         user_id: ObjectId,
     ) -> DaoResult<Vec<ObjectId>> {
-        let listed = self.member_role_ids(tenant_id, user_id).await?;
-        if listed.is_empty() {
-            return Ok(listed);
-        }
-        let live: std::collections::HashSet<ObjectId> = self
-            .roles
-            .find_many(
-                doc! { "tenant_id": tenant_id, "_id": { "$in": &listed } },
-                None,
-            )
+        let listed = self.listed_role_ids(tenant_id, user_id).await?;
+        let live = self.org_role_ids_among(tenant_id, &listed).await?;
+        Ok(keep_listed(listed, &live))
+    }
+
+    /// Every role id of `tenant_id`, in one query: for a caller that resolves
+    /// the roles of MANY members of one org in one pass (an overlay netmap
+    /// compile asks once per node). Intersect each member with
+    /// [`Self::member_live_role_ids_in`]; a one-off reader uses
+    /// [`Self::member_live_role_ids`].
+    pub async fn org_role_ids(&self, tenant_id: ObjectId) -> DaoResult<OrgRoleIds> {
+        let ids = self
+            .org_roles(tenant_id)
             .await?
             .into_iter()
             .filter_map(|r| r.id)
             .collect();
-        Ok(listed.into_iter().filter(|id| live.contains(id)).collect())
+        Ok(OrgRoleIds { tenant_id, ids })
+    }
+
+    /// [`Self::member_live_role_ids`] against a role set read once for the
+    /// org ([`Self::org_role_ids`]): the member's row in `org`'s tenant, kept
+    /// to the ids that set holds. The same rule, one query fewer per member.
+    pub async fn member_live_role_ids_in(
+        &self,
+        org: &OrgRoleIds,
+        user_id: ObjectId,
+    ) -> DaoResult<Vec<ObjectId>> {
+        let listed = self.listed_role_ids(org.tenant_id, user_id).await?;
+        Ok(org.live_among(listed))
     }
 
     /// FR-129 A1 — every member holding `flag` in `tenant_id`, in two
@@ -673,8 +771,9 @@ impl TenantDao {
     /// [`Self::get_member_permissions`] per member: the "device paired"
     /// notice goes to the org's other `MANAGE_AGENTS` holders, and an org
     /// can have hundreds of members. The same fold as
-    /// `get_member_permissions`, so the two cannot disagree on who holds a
-    /// bit (`permissions::has` carries the `ADMINISTRATOR` bypass).
+    /// `get_member_permissions`, over the same rows (the org's own roles,
+    /// [`Self::org_roles`]), so the two cannot disagree on who holds a bit
+    /// (`permissions::has` carries the `ADMINISTRATOR` bypass).
     pub async fn members_with_permission(
         &self,
         tenant_id: ObjectId,
@@ -684,10 +783,7 @@ impl TenantDao {
             .members
             .find_many(doc! { "tenant_id": tenant_id }, None)
             .await?;
-        let roles = self
-            .roles
-            .find_many(doc! { "tenant_id": tenant_id }, None)
-            .await?;
+        let roles = self.org_roles(tenant_id).await?;
         let masks: std::collections::HashMap<ObjectId, u64> = roles
             .iter()
             .filter_map(|r| r.id.map(|id| (id, r.permissions)))

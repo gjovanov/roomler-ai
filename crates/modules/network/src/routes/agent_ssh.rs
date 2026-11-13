@@ -248,14 +248,24 @@ pub async fn authorize(
     // Role ids are only fetched when the policy actually restricts by role —
     // an extra query on every SSH request would be paid by the common case to
     // serve the rare one.
+    // Live: the roles the caller holds in this org now, as this org has them.
+    // A role deleted since, or one of another org, matches no entry, and a
+    // failed read matches none.
     let role_ids = if allowed_role_ids.is_empty() {
         Vec::new()
     } else {
-        state
+        match state
             .tenants
-            .member_role_ids(tenant_id, caller.user_id)
+            .member_live_role_ids(tenant_id, caller.user_id)
             .await
-            .unwrap_or_default()
+        {
+            Ok(roles) => roles,
+            Err(e) => {
+                warn!(tenant = %tenant_id, user = %caller.user_id, %e,
+                    "ssh: the caller's roles could not be read; role entries of the allow-list will not match");
+                Vec::new()
+            }
+        }
     };
     if !gates.allows_caller(&caller.user_id, &role_ids) {
         return Err(SshDenyReason::CallerNotAllowed);
