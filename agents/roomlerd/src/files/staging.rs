@@ -371,6 +371,21 @@ fn mount_id(held: &File) -> Option<(u64, bool)> {
         .map(|id| (id, false))
 }
 
+/// #3734 — whether the handles `a` and `b` hold one folder: the same device
+/// and inode, on the same mount ([`mount_id`]). Only then does
+/// [`may_receive`] answer for one as it would for the other: through another
+/// mount, one inode can show another owner (an idmapped mount) or be
+/// read-only ([`writable`]). A handle whose file or mount cannot be read
+/// holds no folder in common with another.
+pub(super) fn same_folder(a: &File, b: &File) -> bool {
+    let (Ok(x), Ok(y)) = (a.metadata(), b.metadata()) else {
+        return false;
+    };
+    x.dev() == y.dev()
+        && x.ino() == y.ino()
+        && mount_id(a).is_some_and(|mount| mount_id(b) == Some(mount))
+}
+
 /// R5 — the empty probe folders [`keeps_modes`] left in `folder` (a crash
 /// between a probe's make and its removal), removed through a handle on
 /// `folder` (its links followed: the drop folder's own rule), each looked

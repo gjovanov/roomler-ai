@@ -31,6 +31,24 @@ pub struct EnigoInjector {
 
 impl EnigoInjector {
     pub fn new() -> Result<Self> {
+        // #3787 — with no `DISPLAY`, x11rb answers `DisplayNotSet` before any
+        // I/O (`enigo_settings` names no display, so enigo reads `DISPLAY`),
+        // and x11rb is enigo's only backend here: such an open cannot succeed,
+        // and enigo logs it at ERROR twice. So it is not tried. The caller says
+        // why, once a session, at the level its kind has. An EMPTY `DISPLAY`
+        // counts as set: x11rb answers it `MalformedValue`, not `DisplayNotSet`,
+        // so that open still runs and its failure stays enigo's ERROR.
+        #[cfg(target_os = "linux")]
+        {
+            let brief = crate::desktop_brief::current();
+            let seat = brief
+                .as_ref()
+                .map(|b| (b.session.as_str(), b.kind.as_str()));
+            let display_set = std::env::var_os("DISPLAY").is_some();
+            if let Some(kind) = super::no_display::NoDisplay::of(display_set, seat) {
+                return Err(super::no_display::NoDisplayToOpen(kind).into());
+            }
+        }
         let (tx, rx) = std_mpsc::channel::<Job>();
         // Construct Enigo on the worker thread — we never want to move it
         // between threads. Use a ready-ack channel to surface init errors.
@@ -1176,6 +1194,16 @@ mod tests {
             s.independent_of_keyboard_state,
             d.independent_of_keyboard_state
         );
+    }
+
+    /// #3787 — `EnigoInjector::new` skips the open when `DISPLAY` is unset,
+    /// which is right only while enigo reads `DISPLAY`, that is, while the
+    /// settings name no display of their own.
+    #[test]
+    fn enigo_settings_name_no_display_so_enigo_reads_display() {
+        let s = enigo_settings();
+        assert_eq!(s.x11_display, None);
+        assert_eq!(s.wayland_display, None);
     }
 
     /// FR-109 — relative motion is one relative move, by exactly the counts

@@ -149,7 +149,7 @@ flowchart LR
   `inventory-C.md`.
 
 No CI job checks that a doc anchor points at a live line (the doc audits are `fr-registry`,
-`anchor-ranges` and `mermaid-sequences`, at `.github/workflows/ci.yml:2323` and `:2348`). So P1 and P2
+`anchor-ranges` and `mermaid-sequences`, at `.github/workflows/ci.yml:2329` and `:2354`). So P1 and P2
 cannot turn CI red through the docs they leave stale. Each still follows the house gate: it shifts the
 anchors of surviving non-Hive docs that point into the files it edits, and skips the six docs P3 deletes.
 
@@ -357,7 +357,7 @@ Each field check is run **RED first** on the current deploy, then GREEN.
 ### 4.3 P3: what proves it
 
 - `fr-registry`, `anchor-ranges`, `mermaid-sequences` and the docs-site build all pass
-  (`.github/workflows/ci.yml:2637`).
+  (`.github/workflows/ci.yml:2643`).
 - FR-90's row (`docs/fr/README.md:188`) links the branch by full URL and holds no `|` in its prose.
 - No surviving doc links a deleted doc.
 - `CLAUDE.md`, `.claude/rules/modular-monolith.md` and `docs/README.md` keep no Hive text beyond the

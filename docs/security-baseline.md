@@ -323,12 +323,15 @@ roles do not.
   `not_a_member`. For a holder, another org's policy or an id that names nothing is
   a 404.
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:994`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
-  the forward would either defeat it or repeat it. What keeps the chain sound is who
-  may write the policy, and the exit device's own `forward_acl` stays its last word
-  ([tunnels.md](tunnels.md#policy--two-independent-gates)).
+  the forward would either defeat it or repeat it. When a policy names a role, the
+  forward reads which roles the person holds in the org at that forward; in a policy a
+  role is a group of people, and its permission bits are not read
+  ([tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635)). What keeps the
+  chain sound is who may write the policy, and the exit device's own `forward_acl`
+  stays its last word ([tunnels.md](tunnels.md#policy--two-independent-gates)).
 - **The web app asks the mask first** (`canManageTunnelPolicies`,
   `ui/src/utils/permissions.ts:375`). The store sends nothing for a caller without
   the bit, a server 403 lands in the same state, and the Tunnel ACL tab then says who
@@ -665,7 +668,7 @@ environment (a systemd drop-in); remote config cannot reach it
 The viewer chooses an upload's `id`, and the daemon names the upload's staging
 folder after it. So the id is one plain name: letters, digits, `.`, `_` and
 `-`, not starting with `.`, at most 128 bytes (`transfer_id`,
-`agents/roomlerd/src/files.rs:1332`). Every entry that takes an id from the
+`agents/roomlerd/src/files.rs:1561`). Every entry that takes an id from the
 files channel checks it first, on every OS and before anything on disk is
 touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
 other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
@@ -690,13 +693,13 @@ folder on its way is one another account can write
 
 - **Its default folder** is its XDG Downloads when that exists and passes, else
   `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
-  (`default_download_dir`, `agents/roomlerd/src/files.rs:4522`). The folder each
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:4895`). The folder each
   is opened to must be the writer's own: for root, one no other account may
   write; for a per-user daemon, one not every account may, unless its file
   system keeps no owners or modes, where it need only be one the daemon can
   write into. Never the temp dir. Root's home is the one its account names,
   never `HOME`, and must pass root's rule itself
-  (`own_home_and_downloads`, `files.rs:4825`); FR-84's rule judges a
+  (`own_home_and_downloads`, `files.rs:5208`); FR-84's rule judges a
   configured or a chosen folder against that home too.
 - **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
   explicit modes whatever the umask, and is used, resumed or registered by the
@@ -707,11 +710,11 @@ folder on its way is one another account can write
   mounted with fixed modes) cannot hold staging of the writer's own: its upload
   stages in the writer's own private folder, `~/.local/state/roomler/staging` or
   root's `/var/lib/roomler/staging`, and is copied across at its end
-  (`stage_held`, `files.rs:4606`). There root still never places into a
+  (`stage_held`, `files.rs:4989`). There root still never places into a
   folder another account can write, and its private folder sits only in a
   `/var/lib/roomler` that is root's and no other account may write.
 - **A root writer's resume and end** place only in a folder the rule gives it
-  now (`root_may_place_in`, `files.rs:4726`): the one the partial sits beside,
+  now (`root_may_place_in`, `files.rs:5109`): the one the partial sits beside,
   or, for one staged in root's private folder, the one its notes record. Never
   where its notes alone say.
 - **A transfer holds** its folders from its begin, or its resume, to its end, and
@@ -784,9 +787,10 @@ for (its `sub`), with their permissions read at enrollment time.
 
 A tunnel client acts for the person whose enrollment token enrolled it
 (`owner_user_id`; for a paired client, whoever approved the pairing): the forward gate
-matches it as that person, `AllUsers` included, and its overlay node is a peer of the
-org's mesh. So it lasts only as long as that person's membership of the org, as a call
-seat and a room membership do ([§3](#the-media-socket-admits-only-the-calls-participants)):
+matches it as that person (`AllUsers`, `UserId`, and the roles they hold in the org),
+and its overlay node is a peer of the org's mesh. So it lasts only as long as that
+person's membership of the org, as a call seat and a room membership do
+([§3](#the-media-socket-admits-only-the-calls-participants)):
 
 - **Removed from the org, or leaving it, removes the person's tunnel clients there**,
   the way a device manager's `DELETE …/tunnel-client/{cid}` removes one

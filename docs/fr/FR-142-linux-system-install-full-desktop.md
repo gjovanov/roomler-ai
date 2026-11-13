@@ -85,7 +85,7 @@ The worker is bound to ONE logind session id: seat0's `ActiveSession`, class `us
 **Its life and its cost today** (code): the watcher starts on the first `on_screen()` call, once a process
 (`seat_guard.rs:117-120`, `:187-199`), and then loops for the daemon's whole life (`:221-242`). Its callers are the
 system plan (`capture/mod.rs:1221`), the DRM arm (`capture/drm_backend.rs:855-868`, `:1465`) and the automatic
-input gate (`input/mod.rs:232`, `:488`), so on a root daemon it may run from the first hello on (inferred: not
+input gate (`input/mod.rs:235`, `:491`), so on a root daemon it may run from the first hello on (inferred: not
 traced from the hello). With logind's bus it wakes on `PropertiesChanged` but also re-reads the seat with four
 uncached `Properties.Get` calls every second, signal or not (`:29-30`, `:281-289`), because a reading older than
 5 s closes the guard (`:18-21`, `:32-33`). D5's worker at login needs the follower always on, so P1 makes it

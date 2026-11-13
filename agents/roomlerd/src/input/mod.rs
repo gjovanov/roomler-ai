@@ -75,6 +75,9 @@ pub mod sas;
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
+// #3787 — the level an X11 open with no display to open is said at.
+pub mod no_display;
+
 // rc.122 — Windows real-virtual-key text injection so typed letters land in the
 // legacy console (Windows PowerShell 5.1 / cmd), which drops enigo.text()'s
 // KEYEVENTF_UNICODE. Used by the shared `dispatch` KeyText arm.
@@ -675,10 +678,16 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
     #[cfg(feature = "enigo-input")]
     {
         match enigo_backend::EnigoInjector::new() {
-            Ok(e) => return Box::new(e),
-            Err(e) => {
-                tracing::warn!(%e, "enigo init failed — input injection disabled");
+            Ok(e) => {
+                no_display::forget();
+                return Box::new(e);
             }
+            // #3787 — no display to open: one line a session, at its kind's
+            // level, where enigo printed an ERROR pair on every try.
+            Err(e) => match no_display::kind_of(&e) {
+                Some(kind) => no_display::say(kind),
+                None => tracing::warn!(%e, "enigo init failed — input injection disabled"),
+            },
         }
     }
     #[cfg(not(feature = "enigo-input"))]

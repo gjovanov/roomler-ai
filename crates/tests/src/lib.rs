@@ -416,6 +416,10 @@ mod tunnel_enroll_tests;
 /// the policy's to decide.
 #[cfg(test)]
 mod tunnel_policy_permission_tests;
+/// #3635 — a tunnel policy whose subject is a role forwards for the people who
+/// hold that role in the policy's org, read on every forward request.
+#[cfg(test)]
+mod tunnel_role_subject_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the

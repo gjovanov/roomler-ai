@@ -13103,17 +13103,6 @@ fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
     reply.ok()
 }
 
-/// Wire the `files` DC to a per-session file-transfer handler. Strings
-/// carry control frames (`files:begin`/`files:end` + agent replies);
-/// binary frames are chunk payloads appended to the current in-flight
-/// transfer. The handler enforces one active transfer at a time and
-/// replies with `files:accepted` / `files:progress` / `files:complete`
-/// / `files:error` over the same channel.
-///
-/// Public so `crates/tests/src/file_dc_tests.rs` can attach the same
-/// dispatcher to a loopback DC and lock the wire format end-to-end.
-/// The dispatcher itself stays private (free fns below) — only the
-/// wiring entry point is needed across crates.
 /// Multi-user P3 — the FILES-denied handler: every control frame gets an
 /// explicit `files:error` (addressed by the frame's own `id` when present, so
 /// the browser's per-transfer waiter rejects instead of timing out) and
@@ -13154,6 +13143,18 @@ pub fn attach_files_denied(
     on_session_end(&dc, session_end, || async {});
 }
 
+/// Wire the `files` DC to a per-session file-transfer handler. Strings
+/// carry control frames (`files:begin`/`files:end` + agent replies);
+/// binary frames are chunk payloads appended to the current in-flight
+/// transfer. The handler enforces one active transfer at a time and
+/// replies with `files:accepted` / `files:progress` / `files:complete`
+/// / `files:error` over the same channel. #3785 — a refused begin is its
+/// upload's only answer: the chunks and the end behind it get none.
+///
+/// Public so `agents/roomlerd/tests/file_dc.rs` can attach the same
+/// dispatcher to a loopback DC and lock the wire format end-to-end.
+/// The dispatcher itself stays private (free fns below) — only the
+/// wiring entry point is needed across crates.
 pub fn attach_files_handler(
     dc: Arc<RTCDataChannel>,
     session_id: bson::oid::ObjectId,
@@ -13296,6 +13297,12 @@ async fn handle_files_control(
                     .await;
                 }
             }
+        }
+        // #3785 — the end of an upload whose begin this channel refused: the
+        // begin's `files:error` was that upload's answer and the viewer has
+        // settled it, so the end gets none, as its chunks got none.
+        crate::files::FilesIncoming::End { id } if handler.refused_at_begin(&id) => {
+            debug!(%session_id, ?id, "files: the end of an upload whose begin was refused is dropped");
         }
         crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
             Ok((path, bytes)) => {
@@ -17190,17 +17197,18 @@ mod files_channel_tests {
 
     /// A viewer's `files` channel to a device end routed by [`attach_files`],
     /// both in this process. Every candidate travels in the SDP (no trickle),
-    /// as `media_share`'s `viewer_channel` does.
-    struct Pair {
+    /// as `media_share`'s `viewer_channel` does. #3785's tests use it too
+    /// (`refused_upload_tests`).
+    pub(super) struct Pair {
         /// The viewer's peer, then the device's.
         pcs: [Arc<RTCPeerConnection>; 2],
-        viewer: Arc<RTCDataChannel>,
+        pub(super) viewer: Arc<RTCDataChannel>,
         heard: mpsc::UnboundedReceiver<String>,
         session_end: CancellationToken,
     }
 
     impl Pair {
-        async fn open(permissions: Permissions, served: FilesChannel) -> Self {
+        pub(super) async fn open(permissions: Permissions, served: FilesChannel) -> Self {
             let pc = || async {
                 Arc::new(
                     APIBuilder::new()
@@ -17287,7 +17295,7 @@ mod files_channel_tests {
             }
         }
 
-        async fn ask(&self, frame: &Value) {
+        pub(super) async fn ask(&self, frame: &Value) {
             self.viewer
                 .send_text(frame.to_string())
                 .await
@@ -17295,7 +17303,7 @@ mod files_channel_tests {
         }
 
         /// The next `n` frames the viewer heard, fewer if they stop coming.
-        async fn heard(&mut self, n: usize) -> Vec<Value> {
+        pub(super) async fn heard(&mut self, n: usize) -> Vec<Value> {
             let mut got = Vec::new();
             while got.len() < n {
                 match tokio::time::timeout(Duration::from_secs(20), self.heard.recv()).await {
@@ -17317,7 +17325,7 @@ mod files_channel_tests {
 
         /// The session ends, and both peers are closed: a peer that is only
         /// dropped frees nothing (its sockets belong to its ICE agent's tasks).
-        async fn close(self) {
+        pub(super) async fn close(self) {
             self.session_end.cancel();
             for pc in self.pcs {
                 let _ = pc.close().await;
@@ -17470,5 +17478,171 @@ mod files_channel_tests {
             }
             assert_eq!(files_channel_here(), FilesChannel::Declined(WHY));
         }
+    }
+}
+
+/// #3785 — what the viewer hears of an upload whose `files:begin` the device
+/// refused, over a real channel through the production router
+/// ([`attach_files`]): the refusal, and nothing more of it. The viewer sends
+/// an upload's chunks and its end right behind its begin, without waiting for
+/// `files:accepted`, so a small file is wholly on the wire before the refusal.
+///
+/// Not inside `files_channel_tests`: the macOS job runs that module again
+/// under sudo, and an upload here writes into a temp folder, which a root
+/// writer outside the person's profile does not (FR-84 D4).
+#[cfg(test)]
+mod refused_upload_tests {
+    use super::files_channel_tests::Pair;
+    use super::*;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::{Value, json};
+
+    /// One byte over the 2 GiB cap: a begin refused on every OS, before
+    /// anything on the host is touched. The field's refusals (nobody signed in
+    /// to a Windows service's session, #3048; a seat0 lookup out of time on a
+    /// Linux system install, #3711) are answered from the same place, which a
+    /// test process cannot reach: it is neither LocalSystem nor root.
+    const OVER_THE_CAP: u64 = 2 * 1024 * 1024 * 1024 + 1;
+
+    /// The cap's refusal of upload `id`, as the viewer hears it.
+    fn over_the_cap(id: &str) -> Value {
+        json!({
+            "t": "files:error",
+            "id": id,
+            "message": format!("transfer size {OVER_THE_CAP} exceeds the 2147483648 B cap"),
+        })
+    }
+
+    async fn served() -> Pair {
+        Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await
+    }
+
+    /// The frames the viewer hears before the answer to `probe`: an end for an
+    /// upload this channel never began, which is always answered. One channel,
+    /// in order, so by then every frame sent before the probe has had its
+    /// answer, if it gets one.
+    async fn heard_before(pair: &mut Pair, probe: &str) -> Vec<Value> {
+        pair.ask(&json!({"t": "files:end", "id": probe})).await;
+        let mut before = Vec::new();
+        loop {
+            let Some(frame) = pair.heard(1).await.pop() else {
+                panic!("{probe} was never answered; heard before it: {before:?}");
+            };
+            if frame["id"] == probe {
+                return before;
+            }
+            before.push(frame);
+        }
+    }
+
+    /// The issue: a refused small upload's begin, its one chunk and its end,
+    /// sent back to back as the viewer sends them, are answered with exactly
+    /// one `files:error`, the begin's reason. Red on master, which answered
+    /// the chunk ("no active transfer") and the end ("no active transfer to
+    /// end") with one more each.
+    #[tokio::test]
+    async fn a_refused_small_upload_is_answered_once() {
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": OVER_THE_CAP}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        let errors = heard.iter().filter(|f| f["t"] == "files:error").count();
+        assert_eq!(
+            errors, 1,
+            "the files:error frames of one refused upload: {heard:?}"
+        );
+        assert_eq!(heard, vec![over_the_cap("up-1")]);
+    }
+
+    /// A `files:error` for upload `id`, saying `message`.
+    fn error(id: &str, message: &str) -> Value {
+        json!({"t": "files:error", "id": id, "message": message})
+    }
+
+    /// The control: a chunk and an end for an upload this channel never began
+    /// are still answered, each with its own `files:error` as before, and so
+    /// is an end for one never begun after a refused upload.
+    #[tokio::test]
+    async fn an_upload_never_begun_is_still_answered() {
+        let mut pair = served().await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-2"})).await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": OVER_THE_CAP}))
+            .await;
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        pair.ask(&json!({"t": "files:end", "id": "up-3"})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        assert_eq!(
+            heard,
+            vec![
+                error("", "no active transfer"),
+                error("up-2", "no active transfer to end"),
+                over_the_cap("up-1"),
+                error("up-3", "no active transfer to end"),
+            ]
+        );
+    }
+
+    /// A retry: a begin with an id this channel refused runs as a fresh
+    /// begin. Accepted, its chunk lands and its end completes it, and the file
+    /// holds that chunk alone, not the one dropped behind the refusal.
+    #[tokio::test]
+    async fn a_retry_with_a_refused_id_runs_as_a_fresh_begin() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let folder = temp.path().to_string_lossy().into_owned();
+        // Its own id: an accepted begin registers its partial process-wide.
+        let id = format!("up-retry-{}", std::process::id());
+        let mut pair = served().await;
+        pair.ask(&json!({"t": "files:begin", "id": id, "name": "a.txt", "size": OVER_THE_CAP, "dest_path": folder}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        pair.ask(
+            &json!({"t": "files:begin", "id": id, "name": "a.txt", "size": 3, "dest_path": folder}),
+        )
+        .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"xyz"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": id})).await;
+        let heard = heard_before(&mut pair, "never-begun").await;
+        pair.close().await;
+
+        let kinds: Vec<&str> = heard.iter().filter_map(|f| f["t"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["files:error", "files:accepted", "files:complete"],
+            "{heard:?}"
+        );
+        assert_eq!(heard[0], over_the_cap(&id));
+        assert_eq!(heard[2]["id"], id.as_str(), "{heard:?}");
+        assert_eq!(heard[2]["bytes"], 3, "{heard:?}");
+        let placed = std::path::Path::new(heard[2]["path"].as_str().expect("the file's path"));
+        assert_eq!(std::fs::read(placed).expect("the file landed"), b"xyz");
+        assert_eq!(
+            placed.parent().and_then(|p| std::fs::canonicalize(p).ok()),
+            std::fs::canonicalize(temp.path()).ok(),
+            "it landed in the folder asked for"
+        );
     }
 }
