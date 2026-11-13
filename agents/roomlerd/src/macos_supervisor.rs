@@ -1914,6 +1914,101 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::time::Duration;
+
+        /// What `/usr/bin/id <args>` prints, trimmed.
+        fn id(args: &[&str]) -> String {
+            let out = std::process::Command::new("/usr/bin/id")
+                .args(args)
+                .output()
+                .expect("id runs");
+            String::from_utf8(out.stdout)
+                .expect("utf-8")
+                .trim()
+                .to_string()
+        }
+
+        /// #3802 — the account lookup behind the administrator's command
+        /// reads this process's own entry: the name `id -un` prints, and the
+        /// home `appdirs::account_home` reads. Holds whoever the runner is.
+        #[test]
+        fn the_account_lookup_reads_the_processs_own_name_and_home() {
+            // SAFETY: `getuid` takes no arguments and cannot fail.
+            let uid = unsafe { libc::getuid() };
+            assert_eq!(
+                name_and_home(uid),
+                Some((
+                    id(&["-un"]),
+                    crate::appdirs::account_home(uid).expect("a home")
+                )),
+            );
+        }
+
+        /// #3802 — `dseditgroup` says no for a name no account has, and for
+        /// the runner's own name agrees with whether `id -Gn` lists `admin`.
+        #[tokio::test]
+        async fn the_administrator_read_agrees_with_the_groups_id_lists() {
+            let missing = format!("roomler-no-such-account-{}", std::process::id());
+            let answer = tokio::time::timeout(Duration::from_secs(30), is_administrator(&missing))
+                .await
+                .expect("dseditgroup answers");
+            assert!(
+                matches!(
+                    answer,
+                    Err(super::super::NoCommand::NotAdministrator(Some(_)))
+                ),
+                "{missing}: {answer:?}"
+            );
+            let name = id(&["-un"]);
+            let admin = id(&["-Gn", name.as_str()])
+                .split_whitespace()
+                .any(|g| g == "admin");
+            let answer = tokio::time::timeout(Duration::from_secs(30), is_administrator(&name))
+                .await
+                .expect("dseditgroup answers");
+            assert_eq!(answer.is_ok(), admin, "{name}: {answer:?}");
+        }
+
+        /// #3802 — the whole read, for a folder of root's in the runner's
+        /// own `Library/Application Support`, returns inside its bound
+        /// whoever the runner is, and names the runner when it says yes. A
+        /// deadline that has run out answers that it ran out.
+        #[tokio::test]
+        async fn the_whole_administrator_read_returns_inside_its_bound() {
+            // SAFETY: `getuid` takes no arguments and cannot fail.
+            let uid = unsafe { libc::getuid() };
+            let home = crate::appdirs::account_home(uid).expect("a home");
+            let f = super::super::FolderNotTheirs {
+                path: home.join("Library/Application Support/live.roomler.roomler-3802"),
+                uid,
+                owner: 0,
+                mode: 0o755,
+                is_dir: true,
+                kept: Vec::new(),
+                holds_config: false,
+                stamp: "20261113T101502Z".to_string(),
+                administrator: Err(super::super::NoCommand::NotRead),
+            };
+            let started = std::time::Instant::now();
+            let answer = administrator_reads(&f).await;
+            let took = started.elapsed();
+            assert!(
+                took < super::super::ADMIN_READ_DEADLINE + Duration::from_secs(1),
+                "{took:?}: {answer:?}"
+            );
+            if let Ok(name) = &answer {
+                assert_eq!(*name, id(&["-un"]));
+            }
+            let started = std::time::Instant::now();
+            let ran_out = administrator_reads_within(&f, Duration::ZERO).await;
+            assert!(started.elapsed() < Duration::from_secs(1), "{ran_out:?}");
+            if answer.is_ok() {
+                // Every read says yes here, so only the deadline can stop it.
+                assert_eq!(ran_out, Err(super::super::NoCommand::TimedOut));
+            } else {
+                assert!(ran_out.is_err(), "{ran_out:?}");
+            }
+        }
 
         #[tokio::test]
         async fn a_process_left_behind_is_found_by_its_exact_command_and_stopped() {
