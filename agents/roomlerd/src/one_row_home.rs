@@ -305,11 +305,8 @@ fn identity_refusal(me: &Creds, uid: u32, gid: u32) -> Option<String> {
         "uid {} (effective {}), gid {} (effective {}), groups {:?}",
         me.uid, me.euid, me.gid, me.egid, me.groups
     );
-    let exact = me.uid == uid
-        && me.euid == uid
-        && me.gid == gid
-        && me.egid == gid
-        && me.groups == [gid];
+    let exact =
+        me.uid == uid && me.euid == uid && me.gid == gid && me.egid == gid && me.groups == [gid];
     (!exact).then(|| format!("it runs as {is}, not uid {uid} gid {gid} groups [{gid}]"))
 }
 
@@ -468,7 +465,10 @@ impl Reply {
         }
         let answers = [
             (reply.read.is_some(), matches!(verb, Verb::Read)),
-            (reply.convert.is_some(), matches!(verb, Verb::Convert { .. })),
+            (
+                reply.convert.is_some(),
+                matches!(verb, Verb::Convert { .. }),
+            ),
             (reply.put_back.is_some(), matches!(verb, Verb::PutBack)),
             (
                 reply.put_back_legacy.is_some(),
@@ -602,14 +602,19 @@ mod base64_opt {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
 
-    pub fn serialize<S: serde::Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: serde::Serializer>(
+        bytes: &Option<Vec<u8>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         match bytes {
             Some(bytes) => s.serialize_some(&STANDARD.encode(bytes)),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
         let text = <Option<String> as serde::Deserialize>::deserialize(d)?;
         text.map(|t| STANDARD.decode(t).map_err(serde::de::Error::custom))
             .transpose()
@@ -652,7 +657,8 @@ impl Outcome {
                     "not writable: {} (owner {}, mode {})",
                     path.display(),
                     st.uid.map_or("unknown".to_string(), |u| format!("uid {u}")),
-                    st.mode.map_or("unknown".to_string(), |m| format!("{m:04o}"))
+                    st.mode
+                        .map_or("unknown".to_string(), |m| format!("{m:04o}"))
                 ),
             ),
             Fail::Error(why) => (Exit::Error, why),
@@ -767,8 +773,10 @@ pub fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
 }
 
 /// The verb, below the checks. `home` is the account database's home for
-/// `me.uid`, `stdin` what root sent.
-pub fn answer(verb: Verb, home: &Path, me: &Creds, stdin: &[u8], fs: &mut impl Fs) -> Outcome {
+/// `me.uid`, `stdin` what root sent. Private: outside this module the verbs
+/// are reached through [`run`] alone, after every check; the tests here pass
+/// a home of their own.
+fn answer(verb: Verb, home: &Path, me: &Creds, stdin: &[u8], fs: &mut impl Fs) -> Outcome {
     let at = Places::of(home, &*fs);
     let answered = match verb {
         Verb::Read => Ok(Answer::Read(Box::new(read(&at, &*fs)))),
@@ -803,8 +811,7 @@ impl Places {
         let library = home.join("Library");
         let agents_dir = library.join("LaunchAgents");
         let current = crate::appdirs::macos_config_dir_in_home(home, |_| false);
-        let folder =
-            crate::appdirs::macos_config_dir_in_home(home, |p| fs.dev_ino(p).is_some());
+        let folder = crate::appdirs::macos_config_dir_in_home(home, |p| fs.dev_ino(p).is_some());
         let segment = if folder == current {
             Segment::Current
         } else {
@@ -828,7 +835,10 @@ impl Places {
     /// The folders down to `~/Library/LaunchAgents`, each with the mode it
     /// is made with when missing.
     fn to_agents_dir(&self) -> [(&Path, u32); 2] {
-        [(self.library.as_path(), 0o700), (self.agents_dir.as_path(), 0o755)]
+        [
+            (self.library.as_path(), 0o700),
+            (self.agents_dir.as_path(), 0o755),
+        ]
     }
 }
 
@@ -902,10 +912,7 @@ fn live(fs: &impl Fs, path: &Path, bound: usize, want: Expect) -> Result<Option<
                 "{} is not the bytes it was",
                 path.display()
             ))),
-            unreadable => Err(Fail::Error(format!(
-                "{}: {unreadable:?}",
-                path.display()
-            ))),
+            unreadable => Err(Fail::Error(format!("{}: {unreadable:?}", path.display()))),
         },
     }
 }
@@ -917,7 +924,12 @@ fn not_writable(fs: &impl Fs, path: &Path) -> Fail {
 /// `convert`: both live files checked against what root named, both folders
 /// it changes checked writable, and the new config made, before anything
 /// changes; then the plist goes and the config is saved.
-fn convert(at: &Places, want_config: Expect, want_plist: Expect, fs: &mut impl Fs) -> Result<ConvertAnswer, Fail> {
+fn convert(
+    at: &Places,
+    want_config: Expect,
+    want_plist: Expect,
+    fs: &mut impl Fs,
+) -> Result<ConvertAnswer, Fail> {
     let config = live(&*fs, &at.config, CONFIG_BOUND, want_config)?;
     let plist = live(&*fs, &at.plist, PLIST_BOUND, want_plist)?;
     if config.is_some() && !fs.writable(&at.folder) {
@@ -952,9 +964,7 @@ fn convert(at: &Places, want_config: Expect, want_plist: Expect, fs: &mut impl F
             match fs.read(&at.config, CONFIG_BOUND) {
                 Held::Present { bytes, .. } => Some(sha256_hex(&bytes)),
                 other => {
-                    return Err(Fail::Error(format!(
-                        "{origin} after its save: {other:?}"
-                    )));
+                    return Err(Fail::Error(format!("{origin} after its save: {other:?}")));
                 }
             }
         }
@@ -1017,7 +1027,8 @@ fn put_back(at: &Places, stdin: &[u8], fs: &mut impl Fs) -> Result<PutBackAnswer
     if kept.v != FORMAT {
         return Err(Fail::Usage(format!("its input is format {}", kept.v)));
     }
-    let over = |bytes: &Option<Vec<u8>>, bound: usize| bytes.as_ref().is_some_and(|b| b.len() > bound);
+    let over =
+        |bytes: &Option<Vec<u8>>, bound: usize| bytes.as_ref().is_some_and(|b| b.len() > bound);
     if over(&kept.config, CONFIG_BOUND) || over(&kept.plist, PLIST_BOUND) {
         return Err(Fail::Error("a kept file is over its bound".to_string()));
     }
@@ -1064,9 +1075,8 @@ fn put_back_legacy(at: &Places, fs: &mut impl Fs) -> Result<Legacy, Fail> {
         if !fs.writable(&at.folder) {
             return Err(not_writable(&*fs, &at.folder));
         }
-        fs.rename(&at.legacy_config, &at.config).map_err(|e| {
-            Fail::Error(format!("renaming {}: {e}", at.legacy_config.display()))
-        })?;
+        fs.rename(&at.legacy_config, &at.config)
+            .map_err(|e| Fail::Error(format!("renaming {}: {e}", at.legacy_config.display())))?;
         moved.config = true;
     }
     if fs.lstat(&at.legacy_plist).kind != Kind::Absent {
@@ -1074,9 +1084,8 @@ fn put_back_legacy(at: &Places, fs: &mut impl Fs) -> Result<Legacy, Fail> {
             return Err(not_writable(&*fs, &at.folder));
         }
         make_dirs(fs, &at.to_agents_dir())?;
-        fs.rename(&at.legacy_plist, &at.plist).map_err(|e| {
-            Fail::Error(format!("renaming {}: {e}", at.legacy_plist.display()))
-        })?;
+        fs.rename(&at.legacy_plist, &at.plist)
+            .map_err(|e| Fail::Error(format!("renaming {}: {e}", at.legacy_plist.display())))?;
         moved.plist = true;
     }
     Ok(moved)
@@ -1093,9 +1102,11 @@ pub fn answer_if_asked() {
         return;
     }
     let out = run(&args[2..], &mut RealMe, &mut RealFs);
-    let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(&out.stdout);
-    let _ = stdout.flush();
+    {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(&out.stdout);
+        let _ = stdout.flush();
+    }
     if !out.stderr.is_empty() {
         let _ = writeln!(io::stderr(), "{VERB}: {}", out.stderr);
     }
@@ -1119,8 +1130,14 @@ impl Me for RealMe {
 
     fn creds(&self) -> io::Result<Creds> {
         // SAFETY: reads of this process's own credentials.
-        let (uid, euid, gid, egid) =
-            unsafe { (libc::getuid(), libc::geteuid(), libc::getgid(), libc::getegid()) };
+        let (uid, euid, gid, egid) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            )
+        };
         Ok(Creds {
             uid,
             euid,
@@ -1200,6 +1217,25 @@ fn kind_of(t: std::fs::FileType) -> Kind {
     } else {
         Kind::Other
     }
+}
+
+/// [`RealFs::write`]'s new file: made by this call (`create_new`, never a
+/// file found under the name), its bytes, `mode` through the descriptor (the
+/// umask has no say in it), `fsync`, then `rename` over `path`.
+#[cfg(unix)]
+fn write_temp(temp: &Path, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(temp)?;
+    file.write_all(bytes)?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)
 }
 
 #[cfg(unix)]
@@ -1308,31 +1344,21 @@ impl Fs for RealFs {
     }
 
     fn write(&mut self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-            return Err(io::Error::other(format!("{} names no file", path.display())));
+            return Err(io::Error::other(format!(
+                "{} names no file",
+                path.display()
+            )));
         };
         let mut temp = name.to_os_string();
         temp.push(format!(".tmp.{}", std::process::id()));
         let temp = dir.join(temp);
-        match std::fs::remove_file(&temp) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
+        if let Err(e) = std::fs::remove_file(&temp)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(e);
         }
-        let written = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&temp)?;
-            file.write_all(bytes)?;
-            // Through the descriptor: the umask has no say in it.
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-            file.sync_all()?;
-            std::fs::rename(&temp, path)
-        })();
+        let written = write_temp(&temp, path, bytes, mode);
         if written.is_err() {
             let _ = std::fs::remove_file(&temp);
         }
@@ -1468,7 +1494,15 @@ mod tests {
             self.put(path, Kind::File, UID, mode, bytes.to_vec(), true);
         }
 
-        fn put(&mut self, path: &Path, kind: Kind, uid: u32, mode: u32, bytes: Vec<u8>, writable: bool) {
+        fn put(
+            &mut self,
+            path: &Path,
+            kind: Kind,
+            uid: u32,
+            mode: u32,
+            bytes: Vec<u8>,
+            writable: bool,
+        ) {
             let node = Node {
                 kind,
                 uid,
@@ -1580,7 +1614,12 @@ mod tests {
         let folder = crate::appdirs::macos_config_dir_in_home(&home, |_| false);
         fs.dir(&home, UID, 0o750, true);
         fs.dir(&home.join("Library"), UID, 0o700, true);
-        fs.dir(&home.join("Library").join("Application Support"), UID, 0o755, true);
+        fs.dir(
+            &home.join("Library").join("Application Support"),
+            UID,
+            0o755,
+            true,
+        );
         fs.dir(&folder, UID, 0o755, true);
         fs.dir(&home.join("Library").join("LaunchAgents"), UID, 0o755, true);
         fs.file(&folder.join(CONFIG), ENROLLED.as_bytes(), 0o600);
@@ -1614,7 +1653,10 @@ mod tests {
             assert_eq!(args[0], VERB);
             let after = &args[1..];
             let asked = asked(after).expect("asked");
-            assert_eq!((asked.uid, asked.gid, asked.version.as_str()), (UID, GID, VERSION));
+            assert_eq!(
+                (asked.uid, asked.gid, asked.version.as_str()),
+                (UID, GID, VERSION)
+            );
             assert_eq!(super::verb(after), Ok(verb));
         }
     }
@@ -1624,28 +1666,19 @@ mod tests {
     /// exit 2 with nothing read.
     #[test]
     fn child_refuses_an_identity_it_was_not_given() {
-        let other_groups = |groups: Vec<u32>| Creds {
-            groups,
-            ..creds()
-        };
+        let other_groups = |groups: Vec<u32>| Creds { groups, ..creds() };
         let cases: Vec<(&str, Creds, u32, u32)> = vec![
             ("another uid", creds(), UID + 1, GID),
             ("another gid", creds(), UID, GID + 1),
             (
                 "effective uid differs",
-                Creds {
-                    euid: 0,
-                    ..creds()
-                },
+                Creds { euid: 0, ..creds() },
                 UID,
                 GID,
             ),
             (
                 "effective gid differs",
-                Creds {
-                    egid: 0,
-                    ..creds()
-                },
+                Creds { egid: 0, ..creds() },
                 UID,
                 GID,
             ),
@@ -1684,7 +1717,11 @@ mod tests {
             let out = run_with(os(&child_args(uid, gid, Verb::Read)[1..]), &mut me, &mut fs);
             assert_eq!(out.exit, Exit::Refused, "{case}: {}", out.stderr);
             assert!(out.stdout.is_empty(), "{case}");
-            assert!(fs.calls.borrow().is_empty(), "{case}: {:?}", fs.calls.borrow());
+            assert!(
+                fs.calls.borrow().is_empty(),
+                "{case}: {:?}",
+                fs.calls.borrow()
+            );
             assert_eq!(*me.asked.borrow(), ["umask", "creds"], "{case}");
         }
     }
@@ -1734,7 +1771,10 @@ mod tests {
             ("a flag no verb takes", with(&["--home", "/Users/other"])),
             ("a value with no flag", with(&["/Users/other"])),
             ("a flag twice", with(&["--uid", "501"])),
-            ("an expectation for read", with(&["--expect-config", "none"])),
+            (
+                "an expectation for read",
+                with(&["--expect-config", "none"]),
+            ),
             ("no verb", os(&["--uid".into(), "501".into()])),
             ("an unknown verb", os(&["blank".into()])),
         ];
@@ -1757,7 +1797,11 @@ mod tests {
             let (mut fs, _) = a_home();
             let out = run_with(args, &mut me, &mut fs);
             assert_eq!(out.exit, Exit::Refused, "{case}: {}", out.stderr);
-            assert!(fs.calls.borrow().is_empty(), "{case}: {:?}", fs.calls.borrow());
+            assert!(
+                fs.calls.borrow().is_empty(),
+                "{case}: {:?}",
+                fs.calls.borrow()
+            );
         }
     }
 
@@ -1776,16 +1820,24 @@ mod tests {
         let (mut fs, _) = a_home();
         let out = run_with(line(Verb::Read), &mut FakeMe::new(), &mut fs);
         assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        // Each call is `<what> <path>`: every path is the database's home or
+        // under it, by whole components.
         let calls = fs.calls.borrow();
+        assert!(!calls.is_empty());
         assert!(
-            calls.iter().all(|c| c.contains("/Users/person")),
+            calls.iter().all(|c| c
+                .split_once(' ')
+                .is_some_and(|(_, path)| Path::new(path).starts_with("/Users/person"))),
             "{calls:?}"
         );
 
         let source = include_str!("one_row_home.rs");
         let code = source.split("\nmod tests {").next().unwrap();
         for word in ["env::var", "getenv", "env!(\"HOME"] {
-            assert!(!code.contains(word), "the child reads the environment: `{word}`");
+            assert!(
+                !code.contains(word),
+                "the child reads the environment: `{word}`"
+            );
         }
     }
 
@@ -1903,41 +1955,41 @@ mod tests {
     #[test]
     fn convert_refuses_bytes_it_was_not_shown() {
         let other = Expect::of(Some(b"other bytes"));
-        let cases: Vec<(&str, Box<dyn Fn(&Places, &FakeFs) -> Verb>)> = vec![
+        // Every `a_home()` holds the same bytes, so what one shows holds for
+        // each.
+        let (fs, at) = a_home();
+        let Verb::Convert {
+            config: seen_config,
+            plist: seen_plist,
+        } = shown(&at, &fs)
+        else {
+            unreachable!("shown() is a convert");
+        };
+        let cases = [
             (
                 "the config differs",
-                Box::new(|at, fs| match shown(at, fs) {
-                    Verb::Convert { plist, .. } => Verb::Convert {
-                        config: other,
-                        plist,
-                    },
-                    v => v,
-                }),
+                Verb::Convert {
+                    config: other,
+                    plist: seen_plist,
+                },
             ),
             (
                 "the plist differs, after a config that matches",
-                Box::new(|at, fs| match shown(at, fs) {
-                    Verb::Convert { config, .. } => Verb::Convert {
-                        config,
-                        plist: other,
-                    },
-                    v => v,
-                }),
+                Verb::Convert {
+                    config: seen_config,
+                    plist: other,
+                },
             ),
             (
                 "a plist where root saw none",
-                Box::new(|at, fs| match shown(at, fs) {
-                    Verb::Convert { config, .. } => Verb::Convert {
-                        config,
-                        plist: Expect::Absent,
-                    },
-                    v => v,
-                }),
+                Verb::Convert {
+                    config: seen_config,
+                    plist: Expect::Absent,
+                },
             ),
         ];
         for (case, verb) in cases {
             let (mut fs, at) = a_home();
-            let verb = verb(&at, &fs);
             let out = answer(verb, &at.home, &creds(), &[], &mut fs);
             assert_eq!(out.exit, Exit::Changed, "{case}: {}", out.stderr);
             assert!(out.stdout.is_empty(), "{case}");
@@ -1961,7 +2013,11 @@ mod tests {
         let verb = shown(&at, &fs);
         let out = answer(verb, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::NotWritable, "{}", out.stderr);
-        assert!(out.stderr.contains("owner uid 0, mode 0755"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains("owner uid 0, mode 0755"),
+            "{}",
+            out.stderr
+        );
         assert!(fs.changes().is_empty(), "{:?}", fs.changes());
 
         let (mut fs, at) = a_home();
@@ -1979,7 +2035,12 @@ mod tests {
         assert!(fs.changes().is_empty(), "{:?}", fs.changes());
     }
 
-    fn kept(config: Option<&[u8]>, config_mode: Option<u32>, plist: Option<&[u8]>, plist_mode: Option<u32>) -> Vec<u8> {
+    fn kept(
+        config: Option<&[u8]>,
+        config_mode: Option<u32>,
+        plist: Option<&[u8]>,
+        plist_mode: Option<u32>,
+    ) -> Vec<u8> {
         serde_json::to_vec(&Kept {
             v: FORMAT,
             config: config.map(<[u8]>::to_vec),
@@ -2061,7 +2122,11 @@ mod tests {
         unknown["home"] = serde_json::json!("/Users/other");
         let cases: Vec<(&str, Vec<u8>, Exit)> = vec![
             ("not JSON", b"{".to_vec(), Exit::Refused),
-            ("an unknown field", serde_json::to_vec(&unknown).unwrap(), Exit::Refused),
+            (
+                "an unknown field",
+                serde_json::to_vec(&unknown).unwrap(),
+                Exit::Refused,
+            ),
             (
                 "a config over its bound",
                 kept(Some(&vec![b'#'; CONFIG_BOUND + 1]), None, None, None),
@@ -2076,7 +2141,11 @@ mod tests {
         for (case, stdin, exit) in cases {
             let out = answer(Verb::PutBack, &at.home, &creds(), &stdin, &mut fs);
             assert_eq!(out.exit, exit, "{case}: {}", out.stderr);
-            assert!(!out.stderr.contains("/Users/other"), "{case}: {}", out.stderr);
+            assert!(
+                !out.stderr.contains("/Users/other"),
+                "{case}: {}",
+                out.stderr
+            );
             assert!(fs.changes().is_empty(), "{case}: {:?}", fs.changes());
         }
         let mut me = FakeMe {
@@ -2121,8 +2190,14 @@ mod tests {
         fs.put(&at.agents_dir, Kind::Dir, 0, 0o755, Vec::new(), false);
         let out = answer(Verb::PutBackLegacy, &at.home, &creds(), &[], &mut fs);
         assert_eq!(out.exit, Exit::NotWritable, "{}", out.stderr);
-        assert!(!fs.nodes.contains_key(&at.legacy_config), "the config went back");
-        assert!(fs.nodes.contains_key(&at.legacy_plist), "the plist copy stayed");
+        assert!(
+            !fs.nodes.contains_key(&at.legacy_config),
+            "the config went back"
+        );
+        assert!(
+            fs.nodes.contains_key(&at.legacy_plist),
+            "the plist copy stayed"
+        );
     }
 
     fn a_reply() -> Vec<u8> {
@@ -2149,7 +2224,10 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&a_reply()).unwrap();
         v["version"] = serde_json::json!("0.4.1");
         assert!(Reply::parse(&serde_json::to_vec(&v).unwrap(), UID, GID, Verb::Read).is_err());
-        assert!(Reply::parse(&a_reply(), UID, GID, Verb::PutBack).is_err(), "another verb's");
+        assert!(
+            Reply::parse(&a_reply(), UID, GID, Verb::PutBack).is_err(),
+            "another verb's"
+        );
     }
 
     #[test]
@@ -2274,7 +2352,10 @@ mod tests {
             assert_eq!(read.agents_dir.kind, Kind::Dir);
             assert_eq!(read.folder.uid, Some(owner));
             let home = std::fs::metadata(dir.path()).unwrap();
-            assert_eq!((read.home.dev, read.home.ino), (Some(home.dev()), Some(home.ino())));
+            assert_eq!(
+                (read.home.dev, read.home.ino),
+                (Some(home.dev()), Some(home.ino()))
+            );
             assert!(read.home.absolute);
         }
 
@@ -2295,12 +2376,24 @@ mod tests {
                 .read
                 .unwrap();
             assert!(
-                matches!(read.config, Held::Unreadable { error: ReadError::NotRegular, .. }),
+                matches!(
+                    read.config,
+                    Held::Unreadable {
+                        error: ReadError::NotRegular,
+                        ..
+                    }
+                ),
                 "{:?}",
                 read.config
             );
             assert!(
-                matches!(read.plist, Held::Unreadable { error: ReadError::TooLarge, .. }),
+                matches!(
+                    read.plist,
+                    Held::Unreadable {
+                        error: ReadError::TooLarge,
+                        ..
+                    }
+                ),
                 "{:?}",
                 read.plist
             );
@@ -2364,7 +2457,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let at = Places::of(dir.path(), &RealFs);
             std::fs::create_dir_all(&at.library).unwrap();
-            let stdin = kept(Some(ENROLLED.as_bytes()), Some(0o640), Some(PLIST), Some(0o664));
+            let stdin = kept(
+                Some(ENROLLED.as_bytes()),
+                Some(0o640),
+                Some(PLIST),
+                Some(0o664),
+            );
             let out = answer(Verb::PutBack, dir.path(), &creds(), &stdin, &mut RealFs);
             assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
             assert_eq!(mode(&at.agents_dir), 0o755);
@@ -2373,7 +2471,11 @@ mod tests {
             assert_eq!(mode(&at.folder), 0o700);
             assert_eq!(std::fs::read(&at.plist).unwrap(), PLIST);
             assert_eq!(std::fs::read(&at.config).unwrap(), ENROLLED.as_bytes());
-            assert_eq!(listing(&at.agents_dir), [AGENT_PLIST], "no temporary file left");
+            assert_eq!(
+                listing(&at.agents_dir),
+                [AGENT_PLIST],
+                "no temporary file left"
+            );
 
             let stdin = kept(None, None, Some(PLIST), None);
             let out = answer(Verb::PutBack, dir.path(), &creds(), &stdin, &mut RealFs);

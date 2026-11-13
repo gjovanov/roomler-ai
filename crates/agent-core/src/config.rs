@@ -4900,11 +4900,17 @@ machine_name = "devbox"
     /// the NUL signature, and a parse error by line with no quoted text.
     #[test]
     fn parse_text_names_its_origin_in_its_errors() {
-        let nul = format!("{:#}", parse_text("\0\0\0\0", "uid 501's config").unwrap_err());
+        let nul = format!(
+            "{:#}",
+            parse_text("\0\0\0\0", "uid 501's config").unwrap_err()
+        );
         assert!(nul.contains("uid 501's config is 4 bytes of NUL"), "{nul}");
         let broken = "server_url = \"https://roomler.ai\"\nagent_token = \"secret-value\n";
         let said = format!("{:#}", parse_text(broken, "uid 501's config").unwrap_err());
-        assert!(said.starts_with("parsing config at uid 501's config: TOML parse error at line"), "{said}");
+        assert!(
+            said.starts_with("parsing config at uid 501's config: TOML parse error at line"),
+            "{said}"
+        );
         assert!(!said.contains("secret-value"), "{said}");
     }
 
