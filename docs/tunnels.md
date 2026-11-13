@@ -1016,7 +1016,9 @@ originator is matched as the person it acts for, its `owner_user_id`:
 | A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
 The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`),
-through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:649`):
+through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
+the same read every gate that matches a role makes
+([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
 
 - **On every forward request**, never at enrollment or when the socket connects. A
   role given counts from the person's next forward, on a tunnel that is already open
@@ -1053,11 +1055,11 @@ flowchart TD
 
 | Test | What it locks |
 |---|---|
-| `tunnel_role_subject_tests::a_role_subject_forwards_for_a_member_who_holds_the_role_and_for_no_one_else` (`crates/tests/src/tunnel_role_subject_tests.rs:278`) | a holder of the role forwards; a member without it is refused `acl_denied` |
-| `…::the_role_is_read_on_every_forward_so_losing_it_or_the_org_stops_the_next_one` (`:323`) | on one open session: the role taken back refuses, given back allows, the person removed from the org refuses |
-| `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:379`) | a device forwards on its owner's role, and is refused once the owner left the org |
-| `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:436`) | a role of another org, and a role the org deleted, grant nothing here |
-| `…::the_other_subject_kinds_forward_as_before` (`:516`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
+| `tunnel_role_subject_tests::a_role_subject_forwards_for_a_member_who_holds_the_role_and_for_no_one_else` (`crates/tests/src/tunnel_role_subject_tests.rs:297`) | a holder of the role forwards; a member without it is refused `acl_denied` |
+| `…::the_role_is_read_on_every_forward_so_losing_it_or_the_org_stops_the_next_one` (`:342`) | on one open session: the role taken back refuses, given back allows, the person removed from the org refuses |
+| `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
+| `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
+| `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
 | `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2188`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)

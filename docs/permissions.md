@@ -13,7 +13,8 @@ that bit us — what the client is allowed to conclude from a `403`.*
 
 Authorization is a `u64` bitfield per role, OR-ed across the roles a member
 holds in one tenant. `ADMINISTRATOR` (bit 23) is a bypass: `has(mask, flag)` is
-true whenever it is set.
+true whenever it is set. Only the roles **of that tenant** count, read at each
+decision ([below](#which-roles-count-the-orgs-own-read-where-they-are-used)).
 
 ```mermaid
 flowchart LR
@@ -35,6 +36,128 @@ as a JSON number, exact only below 2^53).
 
 ⚠️ **A bit defined in Rust that the UI does not list is a permission nobody can
 grant from the product.** The mirror is hand-maintained.
+
+### Which roles count: the org's own, read where they are used
+
+A membership row (`tenant_members.role_ids`) lists role ids. **A role counts in an
+org only if it is a `roles` row of that org at the moment a decision is made.** An
+id the row lists for a role the org has deleted since, or for a role of another
+org, adds no permission bit and satisfies no rule that names it. One read applies
+the rule for every consumer, `TenantDao::org_roles_among`
+(`crates/services/src/dao/tenant.rs:660`): the permission mask and every
+role-scoped rule read through it, so the two never disagree on who holds what.
+
+```mermaid
+flowchart LR
+    ROW["membership row<br/>tenant_members.role_ids"] --> Q{"a roles row<br/>of THIS org, now?"}
+    Q -->|yes| LIVE["the member's roles"]
+    Q -->|"no: deleted since,<br/>or another org's"| NONE["counts nowhere"]
+    LIVE --> MASK["permission mask<br/>get_member_permissions"]
+    LIVE --> SUBJ["role subjects<br/>member_live_role_ids · CompileRoles"]
+    SUBJ --> G1["tunnel forward"]
+    SUBJ --> G2["overlay ACL"]
+    SUBJ --> G3["remote-control allow-list<br/>request and resume"]
+    SUBJ --> G4["SSH allow-list"]
+    SUBJ --> G5["exec allow-list"]
+```
+
+**Nothing caches a member's roles**: not an enrollment, a socket's connect or a
+session's start. Each reader asks when it decides, so a role given counts from the
+next decision, and a role taken back or deleted stops counting there.
+
+| reader | decides | asked | a read that fails |
+|---|---|---|---|
+| `get_member_permissions` (`tenant.rs:712`) | the permission mask behind `require_permission` and every gate that asks for a bit | every request | the request fails; no mask is guessed. No membership row is `not_a_member` |
+| `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`) | a tunnel policy's `RoleId` subjects ([tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635)) | every forward, when a live policy names a role | no roles, WARN |
+| `CompileRoles` (`crates/modules/network/src/overlay.rs:2516`) | the overlay ACL's `RoleId` sources: netmap shaping, the DERP allow table, org-relay grants | every compile: the org's role ids in one query, kept for the nodes it resolves, intersected with each node owner's row | shaping: no roles, WARN; a relay grant: refused; the relay reconcile: no decision for that member |
+| `resolve_session_authz` (`crates/modules/remote/src/controller.rs:979`) | a device's remote-control allow-list (`access_policy.allowed_role_ids`) | every session request | no roles, WARN |
+| `resume_gate` (`controller.rs:1174`) | the same allow-list when a session resumes | every resume | the resume is refused, and the viewer's redial runs the whole gate |
+| `authorize` gate 3 (`crates/modules/network/src/routes/agent_ssh.rs:259`) | `ssh_policy.allowed_role_ids` | every SSH request, when the list names a role | no roles, WARN |
+| `authorize` gate 3 (`crates/modules/fleet/src/agent_exec.rs:317`) | `exec_policy.allowed_role_ids` | every exec request, when the list names a role | no roles, WARN |
+
+Two readers only show or notify. The members list keeps each row to the org's roles
+with one roles query per listing (`list_members`, `crates/api/src/routes/user.rs:119`),
+so the role chips show what counts. Who is told that a device was paired, or that
+someone from outside came near a device (FR-52), comes from `members_with_permission`
+(`tenant.rs:802`), the same fold over the org's own roles.
+
+⚠️ **No roles is a refusal for role entries, and nothing else.** A user who is not a
+member, a read that fails and a row whose ids the org no longer has all give an
+empty role set: an entry that names a role does not match, the failure is logged at
+WARN, and every other subject (a user, a device, everyone) is decided as before. A
+failed read never becomes an allow.
+
+⚠️ **An empty role SET is not an empty allow-LIST.** The first makes a rule's role
+entries miss. The second, an allow-list with no entries, means "no restriction by
+role" on a device's remote-control, SSH and exec policies. Nothing turns one into
+the other.
+
+⚠️ **The overlay compile reads the org's role set once**, because a netmap build
+resolves every node of the org and the set is the same for all of them; a query per
+node would multiply on the busiest path. The compile is still the point of use, and
+a change of roles re-fans the org ([below](#the-overlay-on-a-role-change)).
+
+### Who may write a role id
+
+Every write that stores a role id accepts only the org's own roles, **for every
+caller, `ADMINISTRATOR` included**. `ADMINISTRATOR` passes the permission-bit check
+of a grant, never the lookup.
+
+| write | gate | a role that is not the org's |
+|---|---|---|
+| assign a role, `POST …/role/{rid}/assign/{uid}` | `MANAGE_ROLES` | 404: `check_grant_roles` (`crates/api/src/routes/role.rs:82`) resolves each id in the org, then `check_grant` (`:50`) checks the bits; `TenantDao::assign_role` (`tenant.rs:620`) refuses it as well |
+| add a member with roles, `POST …/member` | `INVITE_MEMBERS` | 404, the same two checks (`TenantDao::add_member`, `tenant.rs:520`) |
+| create an invite, `POST …/invite`, `…/invite/batch` | `INVITE_MEMBERS` | 404, `check_grant_roles` |
+| redeem an invite, `POST /api/invite/{code}/accept` or registering with its code | the invitee | the invite's roles the org still has (`redeemed_role_ids`, `crates/api/src/routes/invite.rs:166`). If none is left, 409 `conflict` and nothing is spent: the inviter sends a new invite. An invite that names no role gives `member` |
+| a device's remote-control, exec or SSH allow-list: `PUT …/agent/{aid}`, `…/exec-policy`, `…/ssh-policy` | `MANAGE_AGENTS` | 400 `bad_request` `Unknown role id: <hex>` (`guards::require_org_roles`, `crates/core/src/guards.rs:71`; called at `crates/modules/fleet/src/agent.rs:1530`, `crates/modules/fleet/src/agent_exec.rs:996`, `crates/modules/network/src/routes/agent_ssh.rs:1006`) |
+| a tunnel policy's `RoleId` subject, `POST`/`PUT …/tunnel-policy` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/tunnel.rs:961`, `:1042`) |
+| an overlay ACL rule's `RoleId` source, `POST`/`PUT …/overlay-acl` | `MANAGE_AGENTS` | 400, the same guard (`crates/modules/network/src/routes/overlay_policy.rs:195`, `:251`) |
+
+A role named by a member-row write is an object the request resolves in the org,
+like any id, hence the 404. A role named in a policy is a value of the body, hence
+the 400, the sibling of the routes' `Invalid role id`.
+
+⚠️ **A policy write accepts back an id it already stores.** The editors send a
+policy's stored lists back on every save, so a stored id of a role deleted since
+must not make the rest of the policy unsaveable. It matches nobody (above). Only an
+id the write adds must be the org's; a create has nothing stored.
+
+⚠️ **A role id is never pruned from a policy**, not on a write and not when the role
+is deleted. Because an empty role allow-list means "no restriction by role",
+dropping the last id would widen a rule that matches nobody into one that matches
+everybody.
+
+### Deleting a role
+
+`DELETE …/role/{rid}` (`MANAGE_ROLES`) looks the role up in the org, so another
+org's role is a 404 like no role at all, and a managed or default role is refused
+with 403. `RoleDao::delete` (`crates/services/src/dao/role.rs:114`) deletes the row,
+then pulls the id from the org's membership rows. The row goes first on purpose:
+once it is gone the id counts nowhere, so a pull that fails (logged at WARN) or an
+assign that races it leaves an id that grants nothing and matches no rule. Policies
+that name the role keep the id, and it matches nobody.
+
+### The overlay on a role change
+
+The overlay ACL is compiled into each node's netmap, the DERP allow table and the
+org-relay grants, so a change of who holds which role reaches the nodes when they
+are recompiled. Every write that changes it (assign, unassign, delete, adding a
+member, an invite's redemption, registration with an invite) calls
+`HookRegistry::org_roles_changed` (`crates/core/src/hooks.rs:346`) after its write.
+The network module's hook (`crates/modules/network/src/membership.rs:82`) re-fans the
+org 750 ms later, and only while the org's overlay ACL is `warn` or `enforce`
+(`refan_for_role_change`, `crates/modules/network/src/routes/overlay_policy.rs:334`):
+under `off` a role shapes nothing. The request never waits for the re-fan.
+
+⚠️ **One re-fan per org at a time** (`RefanQueue`, `membership.rs:130`). A re-fan
+reads on the order of N² rows for an org of N nodes, so runs that overlapped for one
+org would multiply on a shared pod. A change that arrives while a re-fan waits out
+the 750 ms joins it. Changes that arrive while one runs only mark one more run owed:
+the run in progress finishes, then exactly one more starts, whatever the number of
+changes. The mark is cleared before a run reads anything, so every change is
+followed by a run that started after it. A worker that
+panics clears its org's mark as it unwinds (`WorkerMark`, `membership.rs:200`), so
+the next change starts a new one.
 
 ## 2 · The managed roles
 
@@ -92,7 +215,7 @@ still hold them:
 - any role an owner granted `HIVE_RUN` holds bit 32.
 
 §3's reconcile only adds (`stored | definition`,
-`crates/services/src/dao/tenant.rs:427`), so nothing takes them out. A new
+`crates/services/src/dao/tenant.rs:459`), so nothing takes them out. A new
 permission on one of these bits would reach every role that ever held the old
 one at the next boot, with no migration to review. Deleting a name opens the
 same door: `all_contains_every_named_permission` and
@@ -377,8 +500,11 @@ needs only `MANAGE_AGENTS` — revocation is not a grant.
 | managed-role table | `role::MANAGED_ROLES` (same file) |
 | seed at tenant creation | `TenantDao::create_default_roles` |
 | reconcile at boot | `TenantDao::reconcile_managed_roles`, called from `crates/api/src/main.rs` under the `startup_maintenance` lease |
+| which roles a member holds | `TenantDao::org_roles_among`, `get_member_permissions`, `member_live_role_ids`, `org_role_ids` (`crates/services/src/dao/tenant.rs`); the overlay's `CompileRoles` (`crates/modules/network/src/overlay.rs`) |
+| a role id in a write | `check_grant_roles` (`crates/api/src/routes/role.rs`), `TenantDao::add_member` / `assign_role`, `redeemed_role_ids` (`crates/api/src/routes/invite.rs`), `guards::require_org_roles` |
+| a role's delete, the re-fan | `RoleDao::delete` (`crates/services/src/dao/role.rs`); `MembershipLifecycle::org_roles_changed` (`crates/core/src/hooks.rs`) |
 | the tenant/permission guards | `crates/core/src/guards.rs` |
 | error → wire | `crates/core/src/error.rs` |
 | client contract | `ui/src/api/client.ts` |
 | UI mirror + predicates | `ui/src/utils/permissions.ts` |
-| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `crates/tests/src/tunnel_policy_permission_tests.rs`, `crates/tests/src/magic_dns_permission_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts`, `ui/src/__tests__/stores/tunnelPolicies.spec.ts`, `ui/src/__tests__/stores/overlayRoutes.spec.ts` |
+| tests | `crates/tests/src/member_role_ids_tests.rs`, `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `crates/tests/src/tunnel_policy_permission_tests.rs`, `crates/tests/src/magic_dns_permission_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts`, `ui/src/__tests__/stores/tunnelPolicies.spec.ts`, `ui/src/__tests__/stores/overlayRoutes.spec.ts` |

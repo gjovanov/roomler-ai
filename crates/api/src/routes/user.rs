@@ -113,6 +113,10 @@ pub async fn list_members(
         .find_member_facts(&user_ids)
         .await
         .unwrap_or_default();
+    // The roles each member holds as the org has them, read once for the
+    // page: the list shows the roles that count, never an id the org no
+    // longer has.
+    let org_roles = state.tenants.org_role_ids(tid).await?;
 
     let mut rows: Vec<MemberResponse> = members
         .into_iter()
@@ -124,7 +128,11 @@ pub async fn list_members(
                 nickname: m.nickname,
                 display_name: f.map(|f| f.display_name.clone()).unwrap_or_default(),
                 email: f.map(|f| f.email.clone()).unwrap_or_default(),
-                role_ids: m.role_ids.iter().map(|r| r.to_hex()).collect(),
+                role_ids: org_roles
+                    .live_among(m.role_ids)
+                    .iter()
+                    .map(|r| r.to_hex())
+                    .collect(),
                 joined_at: m.joined_at.try_to_rfc3339_string().unwrap_or_default(),
             }
         })

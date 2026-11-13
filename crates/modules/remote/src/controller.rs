@@ -971,11 +971,21 @@ pub async fn resolve_session_authz(
         .lock_ask(lock_on_end)
         .capped(org_session_cap));
     }
-    let role_ids = state
+    // The roles the controller holds in the device's org NOW, as that org has
+    // them: an id their row still lists for a role deleted since, or one of
+    // another org, matches no allow-list entry. A failed read matches none.
+    let role_ids = match state
         .tenants
-        .member_role_ids(agent.tenant_id, controller_user_id)
+        .member_live_role_ids(agent.tenant_id, controller_user_id)
         .await
-        .unwrap_or_default();
+    {
+        Ok(roles) => roles,
+        Err(e) => {
+            tracing::warn!(tenant = %agent.tenant_id, user = %controller_user_id, %e,
+                "rc: the controller's roles could not be read; role entries of the allow-list will not match");
+            Vec::new()
+        }
+    };
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
         return Ok(SessionAuthz::allow_with_input(
             mode,
@@ -1161,7 +1171,7 @@ pub(crate) async fn resume_gate(
     match gate_read(
         state
             .tenants
-            .member_role_ids(agent.tenant_id, controller_user_id)
+            .member_live_role_ids(agent.tenant_id, controller_user_id)
             .await,
         "no longer a member of the device's organization",
         "the member's roles could not be read",
