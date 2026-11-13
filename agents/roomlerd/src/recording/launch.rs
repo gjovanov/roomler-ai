@@ -187,6 +187,10 @@ pub struct Facts {
     /// (Linux, root only) the uid signed in at the active graphical session:
     /// a person's, never a display manager's greeter.
     pub console_uid: Option<u32>,
+    /// #3830 — (Linux, root only) who is at the screen could not be told in
+    /// time: the console lookup gave no answer within its wait, or could not
+    /// run. Not confirmed, so neither a person to record as nor nobody.
+    pub not_known_yet: bool,
     /// (SYSTEM or root only, when nobody the recorder can run as is signed
     /// in) a screen is showing anyway: on Windows always (the console's
     /// sign-in screen); on Linux an active graphical session that is not a
@@ -210,6 +214,9 @@ pub fn decide_from(f: Facts) -> Result<Identity, Refusal> {
         if f.linux {
             return match f.console_uid {
                 Some(uid) => Ok(Identity::SessionUser { uid }),
+                // #3830 — ahead of the login screen and of "nobody": an
+                // answer not had in time is read as neither.
+                None if f.not_known_yet => Err(Refusal::NotKnownYet),
                 None if f.login_screen => Err(Refusal::LoginScreen),
                 None => Err(Refusal::NoConsoleUser),
             };
@@ -222,19 +229,32 @@ pub fn decide_from(f: Facts) -> Result<Identity, Refusal> {
     Ok(Identity::Inherit)
 }
 
-/// Read the facts for THIS process, now (who is signed in may be an answer
-/// from the last few seconds; see [`decide_fresh`]).
-pub fn facts() -> Facts {
-    facts_with(false)
+/// #3830 — the facts for THIS process, never waiting on the system. On a
+/// Linux system install, who is at the screen is the console lookup's last
+/// answer, however old, and a lookup starts off the async runtime when that
+/// answer is older than its window ([`unix::seat_now`]). For what is SHOWN:
+/// the state's `available`, and what the device advertises. Windows asks
+/// every time, as it always has.
+pub fn facts_now() -> Facts {
+    #[cfg(target_os = "linux")]
+    {
+        let f = base_facts();
+        if f.service_account {
+            return seen(f, unix::seat_now(), unix::Reach::of_this_process());
+        }
+        f
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        base_facts()
+    }
 }
 
-/// `fresh`: ask the system who is signed in, never a cached answer. Windows
-/// asks every time anyway; Linux caches `loginctl`'s answer for a few
-/// seconds unless asked fresh.
-fn facts_with(fresh: bool) -> Facts {
+/// What this process is, all but who is at the screen on Linux. Windows reads
+/// its console here, every time.
+fn base_facts() -> Facts {
     #[cfg(windows)]
     {
-        let _ = fresh;
         let service_account = crate::win_identity::process_is_local_system();
         let console_session = if service_account {
             win::signed_in_console_session()
@@ -248,6 +268,7 @@ fn facts_with(fresh: bool) -> Facts {
             above_medium: win::own_integrity_rid().is_none_or(|rid| rid > win::MEDIUM_RID),
             console_session,
             console_uid: None,
+            not_known_yet: false,
             // With nobody signed in, the console shows the sign-in screen: a
             // Windows device always has one (a headless server's console
             // session included). A user token that cannot be had, and the
@@ -261,36 +282,19 @@ fn facts_with(fresh: bool) -> Facts {
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot
         // fail.
         let root = unsafe { libc::geteuid() } == 0;
-        #[cfg(target_os = "linux")]
-        let seat = if root {
-            unix::seat(fresh)
-        } else {
-            unix::Seat::Empty
-        };
-        #[cfg(not(target_os = "linux"))]
-        let _ = fresh;
         Facts {
             windows: false,
             linux: cfg!(target_os = "linux"),
             service_account: root,
             above_medium: false,
             console_session: None,
-            #[cfg(target_os = "linux")]
-            console_uid: seat.person(),
-            #[cfg(not(target_os = "linux"))]
             console_uid: None,
-            // A greeter, or a screen the recorder could reach with no session
-            // registered for it; never the host's own virtual desktop, which
-            // only a remote controller ever sees (`unix::shows_a_screen`).
-            #[cfg(target_os = "linux")]
-            login_screen: root && unix::shows_a_screen(seat, unix::Reach::of_this_process()),
-            #[cfg(not(target_os = "linux"))]
+            not_known_yet: false,
             login_screen: false,
         }
     }
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = fresh;
         Facts {
             windows: false,
             linux: false,
@@ -298,21 +302,91 @@ fn facts_with(fresh: bool) -> Facts {
             above_medium: false,
             console_session: None,
             console_uid: None,
+            not_known_yet: false,
             login_screen: false,
         }
     }
 }
 
-/// Who a recorder launched now would run as, or why none can be.
-pub fn decide() -> Result<Identity, Refusal> {
-    decide_from(facts())
+/// (Linux) A root daemon's facts `f`, with who the console lookup says is at
+/// the screen. Only a root daemon asks: anyone else records as themselves.
+#[cfg(target_os = "linux")]
+fn seen(f: Facts, seat: unix::Seat, reach: unix::Reach) -> Facts {
+    Facts {
+        console_uid: seat.person(),
+        not_known_yet: seat == unix::Seat::NotKnownYet,
+        // A greeter, or a screen the recorder could reach with no session
+        // registered for it; never the host's own virtual desktop, which only
+        // a remote controller ever sees (`unix::shows_a_screen`).
+        login_screen: unix::shows_a_screen(seat, reach),
+        ..f
+    }
+}
+
+/// Who a recorder launched now would run as, or why none can be, from what is
+/// known NOW ([`facts_now`]): never a wait. For what is SHOWN.
+pub fn decide_now() -> Result<Identity, Refusal> {
+    decide_from(facts_now())
+}
+
+/// Who a recorder launched now would run as, or why none can be: for what is
+/// DECIDED (a local start, the folder, acting as the person).
+///
+/// #3830 — on a Linux system install, who is signed in is at most
+/// [`unix::CONSOLE_TTL`] old, or else asked off the async runtime and waited
+/// for [`unix::CONSOLE_LOOKUP_WAIT`] at most ([`unix::seat_current`]). No
+/// answer in that time is [`Refusal::NotKnownYet`].
+pub async fn decide() -> Result<Identity, Refusal> {
+    #[cfg(target_os = "linux")]
+    {
+        let f = base_facts();
+        if f.service_account {
+            let seat = unix::seat_current().await;
+            return decide_from(seen(f, seat, unix::Reach::of_this_process()));
+        }
+        decide_from(f)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        decide_from(base_facts())
+    }
 }
 
 /// [`decide`], asking the system afresh who is signed in (P1f): the
 /// launch-time re-check of an unattended start and the watch over a running
 /// one must see a sign-in the moment it happens, never a cached "nobody".
-pub fn decide_fresh() -> Result<Identity, Refusal> {
-    decide_from(facts_with(true))
+///
+/// #3830 — never on an async worker. On Linux, only a lookup that began
+/// after this call answers, through the console's one lookup in flight,
+/// [`unix::CONSOLE_LOOKUP_WAIT`] at most; elsewhere on a blocking thread. No
+/// answer in time, or one that cannot be had, is [`Refusal::NotKnownYet`]:
+/// not confirmed, never "nobody".
+pub async fn decide_fresh() -> Result<Identity, Refusal> {
+    #[cfg(target_os = "linux")]
+    {
+        let f = base_facts();
+        if f.service_account {
+            let seat = unix::seat_fresh().await;
+            return decide_from(seen(f, seat, unix::Reach::of_this_process()));
+        }
+        decide_from(f)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::task::spawn_blocking(|| decide_from(base_facts()))
+            .await
+            .unwrap_or(Err(Refusal::NotKnownYet))
+    }
+}
+
+/// #3830 — on a Linux system install, start the console lookup now, off the
+/// async runtime, so the first status already has an answer. Never waits;
+/// nothing elsewhere.
+pub fn prime() {
+    #[cfg(target_os = "linux")]
+    if base_facts().service_account {
+        let _ = unix::seat_now();
+    }
 }
 
 /// What `roomlerd record --whoami` prints: the identity a recorder actually
@@ -1368,8 +1442,7 @@ use crate::fs_identity::own_groups;
 pub(crate) mod unix {
     use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::Launched;
     // The account and the thread's filesystem identity: shared with received
@@ -1377,12 +1450,22 @@ pub(crate) mod unix {
     #[cfg(test)]
     use crate::fs_identity::fsuid;
     pub(crate) use crate::fs_identity::{Account, FsIdentity};
+    use crate::one_in_flight::{Asked, Remembered};
 
     /// How long an answer to "who is signed in" is reused. The Recordings
     /// view polls the state every second while a recording runs, and each
     /// lookup is several `loginctl` processes; a sign-in or sign-out shows
-    /// within this.
-    const CONSOLE_TTL: Duration = Duration::from_secs(5);
+    /// within this. #3830 — what is SHOWN shows it one poll later: it reads
+    /// the last answer and starts the next lookup.
+    pub(crate) const CONSOLE_TTL: Duration = Duration::from_secs(5);
+
+    /// #3830 — how long what is DECIDED, and P1f's fresh checks, wait for the
+    /// console lookup. logind's own D-Bus timeout is 25 s, and every
+    /// `loginctl` waits it out. A healthy walk is a few `loginctl` processes,
+    /// far less than half of this, and half is what one lookup in flight
+    /// needs to answer every caller (`one_in_flight`'s cost). No answer in
+    /// this time is [`Seat::NotKnownYet`].
+    pub(crate) const CONSOLE_LOOKUP_WAIT: Duration = Duration::from_secs(3);
 
     /// What logind says about who is at the screen.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1400,6 +1483,13 @@ pub(crate) mod unix {
         /// logind could not be asked (no `loginctl`, or it failed). Never
         /// read as [`Seat::Empty`]'s "no session".
         Unknown,
+        /// #3830 — no answer in time: the console lookup gave none within
+        /// [`CONSOLE_LOOKUP_WAIT`] (a stopped or hung logind), or our lookup
+        /// could not run. Not confirmed, so never a person and never "no
+        /// session". Unlike [`Seat::Unknown`], which with nothing the
+        /// recorder could reach still lets a remote recording run unattended,
+        /// it lets nothing run: someone may have signed in meanwhile.
+        NotKnownYet,
     }
 
     impl Seat {
@@ -1407,7 +1497,7 @@ pub(crate) mod unix {
         pub(crate) fn person(self) -> Option<u32> {
             match self {
                 Self::Person(uid) => Some(uid),
-                Self::NoPerson | Self::Empty | Self::Unknown => None,
+                Self::NoPerson | Self::Empty | Self::Unknown | Self::NotKnownYet => None,
             }
         }
     }
@@ -1453,107 +1543,171 @@ pub(crate) mod unix {
     /// the scanout (found in review — "no logind session" is not "no
     /// screen"). The host's own virtual desktop and the synthetic source are
     /// no one's screen, whatever the seat says.
+    ///
+    /// #3830 — a seat not told in time always is: a person may have signed in
+    /// at the real screen meanwhile, whatever the recorder could reach.
     pub(crate) fn shows_a_screen(seat: Seat, reach: Reach) -> bool {
         match seat {
             Seat::Person(_) => false,
+            Seat::NotKnownYet => true,
             _ if reach.own_virtual_desktop || reach.synthetic => false,
             Seat::NoPerson => true,
             Seat::Empty | Seat::Unknown => reach.display || reach.drm,
         }
     }
 
-    /// The last answer to "who is signed in", and when it was had.
-    pub(super) struct ConsoleCache(Mutex<Option<(Instant, Seat)>>);
+    /// #3830 — who is at the screen: the last answer, and the one lookup in
+    /// flight, on a thread named `console-lookup`. No lock is held across a
+    /// lookup, and none runs on an async worker. A hung logind holds this
+    /// one thread, however many ask.
+    static CONSOLE: Remembered<Seat> = Remembered::new("console-lookup", CONSOLE_TTL);
 
-    impl ConsoleCache {
-        pub(super) const fn new() -> Self {
-            Self(Mutex::new(None))
-        }
-
-        /// `lookup`'s answer, reused for [`CONSOLE_TTL`] unless `fresh`.
-        ///
-        /// ⚠️ P1f's guards pass `fresh`: the re-check before an unattended
-        /// recorder launches, and the watch while one runs. A cached "nobody"
-        /// read twice within a few milliseconds is ONE observation, so a
-        /// person who signed in inside the window would be recorded with no
-        /// banner (found in review: the re-check was a no-op on the cache).
-        pub(super) fn get(&self, fresh: bool, lookup: impl FnOnce() -> Seat) -> Seat {
-            let mut cached = self.0.lock().unwrap_or_else(|p| p.into_inner());
-            if !fresh
-                && let Some((at, seat)) = *cached
-                && at.elapsed() < CONSOLE_TTL
-            {
-                return seat;
-            }
-            let seat = lookup();
-            *cached = Some((Instant::now(), seat));
-            seat
-        }
+    /// #3830 — who is at the screen, never waiting: the console lookup's last
+    /// answer, however old, with a lookup started when it is past
+    /// [`CONSOLE_TTL`]. [`Seat::NotKnownYet`] before the first answer. For
+    /// what is SHOWN.
+    pub(super) fn seat_now() -> Seat {
+        seat_remembered(CONSOLE.now(look))
     }
 
-    static CONSOLE: ConsoleCache = ConsoleCache::new();
+    /// #3830 — who is at the screen, at most [`CONSOLE_TTL`] old, or else the
+    /// answer of a lookup that began after this call, waited for
+    /// [`CONSOLE_LOOKUP_WAIT`] at most. For what is DECIDED.
+    pub(super) async fn seat_current() -> Seat {
+        seat_answered(
+            CONSOLE.current(CONSOLE_LOOKUP_WAIT, look).await,
+            CONSOLE_LOOKUP_WAIT,
+        )
+    }
 
-    /// Who is at the active graphical session. A person is a `Class=user`
-    /// session, never a display manager's greeter, and uid 0 is no person:
-    /// the recorder never runs as root. `fresh` asks the system now,
-    /// whatever was asked a moment ago.
+    /// Who is at the screen, asked of the system now: only a lookup that
+    /// began after this call answers it, waited for [`CONSOLE_LOOKUP_WAIT`]
+    /// at most.
+    ///
+    /// ⚠️ P1f's guards ask fresh: the re-check before an unattended recorder
+    /// launches, and the watch while one runs. A cached "nobody" read twice
+    /// within a few milliseconds is ONE observation, so a person who signed
+    /// in inside the window would be recorded with no banner (found in
+    /// review: the re-check was a no-op on the cache). #3830 — and an answer
+    /// not had in time is [`Seat::NotKnownYet`], never the cached one.
+    pub(super) async fn seat_fresh() -> Seat {
+        seat_answered(
+            CONSOLE.fresh(CONSOLE_LOOKUP_WAIT, look).await,
+            CONSOLE_LOOKUP_WAIT,
+        )
+    }
+
+    /// The lookup itself: who is at the active graphical session, from the
+    /// `loginctl` walks. A person is a `Class=user` session, never a display
+    /// manager's greeter, and uid 0 is no person: the recorder never runs as
+    /// root.
     ///
     /// ⚠️ FR-85 decision 6: a greeter is NOT an empty seat. Both mean
     /// "nobody to record as", but only an empty one can mean nobody is
     /// looking ([`shows_a_screen`] decides, with what the recorder could
     /// reach).
-    pub(super) fn seat(fresh: bool) -> Seat {
-        CONSOLE.get(fresh, || {
-            let person = crate::companion::graphical_session_matching(None, true)
-                .ok()
-                .map(|s| s.uid);
-            classify(person, any_graphical_session)
-        })
+    fn look() -> Seat {
+        let person = crate::companion::graphical_session_matching(None, true)
+            .ok()
+            .map(|s| s.uid);
+        classify(person, any_graphical_session)
+    }
+
+    /// What is shown before the first answer: not known yet.
+    fn seat_remembered(last: Option<Seat>) -> Seat {
+        last.unwrap_or(Seat::NotKnownYet)
+    }
+
+    /// What a caller that waited `wait` takes from the lookup in flight.
+    fn seat_answered(asked: Asked<Seat>, wait: Duration) -> Seat {
+        match asked {
+            Asked::Answer(seat) => seat,
+            Asked::Failed(why) => {
+                tracing::warn!(
+                    %why,
+                    "recording: the console lookup failed — who is signed in is not confirmed"
+                );
+                Seat::NotKnownYet
+            }
+            Asked::OutOfTime => {
+                tracing::warn!(
+                    ?wait,
+                    "recording: the console lookup gave no answer in time — who is signed in is not confirmed"
+                );
+                Seat::NotKnownYet
+            }
+        }
     }
 
     /// #3830 — the console lookup stood in, for the tests that hold one up:
     /// the `loginctl` walk is `lookup`, and everything above it is the
-    /// daemon's own. A manager given one
-    /// (`RecordingManager::with_console_stand_in`) decides as a Linux root
-    /// daemon whose console lookup this is, whatever this test process is.
+    /// daemon's own, through a [`Remembered`] of the stand-in's own. A
+    /// manager given one (`RecordingManager::with_console_stand_in`) decides
+    /// as a Linux root daemon whose console lookup this is, whatever this
+    /// test process is.
     #[cfg(test)]
     pub(crate) struct StandIn {
-        cache: ConsoleCache,
+        console: &'static Remembered<Seat>,
         lookup: std::sync::Arc<dyn Fn() -> Seat + Send + Sync>,
+        wait: Duration,
     }
 
     #[cfg(test)]
     impl StandIn {
         /// `lookup` in place of the walk. `wait`: how long a caller that
-        /// must have an answer waits for it.
+        /// must have an answer waits for it ([`CONSOLE_LOOKUP_WAIT`] in the
+        /// daemon).
         pub(crate) fn new(
             lookup: impl Fn() -> Seat + Send + Sync + 'static,
             wait: Duration,
         ) -> Self {
-            let _ = wait;
             Self {
-                cache: ConsoleCache::new(),
+                console: Box::leak(Box::new(Remembered::new("console-test", CONSOLE_TTL))),
                 lookup: std::sync::Arc::new(lookup),
+                wait,
             }
         }
 
-        /// Who a recorder launched now would run as: a root daemon's
-        /// decision from this lookup, with no display or scanout of its own.
-        pub(crate) fn decide(&self, fresh: bool) -> Result<super::Identity, super::Refusal> {
-            let seat = self.cache.get(fresh, || (self.lookup)());
-            super::decide_from(super::Facts {
+        fn look(&self) -> impl FnOnce() -> Seat + Send + 'static {
+            let lookup = self.lookup.clone();
+            move || lookup()
+        }
+
+        /// A root daemon's decision from `seat`, with no display or scanout
+        /// of its own.
+        fn as_root(seat: Seat) -> Result<super::Identity, super::Refusal> {
+            let root = super::Facts {
                 windows: false,
                 linux: true,
                 service_account: true,
                 above_medium: false,
                 console_session: None,
-                console_uid: seat.person(),
-                login_screen: shows_a_screen(seat, Reach::default()),
-            })
+                console_uid: None,
+                not_known_yet: false,
+                login_screen: false,
+            };
+            super::decide_from(super::seen(root, seat, Reach::default()))
+        }
+
+        /// [`super::decide_now`], from this lookup.
+        pub(crate) fn decide_now(&self) -> Result<super::Identity, super::Refusal> {
+            Self::as_root(seat_remembered(self.console.now(self.look())))
+        }
+
+        /// [`super::decide`], from this lookup.
+        pub(crate) async fn decide(&self) -> Result<super::Identity, super::Refusal> {
+            let asked = self.console.current(self.wait, self.look()).await;
+            Self::as_root(seat_answered(asked, self.wait))
+        }
+
+        /// [`super::decide_fresh`], from this lookup.
+        pub(crate) async fn decide_fresh(&self) -> Result<super::Identity, super::Refusal> {
+            let asked = self.console.fresh(self.wait, self.look()).await;
+            Self::as_root(seat_answered(asked, self.wait))
         }
     }
 
-    /// The pure half of [`seat`]: `person` is the uid at the active
+    /// The pure half of [`look`]: `person` is the uid at the active
     /// `Class=user` session, if one is; `any_active` asks whether ANY
     /// graphical session is active (a greeter's included), and is asked only
     /// when no person was found. An `Err` from it is [`Seat::Unknown`].
@@ -1875,29 +2029,60 @@ pub(crate) mod unix {
         }
 
         /// P1f's guards ask FRESH. Inside its window a cached "nobody" is
-        /// still the answer after someone signed in; a fresh ask goes to the
-        /// system, sees them, and refreshes the cache. Red when `fresh` is
-        /// ignored: the launch re-check and the running watch would read the
-        /// same stale "nobody" and record the person with no banner.
-        #[test]
-        fn a_fresh_ask_sees_a_sign_in_the_cache_would_hide() {
-            let cache = ConsoleCache::new();
+        /// still the answer after someone signed in, for what is decided and
+        /// for what is shown; a fresh ask goes to the system, sees them, and
+        /// refreshes the cache. Red when the fresh ask takes the cache: the
+        /// launch re-check and the running watch would read the same stale
+        /// "nobody" and record the person with no banner. #3830 — through
+        /// the console's own `Remembered`, as the daemon asks it.
+        #[tokio::test]
+        async fn a_fresh_ask_sees_a_sign_in_the_cache_would_hide() {
+            let console: &'static Remembered<Seat> =
+                Box::leak(Box::new(Remembered::new("console-test", CONSOLE_TTL)));
+            let wait = CONSOLE_LOOKUP_WAIT;
+            let current = |lookup: fn() -> Seat| async move {
+                seat_answered(console.current(wait, lookup).await, wait)
+            };
             assert_eq!(
-                cache.get(false, || Seat::NoPerson),
+                current(|| Seat::NoPerson).await,
                 Seat::NoPerson,
                 "nobody signed in"
             );
             assert_eq!(
-                cache.get(false, || Seat::Person(1000)),
+                current(|| Seat::Person(1000)).await,
                 Seat::NoPerson,
                 "inside the window the cached answer stands"
             );
-            assert_eq!(cache.get(true, || Seat::Person(1000)), Seat::Person(1000));
             assert_eq!(
-                cache.get(false, || Seat::Empty),
+                seat_remembered(console.now(|| Seat::Person(1000))),
+                Seat::NoPerson,
+                "and is what is shown"
+            );
+            assert_eq!(
+                seat_answered(console.fresh(wait, || Seat::Person(1000)).await, wait),
+                Seat::Person(1000)
+            );
+            assert_eq!(
+                current(|| Seat::Empty).await,
                 Seat::Person(1000),
                 "the fresh answer refreshed the cache"
             );
+        }
+
+        /// #3830 — what the console lookup's callers take when it gives no
+        /// answer in time, or cannot run: not known yet, never a seat. What
+        /// is shown before any answer is not known yet too.
+        #[test]
+        fn no_answer_in_time_is_not_known_yet() {
+            let wait = CONSOLE_LOOKUP_WAIT;
+            assert_eq!(seat_answered(Asked::OutOfTime, wait), Seat::NotKnownYet);
+            assert_eq!(
+                seat_answered(Asked::Failed("its thread did not start".into()), wait),
+                Seat::NotKnownYet
+            );
+            assert_eq!(seat_answered(Asked::Answer(Seat::Empty), wait), Seat::Empty);
+            assert_eq!(seat_remembered(None), Seat::NotKnownYet);
+            assert_eq!(seat_remembered(Some(Seat::NoPerson)), Seat::NoPerson);
         }
 
         #[test]
@@ -1906,6 +2091,7 @@ pub(crate) mod unix {
             assert_eq!(Seat::NoPerson.person(), None);
             assert_eq!(Seat::Empty.person(), None);
             assert_eq!(Seat::Unknown.person(), None);
+            assert_eq!(Seat::NotKnownYet.person(), None);
         }
 
         /// FR-85 decision 6: a greeter, and root's own desktop, are a login
@@ -2045,6 +2231,7 @@ mod tests {
             above_medium: high,
             console_session: console,
             console_uid: None,
+            not_known_yet: false,
             login_screen: false,
         }
     }
@@ -2058,6 +2245,7 @@ mod tests {
             above_medium: false,
             console_session: None,
             console_uid: console,
+            not_known_yet: false,
             login_screen: false,
         }
     }
@@ -2068,6 +2256,43 @@ mod tests {
             login_screen: true,
             ..f
         }
+    }
+
+    /// The same facts, with who is at the screen not told in time (#3830).
+    fn not_known(f: Facts) -> Facts {
+        Facts {
+            not_known_yet: true,
+            ..f
+        }
+    }
+
+    /// #3830 — a root daemon that could not tell in time who is at the
+    /// screen refuses by that name, ahead of the login screen and of
+    /// "nobody", so a remote recording never runs unattended on a timeout.
+    /// An identity that is not the service's never asks. Red when the flag is
+    /// ignored: the facts read as "nobody", and a remote start records
+    /// unattended with no banner while someone may be signed in.
+    #[test]
+    fn who_is_at_the_screen_not_told_in_time_refuses_by_that_name() {
+        assert_eq!(
+            decide_from(not_known(linux(true, None))),
+            Err(Refusal::NotKnownYet)
+        );
+        assert_eq!(
+            decide_from(not_known(at_login(linux(true, None)))),
+            Err(Refusal::NotKnownYet),
+            "ahead of the login screen"
+        );
+        assert_eq!(
+            decide_from(not_known(linux(false, None))),
+            Ok(Identity::Inherit),
+            "a user unit records as itself"
+        );
+        assert_eq!(
+            Refusal::NotKnownYet.message(),
+            tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN,
+            "the files' and the person socket's words for the same cause"
+        );
     }
 
     #[test]
@@ -2196,6 +2421,6 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // a root container: the refusal is right
         }
-        assert!(decide().is_ok(), "{:?}", facts());
+        assert!(decide_now().is_ok(), "{:?}", facts_now());
     }
 }

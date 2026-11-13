@@ -46,6 +46,13 @@
 //! no-op on the cache before this was so. A LOCAL recording still needs
 //! someone at the device.
 //!
+//! #3830 — each waits for that answer `launch::unix::CONSOLE_LOOKUP_WAIT` at
+//! most, off the async runtime, and an answer not had in that time is NOT
+//! CONFIRMED (`Refusal::NotKnownYet`): the start is refused, and the
+//! unattended recording is stopped, as for a sign-in. An ATTENDED recording
+//! is never asked: its person is at the screen with its banner up, and a hung
+//! logind cannot change who that is.
+//!
 //! The microphone is not a remote option: [`RecordingManager::start_remote`]
 //! has no parameter for it.
 //!
@@ -418,6 +425,8 @@ async fn grace_watch(session_id: ObjectId) {
             None
         } else if !gates().enabled {
             Some("gate_revoked")
+        // P1f — only an unattended recording is asked, and an answer not had
+        // in time stops it, as a sign-in does (#3830).
         } else if unattended && fresh_remote_identity(m).await != Ok(Identity::Unattended) {
             Some("session_changed")
         } else if Instant::now() >= deadline {
@@ -607,14 +616,15 @@ fn manager() -> Option<&'static Arc<RecordingManager>> {
     MANAGER.get()
 }
 
-/// P1f — [`RecordingManager::identity_remote_fresh`] off the async runtime:
-/// asking afresh who is signed in runs `loginctl` on Linux. An answer that
-/// cannot be had reads as "nobody to record as" at a start (refused) and as
-/// "someone" in the watch (stopped): closed both ways.
+/// P1f — [`RecordingManager::identity_remote_fresh`]: who is signed in,
+/// asked afresh. #3830 — never on an async worker: on Linux, through the
+/// console lookup's one lookup in flight, `launch::unix::CONSOLE_LOOKUP_WAIT`
+/// at most (a blocking thread elsewhere). An answer that cannot be had in
+/// time is NOT CONFIRMED ([`Refusal::NotKnownYet`]): a start refuses it, and
+/// the watch over an unattended recording reads it as a possible sign-in and
+/// stops the recording. Closed both ways, never "nobody".
 async fn fresh_remote_identity(m: &'static Arc<RecordingManager>) -> Result<Identity, Refusal> {
-    tokio::task::spawn_blocking(move || m.identity_remote_fresh())
-        .await
-        .unwrap_or(Err(Refusal::NoConsoleUser))
+    m.identity_remote_fresh().await
 }
 
 /// The wire code and words for a remote start the identity rule refuses. A
@@ -1249,10 +1259,13 @@ impl Handler {
 
         // FR-85 decision 6 — a device at its login screen is refused before
         // anyone is asked: whoever stands at a sign-in screen must not be
-        // asked to approve what could never run there. The answer after the
-        // question is decided afresh below, whatever this one said.
+        // asked to approve what could never run there. #3830 — nor is anyone
+        // asked while who is at the screen cannot be told: that start could
+        // only be refused after the question. The answer after the question
+        // is decided afresh below, whatever this one said.
         if self.ctx.prompt_window.is_some()
-            && let Err(r @ Refusal::LoginScreen) = fresh_remote_identity(m).await
+            && let Err(r @ (Refusal::LoginScreen | Refusal::NotKnownYet)) =
+                fresh_remote_identity(m).await
         {
             return Some(identity_refusal(r));
         }
@@ -2106,7 +2119,11 @@ impl Handler {
                 // P1f — an UNATTENDED recording ends the moment someone signs
                 // in: they never saw it start, and nothing on their screen
                 // says it runs. Asked fresh every tick, never from a cache;
-                // an answer that cannot be had counts as "someone" (closed).
+                // an answer that cannot be had counts as "someone" (closed),
+                // and so does one not had in time (#3830, `NotKnownYet`).
+                // ⚠️ Asked ONLY while unattended: an attended recording's
+                // person is at the screen with its banner up, and a hung
+                // logind must not end it.
                 let signed_in = unattended
                     && !stopping
                     && fresh_remote_identity(m).await != Ok(Identity::Unattended);
