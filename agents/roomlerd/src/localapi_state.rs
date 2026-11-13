@@ -779,6 +779,13 @@ impl LocalApiState for DaemonState {
         let direct_socks = view.direct_socks.clone();
         let derp_inbound_drops = view.derp_inbound_drops;
         drop(view);
+        // #3781 — a Windows tray too old to connect to this daemon, read fresh:
+        // the service host may have just refreshed it. #3814: before the
+        // literal, so no field's lock is held across its file and registry reads.
+        #[cfg(target_os = "windows")]
+        let companion_too_old = crate::companion::too_old_here();
+        #[cfg(not(target_os = "windows"))]
+        let companion_too_old = None;
         NodeStatus {
             node_id: self.node_id.clone(),
             name: self.name.lock().map(|n| n.clone()).unwrap_or_default(),
@@ -998,12 +1005,7 @@ impl LocalApiState for DaemonState {
                 .keep_busy_worker
                 .as_ref()
                 .map(crate::delegate::DelegateHost::worker_status),
-            // #3781 — a Windows tray too old to connect to this daemon, read
-            // fresh: the service host may have just refreshed it.
-            #[cfg(target_os = "windows")]
-            companion_too_old: crate::companion::too_old_here(),
-            #[cfg(not(target_os = "windows"))]
-            companion_too_old: None,
+            companion_too_old,
         }
     }
 
@@ -1657,7 +1659,7 @@ impl LocalApiState for DaemonState {
             let Some(path) = crate::logging::tail_source_path(&source) else {
                 return Response::Error {
                     message: format!(
-                        "no log file for source {source:?} (expected daemon | service | panic)"
+                        "no log file for source {source:?} (expected daemon | service | installer | panic)"
                     ),
                 };
             };

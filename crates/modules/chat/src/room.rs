@@ -9,6 +9,7 @@ use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
+use tracing::Instrument;
 
 use crate::ChatState;
 use roomler_ai_db::models::role::permissions;
@@ -329,6 +330,17 @@ pub async fn update(
     Ok(Json(serde_json::json!({ "updated": true })))
 }
 
+/// How long a room delete waits for what the room held to end
+/// (`room_removed`) before it answers. The slowest healthy teardown, a call
+/// another pod serves, costs a directory read, a bus request whose reply
+/// waits at most 2 s (`cluster::bus::RPC_DEADLINE`), a second read and a
+/// release, and one write of the call's stats record: well inside 5 s. A
+/// Redis or Mongo node lost without a reset hangs a read without end; the
+/// delete answers anyway, the teardown runs on in its own task, and the pod
+/// serving the call ends it on its own once it finds the room's document
+/// gone.
+pub const ROOM_REMOVED_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub async fn delete(
     State(state): State<ChatState>,
     auth: AuthUser,
@@ -350,6 +362,55 @@ pub async fn delete(
     .await?;
 
     state.rooms.cascade_delete(tid, rid).await?;
+
+    // The room is gone, and every membership of it with it: what the room held
+    // ends now, a call running in it for everyone in it (`conference`'s hook).
+    // Told once the room is gone, so nothing new is admitted on it meanwhile;
+    // a join or a start already on its way looks again once it has built its
+    // seat or router. The delete has happened whatever the hook says, so a
+    // failure there is logged, not answered: the pod serving the call ends it
+    // on its own once it finds the room's document gone.
+    //
+    // The teardown runs in a task of its own and the delete waits for it at
+    // most `ROOM_REMOVED_BOUND`: one that outlasts the bound, or a client that
+    // hangs up, never cuts it off half-way (a router already removed whose
+    // people were not yet told would be told by no one).
+    // The task logs how the teardown ended itself, so an end past the bound,
+    // after the delete answered, is still seen.
+    let hooks = state.hooks.clone();
+    let teardown = tokio::spawn(
+        async move {
+            let started = std::time::Instant::now();
+            match hooks.room_removed(tid, rid).await {
+                Err(e) => {
+                    tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held failed");
+                }
+                Ok(()) if started.elapsed() >= ROOM_REMOVED_BOUND => {
+                    tracing::info!(
+                        tenant = %tid, room = %rid, took = ?started.elapsed(),
+                        "room delete: ending what the room held finished after the delete answered"
+                    );
+                }
+                Ok(()) => {}
+            }
+        }
+        .in_current_span(),
+    );
+    match tokio::time::timeout(ROOM_REMOVED_BOUND, teardown).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.is_panic() => {
+            tracing::error!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held panicked");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(tenant = %tid, room = %rid, %e, "room delete: ending what the room held was cancelled");
+        }
+        Err(_) => {
+            tracing::error!(
+                tenant = %tid, room = %rid, bound = ?ROOM_REMOVED_BOUND,
+                "room delete: ending what the room held is still running; the delete answers, the teardown goes on"
+            );
+        }
+    }
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }

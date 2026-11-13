@@ -2494,7 +2494,8 @@ pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
 /// too old to connect to it, Roomler replaces it by itself and when, the one
 /// command that retries now and the one that says why it failed. Those are
 /// the service's when the machine-wide service refreshes the tray, and this
-/// daemon's own when it does that itself.
+/// daemon's own when it does that itself. #3814: with the switch set where
+/// the refresh runs, that the tray is replaced only at a start.
 fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
     let first = match &c.installed {
         Some(v) => format!(
@@ -2518,11 +2519,18 @@ fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
             "roomler logs --grep \"desktop companion\"",
         )
     };
-    vec![
-        first,
+    // #3814 — `ROOMLERD_COMPANION_SYNC=0` turns the retry off. The refresh at
+    // a start stays, so a restart still retries now.
+    let replaced = if c.retry_off {
+        "Roomler replaces it only at a start: its automatic retry is off \
+         (ROOMLERD_COMPANION_SYNC=0)"
+    } else {
         "Roomler replaces it by itself, retrying every few minutes for an hour after a start, \
          then every 4 h"
-            .to_string(),
+    };
+    vec![
+        first,
+        replaced.to_string(),
         format!("To retry now: {retry}"),
         format!("Why it failed: {why}"),
     ]
@@ -4769,6 +4777,7 @@ mod devices_tests {
             installed: Some("0.4.212".into()),
             minimum: "0.4.216".into(),
             by_service: true,
+            retry_off: false,
         };
         assert_eq!(
             tray_lines(&c),
@@ -4795,6 +4804,37 @@ mod devices_tests {
             "version UNKNOWN (no version marker): one older than 0.4.216 cannot connect to this \
              daemon"
         );
+    }
+
+    /// #3814 — with `ROOMLERD_COMPANION_SYNC=0` set where the refresh runs,
+    /// the second line says the retry is off and names the switch. The
+    /// refresh at a start stays on, so the other three lines do not change.
+    #[test]
+    fn the_tray_lines_say_when_the_retry_is_off() {
+        let mut c = localapi::CompanionTooOld {
+            installed: Some("0.4.212".into()),
+            minimum: "0.4.216".into(),
+            by_service: true,
+            retry_off: false,
+        };
+        let retried = tray_lines(&c);
+        c.retry_off = true;
+        let off = tray_lines(&c);
+        assert_eq!(
+            off[1],
+            "Roomler replaces it only at a start: its automatic retry is off \
+             (ROOMLERD_COMPANION_SYNC=0)"
+        );
+        assert!(!off[1].contains("retrying"), "{}", off[1]);
+        assert_eq!(
+            [&off[0], &off[2], &off[3]],
+            [&retried[0], &retried[2], &retried[3]]
+        );
+
+        c.by_service = false;
+        let own = tray_lines(&c);
+        assert_eq!(own[1], off[1]);
+        assert_eq!(own[2], "To retry now: restart roomlerd");
     }
 
     /// FR-55 AC6 — `config set power_policy` on a Mac prints the daemon's own

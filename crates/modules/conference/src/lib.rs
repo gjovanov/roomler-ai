@@ -35,11 +35,12 @@
 //!
 //! And [`Module::hooks`]: when someone's membership of an org or a room ends,
 //! core tells this module, which ends the call seats that membership admitted
-//! (`revoke`).
+//! (`revoke`); when a room is deleted, its call ends for everyone in it.
 //!
-//! The bus handlers (`media.cmd`, `media.leave_user`, …) and the 10 s claim
-//! heartbeat are wired in [`Module::init`] — they need only this state, so the
-//! "registered on the built AppState" step the host used to run is gone.
+//! The bus handlers (`media.cmd`, `media.leave_user`, …), the 10 s claim
+//! heartbeat and the 10 s reconcile that ends a deleted room's call (each a
+//! loop of its own) are wired in [`Module::init`] — they need only this state,
+//! so the "registered on the built AppState" step the host used to run is gone.
 
 use std::sync::Arc;
 
@@ -89,6 +90,13 @@ pub struct ConferenceState {
     /// The per-socket limit on `media:*` frames, for the sockets this pod
     /// holds ([`frame_limit`]).
     pub media_frames: Arc<frame_limit::MediaFrameLimiter>,
+    /// How many reconcile reads in a row found no document for a room whose
+    /// media this pod serves (`media_cluster::rooms_gone`). Locked only for
+    /// the verdict, never across an await.
+    pub(crate) media_room_misses: Arc<std::sync::Mutex<std::collections::HashMap<ObjectId, u8>>>,
+    /// How many reconcile reads of the rooms failed in a row
+    /// (`media_cluster::end_calls_of_rooms_gone`); reset by one that succeeds.
+    pub(crate) media_reconcile_failed_reads: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::ops::Deref for ConferenceState {
@@ -175,9 +183,12 @@ impl Module for ConferenceState {
             media_frames: Arc::new(frame_limit::MediaFrameLimiter::from_settings(
                 &settings.meetings,
             )),
+            media_room_misses: Arc::default(),
+            media_reconcile_failed_reads: Arc::default(),
             core,
         };
-        // C-4 — the owner-side bus handlers + the 10 s claim heartbeat.
+        // C-4 — the owner-side bus handlers + the 10 s claim heartbeat, and
+        // the 10 s reconcile that ends a deleted room's call.
         media_cluster::wire_media_cluster(&state);
         // Stats PR-1 — the per-pod media sampler (no-op unless stats are on).
         media_stats::spawn_media_sampler(state.clone());
@@ -261,7 +272,7 @@ impl Module for ConferenceState {
 
     /// The inverse edge: a call seat ends with the membership that admitted
     /// it — the person removed from the org or leaving it, or leaving the
-    /// room ([`revoke`]).
+    /// room — and a deleted room's call ends for everyone in it ([`revoke`]).
     fn hooks(&self) -> roomler_core::Hooks {
         revoke::hooks(self)
     }
