@@ -74,17 +74,103 @@ fn segment_of(
     }
 }
 
+/// #3802 — the agent's folders in one account's tree, as `ProjectDirs` names
+/// them: the config folder, the data folder and the local data folder.
+/// [`project_dirs`] returns this rather than a `ProjectDirs` because on macOS
+/// the tree hangs off the home the account database names ([`dirs_for`]), and
+/// a `ProjectDirs` takes its home from `$HOME` with no way to be given another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDirs {
+    config: PathBuf,
+    data: PathBuf,
+    data_local: PathBuf,
+}
+
+impl AppDirs {
+    pub fn config_dir(&self) -> &Path {
+        &self.config
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data
+    }
+
+    pub fn data_local_dir(&self) -> &Path {
+        &self.data_local
+    }
+}
+
+impl From<&ProjectDirs> for AppDirs {
+    fn from(dirs: &ProjectDirs) -> Self {
+        Self {
+            config: dirs.config_dir().to_path_buf(),
+            data: dirs.data_dir().to_path_buf(),
+            data_local: dirs.data_local_dir().to_path_buf(),
+        }
+    }
+}
+
+/// The folder `ProjectDirs` names on macOS for segment `app` of the account
+/// whose home is `home`: `<home>/Library/Application Support/live.roomler.<app>`.
+fn macos_app_support(home: &Path, app: &str) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join(format!("{QUALIFIER}.{ORG}.{app}"))
+}
+
+/// #3802 — the macOS rule, pure: the agent's folders for segment `app` hang
+/// off `account_home`, the home the account database names for the account
+/// this process runs as, and nothing reads `$HOME`. All three are the one
+/// [`macos_app_support`] folder, as in `ProjectDirs`' macOS layout. `None`
+/// when the account database names no home for this account.
+#[cfg(any(target_os = "macos", test))]
+fn macos_dirs(app: &str, account_home: impl FnOnce() -> Option<PathBuf>) -> Option<AppDirs> {
+    let dir = macos_app_support(&account_home()?, app);
+    Some(AppDirs {
+        config: dir.clone(),
+        data: dir.clone(),
+        data_local: dir,
+    })
+}
+
+/// #3802 — the agent's folders for segment `app` in the tree of the account
+/// this process runs as.
+///
+/// On macOS the tree hangs off the home the account database names for that
+/// account ([`own_home`], read once per process), whatever `HOME` the process
+/// was given. macOS sudo keeps the caller's `HOME` (`env_keep += "HOME"`), so
+/// a root step that read it, the one-row enrollment or a hand-typed
+/// `sudo roomlerd …`, made and owned the person's `live.roomler.roomler`, and
+/// the screen worker the root daemon starts as that person could not write
+/// it. A process given no `HOME`, which `ProjectDirs` answers from the same
+/// account database (the root daemon under launchd), or its own home in it
+/// (the LaunchAgent, the worker `sudo -u` starts, the tray), resolves the same
+/// folders as before.
+///
+/// Everywhere else `ProjectDirs` decides, as it always has: `$HOME` and the
+/// XDG variables on Linux, the known folders on Windows.
+fn dirs_for(app: &str) -> Option<AppDirs> {
+    #[cfg(target_os = "macos")]
+    {
+        static ACCOUNT_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+        macos_dirs(app, || ACCOUNT_HOME.get_or_init(own_home).clone())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ProjectDirs::from(QUALIFIER, ORG, app).map(|dirs| AppDirs::from(&dirs))
+    }
+}
+
 /// Whether to use the OLD segment for the per-user tree: [`segment_of`] over
-/// this account's own `ProjectDirs`. Cached: the filesystem answer is stable
-/// within a process, and caching guarantees every consumer in one run agrees
-/// (no split trees).
+/// this account's own folders ([`dirs_for`]). Cached: the filesystem answer is
+/// stable within a process, and caching guarantees every consumer in one run
+/// agrees (no split trees).
 fn use_old_segment() -> bool {
     static DECISION: OnceLock<bool> = OnceLock::new();
     *DECISION.get_or_init(|| {
-        let dirs = |app: &str| ProjectDirs::from(QUALIFIER, ORG, app);
         segment_of(
-            |app| dirs(app).map(|d| d.config_dir().to_path_buf()),
-            |app| dirs(app).map(|d| d.data_local_dir().to_path_buf()),
+            |app| dirs_for(app).map(|d| d.config_dir().to_path_buf()),
+            |app| dirs_for(app).map(|d| d.data_local_dir().to_path_buf()),
             Path::exists,
         ) == OLD_APP
     })
@@ -98,11 +184,12 @@ fn app_segment() -> &'static str {
     if use_old_segment() { OLD_APP } else { NEW_APP }
 }
 
-/// The agent's `ProjectDirs`, resolved to the NEW segment unless a pre-rename
-/// install is detected (then the OLD segment, so its enrolled config is never
-/// orphaned). `None` only if the platform exposes no config dir at all.
-pub fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from(QUALIFIER, ORG, app_segment())
+/// The agent's folders ([`dirs_for`]), resolved to the NEW segment unless a
+/// pre-rename install is detected (then the OLD segment, so its enrolled
+/// config is never orphaned). `None` only if the platform exposes no config
+/// dir at all, or on macOS the account database names no home.
+pub fn project_dirs() -> Option<AppDirs> {
+    dirs_for(app_segment())
 }
 
 /// FR-43 P3c — the folder [`project_dirs`]`().config_dir()` is on macOS for
@@ -112,9 +199,8 @@ pub fn project_dirs() -> Option<ProjectDirs> {
 /// person's files through it, since its own `project_dirs` is root's. Pure,
 /// with `exists` as the filesystem, so it tests on every platform.
 pub fn macos_config_dir_in_home(home: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
-    let support = home.join("Library").join("Application Support");
-    let current = support.join(format!("{QUALIFIER}.{ORG}.{NEW_APP}"));
-    let old = support.join(format!("{QUALIFIER}.{ORG}.{OLD_APP}"));
+    let current = macos_app_support(home, NEW_APP);
+    let old = macos_app_support(home, OLD_APP);
     if !exists(&current) && exists(&old) {
         old
     } else {
@@ -681,10 +767,7 @@ pub fn migrate_legacy_trees(
             "migration skipped: desktop companion is running (will retry next start)".to_string(),
         );
     } else {
-        if let (Some(old), Some(new)) = (
-            ProjectDirs::from(QUALIFIER, ORG, OLD_APP),
-            ProjectDirs::from(QUALIFIER, ORG, NEW_APP),
-        ) {
+        if let (Some(old), Some(new)) = (dirs_for(OLD_APP), dirs_for(NEW_APP)) {
             let mut pairs: Vec<(PathBuf, PathBuf)> = vec![
                 (
                     old.config_dir().to_path_buf(),
@@ -777,9 +860,17 @@ fn in_an_installer_step(old: &Path) -> String {
 /// it names no absolute folder.
 #[cfg(unix)]
 pub fn own_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
-    let uid = unsafe { libc::geteuid() };
+    account_home(unsafe { libc::geteuid() })
+}
+
+/// #3802 — the home folder the account database names for `uid`
+/// (`getpwuid_r`), never the environment. `None` when there is no entry or it
+/// names no absolute folder. The macOS supervisor reads the console person's
+/// folder through it ([`macos_config_dir_in_home`]).
+#[cfg(unix)]
+pub fn account_home(uid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
     let mut buf: Vec<libc::c_char> = vec![0; 1024];
     loop {
         // SAFETY: an all-zero `passwd` is a valid value of a plain C struct;
@@ -1979,6 +2070,133 @@ mod tests {
         // Nothing on disk yet: a first install must create the NEW tree,
         // never resurrect the retired name.
         assert_eq!(resolve_machine_global(&base), base.join(NEW_APP));
+    }
+
+    /// #3802 — the macOS rule reads no `HOME`: root's folders hang off
+    /// `/var/root`, the home the account database names for it, a person's
+    /// off theirs, and a person's is the folder a root process reaches their
+    /// files through ([`macos_config_dir_in_home`]).
+    #[test]
+    fn a_macs_folders_hang_off_the_home_the_account_database_names() {
+        let root = macos_dirs(NEW_APP, || Some(PathBuf::from("/var/root"))).unwrap();
+        let want = Path::new("/var/root/Library/Application Support/live.roomler.roomler");
+        assert_eq!(root.config_dir(), want);
+        assert_eq!(root.data_dir(), want);
+        assert_eq!(root.data_local_dir(), want);
+        let person = Path::new("/Users/p");
+        let legacy = macos_dirs(OLD_APP, || Some(person.to_path_buf())).unwrap();
+        assert_eq!(
+            legacy.config_dir(),
+            Path::new("/Users/p/Library/Application Support/live.roomler.roomler-agent")
+        );
+        assert_eq!(
+            macos_dirs(NEW_APP, || Some(person.to_path_buf()))
+                .unwrap()
+                .config_dir(),
+            macos_config_dir_in_home(person, |_| false)
+        );
+        assert_eq!(macos_dirs(NEW_APP, || None), None);
+    }
+
+    /// Set in the child [`a_child_given_another_home_keeps_its_accounts_folders`]
+    /// starts: the child prints what it resolves and writes nothing.
+    const CHILD_3802: &str = "ROOMLER_TEST_3802_CHILD";
+
+    /// Runs this test binary again as a child with `home` as its `HOME`
+    /// (`None`: no `HOME` at all, as launchd starts the root daemon) and
+    /// returns each folder the child resolved: its name, the agent's folder
+    /// ([`project_dirs`]) and `ProjectDirs`' own answer in that same child.
+    fn folders_of_a_child(home: Option<&Path>) -> Vec<(String, PathBuf, PathBuf)> {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "appdirs::tests::a_child_given_another_home_keeps_its_accounts_folders",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_3802, "1");
+        match home {
+            Some(home) => child.env("HOME", home),
+            None => child.env_remove("HOME"),
+        };
+        let out = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "the child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| {
+                // libtest prints the test's name on the same line as its first row.
+                let mut cells = line.split_once("3802|")?.1.split('|');
+                Some((
+                    cells.next()?.to_string(),
+                    PathBuf::from(cells.next()?),
+                    PathBuf::from(cells.next()?),
+                ))
+            })
+            .collect();
+        assert_eq!(rows.len(), 3, "the child printed: {stdout}");
+        rows
+    }
+
+    /// #3802 — a roomlerd process given another account's `HOME` (macOS sudo
+    /// keeps the caller's) takes its folders from the account it runs as: on
+    /// macOS from the home the account database names for it, while
+    /// `ProjectDirs` in that same child follows the `HOME` it was given, which
+    /// shows the child really had another one. With its own `HOME`, or none,
+    /// a child resolves exactly what `ProjectDirs` resolves, so nothing an
+    /// installed Mac reads moves. Everywhere else every answer is
+    /// `ProjectDirs`'. The child only resolves paths: the `HOME` it is given
+    /// stays empty, and nothing is made in the home of whoever runs this.
+    #[test]
+    fn a_child_given_another_home_keeps_its_accounts_folders() {
+        if std::env::var_os(CHILD_3802).is_some() {
+            let ours = project_dirs().expect("the agent's folders");
+            let theirs = ProjectDirs::from(QUALIFIER, ORG, app_segment()).expect("ProjectDirs");
+            for (name, ours, theirs) in [
+                ("config", ours.config_dir(), theirs.config_dir()),
+                ("data", ours.data_dir(), theirs.data_dir()),
+                ("data_local", ours.data_local_dir(), theirs.data_local_dir()),
+            ] {
+                println!("3802|{name}|{}|{}", ours.display(), theirs.display());
+            }
+            return;
+        }
+        let given = tempfile::tempdir().unwrap();
+        let another = folders_of_a_child(Some(given.path()));
+        assert!(
+            std::fs::read_dir(given.path()).unwrap().next().is_none(),
+            "the child wrote into the HOME it was given"
+        );
+        for (name, ours, theirs) in &another {
+            #[cfg(target_os = "macos")]
+            {
+                let account = own_home().expect("the account database names this account's home");
+                assert!(
+                    theirs.starts_with(given.path()),
+                    "{name}: ProjectDirs did not follow the given HOME: {theirs:?}"
+                );
+                assert!(
+                    ours.starts_with(&account) && !ours.starts_with(given.path()),
+                    "{name}: {ours:?} is not in {account:?}, the home of the account the child runs as"
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(ours, theirs, "{name}: the folders moved off ProjectDirs");
+        }
+        #[cfg(unix)]
+        let own = own_home();
+        #[cfg(not(unix))]
+        let own: Option<PathBuf> = None;
+        for home in [own.as_deref(), None] {
+            for (name, ours, theirs) in folders_of_a_child(home) {
+                assert_eq!(ours, theirs, "{name} with HOME {home:?}: a folder moved");
+            }
+        }
     }
 }
 

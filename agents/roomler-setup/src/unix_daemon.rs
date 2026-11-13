@@ -227,7 +227,7 @@ pub fn per_user_config_path() -> anyhow::Result<PathBuf> {
 /// never a fixed `~/.local/share/roomler`. On a pre-rename host that keeps
 /// its legacy tree, a new-segment config folder made beside it would turn the
 /// daemon away from its enrolled config: a new config folder decides the tree.
-pub fn unit_folders(dirs: &directories::ProjectDirs) -> [PathBuf; 2] {
+pub fn unit_folders(dirs: &roomlerd::appdirs::AppDirs) -> [PathBuf; 2] {
     [
         dirs.config_dir().to_path_buf(),
         dirs.data_local_dir().to_path_buf(),
@@ -1328,7 +1328,7 @@ mod tests {
             .home_dir()
             .to_path_buf();
         let dirs = directories::ProjectDirs::from("live", "roomler", "roomler").expect("a home");
-        let folders = unit_folders(&dirs);
+        let folders = unit_folders(&roomlerd::appdirs::AppDirs::from(&dirs));
         for rel in required {
             assert!(
                 folders.contains(&home.join(rel)),
