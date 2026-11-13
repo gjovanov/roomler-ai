@@ -1647,6 +1647,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # #3810 — the six per-Machine MSIs of this run, pm-1.msi to pm-6.msi:
+      # the same binary at versions 0.0.1-smoke.1 to 0.0.6-smoke.1, built by
+      # the hand-run upgrade step above. CI builds, unsigned: never ship them.
+      # A lab replay of the per-Machine steps on a throwaway guest installs
+      # exactly these. No step after the build moves or deletes them. Only on
+      # a pull request from a `lab/` branch, the one that asks for them: at
+      # about 20 MB a file, every other run would only fill the account's
+      # Actions storage.
+      - name: Upload the per-Machine MSIs for a lab replay (#3810)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && startsWith(github.head_ref, 'lab/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-pm-msis
+          path: ${{ runner.temp }}/pm-msi/pm-*.msi
+          if-no-files-found: warn
+          retention-days: 3
+
       # #3754 — what a failure leaves for its reader, taken before the runner
       # cleans up: every process with its image path, and the service's and the
       # per-User daemon's logs. A failed installer run has saved its own already.
