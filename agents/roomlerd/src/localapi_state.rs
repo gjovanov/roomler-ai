@@ -1360,7 +1360,7 @@ impl LocalApiState for DaemonState {
 
     /// S2 — set/clear one editable key. Same write discipline as
     /// [`set_device_name`](Self::set_device_name): daemon-wide write lock
-    /// across load→validate→save so a concurrent config writer can't have
+    /// across load→apply→save so a concurrent config writer can't have
     /// its field dropped by our full-struct save. Validation is
     /// per-key in [`crate::config_surface::apply`]; a validation error
     /// leaves the file untouched.
@@ -1370,41 +1370,48 @@ impl LocalApiState for DaemonState {
                 message: "config editing is not available on this daemon".into(),
             };
         };
+        // FR-84 D4 — `files_dir` names a folder this daemon will WRITE
+        // remote-supplied files into, as the identity it runs under. The
+        // surface's `apply` checks the shape; placement (a SYSTEM/root
+        // writer stays inside the active user's profile — the pipe admits
+        // interactive non-admins) and creatable-and-writable need THIS
+        // process's identity and its disk, so they run here, before
+        // anything is persisted: a refused value is never saved to be
+        // silently ignored at use time, and the reason goes back verbatim.
+        // #3769 — who that is (on a Linux system install, the person at
+        // seat0: logind, then the account database) is asked once, and the
+        // check runs, BEFORE the write lock: neither needs the file, and a
+        // slow lookup held under the lock held every other config read and
+        // write behind it.
+        let mut files = if key == "files_dir" {
+            match crate::files::FilesDirSet::check(value).await {
+                Ok(files) => Some(files),
+                Err(message) => return Response::Error { message },
+            }
+        } else {
+            None
+        };
         let _guard = lock.lock().await;
         let path = path.clone();
         let key = key.to_string();
         let value = value.map(str::to_string);
+        let reseed_files = files.is_some();
         let saved = tokio::task::spawn_blocking(move || {
             let mut cfg =
                 crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
-            // FR-84 D4 — `files_dir` names a folder this daemon will WRITE
-            // remote-supplied files into, as the identity it runs under. The
-            // surface's `apply` checks the shape; placement (a SYSTEM/root
-            // writer stays inside the active user's profile — the pipe admits
-            // interactive non-admins) and creatable-and-writable need THIS
-            // process's identity and its disk, so they run here, before
-            // anything is persisted: a refused value is never saved to be
-            // silently ignored at use time, and the reason goes back verbatim.
-            if key == "files_dir"
-                && let Some(v) = value.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                crate::files::validate_files_dir_setting(v)?;
-            }
             crate::config_surface::apply(&mut cfg, &key, value.as_deref())?;
             crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
             // FR-84 D4 — `files_dir` is LIVE: every transfer reads the
             // process-global this re-seeds, so the next drop already uses
-            // the new folder. The status answer is recomputed HERE, on the
-            // blocking thread, so the read right after the set shows it.
-            // Only a set OF `files_dir` re-seeds it (#2886): `files.rs` says a
-            // hand edit of the file is picked up at the next start, exactly
-            // as every other key, so a set of some other key must not make
-            // one live — and in a binary of parallel tests, every other
-            // `config_set` was resetting the global under the test that
-            // had just set it (the "re-seeded for the next drop" flake).
-            if key == "files_dir" {
+            // the new folder. Only a set OF `files_dir` re-seeds it (#2886):
+            // `files.rs` says a hand edit of the file is picked up at the
+            // next start, exactly as every other key, so a set of some other
+            // key must not make one live — and in a binary of parallel
+            // tests, every other `config_set` was resetting the global under
+            // the test that had just set it (the "re-seeded for the next
+            // drop" flake).
+            if reseed_files {
                 crate::files::set_files_dir(cfg.files_dir.clone());
-                crate::files::refresh_effective_files_dir();
             }
             let entry = crate::config_surface::entry_for(&cfg, &key)
                 .ok_or_else(|| format!("unknown config key {key:?}"))?;
@@ -1414,6 +1421,12 @@ impl LocalApiState for DaemonState {
         .unwrap_or_else(|e| Err(format!("config set task join: {e}")));
         match saved {
             Ok((entry, cfg)) => {
+                // #3769 — what `files_dir` was saved as, and its generation,
+                // read under the lock: the status answer is published for it
+                // only while it is still the configured value.
+                if let Some(files) = files.as_mut() {
+                    files.saved();
+                }
                 // Re-seed the LIVE gate-4 flags from what was just written,
                 // still under the write lock. Everything else on this surface
                 // genuinely is restart-required; `exec_enabled` and
@@ -1447,6 +1460,13 @@ impl LocalApiState for DaemonState {
                 // FR-101 P2b — and the session-policy floor: the next session
                 // is masked by it, and the hub hears it on the next heartbeat.
                 crate::session_policy::set_device_policy(crate::session_policy::from_config(&cfg));
+                drop(_guard);
+                // #3769 — the status answer is recomputed for the same person
+                // after the lock, before the answer, so the read right after
+                // the set shows it.
+                if let Some(files) = files {
+                    files.refresh_status().await;
+                }
                 // The surface says per key whether that re-seed made the
                 // change live (FR-84 D2) — log the same truth the client
                 // shows, never a blanket "on restart".
@@ -2134,7 +2154,9 @@ impl LocalApiState for DaemonState {
     /// #2871 (review) — is `uid` the person at this device's seat right now
     /// ([`crate::person_socket::at_the_seat_now`])? The person socket asks
     /// before it applies a config change. Only Linux and macOS serve one.
-    async fn at_the_seat_now(&self, uid: u32) -> bool {
+    /// #3796 — on Linux it is asked `files::SEAT_LOOKUP_WAIT` at most, and
+    /// may not be known yet.
+    async fn at_the_seat_now(&self, uid: u32) -> tunnel_core::localapi::AtTheSeat {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             crate::person_socket::at_the_seat_now(uid).await
@@ -2142,7 +2164,7 @@ impl LocalApiState for DaemonState {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = uid;
-            false
+            tunnel_core::localapi::AtTheSeat::No
         }
     }
 
