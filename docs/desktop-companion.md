@@ -1565,7 +1565,7 @@ scanner or endpoint protection can refuse it the same way). The start of the old
 as well, and the person had no tray while the log said `respawned it: true`. A later refresh that
 did swap the EXE started no tray, because none was running.
 
-Now the tray is stopped last, once the new EXE is in place:
+From `agent-v0.4.221` the tray is stopped last, once the new EXE is in place:
 
 ```mermaid
 flowchart TD
