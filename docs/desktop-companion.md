@@ -271,7 +271,7 @@ flowchart TD
 ```
 
 - **The same code decides both.** `shape_full_netmap`
-  (`crates/modules/network/src/overlay.rs:2753`) was extracted from the overlay join and is
+  (`crates/modules/network/src/overlay.rs:2810`) was extracted from the overlay join and is
   what the join itself now calls, so the list can never show a peer the netmap withholds:
   ACL `off` / `warn` list every live node, `enforce` only the shaped set.
 - ⚠️ **The device's node is found before any ACL read.** Loading the ACL can create the
@@ -1061,7 +1061,7 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12998`), asked as the channel opens (`files_channel_here`, `:13007`, from the `"files"` arm, `:1331`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3944`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:596`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4848`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12998`), asked as the channel opens (`files_channel_here`, `:13007`, from the `"files"` arm, `:1331`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3944`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:600`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4848`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:13033`), `attach_files_declined` (`:13056`), `declined_reply` (`:13087`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
 | The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12966`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
@@ -1398,6 +1398,22 @@ step differently:
 The CLI needs nothing of its own: it ships inside every daemon package (the MSI's `roomler.exe`
 shim, the `.pkg`, the `.deb`, and the tarball, where `usr/bin/roomler` is a required member).
 
+**Where the release is looked up (#3818).** Windows and Linux both move the companion to the
+daemon's OWN release, `agent-v<own>`. Both look that release up in the update feed on roomler.ai:
+`GET /api/agent/latest-release`, or `ROOMLERD_UPDATE_URL`, the list the daemon's update check
+reads. They take the exact tag from that list (`fetch_release_by_tag`,
+[`agents/roomlerd/src/updater.rs:1695`](../agents/roomlerd/src/updater.rs#L1695); where each
+lookup asks is `release_sources`, `:1674`). They never ask GitHub's API. Until #3818 they asked it
+by tag, unauthenticated, from every device at every release. Behind a corporate network's shared
+egress address, GitHub's per-address limit answered `403 Forbidden` during the agent-v0.4.218 push,
+and the tray stayed a release behind until its next try, 4 h later.
+
+| Case | What happens |
+|---|---|
+| the feed lists the tag | the companion's asset comes from that release. Its bytes come from the asset's URL in the list, through `download_asset`'s checks, as the daemon's own update does |
+| roomler.ai cannot answer (unreachable, a 5xx, a 429) | the refresh logs `desktop companion refresh skipped` with the feed's error, and the retry tries again (§13.2). The Linux sync tries again at the updater's next tick. Neither asks GitHub |
+| the feed lacks the tag | the same skip, logged as `release agent-v<own> is not in the update feed …`. The feed carries GitHub's newest page of releases (48 agent releases on 2026-11-13), so the cause is a daemon further behind than that, or a build that was never released |
+
 **Why Linux needed it.** The companion's package is installed once, by `install.sh` or the wizard,
 from a release asset. There is no apt or dnf repository, so nothing ever upgraded it. **Update
 all** moved the daemon and left the companion behind, and the grid showed the skew: a Fedora
@@ -1413,7 +1429,7 @@ flowchart TD
     Q -->|yes| V{its version vs<br/>this daemon's}
     V -->|equal| N2[nothing]
     V -->|newer| N3[logged once, never a downgrade]
-    V -->|older| F[release agent-v OWN: the companion<br/>for this arch, .deb for dpkg, .rpm for rpm]
+    V -->|older| F[release agent-v OWN, from the update feed:<br/>the companion for this arch,<br/>.deb for dpkg, .rpm for rpm]
     F --> D[download_asset: digest, the pinned key,<br/>the version binding]
     D --> I[the host's package manager,<br/>needrestart suspended]
     I --> P[stop the companions on the replaced<br/>image; start one in the session<br/>where one was stopped]

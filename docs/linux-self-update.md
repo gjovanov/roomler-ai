@@ -93,12 +93,12 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:1944-1953`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2141-2150`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`updater.rs:1875-1889`).
+(`updater.rs:2072-2086`).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —
@@ -550,16 +550,17 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3248`) | after every check that installs nothing; at the start after an update (`:3136`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3187`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3816`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3065`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3445`) | after every check that installs nothing; at the start after an update (`:3333`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3384`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4013`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3262`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
   the same task, one after the other, so two package-manager runs of ours can never fight over
   dpkg's lock. When a check finds an update, the companion waits for the next daemon, which moves
   it to ITS version at its start.
-- **The same trust path as the daemon:** `fetch_release_by_tag("agent-v<own>")`, then
+- **The same trust path as the daemon:** `fetch_release_by_tag("agent-v<own>")`, which looks the
+  release up in the update feed on roomler.ai alone, never at GitHub's API (#3818), then
   `download_asset`, which checks the digest, the `.asc` against the pinned key and the version
   binding. A refusal discards the download, and the companion keeps its version. FR-117 adds the
   `.rpm` reader (`rpm -qp --qf %{VERSION}`, `verify_rpm`, `artifact_version.rs:343`).

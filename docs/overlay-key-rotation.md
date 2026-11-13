@@ -193,7 +193,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 Resolved **once, server-side**, from the order, the claim and the proof
 (`crates/modules/fleet/src/agent.rs:885-969`); the grid only names the states
 (`AgentsSection.vue:2102-2203`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:2036-2044`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:2049-2057`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -317,7 +317,7 @@ refused join holds no lease.
 **The refusal** is `rc:overlay.join_refused { reason: key_retired, detail }`
 (`crates/remote_control/src/signaling.rs:463`). It is not retryable: the same key is
 refused again, and the way out is a new key. The detail says when and why the key retired
-and names no key (`overlay.rs:790`). A ledger read that fails refuses `store_unavailable`
+and names no key (`overlay.rs:791`). A ledger read that fails refuses `store_unavailable`
 under `enforce`, failing closed like the uniqueness check above it.
 
 ⚠️ **Old agents survive the new reason.** Agents from 0.4.41 run a decoder whose unknown
@@ -330,7 +330,7 @@ server's log and audit carry the reason.
 
 **The self-heal** is the route's own order path. `place_order`
 (`crates/modules/network/src/routes/overlay_key.rs:156`) is what the route calls and what
-the join calls for a refused agent (`overlay.rs:860`): the shared one-a-minute ceiling,
+the join calls for a refused agent (`overlay.rs:861`): the shared one-a-minute ceiling,
 `decide()`'s cells, the order on the row as desired state, the push, and ONE audit row.
 The server places it as nobody — `OrderedBy::Server`, the zero `user_id`, and
 `trigger: key_retired` on both the order and its audit row (`overlay_key.rs:114`) — and
@@ -440,7 +440,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1189` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1154-1184` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1043-1204`, `:2040-2048` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1043-1204`, `:2053-2061` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:829-837` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6387-6529`, `:3662-3704`, `:3706-3727`, `:1441-1468` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
@@ -448,7 +448,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1179-1193` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3219`, `:3237`, `:3959`, `:3207`, `:10555`, `:10817`; the node and network fields `:7022`, `:7264` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |
-| P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:790`, `:811`, `:860` |
+| P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:791`, `:812`, `:861` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:380`; nest `crates/modules/network/src/lib.rs:546`, `:604` |
 | P2 DERP | `crates/modules/network/src/derp.rs:440`, `:512-548` |
 | P2 DAO: the check · the CAS write · the switch | `crates/services/src/dao/overlay_node.rs:145`, `:346-368`; `crates/services/src/dao/overlay_network.rs:326` |

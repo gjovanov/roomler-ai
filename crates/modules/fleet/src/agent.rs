@@ -1521,7 +1521,20 @@ pub async fn update_agent(
     // device is a 404 here, like a bogus id. The setters filter on the live
     // row as well, so a removal between this read and those writes cannot
     // land one on the tombstone either.
-    state.agents.find_live_in_tenant(tid, aid).await?;
+    let current = state.agents.find_live_in_tenant(tid, aid).await?;
+
+    // The access policy's role allow-list names roles of this org only. Checked
+    // before anything below writes, so a refused body changes nothing; an id
+    // the stored policy already names is accepted back (`require_org_roles`).
+    if let Some(policy) = &body.access_policy {
+        roomler_core::guards::require_org_roles(
+            &state,
+            tid,
+            &policy.allowed_role_ids,
+            &current.access_policy.allowed_role_ids,
+        )
+        .await?;
+    }
 
     if let Some(owner) = body.owner_user_id {
         let owner_id = ObjectId::parse_str(&owner)

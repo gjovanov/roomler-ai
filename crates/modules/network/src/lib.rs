@@ -921,9 +921,7 @@ impl Module for NetworkState {
             tenant: Some(Arc::new(hooks::NetworkTenantHooks {
                 state: self.clone(),
             })),
-            membership: Some(Arc::new(membership::MembershipHooks {
-                state: self.clone(),
-            })),
+            membership: Some(Arc::new(membership::MembershipHooks::new(self.clone()))),
         }
     }
 

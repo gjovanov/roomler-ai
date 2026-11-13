@@ -285,7 +285,7 @@ sequenceDiagram
 
 | Trigger | Told by | What ends |
 |---|---|---|
-| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:231`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:111`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
+| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:111`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
 | Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:238`, `room_member_removed` | their seats in that room's call (`revoke.rs:88`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:312` `settle_call_after_departure`) |
 
 - The seats close on the pod that holds them (`revoke.rs:180` `withdraw_seats_here`), reached
