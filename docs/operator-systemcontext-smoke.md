@@ -122,7 +122,7 @@ refuses to silently fall back to `%APPDATA%`.
 
 From an elevated prompt it first takes the machine folder and its parent,
 `C:\ProgramData\roomler`, for Administrators (#3609,
-`crates/agent-core/src/config.rs:4619`): the folder's owner and nothing else,
+`crates/agent-core/src/config.rs:4661`): the folder's owner and nothing else,
 and for the parent its owner and what it inherits derived again for that
 owner (`crates/agent-core/src/machine_tree.rs:895`). A person's daemon may have
 made both to stage received files before the service ever ran, and the

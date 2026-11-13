@@ -3478,7 +3478,9 @@ pub fn machine_global_config_path() -> PathBuf {
 
 /// Sibling copy of the last config that both saved AND parsed, kept so an
 /// unreadable live file can be recovered without re-enrolling the host.
-fn prev_path(path: &std::path::Path) -> PathBuf {
+/// Public for a writer that keeps the outgoing config itself under the name
+/// [`load`] recovers from (`roomlerd one-row-home convert`).
+pub fn prev_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("toml.prev")
 }
 
@@ -4137,6 +4139,10 @@ fn private_text(file: &std::path::Path) -> Option<String> {
 /// after the save's own repair): what any other account could have put in a
 /// file there never reaches the machine config, as the fold refuses such a
 /// config ([`read_merge_base`]).
+///
+/// This half chooses the base and reads it; [`keep_unknown_keys`] makes the
+/// text from what it read, as it does for [`serialise_over`], which is handed
+/// the outgoing bytes and reads no file.
 fn serialise_for(
     path: &std::path::Path,
     base: &std::path::Path,
@@ -4174,10 +4180,25 @@ fn serialise_for(
         );
         return Ok(plain);
     };
+    Ok(keep_unknown_keys(path, base, &raw, plain, &unknown).0)
+}
+
+/// #2078 — `plain`, the text of the config being saved, with every key of
+/// `unknown` copied in from `raw`, the text of `base` it replaces at `path`;
+/// and the dotted names of those keys it could not keep. `plain` alone when
+/// `unknown` is empty, and when the merge fails (every key is then one it did
+/// not keep). A key not kept is said, with a fixed string.
+fn keep_unknown_keys(
+    path: &std::path::Path,
+    base: &std::path::Path,
+    raw: &str,
+    plain: String,
+    unknown: &[Vec<KeyStep>],
+) -> (String, Vec<String>) {
     if unknown.is_empty() {
-        return Ok(plain);
+        return (plain, Vec::new());
     }
-    match merge_unknown_keys(&raw, &plain, &unknown) {
+    match merge_unknown_keys(raw, &plain, unknown) {
         Ok((merged, lost)) => {
             if !lost.is_empty() {
                 tracing::warn!(
@@ -4188,7 +4209,7 @@ fn serialise_for(
                      the org, route or table that held them is not in it"
                 );
             }
-            Ok(merged)
+            (merged, lost)
         }
         Err(why) => {
             let keys: Vec<String> = unknown.iter().map(|s| dotted(s)).collect();
@@ -4199,9 +4220,30 @@ fn serialise_for(
                 why,
                 "config keys this build does not know were NOT kept through this save"
             );
-            Ok(plain)
+            (plain, keys)
         }
     }
+}
+
+/// FR-147 — the text [`save`] writes over a config file that holds
+/// `outgoing`, made from those bytes alone: it reads no file. For a caller
+/// that has read the live file once and checked it, and must write over the
+/// bytes it checked and nothing read later (`roomlerd one-row-home convert`).
+/// Also returns the dotted names of the keys this build does not know that it
+/// could not keep; `origin` names the file where that is said. An `outgoing`
+/// that does not read as a config holds no key this can see: the text is
+/// `cfg` alone, as [`save`] writes when neither the file nor its last good
+/// copy reads.
+pub fn serialise_over(
+    cfg: &AgentConfig,
+    outgoing: &str,
+    origin: &std::path::Path,
+) -> Result<(String, Vec<String>)> {
+    let plain = toml::to_string_pretty(cfg).context("serialising config")?;
+    let Some(unknown) = unknown_keys(outgoing) else {
+        return Ok((plain, Vec::new()));
+    };
+    Ok(keep_unknown_keys(origin, origin, outgoing, plain, &unknown))
 }
 
 /// #2078 — names the keys this build ignores in the config it runs on, once per
@@ -5171,6 +5213,51 @@ machine_name = "devbox"
             std::fs::read_to_string(&path).unwrap(),
             toml::to_string_pretty(&cfg).unwrap()
         );
+    }
+
+    /// FR-147 — what [`serialise_over`] makes from the bytes a caller holds is
+    /// exactly what [`save`] writes over a file holding them: with nothing
+    /// unknown in them, with a key this build does not know, and with one it
+    /// cannot keep, which it names.
+    #[test]
+    fn serialise_over_makes_what_a_save_writes_over_the_same_bytes() {
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        let plain = toml::to_string_pretty(&cfg).unwrap();
+        let mut with_gone = cfg.clone();
+        with_gone.orgs.push(org_fixture("gone", "tid-gone"));
+        let mut table: toml::Table =
+            toml::from_str(&toml::to_string_pretty(&with_gone).unwrap()).unwrap();
+        table["orgs"].as_array_mut().unwrap()[1]
+            .as_table_mut()
+            .unwrap()
+            .insert("a_key_from_a_newer_build".into(), 1.into());
+        let in_a_gone_org = toml::to_string_pretty(&table).unwrap();
+        let cases = [
+            ("nothing unknown", plain.clone(), false, Vec::<&str>::new()),
+            (
+                "a key this build does not know",
+                format!("a_key_from_a_newer_build = 1\n{plain}"),
+                true,
+                Vec::new(),
+            ),
+            (
+                "a key in an org this save no longer holds",
+                in_a_gone_org,
+                false,
+                vec!["orgs.1.a_key_from_a_newer_build"],
+            ),
+        ];
+        for (case, outgoing, kept, lost) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &outgoing).unwrap();
+            let (made, not_kept) = serialise_over(&cfg, &outgoing, &path).unwrap();
+            save(&path, &cfg).unwrap();
+            assert_eq!(made, std::fs::read_to_string(&path).unwrap(), "{case}");
+            assert_eq!(made.contains("a_key_from_a_newer_build"), kept, "{case}");
+            assert_eq!(not_kept, lost, "{case}");
+        }
     }
 
     /// #2078 — a key a newer build wrote into an org's entry follows THAT org,

@@ -110,7 +110,7 @@ working two-row.
 | Keep | writes root's records, in root's tree only | nothing: no `.pre-one-row` in a home |
 | LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as today (`:1395-1407`) | the plist is removed by `convert` |
 | Root's file | `config::save` of `/etc/roomler/config.toml`, as today | nothing |
-| People's files | nothing | `convert`: removes `<P>` and saves its config with the enrollments taken out (`without_enrollments`, `:265-277`) through its own `config::save`, each only over the bytes root kept. The files are born the person's |
+| People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:265-277`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and those bytes are kept as the config's `.prev`, 0600, as a save keeps the outgoing file; it reads no file again by path. The files are born the person's |
 | Restart, verify, report | as today (`:731-739`, `:797-892`) | nothing |
 | Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then the bootstrap (D6) |
 | `--revert` | its file back from its kept copy; its records removed after the restart answers | `put-back`, or `put-back-legacy` on a Mac converted by 0.4.200 to 0.4.219 |
@@ -276,8 +276,8 @@ parsed with unknown fields refused.
   and other write (0644 when none was recorded), and `<L>` 0755 when it is missing: launchd ignores a plist that
   group or others can write, and the package sets 644 (`postinstall:335-336`).
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:3880-3919`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4250-4253`), and no `.prev` repair, which belongs to the person's own agent
+  (`crates/agent-core/src/config.rs:3882-3921`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4292-4295`), and no `.prev` repair, which belongs to the person's own agent
   (`:3505-3517`). A config that does not parse stops Read, as today (`one_row.rs:1240-1242`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
@@ -535,7 +535,7 @@ Each carries its recommendation and awaits the operator.
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3505-3517`) could bring it back: its own issue.
+  previous file), and the person's agent's `.prev` repair (`config.rs:3507-3519`) could bring it back: its own issue.
 - Linux and Windows: their root steps take their folders from the system already (#3702). The uninstall's Linux arm
   (`scripts/install.sh:1885-1894`) removes people's folders as root the same way, and is not in this FR.
 

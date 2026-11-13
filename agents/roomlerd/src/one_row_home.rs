@@ -45,10 +45,15 @@
 //! open descriptor that it is a regular file, and reads at most the bound and
 //! one byte: a FIFO, a device or a huge file is an error, never a wait. A
 //! write is a new temporary file in the same folder, `fsync`, its mode set,
-//! `rename`, as `config::save` writes. `put-back` gives the plist its recorded
-//! mode less group and other write (0644 when none was recorded: launchd
-//! ignores a plist others can write) and the config its recorded owner bits
-//! (0600 when none), and makes a missing `~/Library/LaunchAgents` 0755.
+//! `rename`, as the daemon saves its config. `convert` writes only from the
+//! bytes it checked, and reads no file again by path: the new config is the
+//! text a save would write over them (`config::serialise_over`, which keeps
+//! the keys this build does not know), and they are kept as the config's
+//! `.prev` (0600), as a save keeps the outgoing file. `put-back` gives the
+//! plist its recorded mode less group and other write (0644 when none was
+//! recorded: launchd ignores a plist others can write) and the config its
+//! recorded owner bits (0600 when none), and makes a missing
+//! `~/Library/LaunchAgents` 0755.
 //!
 //! The logic is pure over [`Me`] and [`Fs`], so it runs in tests on every
 //! platform; [`RealMe`] and [`RealFs`] are the thin Unix effects.
@@ -60,7 +65,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::AgentConfig;
 use crate::one_row::{AGENT_PLIST, kept_path, without_enrollments};
 
 /// The verb root starts the child with: `roomlerd one-row-home <verb> …`.
@@ -213,7 +217,7 @@ struct Asked {
 /// `--name value` pairs, each name at most once; `args` is everything after
 /// the verb's word.
 fn flags(args: &[String]) -> Result<Vec<(&str, &str)>, String> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err("every flag takes one value".to_string());
     }
     let mut pairs: Vec<(&str, &str)> = Vec::new();
@@ -417,8 +421,6 @@ pub trait Fs {
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
     /// `mkdir`, then `mode` (the umask took group and other bits off).
     fn make_dir(&mut self, path: &Path, mode: u32) -> io::Result<()>;
-    /// `config::save`.
-    fn save_config(&mut self, path: &Path, cfg: &AgentConfig) -> anyhow::Result<()>;
 }
 
 /// The reply: one JSON object on stdout, with exit 0.
@@ -700,6 +702,17 @@ impl Outcome {
             Err(e) => Outcome::failed(Fail::Error(format!("the reply did not serialise: {e}"))),
         }
     }
+
+    /// `said` after what this says already, on its one stderr line.
+    fn saying(mut self, said: &[String]) -> Outcome {
+        for note in said {
+            if !self.stderr.is_empty() {
+                self.stderr.push_str("; ");
+            }
+            self.stderr.push_str(note);
+        }
+        self
+    }
 }
 
 enum Answer {
@@ -778,14 +791,18 @@ pub fn run(args: &[OsString], me: &mut impl Me, fs: &mut impl Fs) -> Outcome {
 /// a home of their own.
 fn answer(verb: Verb, home: &Path, me: &Creds, stdin: &[u8], fs: &mut impl Fs) -> Outcome {
     let at = Places::of(home, &*fs);
+    // What a verb that ends well still says: the child has no log.
+    let mut said = Vec::new();
     let answered = match verb {
         Verb::Read => Ok(Answer::Read(Box::new(read(&at, &*fs)))),
-        Verb::Convert { config, plist } => convert(&at, config, plist, fs).map(Answer::Convert),
+        Verb::Convert { config, plist } => {
+            convert(&at, config, plist, fs, &mut said).map(Answer::Convert)
+        }
         Verb::PutBack => put_back(&at, stdin, fs).map(Answer::PutBack),
         Verb::PutBackLegacy => put_back_legacy(&at, fs).map(Answer::PutBackLegacy),
     };
     match answered {
-        Ok(answer) => Outcome::reply(me, answer),
+        Ok(answer) => Outcome::reply(me, answer).saying(&said),
         Err(fail) => Outcome::failed(fail),
     }
 }
@@ -922,13 +939,17 @@ fn not_writable(fs: &impl Fs, path: &Path) -> Fail {
 }
 
 /// `convert`: both live files checked against what root named, both folders
-/// it changes checked writable, and the new config made, before anything
-/// changes; then the plist goes and the config is saved.
+/// it changes checked writable, and the new config made from the bytes it
+/// checked, before anything changes; then the plist goes, those bytes are kept
+/// as the config's `.prev` and the new config is written. No file is read
+/// again by path. The keys of the outgoing config it could not keep, and a
+/// `.prev` it could not write, go in `said`.
 fn convert(
     at: &Places,
     want_config: Expect,
     want_plist: Expect,
     fs: &mut impl Fs,
+    said: &mut Vec<String>,
 ) -> Result<ConvertAnswer, Fail> {
     let config = live(&*fs, &at.config, CONFIG_BOUND, want_config)?;
     let plist = live(&*fs, &at.plist, PLIST_BOUND, want_plist)?;
@@ -945,7 +966,16 @@ fn convert(
                 .map_err(|_| Fail::Error(format!("{origin} is not UTF-8")))?;
             let cfg = crate::config::parse_text(text, &origin)
                 .map_err(|e| Fail::Error(format!("{e:#}")))?;
-            Some(without_enrollments(&cfg))
+            let (blank, lost) =
+                crate::config::serialise_over(&without_enrollments(&cfg), text, &at.config)
+                    .map_err(|e| Fail::Error(format!("{e:#}")))?;
+            if !lost.is_empty() {
+                said.push(format!(
+                    "keys of {origin} this build does not know were not kept: {}",
+                    lost.join(", ")
+                ));
+            }
+            Some((bytes, blank))
         }
         None => None,
     };
@@ -958,9 +988,18 @@ fn convert(
         None => false,
     };
     let config_sha256 = match blank {
-        Some(cfg) => {
-            fs.save_config(&at.config, &cfg)
-                .map_err(|e| Fail::Error(format!("saving {origin}: {e:#}")))?;
+        Some((outgoing, blank)) => {
+            // Kept as a save keeps the outgoing file: it parsed, and a copy
+            // that cannot be made costs its recovery, not the verb.
+            let prev = crate::config::prev_path(&at.config);
+            if let Err(e) = fs.write(&prev, outgoing, 0o600) {
+                said.push(format!(
+                    "the outgoing config was not kept as {}: {e}",
+                    prev.display()
+                ));
+            }
+            fs.write(&at.config, blank.as_bytes(), 0o600)
+                .map_err(|e| Fail::Error(format!("saving {origin}: {e}")))?;
             match fs.read(&at.config, CONFIG_BOUND) {
                 Held::Present { bytes, .. } => Some(sha256_hex(&bytes)),
                 other => {
@@ -1382,10 +1421,6 @@ impl Fs for RealFs {
         std::fs::create_dir(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
     }
-
-    fn save_config(&mut self, path: &Path, cfg: &AgentConfig) -> anyhow::Result<()> {
-        crate::config::save(&path.to_path_buf(), cfg)
-    }
 }
 
 #[cfg(test)]
@@ -1519,7 +1554,7 @@ mod tests {
         }
 
         fn changes(&self) -> Vec<String> {
-            let changing = ["write", "remove", "rename", "make_dir", "save"];
+            let changing = ["write", "remove", "rename", "make_dir"];
             self.calls
                 .borrow()
                 .iter()
@@ -1592,12 +1627,6 @@ mod tests {
         fn make_dir(&mut self, path: &Path, mode: u32) -> io::Result<()> {
             self.log(format!("make_dir {} {mode:o}", path.display()));
             self.dir(path, UID, mode, true);
-            Ok(())
-        }
-        fn save_config(&mut self, path: &Path, cfg: &AgentConfig) -> anyhow::Result<()> {
-            self.log(format!("save {}", path.display()));
-            let text = toml::to_string(cfg)?;
-            self.put(path, Kind::File, UID, 0o600, text.into_bytes(), true);
             Ok(())
         }
     }
@@ -1841,6 +1870,23 @@ mod tests {
         }
     }
 
+    /// The child reads a file through [`Fs::read`] alone (bounded, on the
+    /// open descriptor): nothing in it reads by path, and nothing saves or
+    /// loads a config, which would read the live file again by path.
+    #[test]
+    fn the_child_reads_no_file_by_path() {
+        let source = include_str!("one_row_home.rs");
+        let code = source.split("\nmod tests {").next().unwrap();
+        for word in [
+            "config::save",
+            "config::load",
+            "read_to_string",
+            "fs::read(",
+        ] {
+            assert!(!code.contains(word), "the child reads by path: `{word}`");
+        }
+    }
+
     #[test]
     fn read_reports_what_is_there_and_who_owns_it() {
         let (mut fs, at) = a_home();
@@ -1938,16 +1984,73 @@ mod tests {
         assert!(!fs.nodes.contains_key(&at.plist));
         let saved = &fs.nodes[&at.config];
         assert_eq!(convert.config_sha256, Some(sha256_hex(&saved.bytes)));
-        let cfg: AgentConfig = toml::from_str(std::str::from_utf8(&saved.bytes).unwrap()).unwrap();
+        assert_eq!(saved.mode, 0o600);
+        let cfg: crate::config::AgentConfig =
+            toml::from_str(std::str::from_utf8(&saved.bytes).unwrap()).unwrap();
         assert!(cfg.agent_token.is_empty() && cfg.tenant_id.is_empty());
         assert_eq!(cfg.machine_name, "Mac", "every other key kept");
         assert_eq!(
             fs.changes(),
             [
                 format!("remove {}", at.plist.display()),
-                format!("save {}", at.config.display())
+                format!(
+                    "write {} 600",
+                    crate::config::prev_path(&at.config).display()
+                ),
+                format!("write {} 600", at.config.display()),
             ]
         );
+        assert!(out.stderr.is_empty(), "{}", out.stderr);
+    }
+
+    /// The new config is made from the bytes `convert` checked, and from
+    /// nothing read later: the config is read through [`Fs::read`] alone, once
+    /// before it is written and once after, for the reply. A key this build
+    /// does not know is kept, and one it cannot keep is said on stderr.
+    #[test]
+    fn convert_writes_from_the_bytes_it_checked() {
+        let (mut fs, at) = a_home();
+        let outgoing = format!(
+            "{ENROLLED}a_key_from_a_newer_build = 1\n\n[[orgs]]\nlabel = \"other\"\n\
+             server_url = \"https://roomler.example\"\nagent_token = \"tok-other\"\n\
+             agent_id = \"a-2\"\ntenant_id = \"t-2\"\nan_org_key_from_a_newer_build = 2\n"
+        );
+        fs.file(&at.config, outgoing.as_bytes(), 0o600);
+        let verb = shown(&at, &fs);
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        let saved = String::from_utf8(fs.nodes[&at.config].bytes.clone()).unwrap();
+        assert!(saved.contains("a_key_from_a_newer_build = 1"), "{saved}");
+        assert!(!saved.contains("tok-"), "{saved}");
+        assert!(
+            out.stderr.contains("orgs.0.an_org_key_from_a_newer_build")
+                && !out.stderr.contains('\n'),
+            "{}",
+            out.stderr
+        );
+        let config = at.config.display().to_string();
+        let calls = fs.calls.borrow();
+        let on_config: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| {
+                let (what, rest) = c.split_once(' ')?;
+                let rest = rest.strip_prefix(config.as_str())?;
+                (rest.is_empty() || rest.starts_with(' ')).then_some(what)
+            })
+            .collect();
+        assert_eq!(on_config, ["read", "write", "read"], "{calls:?}");
+    }
+
+    /// The outgoing config is kept as its `.prev`, 0600, as a save keeps it.
+    #[test]
+    fn convert_keeps_the_outgoing_config_as_prev_0600() {
+        let (mut fs, at) = a_home();
+        let verb = shown(&at, &fs);
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        let prev = &fs.nodes[&crate::config::prev_path(&at.config)];
+        assert_eq!(prev.bytes, ENROLLED.as_bytes());
+        assert_eq!(prev.mode, 0o600);
     }
 
     /// Exit 3 for each way a live file can differ from what root was shown,
@@ -2450,6 +2553,42 @@ mod tests {
             let cfg = crate::config::load(&at.config).unwrap();
             assert!(cfg.agent_token.is_empty());
             assert_eq!(mode(&at.config), 0o600);
+        }
+
+        /// `convert` on disk: the new config and the outgoing one, kept as its
+        /// `.prev`, are both 0600; the `.prev` holds the bytes it checked; a
+        /// key this build does not know is still in the config; and no
+        /// temporary file is left.
+        #[test]
+        fn convert_keeps_the_outgoing_bytes_as_prev_and_the_unknown_key() {
+            let (dir, at) = a_home();
+            let outgoing = format!("{ENROLLED}a_key_from_a_newer_build = 1\n");
+            std::fs::write(&at.config, &outgoing).unwrap();
+            chmod(&at.config, 0o600);
+            let verb = Verb::Convert {
+                config: Expect::of(Some(outgoing.as_bytes())),
+                plist: Expect::of(Some(PLIST)),
+            };
+            let out = answer(verb, dir.path(), &creds(), &[], &mut RealFs);
+            assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+            let prev = crate::config::prev_path(&at.config);
+            assert_eq!(mode(&at.config), 0o600);
+            assert_eq!(mode(&prev), 0o600);
+            assert_eq!(std::fs::read(&prev).unwrap(), outgoing.as_bytes());
+            let saved = std::fs::read_to_string(&at.config).unwrap();
+            assert!(saved.contains("a_key_from_a_newer_build = 1"), "{saved}");
+            assert!(
+                crate::config::load(&at.config)
+                    .unwrap()
+                    .agent_token
+                    .is_empty()
+            );
+            let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(
+                listing(&at.folder),
+                [name(&at.config), name(&prev)],
+                "no temporary file left"
+            );
         }
 
         #[test]
