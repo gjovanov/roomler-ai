@@ -2544,7 +2544,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3280`](../crates/localapi/src/lib.rs#L3280), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3282`](../crates/localapi/src/lib.rs#L3282), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -5281,7 +5281,7 @@ to-activate, so the browser never sees a bait-and-switch.
   folder. Filename sanitization + collision-safe rename + 2 GiB
   per-transfer cap. An upload's `id` names its staging folder, so it is one
   plain name: letters, digits, `.`, `_` and `-`, not starting with `.`, at
-  most 128 bytes (`transfer_id`, `agents/roomlerd/src/files.rs:1561`).
+  most 128 bytes (`transfer_id`, `agents/roomlerd/src/files.rs:1638`).
   `files:begin`, `files:resume`, `files:cancel` and `files:end` check it
   first, on every OS, and answer any other id with a `files:error`; the
   viewer's ids (`up-<base36>-<base36>`) are such names (#3688).
@@ -5357,13 +5357,13 @@ to-activate, so the browser never sees a bait-and-switch.
   settles a transfer on its first error and ignores the rest
   (`useRemoteControl.ts:10669-10670`), so the row kept the right reason, and
   the extra errors were noise. Each files channel now keeps a record of
-  what it refused (`RefusedBegins`, `agents/roomlerd/src/files.rs:2162`).
+  what it refused (`RefusedBegins`, `agents/roomlerd/src/files.rs:2239`).
   The chunks behind a refused begin, up to the next begin or resume, land
-  nowhere and get no answer (`chunk`, `files.rs:2616`). The first is logged
+  nowhere and get no answer (`chunk`, `files.rs:2693`). The first is logged
   at DEBUG and the rest are counted. Before, such a chunk was appended to an
   upload left open before the refused one, which a viewer's Cancel leaves
   open on the device. The end of an upload whose begin the channel refused
-  gets no answer either (`refused_at_begin`, `files.rs:2970`, asked in the
+  gets no answer either (`refused_at_begin`, `files.rs:3047`, asked in the
   End arm at `agents/roomlerd/src/peer.rs:13304`). The channel remembers its
   last 64 refused ids, the oldest forgotten first, and only ids that are one
   plain name. A begin with a refused id is a retry and runs as a fresh
@@ -5373,7 +5373,7 @@ to-activate, so the browser never sees a bait-and-switch.
   everything on the declined (#3757) and FILES-denied channels. Tests:
   `peer::refused_upload_tests` (`agents/roomlerd/src/peer.rs:17494`), over
   a real channel through the production router, and
-  `files::refused_begin_tests` (`files.rs:13078`).
+  `files::refused_begin_tests` (`files.rs:13628`).
   **A refused folder is said, not hidden** (#2930). The agent falls back to
   Downloads for a `dest_path` it will not write: a SYSTEM/root writer
   outside the active user's profile (FR-84 D4), a path that is not a
