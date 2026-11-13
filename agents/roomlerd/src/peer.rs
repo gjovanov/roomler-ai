@@ -1218,7 +1218,7 @@ impl AgentPeer {
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
-            info!(session = %session_id, %label, "data channel opened");
+            info!(session = %session_id, ?label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
             let native_dims_for_dc = native_dims_for_dc.clone();
@@ -10714,7 +10714,7 @@ fn attach_input_handler(
             let parsed: input::InputMsg = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(%e, "input: parse failed");
+                    debug!(e = ?e.to_string(), "input: parse failed");
                     return;
                 }
             };
@@ -11023,7 +11023,7 @@ fn attach_control_handler(
             let val: serde_json::Value = match serde_json::from_str(text) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(%session_id, %e, "control: malformed JSON, dropped");
+                    debug!(%session_id, e = ?e.to_string(), "control: malformed JSON, dropped");
                     return;
                 }
             };
@@ -11983,7 +11983,7 @@ fn cursor_scale_from_dims(native_dims: u64, encoded_dims: u64) -> (f32, f32) {
 fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let label = dc.label().to_string();
     dc.on_message(Box::new(move |msg| {
-        debug!(%session_id, %label, bytes = msg.data.len(), "DC msg (unhandled)");
+        debug!(%session_id, ?label, bytes = msg.data.len(), "DC msg (unhandled)");
         // FR-101 P4b-2 — a view-only session's input channel lands here: what
         // it sends is never injected, but the person sending it is present,
         // and the idle limit must not end their session under them.
@@ -12167,7 +12167,7 @@ fn attach_clipboard(
                     rx.frame(&msg.data)
                 };
                 if let Err(reason) = res {
-                    debug!(%session_id, %reason, "clipboard: dropped binary frame");
+                    debug!(%session_id, ?reason, "clipboard: dropped binary frame");
                 }
                 return;
             }
@@ -12179,7 +12179,7 @@ fn attach_clipboard(
             let parsed = match parsed {
                 Ok(p) => p,
                 Err(e) => {
-                    debug!(%session_id, %e, "clipboard: unparseable JSON");
+                    debug!(%session_id, e = ?e.to_string(), "clipboard: unparseable JSON");
                     return;
                 }
             };
@@ -12232,13 +12232,13 @@ fn attach_clipboard(
                     };
                     match outcome {
                         crate::clipboard::WriteChunkOutcome::Pending => {
-                            debug!(%session_id, id=%id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
+                            debug!(%session_id, id=?id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
                         }
                         crate::clipboard::WriteChunkOutcome::Complete(full_text) => {
                             let bytes = full_text.len();
                             match cb.write(full_text).await {
                                 Ok(()) => {
-                                    info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
+                                    info!(%session_id, id=?id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
                                     tally_clipboard(session_id, TransferDirection::ToHost, bytes);
                                     // v2 ack, keyed by the chunk id the
                                     // browser already assigns. Old UIs
@@ -12253,7 +12253,7 @@ fn attach_clipboard(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(%session_id, id=%id, %e, "clipboard: chunked write failed");
+                                    warn!(%session_id, id=?id, %e, "clipboard: chunked write failed");
                                     let reply = serde_json::json!({
                                         "t": "clipboard:error",
                                         "message": format!("{e}"),
@@ -12266,7 +12266,7 @@ fn attach_clipboard(
                             }
                         }
                         crate::clipboard::WriteChunkOutcome::Rejected(reason) => {
-                            warn!(%session_id, id=%id, %reason, "clipboard: chunk rejected");
+                            warn!(%session_id, id=?id, ?reason, "clipboard: chunk rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12555,10 +12555,10 @@ fn attach_clipboard(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, w, h, bytes, "clipboard: image write begin")
+                            debug!(%session_id, ?id, w, h, bytes, "clipboard: image write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: image begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: image begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12581,10 +12581,10 @@ fn attach_clipboard(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, html_bytes, text_bytes, "clipboard: html write begin")
+                            debug!(%session_id, ?id, html_bytes, text_bytes, "clipboard: html write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: html begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: html begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12608,10 +12608,10 @@ fn attach_clipboard(
                     };
                     match res {
                         Ok(()) => {
-                            debug!(%session_id, %id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
+                            debug!(%session_id, ?id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: native begin rejected");
+                            warn!(%session_id, ?id, ?reason, "clipboard: native begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -12693,7 +12693,7 @@ async fn finish_rich_write(
             "bytes": bytes,
         }),
         Err(message) => {
-            warn!(%session_id, id, %message, "clipboard: rich write failed");
+            warn!(%session_id, id, ?message, "clipboard: rich write failed");
             serde_json::json!({
                 "t": "clipboard:error",
                 "message": message,

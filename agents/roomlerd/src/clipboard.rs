@@ -1697,7 +1697,7 @@ impl RichRx {
         if let Some(stale) = self.in_flight.take() {
             // The browser serializes transfers; a dangling one means it
             // gave up mid-stream (reload / error). Replace it.
-            tracing::debug!(stale = %stale.id, "clipboard: replacing dangling rich transfer");
+            tracing::debug!(stale = ?stale.id, "clipboard: replacing dangling rich transfer");
         }
     }
 
