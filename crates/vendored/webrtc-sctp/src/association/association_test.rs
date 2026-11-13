@@ -2760,3 +2760,656 @@ fn test_send_failure_run_logs_first_then_rate_limited_then_recovery() {
     assert!(run.failed(at(6_000)));
     assert_eq!(run.dropped, 1);
 }
+
+// roomler (#3755): a write cut short leaves no trace. The agent gives some
+// control notices a budget (`tokio::time::timeout`), and a `select!` arm or a
+// task's abort cuts a write the same way: its future is dropped at one of its
+// awaits. A stream's sequence number and its `buffered_amount` were taken
+// before the write waited for room in the association's pending queue, so a
+// write cut while it waited left a hole in its stream's order that the peer
+// waits on forever (RFC 4960 §6.6), and every later message of the stream
+// behind it.
+
+/// The pending queue the #3755 tests give the sending side: 8 KiB, so that a
+/// message of 5461 bytes or more is queued chunk by chunk (two thirds of the
+/// queue), the way one of 85.3 KiB is on a real association's 128 KiB.
+const SMALL_QUEUE: usize = 8 * 1024;
+
+/// Polls `fut` until it has waited `waits` times and drops it there: a cut at a
+/// chosen await, the way a timeout, a `select!` arm or a task's abort cuts
+/// one. `Some` when it finished first.
+async fn cut_at_wait<F: std::future::Future>(fut: F, waits: usize) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut left = waits;
+    std::future::poll_fn(move |cx| match fut.as_mut().poll(cx) {
+        std::task::Poll::Ready(out) => std::task::Poll::Ready(Some(out)),
+        std::task::Poll::Pending if left <= 1 => std::task::Poll::Ready(None),
+        std::task::Poll::Pending => {
+            left -= 1;
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// `flush_buffers` with a ceiling: an association that never drains is a
+/// finding, not a hung test.
+async fn drains_within(
+    br: &Arc<Bridge>,
+    a0: &Association,
+    a1: &Association,
+    within: Duration,
+) -> bool {
+    tokio::time::timeout(within, flush_buffers(br, a0, a1))
+        .await
+        .is_ok()
+}
+
+/// The next message `s` reads, unless none arrives `within`.
+async fn read_within(
+    s: &Stream,
+    buf: &mut [u8],
+    within: Duration,
+) -> Option<Result<(usize, PayloadProtocolIdentifier)>> {
+    tokio::time::timeout(within, s.read_sctp(buf)).await.ok()
+}
+
+/// Moves the link until `task` is done, `within` at most. False if it is not.
+async fn link_until_done<T>(
+    br: &Arc<Bridge>,
+    task: &tokio::task::JoinHandle<T>,
+    within: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while !task.is_finished() && tokio::time::Instant::now() < deadline {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    task.is_finished()
+}
+
+/// roomler (#3755) AC1: a notice cut by its budget while the association's
+/// pending queue is full. The queue is shared by every stream of the
+/// association: the video fills it while the link holds every packet, and the
+/// notice on the ordered control stream waits for room until its budget cuts
+/// it. Once the link moves again, the next notice on the control stream must
+/// arrive, and the cut one must have left the stream's `buffered_amount` as it
+/// found it.
+#[tokio::test]
+async fn test_assoc_a_write_cut_by_its_timeout_leaves_no_gap() -> Result<()> {
+    const CONTROL: u16 = 1;
+    const VIDEO: u16 = 2;
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    a0.association_internal
+        .lock()
+        .await
+        .use_pending_queue_of(SMALL_QUEUE);
+
+    let mut findings: Vec<String> = Vec::new();
+    let outcome: Result<()> = async {
+        let (control0, control1) = establish_session_pair(&br, &a0, &mut a1, CONTROL).await?;
+        let (video0, video1) = establish_session_pair(&br, &a0, &mut a1, VIDEO).await?;
+        let queue = Arc::clone(&control0.pending_queue);
+
+        // The link stalls: nothing crosses the bridge from here on, so nothing
+        // is acknowledged. The video takes what the congestion window lets go,
+        // and fills the pending queue behind it.
+        let frame = Bytes::from(vec![0xa5u8; 1000]);
+        let mut frames = 0;
+        loop {
+            if queue.room() >= frame.len() {
+                video0
+                    .write_sctp(&frame, PayloadProtocolIdentifier::Binary)
+                    .await?;
+                frames += 1;
+                continue;
+            }
+            let room = queue.room();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if queue.room() == room {
+                break;
+            }
+        }
+        let notice = Bytes::from(vec![b'n'; 1500]);
+        assert!(
+            queue.room() < notice.len(),
+            "the queue must have no room for the notice, or this proves nothing"
+        );
+        let buffered = control0.buffered_amount();
+
+        // The notice waits for room, and its budget cuts it there.
+        let cut = tokio::time::timeout(
+            Duration::from_millis(100),
+            control0.write_sctp(&notice, PayloadProtocolIdentifier::String),
+        )
+        .await;
+        assert!(
+            cut.is_err(),
+            "the notice found room, or this proves nothing"
+        );
+        let after_cut = control0.buffered_amount();
+        if after_cut != buffered {
+            findings.push(format!(
+                "the cut notice left its bytes in the control stream's buffered_amount: \
+                 {buffered} before it, {after_cut} after it"
+            ));
+        }
+
+        // The link moves again, and the next notice goes out on the same stream.
+        if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
+            findings.push("the association never drained once the link moved again".to_owned());
+        }
+        let next = Bytes::from_static(b"{\"type\":\"rc:notice\",\"n\":2}");
+        control0
+            .write_sctp(&next, PayloadProtocolIdentifier::String)
+            .await?;
+        if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
+            findings.push("the association never drained after the next notice".to_owned());
+        }
+
+        let mut buf = vec![0u8; 4096];
+        match read_within(&control1, &mut buf, Duration::from_secs(2)).await {
+            None => findings.push(
+                "the next notice never arrived: the peer waits for the cut notice's \
+                 stream sequence number"
+                    .to_owned(),
+            ),
+            Some(read) => {
+                let (n, ppi) = read?;
+                if buf[..n] != next[..] || ppi != PayloadProtocolIdentifier::String {
+                    findings.push(format!(
+                        "the control stream delivered {n} bytes ({ppi:?}) that are not the next notice"
+                    ));
+                }
+            }
+        }
+        let drained = control0.buffered_amount();
+        if drained != 0 {
+            findings.push(format!(
+                "the control stream's buffered_amount is {drained} once everything was \
+                 acknowledged, not 0"
+            ));
+        }
+
+        // The video that filled the queue arrives whole and in order.
+        for i in 0..frames {
+            match read_within(&video1, &mut buf, Duration::from_secs(2)).await {
+                Some(read) => {
+                    let (n, _) = read?;
+                    if buf[..n] != frame[..] {
+                        findings.push(format!("video frame {i} of {frames} arrived damaged"));
+                    }
+                }
+                None => {
+                    findings.push(format!("video frame {i} of {frames} never arrived"));
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    close_association_pair(&br, a0, a1).await;
+    outcome?;
+    assert!(
+        findings.is_empty(),
+        "#3755 AC1, a write cut by its timeout:\n  - {}",
+        findings.join("\n  - ")
+    );
+    Ok(())
+}
+
+/// roomler (#3755) AC2: the fragmented variant. A message larger than the
+/// room in the queue is queued chunk by chunk (`append_large`), and it is cut
+/// part way: its first chunks queued, the next one waiting for room. The peer
+/// must never read part of a message, and the next message on the stream must
+/// arrive. A large write cut after its first chunk was queued is finished
+/// whole, in its place (its first chunks may be on the wire already), so the
+/// peer reads it whole, once, then the next message.
+#[tokio::test]
+async fn test_assoc_a_large_write_cut_part_way_is_never_read_in_part() -> Result<()> {
+    const SI: u16 = 1;
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    a0.association_internal
+        .lock()
+        .await
+        .use_pending_queue_of(SMALL_QUEUE);
+
+    let mut findings: Vec<String> = Vec::new();
+    let outcome: Result<()> = async {
+        let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+        let queue = Arc::clone(&s0.pending_queue);
+
+        // More than the whole queue: its first chunks go in, then it waits for
+        // room, and it is cut there.
+        let big: Bytes = (0..20_000u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>()
+            .into();
+        let cut = cut_at_wait(s0.write_sctp(&big, PayloadProtocolIdentifier::Binary), 1).await;
+        assert!(
+            cut.is_none(),
+            "the large write never waited, or this proves nothing"
+        );
+        assert!(
+            queue.room() < SMALL_QUEUE,
+            "the write must be cut part way, its first chunks queued, or this proves nothing"
+        );
+
+        // The next message on the stream, on a task of its own: it may wait for
+        // room while the link moves.
+        let next = Bytes::from_static(b"the next message");
+        let writer = tokio::spawn({
+            let s0 = Arc::clone(&s0);
+            let next = next.clone();
+            async move {
+                s0.write_sctp(&next, PayloadProtocolIdentifier::Binary)
+                    .await
+            }
+        });
+        if !link_until_done(&br, &writer, Duration::from_secs(10)).await {
+            findings.push("the next write never got its turn or room in the queue".to_owned());
+        } else {
+            match writer.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => findings.push(format!("the next write failed: {err}")),
+                Err(err) => findings.push(format!("the next write's task failed: {err}")),
+            }
+        }
+        if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
+            findings.push("the association never drained".to_owned());
+        }
+
+        // What the peer reads: whole messages only, the next one among them.
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut read: Vec<Bytes> = Vec::new();
+        while let Some(r) = read_within(&s1, &mut buf, Duration::from_secs(2)).await {
+            let (n, _) = r?;
+            read.push(Bytes::copy_from_slice(&buf[..n]));
+            if buf[..n] == next[..] {
+                break;
+            }
+        }
+        for m in &read {
+            if m[..] != big[..] && m[..] != next[..] {
+                findings.push(format!(
+                    "the peer read {} bytes that are neither message whole",
+                    m.len()
+                ));
+            }
+        }
+        if !read.iter().any(|m| m[..] == next[..]) {
+            findings.push(
+                "the next message never arrived: the peer waits for the rest of the cut one"
+                    .to_owned(),
+            );
+        }
+        if read.len() != 2 || read[0] != big || read[1] != next {
+            findings.push(format!(
+                "the peer read messages of {:?} bytes, not the cut one whole ({}) and then the next ({})",
+                read.iter().map(|m| m.len()).collect::<Vec<_>>(),
+                big.len(),
+                next.len()
+            ));
+        }
+        let left = s0.buffered_amount();
+        if left != 0 {
+            findings.push(format!(
+                "the stream's buffered_amount is {left} once everything was acknowledged, not 0"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    close_association_pair(&br, a0, a1).await;
+    outcome?;
+    assert!(
+        findings.is_empty(),
+        "#3755 AC2, a large write cut part way:\n  - {}",
+        findings.join("\n  - ")
+    );
+    Ok(())
+}
+
+/// roomler (#3755): a message larger than the room in the queue, on an
+/// association with nothing else to send. Its first chunks are queued and it
+/// waits for room, which only the write loop sending them makes. The write
+/// loop is woken by an acknowledgement, a timer or the end of a write: with
+/// nothing in flight, none of them comes unless the write wakes it before it
+/// waits.
+#[tokio::test]
+async fn test_assoc_a_message_larger_than_the_queue_goes_out_on_a_quiet_association() -> Result<()>
+{
+    const SI: u16 = 1;
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    a0.association_internal
+        .lock()
+        .await
+        .use_pending_queue_of(SMALL_QUEUE);
+
+    let mut findings: Vec<String> = Vec::new();
+    let outcome: Result<()> = async {
+        let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+        let big: Bytes = (0..20_000u32)
+            .map(|i| (i % 241) as u8)
+            .collect::<Vec<u8>>()
+            .into();
+        let writer = tokio::spawn({
+            let s0 = Arc::clone(&s0);
+            let big = big.clone();
+            async move { s0.write_sctp(&big, PayloadProtocolIdentifier::Binary).await }
+        });
+        if !link_until_done(&br, &writer, Duration::from_secs(10)).await {
+            findings.push(
+                "the write never finished: its first chunks were never sent, so no room \
+                 was ever made"
+                    .to_owned(),
+            );
+        } else if let Err(err) = writer
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
+        {
+            findings.push(format!("the write failed: {err}"));
+        }
+        if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
+            findings.push("the association never drained".to_owned());
+        }
+        let mut buf = vec![0u8; 32 * 1024];
+        match read_within(&s1, &mut buf, Duration::from_secs(2)).await {
+            Some(r) => {
+                let (n, _) = r?;
+                if buf[..n] != big[..] {
+                    findings.push(format!("the peer read {n} bytes, not the message whole"));
+                }
+            }
+            None => findings.push("the message never arrived".to_owned()),
+        }
+        Ok(())
+    }
+    .await;
+
+    close_association_pair(&br, a0, a1).await;
+    outcome?;
+    assert!(
+        findings.is_empty(),
+        "#3755, a message larger than the queue on a quiet association:\n  - {}",
+        findings.join("\n  - ")
+    );
+    Ok(())
+}
+
+/// What one write of the AC3 writers came to.
+#[derive(Clone, Debug, PartialEq)]
+enum CutWrite {
+    /// It returned `Ok`: its message must be read, in its place.
+    Written,
+    /// It was cut at a wait: its message is never read, or read whole, once.
+    Cut,
+    /// It returned an error.
+    Failed(String),
+    /// It was awaited to its end and did not end within its ceiling.
+    Hung,
+}
+
+/// splitmix64: the AC3 writers' seeded choices, the same on every run.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % n
+    }
+}
+
+/// Message `i` of writer `w`, `len` bytes: the writer, the index and the length
+/// up front, then bytes that only this message carries at those offsets.
+fn cut_test_message(w: u8, i: u32, len: usize) -> Bytes {
+    let mut m = Vec::with_capacity(len);
+    m.push(w);
+    m.extend_from_slice(&i.to_le_bytes());
+    m.extend_from_slice(&(len as u32).to_le_bytes());
+    while m.len() < len {
+        let k = m.len();
+        m.push(((usize::from(w) * 31 + i as usize * 7 + k) % 251) as u8);
+    }
+    m.into()
+}
+
+/// The writer and index of a whole message of `cut_test_message`, or `None`
+/// for anything else (a part of one included).
+fn parse_cut_test_message(m: &[u8]) -> Option<(u8, u32)> {
+    if m.len() < 9 {
+        return None;
+    }
+    let w = m[0];
+    let i = u32::from_le_bytes(m[1..5].try_into().ok()?);
+    let len = u32::from_le_bytes(m[5..9].try_into().ok()?) as usize;
+    if len != m.len() {
+        return None;
+    }
+    let whole = m[9..]
+        .iter()
+        .enumerate()
+        .all(|(j, &b)| b == ((usize::from(w) * 31 + i as usize * 7 + 9 + j) % 251) as u8);
+    whole.then_some((w, i))
+}
+
+/// The AC3 property over what the writers logged and what the peer read.
+fn check_cut_writes(log: &[(u8, u32, CutWrite)], read: &[Vec<u8>]) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut last_of: HashMap<u8, u32> = HashMap::new();
+    let mut read_ids = Vec::new();
+    for (k, m) in read.iter().enumerate() {
+        let Some((w, i)) = parse_cut_test_message(m) else {
+            findings.push(format!(
+                "read #{k} ({} bytes) is not a whole message",
+                m.len()
+            ));
+            continue;
+        };
+        if !seen.insert((w, i)) {
+            findings.push(format!("message {w}/{i} was read twice"));
+        }
+        if let Some(&last) = last_of.get(&w) {
+            if i <= last {
+                findings.push(format!(
+                    "writer {w}'s message {i} was read after its message {last}"
+                ));
+            }
+        }
+        last_of.insert(w, i);
+        read_ids.push((w, i));
+    }
+
+    let written: Vec<(u8, u32)> = log
+        .iter()
+        .filter(|(_, _, o)| *o == CutWrite::Written)
+        .map(|(w, i, _)| (*w, *i))
+        .collect();
+    let missing: Vec<&(u8, u32)> = written.iter().filter(|id| !seen.contains(*id)).collect();
+    if let Some(first) = missing.first() {
+        findings.push(format!(
+            "{} of the {} writes that returned Ok were never read, the first {}/{}",
+            missing.len(),
+            written.len(),
+            first.0,
+            first.1
+        ));
+    } else {
+        let read_written: Vec<(u8, u32)> = read_ids
+            .iter()
+            .filter(|id| written.contains(id))
+            .copied()
+            .collect();
+        if read_written != written {
+            findings.push(
+                "the writes that returned Ok were read in another order than they returned"
+                    .to_owned(),
+            );
+        }
+    }
+    for (w, i, o) in log {
+        match o {
+            CutWrite::Failed(err) => findings.push(format!("write {w}/{i} failed: {err}")),
+            CutWrite::Hung => findings.push(format!(
+                "write {w}/{i} was awaited and never ended within its ceiling"
+            )),
+            CutWrite::Written | CutWrite::Cut => {}
+        }
+    }
+    findings
+}
+
+/// One round of AC3 with `seed`: the findings, none when the stream stayed
+/// whole.
+async fn cut_writes_round(seed: u64) -> Result<Vec<String>> {
+    const SI: u16 = 1;
+    const WRITERS: u8 = 3;
+    const WRITES: u32 = 20;
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::NoDelay, 0).await?;
+    a0.association_internal
+        .lock()
+        .await
+        .use_pending_queue_of(SMALL_QUEUE);
+
+    let mut findings: Vec<String> = Vec::new();
+    let outcome: Result<()> = async {
+        let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+        // The link moves all along.
+        let link_up = Arc::new(AtomicBool::new(true));
+        let link = tokio::spawn({
+            let br = Arc::clone(&br);
+            let link_up = Arc::clone(&link_up);
+            async move {
+                while link_up.load(Ordering::SeqCst) {
+                    br.tick().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+
+        // What each write came to, logged in the poll it ended in: on this
+        // one-thread runtime, the order the writes that returned `Ok` were
+        // queued in.
+        let log: Arc<std::sync::Mutex<Vec<(u8, u32, CutWrite)>>> = Arc::default();
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let s0 = Arc::clone(&s0);
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut rng = SplitMix64(seed ^ (u64::from(w) << 32));
+                    for i in 0..WRITES {
+                        // One in four is large: queued chunk by chunk, and
+                        // most of them larger than the whole queue.
+                        let len = if rng.below(4) == 0 {
+                            5_500 + rng.below(14_500)
+                        } else {
+                            16 + rng.below(1_600)
+                        } as usize;
+                        let msg = cut_test_message(w, i, len);
+                        let waits = if rng.below(2) == 0 {
+                            0
+                        } else {
+                            1 + rng.below(3) as usize
+                        };
+                        let write = s0.write_sctp(&msg, PayloadProtocolIdentifier::Binary);
+                        let came_to = if waits == 0 {
+                            match tokio::time::timeout(Duration::from_secs(5), write).await {
+                                Ok(Ok(_)) => CutWrite::Written,
+                                Ok(Err(err)) => CutWrite::Failed(err.to_string()),
+                                Err(_) => CutWrite::Hung,
+                            }
+                        } else {
+                            match cut_at_wait(write, waits).await {
+                                Some(Ok(_)) => CutWrite::Written,
+                                Some(Err(err)) => CutWrite::Failed(err.to_string()),
+                                None => CutWrite::Cut,
+                            }
+                        };
+                        log.lock().unwrap().push((w, i, came_to));
+                    }
+                })
+            })
+            .collect();
+
+        let all_done = tokio::time::timeout(Duration::from_secs(40), async {
+            for writer in writers {
+                let _ = writer.await;
+            }
+        })
+        .await;
+        if all_done.is_err() {
+            findings.push("the writers did not finish within 40 s".to_owned());
+        }
+        link_up.store(false, Ordering::SeqCst);
+        let _ = link.await;
+        if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
+            findings.push("the association never drained".to_owned());
+        }
+
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut read = Vec::new();
+        while let Some(r) = read_within(&s1, &mut buf, Duration::from_millis(500)).await {
+            let (n, _) = r?;
+            read.push(buf[..n].to_vec());
+        }
+        let log = log.lock().unwrap().clone();
+        findings.extend(check_cut_writes(&log, &read));
+        let left = s0.buffered_amount();
+        if left != 0 {
+            findings.push(format!(
+                "the stream's buffered_amount is {left} once everything was acknowledged, not 0"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    close_association_pair(&br, a0, a1).await;
+    outcome?;
+    Ok(findings)
+}
+
+/// roomler (#3755) AC3: the class. Writers share one ordered stream, and each
+/// of their writes is either awaited to its end or cut at a seeded wait: for
+/// the stream's turn, for the queue's lock, for room for a small message, for
+/// room for the next chunk of a large one. The link moves all along. The peer
+/// must read only whole messages, each writer's in the order written, none
+/// twice, and every write that returned `Ok`, in the order they returned. A
+/// cut write is never read, or read whole and once, in its place.
+#[tokio::test(flavor = "current_thread")]
+async fn test_assoc_writes_cut_at_any_wait_keep_the_stream_whole() -> Result<()> {
+    let mut findings = Vec::new();
+    for seed in [0x3755_u64, 1, 2, 3] {
+        for finding in cut_writes_round(seed).await? {
+            findings.push(format!("seed {seed:#x}: {finding}"));
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "#3755 AC3, writes cut at any wait:\n  - {}",
+        findings.join("\n  - ")
+    );
+    Ok(())
+}

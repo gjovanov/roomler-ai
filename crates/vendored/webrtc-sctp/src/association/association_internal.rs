@@ -2441,3 +2441,17 @@ impl RtxTimerObserver for AssociationInternal {
         }
     }
 }
+
+/// roomler (#3755): for the tests that need the pending queue full.
+#[cfg(test)]
+impl AssociationInternal {
+    /// Gives this association a pending queue of `bytes`. Before any stream is
+    /// opened: a stream writes to the queue it was opened with.
+    pub(crate) fn use_pending_queue_of(&mut self, bytes: usize) {
+        assert!(
+            self.streams.is_empty(),
+            "the pending queue is swapped before any stream is opened"
+        );
+        self.pending_queue = Arc::new(PendingQueue::with_limit(bytes));
+    }
+}

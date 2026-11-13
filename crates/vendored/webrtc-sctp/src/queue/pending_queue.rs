@@ -33,6 +33,9 @@ pub(crate) struct PendingQueue {
     // The semaphore is not inside the lock because the permits need to be returned without needing a lock on the semaphore
     semaphore_lock: Mutex<()>,
     semaphore: Semaphore,
+    // roomler (#3755): `QUEUE_APPEND_LARGE`, two thirds of the queue's size;
+    // a field so that a test can make a queue small enough to fill.
+    append_large_at: usize,
 
     unordered_queue: RwLock<PendingBaseQueue>,
     ordered_queue: RwLock<PendingBaseQueue>,
@@ -53,6 +56,7 @@ impl PendingQueue {
         Self {
             semaphore_lock: Mutex::default(),
             semaphore: Semaphore::new(QUEUE_BYTES_LIMIT),
+            append_large_at: QUEUE_APPEND_LARGE,
             unordered_queue: Default::default(),
             ordered_queue: Default::default(),
             queue_len: Default::default(),
@@ -60,6 +64,23 @@ impl PendingQueue {
             selected: Default::default(),
             unordered_is_selected: Default::default(),
         }
+    }
+
+    /// roomler (#3755): a queue of `bytes`, for the tests that need one full
+    /// (`QUEUE_BYTES_LIMIT` is 128 MiB under `cfg(test)`).
+    #[cfg(test)]
+    pub(crate) fn with_limit(bytes: usize) -> Self {
+        Self {
+            semaphore: Semaphore::new(bytes),
+            append_large_at: (bytes * 2) / 3,
+            ..Self::new()
+        }
+    }
+
+    /// roomler (#3755): the bytes a writer could queue now without waiting.
+    #[cfg(test)]
+    pub(crate) fn room(&self) -> usize {
+        self.semaphore.available_permits()
     }
 
     /// roomler (#3716): lets go every writer parked in flow control. Their
@@ -134,7 +155,7 @@ impl PendingQueue {
 
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
 
-        if total_user_data_len >= QUEUE_APPEND_LARGE {
+        if total_user_data_len >= self.append_large_at {
             self.append_large(chunks).await
         } else {
             let _sem_lock = self.semaphore_lock.lock().await;
