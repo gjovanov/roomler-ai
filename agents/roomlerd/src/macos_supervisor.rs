@@ -607,9 +607,10 @@ pub fn gave_up_reason(
 ///
 /// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
 /// no command: moving the folder would leave it where the revert does not
-/// look. Nor does a folder that is not a directory, nor one that holds a
-/// `config.toml` ([`FolderNotTheirs::holds_config`]): a move would set it
-/// aside with the folder, so the line names it instead.
+/// look. Nor does a folder that is not a directory, nor one that holds an
+/// entry named `config.toml` ([`FolderNotTheirs::holds_config`]): a move
+/// would set it aside with the folder, so the line names it instead, and
+/// still names the copies the revert reads there.
 fn move_aside(f: &FolderNotTheirs) -> String {
     if !f.is_dir {
         return "It is not a folder but a link or a file, so this line gives no command for it."
@@ -667,10 +668,18 @@ fn move_aside(f: &FolderNotTheirs) -> String {
     // is root's own and real, and the name is plain.
     let refused = administrator_command(f);
     if refused == Err(NoCommand::HoldsConfig) {
+        // An entry of that name, whatever `lstat` read (a link or a folder
+        // too): only a file of that name is an enrollment.
+        let (dot, also) = if holds.is_empty() {
+            ("", "")
+        } else {
+            (".", " also")
+        };
         return format!(
-            "{only} It holds config.toml, and a move would set that file aside with the folder \
-             (with `macos_one_row` off, it is this person's enrollment), so this line gives no \
-             command to move it; see {INSTALL_DOC}."
+            "{only}{holds}{dot} It{also} holds an entry named config.toml, and a move would set \
+             that entry aside with the folder (with `macos_one_row` off, a file of that name is \
+             this person's enrollment), so this line gives no command to move it; see \
+             {INSTALL_DOC}."
         );
     }
     let Ok(name) = refused else {
@@ -3606,28 +3615,59 @@ mod tests {
         }
     }
 
-    /// #3802 — a folder of root's that holds a `config.toml`: a move would
-    /// set it aside with the folder, and with `macos_one_row` off it is the
-    /// person's enrollment, so the line names it and gives no command, even
-    /// where every read said yes.
+    /// #3802 — a folder of root's that holds an entry named `config.toml`
+    /// (a file, or a link, a folder or a name whose read failed): a move
+    /// would set it aside with the folder, and with `macos_one_row` off a
+    /// file of that name is the person's enrollment, so the line names it,
+    /// still names the copies the revert reads there, and gives no command,
+    /// even where every read said yes.
     #[test]
     fn the_give_up_line_gives_no_command_for_a_folder_that_holds_a_config() {
-        let folder = FolderNotTheirs {
-            holds_config: true,
-            administrator: Ok("p".to_string()),
-            ..folder_not_theirs(F.into(), 501, 0, 0o40755, Vec::new(), STAMP).expect("root's")
-        };
-        let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
-        println!("GIVE-UP [fits + config.toml in the folder] {why}");
-        assert_eq!(
-            why,
-            format!(
-                "{}{ONLY} It holds config.toml, and a move would set that file aside with the \
-                 folder (with `macos_one_row` off, it is this person's enrollment), so this line \
-                 gives no command to move it; {DOC}",
-                cause(F)
-            )
-        );
+        let names = kept_for_revert();
+        let entry = "holds an entry named config.toml, and a move would set that entry aside \
+                     with the folder (with `macos_one_row` off, a file of that name is this \
+                     person's enrollment), so this line gives no command to move it;";
+        for (case, kept, want) in [
+            (
+                "fits + config.toml in the folder",
+                &[][..],
+                format!("{}{ONLY} It {entry} {DOC}", cause(F)),
+            ),
+            (
+                "fits + config.toml + the plist copy",
+                &[0][..],
+                format!(
+                    "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd \
+                     one-row --revert` reads there and nowhere else. It also {entry} {DOC}",
+                    cause(F)
+                ),
+            ),
+            (
+                "fits + config.toml + both kept copies",
+                &[0, 1][..],
+                format!(
+                    "{}{ONLY} It holds {PLIST} and {CONFIG}, which `sudo roomlerd one-row \
+                     --revert` reads there and nowhere else. It also {entry} {DOC}",
+                    cause(F)
+                ),
+            ),
+        ] {
+            let kept = kept
+                .iter()
+                .map(|i: &usize| KeptCopy {
+                    name: names[*i].clone(),
+                    stat: THEIRS,
+                })
+                .collect();
+            let folder = FolderNotTheirs {
+                holds_config: true,
+                administrator: Ok("p".to_string()),
+                ..folder_not_theirs(F.into(), 501, 0, 0o40755, kept, STAMP).expect("root's")
+            };
+            let why = gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder));
+            println!("GIVE-UP [{case}] {why}");
+            assert_eq!(why, want, "{case}");
+        }
     }
 
     /// #3802 — the names the give-up keeps are the paths the revert reads in
