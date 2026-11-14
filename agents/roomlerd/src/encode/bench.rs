@@ -136,7 +136,7 @@ pub enum CellPath {
 }
 
 impl CellPath {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Rtp => "rtp",
             Self::Dc => "dc",
@@ -154,7 +154,7 @@ pub enum Codec {
 }
 
 impl Codec {
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "h264" => Some(Self::H264),
             "h265" | "hevc" => Some(Self::H265),
@@ -184,7 +184,7 @@ pub struct CellSpec {
 }
 
 impl CellSpec {
-    const fn new(path: CellPath, codec: Codec, chroma444: bool) -> Self {
+    pub(crate) const fn new(path: CellPath, codec: Codec, chroma444: bool) -> Self {
         Self {
             path,
             codec,
@@ -336,6 +336,53 @@ pub struct BuildCaps {
     pub ffmpeg: bool,
     /// libvpx: the DataChannel's software VP9.
     pub libvpx: bool,
+    /// A Windows build: where Media Foundation could be, had it been compiled.
+    pub windows: bool,
+    /// FFmpeg is linked into this build, whether or not `ROOMLERD_USE_FFMPEG=0`
+    /// switched it off (`ffmpeg`).
+    pub ffmpeg_compiled: bool,
+}
+
+/// An encoder backend a request can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    MediaFoundation,
+    Ffmpeg,
+    Openh264,
+}
+
+impl Backend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MediaFoundation => "media-foundation",
+            Self::Ffmpeg => "ffmpeg",
+            Self::Openh264 => "openh264",
+        }
+    }
+}
+
+/// Whether a backend was there to try on this OS and build, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Compiled in and switched on.
+    InBuild,
+    /// Media Foundation, off Windows.
+    WindowsOnly,
+    /// This OS could run it; this build does not have it.
+    NotCompiled,
+    /// FFmpeg linked, and `ROOMLERD_USE_FFMPEG=0` switched it off.
+    SwitchedOff,
+}
+
+impl Reach {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InBuild => "in this build",
+            Self::WindowsOnly => "Windows only",
+            Self::NotCompiled => "not compiled into this build",
+            Self::SwitchedOff => "switched off (ROOMLERD_USE_FFMPEG=0)",
+        }
+    }
 }
 
 impl BuildCaps {
@@ -345,6 +392,22 @@ impl BuildCaps {
             openh264: cfg!(feature = "openh264-encoder"),
             ffmpeg: ffmpeg_on(),
             libvpx: cfg!(feature = "vp9-444"),
+            windows: cfg!(target_os = "windows"),
+            ffmpeg_compiled: cfg!(feature = "ffmpeg-encoder"),
+        }
+    }
+
+    /// Could `backend` be tried on this OS and build, and if not, why not.
+    pub fn reach(self, backend: Backend) -> Reach {
+        match backend {
+            Backend::MediaFoundation if self.mf => Reach::InBuild,
+            Backend::MediaFoundation if self.windows => Reach::NotCompiled,
+            Backend::MediaFoundation => Reach::WindowsOnly,
+            Backend::Ffmpeg if self.ffmpeg => Reach::InBuild,
+            Backend::Ffmpeg if self.ffmpeg_compiled => Reach::SwitchedOff,
+            Backend::Ffmpeg => Reach::NotCompiled,
+            Backend::Openh264 if self.openh264 => Reach::InBuild,
+            Backend::Openh264 => Reach::NotCompiled,
         }
     }
 
@@ -362,7 +425,7 @@ impl BuildCaps {
 
     /// Does `cell`'s path have a hardware encoder in this build? Without one,
     /// software answering a request for hardware is the build, not a fallback.
-    fn hardware_on_path(self, cell: CellSpec) -> bool {
+    pub(crate) fn hardware_on_path(self, cell: CellSpec) -> bool {
         match (cell.path, cell.codec) {
             (CellPath::Rtp, Codec::H265) => self.mf || self.ffmpeg,
             (CellPath::Rtp, _) => self.mf,
@@ -403,7 +466,7 @@ fn ffmpeg_on() -> bool {
 /// Does the session ask this path for hardware? The RTP pump asks for what
 /// the preference says; the DataChannel cascades and a named encoder are
 /// hardware by construction, whatever the preference.
-fn requests_hardware(path: CellPath, pref: EncoderPreference) -> bool {
+pub(crate) fn requests_hardware(path: CellPath, pref: EncoderPreference) -> bool {
     match path {
         CellPath::Rtp => pref == EncoderPreference::Hardware,
         CellPath::Dc | CellPath::Named => true,
@@ -1193,6 +1256,8 @@ mod tests {
         openh264: true,
         ffmpeg: true,
         libvpx: true,
+        windows: true,
+        ffmpeg_compiled: true,
     };
 
     /// FR-135 R9 (ledger enc:I284) — the build line names the encoder families
@@ -1212,6 +1277,8 @@ mod tests {
         openh264: true,
         ffmpeg: true,
         libvpx: true,
+        windows: false,
+        ffmpeg_compiled: true,
     };
     /// The software build this PR's container run used.
     const SOFTWARE: BuildCaps = BuildCaps {
@@ -1219,6 +1286,8 @@ mod tests {
         openh264: true,
         ffmpeg: false,
         libvpx: true,
+        windows: false,
+        ffmpeg_compiled: false,
     };
 
     fn cells(p: &BenchPlan) -> Vec<String> {
@@ -1472,6 +1541,8 @@ mod tests {
             openh264: false,
             ffmpeg: false,
             libvpx: false,
+            windows: false,
+            ffmpeg_compiled: false,
         };
         assert!(plan(&args(), hw, None, none).is_err());
     }
