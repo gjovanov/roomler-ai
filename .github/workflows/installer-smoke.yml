@@ -1117,6 +1117,29 @@ jobs:
             if ($sig.Status -ne 'Valid') { throw "the DLL in the MSI is not signed: $($sig.Status)" }
           }
 
+      - name: "TEMPORARY proof (#3810): the runner's own processes, before the next step stops them"
+        shell: pwsh
+        run: |
+          $all = @{}
+          Get-CimInstance Win32_Process | ForEach-Object { $all[[int]$_.ProcessId] = $_ }
+          Write-Host 'This step and the processes above it:'
+          $p = $all[[int]$PID]
+          for ($i = 0; $p -and $i -lt 12; $i++) {
+            Write-Host ('{0,7} {1,7} {2} {3}' -f $p.ProcessId, $p.ParentProcessId, $p.Name, $p.CommandLine)
+            $p = $all[[int]$p.ParentProcessId]
+          }
+          Write-Host 'Every Runner.* process:'
+          $all.Values | Where-Object Name -like 'Runner.*' | Sort-Object ProcessId |
+            ForEach-Object { Write-Host ('{0,7} {1,7} {2} {3}' -f $_.ProcessId, $_.ParentProcessId, $_.Name, $_.CommandLine) }
+
+      - name: "TEMPORARY proof (#3810): the runner is lost, its listener and worker stopped"
+        shell: pwsh
+        run: |
+          Write-Host "$([DateTime]::UtcNow.ToString('o')) stopping the runner's listener, then its worker"
+          Get-Process Runner.Listener -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process Runner.Worker -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3600
+
       - name: "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)"
         # The per-Machine MSI's first INSTALL coverage. A person running
         # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
