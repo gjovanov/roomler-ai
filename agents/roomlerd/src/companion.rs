@@ -998,17 +998,24 @@ enum EnsureOutcome {
     Unsupported,
 }
 
-/// RED (#3858): the Windows and macOS starts as they ran before, every step
-/// inline on the worker that polls this future. The next commit takes them
-/// off the worker.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// #3855, #3858 — the tray's start for a prompt, off the async worker, on
+/// Linux, Windows and macOS alike: every step ([`TraySteps`], each OS's own)
+/// runs on the thread of the one start in flight ([`TRAY_STARTS`],
+/// `tray-start`), and this waits [`TRAY_START_WAIT`] at most. Before, this
+/// async function never awaited, so each step ran on the worker that polled
+/// it, for as long as it took (logind, the account database or systemd-run on
+/// Linux; the process list or `CreateProcessAsUserW` on Windows; `pgrep`,
+/// `stat`, `id` or `launchctl` on macOS), and the callers' 3 s timeout could
+/// not fire.
+#[cfg(any(target_os = "windows", unix))]
 async fn ensure_running_inner() -> Result<EnsureOutcome> {
+    // A test stands the steps in for its own task, with starts in flight of
+    // its own.
     #[cfg(test)]
     if let Some(stood) = tray_stand_in::now() {
-        return start_tray(&stood.steps, &std::sync::atomic::AtomicU8::new(0))
-            .map_err(anyhow::Error::msg);
+        return stood.starts.start(stood.steps, TRAY_START_WAIT).await;
     }
-    start_tray(&TraySteps::real(), &std::sync::atomic::AtomicU8::new(0)).map_err(anyhow::Error::msg)
+    TRAY_STARTS.start(TraySteps::real(), TRAY_START_WAIT).await
 }
 
 /// The steps of the Windows tray's start, in order, as [`TrayStarts::at`]
@@ -1345,23 +1352,6 @@ fn console_owner_person(owner: &str) -> Result<String> {
         );
     }
     Ok(user.to_string())
-}
-
-/// #3855 — the Linux tray's start for a prompt, off the async worker: every
-/// step ([`TraySteps`]) runs on the thread of the one start in flight
-/// ([`TRAY_STARTS`], `tray-start`), and this waits [`TRAY_START_WAIT`] at
-/// most. Before, this async function never awaited, so each step ran on the
-/// worker that polled it, for as long as logind, the account database or
-/// systemd-run took, and the callers' 3 s timeout could not fire.
-#[cfg(all(unix, not(target_os = "macos")))]
-async fn ensure_running_inner() -> Result<EnsureOutcome> {
-    // A test stands the steps in for its own task, with starts in flight of
-    // its own.
-    #[cfg(test)]
-    if let Some(stood) = tray_stand_in::now() {
-        return stood.starts.start(stood.steps, TRAY_START_WAIT).await;
-    }
-    TRAY_STARTS.start(TraySteps::real(), TRAY_START_WAIT).await
 }
 
 /// #3855, #3858 — the tray's starts for prompts: at most one in flight, on a
