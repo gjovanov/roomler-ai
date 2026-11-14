@@ -722,7 +722,7 @@ flowchart LR
 
 - **It runs on a thread of its own, one lookup at a time**, never on an async
   worker. The recording code uses `one_in_flight::Remembered`
-  (`one_in_flight.rs:282`), over #3796's `OneInFlight` (`launch::unix::CONSOLE`,
+  (`one_in_flight.rs:284`), over #3796's `OneInFlight` (`launch::unix::CONSOLE`,
   `recording/launch.rs:1563`). However many callers ask while a lookup hangs,
   only that one lookup's thread waits.
 - **No lock is held across `loginctl`.** The lookup's own thread stores its
