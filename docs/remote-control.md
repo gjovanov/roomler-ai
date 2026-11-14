@@ -738,7 +738,10 @@ flowchart TD
 - **Through the seat user's helper** for a root daemon
   ([`pulse.rs:519`](../agents/roomlerd/src/audio/pulse.rs#L519)). It is the same
   `portal-helper` subcommand, session lookup and privilege drop that portal
-  capture and keep-busy use. PulseAudio admits a client by uid or cookie, so
+  capture and keep-busy use. The session lookup waits 1.5 s at most, one walk
+  of logind in flight for every caller, and without an answer in time the
+  audio is a `backend_error` that gives the reason, never `no_session` (#3857,
+  `docs/desktop-companion.md` §10.3). PulseAudio admits a client by uid or cookie, so
   root cannot record the session's server itself. The helper writes one marked
   line and then raw PCM on stdout ([`pulse.rs:443`](../agents/roomlerd/src/audio/pulse.rs#L443)).
   Closing the pipe stops it.
