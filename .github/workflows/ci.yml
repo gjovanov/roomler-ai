@@ -35,9 +35,9 @@ concurrency:
 jobs:
   # ─── What a pull request changed (FR-6 wave 35, #773, 2026-10-30) ─────────
   #
-  # A pull request that touches only docs skips the thirteen heavy jobs: the
-  # five Rust lanes, the macOS overlay check, the four Windows jobs, both
-  # FFmpeg jobs and the profiles build. "Docs" is `docs/**`, a top-level
+  # A pull request that touches only docs skips the fourteen heavy jobs: the
+  # six Rust lanes, both macOS jobs, the three Windows jobs, both FFmpeg
+  # jobs and the profiles build. "Docs" is `docs/**`, a top-level
   # `*.md` and `.claude/**`. No Rust build, test or link reads them. The jobs
   # that do read them run on every PR: frontend builds the docs site and
   # tests the UI that uses docs/assets, machine-names and commit-identity run
