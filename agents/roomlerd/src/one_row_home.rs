@@ -2590,7 +2590,7 @@ mod tests {
     mod on_disk {
         use super::*;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         /// Set in the process [`the_real_check_refuses_an_account_it_was_not_given`]
         /// starts again from this test binary: that process is the child.
@@ -2716,6 +2716,20 @@ mod tests {
             assert!(read.home.absolute);
         }
 
+        /// `answer` on a thread, its reply waited for 5 s at most: a call
+        /// that blocks (a FIFO opened without `O_NONBLOCK`) fails the test
+        /// instead of holding the lane until the job's timeout.
+        fn answer_within_5s(verb: Verb, home: &Path) -> Outcome {
+            let home = home.to_path_buf();
+            let (said, reply) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = said.send(answer(verb, &home, &creds(), &[], &mut RealFs));
+            });
+            reply
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an answer within 5 s")
+        }
+
         #[test]
         fn a_fifo_or_an_oversize_file_is_an_error_not_a_wait() {
             use std::os::unix::ffi::OsStrExt;
@@ -2725,9 +2739,7 @@ mod tests {
             // SAFETY: a NUL-terminated path.
             assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
             std::fs::write(&at.plist, vec![b'<'; PLIST_BOUND + 1]).unwrap();
-            let started = Instant::now();
-            let out = answer(Verb::Read, dir.path(), &creds(), &[], &mut RealFs);
-            assert!(started.elapsed() < Duration::from_secs(5));
+            let out = answer_within_5s(Verb::Read, dir.path());
             let read = Reply::parse(&out.stdout, UID, GID, Verb::Read)
                 .unwrap()
                 .read
@@ -2773,10 +2785,8 @@ mod tests {
                 config: Expect::of(Some(ENROLLED.as_bytes())),
                 plist: Expect::Absent,
             };
-            let started = Instant::now();
-            let out = answer(verb, dir.path(), &creds(), &[], &mut RealFs);
+            let out = answer_within_5s(verb, dir.path());
             assert_eq!(out.exit, Exit::Changed, "{}", out.stderr);
-            assert!(started.elapsed() < Duration::from_secs(5));
         }
 
         #[test]
