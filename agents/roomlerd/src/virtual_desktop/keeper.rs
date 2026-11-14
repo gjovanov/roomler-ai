@@ -44,8 +44,11 @@
 //!    `ready`: a keeper the daemon gave up on never had a job, so it started
 //!    nothing. The daemon kills such a keeper before its input ends, so an
 //!    input that ends first, a parent that changed, or no job within
-//!    [`JOB_WAIT`] means that the daemon is gone, and the keeper goes on as in
-//!    step 5, with nothing of its own to take down;
+//!    [`JOB_WAIT`] means that the daemon is gone, or was stopped for that
+//!    long (SIGSTOP, a debugger, a freezer), and the keeper goes on as in
+//!    step 5, with nothing of its own to take down. A daemon that was only
+//!    stopped loses the desktop it was starting, and its supervisor starts
+//!    it again;
 //! 3. starts the window manager and the apps with `/dev/null` on stdin, stdout
 //!    and stderr, and waits for every child it has, its own or adopted;
 //! 4. on SIGTERM alone (a service manager's stop signals every process of the
@@ -119,15 +122,29 @@ const GRACE_MAX: Duration = Duration::from_secs(10);
 const NOTICE_DELAY: Duration = Duration::from_secs(2);
 
 /// How long the keeper waits for its job after `ready` (review R2-3). The
-/// daemon sends it as soon as it reads `ready`, and kills a keeper it gives
-/// up on within its own wait of 5 s. A job that has not come by now has no
-/// daemon left to send it: one that died before the keeper read its parent,
-/// while something else holds the write end of the keeper's input.
+/// daemon sends it as soon as it reads `ready`, with no lock and no blocking
+/// call in between. A keeper it gives up on was not ready within its wait
+/// (`KEEPER_READY_TIMEOUT`, 5 s from the spawn), and the daemon SIGKILLs it
+/// after that wait, once `op` is free, which a stop holds for its whole kill.
+/// So a job that has not come by now has no daemon left to send it (one
+/// that died before the keeper read its parent, while something else holds
+/// the write end of the keeper's input), or a daemon that was stopped for
+/// this long (review R3-3).
 const JOB_WAIT: Duration = Duration::from_secs(15);
 
+// Review R3-3 — `JOB_WAIT` outlasts the latest moment at which the daemon can
+// still kill a keeper it gave up on: its ready wait, a stop's whole kill that
+// its discard waits out (`TEARDOWN_GRACE`, then about 1 s for the SIGKILL to
+// land and 1 s for the reap), and the discard's own reap of 1 s. A shorter
+// wait would let an ordinary slow start end the desktop it was starting.
+const _: () = assert!(
+    JOB_WAIT.as_millis()
+        > super::KEEPER_READY_TIMEOUT.as_millis() + super::TEARDOWN_GRACE.as_millis() + 3_000
+);
+
 /// The grace of the teardown a keeper runs before it has a job: the daemon's
-/// own 1.5 s, which the job would have carried.
-const NO_JOB_GRACE: Duration = Duration::from_millis(1500);
+/// own, which the job would have carried (review R3-3: one constant).
+const NO_JOB_GRACE: Duration = super::KEEPER_GRACE;
 
 /// The variable a test sets on a keeper it starts from the test binary
 /// ([`tests::keeper_role`]). A keeper removes it from its children.
@@ -672,15 +689,19 @@ pub(super) fn run() -> i32 {
     // #3665 — the job comes only now: a keeper the daemon gave up on before
     // `ready` never gets one and starts nothing. The daemon kills a keeper it
     // gives up on before its input ends, so no job here (the input ended,
-    // the daemon is gone, or nothing came within `JOB_WAIT`) means that the
-    // daemon left between `ready` and the job. The desktop goes with it, as
-    // it does once the keeper has its job (review R2-3).
+    // the parent changed, or nothing came within `JOB_WAIT`) means that the
+    // daemon left between `ready` and the job, or was stopped for that long
+    // (review R3-3). The desktop goes with it, as it does once the keeper
+    // has its job (review R2-3).
     let job = match read_job(0, daemon, JOB_WAIT) {
         Ok(Some(job)) => job,
         Ok(None) => {
-            say(
-                "info: the daemon left before it sent the desktop's job — taking the whole desktop down",
-            );
+            // Review R3-4 — a daemon that left reads nothing of this, so the
+            // line says what the keeper saw, which is true for whoever reads
+            // it: a daemon that was stopped, or a person.
+            say(&format!(
+                "info: no job came (its input ended, its parent changed, or {JOB_WAIT:?} passed) — taking the whole desktop down"
+            ));
             teardown(me, daemon, Some(group), NO_JOB_GRACE, &mut Book::default());
             return 0;
         }

@@ -1593,7 +1593,8 @@ impl Desktop {
 
 /// Follow a keeper's stderr on a thread of its own: its first `ready` or
 /// `refused: <why>` line goes to the receiver this returns, and every other
-/// line to the log, a `warn: ` line as a warning. The thread ends with the
+/// line to the log, as a warning where [`keeper_line`] says so (a `warn: `
+/// line, or a `refused: ` line after `ready`). The thread ends with the
 /// keeper's stderr.
 #[cfg(target_os = "linux")]
 fn follow_keeper(
