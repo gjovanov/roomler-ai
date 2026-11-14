@@ -594,10 +594,14 @@ pub fn gave_up_reason(
 /// reach stops the command with everything where it was, where the revert
 /// still finds it, and if the last move fails the one before it is undone. It
 /// does the same in an administrator's own shell and as root. The names it
-/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them, and
-/// each command starts with `sudo test ! -e` of the name it moves the folder
-/// to: a second run of the same line does nothing, where BSD `mv` would move
-/// the live folder INTO the one the first run made.
+/// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them. Each
+/// command starts with one `sudo test`, before anything runs: that the folder
+/// is still a real directory of root's (not a link, a directory, and `-O`,
+/// which under `sudo` means owned by root), so a line printed earlier and run
+/// after the folder was given back, by any means, does nothing; and that the
+/// name it moves the folder to is not there yet, so a second run of the same
+/// line does nothing, where BSD `mv` would move the live folder INTO the one
+/// the first run made.
 ///
 /// A copy `lstat` says the person cannot read ([`person_cannot_read`]) gets
 /// no command: moving the folder would leave it where the revert does not
@@ -683,17 +687,23 @@ fn move_aside(f: &FolderNotTheirs) -> String {
     let folder = sh_quote(&path);
     let aside_path = format!("{path}.made-by-root-{}", f.stamp);
     let aside = sh_quote(&aside_path);
-    // Run a second time, the line does nothing: the name it moves the folder
-    // to is there by then.
+    // One test before anything runs. The folder is still a real directory of
+    // root's (under `sudo`, `-O` is owned by root), so a line printed before
+    // the folder was given back changes nothing when it is run after; and the
+    // name it moves the folder to is not there yet, so a second run of the
+    // same line does nothing either.
     let can = format!(
-        " {name} is an administrator of this Mac and can run this: sudo test ! -e {aside} && "
+        " {name} is an administrator of this Mac and can run this: sudo test ! -h {folder} -a -d \
+         {folder} -a -O {folder} -a ! -e {aside} && "
     );
+    let inert = "once the folder is no longer a real folder of root's, as when it is the person's \
+                 again, it changes nothing";
     let restart = " Then log out and back in, or restart this daemon: \
                    sudo launchctl kickstart -k system/com.roomler.daemon";
     if names.is_empty() {
         return format!(
-            "{only}{can}sudo mv {folder} {aside} (if it fails, nothing moved), and the worker \
-             makes the folder again as the person at its next start.{restart}"
+            "{only}{can}sudo mv {folder} {aside} ({inert}; if the move fails, nothing moved), and \
+             the worker makes the folder again as the person at its next start.{restart}"
         );
     }
     // Staged first, moved last: the copies are made, as the person, before
@@ -711,8 +721,8 @@ fn move_aside(f: &FolderNotTheirs) -> String {
         "{only}{holds}, so the command copies {} into a new folder that the person's account \
          makes.{can}{as_person} mkdir {new} && {as_person} cp {copies}{into} && sudo mv \
          {folder} {aside} && {{ sudo mv {new} {folder} || sudo mv {aside} {folder}; }} \
-         (nothing moves until the copies are made, and if the last move fails the one before \
-         it is undone).{restart}",
+         ({inert}; nothing moves until the copies are made, and if the last move fails the one \
+         before it is undone).{restart}",
         if one { "it" } else { "them" },
     )
 }
@@ -2844,10 +2854,11 @@ mod tests {
             cause(F)
         );
         let moves = format!(
-            "{}{ONLY}{WHO}sudo test ! -e '{F}.made-by-root-{STAMP}' && sudo mv '{F}' \
-             '{F}.made-by-root-{STAMP}' (if it fails, nothing moved), and the worker makes the \
-             folder again as the person at its next start.{RESTART}",
-            cause(F)
+            "{}{ONLY}{WHO}{}sudo mv '{F}' '{F}.made-by-root-{STAMP}' ({INERT}; if the move \
+             fails, nothing moved), and the worker makes the folder again as the person at its \
+             next start.{RESTART}",
+            cause(F),
+            guard(F)
         );
         for one_row in [true, false] {
             for end in [
@@ -2950,6 +2961,17 @@ mod tests {
     /// The copies the revert reads, as the command names them.
     const PLIST: &str = "com.roomler.agent.plist.pre-one-row";
     const CONFIG: &str = "config.toml.pre-one-row";
+    /// The one test every command starts with, for the folder `q` as it is
+    /// quoted: still a real directory of root's (under `sudo`, `-O` is owned
+    /// by root), and the name it moves the folder to not there yet.
+    fn guard(q: &str) -> String {
+        format!(
+            "sudo test ! -h '{q}' -a -d '{q}' -a -O '{q}' -a ! -e '{q}.made-by-root-{STAMP}' && "
+        )
+    }
+    /// What the line says that test means.
+    const INERT: &str = "once the folder is no longer a real folder of root's, as when it is the \
+                         person's again, it changes nothing";
 
     /// #3802 — macOS lets no account but root rename a folder of root's, so
     /// a command the person runs with their own rights cannot move it: the
@@ -2973,21 +2995,28 @@ mod tests {
         assert_eq!(
             give_up_line("fits + no kept copy", F, 0o40755, &[]),
             format!(
-                "{}{ONLY}{WHO}sudo test ! -e '{F}.made-by-root-{STAMP}' && sudo mv '{F}' \
-                 '{F}.made-by-root-{STAMP}' (if it fails, nothing moved), and the worker makes \
-                 the folder again as the person at its next start.{RESTART}",
+                "{}{ONLY}{WHO}sudo test ! -h '{F}' -a -d '{F}' -a -O '{F}' -a ! -e \
+                 '{F}.made-by-root-{STAMP}' && sudo mv '{F}' '{F}.made-by-root-{STAMP}' (once \
+                 the folder is no longer a real folder of root's, as when it is the person's \
+                 again, it changes nothing; if the move fails, nothing moved), and the worker \
+                 makes the folder again as the person at its next start.{RESTART}",
                 cause(F)
             )
         );
     }
 
-    /// #3802 — a second run of the same printed line does nothing: each
-    /// command starts with a test that the name it moves the folder to is
-    /// not there yet. Without it, BSD `mv` would move the live folder INTO
-    /// the one the first run made.
+    /// #3802 — a printed line does nothing when it is run again, and a line
+    /// printed before the folder was given back does nothing when it is run
+    /// after: each command starts with one test, before anything runs, that
+    /// the folder is still a real directory of root's (not a link, a
+    /// directory, and `-O`, owned by root under `sudo`) and that the name it
+    /// moves the folder to is not there yet. Without the first, an older line
+    /// in the log would move the person's live folder aside; without the
+    /// second, BSD `mv` would move the live folder INTO the one the first run
+    /// made. The line says so in words.
     #[test]
-    fn the_give_up_line_does_nothing_when_it_is_run_a_second_time() {
-        let guard = format!("{WHO}sudo test ! -e '{F}.made-by-root-{STAMP}' && sudo ");
+    fn the_give_up_line_does_nothing_once_the_folder_is_given_back_or_moved() {
+        let first = format!("{WHO}{}sudo ", guard(F));
         for kept in [
             &[][..],
             &[(0, THEIRS)],
@@ -2995,8 +3024,13 @@ mod tests {
             &[(0, THEIRS), (1, THEIRS)],
         ] {
             let why = give_up_line("which commands", F, 0o40755, kept);
-            assert_eq!(why.matches(guard.as_str()).count(), 1, "{kept:?}: {why}");
+            assert_eq!(why.matches(first.as_str()).count(), 1, "{kept:?}: {why}");
             assert_eq!(why.matches("sudo test").count(), 1, "{kept:?}: {why}");
+            assert_eq!(
+                why.matches(&format!("({INERT}; ")).count(),
+                1,
+                "{kept:?}: {why}"
+            );
         }
     }
 
@@ -3017,14 +3051,14 @@ mod tests {
         format!(
             "{}{ONLY} It holds {}, which `sudo roomlerd one-row --revert` reads there and \
              nowhere else, so the command copies {it} into a new folder that the person's \
-             account makes. {admin} is an administrator of this Mac and can run this: sudo test \
-             ! -e '{aside}' && sudo -u '#501' mkdir '{new}' && sudo -u '#501' cp {from}'{new}/' \
-             && sudo mv '{q}' \
-             '{aside}' && {{ sudo mv '{new}' '{q}' || sudo mv '{aside}' '{q}'; }} (nothing moves \
-             until the copies are made, and if the last move fails the one before it is \
-             undone).{RESTART}",
+             account makes. {admin} is an administrator of this Mac and can run this: {}sudo -u \
+             '#501' mkdir '{new}' && sudo -u '#501' cp {from}'{new}/' && sudo mv '{q}' \
+             '{aside}' && {{ sudo mv '{new}' '{q}' || sudo mv '{aside}' '{q}'; }} ({INERT}; \
+             nothing moves until the copies are made, and if the last move fails the one before \
+             it is undone).{RESTART}",
             cause(path),
             copies.join(" and "),
+            guard(q),
         )
     }
 
@@ -3039,13 +3073,15 @@ mod tests {
             format!(
                 "{}{ONLY} It holds com.roomler.agent.plist.pre-one-row, which `sudo roomlerd \
                  one-row --revert` reads there and nowhere else, so the command copies it into \
-                 a new folder that the person's account makes.{WHO}sudo test ! -e \
-                 '{F}.made-by-root-{STAMP}' && sudo -u '#501' mkdir '{F}.new-{STAMP}' && sudo -u \
-                 '#501' cp \
+                 a new folder that the person's account makes.{WHO}sudo test ! -h '{F}' -a -d \
+                 '{F}' -a -O '{F}' -a ! -e '{F}.made-by-root-{STAMP}' && sudo -u '#501' mkdir \
+                 '{F}.new-{STAMP}' && sudo -u '#501' cp \
                  '{F}/com.roomler.agent.plist.pre-one-row' '{F}.new-{STAMP}/' && sudo mv '{F}' \
                  '{F}.made-by-root-{STAMP}' && {{ sudo mv '{F}.new-{STAMP}' '{F}' || sudo mv \
-                 '{F}.made-by-root-{STAMP}' '{F}'; }} (nothing moves until the copies are made, \
-                 and if the last move fails the one before it is undone).{RESTART}",
+                 '{F}.made-by-root-{STAMP}' '{F}'; }} (once the folder is no longer a real \
+                 folder of root's, as when it is the person's again, it changes nothing; nothing \
+                 moves until the copies are made, and if the last move fails the one before it is \
+                 undone).{RESTART}",
                 cause(F)
             )
         );
