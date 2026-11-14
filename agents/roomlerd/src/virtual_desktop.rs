@@ -4579,6 +4579,10 @@ mod supervise_tests {
     /// Review R1-12 — a keeper that is not ready in time is a strike, as an
     /// early exit is: after two in a row the daemon starts the clients itself
     /// for the rest of its life, and no later start waits for a keeper again.
+    ///
+    /// Review R3-2: the verdict is what the daemon did, not what the slow
+    /// stand-ins had time to write. A third keeper would make the third start
+    /// wait out the whole ready timeout, so that start is timed.
     #[test]
     fn two_keepers_not_ready_in_time_turn_the_keeper_off() {
         let dir = scratch("keeper-slow");
@@ -4589,12 +4593,13 @@ mod supervise_tests {
             &format!("echo $$ >> \"{d}/keeper.pids\"\nexec sleep 300"),
         );
         let wm_body = format!("echo $$ >> \"{d}/wm.pids\"\nexec sleep 300");
+        let ready_timeout = Duration::from_secs(1);
         let (desk, _x_pid) = desktop_with(
             &dir,
             ":476",
             &wm_body,
             Clients::Keeper(KeeperCmd::script(&slow)),
-            Duration::from_millis(300),
+            ready_timeout,
         );
         let _stop = StopAtTheEnd(desk.clone());
         let off = |desk: &Desktop| desk.keeper_off.load(std::sync::atomic::Ordering::Relaxed);
@@ -4602,7 +4607,9 @@ mod supervise_tests {
         let off_after_one = off(&desk);
         let second = desk.start_clients();
         let off_after_two = off(&desk);
+        let asked = Instant::now();
         let third = desk.start_clients();
+        let third_took = asked.elapsed();
         let count = |name: &str| {
             std::fs::read_to_string(dir.join(name))
                 .unwrap_or_default()
@@ -4617,7 +4624,64 @@ mod supervise_tests {
         assert_eq!((first, second, third), (None, None, None));
         assert!(!off_after_one, "one slow keeper turned the keeper off");
         assert!(off_after_two, "two slow keepers in a row did not");
-        assert_eq!(keepers, 2, "a keeper was started after the keeper was off");
+        assert!(
+            third_took < ready_timeout,
+            "the third start waited {third_took:?} for a keeper after the keeper was off"
+        );
+        assert!(
+            keepers <= 2,
+            "a keeper was started after the keeper was off: {keepers}"
+        );
+    }
+
+    /// Review R3-1 — the count of keepers that were not ready in time starts
+    /// again at a `ready`: a slow keeper, a ready one and a slow one again do
+    /// not turn the keeper off. Without that, any two slow starts in a
+    /// daemon's life would. The stand-in is rewritten between the starts, so
+    /// which one is ready does not hang on how fast a script runs.
+    #[test]
+    fn a_ready_keeper_between_two_slow_ones_keeps_the_keeper_on() {
+        let dir = scratch("keeper-slow-ready-slow");
+        let d = dir.display();
+        let slow_body = "exec sleep 300".to_string();
+        let ready_body = format!("echo ready >&2\nread -r job && : > \"{d}/job\"\nexec sleep 300");
+        let keeper = script(&dir, "keeper", &slow_body);
+        let wm_body = format!("echo $$ >> \"{d}/wm.pids\"\nexec sleep 300");
+        let (desk, _x_pid) = desktop_with(
+            &dir,
+            ":479",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::script(&keeper)),
+            Duration::from_secs(2),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let slow = |desk: &Desktop| desk.keeper_slow.load(std::sync::atomic::Ordering::Relaxed);
+        let first = desk.start_clients();
+        let slow_after_first = slow(&desk);
+        script(&dir, "keeper", &ready_body);
+        let second = desk.start_clients();
+        let slow_after_ready = slow(&desk);
+        script(&dir, "keeper", &slow_body);
+        let third = desk.start_clients();
+        let off_after_third = desk.keeper_off.load(std::sync::atomic::Ordering::Relaxed);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(first, None, "the first, slow keeper was the desktop's");
+        assert_eq!(slow_after_first, 1, "the first slow keeper was not counted");
+        assert!(
+            second.is_some(),
+            "the ready keeper was not the desktop's: {second:?}"
+        );
+        assert_eq!(
+            slow_after_ready, 0,
+            "a `ready` did not start the count again"
+        );
+        assert_eq!(third, None, "the third, slow keeper was the desktop's");
+        assert!(
+            !off_after_third,
+            "a slow keeper, a ready one and a slow one turned the keeper off"
+        );
     }
 
     /// Review R2-1 — the daemon's half of R1-2: nothing reaches the keeper's
@@ -4626,19 +4690,24 @@ mod supervise_tests {
     /// job comes after, and it is the desktop's keeper. Were the job written
     /// before the wait, a keeper the daemon gives up on could still start
     /// the clients, and the daemon would start them a second time beside it.
+    ///
+    /// Review R3-7: the probe proves that it ran. `timeout` answers 124 when
+    /// it ended a `dd` that read nothing, 0 for a `dd` that read a byte, and
+    /// 127 when either tool is missing, so a runner without them fails the
+    /// test instead of passing it.
     #[test]
     fn nothing_reaches_the_keepers_input_before_it_said_ready() {
         let dir = scratch("keeper-late");
         let d = dir.display();
         // `dd` copies a byte that comes within 300 ms, and `timeout` ends it
-        // otherwise: anything before the `x` is input that came too early.
+        // otherwise.
         let late = script(
             &dir,
             "keeper",
             &format!(
                 "echo $$ > \"{d}/keeper.pid\"\n\
-                 b=$(timeout 0.3 dd bs=1 count=1 2>/dev/null; echo x)\n\
-                 if [ \"$b\" != x ]; then : > \"{d}/early\"; fi\n\
+                 timeout 0.3 dd bs=1 count=1 of=\"{d}/got\" 2>/dev/null\n\
+                 echo $? > \"{d}/probe.rc\"\n\
                  echo ready >&2\n\
                  read -r job && : > \"{d}/job\"\n\
                  exec sleep 300"
@@ -4655,14 +4724,17 @@ mod supervise_tests {
         let _stop = StopAtTheEnd(desk.clone());
         let keeper = desk.start_clients();
         wait_for("the keeper's job", || dir.join("job").exists());
-        let early = dir.join("early").exists();
+        let probe = std::fs::read_to_string(dir.join("probe.rc")).unwrap_or_default();
+        let got = std::fs::metadata(dir.join("got")).map_or(0, |m| m.len());
         let direct_wm = dir.join("wm.pid").exists();
         desk.stop();
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert!(
-            !early,
-            "the keeper's input had something in it before it said it was ready"
+        assert_eq!(
+            (probe.trim(), got),
+            ("124", 0),
+            "the keeper's look at its input before `ready` (timeout's status, bytes read): \
+             (\"0\", 1) is input that came too early, (\"127\", 0) a probe that did not run"
         );
         assert!(
             keeper.is_some(),
@@ -5043,7 +5115,12 @@ mod supervise_tests {
         let up = desk.state().up;
         let starts = runs(&dir).len();
         // The server's SIGTERM, our child, unreaped while the tree lists it,
-        // and the daemon's own stop.
+        // and the daemon's own stop. Review R3-6: the desktop is marked
+        // stopping first. In a daemon the supervisor that sees the server's
+        // exit first waits 1 s before it starts again, and the stop wakes it
+        // to leave; here that wait is 20 ms, and a preempted test thread
+        // could let a start through, which no daemon would see.
+        desk.state().stopping = true;
         RealProcs.signal(x_pid, libc::SIGTERM);
         let asked = Instant::now();
         desk.stop();
