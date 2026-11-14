@@ -1558,6 +1558,52 @@ jobs:
           printf %s "$SENTINEL" | pbcopy
           [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::the pasteboard did not take the sentinel"; exit 1; }
           env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture --test-threads=1 2>&1 | tee /tmp/clip-plain.log
+          # ── TEMPORARY (#3876): the measurement. Never merged. ─────────────────
+          M3876_LOG=/tmp/clip-plain.log
+          M3876_DIR=/tmp/m3876
+          M3876_REQUIRED="mac_real_the_gate_counts_a_copy write_then_read_round_trip_and_survives_clone_drop"
+          echo "cpus: $(sysctl -n hw.ncpu)"
+          BIN=$(sed -n 's|.*unittests src.lib\.rs (\([^)]*\)).*|\1|p' "$M3876_LOG" | tr '\\' '/')
+          [ -n "$BIN" ] && [ -f "$BIN" ] || { echo "::error::no test binary named in $M3876_LOG ($BIN)"; exit 1; }
+          echo "test binary: $BIN"
+          rm -rf "$M3876_DIR"; mkdir -p "$M3876_DIR"
+          m3876() {  # m3876 <label> <runs> <extra libtest args, may be empty>; sets SPLIT
+            local label=$1 runs=$2 extra=$3 i t
+            SPLIT=0
+            for i in $(seq "$runs"); do
+              env -u ROOMLERD_TEST_REAL_CLIPBOARD "$BIN" clipboard:: --nocapture $extra > "$M3876_DIR/$label-$i.log" 2>&1 \
+                || { echo "::error::$label run $i failed"; tail -30 "$M3876_DIR/$label-$i.log"; exit 1; }
+              grep -qE '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$M3876_DIR/$label-$i.log" \
+                || { echo "::error::$label run $i has no passing summary"; tail -30 "$M3876_DIR/$label-$i.log"; exit 1; }
+              for t in $M3876_REQUIRED; do
+                if ! grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping $t" "$M3876_DIR/$label-$i.log"; then
+                  SPLIT=$((SPLIT + 1))
+                  if [ "$SPLIT" -le 2 ]; then
+                    echo "--- $label, run $i: the skip line of $t is not whole:"
+                    grep -n -E 'ROOMLERD_TEST_REAL_CLIPBOARD|unset: skipping|which writes the real clipboard' "$M3876_DIR/$label-$i.log" || true
+                  fi
+                  break
+                fi
+              done
+            done
+          }
+          N=100
+          m3876 default "$N" ""; D=$SPLIT
+          m3876 one "$N" --test-threads=1; O=$SPLIT
+          echo "split, default threads: $D of $N"
+          echo "split, one thread: $O of $N"
+          if [ "$D" = 0 ]; then
+            echo "default threads: no split in $N runs; raising both to 300, once"
+            N=300
+            m3876 default "$N" ""; D=$SPLIT
+            m3876 one "$N" --test-threads=1; O=$SPLIT
+            echo "split, default threads: $D of $N"
+            echo "split, one thread: $O of $N"
+          fi
+          echo "--- one thread, run 1: each skip line, after its own test's name:"
+          grep -n 'unset: skipping' "$M3876_DIR/one-1.log" || true
+          [ "$O" = 0 ] || { echo "::error::one thread: $O of $N runs had a skip line split"; exit 1; }
+          # ── end of the measurement ────────────────────────────────────────────
           [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::a test replaced the pasteboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping mac_real_the_gate_counts_a_copy" /tmp/clip-plain.log
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
@@ -1996,6 +2042,52 @@ jobs:
           pwsh -NoProfile -Command "Set-Clipboard -Value '$SENTINEL'"
           holds || { echo "::error::this runner's clipboard did not take the sentinel"; exit 1; }
           env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features "$F" -- clipboard:: --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-plain.log"
+          # ── TEMPORARY (#3876): the measurement. Never merged. ─────────────────
+          M3876_LOG="$RUNNER_TEMP/clip-plain.log"
+          M3876_DIR="$RUNNER_TEMP/m3876"
+          M3876_REQUIRED="write_then_read_round_trip_and_survives_clone_drop"
+          echo "cpus: ${NUMBER_OF_PROCESSORS:-?}"
+          BIN=$(sed -n 's|.*unittests src.lib\.rs (\([^)]*\)).*|\1|p' "$M3876_LOG" | tr '\\' '/')
+          [ -n "$BIN" ] && [ -f "$BIN" ] || { echo "::error::no test binary named in $M3876_LOG ($BIN)"; exit 1; }
+          echo "test binary: $BIN"
+          rm -rf "$M3876_DIR"; mkdir -p "$M3876_DIR"
+          m3876() {  # m3876 <label> <runs> <extra libtest args, may be empty>; sets SPLIT
+            local label=$1 runs=$2 extra=$3 i t
+            SPLIT=0
+            for i in $(seq "$runs"); do
+              env -u ROOMLERD_TEST_REAL_CLIPBOARD "$BIN" clipboard:: --nocapture $extra > "$M3876_DIR/$label-$i.log" 2>&1 \
+                || { echo "::error::$label run $i failed"; tail -30 "$M3876_DIR/$label-$i.log"; exit 1; }
+              grep -qE '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$M3876_DIR/$label-$i.log" \
+                || { echo "::error::$label run $i has no passing summary"; tail -30 "$M3876_DIR/$label-$i.log"; exit 1; }
+              for t in $M3876_REQUIRED; do
+                if ! grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping $t" "$M3876_DIR/$label-$i.log"; then
+                  SPLIT=$((SPLIT + 1))
+                  if [ "$SPLIT" -le 2 ]; then
+                    echo "--- $label, run $i: the skip line of $t is not whole:"
+                    grep -n -E 'ROOMLERD_TEST_REAL_CLIPBOARD|unset: skipping|which writes the real clipboard' "$M3876_DIR/$label-$i.log" || true
+                  fi
+                  break
+                fi
+              done
+            done
+          }
+          N=100
+          m3876 default "$N" ""; D=$SPLIT
+          m3876 one "$N" --test-threads=1; O=$SPLIT
+          echo "split, default threads: $D of $N"
+          echo "split, one thread: $O of $N"
+          if [ "$D" = 0 ]; then
+            echo "default threads: no split in $N runs; raising both to 300, once"
+            N=300
+            m3876 default "$N" ""; D=$SPLIT
+            m3876 one "$N" --test-threads=1; O=$SPLIT
+            echo "split, default threads: $D of $N"
+            echo "split, one thread: $O of $N"
+          fi
+          echo "--- one thread, run 1: each skip line, after its own test's name:"
+          grep -n 'unset: skipping' "$M3876_DIR/one-1.log" || true
+          [ "$O" = 0 ] || { echo "::error::one thread: $O of $N runs had a skip line split"; exit 1; }
+          # ── end of the measurement ────────────────────────────────────────────
           holds || { echo "::error::a test replaced the clipboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" "$RUNNER_TEMP/clip-plain.log"
           ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --lib --features "$F" -- clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-real.log"
