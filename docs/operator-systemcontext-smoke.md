@@ -218,7 +218,7 @@ that fails is not run: the device runs as in step 2a, and the service log says
 once which entry fails and why (step 6). The service host and the worker read
 it through one function (`agents/roomlerd/src/win_service/supervisor.rs:976`),
 so they cannot disagree, and a SYSTEM worker never loads a config the check
-refused (`agents/roomlerd/src/app.rs:1842`). `keep-system-context` reads a
+refused (`agents/roomlerd/src/app.rs:1850`). `keep-system-context` reads a
 record that fails as no record, so SystemContext off (`machine_tree.rs:1179`).
 
 The writers make every file they write (`machine_tree.rs:425`): the config's temp file, its

@@ -66,7 +66,7 @@ Sealing closes the write side only. Every reader below keeps working.
 | Folder | Read by | Anchor |
 |---|---|---|
 | `service-logs` | the tray's log view, "Open Logs Folder" and the log tail, as the signed-in person | `agents/roomler-desktop/src/commands.rs:179-190`, `:1916-1921` |
-| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder | `agents/roomlerd/src/app.rs:2290-2300`, `crash_recorder.rs:343-359`, `crash_uploader.rs:18-21` |
+| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder | `agents/roomlerd/src/app.rs:2298-2308`, `crash_recorder.rs:343-359`, `crash_uploader.rs:18-21` |
 | the SystemContext attempt record | Setup, as the person who started it (Users read, `record_aces`) | `machine_tree.rs:537-551` |
 
 ## Design
@@ -284,7 +284,7 @@ above).
 | the SystemContext attempt record (`agents/roomlerd/src/win_service/system_context_attempt.rs:151-155`, `:178-197`) | `create_dir_all(parent)`, `create_fresh(tmp)`, `seal_new_record`, `fs::rename` | `HeldPath` on the machine parent, `write_file(.., Seal::Readable)` |
 | the machine attention file (`crates/agent-core/src/notify.rs:113-138`, `:166-177`, `:210-214`, `:234-244`) | `create_dir_all`, `fs::write`, `remove_file` | `write_file` and `remove_file`, `Seal::Readable`; a person's own attention file in their profile is unchanged |
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
-| the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7461`) reads through the same `HeldPath` (D4) |
+| the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7469`) reads through the same `HeldPath` (D4) |
 | the machine config's saves (`crates/agent-core/src/config.rs:3781`, `:4461`, `:4647`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
 | the repair's and the adoption's opens (`machine_tree.rs:619-621`, `:859-861`) | `win::open` of the whole path | `HeldPath::walk` |
 | the one-time segment move (`appdirs.rs:673`, `:890`, `:901`, `:999`, `:1114`) | renames and removes by path | per D7 |
@@ -326,9 +326,9 @@ them.
 - GitHub's Windows runners set `TEMP` to an 8.3 short path, so T4's control pins the `GetLongPathNameW` compare;
   without it every tempdir-based case would fail in CI.
 - ⚠️ `roomler-node-core`'s Windows cases run elevated in one step only, filtered to `machine_tree::tests` and three
-  others (`.github/workflows/ci.yml:2078-2080`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:2034`). P1 adds
+  others (`.github/workflows/ci.yml:2087-2089`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:2043`). P1 adds
   `machine_tree::held::tests` and `crash_recorder::tests` to that filter, or the new cases never run on Windows.
-  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:1957-1961`).
+  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:1966-1970`).
 
 | # | Test | Where | What it holds | Elevated | RED at the seam |
 |---|---|---|---|---|---|
@@ -387,7 +387,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:2080`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
+| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:2089`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
 | P2 | service logs: `HeldRollingWriter` and every other `service-logs` writer (the prune, the panic and stderr files, the caps cache, the install outcome, the wedged MSI log, the update marker) | the same switch: `RollingFileAppender` and today's writers | not started |
 | P3 | the rest: the attempt record, the machine attention file, the launch marker, the presence lock, the machine config's saves, the repair's and the adoption's opens; the segment move (D7); the gate (D8) | the same switch | not started |
 | Docs | the docs below, each in the PR of the phase it describes, the rest by P3 | none | not started |
@@ -454,7 +454,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D4. The presence lock's folder**, which sits directly below `%ProgramData%`, outside the machine folder
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
-  reader reads (`app.rs:7461`) for no gain.
+  reader reads (`app.rs:7469`) for no gain.
 - **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1635-1637`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
@@ -471,7 +471,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
   as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
-  drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:566`); without read
+  drains the supervisor's records from that folder (`app.rs:2298-2308`, `crash_recorder.rs:566`); without read
   those records would stay on the device. Only the write side closes.
 
 ## Out of scope

@@ -428,7 +428,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2243`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2251`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -439,8 +439,14 @@ sequenceDiagram
   the tree is spawned into its own process group, and teardown unions the group members with
   the parent-link closure of the daemon's direct children (which reaches a setsid'd
   grandchild, since `setsid` changes the session and group but never the parent), SIGTERMs,
-  waits a 2 s grace, then SIGKILLs the remainder. systemd then finds an empty cgroup and
-  relaunches after `RestartSec` (~5 s). ⚠️ It SIGKILLs **as root**, so it never signals a
+  waits a 2 s grace, then SIGKILLs the remainder. A parent link reaches such a grandchild
+  only while its parent lives, and an app that exits, or an X server whose death ends its
+  clients, takes the link with it. So since #3665 the window manager and the apps are the
+  children of **the desktop's keeper** (`roomlerd vd-keeper`), a subreaper in the desktop's
+  group that adopts what they leave behind and ends the whole desktop when the daemon's end
+  of its input closes, which a daemon that dies closes too
+  ([`linux-capture.md` §2.3](linux-capture.md#23-the-desktops-keeper-3665)). systemd then
+  finds an empty cgroup and relaunches after `RestartSec` (~5 s). ⚠️ It SIGKILLs **as root**, so it never signals a
   recycled pid: the daemon's own children are reaped only **after the last signal** (an
   unreaped zombie keeps its pid — and, for Xvfb, the desktop's pgid — reserved), and any
   other pid is signalled only after its `/proc` **starttime** is re-read and matches the
