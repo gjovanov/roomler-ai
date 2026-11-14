@@ -98,7 +98,7 @@ not from a second watcher. A build without zbus keeps today's 1 s `loginctl` loo
 | event | logind shows (code: `seat_guard.rs:300-335`) | which session has a worker | a live remote-desktop session |
 |---|---|---|---|
 | login | a new id, class `user`, `active` | the new id gets one (spawned at once while the key is on, D5) | none yet |
-| lock | same id, `LockedHint=yes` | kept; the worker's mutter/portal stream ends (GNOME, `docs/linux-capture.md:1901-1912`) | the peer stays in root; `GuardLocked` as today, or DRM reads the lock screen where `drm_capture` is set; clipboard and layout are refused while locked (D6) |
+| lock | same id, `LockedHint=yes` | kept; the worker's mutter/portal stream ends (GNOME, `docs/linux-capture.md:1908-1919`) | the peer stays in root; `GuardLocked` as today, or DRM reads the lock screen where `drm_capture` is set; clipboard and layout are refused while locked (D6) |
 | unlock | same id, `LockedHint=no` | the same worker reopens its sources | resumes on the same peer, no renegotiation |
 | user switch, greeter in front | another id, or class `greeter`; ours `online` (`keep_busy/logind.rs:65`) | ours kept, serves nothing while `Away`; the other person gets a worker only for a session opened to them | waits `GuardAway`, as today; never follows to the new person, who was not told (`seat_guard.rs:8-13`) |
 | several graphical sessions (xrdp, a second seat) | not seat0's active one | none | not served (out of scope) |
@@ -137,7 +137,7 @@ flowchart TB
 - **Its supervisor is the virtual desktop's, not a new `Supervision` row** (code, corrected after review): the
   daemon already keeps a child alive on Linux for its whole life, the virtual desktop's X server: a thread waits for
   its exit, marks the desktop down first, kills and reaps the tree, and waits before the next start, 1 s doubling to
-  300 s, a run of 60 s resetting it (`virtual_desktop.rs:1672-1703`, `:809-821`, `Backoff` `:1774`). The worker's
+  300 s, a run of 60 s resetting it (`virtual_desktop.rs:1692-1723`, `:809-821`, `Backoff` `:1794`). The worker's
   supervisor reuses that loop and its `Backoff`, with the worker's own floor and ceiling (2 s to 60 s, five fast
   exits). `Supervision` names what restarts the DAEMON (`supervision.rs:240-253`); the worker is a subcommand that
   never takes `run`'s restart path, so it needs no row there.
@@ -173,7 +173,7 @@ flowchart TB
   - The worker sweeps like every long-lived child and every child that runs a caller's code: the repository's
     guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-25`, `:202-228`),
     used today by exec (`exec.rs:2434-2439`), the SSH shell (`pty/unix.rs:272-276`), the portal helper
-    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:2380`, `:2393`). It marks every
+    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:2400`, `:2413`). It marks every
     descriptor above stderr close-on-exec, so the channel must ride a standard stream or the sweep would close it.
     The companion's launch is a `systemd-run` client whose unit PID 1 starts (`companion.rs:2586-2589`), so it holds
     nothing of the daemon's either way.
@@ -299,7 +299,7 @@ surface, which applies a key only where the device's own `remote_config_enabled`
 | failure | what a person would see | what the design does |
 |---|---|---|
 | the worker dies mid-session | the clipboard and layout chip stop; the picture goes on (P1) or stops with a reason (P2) | root's peer lives on; respawn with backoff; the caps narrow until the worker is back |
-| the worker cannot start: no session bus, a home it cannot enter, a session type nobody planned for (a tty, a WSL2 distro, `docs/linux-capture.md:1780-1802`) | the features answer `no-session`, as today | five fast exits stop the respawns (`macos_supervisor.rs:70-73`), the reason is logged and in the hello's `unavailable` |
+| the worker cannot start: no session bus, a home it cannot enter, a session type nobody planned for (a tty, a WSL2 distro, `docs/linux-capture.md:1787-1809`) | the features answer `no-session`, as today | five fast exits stop the respawns (`macos_supervisor.rs:70-73`), the reason is logged and in the hello's `unavailable` |
 | two people logged in | only the person on seat0 is served | one worker per session id; the one in the background serves nothing while `Away` |
 | an update replaces the binary under a running worker | nothing, until the daemon restarts | the worker is spawned from the daemon's own image (inferred: `/proc/self/exe`), and the lifeline ends it with its daemon; the next daemon spawns the new one |
 | the portal asks the person a question nobody is there to answer (KDE, P2) | a dialog on an unattended screen | the 120 s bound (`capture/portal/mod.rs:1505`) fails the open and the cascade falls through, as today; P1 opens no portal |
