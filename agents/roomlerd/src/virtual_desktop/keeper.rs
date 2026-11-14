@@ -33,20 +33,31 @@
 //!
 //! The daemon runs its own binary as `roomlerd vd-keeper` (the argument matched
 //! whole, never as a prefix), in the desktop's process group, with a pipe on
-//! stdin. It writes one JSON line, the [`Job`], and keeps the write end for the
-//! desktop's life: that pipe is the keeper's lifeline. The keeper:
+//! stdin, and keeps the pipe's write end for the desktop's life: that pipe is
+//! the keeper's lifeline. The keeper:
 //!
-//! 1. reads the job, makes itself a subreaper and arms its signals, then says
-//!    `ready` on stderr, or `refused: <why>` and exits (the daemon then starts
-//!    the clients itself, as before, and says why);
-//! 2. starts the window manager and the apps with `/dev/null` on stdin, stdout
+//! 1. checks that it is in a process group of the desktop's own, makes itself
+//!    a subreaper and arms its signals, then says `ready` on stderr, or
+//!    `refused: <why>` and exits (the daemon then starts the clients itself,
+//!    as before, and says why);
+//! 2. reads the [`Job`], one JSON line that the daemon writes only after
+//!    `ready`: a keeper the daemon gave up on never had a job, so it started
+//!    nothing;
+//! 3. starts the window manager and the apps with `/dev/null` on stdin, stdout
 //!    and stderr, and waits for every child it has, its own or adopted;
-//! 3. on SIGTERM alone (a service manager's stop signals every process of the
+//! 4. on SIGTERM alone (a service manager's stop signals every process of the
 //!    unit at once), takes down what it started and stays, for [`LINGER`] at
 //!    most, until its input ends;
-//! 4. on the end of its input, which only the daemon can cause (by its
-//!    teardown, or by dying), takes down what it started AND every other
-//!    member of the desktop's group, the X server included, then exits.
+//! 5. when the daemon is gone or tearing down, takes down what it started AND
+//!    every other member of the desktop's group, the X server included, then
+//!    exits. It hears that from the end of its input, which only the daemon
+//!    can cause (by its teardown, or by dying), and, should anything else
+//!    hold the write end, from its parent no longer being the daemon.
+//!
+//! A client's exit is reported only once the desktop has outlived it by
+//! [`NOTICE_DELAY`]. The X server's death and a stop make every client exit
+//! within milliseconds, before the keeper hears why, and such an exit is no
+//! news.
 //!
 //! Every write to stderr is non-blocking and ignores its error: once the daemon
 //! is gone, stderr is a broken pipe, and nothing in the teardown may block or
@@ -91,6 +102,18 @@ const LINE_MAX: usize = 4096;
 /// How long a teardown may take beyond its grace before the keeper gives up
 /// on a child it cannot end.
 const TEARDOWN_SLACK: Duration = Duration::from_secs(2);
+
+/// The longest grace a job may ask for. The daemon asks for 1.5 s; a keeper
+/// run by hand with a larger one still ends in bounded time.
+const GRACE_MAX: Duration = Duration::from_secs(10);
+
+/// How long the desktop must outlive a client's exit before the keeper
+/// reports it. An X server's death ends every client on its I/O error, and a
+/// service manager's stop signals every process at once, so in both cases
+/// the clients go first; the end of input, the keeper's own SIGTERM or the
+/// server's death follows within milliseconds, and the exit is then dropped,
+/// because the desktop did not run on without that client.
+const NOTICE_DELAY: Duration = Duration::from_secs(2);
 
 /// The variable a test sets on a keeper it starts from the test binary
 /// ([`tests::keeper_role`]). A keeper removes it from its children.
@@ -221,9 +244,26 @@ extern "C" fn on_signal(sig: libc::c_int) {
     }
 }
 
+/// Is `sig` ignored in this process now? Read before the keeper catches it:
+/// what the daemon ignored, the keeper inherited.
+fn ignored(sig: libc::c_int) -> bool {
+    // SAFETY: `sigaction(2)` with no new action only reads the current one
+    // into a zeroed, live struct.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 /// Make the wake pipe and catch SIGTERM, SIGINT, SIGHUP and SIGCHLD. The
 /// handlers are the process's, whichever thread runs this: a test runs the
 /// keeper on a thread of the test harness. The read end of the pipe.
+///
+/// A signal the keeper found ignored stays ignored, and is not caught: a
+/// daemon run under `nohup` ignores SIGHUP, and the clients it started itself
+/// inherited that, so the keeper's clients inherit it too (a caught signal is
+/// reset to its default at `exec`, an ignored one is not). SIGCHLD is always
+/// caught: the keeper waits for its children.
 fn arm_signals() -> std::io::Result<RawFd> {
     let mut fds: [libc::c_int; 2] = [-1, -1];
     // SAFETY: `pipe2(2)` into a live two-element array.
@@ -237,6 +277,9 @@ fn arm_signals() -> std::io::Result<RawFd> {
         (libc::SIGHUP, libc::SA_RESTART),
         (libc::SIGCHLD, libc::SA_RESTART | libc::SA_NOCLDSTOP),
     ] {
+        if sig != libc::SIGCHLD && ignored(sig) {
+            continue;
+        }
         // SAFETY: `sigaction` is plain data; all-zero is a valid value, and
         // every field the call reads is set below.
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -267,9 +310,16 @@ fn drain(fd: RawFd) {
 // The job
 // ---------------------------------------------------------------------------
 
+/// Has the daemon that started the keeper gone? Its orphans go to a
+/// subreaper or init, so the keeper's parent is then another process.
+fn daemon_gone(daemon: i32) -> bool {
+    // SAFETY: `getppid(2)` cannot fail.
+    unsafe { libc::getppid() != daemon }
+}
+
 /// Read the job's line from `fd`. `Ok(None)` when the input ends before a
-/// whole line: the daemon left before it said what to start.
-fn read_job(fd: RawFd) -> Result<Option<Job>, String> {
+/// whole line, or the daemon is gone: it left before it said what to start.
+fn read_job(fd: RawFd, daemon: i32) -> Result<Option<Job>, String> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -278,6 +328,18 @@ fn read_job(fd: RawFd) -> Result<Option<Job>, String> {
         }
         if buf.len() > JOB_MAX {
             return Err(format!("a job longer than {JOB_MAX} bytes"));
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll(2)` over one live descriptor; a signal returns early.
+        if unsafe { libc::poll(&mut pfd, 1, 1000) } <= 0 {
+            if daemon_gone(daemon) {
+                return Ok(None);
+            }
+            continue;
         }
         // SAFETY: `read(2)` into a live buffer of `chunk.len()` bytes.
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
@@ -309,11 +371,14 @@ struct Book {
     adopted: u64,
     /// Exits are expected now: the keeper is taking the desktop down.
     tearing_down: bool,
+    /// Exits of the keeper's own clients, each with the line that reports it,
+    /// held for [`NOTICE_DELAY`] ([`Book::say_notices`]).
+    notices: Vec<(Instant, String)>,
 }
 
 /// What a sweep of `waitpid` found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Left {
+pub(super) enum Left {
     /// Children are still running.
     Some,
     /// The keeper has no child left.
@@ -366,20 +431,49 @@ impl Book {
 
     fn collected(&mut self, pid: i32, status: libc::c_int) {
         let how = describe_status(status);
-        if self.wm == Some(pid) {
+        let line = if self.wm == Some(pid) {
             self.wm = None;
-            if !self.tearing_down {
-                say(&format!(
-                    "warn: the window manager ({pid}) exited: {how} — the desktop runs on without one"
-                ));
-            }
+            format!(
+                "warn: the window manager ({pid}) exited: {how} — the desktop runs on without one"
+            )
         } else if let Some(i) = self.apps.iter().position(|(p, _)| *p == pid) {
             let (_, app) = self.apps.swap_remove(i);
-            if !self.tearing_down {
-                say(&format!("info: startup app {app} ({pid}) exited: {how}"));
-            }
+            format!("info: startup app {app} ({pid}) exited: {how}")
         } else {
             self.adopted += 1;
+            return;
+        };
+        if !self.tearing_down {
+            self.notices.push((Instant::now(), line));
+        }
+    }
+
+    /// The desktop is going down: no held exit is news any more.
+    fn tear_down(&mut self) {
+        self.tearing_down = true;
+        self.notices.clear();
+    }
+
+    /// Say each held exit that the desktop has outlived by [`NOTICE_DELAY`],
+    /// while `server_alive` says its X server still runs; drop it when the
+    /// server died. Exits not yet due wait for a later call.
+    fn say_notices(&mut self, server_alive: impl FnOnce() -> bool) {
+        if !self
+            .notices
+            .iter()
+            .any(|(at, _)| at.elapsed() >= NOTICE_DELAY)
+        {
+            return;
+        }
+        let alive = !self.tearing_down && server_alive();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.notices)
+            .into_iter()
+            .partition(|(at, _)| at.elapsed() >= NOTICE_DELAY);
+        self.notices = later;
+        if alive {
+            for (_, line) in due {
+                say(&line);
+            }
         }
     }
 }
@@ -462,29 +556,46 @@ impl Procs for KeeperProcs {
 }
 
 /// Take down everything the keeper has, and with `group` every other member
-/// of the desktop's group: SIGTERM, `grace`, SIGKILL, collect. Then, within
-/// one deadline, again with no grace while any child is left, so that an
-/// orphan adopted during a pass (its parent ended by that pass) is ended too.
-/// What it cannot end in the deadline (a process that forks faster than this
-/// loop kills) is counted in a warning.
+/// of the desktop's group: SIGTERM, `grace`, SIGKILL, collect. Then again,
+/// with no grace, while any child is left, so that an orphan adopted during a
+/// pass (its parent ended by that pass) is ended too. What it cannot end (a
+/// process that forks faster than this loop kills) is counted in a warning.
 fn teardown(me: i32, daemon: i32, group: Option<i32>, grace: Duration, book: &mut Book) {
-    book.tearing_down = true;
-    let deadline = Instant::now() + grace + TEARDOWN_SLACK;
+    book.tear_down();
     let mut procs = KeeperProcs { me, daemon };
-    kill_tree_with(&mut procs, &[me], group, grace);
+    if let Err(left) = teardown_with(&mut procs, me, group, grace, &mut |_| book.reap()) {
+        say(&format!(
+            "warn: {left} processes of the desktop were still running at the end of the keeper's teardown"
+        ));
+    }
+}
+
+/// [`teardown`]'s passes over `procs`; `collect` reaps what exited and says
+/// whether any child is left. `Err` with the number of the keeper's children
+/// still running when it gave up.
+///
+/// Its bound: the first pass takes `grace` and then up to one settle (1 s)
+/// for its SIGKILL to land. Further passes have no grace and start only until
+/// `grace` + [`TEARDOWN_SLACK`] after the start, and the last one can add one
+/// settle: at most about `grace` + 3 s, 4.5 s with the daemon's 1.5 s.
+pub(super) fn teardown_with(
+    procs: &mut dyn Procs,
+    me: i32,
+    group: Option<i32>,
+    grace: Duration,
+    collect: &mut dyn FnMut(&mut dyn Procs) -> Left,
+) -> Result<(), usize> {
+    let deadline = Instant::now() + grace + TEARDOWN_SLACK;
+    kill_tree_with(procs, &[me], group, grace);
     loop {
-        if book.reap() == Left::None {
-            return;
+        if collect(procs) == Left::None {
+            return Ok(());
         }
         if Instant::now() >= deadline {
-            let left = read_proc_snapshot().iter().filter(|p| p.ppid == me).count();
-            say(&format!(
-                "warn: {left} processes of the desktop were still running at the end of the keeper's teardown"
-            ));
-            return;
+            return Err(procs.snapshot().iter().filter(|p| p.ppid == me).count());
         }
-        kill_tree_with(&mut procs, &[me], group, Duration::ZERO);
-        std::thread::sleep(Duration::from_millis(20));
+        kill_tree_with(procs, &[me], group, Duration::ZERO);
+        procs.sleep(Duration::from_millis(20));
     }
 }
 
@@ -505,24 +616,20 @@ pub(super) fn run() -> i32 {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    set_nonblocking(2);
+    // A terminal it shares with a shell (a keeper run by hand) keeps its
+    // flags; the daemon gives it a pipe of its own.
+    // SAFETY: `isatty(3)` on a descriptor number.
+    if unsafe { libc::isatty(2) } == 0 {
+        set_nonblocking(2);
+    }
     let me = std::process::id() as i32;
-    // SAFETY: `getppid(2)` and `getpgrp(2)` cannot fail.
+    // SAFETY: `getppid(2)` and `getpgrp(2)` cannot fail; `getpgid(2)` of the
+    // daemon is -1 once it is gone.
     let (daemon, group) = unsafe { (libc::getppid(), libc::getpgrp()) };
-    let job = match read_job(0) {
-        Ok(Some(job)) => job,
-        Ok(None) => return 0,
-        Err(why) => {
-            say(&format!("refused: {why}"));
-            return 2;
-        }
-    };
-    // SAFETY: `getpgid(2)` of the daemon; -1 once it is gone.
     let daemons_group = unsafe { libc::getpgid(daemon) };
-    if job.group <= 1 || job.group != group || group == me || group == daemons_group {
+    if group <= 1 || group == me || group == daemons_group {
         say(&format!(
-            "refused: not in the desktop's own process group (job {}, keeper {group}, daemon {daemons_group})",
-            job.group
+            "refused: not in a process group of the desktop's own (keeper {group}, daemon {daemons_group})"
         ));
         return 2;
     }
@@ -543,15 +650,35 @@ pub(super) fn run() -> i32 {
         }
     };
     say("ready");
+    // #3665 — the job comes only now: a keeper the daemon gave up on before
+    // `ready` never gets one and starts nothing.
+    let job = match read_job(0, daemon) {
+        Ok(Some(job)) => job,
+        Ok(None) => return 0,
+        Err(why) => {
+            say(&format!("refused: {why}"));
+            return 2;
+        }
+    };
+    if job.group != group {
+        say(&format!(
+            "refused: the job is for process group {}, and the keeper is in {group}",
+            job.group
+        ));
+        return 2;
+    }
     let mut book = Book::default();
-    book.start(&job);
+    if !TERM.load(Ordering::SeqCst) {
+        book.start(&job);
+    }
     serve(me, daemon, group, wake, &job, &mut book)
 }
 
-/// The keeper's loop: collect children, and end on the end of input (the
-/// whole desktop) or on SIGTERM (what the keeper started, then the linger).
+/// The keeper's loop: collect children, report the exits the desktop
+/// outlived, and end when the daemon is gone or tearing down (the whole
+/// desktop) or on SIGTERM (what the keeper started, then the linger).
 fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Book) -> i32 {
-    let grace = Duration::from_millis(job.grace_ms);
+    let grace = Duration::from_millis(job.grace_ms).min(GRACE_MAX);
     let mut termed: Option<Instant> = None;
     let mut input = [0u8; 4096];
     loop {
@@ -590,6 +717,15 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
             say_goodbye(book);
             return 0;
         }
+        // A second notice, for a write end that something besides the daemon
+        // holds: the daemon's orphans, the keeper among them, have another
+        // parent now.
+        if daemon_gone(daemon) {
+            say("info: the daemon is gone — taking the whole desktop down");
+            teardown(me, daemon, Some(group), grace, book);
+            say_goodbye(book);
+            return 0;
+        }
         if termed.is_none() && TERM.load(Ordering::SeqCst) {
             say(
                 "info: asked to stop — taking down what the desktop started, then waiting for the daemon",
@@ -602,6 +738,9 @@ fn serve(me: i32, daemon: i32, group: i32, wake: RawFd, job: &Job, book: &mut Bo
             say_goodbye(book);
             return 0;
         }
+        // The X server is the desktop's group leader, and the daemon's child:
+        // dead, it stays a zombie until the daemon's teardown reaps it.
+        book.say_notices(|| is_running(group));
     }
 }
 
@@ -618,12 +757,23 @@ fn say_goodbye(book: &Book) {
 pub(super) mod tests {
     use super::*;
 
+    /// Is this test binary running `test` (its path below the crate) alone, as
+    /// a role: `--exact` and the test's own name on its command line? A role's
+    /// variable that leaked into a plain run of the suite must not make a
+    /// subreaper of the process every test shares, or end it midway.
+    pub(in crate::virtual_desktop) fn runs_alone_as(test: &str) -> bool {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        args.iter().any(|a| a == "--exact") && args.iter().any(|a| a == test)
+    }
+
     /// The keeper, as a test starts it: this test binary re-run with this
     /// function's name, `--exact`, and [`TEST_ROLE_ENV`] set. In a plain run of
     /// the suite it does nothing.
     #[test]
     fn keeper_role() {
-        if std::env::var_os(TEST_ROLE_ENV).is_none() {
+        if std::env::var_os(TEST_ROLE_ENV).is_none()
+            || !runs_alone_as("virtual_desktop::keeper::tests::keeper_role")
+        {
             return;
         }
         std::process::exit(run());
@@ -689,12 +839,15 @@ pub(super) mod tests {
         };
         let line = job.line();
         assert_eq!(line.matches('\n').count(), 1, "one line: {line:?}");
+        // The "daemon" is whoever runs this test process: never gone here.
+        // SAFETY: `getppid(2)` cannot fail.
+        let parent = unsafe { libc::getppid() };
         let (r, w) = pipe();
         write_all(w, line.as_bytes());
         // A later line is reserved: the job's reader stops at the first.
         write_all(w, b"{\"later\":true}\n");
         close(w);
-        let read = read_job(r);
+        let read = read_job(r, parent);
         close(r);
         assert_eq!(read, Ok(Some(job)));
 
@@ -705,7 +858,7 @@ pub(super) mod tests {
             b"{\"display\":\":7\",\"group\":9,\"wm\":\"openbox\",\"grace_ms\":1,\"new\":[1]}\n",
         );
         close(w);
-        let read = read_job(r).unwrap().unwrap();
+        let read = read_job(r, parent).unwrap().unwrap();
         close(r);
         assert!(read.apps.is_empty());
 
@@ -713,7 +866,7 @@ pub(super) mod tests {
         let (r, w) = pipe();
         write_all(w, b"not json\n");
         close(w);
-        let read = read_job(r);
+        let read = read_job(r, parent);
         close(r);
         assert!(read.is_err(), "{read:?}");
 
@@ -721,9 +874,22 @@ pub(super) mod tests {
         let (r, w) = pipe();
         write_all(w, b"{\"display\"");
         close(w);
-        let read = read_job(r);
+        let read = read_job(r, parent);
         close(r);
         assert_eq!(read, Ok(None));
+
+        // Review R1-9: the input stays open (something besides the daemon
+        // holds its write end) but the daemon is gone: no job, after one
+        // quiet poll. -1 is no process's parent.
+        let (r, w) = pipe();
+        write_all(w, b"{\"display\"");
+        let asked = Instant::now();
+        let read = read_job(r, -1);
+        let took = asked.elapsed();
+        close(w);
+        close(r);
+        assert_eq!(read, Ok(None));
+        assert!(took < Duration::from_secs(3), "it took {took:?}");
     }
 
     #[test]
