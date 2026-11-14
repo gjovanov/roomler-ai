@@ -749,9 +749,40 @@ The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
 logged as they are. Text the server relays from a person follows the same rule:
 a fleet RPC command's `caller`, the server's name for who asked (their display
-name, or `name (via device)`). Pinned by `peer::files_log_tests` (the files
-channel) and `peer::wire_text_log_tests` (the clipboard channel, and a channel
-named with a line break).
+name, or `name (via device)`), and what an SSH grant brings (below). Pinned by
+`peer::files_log_tests` (the files channel) and `peer::wire_text_log_tests` (the
+clipboard channel, and a channel named with a line break).
+
+### What an SSH client sends, and what a grant names, are escaped too (#3815)
+
+The device's SSH server writes its log by the same rule. A client chooses its
+login name, the terminal it asks for, a subsystem's name and every place it
+asks to forward to. A grant brings two strings a person typed: `caller`, the
+server's name for who asked, and the account a `named` policy runs as, which an
+admin typed into the device's SSH policy. So each of these is logged with Debug
+escaping, on every line that holds it:
+
+| Field | What it holds | Its lines |
+|---|---|---|
+| `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
+| `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2165`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2083`) | the four `ssh: forward …` lines |
+| `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:901`, `:924`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
+| `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
+| `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
+
+Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
+question's id), which the SYSTEM service checks with `valid_object_id` before it
+logs one; the server's word for the account mode (`account_mode`: `daemon`,
+`console_user` or `named`); a key's fingerprint; the resolver's error for a
+forward, which names no host; and a refusal the worker sends back to the SYSTEM
+service, which `clean_reason` has stripped of control characters. The exec
+engine's lines serve fleet RPC too, so a fleet RPC command's `caller` is escaped
+there as well. Pinned by `ssh::tests::wire_text_log_tests`: a client's login
+name, terminal, subsystem and forward hosts; a grant's caller, through the
+question to the person at the device and on the SYSTEM service's port; and a
+named account. Each holds a line break and a control character.
 
 ### A received file's folders are its writer's own (#3688)
 

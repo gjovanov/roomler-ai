@@ -1110,7 +1110,10 @@ mod sshd {
             let handle = session.handle();
             tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
-                warn!(%caller, "ssh: session reached its granted time limit — disconnecting");
+                warn!(
+                    ?caller,
+                    "ssh: session reached its granted time limit — disconnecting"
+                );
                 let _ = handle
                     .disconnect(
                         russh::Disconnect::ByApplication,
@@ -1265,7 +1268,7 @@ mod sshd {
             };
 
             info!(
-                peer = %self.peer, %caller, run_as = %run_as.label(),
+                peer = %self.peer, ?caller, run_as = ?run_as.label(),
                 privileged = run_as.is_privileged(), server = %program.display(),
                 "ssh: sftp session started"
             );
@@ -1390,7 +1393,7 @@ mod sshd {
             self.exec_aborts.insert(channel, abort.clone());
             let peer = self.peer;
             info!(
-                %peer, %caller, run_as = "console_user", privileged = false,
+                %peer, ?caller, run_as = "console_user", privileged = false,
                 server = %program.display(),
                 "ssh: sftp session started (CreateProcessAsUserW)"
             );
@@ -1517,7 +1520,7 @@ mod sshd {
             let pty = match spawned {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!(peer = %self.peer, %e, "ssh: could not start the terminal session");
+                    warn!(peer = %self.peer, ?e, "ssh: could not start the terminal session");
                     let _ = handle
                         .extended_data(channel, 1, format!("roomler-ssh: {e}\r\n").into_bytes())
                         .await;
@@ -1528,8 +1531,8 @@ mod sshd {
             };
 
             info!(
-                peer = %self.peer, %caller, run_as = %run_as.label(),
-                privileged = run_as.is_privileged(), %term,
+                peer = %self.peer, ?caller, run_as = ?run_as.label(),
+                privileged = run_as.is_privileged(), ?term,
                 "ssh: interactive session started"
             );
 
@@ -1586,11 +1589,11 @@ mod sshd {
                     // Nobody is left to tell how it ended, and waiting for that
                     // would keep a shell alive against a channel nobody reads:
                     // `pty` drops here, which ends the session.
-                    info!(caller = %caller_for_pump, "ssh: interactive session ended: its client is gone");
+                    info!(caller = ?caller_for_pump, "ssh: interactive session ended: its client is gone");
                     return;
                 }
                 let status = pty.wait().await;
-                info!(caller = %caller_for_pump, status, "ssh: interactive session ended");
+                info!(caller = ?caller_for_pump, status, "ssh: interactive session ended");
                 let _ = handle.exit_status_request(channel, status).await;
                 let _ = handle.close(channel).await;
                 // `pty` drops here, which kills anything still in the group.
@@ -1643,8 +1646,8 @@ mod sshd {
             // a second session even within the grant's lifetime.
             if let Some(grant) = super::take_grant_for(key) {
                 info!(
-                    peer = %self.peer, %user, %fingerprint,
-                    grant_id = %grant.grant_id, caller = %grant.caller,
+                    peer = %self.peer, ?user, %fingerprint,
+                    grant_id = %grant.grant_id, caller = ?grant.caller,
                     account_mode = %grant.account_mode,
                     "ssh: authenticated (server grant)"
                 );
@@ -1677,7 +1680,7 @@ mod sshd {
                 .any(|k| k.key_data() == key.key_data());
             if listed {
                 info!(
-                    peer = %self.peer, %user, %fingerprint,
+                    peer = %self.peer, ?user, %fingerprint,
                     "ssh: authenticated (ssh_authorized_keys)"
                 );
                 self.policy = Some(ResolvedSessionPolicy::from_key_list(
@@ -1687,7 +1690,7 @@ mod sshd {
                 Ok(Auth::Accept)
             } else {
                 warn!(
-                    peer = %self.peer, %user, %fingerprint,
+                    peer = %self.peer, ?user, %fingerprint,
                     pending_grants = super::pending_grants(),
                     "ssh: rejected — no live grant for this key and it is not in ssh_authorized_keys"
                 );
@@ -1762,7 +1765,7 @@ mod sshd {
                 // tells the caller it was a policy decision and not a dead
                 // destination. The *reason* stays here, next to the operator
                 // who can act on it — it names internal topology.
-                warn!(peer = %self.peer, %caller, %host, port, %why, "ssh: forward refused");
+                warn!(peer = %self.peer, ?caller, ?host, port, ?why, "ssh: forward refused");
                 // Reported as DENIED. A refused forward is the row an operator
                 // most wants to see — it is someone probing what this device
                 // can reach.
@@ -1781,7 +1784,7 @@ mod sshd {
             // Held for the life of the splice, released when the task ends.
             let Ok(permit) = self.ctx.forwards.clone().try_acquire_owned() else {
                 warn!(
-                    peer = %self.peer, %caller, %host, port,
+                    peer = %self.peer, ?caller, ?host, port,
                     cap = MAX_CONCURRENT_FORWARDS,
                     "ssh: forward refused — concurrent-forward ceiling reached"
                 );
@@ -1795,7 +1798,7 @@ mod sshd {
             let target = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(peer = %self.peer, %host, port, %e, "ssh: forward could not connect");
+                    warn!(peer = %self.peer, ?host, port, %e, "ssh: forward could not connect");
                     reply.reject(ChannelOpenFailure::ConnectFailed).await;
                     return Ok(());
                 }
@@ -1803,7 +1806,7 @@ mod sshd {
             let _ = target.set_nodelay(true);
 
             reply.accept().await;
-            info!(peer = %self.peer, %caller, %host, port, "ssh: forward opened");
+            info!(peer = %self.peer, ?caller, ?host, port, "ssh: forward opened");
             self.report(
                 SshActivityKind::Forward,
                 Some(format!("{host}:{port}")),
@@ -1965,7 +1968,7 @@ mod sshd {
                     rows: row_height as u16,
                 },
             ));
-            info!(peer = %self.peer, %term, cols = col_width, rows = row_height, "ssh: pty requested");
+            info!(peer = %self.peer, ?term, cols = col_width, rows = row_height, "ssh: pty requested");
             session.channel_success(channel)?;
             Ok(())
         }
@@ -2159,7 +2162,7 @@ mod sshd {
         what: &str,
         why: &str,
     ) -> Result<(), russh::Error> {
-        warn!(%peer, request = %what, "ssh: refused an unsupported request");
+        warn!(%peer, request = ?what, "ssh: refused an unsupported request");
         let _ = session.extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes());
         session.channel_failure(channel)?;
         Ok(())
@@ -2274,12 +2277,12 @@ mod sshd {
             .get(&key)
             .and_then(|(_, id, q)| q.upgrade().map(|q| (id.clone(), q)))
         {
-            info!(%caller, %grant, question = %id, what, "ssh: this is asked already — waiting on that question");
+            info!(?caller, %grant, question = %id, what, "ssh: this is asked already — waiting on that question");
             return (standing, true);
         }
         let turn = TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = bson::oid::ObjectId::new().to_hex();
-        info!(%caller, %grant, question = %id, what, "ssh: asking the person at the device");
+        info!(?caller, %grant, question = %id, what, "ssh: asking the person at the device");
         let leave = Leave {
             key: key.clone(),
             turn,
@@ -2352,11 +2355,11 @@ mod sshd {
                 let verdict = relay.ask(id, caller, what, timeout).await;
                 match &verdict {
                     Ok(()) => info!(
-                        %caller, %grant, question = %id,
+                        ?caller, %grant, question = %id,
                         "ssh-service: the person at the device approved the session"
                     ),
                     Err(why) => warn!(
-                        %caller, %grant, question = %id, %why,
+                        ?caller, %grant, question = %id, %why,
                         "ssh-service: the person at the device did not approve the session"
                     ),
                 }
@@ -2429,7 +2432,7 @@ mod sshd {
         let marker = match broker.write_prompt(sentinel, &prompt) {
             Ok(_) => true,
             Err(e) => {
-                warn!(%caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
+                warn!(?caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
                 false
             }
         };
@@ -2450,7 +2453,7 @@ mod sshd {
             if notified && marker {
                 prompt.surface = crate::consent::PromptSurface::Notification;
                 if let Err(e) = broker.write_prompt(sentinel, &prompt) {
-                    warn!(%caller, %sentinel, %e, "ssh: could not mark the consent prompt as shown by a notification");
+                    warn!(?caller, %sentinel, %e, "ssh: could not mark the consent prompt as shown by a notification");
                 }
             }
             // A companion that is up and has the marker to read IS a surface:
@@ -2458,7 +2461,7 @@ mod sshd {
             // and nobody answered was reported as one nobody could be asked.
             have_surface = (companion_up && marker) || notified;
         }
-        info!(%caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
+        info!(?caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
 
         let decision = asking.await;
         // The single convergence point: answered, timed out, or resolved from
@@ -2468,10 +2471,10 @@ mod sshd {
         // question logs that id, and is matched to this answer by it.
         let grant = grant.unwrap_or("-");
         if decision.granted() {
-            info!(%caller, %grant, %sentinel, "ssh: operator approved the session");
+            info!(?caller, %grant, %sentinel, "ssh: operator approved the session");
             return Ok(());
         }
-        warn!(%caller, %grant, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
+        warn!(?caller, %grant, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
         Err(match decision {
             crate::consent::Decision::Timeout if !have_surface => {
                 "nobody could be asked at this device — it has no prompt surface (no one at its \
@@ -2605,7 +2608,10 @@ mod sshd {
         // again before it spawns; this check just spares the log a run that
         // was never going to deliver anything.
         if abort.is_cancelled() {
-            info!(%caller, "ssh: the channel closed before the command started — not running it");
+            info!(
+                ?caller,
+                "ssh: the channel closed before the command started — not running it"
+            );
             let _ = handle.exit_status_request(channel, 1).await;
             let _ = handle.close(channel).await;
             return;
@@ -2666,7 +2672,7 @@ mod sshd {
         // is actually asking, and it should not require joining against the
         // device's policy to answer.
         info!(
-            %caller, run_as = %identity, privileged,
+            ?caller, run_as = ?identity, privileged,
             exit = status, duration_ms = finished.duration_ms,
             bytes = finished.bytes, streamed = streaming,
             "ssh: exec finished"
@@ -3077,7 +3083,7 @@ pub fn record_grant(
         tracing::warn!("ssh: pending-grant table full — dropped the oldest");
     }
     tracing::info!(
-        grant_id = %grant.grant_id, caller = %grant.caller,
+        grant_id = %grant.grant_id, caller = ?grant.caller,
         account_mode = %grant.account_mode, ttl_secs = window.as_secs(),
         server_expiry_in_ms,
         "ssh: grant recorded"

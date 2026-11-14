@@ -6213,7 +6213,7 @@ async fn handle_server_msg(
                     None
                 };
                 if let Some((refused, why)) = refusal {
-                    warn!(%grant_id, %caller, why, "rc:ssh.grant for the SYSTEM service refused");
+                    warn!(%grant_id, ?caller, why, "rc:ssh.grant for the SYSTEM service refused");
                     let _ = outbound_tx
                         .send(ClientMsg::SshGrantAck {
                             grant_id,
@@ -6226,12 +6226,12 @@ async fn handle_server_msg(
                     tokio::spawn(async move {
                         match crate::exec_service::ring_ssh(&grant_id).await {
                             Ok(()) => info!(
-                                %grant_id, %caller,
+                                %grant_id, ?caller,
                                 "rc:ssh.grant handed to the SYSTEM service"
                             ),
                             Err(e) => {
                                 warn!(
-                                    %grant_id, %caller, %e,
+                                    %grant_id, ?caller, %e,
                                     "rc:ssh.grant refused — the SYSTEM service did not take it"
                                 );
                                 let _ = tx
@@ -6257,7 +6257,7 @@ async fn handle_server_msg(
                 use roomler_ai_remote_control::models::SshGrantRefusal;
                 let refused = if !agent_cfg.ssh_enabled {
                     warn!(
-                        %grant_id, %caller,
+                        %grant_id, ?caller,
                         "rc:ssh.grant refused — ssh_enabled is off on this device"
                     );
                     Some(SshGrantRefusal::SshDisabled)
@@ -6274,7 +6274,7 @@ async fn handle_server_msg(
                     ) {
                         Ok(()) => None,
                         Err(e) => {
-                            warn!(%grant_id, %caller, %e, "rc:ssh.grant rejected");
+                            warn!(%grant_id, ?caller, %e, "rc:ssh.grant rejected");
                             Some(e.refusal())
                         }
                     }
@@ -6301,7 +6301,7 @@ async fn handle_server_msg(
                     via_service,
                 );
                 warn!(
-                    %grant_id, %caller,
+                    %grant_id, ?caller,
                     "rc:ssh.grant ignored — this build lacks the `ssh-server` feature"
                 );
             }

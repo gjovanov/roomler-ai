@@ -2168,7 +2168,7 @@ impl ExecEngine {
 
         info!(
             request_id = %req.request_id,
-            caller = %req.caller,
+            caller = ?req.caller,
             shell = %req.shell,
             timeout_ms,
             "fleet-rpc: running command"
@@ -2270,7 +2270,7 @@ impl ExecEngine {
 
         info!(
             request_id = %req.request_id,
-            caller = %req.caller,
+            caller = ?req.caller,
             shell = %req.shell,
             "exec: streaming command"
         );
@@ -2425,8 +2425,8 @@ impl ExecEngine {
         };
         if let Err(e) = applied {
             warn!(
-                request_id = %req.request_id, caller = %req.caller,
-                run_as = %req.run_as.label(),
+                request_id = %req.request_id, caller = ?req.caller,
+                run_as = ?req.run_as.label(),
                 "exec: refusing to run — the requested identity is unavailable"
             );
             return ExecOutcome::failed(e);
