@@ -4297,8 +4297,8 @@ any of the three off, a roll ends the session as it did before FR-138. With its 
 does nothing new at all, the server's end of a session and a supervised Mac's delegated sessions included (P4-0,
 §11.16), so the resume scope alone decides which devices change.
 
-**A roll, end to end.** Production has run the window at 60 s since 2026-11-10, with a scope that names a few test
-devices.
+**A roll, end to end.** Production has run the window at 60 s since 2026-11-10, and its scope, widened class by
+class (FR-138's P4), has read `all` since 2026-11-13.
 
 ```mermaid
 sequenceDiagram

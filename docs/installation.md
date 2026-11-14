@@ -2899,7 +2899,10 @@ A tray with no marker reads `version UNKNOWN (no version marker)` instead. Resta
 retries at once. The log the last line names is the service's own (`roomlerd-service.log`), where
 the refresh writes. When it shows the swap refused (`desktop companion refresh skipped`, with
 access denied or a file in use), allowing Roomler to replace `roomler-desktop.exe` in its install
-folder ends it. `ROOMLERD_COMPANION_SYNC=0` turns the retry off, the faster one with it, and the
+folder ends it. The tray keeps running meanwhile: the refresh stops it only once the new EXE is in
+place, and brings back a tray whose start it saw fail (#3824, [`desktop-companion.md`
+§13.3](desktop-companion.md#133-the-tray-is-stopped-last-and-a-tray-the-refresh-lost-comes-back-windows-3824)).
+`ROOMLERD_COMPANION_SYNC=0` turns the retry off, the faster one with it, and the
 second line then reads `Roomler replaces it only at a start: its automatic retry is off
 (ROOMLERD_COMPANION_SYNC=0)`. The refresh at a start stays on. The mechanics:
 [`desktop-companion.md` §13.2](desktop-companion.md#132-a-tray-too-old-for-its-daemon-windows-3781).
