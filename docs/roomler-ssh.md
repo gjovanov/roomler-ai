@@ -386,7 +386,7 @@ Mechanics worth knowing:
   `crates/tunnel-core/src/child.rs:231`; registered at
   `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
-  (`agents/roomlerd/src/exec.rs:1944`) and `sftp-server`
+  (`agents/roomlerd/src/exec.rs:2287`) and `sftp-server`
   (`agents/roomlerd/src/ssh.rs:1250`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
@@ -630,9 +630,9 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1374`](../agents/roomlerd/src/exec.rs#L1374)). Exec, the pty and `sftp`
+[`exec.rs:1717`](../agents/roomlerd/src/exec.rs#L1717)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:817`](../agents/roomlerd/src/exec.rs#L817)), so one rule covers all
+([`exec.rs:819`](../agents/roomlerd/src/exec.rs#L819)), so one rule covers all
 three.
 
 ```mermaid
@@ -640,13 +640,15 @@ flowchart TD
   S["a session or command asks for console_user"] --> L{"who is at the screen?"}
   L -- "Linux: loginctl show-seat seat0 → ActiveSession,<br/>off the async worker, 1.5 s at most (#3822)" --> K{"that session's Class"}
   L -- "Linux: no answer within 1.5 s, or the lookup failed" --> X4["refused: could not tell who is there, try again"]
-  L -- "macOS: stat -f %Su /dev/console" --> M{"root, empty, or _system?"}
+  L -- "macOS: stat -f %Su /dev/console,<br/>off the async worker, 1.5 s at most (#3853)" --> M{"root, empty, or _system?"}
+  L -- "macOS: no answer within 1.5 s" --> X4
   L -- "no logind, no seat0, no active session" --> X1["refused: nobody is signed in"]
   K -- "greeter (the login screen), or any non-user class" --> X1
   K -- user --> A["that session's Name"]
   M -- yes --> X1
   M -- no --> A
-  A --> R{"resolve the account"}
+  A --> R{"resolve the account, off the async worker,<br/>1.5 s at most (#3853)"}
+  R -- "no answer within 1.5 s, or the lookup failed" --> X5["refused: could not look up the account, try again"]
   R -- "uid 0, or root's session at seat0" --> X2["refused: never root this way"]
   R -- "Linux: not the uid logind recorded for the session" --> X1
   R -- ok --> D{"the daemon runs as"}
@@ -690,13 +692,13 @@ the account, for as long as it took. It now asks through the one seat0 lookup in
 flight that a received file asks (`files::ask_seat0`, on a thread named
 `seat0-lookup`, [`files.rs:1046`](../agents/roomlerd/src/files.rs#L1046)), awaited
 from the session's own task, `SEAT_LOOKUP_WAIT` (1.5 s) at most
-(`exec::console_account`, [`exec.rs:908`](../agents/roomlerd/src/exec.rs#L908)). It
+(`exec::console_account`, [`exec.rs:919`](../agents/roomlerd/src/exec.rs#L919)). It
 asks at the same point as before: after every gate and the consent prompt, right
 before the drop. A hung logind holds one thread for files, exec and SSH together,
 and each later caller waits on that lookup within its own 1.5 s, starting none.
 
 Only a person's answer is an account (`exec::console_person`,
-[`exec.rs:949`](../agents/roomlerd/src/exec.rs#L949)):
+[`exec.rs:972`](../agents/roomlerd/src/exec.rs#L972)):
 
 | The lookup answers | The command or session |
 |---|---|
@@ -712,7 +714,9 @@ person: not root, not the daemon's own identity, not the person a lookup found
 before. A refusal reaches the caller where every refusal does: the Fleet RPC
 result's `error` (and so `exec_audit`), and `roomler-ssh: …` on the SSH client's
 stderr for a command or a shell, `roomler: …` for `sftp`. macOS reads
-`/dev/console`'s owner as before.
+`/dev/console`'s owner off the async worker too since #3853, and the account the
+person's name resolves to is looked up the same way on both
+(§ The account is looked up off the async worker, below).
 
 Tested in `exec::console_lookup_tests`, as the runner (rust-agent's "Test agent
 under vp9-444") and as root (rust-recorder's #3822 step): with the lookup held up,
@@ -730,6 +734,70 @@ and were refused once GDM's greeter held the seat. A per-user daemon whose own
 account was at the screen ran them as itself. On a Mac's root daemon they ran as
 the GUI user and were refused at the login window. On the release, every one of
 them had been refused as "a Windows concept".
+
+#### The account is looked up off the async worker, 1.5 s at most (#3853)
+
+`named` and `console_user` both end in an account lookup: `getpwnam_r`, then
+`getgrouplist`, which reach the account database through NSS. On a domain-joined
+Linux host that is SSSD, LDAP or Active Directory, on a Mac Open Directory, and any
+of them can stop answering. The agent used to run the lookup inline, on the async
+worker that applied the account, for as long as it took, so a stalled SSSD held that
+worker and every socket and timer on it: the shape #3830 measured for a hung logind.
+
+The lookup now runs on a thread of its own, named `account-lookup`, through one
+lookup in flight **per account name** (`one_in_flight::OneInFlightPerKey`,
+[`one_in_flight.rs:391`](../agents/roomlerd/src/one_in_flight.rs#L391); the
+daemon's `ACCOUNTS`, [`exec.rs:1475`](../agents/roomlerd/src/exec.rs#L1475)). The
+session's own task awaits it `ACCOUNT_LOOKUP_WAIT` (1.5 s) at most
+(`unix_priv::session_account`,
+[`exec.rs:1497`](../agents/roomlerd/src/exec.rs#L1497)), at the same point as
+before: after every gate and the consent prompt, right before the drop.
+
+- **Keyed by the name.** `named:ana` and a `console_user` session whose person is
+  `ana` share one lookup, and another account gets its own. While the account
+  database hangs, every retry for an account waits on the lookup already running
+  and starts none, so the hang holds one thread per account asked, however often
+  it is asked.
+- **Only a lookup that began after the question answers it** (#3796's rule). A
+  lookup already running is waited out, and its answer is left to the callers it
+  was started for. No answer from before the question, late or remembered, ever
+  names the account a command runs as.
+- **The map holds only the lookups that run.** The lookup's own thread removes its
+  account's entry as it ends, answered, failed or panicked.
+- **Fork safety is unchanged.** The account (uid, gid, groups, home, name) is still
+  resolved in the parent, now on the lookup's thread, before the fork. The child
+  only calls `setgroups`, `setgid`, `setuid`, `getuid`, `geteuid` and `chdir` over
+  memory the drop already owns.
+
+What the lookup gives decides the session (`unix_priv::in_time`,
+[`exec.rs:1530`](../agents/roomlerd/src/exec.rs#L1530)):
+
+| The lookup, within 1.5 s | The command or session |
+|---|---|
+| resolves the account | runs as it, as before |
+| no such account, uid 0, a name with a NUL byte | refused in the words it always had, with no try-again |
+| gives no answer, returns an error from the account database (`getpwnam_r` failing), or panics | refused: `cannot run as "<name>": Could not look up the account to run as in this computer's account database. Try again. (<why>)`. Nothing runs, as anyone |
+
+`console_user` asks who is at the screen first (#3822's 1.5 s on Linux; on a Mac
+the owner of `/dev/console`, a `stat` child, now asked through one lookup in flight
+on a thread named `console-owner`, `exec::ask_console_owner`,
+[`exec.rs:1015`](../agents/roomlerd/src/exec.rs#L1015), with #3822's
+try-again words when it gives no answer), then looks the person's account up as
+above, so it waits 3 s at most. The refusal reaches the caller where every refusal
+does: the Fleet RPC result's `error` (and `exec_audit`), `roomler-ssh: …` on the SSH
+client's stderr for a command or a shell, and `roomler: …` for `sftp`.
+
+Tested, with the account database stood in for each test's own tasks:
+`exec::console_lookup_tests::account_database` runs as the runner (rust-agent's
+"Test agent under vp9-444", with the shell) and as root (rust-recorder's
+#3822/#3853 step). With the database stalled, `named` and `console_user` are refused
+every way within the wait with the try-again words and run nothing. A 10 ms timer on
+a two-worker runtime stays on time while they ask, and asks for one account share
+one lookup while another account gets its own. A lookup that answers in time drops
+as before, and no answer but an account runs anything.
+`exec::mac_console_lookup_tests` (the macOS lane) does the same for the console's
+owner and for `named` on a Mac. Field verification is owed: a paused SSSD on a Linux
+system install.
 
 #### Where a session starts (FR-97 P5b)
 
@@ -785,7 +853,9 @@ privilege-retention bug and looks like a successful drop from outside. The
 result is then verified (`getuid`/`geteuid`) rather than assumed. Account and
 group lookup happen in the *parent*: everything between `fork` and `exec` must
 be async-signal-safe and must not allocate, since a malloc lock held by another
-thread at fork time is never released in the child.
+thread at fork time is never released in the child. Since #3853 that lookup runs
+on the parent's `account-lookup` thread, 1.5 s at most, never on the async worker
+(§ The account is looked up off the async worker, 1.5 s at most).
 
 Naming an account that resolves to uid 0 is refused. Not because running as
 root is impossible — `daemon` already is root there — but because it has to be
@@ -1381,7 +1451,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:1055`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:1184`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
