@@ -496,7 +496,7 @@ pub struct ReadAnswer {
     pub segment: Segment,
     pub config: Held,
     pub plist: Held,
-    pub legacy: LegacyKinds,
+    pub legacy: LegacyEntries,
 }
 
 /// The home itself.
@@ -512,7 +512,7 @@ pub struct HomeEntry {
     pub ino: Option<u64>,
 }
 
-/// A folder in the home.
+/// A folder in the home, or a name an old copy is kept under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -534,13 +534,14 @@ pub enum Segment {
 
 /// What `lstat` finds at each name an older release kept its copies under in
 /// the roomler folder (`config.toml.pre-one-row`,
-/// `com.roomler.agent.plist.pre-one-row`): `absent` when there is none,
-/// `other` with no owner when it could not be looked at.
+/// `com.roomler.agent.plist.pre-one-row`), reported as a folder is: kind,
+/// owner, mode and whether the person can write it. `absent` when there is
+/// none; `other` with no owner and no mode when it could not be looked at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LegacyKinds {
-    pub config: Kind,
-    pub plist: Kind,
+pub struct LegacyEntries {
+    pub config: Entry,
+    pub plist: Entry,
 }
 
 /// `put-back-legacy`'s answer: which of those copies it renamed back.
@@ -922,9 +923,9 @@ fn read(at: &Places, fs: &impl Fs) -> ReadAnswer {
         segment: at.segment,
         config: fs.read(&at.config, CONFIG_BOUND),
         plist: fs.read(&at.plist, PLIST_BOUND),
-        legacy: LegacyKinds {
-            config: fs.lstat(&at.legacy_config).kind,
-            plist: fs.lstat(&at.legacy_plist).kind,
+        legacy: LegacyEntries {
+            config: entry(fs, &at.legacy_config),
+            plist: entry(fs, &at.legacy_plist),
         },
     }
 }
@@ -1996,12 +1997,47 @@ mod tests {
         assert_eq!(read.segment, Segment::Current);
         assert_eq!(
             read.legacy,
-            LegacyKinds {
-                config: Kind::File,
-                plist: Kind::Other
+            LegacyEntries {
+                config: Entry {
+                    kind: Kind::File,
+                    uid: Some(UID),
+                    mode: Some(0o600),
+                    writable: true
+                },
+                plist: Entry {
+                    kind: Kind::Other,
+                    uid: None,
+                    mode: None,
+                    writable: false
+                }
             }
         );
         assert!(fs.changes().is_empty(), "{:?}", fs.changes());
+    }
+
+    /// Root's side names the owner and the mode of a kept copy when it
+    /// refuses, so both are on the wire, as a folder's are.
+    #[test]
+    fn read_reports_a_kept_copy_with_its_owner_and_mode() {
+        let (mut fs, at) = a_home();
+        fs.put(
+            &at.legacy_config,
+            Kind::File,
+            0,
+            0o600,
+            b"old".to_vec(),
+            false,
+        );
+        let out = answer(Verb::Read, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let legacy = &reply["read"]["legacy"];
+        assert_eq!(
+            legacy["config"],
+            serde_json::json!({"kind": "file", "uid": 0, "mode": 0o600, "writable": false}),
+            "{legacy}"
+        );
+        assert_eq!(legacy["plist"]["kind"], "absent", "{legacy}");
     }
 
     #[test]
@@ -2664,12 +2700,10 @@ mod tests {
                     mode: 0o644
                 }
             );
+            assert_eq!(read.legacy.config.kind, Kind::Absent);
             assert_eq!(
-                read.legacy,
-                LegacyKinds {
-                    config: Kind::Absent,
-                    plist: Kind::File
-                }
+                (read.legacy.plist.kind, read.legacy.plist.uid),
+                (Kind::File, Some(owner))
             );
             assert_eq!(read.segment, Segment::Current);
             assert_eq!(read.agents_dir.kind, Kind::Dir);
