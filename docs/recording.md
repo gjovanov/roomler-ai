@@ -758,7 +758,12 @@ flowchart LR
   (`exec::drop_to_std`). So `launch::spawn` runs on a blocking thread, for a
   start (`recording/manager.rs:704`) and for `record --where`
   (`recording/manager.rs:1038`). No timeout surrounds it: a recorder spawned
-  after its caller had given up would run with nothing holding it.
+  after its caller had given up would run with nothing holding it. #3855 — the
+  account itself is looked up 1.5 s at most, through the one lookup in flight
+  for that account that exec and SSH ask too (`docs/roomler-ssh.md`, "The
+  blocking callers"), and so is the person's uid when the daemon acts as them
+  (`Account::by_uid`). No answer in time refuses the launch with the try-again
+  words (`could not launch the recorder: …`), never a launch as anyone else.
 - The answer is primed when the recorder's supervisor is built
   (`RecordingManager::new`, `recording/manager.rs:176`), so the first status
   after a daemon start already has one.

@@ -386,7 +386,7 @@ Mechanics worth knowing:
   `crates/tunnel-core/src/child.rs:231`; registered at
   `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
-  (`agents/roomlerd/src/exec.rs:2287`) and `sftp-server`
+  (`agents/roomlerd/src/exec.rs:2439`) and `sftp-server`
   (`agents/roomlerd/src/ssh.rs:1250`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
@@ -630,7 +630,7 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1717`](../agents/roomlerd/src/exec.rs#L1717)). Exec, the pty and `sftp`
+[`exec.rs:1865`](../agents/roomlerd/src/exec.rs#L1865)). Exec, the pty and `sftp`
 all go through `apply_run_as`
 ([`exec.rs:819`](../agents/roomlerd/src/exec.rs#L819)), so one rule covers all
 three.
@@ -659,7 +659,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:1593`](../agents/roomlerd/src/companion.rs#L1593)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1113`](../agents/roomlerd/src/companion.rs#L1113)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:2273`](../agents/roomlerd/src/companion.rs#L2273)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1113`](../agents/roomlerd/src/companion.rs#L1113)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -746,11 +746,11 @@ worker and every socket and timer on it: the shape #3830 measured for a hung log
 
 The lookup now runs on a thread of its own, named `account-lookup`, through one
 lookup in flight **per account name** (`one_in_flight::OneInFlightPerKey`,
-[`one_in_flight.rs:391`](../agents/roomlerd/src/one_in_flight.rs#L391); the
-daemon's `ACCOUNTS`, [`exec.rs:1475`](../agents/roomlerd/src/exec.rs#L1475)). The
+[`one_in_flight.rs:396`](../agents/roomlerd/src/one_in_flight.rs#L396); the
+daemon's `ACCOUNTS`, [`exec.rs:1550`](../agents/roomlerd/src/exec.rs#L1550)). The
 session's own task awaits it `ACCOUNT_LOOKUP_WAIT` (1.5 s) at most
 (`unix_priv::session_account`,
-[`exec.rs:1497`](../agents/roomlerd/src/exec.rs#L1497)), at the same point as
+[`exec.rs:1572`](../agents/roomlerd/src/exec.rs#L1572)), at the same point as
 before: after every gate and the consent prompt, right before the drop.
 
 - **Keyed by the name.** `named:ana` and a `console_user` session whose person is
@@ -770,7 +770,7 @@ before: after every gate and the consent prompt, right before the drop.
   memory the drop already owns.
 
 What the lookup gives decides the session (`unix_priv::in_time`,
-[`exec.rs:1530`](../agents/roomlerd/src/exec.rs#L1530)):
+[`exec.rs:1605`](../agents/roomlerd/src/exec.rs#L1605)):
 
 | The lookup, within 1.5 s | The command or session |
 |---|---|
@@ -798,6 +798,39 @@ as before, and no answer but an account runs anything.
 `exec::mac_console_lookup_tests` (the macOS lane) does the same for the console's
 owner and for `named` on a Mac. Field verification is owed: a paused SSSD on a Linux
 system install.
+
+#### The blocking callers share the lookup, 1.5 s at most (#3855)
+
+The other callers that drop to a person, or read an account's ids, run on blocking
+threads of their own: `exec::drop_to_std` (Remote Apps on a person's desktop, the
+recorder's launch, the portal's session helper and every helper it runs, the tray's
+session environment) and `account_ids` / `account_home` (the recorder's and received
+files' identity). Each looked the account up inline, so while the account database
+hung, every ask held its blocking thread for as long as the hang lasted. They now ask
+the same lookup in flight (`unix_priv::account_blocking`,
+[`exec.rs:1311`](../agents/roomlerd/src/exec.rs#L1311), through
+`OneInFlightPerKey::ask_blocking`,
+[`one_in_flight.rs:437`](../agents/roomlerd/src/one_in_flight.rs#L437)), 1.5 s at most
+from the caller's own thread. The recorder's uid is looked up through one lookup in
+flight per uid (`account_name`, [`exec.rs:1476`](../agents/roomlerd/src/exec.rs#L1476)).
+An ask from the recorder's launch and an exec as the same account share one lookup.
+A refusal carries the try-again words above through each caller's own error:
+
+| Caller | Its thread | The refusal |
+|---|---|---|
+| Remote Apps on a person's desktop (`apps::linux`, `LinuxWm::cmd`) | `spawn_blocking` for `rc:apps.*`, the caps probe's thread for the hello | `cannot_run_as`: ``cannot run `wmctrl` as <user>: cannot run as "<user>": Could not look up …`` |
+| The recorder's launch (`spawn_as_account`) and its identity (`Account::by_uid`) | `spawn_blocking` | `could not launch the recorder: …`; acting as them logs `could not act as the recorder's identity` |
+| The portal's session helper (`capture::portal::helper::spawn_child`): capture, detection, audio, keep busy, the notification prompt and the being-viewed notice | the capture, audio and keep-busy threads, a detection thread, `spawn_blocking` | `cannot run the portal helper as the session's owner: …` |
+| The tray's session environment (the prompt's start, `docs/desktop-companion.md` §10.2; the post-install launch; the post-update restart) | `tray-start`, `spawn_blocking` | the tray starts with logind's four variables, as on any failed read |
+| Received files' person (`files::seat_now`) | `seat0-lookup` | bounded by its own 1.5 s already |
+
+Fork safety is unchanged: the account is resolved in the parent, before the fork.
+Tested in `exec::console_lookup_tests::account_database::blocking` (both lanes above):
+with the database stalled, each blocking caller is refused within 1.5 s with the
+try-again words, and blocking asks and a `named` exec for one account share one
+lookup; the control resolves as before, and as root the child runs as the person.
+Remote Apps' and the recorder's own refusals are tested where they live
+(`apps::linux`, `recording::launch`).
 
 #### Where a session starts (FR-97 P5b)
 

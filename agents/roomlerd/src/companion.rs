@@ -1136,13 +1136,128 @@ fn console_owner_person(owner: &str) -> Result<String> {
     Ok(user.to_string())
 }
 
+/// #3855 — the Linux tray's start for a prompt, off the async worker: every
+/// step ([`TraySteps`]) runs on the thread of the one start in flight
+/// ([`TRAY_STARTS`], `tray-start`), and this waits [`TRAY_START_WAIT`] at
+/// most. Before, this async function never awaited, so each step ran on the
+/// worker that polled it, for as long as logind, the account database or
+/// systemd-run took, and the callers' 3 s timeout could not fire.
 #[cfg(all(unix, not(target_os = "macos")))]
 async fn ensure_running_inner() -> Result<EnsureOutcome> {
+    // A test stands the steps in for its own task, with starts in flight of
+    // its own.
     #[cfg(test)]
-    let steps = tray_stand_in::now().map_or_else(TraySteps::real, |stood| stood.steps);
-    #[cfg(not(test))]
-    let steps = TraySteps::real();
-    start_tray(&steps).map_err(anyhow::Error::msg)
+    if let Some(stood) = tray_stand_in::now() {
+        return stood.starts.start(stood.steps, TRAY_START_WAIT).await;
+    }
+    TRAY_STARTS.start(TraySteps::real(), TRAY_START_WAIT).await
+}
+
+/// #3855 — the Linux tray's starts for prompts: at most one in flight, on a
+/// thread named `tray-start` (`one_in_flight`'s rules). While logind, the
+/// account database, the person's user manager or systemd-run hangs, every
+/// prompt that asks waits on that one start, within its own wait, and starts
+/// none of its own, so the hang holds one thread however many prompts ask.
+#[cfg(all(unix, not(target_os = "macos")))]
+static TRAY_STARTS: TrayStarts = TrayStarts::new("tray-start");
+
+/// One start in flight, and the step it is at.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct TrayStarts {
+    flight: crate::one_in_flight::OneInFlight<std::result::Result<EnsureOutcome, String>>,
+    /// The step the running start (or the last one) is at, a [`TrayStep`]:
+    /// what a prompt that ran out of time says it was waiting on.
+    at: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl TrayStarts {
+    const fn new(thread_name: &'static str) -> Self {
+        Self {
+            flight: crate::one_in_flight::OneInFlight::new(thread_name),
+            at: std::sync::atomic::AtomicU8::new(TrayStep::Path as u8),
+        }
+    }
+
+    /// A start with `steps`, on the start in flight's thread, waited for
+    /// `wait` at most. Out of time it is an error naming the step the start
+    /// was still waiting on; the start goes on, and its late answer is
+    /// nobody's.
+    async fn start(
+        &'static self,
+        steps: TraySteps,
+        wait: std::time::Duration,
+    ) -> Result<EnsureOutcome> {
+        let at = &self.at;
+        let asked = self.flight.ask(wait, move || start_tray(&steps, at)).await;
+        started_in_time(
+            asked,
+            wait,
+            TrayStep::from_u8(at.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    }
+}
+
+/// The steps of the tray's start, in order, as [`TrayStarts::at`] holds them.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TrayStep {
+    Path,
+    Session,
+    Running,
+    Environment,
+    SystemdRun,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl TrayStep {
+    fn from_u8(at: u8) -> Self {
+        match at {
+            1 => Self::Session,
+            2 => Self::Running,
+            3 => Self::Environment,
+            4 => Self::SystemdRun,
+            _ => Self::Path,
+        }
+    }
+
+    /// What a start at this step waits on, in a refusal's words.
+    fn waiting_on(self) -> &'static str {
+        match self {
+            Self::Path => "the companion's install path",
+            Self::Session => "logind (`loginctl`, for the graphical session)",
+            Self::Running => "the process list (`pgrep`)",
+            Self::Environment => {
+                "the session's environment (the account database, then the person's user manager)"
+            }
+            Self::SystemdRun => "systemd-run",
+        }
+    }
+}
+
+/// #3855 — what a prompt that waited `wait` takes from the start in flight:
+/// its outcome, or an error with the reason. A start's own failure keeps its
+/// words; no answer in time names the step the start was at.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn started_in_time(
+    asked: crate::one_in_flight::Asked<std::result::Result<EnsureOutcome, String>>,
+    wait: std::time::Duration,
+    at: TrayStep,
+) -> Result<EnsureOutcome> {
+    use crate::one_in_flight::Asked;
+    match asked {
+        Asked::Answer(Ok(outcome)) => Ok(outcome),
+        Asked::Answer(Err(why)) => Err(anyhow::anyhow!(why)),
+        Asked::Failed(why) => Err(anyhow::anyhow!(
+            "the tray's start ended with no answer: {why}"
+        )),
+        Asked::OutOfTime => Err(anyhow::anyhow!(
+            "the tray's start did not finish within {wait:?}: it was still waiting on {}; it goes \
+             on on its own thread, and the next prompt asks again",
+            at.waiting_on()
+        )),
+    }
 }
 
 /// #3855 — the blocking steps of the Linux tray's start for a prompt: where
@@ -1197,10 +1312,16 @@ impl TraySteps {
     }
 }
 
-/// The Linux tray's start, blocking: its steps in the order the start has
-/// always taken them. `Started` only when systemd-run exited 0.
+/// The Linux tray's start, blocking, on the start in flight's thread: its
+/// steps in the order the start has always taken them, each recorded in `at`
+/// as it begins. `Started` only when systemd-run exited 0.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn start_tray(steps: &TraySteps) -> std::result::Result<EnsureOutcome, String> {
+fn start_tray(
+    steps: &TraySteps,
+    at: &std::sync::atomic::AtomicU8,
+) -> std::result::Result<EnsureOutcome, String> {
+    let step = |now: TrayStep| at.store(now as u8, std::sync::atomic::Ordering::SeqCst);
+    step(TrayStep::Path);
     let Some(path) = (steps.path)() else {
         // Until FR-27's packaging phase there is no Linux companion at all,
         // and after it there still won't be on a headless server — which is
@@ -1210,6 +1331,7 @@ fn start_tray(steps: &TraySteps) -> std::result::Result<EnsureOutcome, String> {
 
     // A root systemd daemon has no display of its own. Find the graphical
     // session's owner and its bus/display, then spawn as that user.
+    step(TrayStep::Session);
     let sess =
         (steps.session)().map_err(|e| format!("finding a graphical login session: {e:#}"))?;
     // FR-93 P6b — THAT user's companion (`pgrep -u`: another user's on a
@@ -1217,6 +1339,7 @@ fn start_tray(steps: &TraySteps) -> std::result::Result<EnsureOutcome, String> {
     // daemon may use. A per-user daemon has its own user manager; the system
     // manager would ask polkit for a password nobody is there to type. The
     // shape `launch_once` already has.
+    step(TrayStep::Running);
     if (steps.running)(sess.uid) {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
@@ -1226,11 +1349,13 @@ fn start_tray(steps: &TraySteps) -> std::result::Result<EnsureOutcome, String> {
     let session_env = if steps.user_manager {
         Vec::new()
     } else {
+        step(TrayStep::Environment);
         (steps.environment)(&sess)
             .map(|text| session_env_pairs(&text))
             .unwrap_or_default()
     };
     let cmd = systemd_run_command_with(&sess, &path, &[], steps.user_manager, &session_env);
+    step(TrayStep::SystemdRun);
     let out = (steps.systemd_run)(cmd).map_err(|e| format!("spawning systemd-run: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -1241,26 +1366,37 @@ fn start_tray(steps: &TraySteps) -> std::result::Result<EnsureOutcome, String> {
     Ok(EnsureOutcome::Started)
 }
 
-/// #3855 — how long a prompt waits for the Linux tray's start.
+/// #3855 — how long a prompt waits for the Linux tray's start: 2.5 s, under
+/// the 3 s its callers give it (`signaling::COMPANION_START_BUDGET`), so the
+/// start's own reason lands before their fallback fires (the hub's lesson
+/// with equal timers, FR-27). A start that works (`loginctl`, `pgrep`, the
+/// session's environment, `systemd-run`: tens to a few hundred
+/// milliseconds) takes well under half of it, which one start in flight
+/// needs to answer a prompt that asks just after another start began
+/// (`one_in_flight`'s cost).
 #[cfg(all(unix, not(target_os = "macos")))]
-#[cfg_attr(not(test), allow(dead_code))]
 const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// #3855 — the tray's start stood in for the tasks of one test: its steps,
-/// in place of the daemon's ([`TraySteps::real`]). A task-local, so the tests
-/// beside it, and the daemon's own starts, are never stood in.
+/// in place of the daemon's ([`TraySteps::real`]), and starts in flight of
+/// its own. A task-local, so the tests beside it, and the daemon's own
+/// starts, are never stood in.
 #[cfg(all(test, unix, not(target_os = "macos")))]
 mod tray_stand_in {
-    use super::TraySteps;
+    use super::{TrayStarts, TraySteps};
 
     #[derive(Clone)]
     pub(super) struct StandIn {
         pub(super) steps: TraySteps,
+        pub(super) starts: &'static TrayStarts,
     }
 
     impl StandIn {
         pub(super) fn new(steps: TraySteps) -> Self {
-            Self { steps }
+            Self {
+                steps,
+                starts: Box::leak(Box::new(TrayStarts::new("tray-start"))),
+            }
         }
     }
 

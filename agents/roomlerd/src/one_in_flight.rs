@@ -388,6 +388,11 @@ impl<T: Clone + Send + 'static> Remembered<T> {
 /// account hold one thread, however many there are, and each other account
 /// asked holds one of its own. The daemon's is a static, so the methods take
 /// `&'static self`: the lookup's own thread removes its key.
+///
+/// #3855 — so are the account lookups of the callers on blocking threads
+/// (`drop_to_std`, `account_ids`, `account_home`; uids per uid), through
+/// [`Self::ask_blocking`]: an ask from a blocking thread and one from a task
+/// share the account's lookup.
 pub(crate) struct OneInFlightPerKey<K, T> {
     /// What each lookup's thread is called.
     thread_name: &'static str,
@@ -420,6 +425,27 @@ impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerK
         }
         // Then the lookup for this key that began since, or this caller's own.
         match self.join_or_start(key, lookup).ended_by(deadline).await {
+            Some(how) => how.into(),
+            None => Asked::OutOfTime,
+        }
+    }
+
+    /// #3855 — [`Self::ask`] from a blocking thread, by the same rules and
+    /// through the same lookups: an ask for `key` from a blocking thread and
+    /// one from a task share its lookup.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn ask_blocking<F>(&'static self, key: K, wait: Duration, lookup: F) -> Asked<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let asked = Instant::now();
+        let deadline = asked + wait;
+        while let Some(earlier) = self.running_from_before(&key, asked) {
+            if earlier.ended_by_blocking(deadline).is_none() {
+                return Asked::OutOfTime;
+            }
+        }
+        match self.join_or_start(key, lookup).ended_by_blocking(deadline) {
             Some(how) => how.into(),
             None => Asked::OutOfTime,
         }
@@ -971,6 +997,54 @@ mod tests {
         eventually("the ended lookups leave no entry", || {
             lookups.keys_in_flight() == 0
         });
+    }
+
+    /// #3855 — asks for a key from blocking threads share its one lookup
+    /// with an ask from a task, each within its own wait, and another key's
+    /// lookup is its own. Once let go, the next blocking ask starts a lookup
+    /// of its own and is answered.
+    #[test]
+    fn blocking_asks_for_one_key_share_its_lookup() {
+        let lookups = per_key();
+        let (ana, bob) = (Gate::default(), Gate::default());
+        let _opened = (OpenedAtTheEnd(ana.clone()), OpenedAtTheEnd(bob.clone()));
+        let asks: Vec<_> = (0..3)
+            .map(|answer| {
+                let lookup = ana.lookup(answer);
+                std::thread::spawn(move || lookups.ask_blocking("ana", SHORT, lookup))
+            })
+            .collect();
+        let other = {
+            let lookup = bob.lookup(9);
+            std::thread::spawn(move || lookups.ask_blocking("bob", SHORT, lookup))
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        assert_eq!(
+            rt.block_on(lookups.ask("ana", SHORT, ana.lookup(4))),
+            Asked::OutOfTime
+        );
+        for ask in asks {
+            assert_eq!(ask.join().expect("an ask's thread"), Asked::OutOfTime);
+        }
+        assert_eq!(other.join().expect("an ask's thread"), Asked::OutOfTime);
+        assert_eq!(
+            (ana.began(), bob.began()),
+            (1, 1),
+            "one lookup a key, from threads and a task alike"
+        );
+        ana.open();
+        bob.open();
+        eventually("the released lookups leave no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+        assert_eq!(
+            lookups.ask_blocking("ana", LONG, ana.lookup(5)),
+            Asked::Answer(5)
+        );
+        assert_eq!(ana.began(), 2, "the next ask's own lookup");
     }
 
     /// #3853 — a lookup that panics ends as any other: its caller is told it
