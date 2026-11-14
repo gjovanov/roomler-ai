@@ -1905,6 +1905,86 @@ pub(crate) mod unix {
             Account::by_name("nobody").expect("the `nobody` account")
         }
 
+        /// #3855 — the recorder launches as the person through the one drop
+        /// (`exec::drop_to_std`), and acts as them through their ids
+        /// (`Account::by_uid`: `exec::account_name`, then
+        /// `exec::account_ids`), each on a blocking thread. With the
+        /// account database stalled, both are refused within the account
+        /// lookup's wait with the try-again words, and nothing is launched.
+        ///
+        /// Red before #3855: each looked the account up on its blocking
+        /// thread for as long as the account database did not answer.
+        #[test]
+        fn a_stalled_account_lookup_refuses_the_recorder_within_its_wait() {
+            use crate::exec::account_stand_in as database;
+            use std::sync::{Arc, Condvar, Mutex, PoisonError};
+            type Gate = Arc<(Mutex<bool>, Condvar)>;
+            /// Lets the stalled database go when dropped.
+            struct LetGo(Gate);
+            impl Drop for LetGo {
+                fn drop(&mut self) {
+                    *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                    self.0.1.notify_all();
+                }
+            }
+            let gate: Gate = Arc::default();
+            let _let_go = LetGo(gate.clone());
+            let stalled = database::StandIn::new(move |_| {
+                let (gone, let_go) = &*gate;
+                let gone = gone.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    let_go
+                        .wait_while(gone, |gone| !*gone)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                Err("the stalled account database was let go".into())
+            });
+            type Probe = Box<dyn FnOnce() -> Result<(), String> + Send>;
+            let probes: [(&str, Probe); 2] = [
+                (
+                    "the launch",
+                    Box::new(|| {
+                        spawn_as_account("i3855-person", &[], Path::new("/bin/true"), &[], &[])
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                ),
+                (
+                    "acting as them",
+                    Box::new(|| {
+                        super::super::as_identity(
+                            super::super::Identity::SessionUser { uid: 4_000_000 },
+                            || (),
+                        )
+                    }),
+                ),
+            ];
+            let wait = crate::exec::ACCOUNT_LOOKUP_WAIT;
+            for (what, probe) in probes {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stood = stalled.clone();
+                let asked = std::time::Instant::now();
+                std::thread::spawn(move || {
+                    let took = database::blocking(&stood, probe);
+                    let _ = tx.send((took, asked.elapsed()));
+                });
+                let (took, waited) = rx
+                    .recv_timeout(wait + Duration::from_secs(1))
+                    .unwrap_or_else(|_| {
+                        panic!("{what}: no answer within the account lookup's wait")
+                    });
+                let refused = took.expect_err("nothing resolves while the database stalls");
+                assert!(
+                    waited >= wait,
+                    "{what} was refused in {waited:?}, before its wait"
+                );
+                assert!(
+                    refused.contains(crate::exec::ACCOUNT_LOOKUP_TRY_AGAIN),
+                    "{what}: the refusal says to try again: {refused}"
+                );
+            }
+        }
+
         /// FR-85 P2e — logind's word first, then the person's own server,
         /// and never Xwayland for a Wayland session.
         #[test]

@@ -1138,7 +1138,70 @@ fn console_owner_person(owner: &str) -> Result<String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 async fn ensure_running_inner() -> Result<EnsureOutcome> {
-    let Some(path) = linux_companion_path() else {
+    #[cfg(test)]
+    let steps = tray_stand_in::now().map_or_else(TraySteps::real, |stood| stood.steps);
+    #[cfg(not(test))]
+    let steps = TraySteps::real();
+    start_tray(&steps).map_err(anyhow::Error::msg)
+}
+
+/// #3855 — the blocking steps of the Linux tray's start for a prompt: where
+/// the companion is installed, the graphical session (logind), whether that
+/// person's tray runs (the process list), the session's environment for a
+/// root daemon's unit (the person's user manager, reached as them through the
+/// account database) and systemd-run itself. Each is a seam a test stands in;
+/// the daemon's are [`TraySteps::real`].
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone)]
+struct TraySteps {
+    path: std::sync::Arc<PathStep>,
+    session: std::sync::Arc<SessionStep>,
+    running: std::sync::Arc<RunningStep>,
+    environment: std::sync::Arc<EnvironmentStep>,
+    systemd_run: std::sync::Arc<SystemdRunStep>,
+    /// A per-user daemon starts the tray through its own user manager, a
+    /// root one through the system manager as the person ([`start_tray`]).
+    user_manager: bool,
+}
+
+/// Where the companion is installed, if it is.
+#[cfg(all(unix, not(target_os = "macos")))]
+type PathStep = dyn Fn() -> Option<std::path::PathBuf> + Send + Sync;
+/// The graphical session to start it in, or why there is none.
+#[cfg(all(unix, not(target_os = "macos")))]
+type SessionStep = dyn Fn() -> Result<GraphicalSession> + Send + Sync;
+/// Whether the person with this uid already runs it.
+#[cfg(all(unix, not(target_os = "macos")))]
+type RunningStep = dyn Fn(u32) -> bool + Send + Sync;
+/// The session's environment, as `systemctl --user show-environment` prints it.
+#[cfg(all(unix, not(target_os = "macos")))]
+type EnvironmentStep = dyn Fn(&GraphicalSession) -> Option<String> + Send + Sync;
+/// systemd-run, run.
+#[cfg(all(unix, not(target_os = "macos")))]
+type SystemdRunStep =
+    dyn Fn(std::process::Command) -> std::io::Result<std::process::Output> + Send + Sync;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl TraySteps {
+    /// The daemon's own steps.
+    fn real() -> Self {
+        Self {
+            path: std::sync::Arc::new(linux_companion_path),
+            session: std::sync::Arc::new(graphical_session),
+            running: std::sync::Arc::new(companion_running_for_uid),
+            environment: std::sync::Arc::new(user_manager_environment),
+            systemd_run: std::sync::Arc::new(|mut cmd: std::process::Command| cmd.output()),
+            // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+            user_manager: unsafe { libc::geteuid() } != 0,
+        }
+    }
+}
+
+/// The Linux tray's start, blocking: its steps in the order the start has
+/// always taken them. `Started` only when systemd-run exited 0.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn start_tray(steps: &TraySteps) -> std::result::Result<EnsureOutcome, String> {
+    let Some(path) = (steps.path)() else {
         // Until FR-27's packaging phase there is no Linux companion at all,
         // and after it there still won't be on a headless server — which is
         // the correct state for a machine with no screen, not a fault.
@@ -1147,27 +1210,508 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
 
     // A root systemd daemon has no display of its own. Find the graphical
     // session's owner and its bus/display, then spawn as that user.
-    let sess = graphical_session().context("finding a graphical login session")?;
+    let sess =
+        (steps.session)().map_err(|e| format!("finding a graphical login session: {e:#}"))?;
     // FR-93 P6b — THAT user's companion (`pgrep -u`: another user's on a
     // shared machine is not this person's), started through the manager this
     // daemon may use. A per-user daemon has its own user manager; the system
     // manager would ask polkit for a password nobody is there to type. The
     // shape `launch_once` already has.
-    if companion_running_for_uid(sess.uid) {
+    if (steps.running)(sess.uid) {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
-    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
-    let user_manager = unsafe { libc::geteuid() } != 0;
-    let out = systemd_run_command(&sess, &path, &[], user_manager)
-        .output()
-        .context("spawning systemd-run")?;
+    // #2713 — a root daemon's system unit carries the desktop session's own
+    // environment ([`systemd_run_command`]); a per-user daemon's `--user`
+    // unit inherits its manager's.
+    let session_env = if steps.user_manager {
+        Vec::new()
+    } else {
+        (steps.environment)(&sess)
+            .map(|text| session_env_pairs(&text))
+            .unwrap_or_default()
+    };
+    let cmd = systemd_run_command_with(&sess, &path, &[], steps.user_manager, &session_env);
+    let out = (steps.systemd_run)(cmd).map_err(|e| format!("spawning systemd-run: {e}"))?;
     if !out.status.success() {
-        anyhow::bail!(
+        return Err(format!(
             "systemd-run failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        );
+        ));
     }
     Ok(EnsureOutcome::Started)
+}
+
+/// #3855 — how long a prompt waits for the Linux tray's start.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg_attr(not(test), allow(dead_code))]
+const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// #3855 — the tray's start stood in for the tasks of one test: its steps,
+/// in place of the daemon's ([`TraySteps::real`]). A task-local, so the tests
+/// beside it, and the daemon's own starts, are never stood in.
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tray_stand_in {
+    use super::TraySteps;
+
+    #[derive(Clone)]
+    pub(super) struct StandIn {
+        pub(super) steps: TraySteps,
+    }
+
+    impl StandIn {
+        pub(super) fn new(steps: TraySteps) -> Self {
+            Self { steps }
+        }
+    }
+
+    tokio::task_local! {
+        static STOOD: StandIn;
+    }
+
+    /// `run`, its tray starts taking `stood`'s steps.
+    pub(super) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
+        STOOD.scope(stood, run).await
+    }
+
+    /// The start stood in for this task, if there is one.
+    pub(super) fn now() -> Option<StandIn> {
+        STOOD.try_with(StandIn::clone).ok()
+    }
+}
+
+/// #3855 — the Linux tray's start for a prompt with its steps stood in
+/// ([`tray_stand_in`]): a stopped logind, a session environment that does not
+/// come (the account database or the person's user manager) and a systemd-run
+/// that hangs each hold one step. Everything above the steps is the daemon's.
+/// Each probe runs as a task on a two-worker runtime, the daemon's shape, and
+/// is waited for from the test's own thread (#3836's shape).
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tray_start_tests {
+    use super::tray_stand_in::{StandIn, asking};
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// What a failure may take past the start's own wait on a busy runner.
+    const SLACK: Duration = Duration::from_secs(1);
+    /// What a start that answers may take on a busy runner.
+    const RUNS_WITHIN: Duration = Duration::from_secs(10);
+    /// How late "on time" may be on a busy runner: #3836's bar.
+    const AT_ONCE: Duration = Duration::from_millis(500);
+    /// Where the stood-in companion is installed.
+    const COMPANION: &str = "/usr/bin/roomler-desktop";
+
+    /// What a start answered: the outcome, or why it failed.
+    type Answer = std::result::Result<EnsureOutcome, String>;
+
+    /// The step a test holds up.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        /// logind, asked for the graphical session.
+        Session,
+        /// The session's environment: the account database, then the
+        /// person's user manager.
+        Environment,
+        /// systemd-run itself.
+        SystemdRun,
+    }
+
+    /// The held step: each start that reaches it is counted, and held until
+    /// the gate opens. Then it goes on as if it had answered.
+    #[derive(Clone, Default)]
+    struct Held(Arc<HeldState>);
+
+    #[derive(Default)]
+    struct HeldState {
+        open: Mutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Held {
+        fn hold(&self) {
+            self.0.began.fetch_add(1, SeqCst);
+            let open = self.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                self.0
+                    .opened
+                    .wait_while(open, |open| !*open)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+
+        fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        /// Starts that reached the held step.
+        fn began(&self) -> usize {
+            self.0.began.load(SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held,
+    /// and the runtime declared before it can shut down.
+    struct OpenedAtTheEnd(Held);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// What systemd-run was asked to run, each time.
+    #[derive(Clone, Default)]
+    struct Ran(Arc<Mutex<Vec<Vec<String>>>>);
+
+    impl Ran {
+        fn record(&self, cmd: &std::process::Command) {
+            let mut argv = vec![cmd.get_program().to_string_lossy().into_owned()];
+            argv.extend(cmd.get_args().map(|a| a.to_string_lossy().into_owned()));
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(argv);
+        }
+
+        fn argvs(&self) -> Vec<Vec<String>> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// The person at the screen, as logind reports them.
+    fn ana() -> GraphicalSession {
+        GraphicalSession {
+            uid: 4242,
+            name: "ana".into(),
+            display: Some(":0".into()),
+            wayland_display: None,
+        }
+    }
+
+    /// A child that exited `code`, having written `stderr`.
+    fn exited(code: i32, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// A root daemon's start on a host with the companion installed, the
+    /// person at the screen and their tray not running. Every step answers
+    /// at once, except `hold`'s, which waits for `held`. systemd-run's argv
+    /// goes to `ran`, and it exits 0.
+    fn steps(hold: Option<Step>, held: &Held, ran: &Ran) -> TraySteps {
+        let holds = move |step: Step, held: &Held| {
+            if hold == Some(step) {
+                held.hold();
+            }
+        };
+        let (at_session, at_environment, at_run) = (held.clone(), held.clone(), held.clone());
+        let ran = ran.clone();
+        TraySteps {
+            path: Arc::new(|| Some(std::path::PathBuf::from(COMPANION))),
+            session: Arc::new(move || -> Result<GraphicalSession> {
+                holds(Step::Session, &at_session);
+                Ok(ana())
+            }),
+            running: Arc::new(|_: u32| false),
+            environment: Arc::new(move |_: &GraphicalSession| -> Option<String> {
+                holds(Step::Environment, &at_environment);
+                Some("XDG_CURRENT_DESKTOP=GNOME\nLD_PRELOAD=/not/allowed.so\n".into())
+            }),
+            systemd_run: Arc::new(
+                move |cmd: std::process::Command| -> std::io::Result<std::process::Output> {
+                    holds(Step::SystemdRun, &at_run);
+                    ran.record(&cmd);
+                    Ok(exited(0, ""))
+                },
+            ),
+            user_manager: false,
+        }
+    }
+
+    /// A runtime like the daemon's: more than one worker, timers and I/O.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// The tray's start as a prompt asks for it ([`ensure_running_inner`]),
+    /// as a task on `rt` taking `stood`'s steps: what it answered and how
+    /// long that took, waited for `bound` at most from THIS thread.
+    fn start_on_a_worker(
+        rt: &tokio::runtime::Runtime,
+        stood: &StandIn,
+        bound: Duration,
+    ) -> std::result::Result<(Answer, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(asking(stood.clone(), async move {
+            let started = ensure_running_inner().await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send((started, asked.elapsed()));
+        }));
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("no answer within {bound:?}"))
+    }
+
+    /// #3855 — with logind, the session's environment (the account
+    /// database, the person's user manager) or systemd-run held up, a start
+    /// for a prompt fails within its own wait ([`TRAY_START_WAIT`]), never
+    /// `Started`, and its reason names the step that did not answer.
+    ///
+    /// Red before #3855: the start ran on the worker that asked, for as long
+    /// as the step was held.
+    #[test]
+    fn a_held_step_fails_the_start_within_its_wait_naming_it() {
+        let rt = runtime();
+        for (step, names) in [
+            (Step::Session, "logind"),
+            (Step::Environment, "user manager"),
+            (Step::SystemdRun, "systemd-run"),
+        ] {
+            let held = Held::default();
+            let _opened = OpenedAtTheEnd(held.clone());
+            let ran = Ran::default();
+            let stood = StandIn::new(steps(Some(step), &held, &ran));
+            let (started, waited) = start_on_a_worker(&rt, &stood, TRAY_START_WAIT + SLACK)
+                .unwrap_or_else(|e| panic!("{step:?}: {e}"));
+            let why = match started {
+                Err(why) => why,
+                Ok(outcome) => panic!("{step:?} held, and the start answered {outcome:?}"),
+            };
+            assert!(
+                waited >= TRAY_START_WAIT,
+                "{step:?}: the start failed in {waited:?}, before its wait"
+            );
+            assert!(
+                why.contains("did not finish within"),
+                "{step:?}: the reason says the start ran out of time: {why}"
+            );
+            assert!(
+                why.contains(names),
+                "{step:?}: the reason names the step: {why}"
+            );
+        }
+    }
+
+    /// #3855 — a held start holds no async worker. On a two-worker runtime,
+    /// tasks asking again and again while logind holds the start leave a
+    /// 10 ms timer waking on time (#3836's measure), and the hold holds one
+    /// start, however many ask.
+    ///
+    /// Red before #3855: each ask held the worker it ran on, and two of them
+    /// held both.
+    #[test]
+    fn a_held_start_delays_no_timer() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let ran = Ran::default();
+        let stood = StandIn::new(steps(Some(Step::Session), &held, &ran));
+        // More askers than the runtime has workers.
+        for _ in 0..4 {
+            rt.spawn(asking(stood.clone(), async {
+                for _ in 0..1_000 {
+                    let _ = ensure_running_inner().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }));
+        }
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(asked.elapsed() < RUNS_WITHIN, "no start reached logind");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let tick = Duration::from_millis(10);
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            let _ = tx.send(worst);
+        });
+        let worst = rx
+            .recv_timeout(RUNS_WITHIN)
+            .expect("a 10 ms timer kept waking while logind held the start");
+        assert!(
+            worst < AT_ONCE,
+            "a 10 ms timer woke {worst:?} late while logind held the start"
+        );
+        assert_eq!(held.began(), 1, "one start in flight, however many asked");
+    }
+
+    /// #3855 — while logind holds a start, asks at once and in a row share
+    /// it: each fails within its own wait, and none starts another, so the
+    /// hold holds one thread. Once logind answers, the late start answers
+    /// nobody, and the next ask starts afresh and is answered.
+    ///
+    /// Red before #3855: every ask was a start of its own, on its own worker.
+    #[test]
+    fn asks_while_a_start_hangs_share_it() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let ran = Ran::default();
+        let stood = StandIn::new(steps(Some(Step::Session), &held, &ran));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..4 {
+            let tx = tx.clone();
+            rt.spawn(asking(stood.clone(), async move {
+                let _ = tx.send(ensure_running_inner().await.map_err(|e| format!("{e:#}")));
+            }));
+        }
+        for _ in 0..4 {
+            let started = rx
+                .recv_timeout(TRAY_START_WAIT + SLACK)
+                .expect("every ask at once is answered while logind holds the start");
+            assert!(started.is_err(), "nothing starts while held: {started:?}");
+        }
+        for _ in 0..2 {
+            let (started, _) = start_on_a_worker(&rt, &stood, TRAY_START_WAIT + SLACK)
+                .expect("an ask in a row is answered while logind holds the start");
+            assert!(started.is_err(), "nothing starts while held: {started:?}");
+        }
+        assert_eq!(held.began(), 1, "one start, however many asked");
+        assert!(ran.argvs().is_empty(), "systemd-run never ran while held");
+        held.open();
+        let (started, _) =
+            start_on_a_worker(&rt, &stood, RUNS_WITHIN).expect("the next ask is answered");
+        assert_eq!(started, Ok(EnsureOutcome::Started), "a start of its own");
+        assert_eq!(held.began(), 2, "the held start, and the next ask's own");
+    }
+
+    /// The control: a start whose steps answer in time does what it always
+    /// did. A root daemon starts the tray through the system manager as the
+    /// person, with the session's allowlisted environment; a per-user daemon
+    /// through its own manager, without reading it. A tray already running,
+    /// no companion installed, nobody at the screen and a failed systemd-run
+    /// answer as before, and only a systemd-run that exited 0 is `Started`.
+    #[test]
+    fn a_start_in_time_works_as_today() {
+        let rt = runtime();
+        let held = Held::default();
+        let ask = |taken: TraySteps| {
+            start_on_a_worker(&rt, &StandIn::new(taken), RUNS_WITHIN)
+                .expect("a start in time is answered")
+                .0
+        };
+        let argv = |args: &[&str]| -> Vec<String> { args.iter().map(|a| a.to_string()).collect() };
+
+        let ran = Ran::default();
+        assert_eq!(ask(steps(None, &held, &ran)), Ok(EnsureOutcome::Started));
+        assert_eq!(
+            ran.argvs(),
+            vec![argv(&[
+                "systemd-run",
+                "--quiet",
+                "--collect",
+                "--property=KillMode=process",
+                "--uid=4242",
+                "--setenv=XDG_RUNTIME_DIR=/run/user/4242",
+                "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
+                "--setenv=DISPLAY=:0",
+                "--setenv=XDG_CURRENT_DESKTOP=GNOME",
+                COMPANION,
+            ])],
+            "a root daemon: the system manager, as the person, with the allowlisted environment"
+        );
+
+        let ran = Ran::default();
+        let read = Arc::new(AtomicUsize::new(0));
+        let mut per_user = steps(None, &held, &ran);
+        per_user.user_manager = true;
+        per_user.environment = {
+            let read = read.clone();
+            Arc::new(move |_: &GraphicalSession| -> Option<String> {
+                read.fetch_add(1, SeqCst);
+                None
+            })
+        };
+        assert_eq!(ask(per_user), Ok(EnsureOutcome::Started));
+        assert_eq!(
+            ran.argvs(),
+            vec![argv(&[
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--collect",
+                "--property=KillMode=process",
+                "--setenv=XDG_RUNTIME_DIR=/run/user/4242",
+                "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
+                "--setenv=DISPLAY=:0",
+                COMPANION,
+            ])],
+            "a per-user daemon: its own manager"
+        );
+        assert_eq!(
+            read.load(SeqCst),
+            0,
+            "a per-user daemon's unit inherits its manager's environment"
+        );
+
+        let ran = Ran::default();
+        let mut running = steps(None, &held, &ran);
+        running.running = Arc::new(|uid: u32| uid == 4242);
+        assert_eq!(ask(running), Ok(EnsureOutcome::AlreadyRunning));
+        assert!(
+            ran.argvs().is_empty(),
+            "a running tray is not started again"
+        );
+
+        let ran = Ran::default();
+        let mut not_installed = steps(None, &held, &ran);
+        not_installed.path = Arc::new(|| -> Option<std::path::PathBuf> { None });
+        assert_eq!(ask(not_installed), Ok(EnsureOutcome::Unsupported));
+        assert!(ran.argvs().is_empty());
+
+        let ran = Ran::default();
+        let mut nobody = steps(None, &held, &ran);
+        nobody.session = Arc::new(|| -> Result<GraphicalSession> {
+            anyhow::bail!("no active graphical session — nobody is at this machine's screen")
+        });
+        let why = ask(nobody).expect_err("nobody at the screen is no start");
+        assert_eq!(
+            why,
+            "finding a graphical login session: no active graphical session — nobody is at this \
+             machine's screen"
+        );
+        assert!(ran.argvs().is_empty());
+
+        let ran = Ran::default();
+        let mut refused = steps(None, &held, &ran);
+        refused.systemd_run = {
+            let ran = ran.clone();
+            Arc::new(
+                move |cmd: std::process::Command| -> std::io::Result<std::process::Output> {
+                    ran.record(&cmd);
+                    Ok(exited(
+                        1,
+                        "Failed to start transient service unit: Access denied\n",
+                    ))
+                },
+            )
+        };
+        assert_eq!(
+            ask(refused),
+            Err("systemd-run failed: Failed to start transient service unit: Access denied".into()),
+            "only a systemd-run that exited 0 is a start"
+        );
+        assert_eq!(ran.argvs().len(), 1);
+    }
 }
 
 /// Where the Linux companion lives: `/usr/bin` from its .deb, `/usr/local/bin`
