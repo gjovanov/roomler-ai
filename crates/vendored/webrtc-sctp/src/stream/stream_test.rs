@@ -271,12 +271,14 @@ async fn test_stream_reset_waits_for_a_write_turn() -> Result<()> {
         tokio::task::yield_now().await;
     }
     let data = Bytes::from_static(b"the last frame");
-    // roomler (#3755): `append` takes the write loop's wake.
+    // roomler (#3755): `append` takes the write loop's wake, and the write's
+    // commit, as `send_payload_data` passes them.
     assert!(
         s.pending_queue
             .append(
                 s.packetize(&data, PayloadProtocolIdentifier::Binary),
-                &s.awake_write_loop_ch
+                &s.awake_write_loop_ch,
+                || s.commit_write(false, data.len())
             )
             .await
     );

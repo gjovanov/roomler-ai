@@ -3,8 +3,9 @@ use std::sync::atomic::Ordering;
 
 use portable_atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::{Mutex, Semaphore};
-// roomler (#3755): a write that waits for room wakes the write loop first.
-use tokio::sync::{mpsc, SemaphorePermit, TryAcquireError};
+// roomler (#3755): a write that waits for room wakes the write loop first,
+// and a begun message holds the lock while it queues its rest.
+use tokio::sync::{mpsc, MutexGuard, SemaphorePermit, TryAcquireError};
 use util::sync::RwLock;
 
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
@@ -38,6 +39,10 @@ pub(crate) struct PendingQueue {
     // roomler (#3755): `QUEUE_APPEND_LARGE`, two thirds of the queue's size;
     // a field so that a test can make a queue small enough to fill.
     append_large_at: usize,
+    // roomler (#3755): bytes queued without room by a begun message whose
+    // append was dropped (`BegunMessage`); `pop` pays them back before it
+    // gives room again. At rest: room + queued bytes - overdraft == the limit.
+    overdraft: AtomicUsize,
 
     unordered_queue: RwLock<PendingBaseQueue>,
     ordered_queue: RwLock<PendingBaseQueue>,
@@ -59,6 +64,7 @@ impl PendingQueue {
             semaphore_lock: Mutex::default(),
             semaphore: Semaphore::new(QUEUE_BYTES_LIMIT),
             append_large_at: QUEUE_APPEND_LARGE,
+            overdraft: Default::default(), // roomler (#3755)
             unordered_queue: Default::default(),
             ordered_queue: Default::default(),
             queue_len: Default::default(),
@@ -83,6 +89,12 @@ impl PendingQueue {
     #[cfg(test)]
     pub(crate) fn room(&self) -> usize {
         self.semaphore.available_permits()
+    }
+
+    /// roomler (#3755): the bytes queued without room, not yet paid back.
+    #[cfg(test)]
+    pub(crate) fn overdraft(&self) -> usize {
+        self.overdraft.load(Ordering::SeqCst)
     }
 
     /// roomler (#3716): lets go every writer parked in flow control. Their
@@ -150,6 +162,14 @@ impl PendingQueue {
     /// roomler (#3755): `wake` is the association's write loop, woken before
     /// the append waits for room ([`Self::take_room`]).
     ///
+    /// roomler (#3755): `commit` is the writer's own state change (the
+    /// stream's sequence number and buffered amount). It runs once the first
+    /// chunk has room, with no await between it and that chunk's push, so an
+    /// append dropped at any of its awaits before then (the lock, the room)
+    /// leaves no trace, and one let go by the queue's close commits nothing.
+    /// An empty append commits nothing: no chunk carries the number. It runs
+    /// before the push, so no ack can release bytes not yet counted.
+    ///
     /// # Panics
     ///
     /// If it's a mix of unordered and ordered chunks.
@@ -157,6 +177,7 @@ impl PendingQueue {
         &self,
         chunks: Vec<ChunkPayloadData>,
         wake: &mpsc::Sender<()>,
+        commit: impl FnOnce(),
     ) -> bool {
         if chunks.is_empty() {
             return true;
@@ -165,7 +186,7 @@ impl PendingQueue {
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
 
         if total_user_data_len >= self.append_large_at {
-            self.append_large(chunks, wake).await
+            self.append_large(chunks, wake, commit).await
         } else {
             let _sem_lock = self.semaphore_lock.lock().await;
             // roomler (#3755): `take_room`, which wakes the write loop if it waits.
@@ -174,6 +195,8 @@ impl PendingQueue {
                 return false;
             };
             permits.forget();
+            // roomler (#3755): no await from here to the push.
+            commit();
             self.append_unlimited(chunks, total_user_data_len);
             true
         }
@@ -197,12 +220,41 @@ impl PendingQueue {
     }
 
     // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>, wake: &mpsc::Sender<()>) -> bool {
+    //
+    // roomler (#3755): the first chunk is queued with the writer's commit, and
+    // from then on the message is begun: dropped before its last chunk is
+    // queued, it queues its rest at once (`BegunMessage`).
+    async fn append_large(
+        &self,
+        chunks: Vec<ChunkPayloadData>,
+        wake: &mpsc::Sender<()>,
+        commit: impl FnOnce(),
+    ) -> bool {
         // lock this for the whole duration
-        let _sem_lock = self.semaphore_lock.lock().await;
+        let sem_lock = self.semaphore_lock.lock().await;
 
-        for chunk in chunks.into_iter() {
-            let user_data_len = chunk.user_data.len();
+        // roomler (#3755): the first chunk, then the begun message's rest.
+        let mut chunks = chunks.into_iter();
+        let Some(first) = chunks.next() else {
+            return true;
+        };
+        // roomler (#3755): `take_room`, which wakes the write loop if it waits.
+        // roomler (#3716): `None` = closed by the association's close; was an unwrap.
+        let Some(permits) = self.take_room(first.user_data.len(), wake).await else {
+            return false;
+        };
+        permits.forget();
+        // roomler (#3755): no await from here to the push of the first chunk.
+        commit();
+        self.push_chunk(first);
+        let mut begun = BegunMessage {
+            rest: chunks,
+            queue: self,
+            wake,
+            _sem_lock: sem_lock,
+        };
+
+        while let Some(user_data_len) = begun.rest.as_slice().first().map(|c| c.user_data.len()) {
             // roomler (#3755): `take_room`, which wakes the write loop if it waits.
             // roomler (#3716): `None` = closed by the association's close; was an unwrap.
             // The chunks queued so far are the association's to drop.
@@ -210,18 +262,26 @@ impl PendingQueue {
                 return false;
             };
             permits.forget();
-
-            if chunk.unordered {
-                let mut unordered_queue = self.unordered_queue.write();
-                unordered_queue.push_back(chunk);
-            } else {
-                let mut ordered_queue = self.ordered_queue.write();
-                ordered_queue.push_back(chunk);
+            if let Some(chunk) = begun.rest.next() {
+                self.push_chunk(chunk);
             }
-            self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-            self.queue_len.fetch_add(1, Ordering::SeqCst);
         }
         true
+    }
+
+    /// roomler (#3755): queues one chunk. The caller holds `semaphore_lock`
+    /// and has accounted for its bytes: permits, or the overdraft.
+    fn push_chunk(&self, chunk: ChunkPayloadData) {
+        let user_data_len = chunk.user_data.len();
+        if chunk.unordered {
+            let mut unordered_queue = self.unordered_queue.write();
+            unordered_queue.push_back(chunk);
+        } else {
+            let mut ordered_queue = self.ordered_queue.write();
+            ordered_queue.push_back(chunk);
+        }
+        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+        self.queue_len.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Assumes that A) enough permits have been acquired and forget from the semaphore and that the semaphore_lock is held
@@ -330,7 +390,15 @@ impl PendingQueue {
             let user_data_len = p.user_data.len();
             self.n_bytes.fetch_sub(user_data_len, Ordering::SeqCst);
             self.queue_len.fetch_sub(1, Ordering::SeqCst);
-            self.semaphore.add_permits(user_data_len);
+            // roomler (#3755): the overdraft is paid first, and only the rest
+            // becomes room again. One load while nothing is owed.
+            let owed = self
+                .overdraft
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                    (d > 0).then_some(d - d.min(user_data_len))
+                })
+                .map_or(0, |d| d.min(user_data_len));
+            self.semaphore.add_permits(user_data_len - owed);
         }
 
         popped
@@ -346,5 +414,60 @@ impl PendingQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// roomler (#3755): a large message whose first chunk is queued, so its
+/// writer's commit (the stream's sequence number) is spent. Dropped before its
+/// last chunk is queued (a timeout, a `select!` arm, a task abort), it queues
+/// the rest at once, in place, while it still holds `semaphore_lock`, so
+/// nothing interleaves and the peer reads the message whole, once. Without
+/// it, the receiver of an ordered stream waits for the missing fragments
+/// forever, and every later message of the stream waits behind them (RFC 4960
+/// §6.6); a half-popped message also stalls the whole association's queue
+/// (`pop` keeps it selected).
+///
+/// The rest takes the room that is free and owes the shortfall
+/// (`PendingQueue::overdraft`). No writer gets room until `pop` has paid it
+/// back, so at most one message is ever owed. Nothing is queued once the queue
+/// was closed (#3716): the association is going away. The drop never awaits,
+/// needs no runtime and does not panic, short of a poisoned queue lock, as
+/// `pop`.
+struct BegunMessage<'a> {
+    rest: std::vec::IntoIter<ChunkPayloadData>,
+    queue: &'a PendingQueue,
+    wake: &'a mpsc::Sender<()>,
+    // A field, so it is released after `drop` has queued the rest.
+    _sem_lock: MutexGuard<'a, ()>,
+}
+
+impl Drop for BegunMessage<'_> {
+    fn drop(&mut self) {
+        if self.rest.len() == 0 {
+            return;
+        }
+        let n: usize = self.rest.as_slice().iter().map(|c| c.user_data.len()).sum();
+        // The free room is taken first. This holds `semaphore_lock`, so no
+        // writer takes room meanwhile and the room can only grow (a `pop`):
+        // what is counted here is there to take.
+        let free =
+            u32::try_from(self.queue.semaphore.available_permits().min(n)).unwrap_or(u32::MAX);
+        let taken = match self.queue.semaphore.try_acquire_many(free) {
+            Ok(permits) => {
+                permits.forget();
+                free as usize
+            }
+            Err(TryAcquireError::Closed) => return,
+            Err(TryAcquireError::NoPermits) => 0,
+        };
+        // Owed before it is queued, so a `pop` of the rest can never return
+        // room for bytes that never had it.
+        self.queue
+            .overdraft
+            .fetch_add(n.saturating_sub(taken), Ordering::SeqCst);
+        for chunk in self.rest.by_ref() {
+            self.queue.push_chunk(chunk);
+        }
+        let _ = self.wake.try_send(());
     }
 }

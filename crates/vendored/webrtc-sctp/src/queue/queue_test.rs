@@ -427,8 +427,10 @@ async fn test_pending_queue_selection_persistence() -> Result<()> {
 #[tokio::test]
 async fn test_pending_queue_append() -> Result<()> {
     let pq = PendingQueue::new();
-    // roomler (#3755): `append` takes the write loop's wake.
+    // roomler (#3755): `append` takes the write loop's wake and the writer's
+    // commit, which runs once.
     let (wake, _woken) = tokio::sync::mpsc::channel(1);
+    let mut commits = 0;
     pq.append(
         vec![
             make_data_chunk(0, false, NO_FRAGMENT),
@@ -436,8 +438,10 @@ async fn test_pending_queue_append() -> Result<()> {
             make_data_chunk(3, false, NO_FRAGMENT),
         ],
         &wake,
+        || commits += 1,
     )
     .await;
+    assert_eq!(commits, 1, "the commit must run once"); // roomler (#3755)
     assert_eq!(pq.get_num_bytes(), 30, "total bytes mismatch");
     assert_eq!(pq.len(), 3, "len mismatch");
 
