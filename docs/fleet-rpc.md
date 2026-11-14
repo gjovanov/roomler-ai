@@ -460,6 +460,7 @@ flowchart TD
   L -- yes --> PU["rc:rpc.exec run_as = console_user: the daemon drops<br/>to the person at its screen, ran_as = console_user"]
   PU --> T2{"someone at the screen?"}
   T2 -- no --> D6["refused on the device: nobody is signed in"]
+  T2 -- "Linux: not known within 1.5 s (#3822)" --> D7["refused on the device: could not tell, try again"]
   C -- no --> W["the process holding the agent socket runs it<br/>(Windows: the worker, ran_as = worker)"]
   V -- yes --> P["exec_pending row; rc:rpc.exec via_service to the worker"]
   P --> K{"the person's exec_enabled, consent,<br/>then the anchor's exec_enabled"}
@@ -489,7 +490,12 @@ the signed-in user back into SYSTEM.
 screen: logind's seat0 on Linux, the owner of `/dev/console` on macOS. No
 service is involved: the root daemon drops to them itself, by the drop a `named`
 SSH account takes, and refuses when nobody is at the screen
-([`roomler-ssh.md`](roomler-ssh.md) § `console_user` on Linux and macOS). The
+([`roomler-ssh.md`](roomler-ssh.md) § `console_user` on Linux and macOS). On Linux
+it asks who that is off its async worker, 1.5 s at most, through the seat0 lookup
+a received file asks, and a lookup that gives no answer in that time, or fails,
+refuses the command with "Could not tell who is signed in at this computer's
+screen. Try again." in the result's `error`, never running it as anyone else
+(#3822). The
 server says so in the frame (`rc:rpc.exec`'s `run_as`), and it is the one frame
 field an older agent must never be sent, because it would ignore the field and
 run the command as root:

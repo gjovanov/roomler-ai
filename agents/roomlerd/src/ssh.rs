@@ -1237,7 +1237,7 @@ mod sshd {
                 .stderr(std::process::Stdio::piped());
             // FR-97 P5b — in the person's home, where sshd starts `sftp-server`:
             // a client resolves every relative path against it.
-            if let Err(why) = crate::exec::apply_run_as_at_home(&mut cmd, &run_as) {
+            if let Err(why) = crate::exec::apply_run_as_at_home(&mut cmd, &run_as).await {
                 let _ = handle
                     .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
                     .await;
@@ -1506,8 +1506,15 @@ mod sshd {
                 return Ok(());
             }
 
-            let pty = match crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as)
-            {
+            // #3822 — a Unix spawn asks who `console_user` is (logind, on
+            // Linux) from this task, so it is awaited; a Windows spawn takes
+            // the person's token itself.
+            #[cfg(unix)]
+            let spawned =
+                crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as).await;
+            #[cfg(windows)]
+            let spawned = crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as);
+            let pty = match spawned {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(peer = %self.peer, %e, "ssh: could not start the terminal session");
@@ -3784,6 +3791,86 @@ mod tests {
         assert!(
             !reason.is_empty(),
             "and the refusal must explain itself, or scp just hangs"
+        );
+    }
+
+    /// #3822 — a `console_user` session this device cannot serve says why on
+    /// the SSH client's stderr, for a command, a shell and SFTP alike, and
+    /// runs nothing. Over a real SSH connection, against this host's own
+    /// seat0 lookup (`exec::console_account`): nobody is at a CI runner's
+    /// screen, so each is refused. When the lookup gives no answer in time
+    /// the same refusal carries the try-again text instead
+    /// (`exec::console_lookup_tests`). A desktop running the tests as the
+    /// person at its screen can serve the session, so there this test proves
+    /// nothing and says so.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_console_user_refusal_reaches_the_ssh_clients_stderr() {
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(71);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("console_user"))).await;
+        let session = connect(addr, key).await;
+        let marks = tempfile::tempdir().expect("a temp dir");
+        let mark = marks.path().join("ran");
+
+        // A command.
+        let command = session.channel_open_session().await.unwrap();
+        command
+            .exec(true, format!(": > '{}'", mark.display()).as_str())
+            .await
+            .unwrap();
+        let (_, err, exit) = read_channel(command, None).await;
+        if exit == Some(0) {
+            eprintln!("skipped: someone is at this machine's screen, so console_user can run");
+            return;
+        }
+        assert!(
+            err.contains("roomler-ssh: account_mode `console_user`"),
+            "a command's refusal on stderr: {err:?}"
+        );
+        assert_eq!(exit, Some(1), "a command: {err:?}");
+        assert!(!mark.exists(), "the refused command ran");
+
+        // A shell: asked to leave at once, in case it starts.
+        let shell = session.channel_open_session().await.unwrap();
+        shell
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        shell.request_shell(true).await.unwrap();
+        let _ = shell.data(&b"exit\n"[..]).await;
+        let (_, err, exit) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read_channel(shell, None),
+        )
+        .await
+        .expect("the shell's channel ends");
+        assert!(
+            err.contains("roomler-ssh: account_mode `console_user`"),
+            "a shell's refusal on stderr: {err:?}"
+        );
+        assert_eq!(exit, Some(1), "a shell: {err:?}");
+
+        // SFTP: its account is reached only where there is an `sftp-server`
+        // to start; without one, it is refused for that, before.
+        let mut sftp = session.channel_open_session().await.unwrap();
+        sftp.request_subsystem(true, "sftp").await.unwrap();
+        let mut err = Vec::new();
+        while let Some(msg) = sftp.wait().await {
+            match msg {
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => err.extend_from_slice(data),
+                russh::ChannelMsg::Failure | russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        let err = String::from_utf8_lossy(&err);
+        if err.contains("no `sftp-server` binary") {
+            eprintln!("SFTP's account is not reached here: this host has no sftp-server");
+            return;
+        }
+        assert!(
+            err.contains("roomler: account_mode `console_user`"),
+            "SFTP's refusal on stderr: {err:?}"
         );
     }
 
