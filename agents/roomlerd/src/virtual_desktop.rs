@@ -4820,4 +4820,448 @@ mod supervise_tests {
         println!("x11-real: after two keeper exits the desktop on {display} ran without one");
     }
 
+    /// The role a test runs this binary in to stand in for the daemon: the
+    /// variable names the test's scratch directory.
+    const DAEMON_ROLE_ENV: &str = "ROOMLERD_TEST_VD_DAEMON";
+
+    /// Run this test binary as one test of this module, alone, with `env`
+    /// set: a role. The test's name is the module path without the crate.
+    fn rerun(test: &str, env: (&str, &std::ffi::OsStr)) -> Command {
+        let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
+        cmd.args([
+            format!("virtual_desktop::supervise_tests::{test}").as_str(),
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(env.0, env.1)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        cmd
+    }
+
+    /// A daemon, as far as the desktop can tell: it brings a desktop up with
+    /// the test's scripts as the window manager and the app, the keeper
+    /// started from this binary, and a `sleep` in the server's place; writes
+    /// the server's and the keeper's pids; and waits to be killed. It leaves
+    /// by itself after a minute, should the test that started it be gone.
+    #[test]
+    fn daemon_stand_in_role() {
+        let Some(dir) = std::env::var_os(DAEMON_ROLE_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (desk, x_pid) = desktop_planned(
+            ":470",
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: dir.join("wm").display().to_string(),
+                    startup: vec![dir.join("app").display().to_string()],
+                },
+                ..plan(stand_in(&dir, "exit 1"))
+            },
+        );
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        std::fs::write(dir.join("server.pid"), x_pid.to_string()).unwrap();
+        std::fs::write(dir.join("keeper.pid"), keeper.to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
+    }
+
+    /// #3665 (a-ii, condition 1) — a daemon killed outright (SIGKILL, the OOM
+    /// killer, a stall exit) runs no teardown. Its end closes the keeper's
+    /// input, and the keeper takes the whole desktop down by itself: the
+    /// server, the window manager, the app, and the app's SIGTERM-deaf
+    /// orphan. It logs on the way, into the pipe of a daemon that is gone, so
+    /// a keeper whose writes could fail or block would leave the orphan.
+    #[test]
+    fn a_killed_daemon_leaves_nothing_of_its_desktop() {
+        if !have_setsid("a_killed_daemon_leaves_nothing_of_its_desktop") {
+            return;
+        }
+        let dir = scratch("daemon-killed");
+        let d = dir.display();
+        script(
+            &dir,
+            "wm",
+            &format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300"),
+        );
+        script(
+            &dir,
+            "app",
+            &format!(
+                "{}\necho $$ > \"{d}/app.pid\"\nexec sleep 300",
+                deaf_setsid_child(&dir)
+            ),
+        );
+        let mut daemon = rerun("daemon_stand_in_role", (DAEMON_ROLE_ENV, dir.as_os_str()))
+            .spawn()
+            .unwrap();
+        let daemon_info = read_proc_stat(daemon.id() as i32).expect("the daemon stand-in");
+        let mut ours = KillAtTheEnd(vec![daemon_info]);
+        let names = ["server.pid", "keeper.pid", "wm.pid", "app.pid", "gc.pid"];
+        let desktop: Vec<ProcInfo> = names.iter().map(|n| recorded(&dir, n)).collect();
+        ours.0.extend(desktop.iter().copied());
+
+        // SAFETY: SIGKILL to this test's own child, not yet waited for.
+        unsafe {
+            libc::kill(daemon.id() as i32, libc::SIGKILL);
+        }
+        let _ = daemon.wait();
+        let killed = Instant::now();
+        let bound = Duration::from_secs(10);
+        while desktop.iter().any(still_running) && killed.elapsed() < bound {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let took = killed.elapsed();
+        let left: Vec<(&str, i32)> = names
+            .iter()
+            .zip(&desktop)
+            .filter(|(_, p)| still_running(p))
+            .map(|(n, p)| (*n, p.pid))
+            .collect();
+        drop(ours);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            left.is_empty(),
+            "{took:?} after the daemon was killed, still running: {left:?}"
+        );
+    }
+
+    /// The pipe a descriptor of `pid` is, as `/proc` names it (`pipe:[N]`),
+    /// or what else it links to.
+    fn fd_target(pid: i32, fd: i32) -> Option<String> {
+        std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+            .ok()
+            .map(|p| p.display().to_string())
+    }
+
+    /// Every descriptor `pid` holds, and what each links to.
+    fn fds_of(pid: i32) -> std::collections::BTreeMap<i32, String> {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let fd = e.file_name().to_str()?.parse::<i32>().ok()?;
+                        Some((fd, fd_target(pid, fd)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #3665 (a-ii, conditions 2 and 8) — only the daemon holds the write end
+    /// of the keeper's input, so its end means the daemon is gone or tearing
+    /// down: the keeper reads it as fd 0, the daemon's end is write-only and
+    /// close-on-exec, and no process of the desktop holds either pipe of the
+    /// keeper's. Every client has `/dev/null` on stdin, stdout and stderr.
+    #[test]
+    fn only_the_daemon_holds_the_keepers_input() {
+        use std::os::fd::AsRawFd as _;
+        if !have_setsid("only_the_daemon_holds_the_keepers_input") {
+            return;
+        }
+        let dir = scratch("keeper-fds");
+        let d = dir.display();
+        let app = script(
+            &dir,
+            "app",
+            &format!(
+                "{}\necho $$ > \"{d}/app.pid\"\nexec sleep 300",
+                deaf_setsid_child(&dir)
+            ),
+        );
+        let (desk, x_pid) = desktop_planned(
+            ":471",
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: script(
+                        &dir,
+                        "wm",
+                        &format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300"),
+                    ),
+                    startup: vec![app],
+                },
+                ..plan(stand_in(&dir, "exit 1"))
+            },
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let wm = recorded(&dir, "wm.pid");
+        let app = recorded(&dir, "app.pid");
+        let gc = recorded(&dir, "gc.pid");
+        let _gc = KillAtTheEnd(vec![gc]);
+        let me = std::process::id() as i32;
+        let (end, flags) = {
+            let st = desk.state();
+            let fd = st.lifeline.as_ref().expect("the lifeline").as_raw_fd();
+            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+            let flags = info
+                .lines()
+                .find_map(|l| l.strip_prefix("flags:"))
+                .and_then(|v| i64::from_str_radix(v.trim(), 8).ok())
+                .expect("the lifeline's flags");
+            (fd_target(me, fd).expect("the lifeline's pipe"), flags)
+        };
+        let keeper_fds = fds_of(keeper);
+        let input = keeper_fds.get(&0).cloned();
+        let output = keeper_fds.get(&2).cloned();
+        let daemon_ends = fds_of(me).values().filter(|t| **t == end).count();
+        let clients: Vec<(&str, i32, std::collections::BTreeMap<i32, String>)> = [
+            ("server", x_pid),
+            ("window manager", wm.pid),
+            ("app", app.pid),
+            ("orphan", gc.pid),
+        ]
+        .into_iter()
+        .map(|(n, pid)| (n, pid, fds_of(pid)))
+        .collect();
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            input.as_deref(),
+            Some(end.as_str()),
+            "the keeper's fd 0 is the lifeline"
+        );
+        assert!(end.starts_with("pipe:"), "{end}");
+        assert_eq!(daemon_ends, 1, "the daemon holds one end of the lifeline");
+        assert_eq!(
+            flags & libc::O_ACCMODE as i64,
+            libc::O_WRONLY as i64,
+            "flags {flags:o}"
+        );
+        assert_ne!(flags & libc::O_CLOEXEC as i64, 0, "flags {flags:o}");
+        let output = output.expect("the keeper's stderr");
+        assert!(output.starts_with("pipe:"), "{output}");
+        for (name, pid, fds) in &clients {
+            for (fd, target) in fds {
+                assert!(
+                    *target != end && *target != output,
+                    "the {name} {pid} holds one of the keeper's pipes on fd {fd}"
+                );
+            }
+        }
+        for (name, pid, fds) in clients.iter().filter(|(n, _, _)| *n != "server") {
+            for fd in 0..=2 {
+                assert_eq!(
+                    fds.get(&fd).map(String::as_str),
+                    Some("/dev/null"),
+                    "the {name} {pid}'s fd {fd}: {fds:?}"
+                );
+            }
+        }
+    }
+
+    /// The role [`a_client_sees_the_same_on_both_paths`] runs in.
+    const SAME_ROLE_ENV: &str = "ROOMLERD_TEST_VD_SAME";
+
+    /// What a client of the desktop gets from whoever started it.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Seen {
+        environ: Vec<String>,
+        cwd: Option<std::path::PathBuf>,
+        umask: Option<String>,
+        ignored: Option<String>,
+        blocked: Option<String>,
+        group_is_the_servers: bool,
+        session: i32,
+        fds: std::collections::BTreeMap<i32, String>,
+    }
+
+    /// `/proc/<pid>/status`'s `key:` line.
+    fn status_line(pid: i32, key: &str) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
+    }
+
+    /// Bring a desktop up on `:472` with `clients`, read what its window
+    /// manager got, and stop it.
+    fn seen_by_a_client(dir: &Path, clients: Clients) -> Seen {
+        let d = dir.display();
+        let _ = std::fs::remove_file(dir.join("wm.pid"));
+        let (desk, x_pid) = desktop_planned(
+            ":472",
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: script(
+                        dir,
+                        "wm",
+                        &format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300"),
+                    ),
+                    startup: vec![],
+                },
+                clients,
+                ..plan(stand_in(dir, "exit 1"))
+            },
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        desk.start_clients();
+        let wm = recorded(dir, "wm.pid");
+        let mut environ: Vec<String> = std::fs::read(format!("/proc/{}/environ", wm.pid))
+            .unwrap_or_default()
+            .split(|b| *b == 0)
+            .filter(|v| !v.is_empty())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect();
+        environ.sort();
+        // SAFETY: `getsid(2)` on a live pid.
+        let session = unsafe { libc::getsid(wm.pid) };
+        let seen = Seen {
+            environ,
+            cwd: std::fs::read_link(format!("/proc/{}/cwd", wm.pid)).ok(),
+            umask: status_line(wm.pid, "Umask:"),
+            ignored: status_line(wm.pid, "SigIgn:"),
+            blocked: status_line(wm.pid, "SigBlk:"),
+            group_is_the_servers: wm.pgid == x_pid,
+            session,
+            fds: fds_of(wm.pid),
+        };
+        desk.stop();
+        seen
+    }
+
+    /// Run in a process of its own ([`a_client_sees_the_same_on_both_paths`]),
+    /// where no other test can change the environment between the two
+    /// looks: reads what a client gets on each path, and says whether they
+    /// match.
+    #[test]
+    fn same_on_both_paths_role() {
+        let Some(dir) = std::env::var_os(SAME_ROLE_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let by_keeper = seen_by_a_client(&dir, Clients::Keeper(KeeperCmd::test()));
+        let by_daemon = seen_by_a_client(&dir, Clients::Direct);
+        let verdict = if by_keeper == by_daemon {
+            "same".to_string()
+        } else {
+            format!("keeper {by_keeper:#?}\ndaemon {by_daemon:#?}")
+        };
+        std::fs::write(dir.join("verdict"), verdict).unwrap();
+    }
+
+    /// #3665, condition 6 — a client started by the keeper gets exactly what
+    /// one started by the daemon gets: environment, working directory,
+    /// umask, ignored and blocked signals, process group, session and open
+    /// descriptors. What differs is its parent, which is the point.
+    #[test]
+    fn a_client_sees_the_same_on_both_paths() {
+        let dir = scratch("same");
+        let mut role = rerun("same_on_both_paths_role", (SAME_ROLE_ENV, dir.as_os_str()));
+        let status = role.status().expect("re-run this test binary in its role");
+        let verdict = std::fs::read_to_string(dir.join("verdict"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "the role failed: {status}");
+        // No verdict: the role's name matched nothing, so it ran nothing.
+        assert_eq!(verdict.as_deref().ok(), Some("same"), "{verdict:?}");
+    }
+
+    /// #3665, condition 4 — the keeper's teardown loops until it has no child
+    /// left. Here a client answers SIGTERM by starting a SIGTERM-deaf child in
+    /// a session of its own and leaving: an orphan born during the teardown,
+    /// after the first snapshot, and adopted by the keeper. The keeper still
+    /// ends it, and leaves by itself (exit 0) within its deadline instead of
+    /// waiting for a child it would never see go.
+    #[test]
+    fn the_keepers_teardown_ends_an_orphan_adopted_during_it() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::process::CommandExt as _;
+        if !have_setsid("the_keepers_teardown_ends_an_orphan_adopted_during_it") {
+            return;
+        }
+        let dir = scratch("keeper-loop");
+        let d = dir.display();
+        let wm = script(
+            &dir,
+            "wm",
+            &format!(
+                "trap 'setsid sh -c \"trap \\\"\\\" TERM; echo \\$\\$ > \\\"{d}/late.pid\\\"; exec sleep 300\" & sleep 0.2; exit 0' TERM\n\
+                 echo $$ > \"{d}/wm.pid\"\n\
+                 while :; do sleep 0.05; done"
+            ),
+        );
+        // The desktop's group, led by a `sleep` in the server's place.
+        let mut leader = Command::new("sleep");
+        leader
+            .arg("300")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut leader = leader.spawn().unwrap();
+        let group = leader.id() as i32;
+        let leader_info = read_proc_stat(group).expect("the group's leader");
+        let mut cmd = KeeperCmd::test().command();
+        cmd.process_group(group)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut keeper = cmd.spawn().unwrap();
+        let keeper_pid = keeper.id() as i32;
+        let job = keeper::Job {
+            display: ":473".into(),
+            group,
+            wm,
+            apps: vec![],
+            grace_ms: KEEPER_GRACE.as_millis() as u64,
+        };
+        let mut input = keeper.stdin.take().unwrap();
+        input.write_all(job.line().as_bytes()).unwrap();
+        let mut lines = std::io::BufReader::new(keeper.stderr.take().unwrap()).lines();
+        let first = lines.next().and_then(|l| l.ok());
+        let wm = recorded(&dir, "wm.pid");
+        let mut ours = KillAtTheEnd(vec![leader_info, wm]);
+
+        // The daemon's teardown: the keeper's input ends.
+        let asked = Instant::now();
+        drop(input);
+        let mut status = None;
+        while asked.elapsed() < Duration::from_secs(10) {
+            if let Ok(Some(s)) = keeper.try_wait() {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let took = asked.elapsed();
+        let late = std::fs::read_to_string(dir.join("late.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+        let late_running = late.is_some_and(is_running);
+        if let Some(info) = late.and_then(read_proc_stat) {
+            ours.0.push(info);
+        }
+        if status.is_none() {
+            let _ = keeper.kill();
+            let _ = keeper.wait();
+        }
+        let leader_running = is_running(group);
+        let _ = leader.kill();
+        let _ = leader.wait();
+        drop(ours);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(first.as_deref(), Some("ready"));
+        assert!(late.is_some(), "the client never started its late child");
+        assert!(
+            !late_running,
+            "the orphan born during the teardown is still running"
+        );
+        assert!(
+            !leader_running,
+            "the end of input left the desktop's group leader running"
+        );
+        let status =
+            status.unwrap_or_else(|| panic!("the keeper {keeper_pid} had not left after {took:?}"));
+        assert!(status.success(), "the keeper left with {status}");
+        assert!(took < Duration::from_secs(6), "the teardown took {took:?}");
+    }
 }
