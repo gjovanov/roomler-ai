@@ -8960,3 +8960,46 @@ mod one_row_enroll_tests {
         assert!(help.contains("--one-row"), "{help}");
     }
 }
+
+/// #3652 — the plain smoke, real code, on a build whose only encoder is
+/// OpenH264: no Media Foundation, no FFmpeg, so nothing here touches a GPU.
+/// Hardware asked for and software answering is not a pass. The recorder lane
+/// runs these (`ci.yml`, its OpenH264 `--lib` line), the one lane that builds
+/// OpenH264 without an FFmpeg; a build with hardware backends would prove
+/// nothing here, so it does not compile them.
+#[cfg(all(
+    test,
+    feature = "openh264-encoder",
+    not(all(target_os = "windows", feature = "mf-encoder")),
+    not(feature = "ffmpeg-encoder")
+))]
+mod smoke_openh264_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hardware_answered_by_openh264_is_not_a_pass() {
+        let smoke = encoder_smoke_cmd("hardware", "h264", None, None).await;
+        assert!(
+            smoke.is_err(),
+            "hardware was asked for, OpenH264 answered, and the smoke passed"
+        );
+    }
+
+    /// The `.deb` lanes' call (`scripts/deb-bare-check.sh`).
+    #[tokio::test]
+    async fn software_h264_still_passes() {
+        encoder_smoke_cmd("software", "h264", None, None)
+            .await
+            .expect("the software smoke passes on OpenH264");
+    }
+
+    /// This build has no HEVC encoder at all, so the failure has to say that,
+    /// not that a hardware and a software backend both failed.
+    #[tokio::test]
+    async fn hevc_fails_and_names_what_this_build_has() {
+        let failed = encoder_smoke_cmd("hardware", "hevc", None, None)
+            .await
+            .expect_err("no HEVC encoder in this build");
+        assert!(!format!("{failed:#}").contains("HW and SW"), "{failed:#}");
+    }
+}
