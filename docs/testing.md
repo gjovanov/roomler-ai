@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux. The tests that write the real clipboard or change an X display skip unless opted in ([below](#tests-that-change-a-real-desktop-3813)) |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2822`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2826`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Self-host quickstart | `bash scripts/selfhost-pull-check.sh` (lane `Self-host pull`, amd64 and arm64) | a throwaway machine with Docker, since it ends with `down -v`: no registry login, an empty image cache, `pull` then `up -d`, and every image pinned |
@@ -281,7 +281,7 @@ and passes.
 
 | Opt-in | Tests | What they do | CI step that sets it |
 |---|---|---|---|
-| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:2797`](../agents/roomlerd/src/clipboard.rs#L2797)); the change gate on X11 ([`:1931`](../agents/roomlerd/src/clipboard.rs#L1931), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:2007`](../agents/roomlerd/src/clipboard.rs#L2007)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1561`](../.github/workflows/ci.yml#L1561), [`:1995`](../.github/workflows/ci.yml#L1995)) |
+| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:2797`](../agents/roomlerd/src/clipboard.rs#L2797)); the change gate on X11 ([`:1931`](../agents/roomlerd/src/clipboard.rs#L1931), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:2007`](../agents/roomlerd/src/clipboard.rs#L2007)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1563`](../.github/workflows/ci.yml#L1563), [`:1999`](../.github/workflows/ci.yml#L1999)) |
 | `ROOMLERD_TEST_X11=1` | `capture::pointer::x11_tests` ([`pointer.rs:325`](../agents/roomlerd/src/capture/pointer.rs#L325)), `capture::x11_cursor::x11_tests` ([`x11_cursor.rs:422`](../agents/roomlerd/src/capture/x11_cursor.rs#L422)) and `input::layout_x11`'s `x11_real_switch_round_trip` ([`layout_x11.rs:838`](../agents/roomlerd/src/input/layout_x11.rs#L838)), which until #3813 ran on any display they reached; and, from before, `indicator::x11`, `capture::xwayland_probe_tests`, `keep_busy::host_x11` and `virtual_desktop`'s X tests | move the pointer, set the root cursor, replace the layouts with `setxkbmap` and leave `us` behind, send XTest input, put a window up | the Xvfb step, "The recorder's pointer (FR-85 P1d) and keep busy (FR-92 P3) on X11" ([`ci.yml:1224`](../.github/workflows/ci.yml#L1224)) |
 
 - **The gate.** A real-clipboard test calls `clipboard::real_clipboard_opted_in` first
@@ -297,6 +297,18 @@ and passes.
   line is grepped: that is what a developer's own run has to leave alone. The second run has the
   opt-in, and each test's own line is grepped. The sentinel check was RED on the code before
   #3813, on X11 and on a Mac.
+- **One test at a time (#3876).** Both runs of each step pass `--test-threads=1`, so that each
+  grep finds its line whole. The runs without the opt-in are
+  [`ci.yml:1344`](../.github/workflows/ci.yml#L1344),
+  [`:1569`](../.github/workflows/ci.yml#L1569) and [`:2007`](../.github/workflows/ci.yml#L2007).
+  A skip line is one `eprintln!` of four pieces, the variable's name and the test's among them
+  ([`clipboard.rs:1912`](../agents/roomlerd/src/clipboard.rs#L1912)). Stderr is not buffered,
+  so each piece is a write of its own. On several threads, libtest prints a finished test's
+  `test NAME ... ok` while other tests still run, and those writes can land between the pieces.
+  The grep then misses a line that was printed, and the step fails after every test passed: it
+  did on macOS and on Windows. One at a time, libtest prints a test's name before the test
+  starts and its result after it returns, so while a test runs, libtest writes nothing and no
+  other test runs. A new step that greps a line a test prints runs its tests the same way.
 - **A new test** that writes the real clipboard calls `real_clipboard_opted_in` first, and gets
   a line to grep in its OS's step. One that changes an X display runs only under
   `ROOMLERD_TEST_X11=1`. That variable alone never opens the clipboard: a developer may set it to

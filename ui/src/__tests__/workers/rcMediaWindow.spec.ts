@@ -87,6 +87,34 @@ describe('FR-135 R0 — the recorder', () => {
     expect(take(r).freezes).toBe(0)
   })
 
+  it('counts no freeze for a gap the host left, by the frames’ wire timestamps (N11, #3875)', () => {
+    const r = createViewerMediaRecorder(async () => null)
+    // A frame every 16 ms (µs on the wire), each painted 30 ms after it was framed.
+    for (let ts = 0; ts <= 400_000; ts += 16_000) r.onPainted(ts / 1000 + 30, 1, ts)
+    // Motion stops: the next frame is framed 1.2 s later and paints on time.
+    r.onPainted(1_630, 1, 1_600_000)
+    expect(take(r).freezes).toBe(0)
+    // A still screen with a caret that blinks every 530 ms, each blink on time.
+    for (let ts = 2_130_000; ts <= 6_900_000; ts += 530_000) r.onPainted(ts / 1000 + 30, 1, ts)
+    expect(take(r).freezes).toBe(0)
+    // The path holds the next frame 400 ms past its latency: that one is a freeze.
+    r.onPainted(6_916 + 30 + 400, 1, 6_916_000)
+    expect(take(r).freezes).toBe(1)
+  })
+
+  it('counts a wait at the key-frame gate as a freeze: the frames it dropped were framed', () => {
+    const r = createViewerMediaRecorder(async () => null)
+    r.onFramed(0)
+    r.onPainted(30, 1, 0)
+    // Dropped at the gate after their headers reached the worker.
+    for (let ts = 16_000; ts <= 400_000; ts += 16_000) r.onFramed(ts)
+    r.onFramed(416_000)
+    r.onPainted(500, 1, 416_000)
+    expect(take(r).freezes).toBe(1)
+    r.reset()
+    expect(take(r).freezes).toBe(0)
+  })
+
   it('counts no freeze across a capture hold the agent announced, and only that gap', () => {
     const r = createViewerMediaRecorder(async () => null)
     r.onPainted(1_000, 1, 1)
@@ -381,6 +409,47 @@ describe.each(DC_CODECS)('FR-135 R0 — the data-channel worker carries the wind
     expect(FakeDecoder.isConfigSupported).toHaveBeenCalledWith(
       expect.objectContaining({ hardwareAcceleration: 'prefer-hardware' }),
     )
+  })
+
+  it('counts no freeze where the host framed nothing, and the wait at the gate where it framed on (#3875)', async () => {
+    const send = await start()
+    const dec = () => FakeDecoder.instances[0]!
+    // Wire timestamps in µs, as the agent stamps them at framing.
+    at(0)
+    send({ type: 'chunk', bytes: bare(true, 0) })
+    at(10)
+    dec().init.output(fakeFrame(0))
+    // The screen went still for a second and the next frame paints at its
+    // usual latency: the host left that gap, so it is no freeze.
+    at(1_000)
+    send({ type: 'chunk', bytes: bare(false, 1_000_000) })
+    at(1_010)
+    dec().init.output(fakeFrame(1_000_000))
+    // Motion again. A delta the decoder sits on, then one behind it: the
+    // backlog sheds that one and the gate closes. The deltas after it reach
+    // the worker and wait at the gate, framed every 16 ms.
+    at(1_020)
+    send({ type: 'chunk', bytes: bare(false, 1_016_000) })
+    at(1_200)
+    send({ type: 'chunk', bytes: bare(false, 1_032_000) })
+    expect(posted.filter((m) => m.type === 'backlog-drop')).toHaveLength(1)
+    at(1_210)
+    dec().init.output(fakeFrame(1_016_000)) // 200 ms after the last paint: not a freeze
+    for (let ts = 1_048_000; ts <= 1_200_000; ts += 16_000) {
+      at(1_210 + (ts - 1_032_000) / 1000)
+      send({ type: 'chunk', bytes: bare(false, ts) })
+    }
+    // The key frame, framed 16 ms after the last of them, paints 250 ms after
+    // the held delta. The host never paused more than 16 ms, though the two
+    // painted frames were framed 200 ms apart.
+    at(1_400)
+    send({ type: 'chunk', bytes: bare(true, 1_216_000) })
+    at(1_460)
+    dec().init.output(fakeFrame(1_216_000))
+
+    const media = await statsAfter(send, 2_600, 1_232_000)
+    expect(media.painted).toBe(4)
+    expect(media.freezes).toBe(1)
   })
 
   it('times an R1 recovery as a gate wait, from the failure to the painted key frame', async () => {

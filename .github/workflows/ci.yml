@@ -1558,13 +1558,15 @@ jobs:
       #      outlives a clone's drop. Until #3813 the gate's test had its own
       #      variable, ROOMLERD_TEST_MAC_PASTEBOARD, and the round trip ran in
       #      no Mac step.
+      # #3876 — one test at a time. A skip line is written in pieces; on several
+      # threads another test's line can land between them, and grep misses it.
       - name: The real clipboard on a Mac — untouched without the opt-in, its tests run with it (#3813)
         run: |
           set -euo pipefail
           SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           printf %s "$SENTINEL" | pbcopy
           [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::the pasteboard did not take the sentinel"; exit 1; }
-          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture 2>&1 | tee /tmp/clip-plain.log
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture --test-threads=1 2>&1 | tee /tmp/clip-plain.log
           [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::a test replaced the pasteboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping mac_real_the_gate_counts_a_copy" /tmp/clip-plain.log
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
@@ -1992,6 +1994,8 @@ jobs:
       #      skipping. A clipboard that does not open is then a failure.
       # Before #3813 no Windows step built `clipboard`, so the round trip ran
       # on Windows only on developers' own machines.
+      # #3876 — one test at a time. A skip line is written in pieces; on several
+      # threads another test's line can land between them, and grep misses it.
       - name: The real clipboard on Windows — untouched without the opt-in, its test runs with it (#3813)
         timeout-minutes: 20
         run: |
@@ -2000,7 +2004,7 @@ jobs:
           holds() { [ "$(pwsh -NoProfile -Command Get-Clipboard | tr -d '\r')" = "$SENTINEL" ]; }
           pwsh -NoProfile -Command "Set-Clipboard -Value '$SENTINEL'"
           holds || { echo "::error::this runner's clipboard did not take the sentinel"; exit 1; }
-          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features "$F" -- clipboard:: --nocapture 2>&1 | tee "$RUNNER_TEMP/clip-plain.log"
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features "$F" -- clipboard:: --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-plain.log"
           holds || { echo "::error::a test replaced the clipboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" "$RUNNER_TEMP/clip-plain.log"
           ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --lib --features "$F" -- clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-real.log"
