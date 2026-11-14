@@ -5,8 +5,9 @@
 # re-run once, as attempt 2 of its run, when it ended without every step
 # reporting an end. This script is that decision, and its only copy: the
 # smoke's check job prints its lines in the run, and the workflow
-# installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml) re-runs
-# the run's failed jobs when it reads `incomplete` on attempt 1.
+# installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml, through
+# scripts/job-steps-ended-rerun.sh) asks GitHub to re-run that one job when it
+# reads `incomplete` on attempt 1.
 #
 # The rule:
 #   complete    GitHub lists at least one step of the job, and the status of
@@ -14,11 +15,14 @@
 #   incomplete  anything else: a step whose status is not `completed`
 #               (`in_progress`, `pending`, ...), or no step listed at all.
 # Neither the job's conclusion nor GitHub's annotations on the job decide; both
-# are printed. A re-run runs the real test again, so it cannot turn a real
-# failure green, and when in doubt the job is re-run.
+# are printed. A re-run runs the real test again, and a failure that comes and
+# goes can pass on it. When in doubt the job is re-run.
 #
 # The lines say what GitHub lists and nothing more. They name no cause: a step
-# that reported no end is printed with the API's own status word.
+# that reported no end is printed with the API's own status word. Every string
+# the API gives (a step's name first) is printed with each control character,
+# U+0000 to U+001F and U+007F, replaced by a space, so that no name can start a
+# line of its own: a pull request's own workflow file names its steps.
 #
 # Usage:
 #   job-steps-ended.sh --job NAME --attempt N --repo OWNER/REPO --run ID
@@ -77,6 +81,13 @@ wait=${JOB_STEPS_ENDED_WAIT:-10}
 [ -z "$jobs_file" ] || reads=1 # a saved reply does not change
 where="attempt $attempt${run:+ of run $run}"
 
+# jq: `clean` makes each control character of a string a space; `clean_all`
+# does it to every string in a value. The job is matched by its name as GitHub
+# lists it, and cleaned once it is chosen, before anything of it is printed.
+CLEAN='def clean: tostring | explode | map(if . < 32 or . == 127 then 32 else . end) | implode;
+  def clean_all: if type == "string" then clean elif type == "array" then map(clean_all)
+    elif type == "object" then map_values(clean_all) else . end;'
+
 job='' got=no
 for ((i = 1; i <= reads; i++)); do
   if [ -n "$jobs_file" ]; then
@@ -86,7 +97,7 @@ for ((i = 1; i <= reads; i++)); do
   fi
   if jq -e 'has("jobs")' <<<"$all" >/dev/null 2>&1; then
     got=yes
-    job=$(jq -c --arg n "$job_name" '[.jobs[] | select(.name == $n)] | last // empty' <<<"$all")
+    job=$(jq -c --arg n "$job_name" "$CLEAN"' [.jobs[] | select(.name == $n)] | last // empty | clean_all' <<<"$all")
     [ -n "$job" ] && [ "$(jq -r .status <<<"$job")" = completed ] && break
   fi
   [ "$i" -lt "$reads" ] && sleep "$wait"
@@ -149,9 +160,9 @@ annotations() {
   else
     a=$(gh api "repos/$repo/check-runs/$id/annotations?per_page=100") || { echo 'could not be read'; return; }
   fi
-  jq -r 'if type != "array" then error("not a list")
+  jq -r "$CLEAN"' if type != "array" then error("not a list")
          elif length == 0 then "none"
-         else map("\(.annotation_level // "annotation") \"\((.message // "") | tostring | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" "))\"") | join("; ")
+         else map("\(.annotation_level // "annotation" | clean) \"\((.message // "") | clean | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" "))\"") | join("; ")
          end' <<<"$a" 2>/dev/null || echo 'could not be read'
 }
 
@@ -161,7 +172,7 @@ echo "GitHub's annotations on the job: $(annotations)."
 if [ "$verdict" = complete ]; then
   echo 'Every step reported an end, so this job is not re-run.'
 elif [ "$attempt" = 1 ]; then
-  echo 'Not every step reported an end, so the workflow installer-smoke-rerun re-runs this job once, as attempt 2 of this run, unless a newer run of the same branch exists by then.'
+  echo 'Not every step reported an end, so the workflow installer-smoke-rerun asks GitHub to re-run this job once, as attempt 2 of this run, unless one of its guards refuses. If no attempt 2 follows, its run among the installer-smoke-rerun runs in the Actions list says why.'
 else
   echo "Not every step reported an end. This is attempt $attempt; only attempt 1 is re-run, so this job is not re-run again."
 fi

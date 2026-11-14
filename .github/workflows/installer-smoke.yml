@@ -1721,9 +1721,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # #3810: from attempt 2 on (a re-run), the name carries the attempt.
-          # An upload of a name that attempt 1 already uploaded does not fail:
-          # the run then holds two artifacts by that one name, and a reader
-          # that downloads by name can get either. The same for the two below.
+          # Documented, of `overwrite` (default false): "If false, the action will
+          # fail if an artifact for the given name already exists"
+          # (https://github.com/actions/upload-artifact/blob/v4/README.md). Observed
+          # in run 43272025014: attempt 2 uploaded attempt 1's name without failing,
+          # and the run then held it twice. The suffix is safe either way. So below.
           name: installer-smoke-msis${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/fr133/branch-*.msi
           if-no-files-found: warn
@@ -2707,14 +2709,14 @@ jobs:
   # `complete` when GitHub lists at least one step and every step reported an
   # end, `incomplete` otherwise (scripts/job-steps-ended-test.sh holds its
   # cases). On attempt 1, `incomplete` means that the workflow
-  # installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml, which
-  # runs from the default branch when this run completes) re-runs this run's
-  # failed jobs once, as attempt 2: only a re-run replaces the Windows job's
-  # own check. On attempt 2 nothing is re-run again. This job fails whenever it
-  # runs, so the run stays red until a re-run of the Windows job passes; after
-  # a passing re-run it is skipped in attempt 2. A cancelled run skips it.
+  # installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml, run
+  # from the default branch when this run completes) asks GitHub to re-run the
+  # Windows job once, as attempt 2, unless one of its guards refuses; attempt 2
+  # is never re-run. This job fails whenever it runs. A run whose Windows job
+  # was lost reads `cancelled` until a re-run replaces that job's check. This
+  # job is skipped when the Windows job passes, and in a run cancelled first.
   windows-steps-check:
-    name: "Did every step of the Windows job report an end? If not, it is re-run once (#3810)"
+    name: "Did every step of the Windows job report an end? (#3810)"
     needs: windows-msi-install-uninstall
     if: ${{ !cancelled() && needs.windows-msi-install-uninstall.result != 'success' && needs.windows-msi-install-uninstall.result != 'skipped' }}
     runs-on: ubuntu-latest
