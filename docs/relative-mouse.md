@@ -71,12 +71,12 @@ sequenceDiagram
 
 | Host | Relative motion | A press where the pointer is |
 |---|---|---|
-| Windows, user worker | `SendInput` with `MOUSEEVENTF_MOVE` and no `ABSOLUTE` ([`enigo_backend.rs:211`](../agents/roomlerd/src/input/enigo_backend.rs#L211)) | [`enigo_backend.rs:218`](../agents/roomlerd/src/input/enigo_backend.rs#L218) |
+| Windows, user worker | `SendInput` with `MOUSEEVENTF_MOVE` and no `ABSOLUTE` ([`enigo_backend.rs:214`](../agents/roomlerd/src/input/enigo_backend.rs#L214)) | [`enigo_backend.rs:221`](../agents/roomlerd/src/input/enigo_backend.rs#L221) |
 | Windows, SystemContext | the same `dispatch`, on its desktop-bound thread | the same |
 | Linux, system install (uinput) | ✅ **P2b**: a second, relative-only pointer beside the absolute tablet (`REL_X`/`REL_Y` plus buttons), made on the first `mouse_rel` ([`uinput_backend.rs:470`](../agents/roomlerd/src/input/uinput_backend.rs#L470) `open_rel_device`; the frame at [`uinput_backend.rs:564`](../agents/roomlerd/src/input/uinput_backend.rs#L564)). libinput adds it as a pointer on GNOME and KDE and hands relative-pointer clients its unaccelerated deltas, the counts sent | ✅ [`uinput_backend.rs:555`](../agents/roomlerd/src/input/uinput_backend.rs#L555) |
 | Linux, per-user Wayland (the RemoteDesktop session) | ✅ **P2c**: the session's own relative call, which names no stream ([`portal/input.rs:163`](../agents/roomlerd/src/capture/portal/input.rs#L163)): the portal's `NotifyPointerMotion` ([`portal/input.rs:470`](../agents/roomlerd/src/capture/portal/input.rs#L470)), or `NotifyPointerMotionRelative` on mutter's own session, where FR-93 routes GNOME's input ([`portal/input.rs:499`](../agents/roomlerd/src/capture/portal/input.rs#L499)). Both move the pointer by exactly the counts sent | ✅ [`portal/input.rs:155`](../agents/roomlerd/src/capture/portal/input.rs#L155) |
-| Linux X11 (enigo, XTest) | ✅ **P2a**: XTest relative motion (`XTestFakeRelativeMotionEvent`, enigo's `Coordinate::Rel`, [`enigo_backend.rs:211`](../agents/roomlerd/src/input/enigo_backend.rs#L211)), which an XI2 raw reader sees 1:1 | ✅ the same `dispatch` |
-| macOS (the per-user agent) | ✅ **P2d**: enigo's `Coordinate::Rel` posts a `MouseMoved` CGEvent (a `…Dragged` one with a button held) at the cursor plus the delta, with the event's delta fields set to the counts sent ([`enigo_backend.rs:211`](../agents/roomlerd/src/input/enigo_backend.rs#L211)). The session's event stream carries each event with exactly that delta, and an app reads it as `NSEvent`'s `deltaX`/`deltaY`, also with the cursor decoupled from the mouse the way a game decouples it | ✅ the same `dispatch` |
+| Linux X11 (enigo, XTest) | ✅ **P2a**: XTest relative motion (`XTestFakeRelativeMotionEvent`, enigo's `Coordinate::Rel`, [`enigo_backend.rs:214`](../agents/roomlerd/src/input/enigo_backend.rs#L214)), which an XI2 raw reader sees 1:1 | ✅ the same `dispatch` |
+| macOS (the per-user agent) | ✅ **P2d**: enigo's `Coordinate::Rel` posts a `MouseMoved` CGEvent (a `…Dragged` one with a button held) at the cursor plus the delta, with the event's delta fields set to the counts sent ([`enigo_backend.rs:214`](../agents/roomlerd/src/input/enigo_backend.rs#L214)). The session's event stream carries each event with exactly that delta, and an app reads it as `NSEvent`'s `deltaX`/`deltaY`, also with the cursor decoupled from the mouse the way a game decouples it | ✅ the same `dispatch` |
 
 ⚠️ **On Windows, enigo has to be told to send a relative move as relative.** enigo 0.6's default
 (`windows_subject_to_mouse_speed_and_acceleration_level = false`) turns `Coordinate::Rel` into an
@@ -84,7 +84,7 @@ ABSOLUTE move to cursor + delta, so that pointer acceleration does not apply. Ra
 absolute event and no motion, and a game sees nothing. Agent 0.4.140 shipped that way: ten `mouse_rel`
 frames reached the host as 0 relative counts and 10 absolute events (the spec's §8 row 5). Every enigo
 the agent builds now starts from one helper with the flag set
-([`enigo_backend.rs:130`](../agents/roomlerd/src/input/enigo_backend.rs#L130) `enigo_settings`), and a
+([`enigo_backend.rs:133`](../agents/roomlerd/src/input/enigo_backend.rs#L133) `enigo_settings`), and a
 test locks it.
 The visible cursor then follows pointer speed and acceleration, as a real mouse does; the raw deltas are
 the counts sent.
@@ -220,7 +220,7 @@ person's.
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
   `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
-  ([`input/mod.rs:882`](../agents/roomlerd/src/input/mod.rs#L882) `fr109_relative_mouse_reads_no_input`).
+  ([`input/mod.rs:883`](../agents/roomlerd/src/input/mod.rs#L883) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 - Not measured on macOS: an app that reads the GameController framework (`GCMouse`). It reads the mouse
