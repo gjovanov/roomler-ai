@@ -178,7 +178,7 @@ record's file. Two topologies split roles:
   (`com.roomler.update`, FR-96 / P4); the per-user half answers its own
   `<log_dir>`, where no root install ever writes. `roomler status` as the
   console user therefore reads `Absent` for the per-user half, and
-  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:248`) lends it
+  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:289`) lends it
   the root half's **network** fields only, never its install record — the
   verdict is per daemon, and the half that answers must not claim another's.
 

@@ -28,6 +28,16 @@
 //!
 //! What the socket serves is decided in `localapi` ([`localapi::person_may`]).
 //!
+//! **Not known is not nobody (#3845).** On Linux who is at the seat is
+//! logind's answer, from another process, which may not come: a paused
+//! logind, and `loginctl`'s D-Bus call gives up after 25 s. A look that
+//! fails or runs out of time ([`Look::NotKnown`]) keeps the socket where it
+//! is, with no close, start or move until the seat answers, and the poll says
+//! so once a run. Only the seat's own answer is nobody ([`look_of`]).
+//! Failing closed stays: every change and every consent answer over the
+//! socket asks the seat again first ([`at_the_seat_now`]), and while it is
+//! not known the person is told to try again.
+//!
 //! **A Mac (FR-97 P2g).** A two-half Mac's companion talks to its per-user
 //! half, whose enrollment has no overlay node: only root can hold a utun, so
 //! the machine is on the private network through its root half alone. The
@@ -70,6 +80,17 @@ use tunnel_core::localapi::{NodeStatus, Response};
 /// logged in ([`any_user_runtime_dir`]); on a Mac it is one `stat`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const POLL: Duration = Duration::from_secs(5);
+
+/// #3845 — how long the poll waits for a look at the seat: the time between
+/// looks. A look takes tens of milliseconds, longer on a loaded host, and a
+/// look cut short is not known, which leaves the socket where it is. So the
+/// poll waits longer than the check a person waits on
+/// (`files::SEAT_LOOKUP_WAIT`, 1.5 s), and it still follows a slow logind.
+/// The lookup runs on the flight's own thread ([`look_at_the_seat`]), so
+/// the wait holds no async worker. A hung logind holds that one thread,
+/// however often the poll and the checks ask.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LOOK_WAIT: Duration = POLL;
 
 /// Is any NON-root user logged in? logind gives every logged-in user a
 /// `/run/user/<uid>`, so its absence is a free answer of "nobody to serve".
@@ -123,12 +144,15 @@ pub enum Look {
 }
 
 /// Pure: the listener follows the person at the seat. Root at the seat is
-/// nobody to serve here.
+/// nobody to serve here. #3845 — a look that could not tell keeps what is
+/// served, a person's socket or none: not known is not nobody. The check
+/// before each change and each consent answer still refuses while it is not
+/// known ([`at_the_seat_now`]).
 pub fn step(serving: Option<u32>, look: &Look) -> Step {
     let want = match look {
         Look::Person(uid) => Some(*uid).filter(|&u| u != 0),
-        // As before #3845: a look that could not tell reads as nobody.
-        Look::Nobody | Look::NotKnown(_) => None,
+        Look::Nobody => None,
+        Look::NotKnown(_) => return Step::Keep,
     };
     match (serving, want) {
         (a, b) if a == b => Step::Keep,
@@ -409,79 +433,85 @@ fn look_of(found: anyhow::Result<u32>) -> Look {
 }
 
 /// #2871 (review) — is `uid` the person at the seat RIGHT NOW? The person
-/// socket asks before it applies a config change
-/// (`LocalApiState::at_the_seat_now`): its listener follows the seat on a
-/// [`POLL`], so a person who switched away still holds an open connection
-/// until the next look, and must not change settings that are the next
-/// person's by then.
+/// socket asks before it applies a config change, and since #3845 before it
+/// takes a consent answer (`LocalApiState::at_the_seat_now`): its listener
+/// follows the seat on a [`POLL`], so a person who switched away still holds
+/// an open connection until the next look, and must neither change settings
+/// that are the next person's by then nor answer for their screen.
 ///
 /// #3796 — on Linux the lookup is logind's, another process, which may not
 /// answer (a stopped logind). It is asked as a received file's is: one
 /// lookup in flight ([`PERSON_AT_SEAT0`]), each check waiting
 /// `files::SEAT_LOOKUP_WAIT` at most. With no answer in that time, who is
 /// at the seat is not known yet, and the change is refused with the
-/// try-again text (`AtTheSeat::NotKnownYet`). A Mac looks at `/dev/console`.
+/// try-again text (`AtTheSeat::NotKnownYet`). #3845 — and so is every other
+/// look that cannot tell ([`seat_for`]). A Mac looks at `/dev/console`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn at_the_seat_now(uid: u32) -> tunnel_core::localapi::AtTheSeat {
     #[cfg(target_os = "linux")]
-    {
-        // Asked here, on the thread a test stood the lookup in on.
-        #[cfg(test)]
-        if let Some(stood) = stand_in::lookup_now() {
-            let lookup = stood.lookup;
-            let asked = stood
-                .flight
-                .ask(crate::files::SEAT_LOOKUP_WAIT, move || lookup())
-                .await;
-            return seat_for(uid, asked);
-        }
-        seat_for(
-            uid,
-            PERSON_AT_SEAT0
-                .ask(crate::files::SEAT_LOOKUP_WAIT, person_at_the_seat)
-                .await,
-        )
-    }
+    let wait = crate::files::SEAT_LOOKUP_WAIT;
     #[cfg(target_os = "macos")]
-    {
-        let at_seat = tokio::task::spawn_blocking(person_at_the_seat).await.ok();
-        if at_seat == Some(Look::Person(uid)) {
-            tunnel_core::localapi::AtTheSeat::Yes
-        } else {
-            tunnel_core::localapi::AtTheSeat::No
-        }
-    }
+    let wait = LOOK_WAIT;
+    seat_for(uid, look_at_the_seat(wait).await)
 }
 
 /// #3796 — the one lookup of who is at seat0 in flight for the person
-/// socket's checks ([`at_the_seat_now`]), on a thread named `seat0-person`.
-/// Its 5 s poll ([`run`]) asks on its own, one look at a time.
+/// socket, on a thread named `seat0-person`. #3845 — the checks
+/// ([`at_the_seat_now`]) and the 5 s poll ([`follow_the_seat`]) both ask
+/// through it, so a hung logind holds one thread for both.
 #[cfg(target_os = "linux")]
 static PERSON_AT_SEAT0: crate::one_in_flight::OneInFlight<Look> =
     crate::one_in_flight::OneInFlight::new("seat0-person");
 
-/// #3796 — what a check answers for `uid` from what the lookup gave it.
+/// #3845 — a look at the seat, `wait` at most, through the one lookup in
+/// flight ([`PERSON_AT_SEAT0`]). No answer in time, or a lookup that
+/// panicked, is not known.
 #[cfg(target_os = "linux")]
-fn seat_for(
-    uid: u32,
-    asked: crate::one_in_flight::Asked<Look>,
-) -> tunnel_core::localapi::AtTheSeat {
+async fn look_at_the_seat(wait: Duration) -> Look {
     use crate::one_in_flight::Asked;
-    use tunnel_core::localapi::AtTheSeat;
-    match asked {
-        Asked::Answer(Look::Person(at_seat)) if at_seat == uid => AtTheSeat::Yes,
-        // As before #3845: a lookup that could not tell is nobody here.
-        Asked::Answer(_) => AtTheSeat::No,
-        // As before: a lookup that failed names nobody at the seat.
-        Asked::Failed(why) => {
-            tracing::warn!(%why, "person socket: the seat lookup failed — nobody at the seat");
-            AtTheSeat::No
+    // Asked here, on the thread a test stood the lookup in on.
+    #[cfg(test)]
+    let asked = match stand_in::lookup_now() {
+        Some(stood) => {
+            let lookup = stood.lookup;
+            stood.flight.ask(wait, move || lookup()).await
         }
-        Asked::OutOfTime => {
+        None => PERSON_AT_SEAT0.ask(wait, person_at_the_seat).await,
+    };
+    #[cfg(not(test))]
+    let asked = PERSON_AT_SEAT0.ask(wait, person_at_the_seat).await;
+    match asked {
+        Asked::Answer(look) => look,
+        Asked::Failed(why) => Look::NotKnown(format!("the lookup failed: {why}")),
+        Asked::OutOfTime => Look::NotKnown(format!("no answer within {wait:?}")),
+    }
+}
+
+/// A Mac's look ([`look_at_the_seat`]): `/dev/console`'s owner, one `stat`,
+/// on a blocking thread.
+#[cfg(target_os = "macos")]
+async fn look_at_the_seat(_wait: Duration) -> Look {
+    tokio::task::spawn_blocking(person_at_the_seat)
+        .await
+        .unwrap_or(Look::Nobody)
+}
+
+/// #3796 — what a check answers for `uid` from a look at the seat. #3845 —
+/// a look that could not tell, however that came about (no answer in time,
+/// `loginctl` failed, the lookup panicked), is not known: a retry asks
+/// again, never "the seat changed".
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seat_for(uid: u32, look: Look) -> tunnel_core::localapi::AtTheSeat {
+    use tunnel_core::localapi::AtTheSeat;
+    match look {
+        Look::Person(at_seat) if at_seat == uid => AtTheSeat::Yes,
+        Look::Person(_) | Look::Nobody => AtTheSeat::No,
+        Look::NotKnown(why) => {
             tracing::warn!(
                 uid,
-                wait = ?crate::files::SEAT_LOOKUP_WAIT,
-                "person socket: who is at the seat gave no answer in time — a change is refused, try again"
+                "person socket: who is at the seat is not known ({}): a change or a consent \
+                 answer is refused, try again",
+                why.escape_debug()
             );
             AtTheSeat::NotKnownYet
         }
@@ -491,7 +521,7 @@ fn seat_for(
 /// #3796 — who is at the seat, as the person socket's check asks it, stood in
 /// on one thread: the lookup itself runs where the real one runs, in a flight
 /// of the stand-in's own, so a test sees how long a `ConfigSet` waits for it,
-/// and how many lookups began.
+/// and how many lookups began. #3845 — and as its poll asks it.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod stand_in {
     use super::Look;
@@ -602,7 +632,7 @@ pub async fn run(state: Arc<dyn LocalApiState>, shutdown: watch::Receiver<bool>)
 struct Following {
     /// The time between looks ([`POLL`]).
     every: Duration,
-    /// How long a look waits for its answer.
+    /// How long a look waits for its answer ([`LOOK_WAIT`]).
     wait: Duration,
     /// Where the socket for a uid is made (`localapi::person_socket_path`).
     path: Box<dyn Fn(u32) -> std::path::PathBuf + Send + Sync>,
@@ -613,31 +643,21 @@ impl Following {
     fn the_daemons() -> Self {
         Self {
             every: POLL,
-            wait: POLL,
+            wait: LOOK_WAIT,
             path: Box::new(localapi::person_socket_path),
         }
     }
 }
 
-/// The poll's look at the seat, as before #3845: on a blocking thread, for as
-/// long as the lookup takes.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn poll_look(_wait: Duration) -> Look {
-    // Asked here, on the thread a test stood the lookup in on.
-    #[cfg(all(test, target_os = "linux"))]
-    if let Some(stood) = stand_in::lookup_now() {
-        let lookup = stood.lookup;
-        return tokio::task::spawn_blocking(move || lookup())
-            .await
-            .unwrap_or(Look::Nobody);
-    }
-    tokio::task::spawn_blocking(person_at_the_seat)
-        .await
-        .unwrap_or(Look::Nobody)
-}
-
 /// Serves the person at the seat a socket of their own, and moves it as the
 /// seat changes, until `shutdown`.
+///
+/// #3845 — each look is [`look_at_the_seat`], [`LOOK_WAIT`] at most, through
+/// the lookup in flight the checks share. It used to wait on a blocking
+/// thread for as long as `loginctl` took, and read a look that failed as
+/// nobody, which closed the person's socket while logind hung. A look that
+/// cannot tell now keeps what is served ([`step`]). A run of them is said
+/// once as it begins and once as it ends, never on every look.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn follow_the_seat(
     state: Arc<dyn LocalApiState>,
@@ -646,13 +666,34 @@ async fn follow_the_seat(
 ) {
     let mut current: Option<Listener> = None;
     let mut failed: Option<(u32, Instant)> = None;
+    // #3845 — when the run of looks that could not tell began, while one runs.
+    let mut not_known_since: Option<Instant> = None;
     loop {
         // A listener that ended on its own was not served: note it, and let
         // the step below see "nobody served" so it retries after the pause.
         if let Some(l) = current.take_if(|l| l.task.is_finished()) {
             failed = Some((l.uid, Instant::now()));
         }
-        let look = poll_look(following.wait).await;
+        let look = look_at_the_seat(following.wait).await;
+        match (&look, not_known_since) {
+            (Look::NotKnown(why), None) => {
+                tracing::warn!(
+                    serving = ?current.as_ref().map(|l| l.uid),
+                    "person socket: who is at the seat is not known ({}); serving as before",
+                    why.escape_debug()
+                );
+                not_known_since = Some(Instant::now());
+            }
+            (Look::NotKnown(_), Some(_)) => {}
+            (Look::Person(_) | Look::Nobody, Some(since)) => {
+                tracing::info!(
+                    after = ?since.elapsed(),
+                    "person socket: who is at the seat is known again"
+                );
+                not_known_since = None;
+            }
+            (Look::Person(_) | Look::Nobody, None) => {}
+        }
         match step(current.as_ref().map(|l| l.uid), &look) {
             Step::Keep => {}
             Step::Stop => {
