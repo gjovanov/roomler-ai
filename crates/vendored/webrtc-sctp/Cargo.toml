@@ -34,6 +34,25 @@
 #     so it never goes ahead of a write the check let through.
 #   - src/stream/stream_test.rs: the regression test for that order (a
 #     reset taken while a write holds its turn queues behind the write).
+#   - src/queue/pending_queue.rs and src/stream/mod.rs (#3755): a write cut
+#     short (a timeout, a `select!` arm, a task abort) leaves its stream
+#     whole. Upstream spent the stream's sequence number and added to
+#     `buffered_amount` in `packetize`, before the waits for the queue's
+#     lock and room, so a write dropped in those waits left a gap: the
+#     receiver of an ordered stream waited for that number forever (RFC
+#     4960 §6.6), and every later message of the stream waited behind it.
+#     The queue now commits a write (`Stream::commit_write`) once its first
+#     chunk has room, with no await before that chunk's push. A large
+#     message cut after its first chunk queues its rest as it drops
+#     (`BegunMessage`) and owes the room it lacks (`PendingQueue::overdraft`,
+#     which `pop` pays back first). A write that must wait for room wakes
+#     the write loop first: on an association with nothing in flight nothing
+#     else woke it, and a message larger than the room left waited forever.
+#   - src/queue/queue_test.rs, src/stream/stream_test.rs,
+#     src/association/association_test.rs and a test-only seam in
+#     src/association/association_internal.rs: the regression tests (a cut
+#     write, a cut large write, writers cut at random on one thread and on
+#     two, the queue's accounting at rest).
 
 [package]
 edition = "2021"
