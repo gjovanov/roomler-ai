@@ -528,7 +528,7 @@ the portal every minute would start it on every host that does not run it.
 
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
-(`desktop_brief.rs:98`) reads it every 60 s into a cache. The hello and the
+(`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
 heartbeat only read that cache (`signaling.rs:7149`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2620`).
 Until the first read lands, which is milliseconds after start, the hello
@@ -700,7 +700,7 @@ stateDiagram-v2
 **While the desktop is down, the device does not offer it.**
 `virtual_desktop::down` (`:273`) carries the reason. The capture plan drops the
 X11 arm (`arm_facts`, `capture/mod.rs:1542`), and the supervisor wakes the
-brief's refresher (`refresh_soon`, `desktop_brief.rs:40`), so the hello's
+brief's refresher (`refresh_soon`, `desktop_brief.rs:53`), so the hello's
 `desktop` reads `capture_arm: none` at the next heartbeat instead of up to a
 minute later. A session opened meanwhile is refused with `backend_error` and
 the agent's own words (`capture/mod.rs:3419`), for example: *this device's
@@ -2276,7 +2276,7 @@ is still in its file (`scripts/code-map-audit.sh`).
 | File | Owns |
 |---|---|
 | `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default`, `open_default_async` and the cascade (`open_with`); the FR-80 failure classifier (`classify_capture_failure`); FR-93's verdicts: `linux_no_pixels_code`, `xwayland_verdict`, the Xwayland guard (in `open_with`) and its socket-only probe (`x_server_query`), the hints (`wayland_hint`, `wayland_not_enabled_detail`); P2's automatic arm: `wayland_plan`, `open_auto_mutter`, and P2d-3's `open_auto_portal` with `auto_portal_unusable` and P4b's `auto_portal_input`; P3d's Wayland-only idle skip, decided at the DRM open (in `open_with`); P5b's and P3e's wait through a state of the host (`open_through_wait`, the states `HostWait`, `GNOME_LOCK` and `DISPLAY_OFF`, bounded by `HOST_WAIT_MAX` and retried by `HOST_WAIT_RETRY`), a running capture's own wait (`ScreenCapture::waits_for`), what a parked open waits for (`OpenWait`, `WaitFor`) the session behind it (`open_has_session`; nothing else waits) and how it learns that session left (`open_abandoned`); FR-93 P5g: this user's session in the background still plans the automatic arm (`OwnSession`, `own_session_in`), and an open waits for it before either arm (`wait_while_away` over `SESSION_AWAY`, called in `open_with`), its hook firing once per wait (`OnOpenWait`, `tell_open_waiting`); FR-93 P6c: a stop at the screen, typed for the pumps (`StoppedAtScreen`, `stopped_at_screen`) |
-| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start`) and the session a controller would see (`seen_session`); P3d's `seen_is_wayland`; `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` |
+| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start`) and the session a controller would see (`seen_session`); P3d's `seen_is_wayland`; #3787: when the brief's read of logind began (`current_read`), and who is at the screen now, read at once for a missing display's line (`seen_now`, [`remote-control.md`](remote-control.md) §6.1b); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` |
 | `agents/roomlerd/src/keep_busy/logind.rs` | the logind facts the cascade, the brief and keep busy read (`Session`, `parse_show`, `sessions`); FR-93 P5g: a session in the background, never one closing (`in_background`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/capture/x11_cursor.rs` | FR-97 P3a: the X11 pointer for the cursor channel (`X11Cursor::open`, `publish`), its shape (`shape_of`) and its CSS keyword (`css_for`) |

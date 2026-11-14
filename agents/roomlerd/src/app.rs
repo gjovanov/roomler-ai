@@ -7253,6 +7253,9 @@ fn input_smoke_cmd(
     use roomlerd::input::{Button, InputMsg};
 
     let mut inj = roomlerd::input::open_default();
+    // #3787 — a missing display is said from a thread of its own, which the
+    // daemon never waits for. This one-shot command does, so the line prints.
+    roomlerd::input::no_display::wait_for_the_line();
     println!("input-smoke: has_permission={}", inj.has_permission());
     let pause = || std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 
