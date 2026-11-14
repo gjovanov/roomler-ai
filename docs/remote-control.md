@@ -2344,7 +2344,10 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    window, no capture exclusion — X has no equivalent), macOS
    (`viewer-indicator-macos`, AppKit).
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
-   starts it if it is not running (`companion::ensure_running`).
+   starts it if it is not running (`companion::ensure_running`). On Linux that
+   start runs off the async worker, one start in flight, 2.5 s at most, and a
+   start that runs out of time names the step it was waiting on (#3855,
+   `docs/desktop-companion.md` §10.2).
 3. **notification** (Linux, FR-93 P6f) — the desktop's own notification with
    **Approve** and **Deny**, where the companion cannot show the question: none
    is installed, or there is no marker for it to read. Posted from inside the

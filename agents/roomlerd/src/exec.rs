@@ -1200,6 +1200,10 @@ pub(crate) async fn run_console_user_program(
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
 #[cfg(all(target_os = "linux", feature = "recording"))]
 pub(crate) use unix_priv::account_name;
+/// #3855 — the account database stood in, for the tests of the blocking
+/// callers in other modules (Remote Apps, the recorder).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use unix_priv::account_stand_in;
 /// Unix privilege drop.
 ///
 /// Split into a "resolve everything first, then apply" shape for one specific
@@ -1277,7 +1281,7 @@ mod unix_priv {
     }
 
     impl Unresolved {
-        #[cfg(any(target_os = "linux", test))]
+        #[cfg(test)]
         fn into_text(self) -> String {
             match self {
                 Self::Refused(why) | Self::Failed(why) => why,
@@ -1285,12 +1289,38 @@ mod unix_priv {
         }
     }
 
-    /// Look up an account by name: [`lookup`], its refusal in words. For
-    /// the callers that resolve inline (FR-85's and FR-97's), which run on a
-    /// lookup thread or a blocking thread of their own.
-    #[cfg(any(target_os = "linux", test))]
+    /// Look up an account by name, inline: [`lookup`], its refusal in
+    /// words. #3855 — the tests' only: every caller in the daemon asks
+    /// through a lookup in flight ([`account_blocking`], `session_account`).
+    #[cfg(test)]
     fn resolve(account: &str) -> Result<Account, String> {
         lookup(account).map_err(Unresolved::into_text)
+    }
+
+    /// #3855 — the account of a caller on a blocking thread of its own:
+    /// `drop_to_std` (Remote Apps on a person's desktop, the recorder's
+    /// launch, the portal's session helper, the tray's session environment)
+    /// and `account_ids` / `account_home` (the recorder's and received files'
+    /// identity). [`lookup`] through the same lookup in flight for the
+    /// account's name as exec's and SSH's ([`ACCOUNTS`]), waited for
+    /// [`super::ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most, its answer or refusal
+    /// as [`in_time`] gives them. While the account database hangs, the asks
+    /// for an account hold that one lookup's thread, however many there are,
+    /// and each caller's own thread no longer than the wait.
+    #[cfg(target_os = "linux")]
+    fn account_blocking(account: &str) -> Result<Account, String> {
+        let wait = super::ACCOUNT_LOOKUP_WAIT;
+        let name = account.to_string();
+        // A test stands the account database in for its own thread, with
+        // lookups in flight of its own.
+        #[cfg(test)]
+        let asked = match account_stand_in::here() {
+            Some(stood) => stood.ask_blocking(name, wait),
+            None => ACCOUNTS.ask_blocking(name.clone(), wait, move || lookup(&name)),
+        };
+        #[cfg(not(test))]
+        let asked = ACCOUNTS.ask_blocking(name.clone(), wait, move || lookup(&name));
+        in_time(asked, account, wait)
     }
 
     /// Look up an account by name (`getpwnam_r`, then `getgrouplist`): the
@@ -1412,26 +1442,67 @@ mod unix_priv {
     }
 
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
-    /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
+    /// groups, resolved as [`lookup`] resolves them (uid 0 refused). #3855 —
+    /// through [`account_blocking`], 1.5 s at most.
     #[cfg(target_os = "linux")]
     pub(crate) fn account_ids(
         account: &str,
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
-        let a = resolve(account)?;
+        let a = account_blocking(account)?;
         Ok((a.uid, a.gid, a.groups))
     }
 
-    /// FR-97 P3d — an account's home directory, resolved as [`resolve`]
+    /// FR-97 P3d — an account's home directory, resolved as [`lookup`]
     /// resolves it (uid 0 refused, so nothing is ever pointed at root's home).
+    /// #3855 — through [`account_blocking`], 1.5 s at most.
     #[cfg(target_os = "linux")]
     pub(crate) fn account_home(account: &str) -> Result<std::path::PathBuf, String> {
-        Ok(std::path::PathBuf::from(resolve(account)?.home))
+        Ok(std::path::PathBuf::from(account_blocking(account)?.home))
     }
 
-    /// FR-85 P1e-unix — the name of the account with `uid` (`getpwuid_r`,
-    /// the buffer grown as [`resolve`] grows its own).
+    /// #3855 — the recorder's uid lookups in flight, one per uid, each on a
+    /// thread named `account-lookup`, as [`ACCOUNTS`] is per name.
+    #[cfg(all(target_os = "linux", feature = "recording"))]
+    static NAMES: OneInFlightPerKey<libc::uid_t, Result<String, Unresolved>> =
+        OneInFlightPerKey::new("account-lookup");
+
+    /// FR-85 P1e-unix — the name of the account with `uid`, for the
+    /// recorder, which is handed a uid. #3855 — [`name_of`] through the one
+    /// lookup in flight for that uid ([`NAMES`]), waited for
+    /// [`super::ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most from the caller's
+    /// blocking thread; no answer in time, or an error from the account
+    /// database, is refused with the try-again words.
     #[cfg(all(target_os = "linux", feature = "recording"))]
     pub(crate) fn account_name(uid: libc::uid_t) -> Result<String, String> {
+        use super::ACCOUNT_LOOKUP_TRY_AGAIN as TRY_AGAIN;
+        let wait = super::ACCOUNT_LOOKUP_WAIT;
+        #[cfg(test)]
+        let asked = match account_stand_in::here() {
+            Some(stood) => stood.ask_name_blocking(uid, wait),
+            None => NAMES.ask_blocking(uid, wait, move || name_of(uid)),
+        };
+        #[cfg(not(test))]
+        let asked = NAMES.ask_blocking(uid, wait, move || name_of(uid));
+        let why = match asked {
+            Asked::Answer(Ok(name)) => return Ok(name),
+            Asked::Answer(Err(Unresolved::Refused(why))) => return Err(why),
+            Asked::Answer(Err(Unresolved::Failed(why))) => why,
+            Asked::Failed(why) => format!("the account lookup failed: {why}"),
+            Asked::OutOfTime => format!("the account database gave no answer within {wait:?}"),
+        };
+        tracing::warn!(
+            uid, %why,
+            "the account with this uid was not looked up — refused, try again"
+        );
+        Err(format!("cannot resolve uid {uid}: {TRY_AGAIN} ({why})"))
+    }
+
+    /// The name of the account with `uid` (`getpwuid_r`, the buffer grown as
+    /// [`lookup`] grows its own): the lookup itself, blocking for as long as
+    /// the account database takes. No such account is a refusal; an error
+    /// from the account database is a failed lookup.
+    #[cfg(all(target_os = "linux", feature = "recording"))]
+    fn name_of(uid: libc::uid_t) -> Result<String, Unresolved> {
         let mut buf = vec![0 as libc::c_char; 1024];
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -1446,15 +1517,17 @@ mod unix_priv {
                 continue;
             }
             if rc != 0 {
-                return Err(format!(
+                return Err(Unresolved::Failed(format!(
                     "looking up uid {uid} failed: {}",
                     std::io::Error::from_raw_os_error(rc)
-                ));
+                )));
             }
             break;
         }
         if result.is_null() {
-            return Err(format!("no local account has uid {uid}"));
+            return Err(Unresolved::Refused(format!(
+                "no local account has uid {uid}"
+            )));
         }
         // SAFETY: `pw_name` points into `buf`, which is still alive.
         Ok(unsafe { cstr_to_string(pwd.pw_name) })
@@ -1471,7 +1544,9 @@ mod unix_priv {
 
     /// #3853 — the account lookups of exec's and SSH's sessions in flight,
     /// one per account name, each on a thread named `account-lookup`
-    /// (`/proc/<pid>/task/*/comm` shows it).
+    /// (`/proc/<pid>/task/*/comm` shows it). #3855 — and of the callers on
+    /// blocking threads ([`account_blocking`]): an ask for `ana` from an exec
+    /// and one from the recorder's launch share one lookup.
     static ACCOUNTS: OneInFlightPerKey<String, Result<Account, Unresolved>> =
         OneInFlightPerKey::new("account-lookup");
 
@@ -1544,7 +1619,7 @@ mod unix_priv {
         };
         tracing::warn!(
             %account, %why,
-            "exec: the account to run as was not looked up — refused, try again"
+            "the account to run as was not looked up — refused, try again"
         );
         Err(format!("cannot run as {account:?}: {TRY_AGAIN} ({why})"))
     }
@@ -1567,6 +1642,10 @@ mod unix_priv {
         /// Lookups in flight, one per account name, as the daemon's.
         type Lookups = OneInFlightPerKey<String, Result<Account, Unresolved>>;
 
+        /// #3855 — uid lookups in flight, one per uid, as the daemon's.
+        #[cfg(all(target_os = "linux", feature = "recording"))]
+        type Names = OneInFlightPerKey<libc::uid_t, Result<String, Unresolved>>;
+
         /// The account database stood in, with lookups in flight of its own:
         /// one a test holds up never holds up the tests beside it, which ask
         /// the daemon's (`ACCOUNTS`).
@@ -1574,6 +1653,8 @@ mod unix_priv {
         pub(crate) struct StandIn {
             database: Arc<Database>,
             lookups: &'static Lookups,
+            #[cfg(all(target_os = "linux", feature = "recording"))]
+            names: &'static Names,
         }
 
         impl StandIn {
@@ -1583,6 +1664,8 @@ mod unix_priv {
                 Self {
                     database: Arc::new(database),
                     lookups: Box::leak(Box::new(OneInFlightPerKey::new("account-lookup"))),
+                    #[cfg(all(target_os = "linux", feature = "recording"))]
+                    names: Box::leak(Box::new(OneInFlightPerKey::new("account-lookup"))),
                 }
             }
 
@@ -1604,6 +1687,39 @@ mod unix_priv {
                     })
                     .await
             }
+
+            /// #3855 — [`Self::ask`] from a blocking thread
+            /// (`account_blocking`), through the same lookups in flight: an
+            /// ask from a blocking thread and one from a task share a lookup.
+            #[cfg(target_os = "linux")]
+            pub(super) fn ask_blocking(
+                &self,
+                account: String,
+                wait: std::time::Duration,
+            ) -> Asked<Result<Account, Unresolved>> {
+                let database = self.database.clone();
+                let key = account.clone();
+                self.lookups.ask_blocking(key, wait, move || {
+                    database(&account).map_err(Unresolved::Failed)?;
+                    lookup(&account)
+                })
+            }
+
+            /// #3855 — `account_name`'s lookup of `uid`, the account
+            /// database asked about `uid N` first, through this stand-in's
+            /// own uid lookups in flight, `wait` at most.
+            #[cfg(all(target_os = "linux", feature = "recording"))]
+            pub(super) fn ask_name_blocking(
+                &self,
+                uid: libc::uid_t,
+                wait: std::time::Duration,
+            ) -> Asked<Result<String, Unresolved>> {
+                let database = self.database.clone();
+                self.names.ask_blocking(uid, wait, move || {
+                    database(&format!("uid {uid}")).map_err(Unresolved::Failed)?;
+                    super::name_of(uid)
+                })
+            }
         }
 
         tokio::task_local! {
@@ -1618,6 +1734,38 @@ mod unix_priv {
         /// The account database stood in for this task, if there is one.
         pub(super) fn now() -> Option<StandIn> {
             STOOD.try_with(StandIn::clone).ok()
+        }
+
+        #[cfg(target_os = "linux")]
+        std::thread_local! {
+            /// #3855 — the account database stood in for the blocking
+            /// lookups of one thread ([`blocking`]).
+            static HERE: std::cell::RefCell<Option<StandIn>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        /// #3855 — `run` on THIS thread, its blocking account lookups
+        /// (`drop_to_std`, `account_ids`, `account_home`, `account_name`)
+        /// asking `stood`. What stood here before comes back after.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn blocking<R>(stood: &StandIn, run: impl FnOnce() -> R) -> R {
+            /// Puts back what stood here before, however `run` ends.
+            struct Restore(Option<StandIn>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let before = self.0.take();
+                    HERE.with(|here| *here.borrow_mut() = before);
+                }
+            }
+            let _restore = Restore(HERE.with(|here| here.replace(Some(stood.clone()))));
+            run()
+        }
+
+        /// #3855 — the account database stood in for this thread, if there
+        /// is one.
+        #[cfg(target_os = "linux")]
+        pub(super) fn here() -> Option<StandIn> {
+            HERE.with(|here| here.borrow().clone())
         }
     }
 
@@ -1791,6 +1939,10 @@ mod unix_priv {
     /// supplementary groups, which is precisely the retention bug `drop_body`
     /// documents. One privilege story, as with exec / pty / sftp.
     ///
+    /// #3855 — the account is looked up through [`account_blocking`], 1.5 s
+    /// at most, still in the parent and before the fork: no answer in time
+    /// configures nothing and says to try again.
+    ///
     /// Gated to match its consumer — see the re-export above for why.
     #[cfg(target_os = "linux")]
     pub(crate) fn drop_to_std(
@@ -1798,7 +1950,7 @@ mod unix_priv {
         account: &str,
     ) -> Result<(), String> {
         use std::os::unix::process::CommandExt as _;
-        let acct = resolve(account)?;
+        let acct = account_blocking(account)?;
         cmd.env("HOME", &acct.home)
             .env("USER", &acct.name)
             .env("LOGNAME", &acct.name);
@@ -5660,6 +5812,234 @@ mod console_lookup_tests {
                             "{what}: {who:?}, {way:?} ran something"
                         );
                     }
+                }
+            }
+        }
+
+        /// #3855 — the callers that look an account up on a blocking thread
+        /// of their own: the drop of a synchronous child (`drop_to_std`:
+        /// Remote Apps on a person's desktop, the recorder's launch, the
+        /// portal's session helper, the tray's session environment), and an
+        /// account's ids, home and name (`account_ids`, `account_home`,
+        /// `account_name`: the recorder's and received files' identity).
+        /// Each asks the account database stood in for its own thread
+        /// (`account_stand_in::blocking`); everything above it is the
+        /// daemon's.
+        mod blocking {
+            use super::*;
+
+            /// A blocking caller, given the person's account name and uid:
+            /// what it resolved, or why it was refused.
+            type Caller = fn(&str, u32) -> Result<String, String>;
+
+            /// Every blocking caller this build has, by name.
+            fn callers() -> Vec<(&'static str, Caller)> {
+                let drop_std: Caller = |name, _| {
+                    let mut child = std::process::Command::new("id");
+                    drop_to_std(&mut child, name).map(|()| "a drop".to_string())
+                };
+                let ids: Caller =
+                    |name, _| account_ids(name).map(|(uid, gid, _)| format!("{uid}:{gid}"));
+                let home: Caller =
+                    |name, _| account_home(name).map(|home| home.display().to_string());
+                let callers = vec![
+                    ("drop_to_std", drop_std),
+                    ("account_ids", ids),
+                    ("account_home", home),
+                ];
+                #[cfg(feature = "recording")]
+                let callers = {
+                    let name_of: Caller = |_, uid| account_name(uid);
+                    let mut callers = callers;
+                    callers.push(("account_name", name_of));
+                    callers
+                };
+                callers
+            }
+
+            /// `probe` on a thread of its own whose blocking account lookups
+            /// ask `database`: its answer and how long it took, waited for
+            /// `bound` at most from THIS thread.
+            fn on_a_thread<T: Send + 'static>(
+                database: &database::StandIn,
+                bound: Duration,
+                probe: impl FnOnce() -> T + Send + 'static,
+            ) -> Result<(T, Duration), String> {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stood = database.clone();
+                let asked = Instant::now();
+                std::thread::spawn(move || {
+                    let answer = database::blocking(&stood, probe);
+                    let _ = tx.send((answer, asked.elapsed()));
+                });
+                rx.recv_timeout(bound)
+                    .map_err(|_| format!("no answer within {bound:?}"))
+            }
+
+            /// #3855 — with the account database stalled, every blocking
+            /// caller is refused within the account lookup's own wait
+            /// (`ACCOUNT_LOOKUP_WAIT`), with the try-again words: it holds
+            /// its thread no longer than that.
+            ///
+            /// Red before #3855: each looked the account up on its own
+            /// thread, for as long as the account database did not answer.
+            #[test]
+            fn a_stalled_account_lookup_refuses_every_blocking_caller_within_its_wait() {
+                let person = the_person();
+                let stalled = Stalled::default();
+                let _let_go = LetGoAtTheEnd(stalled.clone());
+                let database = stalled.database();
+                for (what, caller) in callers() {
+                    let (name, uid) = (person.name.clone(), person.uid);
+                    let (took, waited) =
+                        on_a_thread(&database, ACCOUNT_LOOKUP_WAIT + SLACK, move || {
+                            caller(&name, uid)
+                        })
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    let refused = match took {
+                        Err(refused) => refused,
+                        Ok(resolved) => panic!("{what} resolved while stalled: {resolved}"),
+                    };
+                    assert!(
+                        waited >= ACCOUNT_LOOKUP_WAIT,
+                        "{what} was refused in {waited:?}, before its wait"
+                    );
+                    assert!(
+                        refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                        "{what}: the refusal says to try again: {refused:?}"
+                    );
+                }
+            }
+
+            /// #3855 — while the account database stalls, the asks for one
+            /// account share one lookup, from blocking threads and from an
+            /// exec session alike: every blocking caller three times over,
+            /// all at once, and a `named` exec as the person. Another account
+            /// gets a lookup of its own. Every ask is refused with the
+            /// try-again words.
+            ///
+            /// Red before #3855: every blocking ask held a thread of its own
+            /// for as long as the account database stalled.
+            #[test]
+            fn blocking_asks_for_one_account_share_one_lookup() {
+                let rt = runtime();
+                let person = the_person();
+                let seat = at_the_screen(&person);
+                let stalled = Stalled::default();
+                let _let_go = LetGoAtTheEnd(stalled.clone());
+                let database = stalled.database();
+                let another = "i3855-another-account";
+                let (tx, rx) = std::sync::mpsc::channel::<(&'static str, Result<String, String>)>();
+                let mut asks = 0;
+                for _ in 0..3 {
+                    for (what, caller) in callers() {
+                        let (tx, stood) = (tx.clone(), database.clone());
+                        let (name, uid) = (person.name.clone(), person.uid);
+                        std::thread::spawn(move || {
+                            let took = database::blocking(&stood, || caller(&name, uid));
+                            let _ = tx.send((what, took));
+                        });
+                        asks += 1;
+                    }
+                }
+                {
+                    let (tx, stood) = (tx.clone(), database.clone());
+                    std::thread::spawn(move || {
+                        let took = database::blocking(&stood, || {
+                            account_ids(another).map(|(uid, ..)| uid.to_string())
+                        });
+                        let _ = tx.send(("another account", took));
+                    });
+                    asks += 1;
+                }
+                {
+                    let name = person.name.clone();
+                    let ask = async move {
+                        let took =
+                            as_who(Way::FleetRpcExec, RunAs::Named(name), "true".into()).await;
+                        let _ = tx.send(("a named exec", took));
+                    };
+                    rt.spawn(asking(
+                        seat.clone(),
+                        database::asking(database.clone(), ask),
+                    ));
+                    asks += 1;
+                }
+                for _ in 0..asks {
+                    let (what, took) = rx
+                        .recv_timeout(RUNS_WITHIN)
+                        .expect("every ask is answered while the account database stalls");
+                    let refused = match took {
+                        Err(refused) => refused,
+                        Ok(resolved) => panic!("{what} resolved while stalled: {resolved}"),
+                    };
+                    assert!(
+                        refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                        "{what}: the refusal says to try again: {refused:?}"
+                    );
+                }
+                assert_eq!(
+                    stalled.began_for(&person.name),
+                    1,
+                    "one lookup for the person's account, however many asked"
+                );
+                assert_eq!(
+                    stalled.began_for(another),
+                    1,
+                    "another account's own lookup"
+                );
+                #[cfg(feature = "recording")]
+                assert_eq!(
+                    stalled.began_for(&format!("uid {}", person.uid)),
+                    1,
+                    "one lookup for the person's uid, however many asked"
+                );
+            }
+
+            /// The control: an account database that answers in time
+            /// resolves the account for every blocking caller as before
+            /// #3855, its ids and home the person's, and the drop configures
+            /// the child. As root (CI's sudo step) that child runs as the
+            /// person (`nobody`); only root changes accounts.
+            #[test]
+            fn a_blocking_lookup_that_answers_in_time_resolves_as_before() {
+                let person = the_person();
+                let database = database::StandIn::new(|_| Ok(()));
+                for (what, caller) in callers() {
+                    let (name, uid) = (person.name.clone(), person.uid);
+                    let (took, _) = on_a_thread(&database, RUNS_WITHIN, move || caller(&name, uid))
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    let resolved = took.unwrap_or_else(|refused| panic!("{what}: {refused}"));
+                    let home = match &person.seat {
+                        Seat::Person { home, .. } => home.display().to_string(),
+                        other => panic!("the person's seat: {other:?}"),
+                    };
+                    let want = match what {
+                        "drop_to_std" => "a drop".to_string(),
+                        "account_ids" => format!("{}:", person.uid),
+                        "account_home" => home,
+                        _ => person.name.clone(),
+                    };
+                    assert!(resolved.starts_with(&want), "{what}: {resolved} for {want}");
+                }
+                // SAFETY: reads this process's own credentials.
+                if unsafe { libc::geteuid() } == 0 {
+                    let name = person.name.clone();
+                    let (printed, _) = on_a_thread(&database, RUNS_WITHIN, move || {
+                        let mut child = std::process::Command::new("id");
+                        child.arg("-un");
+                        drop_to_std(&mut child, &name)?;
+                        child
+                            .output()
+                            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                            .map_err(|e| e.to_string())
+                    })
+                    .expect("the drop answers");
+                    assert_eq!(
+                        printed,
+                        Ok(person.name.clone()),
+                        "the child ran as the person"
+                    );
                 }
             }
         }

@@ -1004,6 +1004,10 @@ jobs:
         # most. With the account database held up, every way is refused with
         # the try-again text and runs nothing; with one that answers, both
         # modes drop to `nobody` as before.
+        # #3855 (`…::account_database::blocking`, in the same filter): the
+        # blocking callers (`drop_to_std`, `account_ids`, `account_home`,
+        # `account_name`) ask the same lookups within 1.5 s; as root the
+        # control's child runs as `nobody`.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/i3822.json
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/i3822.json | head -1)
