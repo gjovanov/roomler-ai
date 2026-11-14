@@ -5116,6 +5116,87 @@ mod supervise_tests {
         assert!(!still_running(&wm), "the window manager outlived it all");
     }
 
+    /// Review R2-2 — the notice the two tests above keep quiet is still said
+    /// when it is true. A window manager that exits while its X server runs
+    /// is collected by the keeper and reported with its pid once the exit is
+    /// the keeper's `NOTICE_DELAY` (2 s) old, and the desktop runs on without
+    /// it: collected and logged, nothing restarted (#3665, B2).
+    #[test]
+    fn a_window_manager_that_exits_while_its_server_runs_is_reported() {
+        let dir = scratch("wm-exits");
+        let wm_body = format!("echo $$ > \"{}/wm.pid\"\nexec sleep 300", dir.display());
+        let (desk, x_pid, lines) = desktop_keeping_lines(&dir, ":478", &wm_body);
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let wm = recorded(&dir, "wm.pid");
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
+        };
+        let notice = |lines: &KeeperLines| {
+            keeper_warnings(lines, "")
+                .0
+                .into_iter()
+                .find(|l| l.contains("the window manager"))
+        };
+        // Taken before the signal, so that the exit cannot come before it.
+        let signalled = Instant::now();
+        // The window manager this test's desktop started, while `/proc`
+        // still shows it.
+        if RealProcs.same_process_now(&wm) {
+            RealProcs.signal(wm.pid, libc::SIGTERM);
+        }
+        wait_for("the keeper's notice", || notice(&lines).is_some());
+        let after = signalled.elapsed();
+        let line = notice(&lines).expect("the notice");
+        let server_ran = is_running(x_pid);
+        let keeper_ran = is_running(keeper);
+        let up = desk.state().up;
+        let starts = runs(&dir).len();
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            line.contains(&format!("the window manager ({})", wm.pid)),
+            "the notice does not name the window manager's pid: {line}"
+        );
+        assert!(line.contains("runs on without one"), "{line}");
+        assert!(
+            after >= Duration::from_secs(2),
+            "said {after:?} after the signal, before the notice was due: {line}"
+        );
+        assert!(server_ran, "the X server stopped with its window manager");
+        assert!(keeper_ran, "the keeper left with the window manager");
+        assert_eq!(up, Some(Server::Xvfb), "the desktop went down");
+        assert_eq!(starts, 0, "the desktop was started again");
+    }
+
+    /// Review R2-5 — how the daemon logs a keeper's line after its first
+    /// answer. A refusal then (a job it could not take) warns with its
+    /// reason, because the supervisor's warning that follows names only the
+    /// exit code; a `warn: ` line warns; the rest is information.
+    #[test]
+    fn a_keepers_refusal_after_ready_is_logged_as_a_warning() {
+        assert_eq!(
+            keeper_line("refused: the job names another group"),
+            (true, "refused: the job names another group")
+        );
+        assert_eq!(
+            keeper_line("warn: the window manager (7) exited"),
+            (true, "the window manager (7) exited")
+        );
+        assert_eq!(
+            keeper_line("info: startup app xterm (8) exited"),
+            (false, "startup app xterm (8) exited")
+        );
+        assert_eq!(
+            keeper_line("a line of its own"),
+            (false, "a line of its own")
+        );
+    }
+
     /// #3665, condition 11 — two early keeper exits in a row turn the keeper
     /// off; a keeper or a desktop that ran long enough starts the count again.
     #[test]
@@ -5323,14 +5404,17 @@ mod supervise_tests {
         let _stop = StopAtTheEnd(desk.clone());
         let first = desk.bring_up().expect("the X server comes up");
         let x_pid = first.pid;
+        // The app records its child before it starts the X client, and the
+        // child is guarded before anything here can fail: an app that has
+        // exited leaves it to init, out of the stop's reach (review R2-9).
+        let gc = recorded(&dir, "gc.pid");
+        let _gc = KillAtTheEnd(vec![gc]);
         assert_eq!(
             first.keeper.is_some(),
             by_keeper,
             "the desktop's keeper started the clients"
         );
         let client = recorded(&dir, "xclient.pid");
-        let gc = recorded(&dir, "gc.pid");
-        let _gc = KillAtTheEnd(vec![gc]);
         assert_eq!(gc.pgid, gc.pid, "the child leads a group of its own");
 
         // SAFETY: SIGKILL to a child of this test, which nothing has
