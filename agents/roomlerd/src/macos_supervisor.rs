@@ -582,7 +582,9 @@ pub fn gave_up_reason(
 /// path is quoted ([`sh_quote`]), and a folder whose path holds a `"`, `$`,
 /// backtick, `\`, `!` or control character gets no command
 /// ([`path_survives_double_quotes`]), so every command printed also survives
-/// `sh -c "…"`.
+/// `sh -c "…"`; nor does one whose path holds a Unicode format character
+/// that changes how a line displays ([`path_displays_as_it_runs`]), so every
+/// command printed reads as it runs.
 ///
 /// With nothing the revert reads in it, the command moves it aside and the
 /// worker makes a new one, as the person, at its next start. With copies
@@ -762,7 +764,8 @@ pub enum NoCommand {
     /// The folder holds a `config.toml` ([`FolderNotTheirs::holds_config`]).
     HoldsConfig,
     /// The folder's path would not survive `sh -c "…"`
-    /// ([`path_survives_double_quotes`]).
+    /// ([`path_survives_double_quotes`]), or a command printed with it would
+    /// not display as it runs ([`path_displays_as_it_runs`]).
     PathNotPlain,
     /// The account reads have not run.
     NotRead,
@@ -799,7 +802,8 @@ impl NoCommand {
             NoCommand::NotRoots(uid) => format!("uid {uid} owns the folder, not root"),
             NoCommand::HoldsConfig => "the folder holds config.toml".to_string(),
             NoCommand::PathNotPlain => "the folder's path holds a double quote, `$`, a backtick, \
-                                        a backslash, `!` or a control character"
+                                        a backslash, `!`, a control character or a Unicode \
+                                        format character that changes how a line displays"
                 .to_string(),
             NoCommand::NotRead => "the account reads have not run".to_string(),
             NoCommand::NoAccount => "the account lookup (getpwuid_r) found no entry with a UTF-8 \
@@ -848,10 +852,30 @@ pub fn folder_refuses(f: &FolderNotTheirs) -> Option<NoCommand> {
     if f.holds_config {
         return Some(NoCommand::HoldsConfig);
     }
-    if !f.path.to_str().is_some_and(path_survives_double_quotes) {
+    if !f
+        .path
+        .to_str()
+        .is_some_and(|p| path_survives_double_quotes(p) && path_displays_as_it_runs(p))
+    {
         return Some(NoCommand::PathNotPlain);
     }
     None
+}
+
+/// #3802 — whether `path` holds none of the Unicode format characters that
+/// change how a line displays: the zero-width characters and the marks of
+/// direction (U+200B to U+200F), the bidi embeddings, pop and overrides
+/// (U+202A to U+202E), the word joiner, the invisible operators and the bidi
+/// isolates (U+2060 to U+2069), and the byte order mark (U+FEFF). None of
+/// them is a control character, and a command printed with one reads
+/// otherwise than it runs.
+fn path_displays_as_it_runs(path: &str) -> bool {
+    !path.chars().any(|c| {
+        matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+        )
+    })
 }
 
 /// #3802 — whether `path`, quoted by [`sh_quote`], also survives
@@ -3313,8 +3337,9 @@ mod tests {
                     ..p()
                 },
                 NoCommand::PathNotPlain,
-                "the folder's path holds a double quote, `$`, a backtick, a backslash, `!` or a \
-                 control character",
+                "the folder's path holds a double quote, `$`, a backtick, a backslash, `!`, a \
+                 control character or a Unicode format character that changes how a line \
+                 displays",
             ),
             (
                 root(Ok("p q".to_string())),
@@ -3586,6 +3611,51 @@ mod tests {
         let apostrophe = "/Users/o'brien/Library/Application Support/live.roomler.roomler";
         assert!(path_survives_double_quotes(F) && path_survives_double_quotes(apostrophe));
         assert!(line(apostrophe).contains("can run this"));
+    }
+
+    /// #3802 — every command printed reads as it runs: a folder whose path
+    /// holds a Unicode format character that changes how a line displays
+    /// (U+200B to U+200F, U+202A to U+202E, U+2060 to U+2069, U+FEFF) gets
+    /// none, where every read said yes. None of them is a control character,
+    /// so the shell's check alone lets each through. Each end of each range is
+    /// refused; visible characters beside the ranges are not.
+    #[test]
+    fn the_give_up_line_gives_no_command_for_a_path_that_displays_otherwise() {
+        let path =
+            |c: char| format!("/Users/p{c}q/Library/Application Support/live.roomler.roomler");
+        for c in [
+            '\u{200B}', '\u{200D}', '\u{200F}', '\u{202A}', '\u{202C}', '\u{202E}', '\u{2060}',
+            '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            let path = path(c);
+            assert!(path_survives_double_quotes(&path), "{c:?}");
+            assert!(!path_displays_as_it_runs(&path), "{c:?}");
+            let folder = FolderNotTheirs {
+                administrator: Ok("p".to_string()),
+                ..folder_not_theirs(path.as_str().into(), 501, 0, 0o40755, Vec::new(), STAMP)
+                    .expect("root's")
+            };
+            assert_eq!(
+                administrator_command(&folder),
+                Err(NoCommand::PathNotPlain),
+                "{c:?}"
+            );
+            assert_eq!(
+                gave_up_reason(Some(WorkerEnd::Code(1)), true, Some(&folder)),
+                format!(
+                    "{}{ONLY} This line gives no command for it: an administrator of this Mac \
+                     has to move it aside; {DOC}",
+                    cause(&path)
+                ),
+                "{c:?}"
+            );
+        }
+        for c in [
+            '\u{2010}', '\u{2030}', '\u{205E}', '\u{2070}', '\u{FF01}', 'é',
+        ] {
+            assert!(path_displays_as_it_runs(&path(c)), "{c:?}");
+        }
+        assert!(path_displays_as_it_runs(F));
     }
 
     /// #3802 — the read takes a `config.toml` in a folder of root's as it
