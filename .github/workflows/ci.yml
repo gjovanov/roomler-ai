@@ -1300,6 +1300,33 @@ jobs:
           grep -q "x11-real: a nudge woke a root listener" /tmp/x11-tests.log
           grep -q "x11-real: a killed X server came back on" /tmp/x11-tests.log
 
+      # #3813 — the real clipboard on X11. A test that writes it replaces what
+      # the person at the display had copied, so each such test runs only
+      # under ROOMLERD_TEST_REAL_CLIPBOARD=1. Against an Xvfb of its own, in
+      # the step above's build: xclip puts a sentinel on CLIPBOARD, the
+      # module's tests run WITHOUT the opt-in (with ROOMLERD_TEST_X11=1, as a
+      # developer running the X11 tests on their own display would), and the
+      # sentinel must still be there afterwards, with each real-clipboard test
+      # saying it skipped. That is what a developer's own `cargo test` has to
+      # leave alone. xclip owns the selection from a child it forks, so the
+      # first read waits for it.
+      - name: The real clipboard on X11 — untouched without the opt-in (#3813)
+        run: |
+          set -euo pipefail
+          # The step above refreshed the index and installed xvfb.
+          sudo apt-get install -y --no-install-recommends xvfb xauth xclip
+          export SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env -u ROOMLERD_TEST_REAL_CLIPBOARD ROOMLERD_TEST_X11=1 bash -euo pipefail -c '
+            holds() { [ "$(xclip -selection clipboard -o 2>/dev/null)" = "$SENTINEL" ]; }
+            printf %s "$SENTINEL" | xclip -selection clipboard -i >/dev/null 2>&1
+            for _ in $(seq 50); do holds && break; sleep 0.1; done
+            holds || { echo "::error::the display did not take the sentinel"; exit 1; }
+            cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard:: --nocapture --test-threads=1 2>&1 | tee /tmp/clip-plain.log
+            holds || { echo "::error::a test replaced the clipboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
+          '
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_the_gate_counts_a_copy" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
+
       # FR-6 wave 34: the job's LAST step; see rust-lint's.
       - name: Publish the cargo cache (release-asset store)
         if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
@@ -1495,6 +1522,24 @@ jobs:
         run: |
           cargo check -p roomlerd --lib --bins
           cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests::
+
+      # #3813 — the real clipboard on a Mac. A test that writes it replaces
+      # what the person at the Mac had copied, so each such test runs only
+      # under ROOMLERD_TEST_REAL_CLIPBOARD=1. In the step above's build:
+      # pbcopy puts a sentinel on the general pasteboard, the module's tests
+      # run WITHOUT the opt-in, and the sentinel must still be there
+      # afterwards, with each real-clipboard test saying it skipped. That is
+      # what a developer's own `cargo test` has to leave alone.
+      - name: The real clipboard on a Mac — untouched without the opt-in (#3813)
+        run: |
+          set -euo pipefail
+          SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf %s "$SENTINEL" | pbcopy
+          [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::the pasteboard did not take the sentinel"; exit 1; }
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture 2>&1 | tee /tmp/clip-plain.log
+          [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::a test replaced the pasteboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping mac_real_the_gate_counts_a_copy" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
 
       # #3757 — a Mac's root daemon declines the `files` channel of a session
       # no GUI worker serves; every other process serves it as before. In the
