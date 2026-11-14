@@ -1138,6 +1138,8 @@ fn process_is_root() -> bool {
 /// the callers would fall back to is not that daemon's, and may be a stale
 /// copy no daemon reads: writing it reports a success the daemon refused
 /// (#2871's failure, on Linux). One `Status` on the same connection.
+/// #3831 — the encoding card asks it too, of a daemon that refused
+/// `encoder_caps` there (one older than #3831).
 async fn refused_by_root_daemon(client: &mut localapi::Client) -> bool {
     let Ok(status) = client.status().await else {
         return false;
@@ -1237,8 +1239,9 @@ fn daemon_message(message: &str) -> String {
 pub struct EncoderCapsView {
     /// The daemon answered the verb.
     pub available: bool,
-    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb), or
-    /// the failing stage and error.
+    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb),
+    /// `root_only` (#3831: a root daemon's person socket that refuses the
+    /// verb), or the failing stage and error.
     pub reason: Option<String>,
     /// The daemon's answer, verbatim (`state`, `cells`, `denied`, …).
     pub caps: Option<localapi::EncoderCapsSummary>,
@@ -1326,7 +1329,16 @@ pub async fn cmd_encoder_caps() -> EncoderCapsView {
         }
     };
     let reply = client.request(&localapi::Request::EncoderCaps).await;
-    encoder_caps_view(reply, false)
+    // #3831 — only an ANSWER that refuses is asked about, and the way the
+    // config verbs ask it (#2891): one `Status` on the same connection. A
+    // reply that never came is a failure whatever the daemon is.
+    let refused_by_root = match &reply {
+        Ok(localapi::Response::Error { message }) if !older_than_the_verb(message) => {
+            refused_by_root_daemon(&mut client).await
+        }
+        _ => false,
+    };
+    encoder_caps_view(reply, refused_by_root)
 }
 
 /// Pure: what the encoding card shows for the daemon's reply to
@@ -1338,7 +1350,6 @@ fn encoder_caps_view(
     reply: std::io::Result<localapi::Response>,
     refused_by_root: bool,
 ) -> EncoderCapsView {
-    let _ = refused_by_root;
     match reply {
         Ok(localapi::Response::EncoderCaps(caps)) => {
             refresh_ok(ENCODER_CAPS_SURFACE);
@@ -1347,6 +1358,13 @@ fn encoder_caps_view(
         // A daemon older than the verb: not a failure, a version.
         Ok(localapi::Response::Error { message }) if older_than_the_verb(&message) => {
             EncoderCapsView::unavailable("old_daemon".into())
+        }
+        // #3831 — refused by a ROOT daemon this unprivileged app reached
+        // over its person socket: a Linux system install whose daemon
+        // predates #3831, when that socket served no `encoder_caps`. An
+        // answer, not a failure: the card says whose the encoders are.
+        Ok(localapi::Response::Error { .. }) if refused_by_root => {
+            EncoderCapsView::unavailable("root_only".into())
         }
         Ok(other) => encoder_caps_failed(&not_the_summary(other)),
         Err(e) => encoder_caps_failed(&e),

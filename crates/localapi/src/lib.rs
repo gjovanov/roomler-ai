@@ -1745,7 +1745,9 @@ pub enum Request {
     /// processes at the first server hello, and a control-surface poll must
     /// not be what launches vendor driver code. Before that first hello the
     /// answer is `not_probed`; a build without encoders answers
-    /// `unsupported`. Returns [`Response::EncoderCaps`].
+    /// `unsupported`. Returns [`Response::EncoderCaps`]. The person-at-the-device
+    /// socket serves it too (#3831, [`person_may`]); a daemon older than that
+    /// refuses it there.
     EncoderCaps,
 }
 
@@ -3115,8 +3117,9 @@ pub enum Scope {
     /// The person-at-the-device socket of a Linux system install, and of a
     /// Mac's root half ([`serve_person_socket`]): only what that person needs
     /// to see who is viewing their screen, end it, answer a consent prompt,
-    /// record it, see the devices the machine's private network lets it see,
-    /// and set the keys that are that person's own call (#2871).
+    /// record it, see the devices the machine's private network lets it see
+    /// and what the device can encode (#3831), and set the keys that are that
+    /// person's own call (#2871).
     ///
     /// `owner_uid` is the person it was made for (#2871's review): the
     /// listener drops any connection whose kernel-read uid is neither theirs
@@ -3387,7 +3390,8 @@ fn console_key_refusal(key: &str) -> Response {
 /// adds recording that person's own screen, and #2871 (design A) the
 /// configuration: the listing, read-only but for the keys that are the
 /// console person's call, and `ConfigSet` of exactly those
-/// ([`person_socket_admits_key`]).
+/// ([`person_socket_admits_key`]). #3831 adds what this device can encode,
+/// the Overview's card, from the probe's cached summary.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -3436,7 +3440,19 @@ pub fn person_may(req: &Request) -> bool {
         // administrator's command — instead of another daemon's file. Every
         // key the person socket does not serve a `ConfigSet` of is marked
         // `read_only` on the way out (`person_view`).
-        | Request::ConfigGet => true,
+        | Request::ConfigGet
+        // #3831 — what this device can encode: the Overview's "Hardware video
+        // encoding" card, which read Error on every Linux system install
+        // while this socket refused it. It can go here because the answer is
+        // read-only and cached: `handle` asks `LocalApiState::encoder_caps`,
+        // which the daemon answers with `caps::summarize_cached`, a
+        // `OnceLock::get` and lock reads of what the probe already found plus
+        // the denylist from its env and config. That never starts a probe or
+        // runs vendor driver code (`not_probed_never_triggers_a_probe` pins
+        // it), and it changes nothing on the host. The denylist and the
+        // preference it reports are on the configuration listing above
+        // already, and Windows serves the verb to every interactive user.
+        | Request::EncoderCaps => true,
         // #2871 (design A) — and `ConfigSet` of exactly the keys that are the
         // console person's call (`CONSOLE_PERSON_KEYS`): where their incoming
         // files land, whether a controller may record their screen, what a
@@ -3471,8 +3487,7 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::RestartDaemon { .. }
-        | Request::EncoderCaps => false,
+        | Request::RestartDaemon { .. } => false,
     }
 }
 
@@ -3520,10 +3535,10 @@ fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
                   viewing this screen, ends it, answers consent prompts, records this screen, \
-                  lists the devices this machine's private network reaches and its links to \
-                  them, and shows this device's settings, changing only the ones that are the \
-                  person at the device's own call. Everything else goes to the daemon's own \
-                  socket — run `sudo roomler …`"
+                  lists the devices this machine's private network reaches, its links to them \
+                  and what this device can encode, and shows this device's settings, changing \
+                  only the ones that are the person at the device's own call. Everything else \
+                  goes to the daemon's own socket — run `sudo roomler …`"
             .into(),
     }
 }
