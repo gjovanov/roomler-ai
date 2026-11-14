@@ -1117,6 +1117,11 @@ jobs:
             if ($sig.Status -ne 'Valid') { throw "the DLL in the MSI is not signed: $($sig.Status)" }
           }
 
+      - name: "TEMPORARY proof (#3810): a step that fails by itself"
+        if: github.job == 'windows-msi-install-uninstall'
+        shell: pwsh
+        run: throw 'TEMPORARY proof of #3810: this step fails by itself'
+
       - name: "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)"
         # The per-Machine MSI's first INSTALL coverage. A person running
         # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
