@@ -1,0 +1,102 @@
+# #3810 — re-runs the installer smoke's failed jobs ONCE when its Windows job
+# ended without every step reporting an end.
+#
+# The smoke's Windows job runs on a hosted runner, and a job whose runner goes
+# away mid-job is closed by GitHub at its timeout with steps that reported no
+# end; its check then reads `cancelled`. Only a RE-RUN of the same run
+# (attempt 2) replaces that check, and a job cannot re-run its own run while
+# the run is in progress. So this workflow starts when a smoke run completes,
+# reads the run with the decision that the smoke's check job prints
+# (scripts/job-steps-ended.sh), and on `incomplete` asks GitHub to re-run the
+# run's failed jobs. A re-run runs the real test again, so it cannot turn a
+# real failure green.
+#
+# Pull requests from forks: GitHub runs a `workflow_run` workflow only from
+# the file on the default branch, with the default branch's last commit as
+# GITHUB_SHA, and gives it its own token even when the run that triggered it
+# had a read-only one
+# (https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run).
+# This job never checks out or runs a pull request's code: its checkout is the
+# default branch's decision script, and the run's event data reaches the
+# script as environment values only, never as expression text. The re-run
+# itself runs with the privileges of the actor who started the run, not this
+# token's
+# (https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs).
+#
+# It acts only on attempt 1 of a run that did not succeed, and only when:
+#   G1  the run still reads attempt 1: nobody has re-run it meanwhile;
+#   G2  the smoke's check job ran in it to its end: GitHub skips that job when
+#       the run was cancelled, by a person or by a newer push;
+#   G3  no newer smoke run exists for the same branch, event and head
+#       repository: a re-run enters the smoke's concurrency group again, and
+#       there it could cancel the newer run.
+# It writes ONE line to its summary: what it did, and why.
+name: installer-smoke-rerun
+
+on:
+  workflow_run:
+    workflows: [installer-smoke]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  rerun:
+    name: Re-run the installer smoke once when not every step of its Windows job reported an end (#3810)
+    if: ${{ github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # actions: write reads the run and re-runs its failed jobs. contents: read
+    # is for the checkout of the default branch's decision script.
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/job-steps-ended.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Read the run, and re-run its failed jobs once if not every step of the Windows job reported an end
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          RUN_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          RUN_CREATED: ${{ github.event.workflow_run.created_at }}
+          SMOKE_JOB: per-User MSI install + uninstall (windows-latest)
+          # Matched by equality: the smoke's check job, by its exact name.
+          CHECK_JOB: "Did every step of the Windows job report an end? If not, it is re-run once (#3810)"
+        run: |
+          set -uo pipefail
+          R=$GITHUB_REPOSITORY
+          say() { echo "$1"; echo "$1" >>"$GITHUB_STEP_SUMMARY"; }
+          stop() { say "Did not re-run run $RUN_ID: $1"; exit "${2:-0}"; }
+          # G1
+          a=$(gh api "repos/$R/actions/runs/$RUN_ID" --jq .run_attempt) || stop 'the run could not be read.' 1
+          [ "$a" = 1 ] || stop "it reads attempt $a now, so it has been re-run already."
+          # G2
+          jobs=$(gh api "repos/$R/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100") || stop 'its jobs could not be read.' 1
+          c=$(jq -r --arg n "$CHECK_JOB" '[.jobs[] | select(.name == $n)] | last | .conclusion // "not listed"' <<<"$jobs")
+          case "$c" in
+            'not listed') stop "its check job \"$CHECK_JOB\" is not listed in it." ;;
+            skipped | cancelled) stop "its check job \"$CHECK_JOB\" reads \"$c\": the run was cancelled, or its Windows job succeeded." ;;
+          esac
+          # G3
+          newer=$(gh api -X GET "repos/$R/actions/workflows/$RUN_WORKFLOW_ID/runs" -f branch="$RUN_BRANCH" -f event="$RUN_EVENT" -f per_page=20 |
+            jq -r --arg repo "$RUN_HEAD_REPO" --arg c "$RUN_CREATED" --argjson id "$RUN_ID" \
+              '[.workflow_runs[] | select(.id != $id and .head_repository.full_name == $repo and .created_at > $c)] | first | .id // empty') ||
+            stop 'the newer runs of its branch could not be read.' 1
+          [ -z "$newer" ] || stop "a newer run of the same branch exists (run $newer)."
+          # The decision: the same script as the smoke's check job.
+          out=$(bash scripts/job-steps-ended.sh --repo "$R" --run "$RUN_ID" --attempt 1 --job "$SMOKE_JOB")
+          rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" -eq 0 ] || stop "the job \"$SMOKE_JOB\" could not be read as completed (the decision script exited $rc)." 1
+          [ "$(head -n 1 <<<"$out")" = verdict=incomplete ] || stop "every step of the job \"$SMOKE_JOB\" reported an end."
+          gh api -X POST "repos/$R/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null || stop 'GitHub refused the re-run of its failed jobs.' 1
+          say "$(jq -r --arg n "$SMOKE_JOB" --arg id "$RUN_ID" '[.jobs[] | select(.name == $n)] | last
+            | "Re-ran the failed jobs of run \($id) as attempt 2: the job \"\($n)\" ended \"\(.conclusion)\" and \([.steps[] | select(.status != "completed")] | length) of its \(.steps | length) steps reported no end."' <<<"$jobs")"

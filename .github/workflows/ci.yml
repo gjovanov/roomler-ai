@@ -2973,3 +2973,21 @@ jobs:
         run: bash scripts/macos-postinstall-check.sh
       - name: Run the post-install script on both roads under bash 3.2, the version macOS ships
         run: bash scripts/macos-postinstall-check.sh --bash 3.2
+
+  job-steps-ended:
+    # #3810 — the installer smoke's Windows job is re-run once, as attempt 2,
+    # when it ended without every step reporting an end. The decision is
+    # scripts/job-steps-ended.sh; this job runs it on real runs' API data and
+    # on made-up replies (scripts/job-steps-ended-test.sh says what each case
+    # proves). It takes seconds, so it runs on every pull request.
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: The smoke's re-run decision on real and made-up job data (#3810)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the decision on every case
+        run: bash scripts/job-steps-ended-test.sh
