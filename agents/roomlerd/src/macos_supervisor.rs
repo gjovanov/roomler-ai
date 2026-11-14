@@ -1034,8 +1034,8 @@ pub fn kept_for_revert() -> [std::path::PathBuf; 2] {
 /// #3802 — [`FolderNotTheirs`] out of what `lstat` read for `path`, the folder
 /// of the person `uid` (its owner and full mode), the copies of
 /// [`kept_for_revert`] found in it and the `stamp` of this read: `None` when
-/// that person owns it. Its `administrator` is `None`: the supervisor reads
-/// that apart, off its loop's thread.
+/// that person owns it. Its `administrator` is `Err(NoCommand::NotRead)`: the
+/// supervisor reads that apart, off its loop's thread.
 pub fn folder_not_theirs(
     path: std::path::PathBuf,
     uid: u32,
