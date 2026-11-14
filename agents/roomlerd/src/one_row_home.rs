@@ -829,7 +829,7 @@ fn answer(verb: Verb, home: &Path, me: &Creds, stdin: &[u8], fs: &mut impl Fs) -
     };
     match answered {
         Ok(answer) => Outcome::reply(me, answer).saying(&said),
-        Err(fail) => Outcome::failed(fail),
+        Err(fail) => Outcome::failed(fail).saying(&said),
     }
 }
 
@@ -1571,6 +1571,8 @@ mod tests {
     struct FakeFs {
         nodes: BTreeMap<PathBuf, Node>,
         calls: RefCell<Vec<String>>,
+        /// Every `write` fails, as on a full disk.
+        writes_fail: bool,
     }
 
     impl FakeFs {
@@ -1578,6 +1580,7 @@ mod tests {
             FakeFs {
                 nodes: BTreeMap::new(),
                 calls: RefCell::new(Vec::new()),
+                writes_fail: false,
             }
         }
 
@@ -1684,6 +1687,9 @@ mod tests {
         }
         fn write(&mut self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
             self.log(format!("write {} {mode:o}", path.display()));
+            if self.writes_fail {
+                return Err(io::Error::other("no space left"));
+            }
             self.put(path, Kind::File, UID, mode, bytes.to_vec(), true);
             Ok(())
         }
@@ -2554,6 +2560,23 @@ mod tests {
                 assert!(fs.changes().is_empty(), "{:?}", fs.changes());
             }
         }
+    }
+
+    /// A verb that fails still says what it noted before: here the outgoing
+    /// config that could not be kept, then the save that failed.
+    #[test]
+    fn a_failed_verb_keeps_its_notes() {
+        let (mut fs, at) = a_home();
+        fs.nodes.remove(&at.plist);
+        fs.writes_fail = true;
+        let verb = Verb::Convert {
+            config: Expect::of(Some(ENROLLED.as_bytes())),
+            plist: Expect::Absent,
+        };
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Error, "{}", out.stderr);
+        assert!(out.stderr.contains("was not kept as"), "{}", out.stderr);
+        assert!(out.stderr.contains("saving"), "{}", out.stderr);
     }
 
     #[test]
