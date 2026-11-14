@@ -8753,6 +8753,7 @@ dependencies = [
  "directories",
  "hex",
  "libc",
+ "proc-macro2",
  "reqwest 0.12.28",
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",

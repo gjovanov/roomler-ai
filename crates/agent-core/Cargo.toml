@@ -114,6 +114,9 @@ tempfile = { workspace = true }
 # #3702 — `folder_gate` parses the daemon's sources: `appdirs` is the one
 # module that reads a folder variable.
 syn = { version = "2", features = ["full", "visit"] }
+# #3778 — and reads the tokens of a macro's arguments, which `syn` leaves
+# unparsed.
+proc-macro2 = "1"
 
 # #3073's elevated test hardens from the daemon's position: it disables the
 # privileges that let icacls rewrite a DACL it has no access to, which a shell

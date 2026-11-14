@@ -1617,10 +1617,91 @@ service's `Environment` value, is replaced for the service account by the folder
 names: a daemon on the service account takes its folders from the system whatever its service
 entry says. A process on any other account keeps what its entry gives it.
 
-A source test, `folder_gate::only_appdirs_reads_a_folder_variable`
-(`crates/agent-core/src/folder_gate.rs`), holds every other file of `roomler-node-core` and
-`roomlerd` to this: only `appdirs.rs`, and the two readers its list names with the reason each
-is kept, read a folder variable.
+**The gate.** A source test, `folder_gate::only_appdirs_reads_a_folder_variable`
+(`crates/agent-core/src/folder_gate.rs:1376`), holds the daemon's code to this: a read of a
+folder variable outside `appdirs.rs` carries a row that says why it is there. Whatever the
+test's name says, `appdirs.rs` is not the only reader: Windows has a few reads outside it, and
+Linux and macOS have many, of `HOME`, the XDG folder variables and the lookups that read them.
+
+It scans every package of this repository that `roomlerd` links, so a crate is scanned the day
+it is linked. It takes them from the link graph with no network:
+`cargo metadata --no-deps --offline` reads the workspace members' manifests, and `Cargo.lock`
+gives the edges through the packages that are not members (`Graph::read`,
+`crates/agent-core/src/folder_gate.rs:1908`). In each package it reads the files its library
+compiles, and the daemon's binary too, through every `mod` the build keeps
+(`crates/agent-core/src/folder_gate.rs:1248`), once as a Windows, once as a Linux and once as a
+macOS non-test build (`crates/agent-core/src/folder_gate.rs:451`). A `mod` whose file is moved
+by `#[path]`, or by a `cfg_attr` that applies one, fails the gate, which does not follow it
+(`moves_file`, `crates/agent-core/src/folder_gate.rs:1205`, refused at
+`crates/agent-core/src/folder_gate.rs:1227-1231`). The vendored forks are linked and not
+scanned, and each is listed with the reason (`crates/agent-core/src/folder_gate.rs:1872`);
+`the_scan_is_what_roomlerd_links` (`crates/agent-core/src/folder_gate.rs:2036`) fails on a
+linked package of this repository that is neither scanned nor listed.
+
+A function, `const`, `static` or macro outside `appdirs.rs` counts as a read when it reads the
+environment and names a folder variable of the build it is read as
+(`crates/agent-core/src/folder_gate.rs:455`):
+
+- on Windows, `ProgramData`, `ALLUSERSPROFILE`, `ProgramFiles`, `ProgramW6432`,
+  `ProgramFiles(x86)`, `APPDATA`, `LOCALAPPDATA`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`,
+  `TEMP`, `TMP`, `OneDrive`, `OneDriveCommercial` or `OneDriveConsumer`, in any case
+  (`crates/agent-core/src/folder_gate.rs:67`);
+- on Linux and macOS, `HOME`, or a name that starts with `XDG_` and ends in `_HOME`, `_DIR` or
+  `_DIRS` (`XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `XDG_DATA_DIRS`, the `XDG_*_DIR` user
+  folders), as written (`crates/agent-core/src/folder_gate.rs:99`). `XDG_` alone, the prefix a
+  walk of the environment filters by, stands for all of them. `XDG_CURRENT_DESKTOP`,
+  `XDG_SESSION_TYPE` and the other XDG names name no folder, and they are not counted
+  (`crates/agent-core/src/folder_gate.rs:93-95`).
+
+Each of these shapes counts:
+
+- a read through `std::env`'s `var`, `var_os`, `vars` or `vars_os`, a renamed import too
+  (`crates/agent-core/src/folder_gate.rs:112`);
+- a read through a system call such as `GetEnvironmentVariableW`, `ExpandEnvironmentStringsW`
+  or `getenv` (`crates/agent-core/src/folder_gate.rs:116`);
+- a call of a helper of the scanned code that reads by a name its caller gives it
+  (`crates/agent-core/src/folder_gate.rs:664`);
+- the name in a literal, alone or inside a longer string such as `%APPDATA%\roomler` or
+  `$HOME/.config` (`TEMP` and `TMP` inside a longer string only as `%TEMP%` or `$env:TEMP`,
+  `crates/agent-core/src/folder_gate.rs:714`);
+- the name in a macro's arguments (`crates/agent-core/src/folder_gate.rs:772`);
+- the name held by a `const` or `static` (`crates/agent-core/src/folder_gate.rs:666`).
+
+Two lookups count as a read on their own. A call of `std::env::home_dir`, by its path, imported
+or renamed (`crates/agent-core/src/folder_gate.rs:642`), counts on every build: it takes `HOME`
+on Linux and macOS and `USERPROFILE` on Windows (`crates/agent-core/src/folder_gate.rs:106-108`).
+A `directories` lookup (`ProjectDirs`, `BaseDirs`, `UserDirs`), which takes its folders from
+`HOME` and the XDG variables, counts on Linux and macOS
+(`crates/agent-core/src/folder_gate.rs:131`); on Windows `directories` asks the system for the
+folders, so there it is no read (`crates/agent-core/src/folder_gate.rs:1131-1138`).
+`the_gate_sees_what_it_is_for` (`crates/agent-core/src/folder_gate.rs:1512`) holds a case for
+each shape, `std::env::home_dir` on Windows among them
+(`crates/agent-core/src/folder_gate.rs:1825-1833`), and cases for names that are no read, such
+as `XDG_CURRENT_DESKTOP` and `HOME` on Windows (`crates/agent-core/src/folder_gate.rs:1672-1678`).
+
+Every read outside `appdirs.rs` has a row for each build that flags it
+(`crates/agent-core/src/folder_gate.rs:159`), of one of two kinds
+(`crates/agent-core/src/folder_gate.rs:138`). A **right** row says why the read is right where
+it is. A **tracked** row says that the read is not right for an entry point it names, with the
+platform, the account that runs that entry point and the folder the read returns there, and it
+names the issue that removes it. A row also names the reads it covers: the set of folder
+variables and lookups its function reads on that build
+(`crates/agent-core/src/folder_gate.rs:147-156`), the functions of one name in one file counted
+together (`crates/agent-core/src/folder_gate.rs:1290-1295`). The gate compares the two sets
+(`crates/agent-core/src/folder_gate.rs:1306-1321`): a read of a variable or lookup the row does
+not name fails, added beside the row's or in place of one of them, and so does a name of the
+row that the function no longer reads; a second read of a variable the function already reads
+changes nothing. A row whose function reads none of them any more fails as stale, of either
+kind (`crates/agent-core/src/folder_gate.rs:1340`). A function has one row for a build: a second
+row for it, of either kind, fails (`crates/agent-core/src/folder_gate.rs:1323-1330`). Every run
+prints how many tracked rows there are and the issues they name
+(`crates/agent-core/src/folder_gate.rs:1397`), so the number is in the log of every run.
+
+The gate does not see a helper called with method syntax, a helper of a helper (a function that
+passes the name its caller gives it on to a helper), a helper outside the scanned code, or a
+name put together at run time (`crates/agent-core/src/folder_gate.rs:52-56`). It does not count
+`std::env::temp_dir()` either, though that takes the temp folder from the environment
+(`crates/agent-core/src/folder_gate.rs:1679-1680`).
 
 ## Linux
 
