@@ -35,18 +35,21 @@ impl EnigoInjector {
         // I/O (`enigo_settings` names no display, so enigo reads `DISPLAY`),
         // and x11rb is enigo's only backend here: such an open cannot succeed,
         // and enigo logs it at ERROR twice. So it is not tried. The caller says
-        // why, once a session, at the level its kind has. An EMPTY `DISPLAY`
-        // counts as set: x11rb answers it `MalformedValue`, not `DisplayNotSet`,
-        // so that open still runs and its failure stays enigo's ERROR.
+        // why, once a session, at the level of what a look at the seat sees,
+        // or of this brief's kind when the look has no answer in time. An
+        // EMPTY `DISPLAY` counts as set: x11rb answers it `MalformedValue`, not
+        // `DisplayNotSet`, so that open still runs and its failure stays
+        // enigo's ERROR.
         #[cfg(target_os = "linux")]
         {
-            let brief = crate::desktop_brief::current();
+            let brief = crate::desktop_brief::current_read();
             let seat = brief
                 .as_ref()
-                .map(|b| (b.session.as_str(), b.kind.as_str()));
+                .map(|(_, b)| (b.session.as_str(), b.kind.as_str()));
             let display_set = std::env::var_os("DISPLAY").is_some();
             if let Some(kind) = super::no_display::NoDisplay::of(display_set, seat) {
-                return Err(super::no_display::NoDisplayToOpen(kind).into());
+                let read = brief.as_ref().map(|(read, _)| *read);
+                return Err(super::no_display::NoDisplayToOpen { kind, read }.into());
             }
         }
         let (tx, rx) = std_mpsc::channel::<Job>();

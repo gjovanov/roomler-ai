@@ -143,5 +143,10 @@ minute. Don't shorten it: a root daemon with no `DISPLAY` never gets an injector
 ⚠️ That daemon's try opens nothing (#3787): `input/no_display.rs` says why once a session,
 at INFO with nobody signed in at the screen and at ERROR when someone is. The kind is read
 from the error's TYPE (`NoDisplayToOpen`), never from enigo's text.
+⚠️ Who is at the screen is a look at the seat taken for the session's first line, not the
+desktop brief alone, which can be a minute old. The look runs on threads of its own, 1.5 s
+at most, because the input arbiter's thread serves every injector and must never wait on
+logind (#3830). Without an answer in time, the brief's kind stands. Later, only a NEWER read
+of the seat changes the kind.
 ⚠️ `has_permission()` must stay true for any backend that works. This retry drops
 whatever reports false.
