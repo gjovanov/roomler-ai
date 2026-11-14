@@ -42,7 +42,10 @@
 //!    as before, and says why);
 //! 2. reads the [`Job`], one JSON line that the daemon writes only after
 //!    `ready`: a keeper the daemon gave up on never had a job, so it started
-//!    nothing;
+//!    nothing. The daemon kills such a keeper before its input ends, so an
+//!    input that ends first, a parent that changed, or no job within
+//!    [`JOB_WAIT`] means that the daemon is gone, and the keeper goes on as in
+//!    step 5, with nothing of its own to take down;
 //! 3. starts the window manager and the apps with `/dev/null` on stdin, stdout
 //!    and stderr, and waits for every child it has, its own or adopted;
 //! 4. on SIGTERM alone (a service manager's stop signals every process of the
@@ -114,6 +117,17 @@ const GRACE_MAX: Duration = Duration::from_secs(10);
 /// server's death follows within milliseconds, and the exit is then dropped,
 /// because the desktop did not run on without that client.
 const NOTICE_DELAY: Duration = Duration::from_secs(2);
+
+/// How long the keeper waits for its job after `ready` (review R2-3). The
+/// daemon sends it as soon as it reads `ready`, and kills a keeper it gives
+/// up on within its own wait of 5 s. A job that has not come by now has no
+/// daemon left to send it: one that died before the keeper read its parent,
+/// while something else holds the write end of the keeper's input.
+const JOB_WAIT: Duration = Duration::from_secs(15);
+
+/// The grace of the teardown a keeper runs before it has a job: the daemon's
+/// own 1.5 s, which the job would have carried.
+const NO_JOB_GRACE: Duration = Duration::from_millis(1500);
 
 /// The variable a test sets on a keeper it starts from the test binary
 /// ([`tests::keeper_role`]). A keeper removes it from its children.
@@ -318,8 +332,10 @@ fn daemon_gone(daemon: i32) -> bool {
 }
 
 /// Read the job's line from `fd`. `Ok(None)` when the input ends before a
-/// whole line, or the daemon is gone: it left before it said what to start.
-fn read_job(fd: RawFd, daemon: i32) -> Result<Option<Job>, String> {
+/// whole line, the daemon is gone, or no whole line came within `wait`: the
+/// daemon left before it said what to start.
+fn read_job(fd: RawFd, daemon: i32, wait: Duration) -> Result<Option<Job>, String> {
+    let deadline = Instant::now() + wait;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -328,6 +344,9 @@ fn read_job(fd: RawFd, daemon: i32) -> Result<Option<Job>, String> {
         }
         if buf.len() > JOB_MAX {
             return Err(format!("a job longer than {JOB_MAX} bytes"));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
         }
         let mut pfd = libc::pollfd {
             fd,
@@ -651,10 +670,20 @@ pub(super) fn run() -> i32 {
     };
     say("ready");
     // #3665 — the job comes only now: a keeper the daemon gave up on before
-    // `ready` never gets one and starts nothing.
-    let job = match read_job(0, daemon) {
+    // `ready` never gets one and starts nothing. The daemon kills a keeper it
+    // gives up on before its input ends, so no job here (the input ended,
+    // the daemon is gone, or nothing came within `JOB_WAIT`) means that the
+    // daemon left between `ready` and the job. The desktop goes with it, as
+    // it does once the keeper has its job (review R2-3).
+    let job = match read_job(0, daemon, JOB_WAIT) {
         Ok(Some(job)) => job,
-        Ok(None) => return 0,
+        Ok(None) => {
+            say(
+                "info: the daemon left before it sent the desktop's job — taking the whole desktop down",
+            );
+            teardown(me, daemon, Some(group), NO_JOB_GRACE, &mut Book::default());
+            return 0;
+        }
         Err(why) => {
             say(&format!("refused: {why}"));
             return 2;
@@ -847,7 +876,7 @@ pub(super) mod tests {
         // A later line is reserved: the job's reader stops at the first.
         write_all(w, b"{\"later\":true}\n");
         close(w);
-        let read = read_job(r, parent);
+        let read = read_job(r, parent, JOB_WAIT);
         close(r);
         assert_eq!(read, Ok(Some(job)));
 
@@ -858,7 +887,7 @@ pub(super) mod tests {
             b"{\"display\":\":7\",\"group\":9,\"wm\":\"openbox\",\"grace_ms\":1,\"new\":[1]}\n",
         );
         close(w);
-        let read = read_job(r, parent).unwrap().unwrap();
+        let read = read_job(r, parent, JOB_WAIT).unwrap().unwrap();
         close(r);
         assert!(read.apps.is_empty());
 
@@ -866,7 +895,7 @@ pub(super) mod tests {
         let (r, w) = pipe();
         write_all(w, b"not json\n");
         close(w);
-        let read = read_job(r, parent);
+        let read = read_job(r, parent, JOB_WAIT);
         close(r);
         assert!(read.is_err(), "{read:?}");
 
@@ -874,7 +903,7 @@ pub(super) mod tests {
         let (r, w) = pipe();
         write_all(w, b"{\"display\"");
         close(w);
-        let read = read_job(r, parent);
+        let read = read_job(r, parent, JOB_WAIT);
         close(r);
         assert_eq!(read, Ok(None));
 
@@ -884,12 +913,32 @@ pub(super) mod tests {
         let (r, w) = pipe();
         write_all(w, b"{\"display\"");
         let asked = Instant::now();
-        let read = read_job(r, -1);
+        let read = read_job(r, -1, JOB_WAIT);
         let took = asked.elapsed();
         close(w);
         close(r);
         assert_eq!(read, Ok(None));
         assert!(took < Duration::from_secs(3), "it took {took:?}");
+
+        // Review R2-3: the input stays open and the parent never changes, as
+        // when the daemon died before the keeper read its parent: no job,
+        // once the wait is over. On a thread, so that a reader that waits
+        // for ever fails this test instead of hanging it.
+        let (r, w) = pipe();
+        write_all(w, b"{\"display\"");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(read_job(r, parent, Duration::from_millis(1500)));
+        });
+        let read = rx.recv_timeout(Duration::from_secs(6));
+        let took = asked.elapsed();
+        // Ends a reader that still waits: its input ends.
+        close(w);
+        let _ = reader.join();
+        close(r);
+        assert_eq!(read, Ok(Ok(None)), "after {took:?}");
+        assert!(took >= Duration::from_millis(1500), "it took {took:?}");
     }
 
     #[test]

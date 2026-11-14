@@ -1421,12 +1421,19 @@ impl Desktop {
                 if self.keeper_off.load(std::sync::atomic::Ordering::Relaxed) {
                     warn!(
                         display = self.display.as_str(),
-                        "virtual-desktop: no vd-keeper for the rest of this daemon's life, after two in a row that exited by themselves or were not ready in time — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)"
+                        "virtual-desktop: no vd-keeper for the rest of this daemon's life, after two keepers in a row exited by themselves within a minute of their desktop's start, or two were not ready in time with none ready between them — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)"
                     );
                     None
                 } else {
                     match self.start_keeper(cmd) {
                         Ok(keeper) => keeper,
+                        // A stop that came while the keeper started: nothing
+                        // starts now, and the keeper it ended is no news
+                        // (condition 9, review R2-7).
+                        Err(why) if self.state().stopping => {
+                            info!(display = self.display.as_str(), %why, "virtual-desktop: the desktop is stopping, and its vd-keeper with it");
+                            return None;
+                        }
                         Err(why) => {
                             warn!(display = self.display.as_str(), %why, "virtual-desktop: no vd-keeper — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)");
                             None
@@ -1622,16 +1629,29 @@ fn follow_keeper(
                         .unwrap_or_else(|e| e.into_inner())
                         .push(line.clone());
                 }
-                if let Some(said) = line.strip_prefix("warn: ") {
-                    warn!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}");
-                } else {
-                    let said = line.strip_prefix("info: ").unwrap_or(&line);
-                    info!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}");
+                match keeper_line(&line) {
+                    (true, said) => warn!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}"),
+                    (false, said) => info!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}"),
                 }
             }
         })
         .map_err(|e| format!("its output could not be followed: {e}"))?;
     Ok(rx)
+}
+
+/// How the daemon logs a keeper's line after its first answer: whether it
+/// warns, and what it says. A `warn: ` line warns, and so does a refusal
+/// after `ready` (its job): the supervisor's warning that follows names only
+/// the exit code (review R2-5). The rest is information, `info: ` dropped.
+#[cfg(target_os = "linux")]
+fn keeper_line(line: &str) -> (bool, &str) {
+    if let Some(said) = line.strip_prefix("warn: ") {
+        (true, said)
+    } else if line.starts_with("refused: ") {
+        (true, line)
+    } else {
+        (false, line.strip_prefix("info: ").unwrap_or(line))
+    }
 }
 
 /// Bring the virtual desktop up — the X server, the window manager, the
@@ -4599,6 +4619,60 @@ mod supervise_tests {
         assert_eq!(keepers, 2, "a keeper was started after the keeper was off");
     }
 
+    /// Review R2-1 — the daemon's half of R1-2: nothing reaches the keeper's
+    /// input before the daemon has read its `ready`. A keeper that takes
+    /// 300 ms to get ready looks at its input first and finds it empty; its
+    /// job comes after, and it is the desktop's keeper. Were the job written
+    /// before the wait, a keeper the daemon gives up on could still start
+    /// the clients, and the daemon would start them a second time beside it.
+    #[test]
+    fn nothing_reaches_the_keepers_input_before_it_said_ready() {
+        let dir = scratch("keeper-late");
+        let d = dir.display();
+        // `dd` copies a byte that comes within 300 ms, and `timeout` ends it
+        // otherwise: anything before the `x` is input that came too early.
+        let late = script(
+            &dir,
+            "keeper",
+            &format!(
+                "echo $$ > \"{d}/keeper.pid\"\n\
+                 b=$(timeout 0.3 dd bs=1 count=1 2>/dev/null; echo x)\n\
+                 if [ \"$b\" != x ]; then : > \"{d}/early\"; fi\n\
+                 echo ready >&2\n\
+                 read -r job && : > \"{d}/job\"\n\
+                 exec sleep 300"
+            ),
+        );
+        let wm_body = format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300");
+        let (desk, _x_pid) = desktop_with(
+            &dir,
+            ":477",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::script(&late)),
+            Duration::from_secs(20),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients();
+        wait_for("the keeper's job", || dir.join("job").exists());
+        let early = dir.join("early").exists();
+        let direct_wm = dir.join("wm.pid").exists();
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !early,
+            "the keeper's input had something in it before it said it was ready"
+        );
+        assert!(
+            keeper.is_some(),
+            "the late keeper is not the desktop's: {keeper:?}"
+        );
+        assert!(
+            !direct_wm,
+            "the daemon started the window manager beside its keeper"
+        );
+    }
+
     /// #3665, condition 3 — a keeper that refuses before it is ready (as the
     /// keeper does when it cannot adopt orphans) says why, is collected, and
     /// leaves the tree; the start after it is direct.
@@ -4931,11 +5005,14 @@ mod supervise_tests {
     /// keeper end what it started and stay, so the supervisor sees no exit to
     /// report and starts nothing; the daemon's own stop then ends the keeper.
     ///
-    /// Review R1-1: the window manager is signalled first and the keeper
-    /// 50 ms later, the order in which the keeper collects the window
-    /// manager's exit before it knows of the stop. The keeper must not warn
-    /// that the desktop runs on without a window manager, then or ever. (The
-    /// server's own exit in a stop is the supervisor's to report: #3671.)
+    /// Review R1-1: the window manager goes first, and the keeper is
+    /// signalled only once it has collected the window manager's exit, before
+    /// it knows of the stop: that order made certain, not timed (review
+    /// R2-8). The keeper must not warn that the desktop runs on without a
+    /// window manager, then or ever. The server still runs then, so nothing
+    /// else could keep the keeper quiet; it gets its SIGTERM with the
+    /// daemon's own stop, the rest of the unit's. (The server's own exit in a
+    /// stop is the supervisor's to report: #3671.)
     #[test]
     fn a_service_manager_stop_adds_no_keeper_warning() {
         let dir = scratch("unit-stop");
@@ -4949,24 +5026,30 @@ mod supervise_tests {
             std::thread::spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
         };
         // The window manager this test's desktop started, while `/proc`
-        // still shows it; then the keeper, our child, unreaped while the
+        // still shows it; then, once the keeper has collected it (its entry
+        // is gone from `/proc`), the keeper, our child, unreaped while the
         // tree lists it.
         if RealProcs.same_process_now(&wm) {
             RealProcs.signal(wm.pid, libc::SIGTERM);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for("the keeper to collect the window manager", || {
+            read_proc_stat(wm.pid).is_none_or(|p| p.starttime != wm.starttime)
+        });
         RealProcs.signal(keeper, libc::SIGTERM);
-        wait_for("the keeper to end what it started", || !still_running(&wm));
         // Past the keeper's NOTICE_DELAY: a held exit would be said by now.
         std::thread::sleep(Duration::from_millis(2500));
         let keeper_stayed = is_running(keeper);
         let up = desk.state().up;
         let starts = runs(&dir).len();
+        // The server's SIGTERM, our child, unreaped while the tree lists it,
+        // and the daemon's own stop.
+        RealProcs.signal(x_pid, libc::SIGTERM);
         let asked = Instant::now();
         desk.stop();
         let took = asked.elapsed();
         wait_for("the supervisor to leave", || supervisor.is_finished());
         supervisor.join().expect("the supervisor left cleanly");
+        let starts_after = runs(&dir).len();
         let _ = std::fs::remove_dir_all(&dir);
         let (warned, read) = keeper_warnings(&lines, "asked to stop");
 
@@ -4978,7 +5061,11 @@ mod supervise_tests {
             Some(Server::Xvfb),
             "the desktop went down on its keeper's SIGTERM"
         );
-        assert_eq!(starts, 0, "the desktop was started again");
+        assert_eq!(
+            (starts, starts_after),
+            (0, 0),
+            "the desktop was started again"
+        );
         assert!(collected(keeper), "the stop left the keeper {keeper}");
         assert!(collected(x_pid), "the stop left the server {x_pid}");
         assert!(took < Duration::from_secs(5), "the stop took {took:?}");
@@ -5744,8 +5831,11 @@ mod supervise_tests {
     /// Review R1-2 — the keeper says `ready` before it has a job, and starts
     /// nothing until the job comes: a keeper the daemon gives up on there
     /// (it is killed before its input ends) never had anything to start.
-    /// With no job, the end of its input makes it leave at once, the desktop's
-    /// group untouched: the daemon may be about to start the clients in it.
+    ///
+    /// Review R2-3: so an input that ends before the job can only mean that
+    /// the daemon died between the two. The keeper then takes the desktop's
+    /// group down, its leader with it, as it does once it has its job, and
+    /// leaves: a killed daemon leaves nothing of its desktop there either.
     #[test]
     #[allow(clippy::zombie_processes)] // the keeper is reaped by `try_wait`, or killed and waited for
     fn a_keeper_without_a_job_starts_nothing_and_leaves_when_its_input_ends() {
@@ -5820,10 +5910,11 @@ mod supervise_tests {
         let status =
             status.unwrap_or_else(|| panic!("the keeper {keeper_pid} had not left after {took:?}"));
         assert!(status.success(), "the keeper left with {status}");
-        assert!(took < Duration::from_secs(3), "it took {took:?} to leave");
+        // The keeper's teardown bound, NO_JOB_GRACE + 3 s.
+        assert!(took < Duration::from_secs(6), "it took {took:?} to leave");
         assert!(
-            leader_running,
-            "a keeper with no job took the desktop's group leader with it"
+            !leader_running,
+            "a keeper whose daemon left before its job left the desktop's group leader running"
         );
     }
 
