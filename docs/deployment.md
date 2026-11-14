@@ -178,9 +178,10 @@ is kept unless all three are on:
 | **The resume scope**, `GET` / `PUT /api/admin/rc-resume-scope`, entries of kind `all`, `org` or `device` ([api.md](api.md)) | the `rc_resume_scope` collection | empty | a platform admin. Anyone else gets the 404 every `/api/admin/*` route gives | a `PUT` without the entry, or with no entries at all. Every pod tells each device it no longer covers a window of 0 on its live connection, with no roll (`reannounce`, `crates/modules/fleet/src/resume_scope.rs:255`) |
 | **The device's switch**, `rc_sessions_survive_reattach` (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`) | the device's config, read when the daemon starts (`crates/agent-core/src/config_surface.rs:726`) | on, since FR-138 P4-1. Only `0`, `false`, `no` or `off` turns it off: an empty or unknown value is on. On with no window, a device behaves exactly as off (P4-0), so the resume scope decides which devices keep sessions | nobody, to have it on. Whoever administers the device turns it off, on the device. Remote config cannot set it: a push naming it is refused 403 `device_owned_switch`, by name ([remote-config.md](remote-config.md#6-shape)) | for one device: `roomler config set rc_sessions_survive_reattach off`, then `roomler restart`. Not `roomler config clear`: a cleared key is the default, on. `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH=0` in the service's environment wins over the key. For a class of devices, the scope is faster (the row above) |
 
-Production runs the window at 60 s, with a scope that names a few test devices (FR-138's P3).
-From the agent release that carries FR-138 P4-1 every device's switch is on unless someone turned it
-off, so a device starts keeping sessions only when the scope comes to cover it (P4's staging, D4).
+Production runs the window at 60 s, and its scope has read `all` since 2026-11-13, after FR-138's P4
+widened it class by class (D4). The staged entries stay beside `all`, so a `PUT` that drops `all`
+alone returns the scope to its last stage. From the agent release that carries FR-138 P4-1 every
+device's switch is on unless someone turned it off, so every device on such a release is told the window.
 Whatever the setting says, the server announces at most 120 s (`MAX_WINDOW_SECS`,
 `crates/modules/fleet/src/resume_scope.rs:377`), and the device keeps a peer no longer than that
 either (`WINDOW_CAP`, `agents/roomlerd/src/session_table.rs:70`).
