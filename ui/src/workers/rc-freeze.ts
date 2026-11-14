@@ -36,11 +36,11 @@
  * | the first paint; the paint after a capture hold (`hold`); a timestamp that runs backwards | not judged; the clock starts at that paint |
  * | a keepalive re-encode | a frame like any other: the header cannot tell one apart |
  *
- * ⚠️ Keepalives count. On a still screen the data-channel pumps re-send the
- * last frame every 60 ms (`IDLE_KEEPALIVE`, `agents/roomlerd/src/peer.rs`), and
- * a stall between two of them is counted, though no content changed and nobody
- * saw it. No signal the viewer has tells a keepalive apart: payload size fails
- * on `hevc_qsv`, whose keepalives run about 64 KB, the size of a motion delta,
+ * ⚠️ Keepalives count. On a still screen the pumps re-send the last frame every
+ * 60 ms (`IDLE_KEEPALIVE`), and the settle and refine key frames re-encode it
+ * too, so a stall or a slow key frame among them counts though nothing moved.
+ * No signal the viewer has tells a keepalive apart: payload size fails on
+ * `hevc_qsv`, whose keepalives run about 64 KB, the size of a motion delta,
  * and cadence fails on real frames at the viewer-rate cap or a 15 fps capture,
  * 66 to 83 ms apart. A read of FR-135 §3.5's row takes moving windows (§2.1).
  *
