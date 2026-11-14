@@ -19,7 +19,7 @@
  * | `arr_gap_ms` | N10, the viewer's half | the interval between whole frames reaching the worker |
  * | `gate_ms` | N12, the viewer's half | the key-frame gate armed after a paint → the next painted frame |
  * | `chunk_gaps` | N9 | the framing layer's gaps, cumulative |
- * | `freezes` | N11 | paint-to-paint gaps over {@link FREEZE_GAP_MS}, cumulative |
+ * | `freezes` | N11 | paint gaps more than {@link FREEZE_GAP_MS} longer than the host's own longest pause between the two frames (`rc-freeze.ts`), cumulative |
  * | `painted` | N16 | frames drawn to the canvas, cumulative |
  * | `decoder_hw` | N9 | whether the browser says a hardware decoder takes this configuration |
  *
@@ -32,19 +32,13 @@
  * shadow and the live law read what they read before.
  */
 
+import { createFreezeCounter } from './rc-freeze'
+
+/** N11 — the rule's bar, `rc-freeze.ts`. */
+export { FREEZE_GAP_MS } from './rc-freeze'
+
 /** How many buckets a histogram has; the agent's `media_window::BUCKETS`. */
 export const MEDIA_BUCKETS = 12
-
-/** N11 — two painted frames further apart than this are a freeze. Both
- *  data-channel pumps re-send the last frame every 60 ms on a still screen
- *  (`IDLE_KEEPALIVE`) and the viewer-rate cap stops at 12 fps, so a healthy
- *  session paints closer than this, except across a capture hold: the pumps
- *  send nothing while capture waits (a display off, a session away, a lock).
- *  The agent announces a hold (`rc:media-waiting`, about 2 s in) and the
- *  worker restarts its clock then ({@link ViewerMediaRecorder.onHold}). A hold
- *  shorter than its announcement still counts once, and a host held below
- *  5 fps (`ROOMLERD_FFMPEG_FPS`) counts every paint. */
-export const FREEZE_GAP_MS = 200
 
 /** The bucket a sample in ms lands in, as the agent buckets microseconds:
  *  whole milliseconds, then the bit length. Pure for the tests. */
@@ -136,6 +130,10 @@ export interface ViewerMediaRecorder {
    *  ends when it, or a frame after it, is painted: the frames the decoder
    *  still held when the gate closed paint first, and are not the recovery. */
   onGateOpened(tsUs: number): void
+  /** N11 — the header of the frame the host framed at wire timestamp `tsUs`
+   *  reached the worker, before the gate, the backlog shed and the decoder:
+   *  the frames a wait dropped were framed all the same. */
+  onFramed(tsUs: number): void
   /** N9, N11, N12, N16 — the frame with wire timestamp `tsUs` was drawn at
    *  `nowMs`, and its paint took `ms`. */
   onPainted(nowMs: number, ms: number, tsUs: number): void
@@ -144,7 +142,9 @@ export interface ViewerMediaRecorder {
   probeDecoderHw(codec: string, pref: DecodePref): void
   /** N11, N12 — the agent announced a capture hold (`rc:media-waiting`): the
    *  gap across it is the host waiting, not a stall. The freeze clock and a
-   *  gate wait restart at the next paint. */
+   *  gate wait restart at the next paint. The pumps frame nothing while
+   *  capture waits, so N11's rule would read that gap as the host's pause
+   *  without the restart too. */
   onHold(): void
   /** The window for the stats message, and a fresh one; the cumulative counts
    *  carry on. */
@@ -166,7 +166,7 @@ export function createViewerMediaRecorder(
   let lastPaintMs: number | null = null
   let gateSinceMs: number | null = null
   let gateKeyTsUs: number | null = null
-  let freezes = 0
+  const freeze = createFreezeCounter()
   let painted = 0
   let decoderHw: boolean | null = null
   let probe = 0
@@ -193,10 +193,13 @@ export function createViewerMediaRecorder(
     onGateOpened(tsUs) {
       if (gateSinceMs !== null) gateKeyTsUs = tsUs
     },
+    onFramed(tsUs) {
+      freeze.framed(tsUs)
+    },
     onPainted(nowMs, ms, tsUs) {
       paint.add(ms)
       painted += 1
-      if (lastPaintMs !== null && nowMs - lastPaintMs > FREEZE_GAP_MS) freezes += 1
+      freeze.painted(nowMs, tsUs)
       lastPaintMs = nowMs
       if (gateSinceMs !== null && gateKeyTsUs !== null && tsUs >= gateKeyTsUs) {
         gate.add(nowMs - gateSinceMs)
@@ -218,6 +221,7 @@ export function createViewerMediaRecorder(
       lastPaintMs = null
       gateSinceMs = null
       gateKeyTsUs = null
+      freeze.hold()
     },
     take(chunkGaps) {
       return {
@@ -228,7 +232,7 @@ export function createViewerMediaRecorder(
         arrGap: arrGap.take(),
         gate: gate.take(),
         chunkGaps,
-        freezes,
+        freezes: freeze.count,
         painted,
         decoderHw,
       }
@@ -244,7 +248,7 @@ export function createViewerMediaRecorder(
       lastPaintMs = null
       gateSinceMs = null
       gateKeyTsUs = null
-      freezes = 0
+      freeze.reset()
       painted = 0
       decoderHw = null
       probe += 1

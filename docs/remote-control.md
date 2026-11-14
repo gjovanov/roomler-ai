@@ -3297,13 +3297,14 @@ cumulative for the worker's session.
 | `chunk_gaps` | N9 | the framing layer's gaps (FR-17), cumulative |
 | `decoder_hw` | N9 | whether the browser says a hardware decoder takes this configuration: `isConfigSupported` with `prefer-hardware`, asked once per `configure()`, and `false` under `prefer-software` without asking. Absent until it answers, or when it cannot say. It can be wrong wherever `isConfigSupported` is |
 | `arr_gap_ms` | N10, the viewer's half | the interval between whole frames reaching the worker |
-| `freezes` | N11 | painted frames more than 200 ms apart. Both pumps re-send a still screen every 60 ms and the viewer-rate cap stops at 12 fps, so a healthy session has none outside a capture hold: the pumps send nothing while capture waits (a display off, a session away, a lock), and the worker restarts its clock when the agent announces the hold (`rc:media-waiting`, about 2 s in). A hold shorter than its announcement still counts once, and a host held below 5 fps (`ROOMLERD_FFMPEG_FPS`) counts every paint |
+| `freezes` | N11 | a gap between two painted frames more than 200 ms longer than the host's own longest pause in framing between them (#3875). The pauses come from the frames' wire timestamps, and every header the worker saw counts as framed, so a wait at the key-frame gate is a freeze, while the gap where motion stops, a caret's blink or a host framing 4 times a second is not. A capture or encode stall, or a frame the agent shed or never made, reads as the host's pause, and the agent counts those. A keepalive, or a settle or refine key frame that re-encodes the still picture, counts like any frame, so a stall over a still screen counts though nobody saw it, and a hidden tab counts like a visible one. The clock restarts at a capture hold the agent announces (`rc:media-waiting`) and when the wire timestamp runs backwards. Before #3875 it counted every paint gap over 200 ms outside a hold; the `build` on `rc.connect` (#3582) tells the two apart. Rule, cases and reasons: FR-135 §3.5 |
 | `gate_ms` | N12, the viewer's half | from the key-frame gate closing after the first paint (a backlog drop, a chunk gap, or a decoder R1 rebuilt) to the paint of the key frame through it. The frames the decoder still held paint first and do not end the wait, and the first closing stands while one waits. R1's recovery is this case, timed from the failure |
 | `painted` | N16 | frames drawn to the canvas |
 
 | Piece | What it does | Where |
 |---|---|---|
 | the worker's window | hooks at the hops `rc-hop-stats` already timed; no new message and no new cadence | `createViewerMediaRecorder`, `ui/src/workers/rc-media-window.ts:156`; folded at `ui/src/workers/rc-dc-worker.ts:483` |
+| the freeze rule (N11) | a paint gap less the host's longest framing pause between the two frames, over 200 ms; each header is read as it is parsed, before the gate, the backlog shed and the decoder | `createFreezeCounter`, `ui/src/workers/rc-freeze.ts:95`; fed at `ui/src/workers/rc-dc-worker.ts:1004` |
 | the wire | drops a key it cannot read and keeps the rest; every key it sent before is unchanged | `decodeStatWireMessage`, `ui/src/composables/useRemoteControl.ts:2565` |
 | the parse | the viewer is the untrusted side: a histogram must be exactly twelve counts that fit a `u32`, and a count must sit inside the row's bounds, so no viewer can make the agent send a reading the server drops whole | `ViewerReport::parse`, `agents/roomlerd/src/media_window.rs:389` |
 | the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10925` |
@@ -3377,7 +3378,7 @@ flowchart LR
 |---|---|---|
 | the worker | one wire format and one decoder life: the key-frame gate, the backlog drop, R1's recovery, FR-130's colour space, the bench probe, the render modes, R0c's window and the capture hold. One paint and one 1 s `stats` message, with the keys both workers sent | `ui/src/workers/rc-dc-worker.ts` |
 | the codec | named by the page in `init-canvas` for every session; with none named it is VP9 profile 1, the VP9 worker's old default. HEVC Main is `HEVC_MAIN_CODEC_STRING`, the string the HEVC probe asks about too, so the two cannot drift | `startDcPath`, `ui/src/composables/useRemoteControl.ts:8669`; `:3188`; `DEFAULT_CODEC`, `rc-dc-worker.ts:193` |
-| the crop | `classifyCrop` classifies every codec's frames and the first frame says how, but only HEVC acts on the class: an alignment crop paints and reports the visible picture, and a spurious one is re-wrapped to the coded picture (rc.100, rc.102). Any other codec paints its decoder's visible picture at its natural size, as the VP9 worker did (below) | `classifyCrop`, `rc-dc-worker.ts:1295`, applied at `:800` |
+| the crop | `classifyCrop` classifies every codec's frames and the first frame says how, but only HEVC acts on the class: an alignment crop paints and reports the visible picture, and a spurious one is re-wrapped to the coded picture (rc.100, rc.102). Any other codec paints its decoder's visible picture at its natural size, as the VP9 worker did (below) | `classifyCrop`, `rc-dc-worker.ts:1298`, applied at `:800` |
 | the name | `vp9-444` on VP9, AV1 and H.264 sessions, `hevc` on HEVC ones. It is the `path` of `rc:decode-error` and of the bench record, which the agent and the L4 reads keep, so it stays as it was. Only `msg.codec` says which codec ran | `DcPathLabel`, `useRemoteControl.ts:5060` |
 | the ban | a decoder that fails before its first frame bans the transport the path was started for, and its cell, as both workers did | `onDcWorkerMessage`, `useRemoteControl.ts:8794`, `:8884` |
 | a stale message | a message from a worker that is no longer the page's belongs to a stopped path and is dropped, so a stopped path cannot stop a newer one, now that one handle serves every codec | `useRemoteControl.ts:8795` |
@@ -3503,7 +3504,7 @@ release, so it stays as it is.
 
 | Piece | Where |
 |---|---|
-| fed at arrival | `rc-dc-worker.ts:1033`, beside N10's `onArrival` |
+| fed at arrival | `rc-dc-worker.ts:1036`, beside N10's `onArrival` |
 | the old reading, fed at paint | `rc-dc-worker.ts:889` (`queueDrift`, `:371`) |
 | into the 1 s `stats` message as `queueArrMs` | `rc-dc-worker.ts:472` (`arrivalQueueDrift`, `:376`) |
 | onto `rc:decodestat` | `decodeStatWireMessage`, `useRemoteControl.ts:2563` |
@@ -3537,8 +3538,9 @@ minute.
 | L4 (FR-16) | a bench probe's send (`createBenchProber`, `ui/src/composables/rcBench.ts:188`) | the paint that carried it (`rc-dc-worker.ts:862`, `ui/src/workers/rc-webcodecs-worker.ts:199`) | `toPageEpochMs`, `rc-clock-cal.ts:191`: the worker hands its stamp back on the page's clock |
 
 Every other reading is one context's own: `queue_ms` and `queue_arr_ms` are differences of intervals on the worker's
-clock and on the agent's, where a constant offset cancels (§11.14.2), and `dec_ms`, `paint_ms`, `arr_gap_ms`, `gate_ms`,
-the arrival-to-paint time and the freezes are the worker's alone. The `<video>` path's bench sampler stamps on the
+clock and on the agent's, where a constant offset cancels (§11.14.2), and so are the freezes since #3875 (a gap between
+paints on the worker's clock against the host's pause between framings on the agent's), while `dec_ms`, `paint_ms`,
+`arr_gap_ms`, `gate_ms` and the arrival-to-paint time are the worker's alone. The `<video>` path's bench sampler stamps on the
 page's own clock.
 
 So the page measures the skew once per decode worker, as it starts the worker, the way NTP does:
@@ -3563,7 +3565,7 @@ sequenceDiagram
 | the answer | the worker's first branch: stamped as the ping arrives, before anything else runs | `rc-dc-worker.ts:525`; `rc-webcodecs-worker.ts:141` |
 | the stamp of the answer | the page hands a pong to the calibration before any other handler. A pong from a worker that is no longer the page's never reaches a newer worker's calibration, and an answer to a ping the page gave up on is dropped by its number | `useRemoteControl.ts:8799`, `:8340` |
 | the skew | one number per worker, `pageSkewMs`, 0 until it arrives. Every reading through 0 is the arithmetic of before, bit for bit | `rc-dc-worker.ts:385`, set at `:565`; `rc-webcodecs-worker.ts:94`, `:150` |
-| the band (#3596) | the data-channel worker's second number, `pageSkewBandMs`: how far below zero a `fwd` reading can fall on a real hop, from the round trip the page posts beside the skew. 0 until the skew arrives with its round trip, and again when the session closes. The RTP transform has no relayed hop, and reads only the skew | `rc-dc-worker.ts:390`, set at `:569`, applied at `:610`, cleared at `:1217`; `calBandMs`, `rc-clock-cal.ts:165`; posted at `:256` |
+| the band (#3596) | the data-channel worker's second number, `pageSkewBandMs`: how far below zero a `fwd` reading can fall on a real hop, from the round trip the page posts beside the skew. 0 until the skew arrives with its round trip, and again when the session closes. The RTP transform has no relayed hop, and reads only the skew | `rc-dc-worker.ts:390`, set at `:569`, applied at `:610`, cleared at `:1220`; `calBandMs`, `rc-clock-cal.ts:165`; posted at `:256` |
 | the stop | a path that stops stops its calibration: no more pings, and no verdict | `stopDcPath`, `useRemoteControl.ts:9006`; `stopWebCodecsPath`, `:8488` |
 | the console | one line per worker: `[rc] vp9-444 decode worker clock: 7.25 ms behind the page's (the fastest of 10 round trips, 0.12 ms) - the worker reads the page's timestamps through it (#3566)`, or that it measured nothing, with the fastest round trip it saw. The line is the field read of the skew | `useRemoteControl.ts:7289` |
 
@@ -3572,7 +3574,7 @@ the kept one is wrong by at most 0.5 ms, and by about 0.1 ms on an idle page. Ch
 outside a cross-origin isolated page (`CLOCK_GRAIN_MS`, `ui/src/workers/rc-clock-cal.ts:157`), which adds about that
 much. The error stays the same for the worker's life, because the skew is measured once and both `now()`s run on one
 monotonic clock, and a relay hop is about its size, 0.1 to 1 ms. A real hop can therefore read a little below zero,
-and `HopStats.add` (`ui/src/workers/rc-hop-stats.ts:54`) and `LogHist.add` (`ui/src/workers/rc-media-window.ts:63`)
+and `HopStats.add` (`ui/src/workers/rc-hop-stats.ts:54`) and `LogHist.add` (`ui/src/workers/rc-media-window.ts:57`)
 drop every negative sample as a clock fault. So the page posts the kept round trip beside the skew, and the worker
 keeps a band of half that round trip plus two grains (`calBandMs`, `rc-clock-cal.ts:165`): half the round trip and a
 grain for the skew's own error, and a grain for the hop's two stamps. A `fwd` reading below zero but inside the band
