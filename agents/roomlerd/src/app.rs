@@ -6488,8 +6488,8 @@ async fn encoder_smoke_cmd(
     name: Option<&str>,
     dump: Option<&str>,
 ) -> Result<()> {
-    use roomlerd::encode::{open_default, open_for_codec};
-    use std::io::Write as _;
+    use roomlerd::encode::bench::{BuildCaps, SessionOpener};
+    use roomlerd::encode::smoke;
 
     // FR-78 P3 — the raw bitstream, for an offline decode (see the flag's doc).
     let mut dump_file = match dump {
@@ -6521,100 +6521,22 @@ async fn encoder_smoke_cmd(
 
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
-    let w = 640u32;
-    let h = 480u32;
-    let codec = codec_raw.to_ascii_lowercase();
-    tracing::info!(width = w, height = h, ?pref, codec = %codec, "encoder smoke: opening encoder");
-
-    // For H.264 keep the historical `open_default` path (preserves
-    // logging + behaviour that CI smoke output is pinned to). For any
-    // other codec, go through `open_for_codec` which runs the codec-
-    // specific cascade and reports whether a demotion happened.
-    let (mut enc, actual_codec) = if let Some(name) = name {
-        // FR-78 P2 — a named backend, past every cascade: the same open the
-        // capability probe runs, so what the probe advertised opens here.
-        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-            )
-        })?;
-        (e, actual.to_string())
-    } else if codec == "h264" {
-        (open_default(w, h, pref), "h264".to_string())
-    } else {
-        let (e, actual) = open_for_codec(&codec, w, h, pref);
-        (e, actual.to_string())
+    // #3652 — the cell the request asks for, opened the way a session opens
+    // it (the FR-16 L1 bench's opener), and judged in `encode::smoke`.
+    let req = smoke::Request {
+        pref,
+        codec: codec_raw,
+        name,
     };
-    let backend = enc.name();
-    tracing::info!(backend, actual_codec = %actual_codec, "encoder smoke: backend selected");
-    if codec != "h264" && actual_codec != codec {
-        tracing::warn!(
-            requested = %codec,
-            actual = %actual_codec,
-            "encoder smoke: demoted from requested codec"
-        );
-    }
-
-    let mut keyframes = 0usize;
-    let mut total_bytes = 0usize;
-    for i in 0..10 {
-        let mut data = vec![0u8; (w * h * 4) as usize];
-        // Alternate solid colours so the encoder has content to encode.
-        let (b, g, r) = match i % 3 {
-            0 => (255, 0, 0),
-            1 => (0, 255, 0),
-            _ => (0, 0, 255),
-        };
-        for px in data.chunks_exact_mut(4) {
-            px[0] = b;
-            px[1] = g;
-            px[2] = r;
-            px[3] = 255;
-        }
-        let frame = std::sync::Arc::new(roomlerd::capture::Frame {
-            width: w,
-            height: h,
-            stride: w * 4,
-            pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data: data.into(),
-            monotonic_us: (i as u64) * 33_333,
-            monitor: 0,
-            damage: roomlerd::capture::Damage::Unknown,
-            source: None,
-        });
-        if i == 5 {
-            enc.request_keyframe();
-        }
-        let packets = enc.encode(frame).await?;
-        for p in &packets {
-            total_bytes += p.data.len();
-            if p.is_keyframe {
-                keyframes += 1;
-            }
-            if let Some(f) = dump_file.as_mut() {
-                f.write_all(&p.data)
-                    .context("encoder smoke: --dump write failed")?;
-            }
-        }
-    }
-    if let Some(mut f) = dump_file.take() {
-        f.flush().context("encoder smoke: --dump flush failed")?;
-        tracing::info!(
-            path = dump.unwrap_or(""),
-            total_bytes,
-            "encoder smoke: bitstream dumped"
-        );
-    }
-    tracing::info!(backend, keyframes, total_bytes, "encoder smoke: done");
-    if backend == "noop" {
-        bail!("encoder smoke: fell through to NoopEncoder — HW and SW backends both failed");
-    }
-    if keyframes == 0 {
-        bail!("encoder smoke: no keyframes produced (backend={backend})");
-    }
-    println!(
-        "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
-    );
+    let build = BuildCaps::this_build();
+    let plan = smoke::plan(&req, smoke::WIDTH, smoke::HEIGHT, build)?;
+    let mut opener = SessionOpener { pref };
+    let dump = match (dump, dump_file.as_mut()) {
+        (Some(path), Some(file)) => Some(smoke::Dump { path, file }),
+        _ => None,
+    };
+    let mut stdout = std::io::stdout();
+    smoke::run(&plan, &req, build, &mut opener, &mut stdout, dump).await?;
     Ok(())
 }
 

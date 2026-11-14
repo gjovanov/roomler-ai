@@ -36,6 +36,8 @@ pub mod color_desc;
 /// time can say whether it was starved or stuck.
 pub mod host_cpu;
 pub mod hwid;
+/// #3652 — the plain `encoder-smoke`: one cell, judged by the bench's verdict.
+pub mod smoke;
 
 /// FR-130 P1 — TEST-ONLY readers of the colour description a bitstream
 /// carries (H.264/HEVC SPS VUI, AV1 `color_config`, a VP9 keyframe header).
