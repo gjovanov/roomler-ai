@@ -602,6 +602,21 @@ canary WARN within the same second is the runtime's; a STALL with a dominant
 phase and an on-time canary is the pump's own work. A fleet read of both is
 what AC4 asks for.
 
+**A late wake while the other workers sit idle (#3871).** tokio hands the
+runtime's I/O and timer driver only to a worker that parks. The other workers
+sleep on their own condition variables until a task is scheduled for them. So a
+task that a timer or a socket woke runs on the worker that just held the driver,
+and a synchronous wait inside it can stop every timer and every socket of the
+runtime while the other workers sit idle. That lasts until something outside
+the runtime wakes one of them: a `spawn_blocking` task that ends, or a thread
+that notifies a task. That worker then parks on the driver, and the canary's
+late wake lands then, while the waiting worker may still wait. A per-thread
+read shows the shape: no runtime worker in `epoll_wait`, the others in
+`park_condvar`, one in the wait. #3871 was this. The power keeper joined a
+thread that waited on a paused logind, and the 20 s stall ended 2 ms after the
+person socket's lookup, on a blocking thread, gave up
+([`power.md` §1.1](power.md#11-the-keeper-never-waits-for-the-os-3871)).
+
 **The first fleet read, 2026-11-10** (`--canary`, 7 days on 0.4.199 to 0.4.208,
 every device; FR-65 AC4). Most windows read like an idle runtime: the median
 window's p99 is 5 ms or less on every device that logged all week, and 27 of the 47
