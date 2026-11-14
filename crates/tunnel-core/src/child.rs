@@ -770,13 +770,15 @@ mod tests {
     }
 
     /// More than `cap` on stdout is refused, not truncated, and the child is
-    /// stopped for it: one that never ends by itself is stopped long before
-    /// its deadline.
+    /// stopped for it, long before its deadline. This child stops writing
+    /// once it is over the cap and stays alive, so only the call's kill ends
+    /// it inside the bound: one that kept writing would die of the closed
+    /// pipe by itself.
     #[test]
     fn an_oversize_reply_is_refused() {
         let started = Instant::now();
         let e = output_bounded_fed(
-            &mut sh("exec cat /dev/zero"),
+            &mut sh("head -c 2000000 /dev/zero; exec sleep 30"),
             b"",
             Duration::from_secs(10),
             1 << 20,
