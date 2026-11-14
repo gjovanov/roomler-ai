@@ -31,17 +31,19 @@
 //!   its caller gives it. It names one in a literal, alone or inside a longer
 //!   string (`%APPDATA%\…`, `$HOME/…`), in a macro's arguments, or through a
 //!   `const` or `static` that holds it;
-//! - on macOS and Linux, a `directories` lookup ([`LOOKUPS`]) or a call of
-//!   `std::env::home_dir`.
+//! - on macOS and Linux, a `directories` lookup ([`LOOKUPS`]);
+//! - on every build, a call of `std::env::home_dir`, which takes `HOME`, on
+//!   Windows `USERPROFILE`.
 //!
 //! Every read outside `appdirs` has a row in [`KNOWN`] for each build that
 //! flags it, of one of two kinds ([`Row`]): **right**, with the reason it is
 //! right where it is, or **tracked**, when it is not right for an entry point
-//! the row names, with the one issue that removes it. A row states how many
-//! reads it covers: the distinct folder variables and lookups of its function
-//! on its build (functions of one name in one file share a row), so a read
-//! of another variable added to it fails, and so does a read that is gone; a
-//! second read of the same variable changes nothing. The gate prints how many
+//! the row names, with the one issue that removes it. A row names the reads
+//! it covers: the folder variables and lookups of its function on its build
+//! (functions of one name in one file share a row), so a read of another
+//! variable fails, added or in place of one, and so does a read that is
+//! gone; a second read of the same variable changes nothing. A function has
+//! one row for a build. The gate prints how many
 //! tracked rows there are and the issues they name, so the number is in every
 //! run's log. A linked package that is not scanned is listed in
 //! [`NOT_SCANNED`]. A row whose read is gone fails as stale, of either kind,
@@ -102,7 +104,7 @@ fn unix_folder(name: &str) -> bool {
 }
 
 /// `std::env`'s lookup of the home, which takes it from `HOME` on macOS and
-/// Linux.
+/// Linux and from `USERPROFILE` on Windows.
 const HOME_DIR: &str = "home_dir";
 
 /// `std::env`'s readers. `var`, `var_os` and `vars_os` count alone, as an
@@ -143,9 +145,15 @@ enum Row {
 }
 
 /// A read outside [`READER`] on one build: `(file, function, build, reads,
-/// row)`, where `reads` is how many distinct folder variables and lookups the
-/// function reads on that build.
-type KnownRow = (&'static str, &'static str, Build, usize, Row);
+/// row)`, where `reads` names the folder variables and lookups the function
+/// reads on that build, each once.
+type KnownRow = (
+    &'static str,
+    &'static str,
+    Build,
+    &'static [&'static str],
+    Row,
+);
 
 /// Reads outside [`READER`], one row for each build that flags one.
 const KNOWN: &[KnownRow] = &[
@@ -153,7 +161,7 @@ const KNOWN: &[KnownRow] = &[
         "crates/agent-core/src/files_dir.rs",
         "from_env",
         Build::Windows,
-        3,
+        &["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"],
         Row::Right(
             "Windows: the received-files denylist's roots, in the process that \
              checks a path: not a folder a step writes, and on the service account \
@@ -164,19 +172,20 @@ const KNOWN: &[KnownRow] = &[
         "crates/agent-core/src/companion_autostart.rs",
         "program_files_dirs",
         Build::Windows,
-        3,
+        &["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"],
         Row::Right(
             "Windows: the companion reads these as the person; the daemon reads \
              them on the service account after `pin_system_folders`, the first \
              statement of `app::main`, set `ProgramFiles` and `ProgramW6432` to the \
-             machine's own",
+             machine's own; `ProgramFiles(x86)` is not pinned and is what the \
+             Service Control Manager gave the service",
         ),
     ),
     (
         "agents/roomler-cli/src/update.rs",
         "sudo_user_config_path",
         Build::Linux,
-        1,
+        &["BaseDirs::new"],
         Row::Right(
             "Linux: `sudo roomler self-update` runs as root and re-bases the path \
              onto the home the account database gives `SUDO_USER`, so it names \
@@ -187,7 +196,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomler-cli/src/update.rs",
         "sudo_user_config_path",
         Build::Macos,
-        1,
+        &["BaseDirs::new"],
         Row::Right(
             "macOS: `sudo roomler self-update` runs as root and re-bases the path \
              onto the home the account database gives `SUDO_USER`, so it names \
@@ -198,7 +207,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/files.rs",
         "private_staging_root",
         Build::Linux,
-        2,
+        &["BaseDirs::new", "XDG_STATE_HOME"],
         Row::Right(
             "Linux: root (the system service, `sudo`) takes `/var/lib/roomler/staging` \
              or the seat person's home from the account database first; only a \
@@ -210,7 +219,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/files.rs",
         "process_home",
         Build::Linux,
-        1,
+        &["BaseDirs::new"],
         Row::Right(
             "Linux: reached only by a process that is not root, which names its \
              own home; root, `sudo roomlerd run` too, takes its home from the \
@@ -221,7 +230,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/files.rs",
         "own_home_and_downloads",
         Build::Linux,
-        2,
+        &["BaseDirs::new", "UserDirs::new"],
         Row::Right(
             "Linux: read only by a daemon that is not root, the person's own, so \
              it names the person's home and Downloads; root takes its home from \
@@ -230,55 +239,21 @@ const KNOWN: &[KnownRow] = &[
     ),
     (
         "agents/roomlerd/src/recording/folder.rs",
-        "default_choice",
-        Build::Linux,
-        2,
-        Row::Right(
-            "Linux: resolved only by a recorder that runs as the person (the \
-             daemon itself when it is the person, or the root daemon's child, \
-             given the person's `HOME` from the account database), so it names \
-             the person's folders",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/recording/folder.rs",
-        "default_choice",
-        Build::Macos,
-        2,
-        Row::Right(
-            "macOS: resolved only by a recorder that runs as the daemon's own \
-             account, the person (a root daemon launches no recorder), so it \
-             names the person's folders",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/recording/folder.rs",
         "cloud_synced_reason",
         Build::Windows,
-        3,
+        &["OneDrive", "OneDriveCommercial", "OneDriveConsumer"],
         Row::Right(
-            "Windows: the person's OneDrive roots, read only by a process running \
-             as the person: the person's own daemon, its restricted copy, or the \
-             recorder a service-account daemon starts as the console person with \
-             that person's own environment block; compared, not a folder a step \
-             writes",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/display_match.rs",
-        "guard_path",
-        Build::Linux,
-        1,
-        Row::Right(
-            "Linux: the per-user daemon as the person in an X11 session: that \
-             person's runtime dir; root has none and does not switch",
+            "Windows: as the person (its own daemon, its restricted copy, or the \
+             recorder started as the console person), that person's own OneDrive \
+             roots; on the service account (the unattended recorder), the \
+             service's own, none by default; compared, not a folder a step writes",
         ),
     ),
     (
         "agents/roomlerd/src/capture/portal/screencast.rs",
         "for_current_user",
         Build::Linux,
-        2,
+        &["HOME", "XDG_STATE_HOME"],
         Row::Right(
             "Linux: the portal helper as the session's person: that person's state \
              folder",
@@ -288,7 +263,7 @@ const KNOWN: &[KnownRow] = &[
         "crates/localapi/src/lib.rs",
         "per_user_socket_path",
         Build::Linux,
-        1,
+        &["XDG_RUNTIME_DIR"],
         Row::Right(
             "Linux: each caller as its own account: its own runtime dir, kept only \
              when private to it",
@@ -298,14 +273,14 @@ const KNOWN: &[KnownRow] = &[
         "crates/localapi/src/lib.rs",
         "per_user_socket_path",
         Build::Macos,
-        1,
+        &["XDG_RUNTIME_DIR"],
         Row::Right("macOS: each caller as its own account: the value is not used"),
     ),
     (
         "crates/localapi/src/lib.rs",
         "no_per_user_socket_note",
         Build::Linux,
-        1,
+        &["XDG_RUNTIME_DIR"],
         Row::Right(
             "Linux: a caller that is not root: its own runtime dir, named in a \
              message only",
@@ -315,7 +290,7 @@ const KNOWN: &[KnownRow] = &[
         "crates/localapi/src/lib.rs",
         "no_per_user_socket_note",
         Build::Macos,
-        1,
+        &["XDG_RUNTIME_DIR"],
         Row::Right("macOS: a caller that is not root: the read is not reached"),
     ),
     // FR-147: on a Mac, a root step of ours does nothing inside a person's
@@ -324,7 +299,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/files.rs",
         "process_home",
         Build::Macos,
-        1,
+        &["BaseDirs::new"],
         Row::Tracked(
             3834,
             "macOS: `sudo roomlerd run` runs as root and keeps the caller's `HOME`, \
@@ -335,7 +310,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/files.rs",
         "default_download_dir",
         Build::Macos,
-        1,
+        &["UserDirs::new"],
         Row::Tracked(
             3834,
             "macOS: `sudo roomlerd run` runs as root and keeps the caller's `HOME`, \
@@ -346,7 +321,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/instance_lock.rs",
         "unix_lock_path",
         Build::Macos,
-        1,
+        &["BaseDirs::new"],
         Row::Tracked(
             3834,
             "macOS: `sudo roomlerd run` runs as root and keeps the caller's `HOME`, \
@@ -357,7 +332,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/service.rs",
         "plist_path",
         Build::Macos,
-        1,
+        &["BaseDirs::new"],
         Row::Tracked(
             3834,
             "macOS: `sudo roomlerd service install` or `uninstall` runs as root and \
@@ -369,7 +344,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomler-cli/src/config.rs",
         "default_config_path",
         Build::Macos,
-        1,
+        &["ProjectDirs::from"],
         Row::Tracked(
             3834,
             "macOS: `sudo roomler enroll`, `forward` or `socks5` without `--config` \
@@ -377,12 +352,23 @@ const KNOWN: &[KnownRow] = &[
              tunnel config, not root's",
         ),
     ),
+    (
+        "agents/roomlerd/src/recording/folder.rs",
+        "default_choice",
+        Build::Macos,
+        &["BaseDirs::new", "UserDirs::new"],
+        Row::Tracked(
+            3834,
+            "macOS: `roomlerd record` typed with `sudo` keeps the caller's `HOME`, \
+             so this names the caller's Movies folder, not root's",
+        ),
+    ),
     // Linux: a root command run through a `sudo` that keeps `HOME`.
     (
         "agents/roomlerd/src/service.rs",
         "user_unit_path_for",
         Build::Linux,
-        1,
+        &["BaseDirs::new"],
         Row::Tracked(
             3866,
             "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomlerd service \
@@ -394,7 +380,7 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomler-cli/src/config.rs",
         "default_config_path",
         Build::Linux,
-        1,
+        &["ProjectDirs::from"],
         Row::Tracked(
             3866,
             "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomler enroll`, \
@@ -406,11 +392,33 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/instance_lock.rs",
         "unix_lock_path",
         Build::Linux,
-        1,
+        &["BaseDirs::new"],
         Row::Tracked(
             3866,
             "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomlerd run` \
              (root) takes its lock in the caller's folders here",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/recording/folder.rs",
+        "default_choice",
+        Build::Linux,
+        &["BaseDirs::new", "UserDirs::new"],
+        Row::Tracked(
+            3866,
+            "Linux: where `sudo` keeps the caller's `HOME`, `roomlerd record` typed \
+             as root names the caller's Videos folder here",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/display_match.rs",
+        "guard_path",
+        Build::Linux,
+        &["XDG_RUNTIME_DIR"],
+        Row::Tracked(
+            3866,
+            "Linux: a root command typed with `sudo -E` keeps the caller's \
+             `XDG_RUNTIME_DIR`, so this names the caller's runtime folder",
         ),
     ),
     // Linux: a root daemon that needs the seat person's settings.
@@ -418,11 +426,12 @@ const KNOWN: &[KnownRow] = &[
         "agents/roomlerd/src/input/reach.rs",
         "kwin_granted",
         Build::Linux,
-        2,
+        &["HOME", "XDG_CONFIG_HOME"],
         Row::Tracked(
             3870,
             "Linux: a daemon typed by hand as root reads root's own `kwinrc` here, \
-             not the seat person's",
+             or the caller's where `sudo` keeps the caller's `HOME`, not the seat \
+             person's",
         ),
     ),
 ];
@@ -1115,9 +1124,14 @@ fn flagged(files: &[(String, &syn::File)], build: Build) -> Vec<(String, Read)> 
             } else {
                 BTreeSet::new()
             };
-            if build != Build::Windows {
-                names.extend(item.lookups);
-            }
+            // On Windows `directories` asks the system for its known folders,
+            // and `std::env::home_dir` takes `USERPROFILE`.
+            let home = format!("std::env::{HOME_DIR}");
+            names.extend(
+                item.lookups
+                    .into_iter()
+                    .filter(|lookup| build != Build::Windows || *lookup == home),
+            );
             if !names.is_empty() {
                 found.push((
                     (*file).clone(),
@@ -1182,6 +1196,21 @@ impl Sources {
     }
 }
 
+/// Whether an attribute of a `mod` moves its file away from its name:
+/// `#[path]`, or a `cfg_attr` that applies one on some build.
+fn moves_file(meta: &syn::Meta) -> bool {
+    meta.path().is_ident("path")
+        || meta.path().is_ident("cfg_attr")
+            && meta
+                .require_list()
+                .and_then(|list| {
+                    list.parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    )
+                })
+                .is_ok_and(|metas| metas.iter().skip(1).any(moves_file))
+}
+
 /// The file of every `mod name;` among `items` that `build` keeps, with the
 /// folder its own `mod`s live in.
 fn mods(items: &[syn::Item], dir: &Path, build: Build, out: &mut Vec<(PathBuf, PathBuf)>) {
@@ -1192,7 +1221,7 @@ fn mods(items: &[syn::Item], dir: &Path, build: Build, out: &mut Vec<(PathBuf, P
         }
         let name = m.ident.to_string();
         assert!(
-            !m.attrs.iter().any(|a| a.path().is_ident("path")),
+            !m.attrs.iter().any(|a| moves_file(&a.meta)),
             "mod {name} in {}: the gate does not follow #[path]",
             dir.display()
         );
@@ -1247,8 +1276,9 @@ fn files<'s>(
 }
 
 /// What `rows` leave unmatched in `reads` (`(build, file, read)`): a read
-/// with no row of either kind for its build, a row that covers another
-/// number of reads than its function makes, a row, of either kind, whose
+/// with no row of either kind for its build, a read its row does not name
+/// and a name its row holds that the function no longer reads, a second row
+/// for one function and build, a row, of either kind, whose
 /// read is gone (stale), and a row whose text does not start with its
 /// build's platform. One line each. The functions of one name in one file
 /// share a row, so their reads count together.
@@ -1261,26 +1291,39 @@ fn unmatched(reads: &[(Build, String, Read)], rows: &[KnownRow]) -> Vec<String> 
     }
     let mut lines = Vec::new();
     for ((build, file, function), names) in &made {
-        let names: Vec<&str> = names.iter().copied().collect();
-        let count = names.len();
-        match rows
+        let Some((_, _, _, covers, _)) = rows
             .iter()
             .find(|(f, func, b, _, _)| f == file && func == function && b == build)
-        {
-            None => lines.push(format!("{build:?}: {file}: {function} names {names:?}")),
-            Some((_, _, _, covers, _)) if count > *covers => lines.push(format!(
-                "{build:?}: {file}: {function} makes {count} reads where its row covers \
-                 {covers}: a new read; move it into appdirs, or widen the row after a read \
-                 of its callers: {names:?}"
-            )),
-            Some((_, _, _, covers, _)) if count < *covers => lines.push(format!(
-                "{build:?}: {file}: {function} makes {count} reads where its row covers \
-                 {covers}: a read is gone; lower the number, or delete the row: {names:?}"
-            )),
-            Some(_) => {}
+        else {
+            let names: Vec<&str> = names.iter().copied().collect();
+            lines.push(format!("{build:?}: {file}: {function} names {names:?}"));
+            continue;
+        };
+        let covers: BTreeSet<&str> = covers.iter().copied().collect();
+        let new: Vec<&str> = names.difference(&covers).copied().collect();
+        let gone: Vec<&str> = covers.difference(names).copied().collect();
+        if !new.is_empty() {
+            lines.push(format!(
+                "{build:?}: {file}: {function} reads {new:?}, which its row does not name: \
+                 a new read; move it into appdirs, or name it in the row after a read of \
+                 its callers"
+            ));
+        }
+        if !gone.is_empty() {
+            lines.push(format!(
+                "{build:?}: {file}: {function} no longer reads {gone:?}, which its row \
+                 names: take it out of the row"
+            ));
         }
     }
+    let mut seen = BTreeSet::new();
     for (file, function, build, _, row) in rows {
+        if !seen.insert((*build, *file, *function)) {
+            lines.push(format!(
+                "a second row for one function on one build: {build:?}: {file}: \
+                 {function}; keep one"
+            ));
+        }
         let (Row::Right(text) | Row::Tracked(_, text)) = row;
         if !text
             .to_ascii_lowercase()
@@ -1355,8 +1398,9 @@ fn only_appdirs_reads_a_folder_variable() {
         "a folder read outside appdirs; take the folder from `appdirs` (the machine's \
          from the system, the service account's profile from the profile list), or give \
          the read a row in KNOWN for its build: right, with why, or tracked, with the \
-         issue that removes it. A row states how many reads its function makes there, so \
-         a new read beside it fails; a row whose read is gone is stale:\n{}",
+         issue that removes it. A row names the folder variables and lookups its function \
+         reads there, so a read added beside them or in place of one fails, and a name it \
+         no longer reads comes out of the row; a row whose read is gone is stale:\n{}",
         lines.join("\n")
     );
 }
@@ -1374,12 +1418,18 @@ fn rows_hold_their_reads() {
         )
     };
     const ROWS: &[KnownRow] = &[
-        ("a.rs", "right", Build::Linux, 1, Row::Right("Linux: why")),
+        (
+            "a.rs",
+            "right",
+            Build::Linux,
+            &["BaseDirs::new"],
+            Row::Right("Linux: why"),
+        ),
         (
             "a.rs",
             "tracked",
             Build::Macos,
-            1,
+            &["BaseDirs::new"],
             Row::Tracked(1, "macOS: where"),
         ),
     ];
@@ -1405,19 +1455,31 @@ fn rows_hold_their_reads() {
         [r#"Linux: a.rs: tracked names ["BaseDirs::new"]"#]
     );
     // A row's text states its platform: a row copied to another build fails.
-    const COPIED: &[KnownRow] = &[("a.rs", "right", Build::Macos, 1, Row::Right("Linux: why"))];
+    const COPIED: &[KnownRow] = &[(
+        "a.rs",
+        "right",
+        Build::Macos,
+        &["BaseDirs::new"],
+        Row::Right("Linux: why"),
+    )];
     assert_eq!(
         unmatched(&[read(Build::Macos, "right")], COPIED),
         ["a row whose text does not start with its platform: Macos: a.rs: right"]
     );
-    // A row states how many reads it covers: fewer fail, as more do; the
+    // A row names the reads it covers: one gone fails, as a new one does; the
     // functions of one name in one file count together, and a variable read
     // twice is one read.
-    const TWO: &[KnownRow] = &[("a.rs", "right", Build::Linux, 2, Row::Right("Linux: why"))];
+    const TWO: &[KnownRow] = &[(
+        "a.rs",
+        "right",
+        Build::Linux,
+        &["BaseDirs::new", "HOME"],
+        Row::Right("Linux: why"),
+    )];
     assert_eq!(
         unmatched(&[read(Build::Linux, "right")], TWO),
         [
-            r#"Linux: a.rs: right makes 1 reads where its row covers 2: a read is gone; lower the number, or delete the row: ["BaseDirs::new"]"#
+            r#"Linux: a.rs: right no longer reads ["HOME"], which its row names: take it out of the row"#
         ]
     );
     let home = || {
@@ -1430,7 +1492,7 @@ fn rows_hold_their_reads() {
     assert_eq!(
         unmatched(&twice, ROWS),
         [
-            r#"Linux: a.rs: right makes 2 reads where its row covers 1: a new read; move it into appdirs, or widen the row after a read of its callers: ["BaseDirs::new", "HOME"]"#,
+            r#"Linux: a.rs: right reads ["HOME"], which its row does not name: a new read; move it into appdirs, or name it in the row after a read of its callers"#,
             "a stale tracked #1 row: Macos: a.rs: tracked",
         ]
     );
@@ -1682,7 +1744,13 @@ fn the_gate_sees_what_it_is_for() {
     }
     // A row covers the reads it counts: a second folder variable read in its
     // function is a new read.
-    const ONE: &[KnownRow] = &[("t.rs", "f", Build::Windows, 1, Row::Right("Windows: why"))];
+    const ONE: &[KnownRow] = &[(
+        "t.rs",
+        "f",
+        Build::Windows,
+        &["APPDATA"],
+        Row::Right("Windows: why"),
+    )];
     let one = r#"fn f() { std::env::var_os("APPDATA"); }"#;
     let two = r#"fn f() { std::env::var_os("APPDATA"); std::env::var_os("LOCALAPPDATA"); }"#;
     if !unmatched(&on(Build::Windows, one), ONE).is_empty() {
@@ -1691,13 +1759,90 @@ fn the_gate_sees_what_it_is_for() {
     if unmatched(&on(Build::Windows, two), ONE).is_empty() {
         missed.push(format!("a second read is not seen: {two}"));
     }
-    // The review's input: a tracked function whose `directories` lookup is
-    // rewritten as a read of `HOME` still reads, and its row still holds.
+    // A row states the names its function reads: a name read in place of
+    // one of them fails, though the number stays the same.
+    const FROM_ENV: &[KnownRow] = &[(
+        "t.rs",
+        "from_env",
+        Build::Windows,
+        &["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"],
+        Row::Right("Windows: why"),
+    )];
+    const STAGING: &[KnownRow] = &[(
+        "t.rs",
+        "private_staging_root",
+        Build::Linux,
+        &["BaseDirs::new", "XDG_STATE_HOME"],
+        Row::Right("Linux: why"),
+    )];
+    for (build, rows, held, swapped) in [
+        (
+            Build::Windows,
+            FROM_ENV,
+            r#"fn from_env() { for (var, _) in [("ProgramFiles", 1), ("ProgramFiles(x86)", 2), ("ProgramW6432", 3)] { std::env::var(var); } }"#,
+            r#"fn from_env() { for (var, _) in [("ProgramFiles", 1), ("ProgramFiles(x86)", 2), ("APPDATA", 3)] { std::env::var(var); } }"#,
+        ),
+        (
+            Build::Linux,
+            STAGING,
+            r#"fn private_staging_root() { directories::BaseDirs::new(); std::env::var_os("XDG_STATE_HOME"); }"#,
+            r#"fn private_staging_root() { directories::BaseDirs::new(); std::env::var_os("XDG_RUNTIME_DIR"); }"#,
+        ),
+    ] {
+        if !unmatched(&on(build, held), rows).is_empty() {
+            missed.push(format!("its row does not hold: {held}"));
+        }
+        // One line names the new read, one the name it took the place of.
+        let lines = unmatched(&on(build, swapped), rows);
+        if lines.len() != 2 {
+            missed.push(format!("a swapped read is not seen: {swapped}: {lines:?}"));
+        }
+    }
+    // One row for a function on a build: a second one, of either kind, fails.
+    const TWICE: &[KnownRow] = &[
+        (
+            "t.rs",
+            "f",
+            Build::Windows,
+            &["APPDATA"],
+            Row::Right("Windows: why"),
+        ),
+        (
+            "t.rs",
+            "f",
+            Build::Windows,
+            &["APPDATA"],
+            Row::Tracked(1, "Windows: where"),
+        ),
+    ];
+    if unmatched(&on(Build::Windows, one), TWICE).is_empty() {
+        missed.push(format!("a second row for one read is not seen: {one}"));
+    }
+    // `std::env::home_dir` is a read on Windows too: it takes `USERPROFILE`.
+    let home = r#"#[cfg(windows)] fn f() -> Option<std::path::PathBuf> { std::env::home_dir() }"#;
+    if on(Build::Windows, home)
+        .iter()
+        .map(|(_, _, read)| read.function.as_str())
+        .ne(["f"])
+    {
+        missed.push(format!("not seen as a read on Windows: {home}"));
+    }
+    // A `mod` whose file a `cfg_attr` moves is refused, as `#[path]` is.
+    let moved = r#"#[cfg_attr(windows, path = "w.rs")] mod imp;"#;
+    let moved = syn::parse_file(moved).unwrap_or_else(|e| panic!("{moved}: {e}"));
+    if let Some(syn::Item::Mod(m)) = moved.items.first() {
+        if !m.attrs.iter().any(|a| moves_file(&a.meta)) {
+            missed.push("a mod file moved by cfg_attr is not refused".to_owned());
+        }
+    }
+    // The first review's input: a tracked function whose `directories`
+    // lookup is rewritten as a read of `HOME` still reads, so its row is not
+    // stale, and it names the lookup, so the row is edited with the read.
     const LOCK: &[KnownRow] = &[(
         "t.rs",
         "unix_lock_path",
         Build::Macos,
-        1,
+        &["BaseDirs::new"],
         Row::Tracked(3834, "macOS: where"),
     )];
     for source in [
@@ -1705,7 +1850,9 @@ fn the_gate_sees_what_it_is_for() {
         r#"fn unix_lock_path() -> Option<PathBuf> { Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches")) }"#,
     ] {
         let lines = unmatched(&on(Build::Macos, source), LOCK);
-        if !lines.is_empty() {
+        let rewritten = source.contains("HOME");
+        if lines.len() != if rewritten { 2 } else { 0 } || lines.iter().any(|l| l.contains("stale"))
+        {
             missed.push(format!("{lines:?}: {source}"));
         }
     }
