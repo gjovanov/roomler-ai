@@ -1145,20 +1145,28 @@ fn put_back(at: &Places, stdin: &[u8], fs: &mut impl Fs) -> Result<PutBackAnswer
 /// `put-back-legacy`: the copies an older release kept in the roomler
 /// folder, renamed back, the config first. A rename needs write on the two
 /// folders only, whoever owns the file. A kept copy is a file: anything else
-/// at either name is refused as changed (3), before anything is renamed.
+/// it looked at, at either name, is refused as changed (3), and a name it
+/// could not look at is the folder not letting the person through (4,
+/// naming the folder, as `make_dirs` does), both before anything is renamed.
 fn put_back_legacy(at: &Places, fs: &mut impl Fs) -> Result<Legacy, Fail> {
-    let config = fs.lstat(&at.legacy_config).kind;
-    let plist = fs.lstat(&at.legacy_plist).kind;
-    for (kind, path) in [(config, &at.legacy_config), (plist, &at.legacy_plist)] {
-        if !matches!(kind, Kind::File | Kind::Absent) {
-            return Err(Fail::Changed(format!("{} is not a file", path.display())));
+    let config = fs.lstat(&at.legacy_config);
+    let plist = fs.lstat(&at.legacy_plist);
+    for (st, path) in [(config, &at.legacy_config), (plist, &at.legacy_plist)] {
+        match st.kind {
+            Kind::File | Kind::Absent => {}
+            // It could not be looked at: the folder it is in does not let
+            // the person through.
+            Kind::Other if st.uid.is_none() => return Err(not_writable(&*fs, &at.folder)),
+            Kind::Dir | Kind::Link | Kind::Other => {
+                return Err(Fail::Changed(format!("{} is not a file", path.display())));
+            }
         }
     }
     let mut moved = Legacy {
         config: false,
         plist: false,
     };
-    if config == Kind::File {
+    if config.kind == Kind::File {
         if !fs.writable(&at.folder) {
             return Err(not_writable(&*fs, &at.folder));
         }
@@ -1166,7 +1174,7 @@ fn put_back_legacy(at: &Places, fs: &mut impl Fs) -> Result<Legacy, Fail> {
             .map_err(|e| Fail::Error(format!("renaming {}: {e}", at.legacy_config.display())))?;
         moved.config = true;
     }
-    if plist == Kind::File {
+    if plist.kind == Kind::File {
         if !fs.writable(&at.folder) {
             return Err(not_writable(&*fs, &at.folder));
         }
@@ -2535,12 +2543,15 @@ mod tests {
         answer(Verb::Read, &at.home, &creds(), &[], &mut fs).stdout
     }
 
-    /// Only a file at an old copy's name is put back. A folder or a link
-    /// there is refused as changed (3), and nothing is renamed, the other
-    /// copy included.
+    /// Only a file at an old copy's name is put back. Anything else it
+    /// looked at there (a folder, a link, a socket) is refused as changed
+    /// (3); a name it could not look at is the folder not letting the person
+    /// through (4, naming the folder). Either way nothing is renamed, the
+    /// other copy included.
     #[test]
     fn put_back_legacy_refuses_a_folder_or_a_link() {
-        for kind in [Kind::Dir, Kind::Link] {
+        // `None`: a name `lstat` could not look at.
+        for kind in [Some(Kind::Dir), Some(Kind::Link), Some(Kind::Other), None] {
             for config_is_it in [true, false] {
                 let (mut fs, at) = a_home();
                 fs.nodes.remove(&at.config);
@@ -2549,16 +2560,22 @@ mod tests {
                     true => (&at.legacy_config, &at.legacy_plist),
                     false => (&at.legacy_plist, &at.legacy_config),
                 };
-                fs.put(it, kind, UID, 0o755, Vec::new(), true);
+                match kind {
+                    Some(kind) => fs.put(it, kind, UID, 0o755, Vec::new(), true),
+                    None => fs.hidden(it),
+                }
                 fs.file(file, b"old", 0o600);
                 let out = answer(Verb::PutBackLegacy, &at.home, &creds(), &[], &mut fs);
                 let at_it = it.display();
-                assert_eq!(
-                    out.exit,
-                    Exit::Changed,
-                    "{kind:?} at {at_it}: {}",
-                    out.stderr
-                );
+                let want = match kind {
+                    Some(_) => Exit::Changed,
+                    None => Exit::NotWritable,
+                };
+                assert_eq!(out.exit, want, "{kind:?} at {at_it}: {}", out.stderr);
+                if kind.is_none() {
+                    let named = format!("not writable: {} (", at.folder.display());
+                    assert!(out.stderr.contains(&named), "{}", out.stderr);
+                }
                 assert!(fs.changes().is_empty(), "{:?}", fs.changes());
             }
         }
