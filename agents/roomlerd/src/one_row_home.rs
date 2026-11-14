@@ -1959,7 +1959,9 @@ mod tests {
 
     /// The child reads a file through [`Fs::read`] alone (bounded, on the
     /// open descriptor): nothing in it reads by path, and nothing saves or
-    /// loads a config, which would read the live file again by path.
+    /// loads a config, which would read the live file again by path. It is a
+    /// tripwire on four tokens, not a proof: it would not see `File::open`
+    /// with `read_to_end`, nor a read by path in a helper of another module.
     #[test]
     fn the_child_reads_no_file_by_path() {
         let source = include_str!("one_row_home.rs");
