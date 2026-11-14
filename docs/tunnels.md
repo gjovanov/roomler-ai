@@ -352,8 +352,8 @@ Three links had to break, one in each place that owned it:
 | Where | Change | Anchor |
 |---|---|---|
 | `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write. They take turns on a `send_lock` of their own, which `close()` and `buffered_amount()` never take: the slot lock was the only thing ordering a channel's writes, and two at once shared a stream sequence number or split a message | `crates/vendored/webrtc/src/data_channel/mod.rs:378`, `:89` |
-| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:547`, `:287`, `queue/pending_queue.rs:118` |
-| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:264`, `queue/pending_queue.rs:111` |
+| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:551`, `:291`, `queue/pending_queue.rs:145` |
+| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:264`, `queue/pending_queue.rs:138` |
 
 #1856's comment expected a transport that is really gone to fail the association's `recv`.
 Nothing below SCTP ever fails it on a dead path, because the ICE agent's conn ends only when
@@ -448,7 +448,7 @@ Fixed in the vendored `webrtc-sctp`
 code and has not been seen in the field; the tests below are its reproduction.
 
 Every data-channel send ends in `Stream::write_sctp`
-(`crates/vendored/webrtc-sctp/src/stream/mod.rs:287`), which can wait twice before its
+(`crates/vendored/webrtc-sctp/src/stream/mod.rs:291`), which can wait twice before its
 chunks are queued: for the pending queue's lock, and for room in the queue (128 KiB, shared
 by every stream of the association). Upstream spent the write's stream sequence number (SSN)
 and added its bytes to `buffered_amount` in `packetize`, **before** those waits. A caller that
@@ -499,10 +499,10 @@ the fix is there and no caller changed:
 
 | Where | Change | Anchor |
 |---|---|---|
-| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:358`, `:380`, `:519` |
-| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:182`, `:205` |
-| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest takes the free room and owes the shortfall (`overdraft`), which `pop` pays back before it gives room again | `queue/pending_queue.rs:448`, `:456`, `:401` |
-| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:217` |
+| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:362`, `:384`, `:523` |
+| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:212`, `:235` |
+| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:478`, `:486`, `:431` |
+| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:247` |
 
 **What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:276`):
 
@@ -518,13 +518,13 @@ maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
 (`crates/vendored/webrtc/src/sctp_transport/mod.rs:162`), which means the default
 (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:105`,
 `association/mod.rs:61`), and `prepare_write` refuses a larger write before it waits
-(`stream/mod.rs:313`). So every agent and tunnel send is below the large threshold and is all
+(`stream/mod.rs:317`). So every agent and tunnel send is below the large threshold and is all
 or nothing: a cut send was never sent. `send_control_notice`'s retry therefore sends its notice
 once, and a tunnel write (at most 65,535 bytes, `crates/tunnel-core/src/forward.rs:68`) is the
-same. The begun-message path and its overdraft are reached only by the tests. The overdraft is
-at most the rest of one cut message, plus one more for each `pop` that runs on another worker
-thread alongside a cut message's drop, and it only shrinks as the queue drains. At rest the
-accounting is exact: room + queued bytes − overdraft = the queue's size.
+same. The begun-message path and its overdraft are reached only by the tests. The drop records
+the debt before it reads the room, so a `pop` on another worker thread pays it instead of
+freeing room: no room is free while anything is owed, and the overdraft is at most the rest of
+one cut message, on any runtime. At rest: room + queued bytes − overdraft = the queue's size.
 
 **On the success path** nothing was added that a send pays for: no lock, allocation or task.
 The same two atomic updates run later, the first try for room is a `try_acquire_many` (cheaper
@@ -538,11 +538,13 @@ crate's in-memory bridge, with a queue of a few KiB, and close the pair at the e
 |---|---|---|
 | `test_assoc_a_write_cut_by_its_timeout_leaves_no_gap` (`association/association_test.rs:2866`) | video fills the queue while the link holds every packet; a timeout cuts a notice on the ordered control stream; once the link moves, the next notice is read, and `buffered_amount` is what it was before the cut, then 0 | `the next notice never arrived: the peer waits for the cut notice's stream sequence number`; `buffered_amount` 1,500 once everything was acknowledged |
 | `test_assoc_a_large_write_cut_part_way_is_never_read_in_part` (`:3002`) | a 20,000-byte write cut after its first chunks: the peer reads it whole, once, then the next message | the next message never arrived; `buffered_amount` 12,800 at rest |
-| `test_assoc_writes_cut_at_any_wait_keep_the_stream_whole` (`:3494`) | seeded: writers share one ordered stream, each write awaited or cut at a random wait (turn, lock, room, a later chunk's room): only whole messages, each writer's in order, none twice, every `Ok` write read | seed `0x3755`: 37 of the 47 writes that returned `Ok` were never read |
-| `test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting` (`:3523`) | the same on two worker threads, and the queue's accounting exact once drained; the overdraft sampled under two of the largest messages while writers run | uses the fix's accessors |
+| `test_assoc_writes_cut_at_any_wait_keep_the_stream_whole` (`:3513`) | seeded: writers share one ordered stream, each write awaited or cut at a random wait (turn, lock, room, a later chunk's room): only whole messages, each writer's in order, none twice, every `Ok` write read; every task's end is read, so a panic in the write path fails the round | seed `0x3755`: 37 of the 47 writes that returned `Ok` were never read |
+| `test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting` (`:3541`) | the same on two worker threads, and the queue's accounting exact once drained; the overdraft sampled under one of the largest messages while writers run | uses the fix's accessors |
 | `test_assoc_a_message_larger_than_the_queue_goes_out_on_a_quiet_association` (`:3134`) | the wake: a message larger than the free room, on an idle association, goes out | `the write never finished: its first chunks were never sent` |
 | `test_stream_a_write_dropped_at_any_await_leaves_no_trace` (`stream/stream_test.rs:354`) | the stream's SSN, `buffered_amount` and queue after a drop at each await | each drop spent an SSN and the write's bytes |
-| `test_pending_queue_an_append_cut_before_it_has_room_leaves_no_trace` and the four `test_pending_queue_a_begun_message_dropped_*` (`queue/queue_test.rs:517`, `:543`, `:609`, `:647`, `:677`) | the queue alone: a cut append leaves no trace; a begun message's drop queues its rest and owes the room, queues nothing once the queue is closed, and works outside any runtime and while unwinding | uses the fix's accessors |
+| `test_stream_a_write_refused_before_the_association_is_up_leaves_no_trace` and `test_stream_an_empty_write_spends_no_sequence_number` (`:566`, `:613`) | a write refused before the association is established, and an empty write, leave the SSN, `buffered_amount` and queue as they were; the next write takes the number | (SSN, `buffered_amount`, chunks) after the refused write (1, 5, 0), after the empty one (1, 0, 0), not (0, 0, 0) |
+| `test_pending_queue_an_append_cut_before_it_has_room_leaves_no_trace` and the four `test_pending_queue_a_begun_message_dropped_*` (`queue/queue_test.rs:517`, `:543`, `:618`, `:667`, `:706`) | the queue alone: a cut append leaves no trace; a begun message's drop queues its rest, owes the room and wakes the write loop, queues nothing once the queue is closed (what a `pop` paid meanwhile is room again), and works outside any runtime and while unwinding | uses the fix's accessors |
+| `test_pending_queue_no_room_is_free_while_a_cut_message_is_owed` (`:748`) | a stand-in for the write loop on another thread pops 0 to 3 chunks at each step of a begun message's drop: once the drop is done no room is free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
 
 **CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:2977`), which is not
 yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
