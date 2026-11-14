@@ -729,7 +729,7 @@ serving its zip. One wizard, four roles:
 | Wizard role | What it installs | Runs as |
 |---|---|---|
 | **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
-| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
+| **Daemon — per user** | perUser MSI | the account's own Scheduled Task, `Roomler-<SID>` ([one per account](#two-accounts-on-one-machine-a-task-each-3801)), at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
 | **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
 
@@ -970,7 +970,7 @@ action can tell, because the installer's token is `SANDBOX_INERT`, which AppLock
 check: the blocked launcher ran all of them. A task is the one start with the token the
 real task gets. So `service install`, only where the compiled policy
 `%SystemRoot%\System32\AppLocker\Exe.AppLocker` exists, starts the launcher with `--version`
-through a throwaway task, `Roomler launcher check`, and reads its
+through a throwaway task of the account's own, `Roomler launcher check-<SID>` (#3801), and reads its
 `LastTaskResult` for at most ten seconds (the answer was there in 0.6 s). `0x800704EC`
 means the real task names `roomlerd.exe`: a console window a person can close, on a device
 that is online. Any other answer keeps the launcher, so a person who is not signed in at
@@ -1092,6 +1092,86 @@ What it does not do:
   onto it, the device stays down until the next sign-in.
 
 The per-machine table has no such attribute, and none of this was read on it.
+
+### Two accounts on one machine: a task each (#3801)
+
+Each per-user install registers its autostart as a task of its account's own,
+`Roomler-<SID>`, named for the SID of the account it runs as
+(`agents/roomlerd/src/service/user_task.rs:58`): the form Windows' own per-user tasks
+take. Until #3801 every account registered `\Roomler`, one name in the one task library a
+machine has, so two accounts with a per-user install each could not both hold it. The second
+account's registration was refused, so its device never started at sign-in. And the per-user
+arm of `cleanup-legacy-install`, run for one account, deleted the task by name whichever
+account's it was, which took that device offline (seen in the agent-v0.4.218 release lab).
+
+```mermaid
+flowchart TD
+    P["a path of this account:<br/>service install · start · stop · status · uninstall"] --> O{"Roomler-&lt;its SID&gt;<br/>there?"}
+    O -->|yes| A["acts on it"]
+    O -->|no| L{"Roomler, or the name before the P3d rename,<br/>there, and its principal is this account?"}
+    L -->|yes| B["acts on it:<br/>an install not updated yet"]
+    L -->|"no, or the principal<br/>cannot be read"| N["leaves it alone:<br/>another account's, or nobody's to touch"]
+```
+
+One rule, in one file, decides which task a path acts on, and every path goes through it:
+
+| Path | Who runs it | What it acts on |
+|---|---|---|
+| `service install` | the MSI's `RegisterAutostart`, the tray, by hand | registers `Roomler-<SID>`; then deletes `Roomler`, or the name before the P3d rename, when its principal is this account, never before its own task is registered (`register`, `agents/roomlerd/src/service/user_task.rs:155`) |
+| `service start`; the hard stop's `schtasks /End` | the wizard, the tray's and `roomler restart`'s restart, the updater's watcher after a failed install, the Start menu entry; `service stop` and the MSI's `StopDaemon` and `StopOldDaemon` | `Roomler-<SID>`, else a legacy task whose principal is this account (`own_autostart`, `agents/roomlerd/src/service/user_task.rs:121`) |
+| `service status` | the tray every 10 s, by hand | the same, read (`status`, `agents/roomlerd/src/service/user_task.rs:134`) |
+| `service uninstall` | the MSI's `UnregisterAutostart`, by hand | `Roomler-<SID>` and its launcher check, and the legacy ones whose principal is this account (`unregister`, `agents/roomlerd/src/service/user_task.rs:174`) |
+| the per-user arm of `cleanup-legacy-install` | an operator, by hand | the tasks of the account signed in to the step's session ([below](#what-the-per-user-arm-of-the-clean-up-removes-3801)) |
+
+A legacy task is this account's only when its principal says so (`is_own`, `agents/roomlerd/src/service/user_task.rs:114`). The
+principal is read from the task's definition (`schtasks /Query /XML`): a SID, or an account name
+the system resolves to one. A definition this process may not read, one that does not parse,
+and one that names a group are not its own, and nothing acts on them. A standard account sees
+only its own tasks, so to it another account's task is simply not there.
+
+**The launcher check is each account's own too**: `Roomler launcher check-<SID>`
+(`launcher_check`, `agents/roomlerd/src/service/user_task.rs:63`), the throwaway task `service install` runs where an AppLocker
+policy is in force ([above](#what-the-per-user-scheduled-task-runs-3292)). `service uninstall`
+deletes the one under the shared name only when its principal is this account.
+
+**An install from before #3801 moves on its own account's update.** The old product's
+`UnregisterAutostart` deletes its `Roomler`, as every update has, and the new product's
+`RegisterAutostart`, run as the same account, registers `Roomler-<SID>` with the one-shot
+starts that bring the daemon back. Until that account updates, its `Roomler` keeps starting its
+daemon, and no other account's code acts on it: not a registration, a start, a stop, an
+uninstall or the clean-up. Nothing falls back to the shared name: without `/F`, `schtasks
+/Create` asks on its input whether to replace a task, and with it, a registration could replace
+another account's task that this account cannot see. A failed upgrade's rollback runs the old
+release's `service install`, which puts `Roomler` back for the old release.
+
+**Read a task by hand** with its account's SID, which `whoami /user` prints:
+`schtasks /Query /TN Roomler-<SID>`. An administrator sees every account's task; a standard
+account sees its own.
+
+**A limit that stays:** another account on the machine can register a task under this
+account's name first. This account's registration is then refused, as the second account's
+always was under the shared name.
+
+#### What the per-user arm of the clean-up removes (#3801)
+
+`cleanup-legacy-install --target-flavour perMachine`, run by hand, removes the per-user
+install of the account signed in to the step's session: the same account whose data trees it
+removes ([where a step finds its folders](#where-a-step-on-the-service-account-finds-its-folders-3702)).
+That account is read from the session (`account_cleaned`,
+`agents/roomlerd/src/install_cleanup.rs:440`), and the choice is
+`clean_up_choice` (`agents/roomlerd/src/service/user_task.rs:219`):
+
+| Task it finds | What it does | Its report line |
+|---|---|---|
+| `Roomler-<SID>` of the account it cleans | removes it | `Scheduled Task Roomler-<this account's SID>` |
+| `Roomler`, or the name before the P3d rename, that runs as that account | removes it | `Scheduled Task Roomler` |
+| `Roomler-<SID>` of another account | leaves it | `Scheduled Task Roomler-<another account's SID> left in place: it runs as another account` |
+| `Roomler`, or the name before the P3d rename, that runs as another account | leaves it | `Scheduled Task Roomler left in place: it runs as another account` |
+| `Roomler`, or the name before the P3d rename, whose principal it cannot read | leaves it | `… left in place: this step cannot tell which account it runs as` |
+| any of them, with nobody signed in to its session, an account it cannot tell, or a build without `system-context` | leaves them all | `… left in place: nobody is signed in to this step's session, so this step removes no account's task` |
+
+No line names an account: an account's own task is shown with its SID left out. The arm's
+task calls run `schtasks.exe` from System32, where it ran a bare `schtasks`.
 
 ### What an MSI run does to the `Roomler` service
 
@@ -1484,9 +1564,9 @@ folder they name from the system, never from the environment they were started w
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:952` |
 | The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:999`, `crates/agent-core/src/appdirs.rs:779` |
-| The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:254`, `agents/roomlerd/src/install_cleanup.rs:286` |
-| The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:631`, `agents/roomlerd/src/install_cleanup.rs:679` |
-| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the per-user package's Scheduled Tasks it finds (`Roomler` and the one under the retired name), then removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session it removes no tree either, and when it cannot tell the session's account, or the system records no profile for it, it removes none and its line says which. | `agents/roomlerd/src/install_cleanup.rs:179`, `agents/roomlerd/src/install_cleanup.rs:383`, `agents/roomlerd/src/install_cleanup.rs:509`, `agents/roomlerd/src/install_cleanup.rs:561`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
+| The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:257`, `agents/roomlerd/src/install_cleanup.rs:289` |
+| The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:679`, `agents/roomlerd/src/install_cleanup.rs:727` |
+| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the Scheduled Tasks of the account signed in to its session, and no other account's ([#3801](#what-the-per-user-arm-of-the-clean-up-removes-3801)): that account's `Roomler-<SID>`, and `Roomler` or the one under the retired name when their principal is that account. Then it removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session, or an account it cannot tell, it removes no tree and no task; when the system records no profile for that account, it removes no tree. Its lines say which. | `agents/roomlerd/src/install_cleanup.rs:182`, `agents/roomlerd/src/install_cleanup.rs:386`, `agents/roomlerd/src/service/user_task.rs:219`, `agents/roomlerd/src/install_cleanup.rs:557`, `agents/roomlerd/src/install_cleanup.rs:609`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
 
 **Which tree an account's folders are in (#3747).** An account's tree is the one that holds its
 config folder: the NEW one when it holds one, else the OLD one when it holds one. Only when

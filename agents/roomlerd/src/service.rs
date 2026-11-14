@@ -7,10 +7,10 @@
 //! `roomlerd service install` registers the agent so it launches
 //! automatically on the next interactive login:
 //!
-//!   - **Windows**: Scheduled Task named `Roomler` (pre-P3D-rename hosts
-//!     have `RoomlerAgent`, which `install()` retires and `uninstall()`
-//!     deletes), ONLOGON trigger, LIMITED run level (matches the agent's
-//!     un-elevated-by-design posture from `packaging/windows/README.txt`).
+//!   - **Windows**: a Scheduled Task of each account's own, `Roomler-<SID>`
+//!     (#3801; an install not updated since has `Roomler`, or `RoomlerAgent`
+//!     from before the P3D rename), ONLOGON trigger, LIMITED run level (the
+//!     agent's un-elevated-by-design posture, `packaging/windows/README.txt`).
 //!   - **Linux**: systemd user unit. The .deb already drops the unit
 //!     file at `/usr/lib/systemd/user/roomler.service`; install
 //!     here means `systemctl --user enable --now roomler.service`.
@@ -723,6 +723,30 @@ mod windows {
             task_exists(name)
         }
 
+        /// The task's definition, `schtasks /Query /XML`, and the account its
+        /// principal names: a SID as written, or a name the system resolves to
+        /// one. A query this process is refused, a document that does not
+        /// parse and a name the system cannot resolve are `None`: not its own.
+        fn principal(&self, name: &str) -> Option<String> {
+            let out = schtasks()
+                .args(["/Query", "/TN", name, "/XML"])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let user = user_task::principal_user_id(&user_task::console_text(&out.stdout))?;
+            if user_task::is_sid(&user) {
+                Some(user)
+            } else {
+                account_sid(&user)
+            }
+        }
+
+        fn names(&self) -> Option<Vec<String>> {
+            listed_tasks()
+        }
+
         fn status(&self, name: &str) -> Result<AutostartStatus> {
             query_task(name)
         }
@@ -981,19 +1005,33 @@ mod windows {
     /// caller treating absence as success can never be fooled by a broken
     /// probe into skipping real work.
     fn task_exists(name: &str) -> bool {
-        let Ok(out) = schtasks().args(["/Query", "/TN", name]).output() else {
+        let Ok(out) = query_one(name) else {
             return true;
         };
-        if !out.status.success() {
-            return false;
-        }
-        String::from_utf8_lossy(&out.stdout).contains(name)
+        out.status.success() && names_task(&out.stdout, name)
+    }
+
+    /// `schtasks /Query /TN <name>`, as CSV (#3801). The default table gives a
+    /// task's name a column 40 characters wide, and an account's own name,
+    /// `Roomler-<SID>`, is about 55: a search of the table for the whole name
+    /// misses a task that is there.
+    fn query_one(name: &str) -> std::io::Result<std::process::Output> {
+        schtasks()
+            .args(["/Query", "/TN", name, "/FO", "CSV", "/NH"])
+            .output()
+    }
+
+    /// Does `query_one`'s answer name the task `name`, whole?
+    fn names_task(stdout: &[u8], name: &str) -> bool {
+        user_task::listed_names(&user_task::console_text(stdout))
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name))
     }
 
     /// Is `name` provably ABSENT from the full task list?
     ///
     /// The independent, locale-proof half of [`query_task`]'s error path: a
-    /// listing that succeeds and does not mention our name is real evidence of
+    /// listing that succeeds and does not hold our name is real evidence of
     /// absence, in any language. `/FO CSV /NH` keeps the output machine-shaped
     /// rather than the localized table.
     ///
@@ -1001,13 +1039,63 @@ mod windows {
     /// fails, so an unavailable or access-denied schtasks yields `Unknown`
     /// rather than a confident `NotInstalled`.
     fn task_absent_from_listing(name: &str) -> bool {
-        let Ok(out) = schtasks().args(["/Query", "/FO", "CSV", "/NH"]).output() else {
-            return false;
+        listed_tasks().is_some_and(|names| !names.iter().any(|n| n.eq_ignore_ascii_case(name)))
+    }
+
+    /// Every task of the library's top folder this process sees, by whole name
+    /// (`user_task::listed_names`): `Roomler` is a prefix of each account's own
+    /// name (#3801), so a text search for it proves nothing. `None` when the
+    /// listing fails.
+    fn listed_tasks() -> Option<Vec<String>> {
+        let out = schtasks()
+            .args(["/Query", "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| user_task::listed_names(&user_task::console_text(&out.stdout)))
+    }
+
+    /// #3801 — the SID of the account `name` names in a task's definition
+    /// (`DOMAIN\user`, or any name the system resolves, a well-known one
+    /// included), as text. `None` when the system resolves none.
+    fn account_sid(name: &str) -> Option<String> {
+        use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let (mut sid_len, mut domain_len) = (0u32, 0u32);
+        let mut kind: SID_NAME_USE = 0;
+        // SAFETY: a NUL-terminated name; null buffers with zero sizes ask for
+        // the sizes, which the call writes back.
+        unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut sid_len,
+                std::ptr::null_mut(),
+                &mut domain_len,
+                &mut kind,
+            )
         };
-        if !out.status.success() {
-            return false;
+        if sid_len == 0 {
+            return None;
         }
-        !String::from_utf8_lossy(&out.stdout).contains(name)
+        let mut sid = vec![0u8; sid_len as usize];
+        let mut domain = vec![0u16; domain_len.max(1) as usize];
+        // SAFETY: buffers of the sizes the first call asked for, alive across
+        // the call.
+        let ok = unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                wide.as_ptr(),
+                sid.as_mut_ptr().cast(),
+                &mut sid_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut kind,
+            )
+        };
+        (ok != 0).then(|| crate::win_token::sid_string(sid.as_mut_ptr().cast()))
     }
 
     /// This account's task (#3801): its own first, then a legacy one of its
@@ -1017,14 +1105,11 @@ mod windows {
     }
 
     fn query_task(name: &str) -> Result<AutostartStatus> {
-        let output = schtasks()
-            .args(["/Query", "/TN", name])
-            .output()
-            .context("running schtasks /Query")?;
+        let output = query_one(name).context("running schtasks /Query")?;
         if output.status.success() {
             // Confirm it really named OUR task: a success whose output doesn't
-            // mention it is not evidence of installation.
-            if String::from_utf8_lossy(&output.stdout).contains(name) {
+            // name it, whole, is not evidence of installation.
+            if names_task(&output.stdout, name) {
                 Ok(AutostartStatus::Installed)
             } else {
                 Ok(AutostartStatus::Unknown)
@@ -1143,10 +1228,7 @@ mod windows {
 
     /// The real task with one change: what it asks the launcher to do.
     fn render_launcher_check_xml(name: &str, launcher: &str, user: &str) -> String {
-        // RED (#3801): the document keeps the URI it always had.
-        let _ = name;
-        render_task_xml(user_task::SHARED, launcher, user, "")
-            .replace("run --supervisor task", "--version")
+        render_task_xml(name, launcher, user, "").replace("run --supervisor task", "--version")
     }
 
     /// The `Last Result` of a `schtasks /Query /V /FO CSV /NH` listing: the seventh
@@ -1435,6 +1517,38 @@ mod windows {
             assert_eq!(last_result(&row("0")), Some(0));
             assert_eq!(last_result(&row("n/a")), None);
             assert_eq!(last_result(""), None);
+        }
+
+        /// #3801 — one task's query is read as CSV, by the whole name. In the
+        /// default table the name column is 40 characters, so an account's own
+        /// name breaks across it and a search for the whole name missed a task
+        /// that was there; and `Roomler` is a prefix of that name, so a text
+        /// search found the shared task where only an account's own was.
+        #[test]
+        fn a_query_names_its_task_whole() {
+            let csv = format!("\r\n\"\\{TASK}\",\"N/A\",\"Ready\"\r\n");
+            assert!(names_task(csv.as_bytes(), TASK));
+            assert!(!names_task(csv.as_bytes(), "Roomler"));
+            let utf16: Vec<u8> = csv.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            assert!(names_task(&utf16, TASK));
+            let (head, tail) = TASK.split_at(40);
+            let table = format!(
+                "\r\nFolder: \\\r\nTaskName{pad}Next Run Time          Status\r\n\
+                 {head} N/A                    Ready\r\n{tail}\r\n",
+                pad = " ".repeat(33)
+            );
+            assert!(!names_task(table.as_bytes(), TASK), "only CSV is read");
+        }
+
+        /// #3801 — each document names the task it registers: the account's
+        /// own, and the account's own launcher check.
+        #[test]
+        fn each_document_names_the_accounts_own_task() {
+            let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", "");
+            assert!(xml.contains(&format!("<URI>\\{TASK}</URI>")), "{xml}");
+            let xml = render_launcher_check_xml(CHECK, "C:\\P\\roomlerdw.exe", "DOM\\u");
+            assert!(xml.contains(&format!("<URI>\\{CHECK}</URI>")), "{xml}");
+            assert_eq!(xml.matches("<URI>").count(), 1, "{xml}");
         }
 
         #[test]

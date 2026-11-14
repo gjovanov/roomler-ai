@@ -29,8 +29,11 @@
 //!
 //! When installing **perMachine**, the helper cleans **perUser**
 //! leftovers:
-//! - Scheduled Task `RoomlerAgent` (`schtasks /Delete /TN RoomlerAgent
-//!   /F`). Runs as SYSTEM, can see + delete the user-scope task.
+//! - #3801: the Scheduled Tasks of the account signed in to the step's
+//!   session, and no other account's: its `Roomler-<SID>`, and `Roomler` or
+//!   `RoomlerAgent` when their principal is that account
+//!   (`service::user_task::clean_up_choice`). Another account's task, or one
+//!   whose account it cannot read, stays, with a line that says so.
 //! - The session user's data dirs at `AppData\Local\roomler\
 //!   roomler-agent\` and `AppData\Roaming\roomler\roomler-agent\` (and the
 //!   `roomler` segment; `needs-attention.txt` goes with the Roaming one),
@@ -383,10 +386,12 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
     // 1. Scheduled Tasks — registered by the perUser MSI's
     //    `RegisterAutostart` custom action: `RoomlerAgent` pre-P3d,
-    //    `Roomler` since the P3d rename, `Roomler-<SID>` since #3801.
-    //    NB reachable via operator CLI only — the MSI CA always exits
-    //    through the same-flavour fast path (module docs) — so this can
-    //    never race the SAME install's freshly-registered task.
+    //    `Roomler` since the P3d rename, `Roomler-<SID>` since #3801. Only
+    //    those of the account this arm cleans: every account's install
+    //    held the shared names, so one is removed only when its principal
+    //    is that account. NB reachable via operator CLI only — the MSI CA
+    //    always exits through the same-flavour fast path (module docs) — so
+    //    this can never race the SAME install's freshly-registered task.
     let cleaned = account_cleaned();
     clean_up_user_tasks(
         &mut crate::service::Schtasks,
@@ -447,7 +452,9 @@ fn account_cleaned() -> Result<String, &'static str> {
 }
 
 /// #3801 — the per-user arm's Scheduled Tasks: those of `cleaned`, the account
-/// it cleans ([`account_cleaned`]), each with its line in `report`.
+/// it cleans ([`account_cleaned`]; `Err`: why it cannot tell that account),
+/// and no other account's. The choice is `user_task::clean_up_choice`; every
+/// task it finds has its line in `report`, and no line names an account.
 #[cfg(target_os = "windows")]
 fn clean_up_user_tasks(
     lib: &mut impl crate::service::user_task::Library,
@@ -455,26 +462,31 @@ fn clean_up_user_tasks(
     report: &mut CleanupReport,
     dry_run: bool,
 ) {
-    // RED (#3801): today's names, deleted by name whichever account's they are.
-    let _ = cleaned;
-    for task_name in ["RoomlerAgent", "Roomler"] {
-        if lib.exists(task_name) {
-            if dry_run {
-                report
-                    .removed
-                    .push(format!("[dry-run] schtasks /Delete /TN {task_name} /F"));
-            } else {
-                match lib.delete(task_name) {
-                    Ok(()) => report.removed.push(format!("Scheduled Task {task_name}")),
-                    Err(e) => report
-                        .errors
-                        .push(format!("schtasks /Delete {task_name}: {e}")),
-                }
-            }
-        } else {
-            report
+    use crate::service::user_task::{Verdict, clean_up_choice};
+    for choice in clean_up_choice(lib, cleaned) {
+        let shown = &choice.shown;
+        match choice.verdict {
+            Verdict::Remove if dry_run => report
+                .removed
+                .push(format!("[dry-run] schtasks /Delete /TN {shown} /F")),
+            Verdict::Remove => match lib.delete(&choice.name) {
+                Ok(()) => report.removed.push(format!("Scheduled Task {shown}")),
+                Err(e) => report.errors.push(format!("schtasks /Delete {shown}: {e}")),
+            },
+            Verdict::Absent => report
                 .skipped
-                .push(format!("Scheduled Task {task_name} not present"));
+                .push(format!("Scheduled Task {shown} not present")),
+            Verdict::Another => report.skipped.push(format!(
+                "Scheduled Task {shown} left in place: it runs as another account"
+            )),
+            Verdict::Unknown => report.skipped.push(format!(
+                "Scheduled Task {shown} left in place: this step cannot tell which account it \
+                 runs as"
+            )),
+            Verdict::NoAccount(why) => report.skipped.push(format!(
+                "Scheduled Task {shown} left in place: {why}, so this step removes no account's \
+                 task"
+            )),
         }
     }
 }

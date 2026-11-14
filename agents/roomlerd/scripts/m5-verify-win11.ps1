@@ -78,16 +78,35 @@ function Get-AgentVersion {
 }
 
 function Get-TaskState {
-    try {
-        $t = Get-ScheduledTask -TaskName 'Roomler' -ErrorAction Stop
+    # #3801: the task is this account's own, Roomler-<SID>; an install from
+    # before it has Roomler, which every account's install held, so that one
+    # counts only when it runs as this account.
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    foreach ($name in @("Roomler-$sid", 'Roomler')) {
+        try {
+            $t = Get-ScheduledTask -TaskPath '\' -TaskName $name -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if ($name -eq 'Roomler') {
+            $runsAs = $t.Principal.UserId
+            if ($runsAs -notmatch '^S-1-') {
+                try {
+                    $runsAs = (New-Object System.Security.Principal.NTAccount($runsAs)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                } catch {
+                    $runsAs = $null
+                }
+            }
+            if ($runsAs -ne $sid) { continue }
+        }
         return @{
             Present = $true
+            Name    = $name
             State   = $t.State
             Author  = $t.Principal.UserId
         }
-    } catch {
-        return @{ Present = $false }
     }
+    return @{ Present = $false }
 }
 
 function Get-ServiceState {

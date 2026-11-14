@@ -388,9 +388,11 @@
           perMachine MSI over a prior perUser install, this CA shells
           out to the freshly-laid EXE to scrub the perUser flavour's
           stale Scheduled Task + user-data dirs. Runs deferred + non-
-          impersonated (SYSTEM) so it can: (a) delete a per-user task
-          via `schtasks /Delete /TN RoomlerAgent /F` (SYSTEM has the
-          rights), (b) reach into the active-session user's
+          impersonated (SYSTEM) so it can: (a) delete the per-user tasks
+          of the account signed in to its session and of no other
+          account (#3801: that account's Roomler-SID task, and a task
+          under a shared name only when its principal is that account),
+          (b) reach into the active-session user's
           %LOCALAPPDATA% / %APPDATA% in the profile Windows records for
           that person's SID (FR-145; system-context feature). On
           headless installs with no logged-in user the helper logs a

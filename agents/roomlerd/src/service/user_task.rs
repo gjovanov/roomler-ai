@@ -46,22 +46,44 @@ pub(crate) const SHARED: &str = "Roomler";
 // RETIRED-NAME-ANCHOR: a host may still carry the pre-P3d task; without this the paths lose it and the host runs two daemons. docs/fr/FR-21
 pub(crate) const RETIRED: &str = "RoomlerAgent";
 
+/// The names an account's autostart task had before #3801, in the order every
+/// path looks for one. Any account's task may hold one.
+pub(crate) const LEGACY: [&str; 2] = [SHARED, RETIRED];
+
 /// The launcher check's name before #3801: a throwaway task `service install`
 /// registers for seconds where an AppLocker policy is in force (#3292).
 pub(crate) const SHARED_CHECK: &str = "Roomler launcher check";
 
 /// The autostart task of the account `sid` (its SID, `S-1-5-21-…`).
 pub(crate) fn autostart(sid: &str) -> String {
-    // RED (#3801): today's one name, whichever account registers it.
-    let _ = sid;
-    SHARED.to_string()
+    format!("{SHARED}-{sid}")
 }
 
 /// The launcher check of the account `sid`.
 pub(crate) fn launcher_check(sid: &str) -> String {
-    // RED (#3801): today's one name, whichever account registers it.
-    let _ = sid;
-    SHARED_CHECK.to_string()
+    format!("{SHARED_CHECK}-{sid}")
+}
+
+/// The account an autostart task's name is for: `Roomler-<SID>`, the whole
+/// name. The shared name, the launcher check's and a name that only starts like
+/// one are no account's. `Roomler` is a prefix of every account's own name, so
+/// this is never a `starts_with`.
+pub(crate) fn account_of(name: &str) -> Option<&str> {
+    let sid = name.strip_prefix(SHARED)?.strip_prefix('-')?;
+    is_sid(sid).then_some(sid)
+}
+
+/// Is `text` a SID, `S-1-` and then numbers between dashes?
+pub(crate) fn is_sid(text: &str) -> bool {
+    text.strip_prefix("S-1-").is_some_and(|rest| {
+        rest.split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Are `a` and `b` one account's SID? A SID's letters compare without case.
+fn same_account(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// The machine's task library as the process asking sees it: the seam between
@@ -71,6 +93,13 @@ pub(crate) trait Library {
     /// its own tasks. `true` when the question could not be asked, so a caller
     /// that takes absence as done is never fooled into skipping work.
     fn exists(&self, name: &str) -> bool;
+    /// The SID of the account the task runs as, from its definition. `None`
+    /// when this process may not read it, it is not there, or it names no
+    /// account this machine can tell.
+    fn principal(&self, name: &str) -> Option<String>;
+    /// Every task in the library's top folder that this process sees, by name.
+    /// `None` when the listing fails.
+    fn names(&self) -> Option<Vec<String>>;
     /// What `service status` says of one task.
     fn status(&self, name: &str) -> Result<AutostartStatus>;
     /// Register `xml` as `name`, replacing a task of that name.
@@ -79,46 +108,236 @@ pub(crate) trait Library {
     fn delete(&mut self, name: &str) -> Result<()>;
 }
 
+/// Is the task `name` the account `sid`'s, by its principal? A task this
+/// process cannot see, a definition it may not read and one that names no
+/// account it can tell are not its own (#3801).
+pub(crate) fn is_own(lib: &impl Library, name: &str, sid: &str) -> bool {
+    lib.exists(name) && lib.principal(name).is_some_and(|p| same_account(&p, sid))
+}
+
 /// The task that starts the daemon of the account `sid`: its own, else a
 /// legacy one whose principal is `sid`. What `service start` runs, and what the
 /// hard stop ends.
 pub(crate) fn own_autostart(lib: &impl Library, sid: &str) -> Option<String> {
-    // RED (#3801): today's two names, by name alone.
-    let _ = sid;
-    [SHARED, RETIRED]
+    let own = autostart(sid);
+    if lib.exists(&own) {
+        return Some(own);
+    }
+    LEGACY
         .into_iter()
-        .find(|name| lib.exists(name))
+        .find(|name| is_own(lib, name, sid))
         .map(str::to_string)
 }
 
 /// `service status` for the account `sid`: its own task, else a legacy one
 /// whose principal is `sid`.
 pub(crate) fn status(lib: &impl Library, sid: &str) -> Result<AutostartStatus> {
-    // RED (#3801): today's two names, by name alone.
-    let _ = sid;
-    match lib.status(SHARED)? {
-        AutostartStatus::NotInstalled => lib.status(RETIRED),
-        other => Ok(other),
+    match lib.status(&autostart(sid))? {
+        AutostartStatus::NotInstalled => {}
+        other => return Ok(other),
     }
+    for name in LEGACY {
+        match lib.status(name)? {
+            AutostartStatus::Installed if is_own(lib, name, sid) => {
+                return Ok(AutostartStatus::Installed);
+            }
+            AutostartStatus::Unknown => return Ok(AutostartStatus::Unknown),
+            _ => {}
+        }
+    }
+    Ok(AutostartStatus::NotInstalled)
 }
 
 /// `service install` for the account `sid`: register its task as `xml`, then
 /// delete a legacy task of its own, best effort, once the new one is there.
+/// Never another account's, and never before its own task registered: a
+/// registration that fails leaves the old task to start the daemon.
 pub(crate) fn register(lib: &mut impl Library, sid: &str, xml: &str) -> Result<()> {
-    // RED (#3801): today's one name, and the retired one deleted by name.
     lib.create(&autostart(sid), xml)?;
-    let _ = lib.delete(RETIRED);
+    for name in LEGACY {
+        if is_own(lib, name, sid)
+            && let Err(e) = lib.delete(name)
+        {
+            tracing::warn!(
+                task = name,
+                error = %format!("{e:#}"),
+                "this account's task from before #3801 could not be removed: it starts the \
+                 daemon too, and the second start exits"
+            );
+        }
+    }
     Ok(())
 }
 
 /// `service uninstall` for the account `sid`: its task and launcher check, and
 /// the legacy ones whose principal is `sid`.
 pub(crate) fn unregister(lib: &mut impl Library, sid: &str) -> Result<()> {
-    // RED (#3801): today's names, deleted by name alone.
-    lib.delete(SHARED)?;
-    lib.delete(RETIRED)?;
+    lib.delete(&autostart(sid))?;
+    for name in LEGACY {
+        if is_own(lib, name, sid) {
+            lib.delete(name)?;
+        }
+    }
     let _ = lib.delete(&launcher_check(sid));
+    if is_own(lib, SHARED_CHECK, sid) {
+        let _ = lib.delete(SHARED_CHECK);
+    }
     Ok(())
+}
+
+/// What the per-user arm of `cleanup-legacy-install` does with one task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The account it cleans: removed.
+    Remove,
+    /// Not there.
+    Absent,
+    /// Another account's: left in place.
+    Another,
+    /// Its account cannot be read: left in place.
+    Unknown,
+    /// The arm cannot tell which account it cleans, for this reason: left in
+    /// place.
+    NoAccount(String),
+}
+
+/// One task the per-user arm found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Choice {
+    pub(crate) name: String,
+    /// Its name in the report, with an account's SID left out ([`shown`]).
+    pub(crate) shown: String,
+    pub(crate) verdict: Verdict,
+}
+
+/// #3801 — the per-user arm's choice for `cleaned`, the account it cleans
+/// (`Err`: why it cannot tell that account). It removes that account's own task
+/// and a legacy one whose principal is that account. It leaves every other
+/// task: another account's own (from the listing), a legacy one that runs as
+/// another account or whose account it cannot read, and all of them when it
+/// cleans no account.
+pub(crate) fn clean_up_choice(lib: &impl Library, cleaned: Result<&str, &str>) -> Vec<Choice> {
+    let mut choice = Vec::new();
+    if let Ok(sid) = cleaned {
+        let name = autostart(sid);
+        let verdict = if lib.exists(&name) {
+            Verdict::Remove
+        } else {
+            Verdict::Absent
+        };
+        choice.push(Choice {
+            shown: shown(&name, cleaned),
+            name,
+            verdict,
+        });
+    }
+    for name in LEGACY {
+        let verdict = match cleaned {
+            _ if !lib.exists(name) => Verdict::Absent,
+            Err(why) => Verdict::NoAccount(why.to_string()),
+            Ok(sid) => match lib.principal(name) {
+                Some(p) if same_account(&p, sid) => Verdict::Remove,
+                Some(_) => Verdict::Another,
+                None => Verdict::Unknown,
+            },
+        };
+        choice.push(Choice {
+            name: name.to_string(),
+            shown: name.to_string(),
+            verdict,
+        });
+    }
+    for name in lib.names().unwrap_or_default() {
+        let Some(sid) = account_of(&name) else {
+            continue;
+        };
+        let verdict = match cleaned {
+            Ok(own) if same_account(sid, own) => continue,
+            Ok(_) => Verdict::Another,
+            Err(why) => Verdict::NoAccount(why.to_string()),
+        };
+        choice.push(Choice {
+            shown: shown(&name, cleaned),
+            name,
+            verdict,
+        });
+    }
+    choice
+}
+
+/// How the per-user arm's report names the task `name`: an account's own task
+/// with its SID left out, `Roomler-<this account's SID>` for the account it
+/// cleans and `Roomler-<another account's SID>` for any other, so no line names
+/// an account (#3801).
+fn shown(name: &str, cleaned: Result<&str, &str>) -> String {
+    match (account_of(name), cleaned) {
+        (None, _) => name.to_string(),
+        (Some(sid), Ok(own)) if same_account(sid, own) => {
+            format!("{SHARED}-<this account's SID>")
+        }
+        (Some(_), Ok(_)) => format!("{SHARED}-<another account's SID>"),
+        (Some(_), Err(_)) => format!("{SHARED}-<an account's SID>"),
+    }
+}
+
+/// The text of a console program's output: UTF-16 when it starts with the
+/// little-endian mark or reads as UTF-16 text, else its bytes as UTF-8, with a
+/// replacement character for any byte that is not.
+pub(crate) fn console_text(bytes: &[u8]) -> String {
+    let body = bytes.strip_prefix(&[0xFF, 0xFE][..]);
+    let utf16 = body.is_some() || (bytes.len() >= 2 && bytes[0] != 0 && bytes[1] == 0);
+    if !utf16 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let units: Vec<u16> = body
+        .unwrap_or(bytes)
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// The account in a task's definition (`schtasks /Query /TN <name> /XML`): the
+/// `<UserId>` of its principal, never a trigger's, with the document's entities
+/// read. `None` for a principal that names a group, or none.
+pub(crate) fn principal_user_id(xml: &str) -> Option<String> {
+    let principals = xml
+        .split_once("<Principals")?
+        .1
+        .split_once("</Principals>")?
+        .0;
+    let principal = principals.split_once("<Principal")?.1;
+    let principal = principal
+        .split_once("</Principal>")
+        .map_or(principal, |(inside, _)| inside);
+    let user = principal
+        .split_once("<UserId>")?
+        .1
+        .split_once("</UserId>")?
+        .0
+        .trim();
+    (!user.is_empty()).then(|| {
+        user.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    })
+}
+
+/// The tasks of the library's top folder, by name, from a
+/// `schtasks /Query [/TN <name>] /FO CSV /NH` listing: each row's first field,
+/// `\<name>`, whole, its leading `\` optional. A task in a folder below the top
+/// one is left out.
+pub(crate) fn listed_names(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|row| {
+            let field = row.trim().strip_prefix('"')?.split('"').next()?;
+            let name = field.strip_prefix('\\').unwrap_or(field);
+            (!name.is_empty() && !name.contains('\\')).then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// A task library in memory, for the tests here and the per-user clean-up's
@@ -227,6 +446,25 @@ pub(crate) mod fake {
     impl super::Library for Library {
         fn exists(&self, name: &str) -> bool {
             self.find(name).is_some_and(|i| self.sees(&self.tasks[i]))
+        }
+
+        fn principal(&self, name: &str) -> Option<String> {
+            let task = &self.tasks[self.find(name)?];
+            if self.may_change(task) {
+                task.principal.clone()
+            } else {
+                None
+            }
+        }
+
+        fn names(&self) -> Option<Vec<String>> {
+            Some(
+                self.tasks
+                    .iter()
+                    .filter(|t| self.sees(t))
+                    .map(|t| t.name.clone())
+                    .collect(),
+            )
         }
 
         fn status(&self, name: &str) -> Result<AutostartStatus> {
@@ -431,5 +669,99 @@ mod tests {
             assert!(!lib.asked_for(SHARED), "{case}: {:?}", lib.asked);
             assert!(lib.owner(SHARED).is_some(), "{case}");
         }
+    }
+
+    /// #3801 — a name is an account's own only when it is `Roomler-<SID>`,
+    /// whole: `Roomler` is a prefix of every account's own name, and the
+    /// launcher check's names start with it too.
+    #[test]
+    fn a_name_is_an_accounts_only_when_it_is_that_whole_name() {
+        assert_eq!(account_of(&autostart(A)), Some(A));
+        assert_eq!(account_of(&autostart(B)), Some(B));
+        let check = launcher_check(A);
+        for name in [
+            SHARED,
+            RETIRED,
+            SHARED_CHECK,
+            check.as_str(),
+            "Roomler-",
+            "Roomler-S-1-",
+            "Roomler-S-1-5-x",
+            "Roomler-S-1-5--21",
+            "Roomler-s-1-5-21-1",
+            "RoomlerX-S-1-5-21-1",
+            "Roomler S-1-5-21-1",
+        ] {
+            assert_eq!(account_of(name), None, "{name}");
+        }
+    }
+
+    /// #3801 — the listing is read by whole names, top folder only: `Roomler`
+    /// is listed only when a task of that name is, never because an account's
+    /// own task starts with it.
+    #[test]
+    fn the_listing_is_read_by_whole_names() {
+        let listing = format!(
+            "\r\n\"\\{}\",\"N/A\",\"Bereit\"\r\n\"\\{SHARED_CHECK}\",\"N/A\",\"Ready\"\r\n\
+             \"\\Microsoft\\Windows\\{SHARED}\",\"N/A\",\"Ready\"\r\n",
+            named(B)
+        );
+        let names = listed_names(&listing);
+        assert_eq!(names, [named(B), SHARED_CHECK.to_string()]);
+        assert!(!names.iter().any(|n| n == SHARED), "{names:?}");
+        let names = listed_names(&format!("\"\\{SHARED}\",\"N/A\",\"Ready\"\r\n"));
+        assert_eq!(names, [SHARED.to_string()]);
+        // One task's query answers with its whole name, however long: the
+        // default table's name column is 40 characters, an account's own name
+        // about 55. Read with or without its leading `\`.
+        assert!(named(A).len() > 40);
+        for row in [
+            format!("\"\\{}\",\"N/A\",\"Ready\"", named(A)),
+            format!("\"{}\",\"N/A\",\"Ready\"", named(A)),
+        ] {
+            assert_eq!(listed_names(&row), [named(A)], "{row}");
+        }
+        assert!(listed_names("").is_empty());
+    }
+
+    /// #3801 — the account in a task's definition is its principal's
+    /// `<UserId>`, never its logon trigger's, as a SID or as a name with its
+    /// entities read. A principal that names a group, or nobody, is none.
+    #[test]
+    fn the_principal_is_the_principals_user_not_a_triggers() {
+        let xml = |principal: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+                 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
+                 <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>DOMAIN\\other</UserId>\
+                 </LogonTrigger></Triggers>\r\n\
+                 <Principals>\r\n<Principal id=\"Author\">\r\n{principal}\r\n\
+                 <LogonType>InteractiveToken</LogonType>\r\n</Principal>\r\n</Principals>\r\n</Task>\r\n"
+            )
+        };
+        let read = |principal: &str| principal_user_id(&xml(principal));
+        assert_eq!(read(&format!("<UserId>{A}</UserId>")), Some(A.to_string()));
+        assert_eq!(
+            read("<UserId> DOMAIN\\a &amp; b </UserId>"),
+            Some("DOMAIN\\a & b".to_string())
+        );
+        assert_eq!(read("<GroupId>S-1-5-32-545</GroupId>"), None);
+        assert_eq!(read("<UserId></UserId>"), None);
+        assert_eq!(principal_user_id("ERROR: Access is denied."), None);
+        assert_eq!(principal_user_id(""), None);
+    }
+
+    /// #3801 — `schtasks` output is read whether it comes as UTF-16, with its
+    /// mark or without, or as bytes.
+    #[test]
+    fn console_output_is_read_as_utf16_or_as_bytes() {
+        let text = format!("<UserId>{A}</UserId>");
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let marked: Vec<u8> = [0xFF, 0xFE].into_iter().chain(utf16.clone()).collect();
+        assert_eq!(console_text(&marked), text);
+        assert_eq!(console_text(&utf16), text);
+        assert_eq!(console_text(text.as_bytes()), text);
+        assert_eq!(console_text(b""), "");
+        assert!(is_sid(A) && !is_sid("DOMAIN\\a") && !is_sid("S-1-") && !is_sid(""));
     }
 }

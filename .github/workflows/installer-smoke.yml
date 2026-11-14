@@ -774,6 +774,72 @@ jobs:
             Move-Item $stash $victim
           }
 
+      # #3801 — until it, every per-user install registered `\Roomler`, one name
+      # for every account on a machine: a second account could not hold it, and a
+      # clean-up run for one account deleted the other's. Each account's task is
+      # now its own, `Roomler-<SID>`, and a task under a shared name is acted on
+      # only when its principal is the account acting. The unit tests decide that
+      # over a task library in memory; this reads Windows' own: the name the MSI
+      # registered, a principal read from a real definition, and a shared-name
+      # task of another account (SYSTEM's here) left alone by every path, from
+      # this elevated runner.
+      - name: "The per-user task is the account's own, and a shared one moves only when it is its own (#3801)"
+        shell: pwsh
+        run: |
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $own = "Roomler-$sid"
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
+          function Test-Task([string]$Name) {
+            try { schtasks /Query /TN $Name 2>&1 | Out-Null } catch { return $false }
+            return ($LASTEXITCODE -eq 0)
+          }
+          # A disabled task under the shared name that runs as $UserId: what a
+          # release before #3801 registered for its account, or another account's.
+          function New-SharedTask([string]$UserId, [string]$Logon) {
+            $xml = '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>{0}</UserId>{1}<RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><Enabled>false</Enabled></Settings><Actions Context="Author"><Exec><Command>{2}</Command><Arguments>--version</Arguments></Exec></Actions></Task>' -f $UserId, $Logon, $exe
+            $file = Join-Path $env:RUNNER_TEMP 'shared-name-task.xml'
+            Set-Content -LiteralPath $file -Value $xml -Encoding Unicode
+            schtasks /Create /TN Roomler /XML $file /F | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "could not register a shared-name task that runs as $UserId" }
+          }
+          if (-not (Test-Task $own)) { throw "the per-user MSI registered no task of this account's own ($own)" }
+          if (Test-Task 'Roomler') { throw 'the per-user MSI registered the shared name Roomler' }
+          Write-Host "the MSI registered this account's own task: $own"
+
+          # 1. This account's task under the shared name, as a release before #3801
+          #    left it: the account's next registration moves it to its own name.
+          New-SharedTask "$env:USERDOMAIN\$env:USERNAME" '<LogonType>InteractiveToken</LogonType>'
+          & $exe service install
+          if ($LASTEXITCODE -ne 0) { throw "service install exited $LASTEXITCODE" }
+          if (Test-Task 'Roomler') { throw "this account's Roomler survived its registration: its principal was not read as this account" }
+          if (-not (Test-Task $own)) { throw "the registration left no $own" }
+          Write-Host "this account's shared-name task moved to its own name"
+
+          # 2. Another account's task under the shared name: no path of this account
+          #    acts on it, and the clean-up's report says it left it.
+          New-SharedTask 'S-1-5-18' ''
+          try {
+            & $exe service install
+            if ($LASTEXITCODE -ne 0) { throw "service install exited $LASTEXITCODE" }
+            if (-not (Test-Task 'Roomler')) { throw "service install deleted another account's Roomler" }
+            $said = & $exe service status | Out-String
+            if ($said -notmatch 'Auto-start: installed') { throw "service status: $said" }
+            $report = & $exe cleanup-legacy-install --target-flavour perMachine --dry-run 2>&1 | Out-String
+            Write-Host $report
+            if ($report -match 'Delete /TN Roomler /F') { throw "the clean-up would delete another account's Roomler" }
+            if ($report -notmatch 'Scheduled Task Roomler left in place') { throw 'the clean-up does not say it leaves Roomler' }
+            & $exe service uninstall
+            if ($LASTEXITCODE -ne 0) { throw "service uninstall exited $LASTEXITCODE" }
+            if (-not (Test-Task 'Roomler')) { throw "service uninstall deleted another account's Roomler" }
+            if (Test-Task $own) { throw "service uninstall left this account's $own" }
+            Write-Host "another account's shared-name task: left by install, status, the clean-up and uninstall"
+          } finally {
+            schtasks /Delete /TN Roomler /F 2>&1 | Out-Null
+          }
+          # The steps below start from what the MSI left: this account's own task.
+          & $exe service install
+          if (-not (Test-Task $own)) { throw "could not register $own again" }
+
       # #3292 — Restart Manager stops nothing once the daemon runs through the
       # windowless launcher, so the MSI's StopDaemon custom action is what ends
       # it. Without that action `msiexec /x` still exits 0, and the daemon runs on
@@ -906,7 +972,11 @@ jobs:
           if ($userPath -and $userPath -match [regex]::Escape('Programs\Roomler')) {
             throw "user PATH still contains Programs\Roomler after uninstall (HKCU\Environment PATH = '$userPath')"
           }
-          Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry and MSI registry record all clean'
+          # #3801: the uninstall's UnregisterAutostart removed this account's own task.
+          $own = 'Roomler-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          schtasks /Query /TN $own 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "this account's task $own survived the uninstall" }
+          Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry, MSI registry record and the task all clean'
 
       - name: Compile per-Machine MSI (wxs lint, no install)
         shell: pwsh

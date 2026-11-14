@@ -61,13 +61,17 @@ Autostart on logon (registered automatically since 0.1.54)
 ----------------------------------------------------------
 The MSI registers the auto-start hook automatically on install + on
 every upgrade. After running the MSI you should already have a
-Scheduled Task called `Roomler` with the resilience XML (battery-defeat,
-single-instance belt). It runs roomlerdw.exe, a launcher with no window
-that starts roomlerd.exe, so no terminal opens on your desktop; the
-daemon's output, its errors included, is in its rolling log file. Confirm
-with:
+Scheduled Task of your account's own, `Roomler-<SID>`, with the
+resilience XML (battery-defeat, single-instance belt). <SID> is your
+account's SID, which `whoami /user` prints, so each account on one
+machine has a task of its own. An install from before this release has
+`Roomler` until its next update moves it. The task runs roomlerdw.exe,
+a launcher with no window that starts roomlerd.exe, so no terminal
+opens on your desktop; the daemon's output, its errors included, is in
+its rolling log file. Confirm with:
 
-    schtasks /Query /TN Roomler
+    & $roomlerd service status      # "Auto-start: installed"
+    schtasks /Query /TN Roomler-<SID>
 
 If you ever need to manage the hook manually (e.g. after restoring a
 backup or recovering from the rare Win11 ACL-locked-task scenario):
@@ -84,9 +88,13 @@ Win11 quirk), the MSI's RegisterAutostart custom action will silently
 skip (Return="ignore" so install completes), and the operator can
 delete the locked task from an elevated PowerShell once with:
 
-    schtasks /Delete /TN Roomler /F
+    schtasks /Delete /TN Roomler-<SID> /F
 
-then re-run `service install` from a normal shell.
+with the SID of the account whose task it is (or `Roomler`, on an install
+from before the per-account name, after checking with
+`schtasks /Query /TN Roomler /XML` that its <UserId> is that account:
+every account's install used that one name), then re-run
+`service install` from a normal shell as that account.
 
 Auto-update
 -----------
