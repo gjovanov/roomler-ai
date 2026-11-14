@@ -111,22 +111,22 @@ concurrency:
 
 jobs:
   windows-msi-install-uninstall:
-    name: per-User MSI install + uninstall (windows-latest)
+    name: &windows-smoke-name per-User MSI install + uninstall (windows-latest)
     runs-on: windows-latest
     # 40, not 30: FR-133 P1's upgrade cells add three released-MSI installs and
     # two more MSI builds (about 6 min) to a job that runs ~10 min warm.
-    timeout-minutes: 40
+    timeout-minutes: &windows-smoke-timeout 40
     # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
     # release asset (ci-seed-save), which needs `contents: write`.
-    permissions:
+    permissions: &windows-smoke-permissions
       contents: write
-    env:
+    env: &windows-smoke-env # #3810: the anchors on this job are the retry's, at the end of this file
       # Mirrored so the payload-signing step's `if:` can test it -- secrets
       # are not available in step-level `if:` conditions.
       WIN_TEST_PFX_BASE64: ${{ secrets.WIN_TEST_PFX_BASE64 }}
       # rust-cache set this for the job until wave 22; set it here.
       CARGO_INCREMENTAL: 0
-    steps:
+    steps: &windows-smoke-steps # #3810: a lost runner's retry runs these same steps
       - uses: actions/checkout@v4
 
       # #3754 — every installer run of this job goes through Invoke-Installer,
@@ -1725,6 +1725,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # #3810 — the six per-Machine MSIs of this run, pm-1.msi to pm-6.msi:
+      # the same binary at versions 0.0.1-smoke.1 to 0.0.6-smoke.1, built by
+      # the hand-run upgrade step above. CI builds, unsigned: never ship them.
+      # A lab replay of the per-Machine steps on a throwaway guest installs
+      # exactly these. No step after the build moves or deletes them. Only on
+      # a pull request from a `lab/` branch, the one that asks for them: at
+      # about 20 MB a file, every other run would only fill the account's
+      # Actions storage.
+      - name: Upload the per-Machine MSIs for a lab replay (#3810)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && startsWith(github.head_ref, 'lab/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-pm-msis
+          path: ${{ runner.temp }}/pm-msi/pm-*.msi
+          if-no-files-found: warn
+          retention-days: 3
+
       # #3754 — what a failure leaves for its reader, taken before the runner
       # cleans up: every process with its image path, and the service's and the
       # per-User daemon's logs. A failed installer run has saved its own already.
@@ -2677,5 +2694,158 @@ jobs:
           family: macos-pkg-smoke
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
+
+  # #3810 — a Windows job whose hosted runner goes away mid-job cannot say so.
+  # It sits until GitHub closes it at its timeout, with one step still "in
+  # progress" and every step after it never run, the evidence step among them.
+  # Nine jobs ended that way from 2026-11-09 to 11-13, all in the per-Machine
+  # steps, and a lab replay of those steps (30 cycles of 12 on a throwaway
+  # Windows guest: no restart, no lost network, no ended session) found that
+  # the product is not what takes the machine away. So the saying comes from
+  # here: a job on a fresh runner that reads the Windows job through the API
+  # when it did not succeed, and decides one of two things.
+  #   * The runner was lost: a step never reported an end and no step failed
+  #     before it, or GitHub's own annotation says the runner lost
+  #     communication or was shut down, or no step ran at all. It writes one
+  #     line, which step and "the runner, not the product", as an error
+  #     annotation and in the job summary, and the job after it runs the
+  #     Windows job's steps once more, on a fresh runner.
+  #   * A step failed by itself: the runner reported it and went on to run the
+  #     steps that follow a failure. That is the product or the test: it says
+  #     so, and nothing is retried.
+  # Why a job in the same run: a job cannot re-run its own run while that run
+  # is in progress, and a `workflow_run` workflow runs only from the default
+  # branch, out of a pull request's reach. A cancelled run skips all three.
+  windows-runner-check:
+    name: "Was the Windows job's runner lost? A lost one is retried once (#3810)"
+    needs: windows-msi-install-uninstall
+    if: ${{ !cancelled() && needs.windows-msi-install-uninstall.result != 'success' && needs.windows-msi-install-uninstall.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Reads only, and on these two jobs alone: the run's jobs and their steps
+    # (actions), the job's annotations (checks). No checkout.
+    permissions: &runner-check-permissions
+      actions: read
+      checks: read
+    env:
+      SMOKE_JOB: *windows-smoke-name
+      RETRY_JOB: &windows-retry-name "per-User MSI install + uninstall (windows-latest), once more after a lost runner"
+      IS_RETRY: 'false'
+    outputs:
+      lost: ${{ steps.read.outputs.lost }}
+    steps: &runner-check-steps
+      - name: Read the job through the API, a lost runner or a step that failed by itself
+        id: read
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          esc() { local s=${1//%/%25}; s=${s//$'\r'/%0D}; printf '%s' "${s//$'\n'/%0A}"; }
+          say() { echo "::$1 title=$2::$(esc "$3")"; printf '### %s\n\n%s\n\n' "$2" "$3" >> "$GITHUB_STEP_SUMMARY"; }
+          # The newest attempt of the job by that name, in this run. This job
+          # starts once that one is completed; a few reads cover the API's lag.
+          job=''
+          for i in 1 2 3 4 5 6; do
+            job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" |
+              jq -c --arg n "$SMOKE_JOB" '[.jobs[] | select(.name == $n)] | last // empty') || job=''
+            [ -n "$job" ] && [ "$(jq -r .status <<<"$job")" = completed ] && break
+            sleep 10
+          done
+          if [ -z "$job" ] || [ "$(jq -r .status <<<"$job")" != completed ]; then
+            echo 'lost=false' >> "$GITHUB_OUTPUT"
+            say error 'Lost-runner check (#3810)' "The job \"$SMOKE_JOB\" could not be read as completed, so there is no decision and nothing is retried."
+            exit 1
+          fi
+          q() { jq -r "$@" <<<"$job"; }
+          q '.steps[] | "step \(.number): \(.status)/\(.conclusion // "-") \(.name) (\(.started_at // "-") to \(.completed_at // "-"))"'
+          id=$(q .id); concl=$(q '.conclusion // "none"'); runner=$(q '.runner_name // "none"')
+          started=$(q '.started_at // ""'); ended=$(q '.completed_at // ""')
+          nsteps=$(q '.steps | length')
+          # A step left without an end: the one in progress, else the first that never ran.
+          open=$(q '[.steps[] | select(.status != "completed")] | length')
+          O='([.steps[] | select(.status == "in_progress")] + [.steps[] | select(.status != "completed")])[0]'
+          during=$(q "$O.name // \"\""); since=$(q "$O.started_at // \"\"")
+          # The first step that ended badly, and how many steps the runner still ran after it.
+          F='[.steps[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out"))][0]'
+          fname=$(q "$F.name // \"\""); fconcl=$(q "$F.conclusion // \"\""); fnum=$(q "$F.number // 0")
+          ran_after=$(q --argjson n "$fnum" '[.steps[] | select(.number > $n and .status == "completed" and (.conclusion == "success" or .conclusion == "failure"))] | length')
+          notes=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations?per_page=100" | jq -r '.[].message | gsub("\\s+"; " ")') || notes=''
+          lost_note=$(grep -m1 -iE 'lost communication with the server|received a shutdown signal' <<<"$notes" || true)
+          verdict=failed why=''
+          if [ -n "$fname" ] && [ "$ran_after" -gt 0 ]; then
+            verdict=failed
+          elif [ "$nsteps" -eq 0 ]; then
+            verdict=lost why='GitHub lists no step of the job, so no runner ever ran it.'
+          elif [ -n "$lost_note" ]; then
+            verdict=lost why="GitHub's own annotation on the job says \"$lost_note\""
+          elif [ "$open" -gt 0 ]; then
+            verdict=lost why="it never reported an end, and none of the $((open - 1)) steps after it ran, not even those that run on any failure or cancel."
+          fi
+          where="during a step GitHub does not name"
+          if [ -n "$during" ]; then where="during the step \"$during\""
+          elif [ -n "$fname" ]; then where="during the step \"$fname\""
+          elif [ "$nsteps" -eq 0 ]; then where='before its first step'; fi
+          mins=''
+          if [ -n "$started" ] && [ -n "$ended" ]; then mins=$(( ($(date -ud "$ended" +%s) - $(date -ud "$started" +%s) + 30) / 60 )); fi
+          lost=false
+          case "$verdict:$IS_RETRY" in
+            lost:false)
+              lost=true
+              say error 'The hosted runner was lost (#3810)' "The hosted runner was lost $where: $why This is the runner, not the product (see #3810). Retrying the job once, on a fresh runner, as \"$RETRY_JOB\"." ;;
+            lost:true)
+              say error 'The hosted runner was lost again (#3810)' "The hosted runner was lost again, $where of the retry: $why This is the runner, not the product (see #3810). It is not retried again, so this run fails." ;;
+            *)
+              if [ "$fconcl" = cancelled ]; then
+                say notice 'No lost runner (#3810)' "The step \"$fname\" was cancelled with its runner still answering: the runner reported it and went on to run the steps that follow a failure or a cancel. The job ran out of time or was cancelled, and its runner was not lost (see #3810), so nothing is retried."
+              elif [ -n "$fname" ]; then
+                say notice 'A step failed by itself (#3810)' "The step \"$fname\" ended \"$fconcl\" by itself: its runner reported that and went on to run the steps that follow a failure. That is the product or the test, not the runner (see #3810), so nothing is retried."
+              else
+                say notice 'No lost runner (#3810)' "The job ended \"$concl\" with every step reported and none failed: no lost runner, so nothing is retried (see #3810)."
+              fi ;;
+          esac
+          {
+            echo '| Read from the job | |'
+            echo '|---|---|'
+            echo "| job | \"$SMOKE_JOB\", id $id, runner \"$runner\" |"
+            echo "| ended | \"$concl\"${mins:+ after $mins min}, $started to $ended |"
+            echo "| step left without an end | ${during:-none}${since:+, started $since} |"
+            echo "| steps that never ran | $(( open > 0 ? open - 1 : 0 )) |"
+            echo "| first step that ended badly | ${fname:-none}${fconcl:+ ($fconcl), steps run after it: $ran_after} |"
+            echo "| GitHub's annotations | $(printf '%s' "$notes" | tr '\n|' ';/') |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "lost=$lost" >> "$GITHUB_OUTPUT"
+          [ "$verdict:$IS_RETRY" = lost:true ] && exit 1
+          exit 0
+
+  # #3810 — the Windows job once more, on a fresh runner, when and only when the
+  # check above found its runner lost. The same steps, timeout, permissions and
+  # environment, by YAML alias, so there is one definition. The whole job, not
+  # only its per-Machine steps: those install MSIs that the job builds from its
+  # own target\release (`cargo wix --no-build`), which a fresh runner builds again.
+  windows-msi-install-uninstall-retry:
+    name: *windows-retry-name
+    needs: windows-runner-check
+    if: ${{ !cancelled() && needs.windows-runner-check.outputs.lost == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: *windows-smoke-timeout
+    permissions: *windows-smoke-permissions
+    env: *windows-smoke-env
+    steps: *windows-smoke-steps
+
+  # #3810 — a retry is not retried: a second lost runner fails the run for good,
+  # and says so. A step of the retry that failed by itself is named the same way.
+  windows-retry-runner-check:
+    name: "Was the retry's runner lost? It is not retried again (#3810)"
+    needs: windows-msi-install-uninstall-retry
+    if: ${{ !cancelled() && needs.windows-msi-install-uninstall-retry.result != 'success' && needs.windows-msi-install-uninstall-retry.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: *runner-check-permissions
+    env:
+      SMOKE_JOB: *windows-retry-name
+      RETRY_JOB: ''
+      IS_RETRY: 'true'
+    steps: *runner-check-steps
 
 # RETIRED-NAME-ANCHOR-END
