@@ -477,7 +477,7 @@ The docs:
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:2529`): one-row's row, and
   P2's.
-- `docs/installation.md`, where the give-up's line is described (`:2592-2609`): P2's verb in its place.
+- `docs/installation.md`, where the give-up's line is described (`:2592-2615`): P2's verb in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:1-27` (the step table) and the new `one_row_home.rs`.
 - `docs/README.md`: the `installation.md` row names the rule.

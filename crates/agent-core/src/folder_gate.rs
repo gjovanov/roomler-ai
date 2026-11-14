@@ -163,9 +163,10 @@ const KNOWN: &[KnownRow] = &[
         Build::Windows,
         &["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"],
         Row::Right(
-            "Windows: the received-files denylist's roots, in the process that \
-             checks a path: not a folder a step writes, and on the service account \
-             the values are the system's own once `appdirs::pin_system_folders` ran",
+            "Windows: the received-files denylist's roots, in the process that checks a path: \
+             not a folder a step writes; on the service account `ProgramFiles` and `ProgramW6432` \
+             are the machine's own once `appdirs::pin_system_folders` ran; `ProgramFiles(x86)` \
+             is not pinned and is what the Service Control Manager gave the service",
         ),
     ),
     (
@@ -419,8 +420,9 @@ const KNOWN: &[KnownRow] = &[
         &["HOME", "XDG_STATE_HOME"],
         Row::Tracked(
             3866,
-            "Linux: a root command typed with `sudo -E` keeps the caller's XDG \
-             variables, so this names the caller's folder",
+            "Linux: where `sudo` keeps the caller's `HOME`, or with `sudo -E`, which keeps the \
+             caller's XDG variables, `roomlerd portal-helper` typed with `sudo` (root) names the \
+             caller's state folder here; with `sudo -E`, so does the helper `roomlerd run` starts",
         ),
     ),
     // Linux: a root daemon that needs the seat person's settings.
