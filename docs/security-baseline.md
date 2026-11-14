@@ -1218,12 +1218,7 @@ new verb cannot reach it by default. Widening it is a security change and needs
 review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
 for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
 `exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
-install pending a separate policy call. #3831 admitted `EncoderCaps`, the companion's
-encoder matrix: the daemon answers it from the probe's cached summary alone
-(`caps::summarize_cached`, `agents/roomlerd/src/encode/caps.rs:298`), which starts no probe
-and runs no vendor code (`not_probed_never_triggers_a_probe`) and changes nothing on the
-host. Besides which cells opened, it carries the denylist and the encoder preference, which
-the configuration listing above already shows. The dispatcher gates the peer again, three ways
+install pending a separate policy call. The dispatcher gates the peer again, three ways
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
   made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2523`, by
@@ -1266,6 +1261,13 @@ password record have no row there, and `apply` refuses them like any unknown key
 (`crates/agent-core/src/config_surface.rs:2844`). Two tests lock it:
 `secrets_and_identity_are_not_exposed` (`:4748`) and
 `no_external_credential_key_is_editable_through_the_config_surface` (`:5339`).
+
+#3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
+daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,
+`agents/roomlerd/src/encode/caps.rs:298`), which starts no probe, runs no vendor code
+(`not_probed_never_triggers_a_probe`) and changes nothing on the host. Besides what the probe
+found, it carries the denylist and the encoder preference, which the configuration listing
+(`ConfigGet`) already shows. Like `Status` and `Peers`, it has no per-peer gate of its own.
 
 The server reaches none of it (the socket is local, and `remote_config_enabled` stays
 structurally outside `DesiredConfig`). The root socket itself is unchanged. Kill switch:
