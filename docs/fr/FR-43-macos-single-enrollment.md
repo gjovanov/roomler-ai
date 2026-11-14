@@ -507,7 +507,7 @@ flowchart TB
 
 | | Off, the default | On |
 |---|---|---|
-| The spawn (`agents/roomlerd/src/macos_supervisor.rs:708`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
+| The spawn (`agents/roomlerd/src/macos_supervisor.rs:731`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
 | A person's enrollment on this Mac | what the worker runs on | ignored and left in the file, so turning the switch off brings it back until the migration strips it |
 | A secondary org's session | served by the root, no pixels | delegated |
 | A Mac with no per-user config | no worker | a worker |
@@ -541,7 +541,7 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 | No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:210`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
 | Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay | from the file | blank or off in the view: the root holds all of them |
 | Preflight to the server (`app.rs:4200`) | runs | skipped |
-| Crash bookkeeping and rollback (`app.rs:4204-4342`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1486`) |
+| Crash bookkeeping and rollback (`app.rs:4204-4342`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1531`) |
 | Updater (`app.rs:4352`, `:5536`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
 | Crash upload (`app.rs:4552`), log upload (`app.rs:4595`) | on its own token | no token: the supervisor records a crash on the root's enrollment, and the log lines go to the daemon (below) |
 | Self-unenroll on a stop (`app.rs:5698`) | if its row is ephemeral | never: this process is not that row |
@@ -654,7 +654,7 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 | Invariant | Under P3 |
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
-| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:708-969`). The migration touches no bundle, which is what AC5 reads |
+| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:731-1014`). The migration touches no bundle, which is what AC5 reads |
 | The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:914`) | The worker no longer dials a server, so it can displace nothing |
 | The delegation channel's two gates (`delegate.rs:1141-1162`) | Unchanged |
 | The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
@@ -815,7 +815,7 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       owning the worker, and the heartbeats of the AC8 row. On 0.4.191 a real viewer on the
       per-user row streamed lit pixels, and the daemon's row logged `no_display` and showed
       none. That is the pre-P1 pair. In the code the switch stops the supervisor before it does
-      anything (`macos_supervisor.rs:1370-1377`). "Byte-for-byte" is read off those surfaces;
+      anything (`macos_supervisor.rs:1415-1422`). "Byte-for-byte" is read off those surfaces;
       nothing here diffs two builds.)*
 - [~] **Docs:** `docs/installation.md` describes the one-row Mac, with a mermaid diagram of the
       daemon, the worker and the delegation channel, its migration and its kill switch, under
