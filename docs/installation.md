@@ -1145,7 +1145,9 @@ another account's task that this account cannot see. A failed upgrade's rollback
 release's `service install`, which puts `Roomler` back for the old release.
 
 **Read a task by hand** with its account's SID, which `whoami /user` prints:
-`schtasks /Query /TN Roomler-<SID>`. An administrator sees every account's task; a standard
+`schtasks /Query /TN Roomler-<SID> /FO LIST`. The default table gives a task's name a column of
+40 characters, and an account's own name is about 55, so the table breaks it; the daemon reads
+every query as CSV for the same reason. An administrator sees every account's task; a standard
 account sees its own.
 
 **A limit that stays:** another account on the machine can register a task under this

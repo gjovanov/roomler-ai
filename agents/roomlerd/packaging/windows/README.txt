@@ -71,7 +71,7 @@ opens on your desktop; the daemon's output, its errors included, is in
 its rolling log file. Confirm with:
 
     & $roomlerd service status      # "Auto-start: installed"
-    schtasks /Query /TN Roomler-<SID>
+    schtasks /Query /TN Roomler-<SID> /FO LIST
 
 If you ever need to manage the hook manually (e.g. after restoring a
 backup or recovering from the rare Win11 ACL-locked-task scenario):

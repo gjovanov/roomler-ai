@@ -789,9 +789,13 @@ jobs:
           $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           $own = "Roomler-$sid"
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
+          # The query's exit code is reset once read: the runner ends a pwsh step
+          # with the last native command's code, and 1 (no such task) is an answer.
           function Test-Task([string]$Name) {
             try { schtasks /Query /TN $Name 2>&1 | Out-Null } catch { return $false }
-            return ($LASTEXITCODE -eq 0)
+            $found = ($LASTEXITCODE -eq 0)
+            $global:LASTEXITCODE = 0
+            return $found
           }
           # A disabled task under the shared name that runs as $UserId: what a
           # release before #3801 registered for its account, or another account's.
@@ -802,9 +806,9 @@ jobs:
             schtasks /Create /TN Roomler /XML $file /F | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "could not register a shared-name task that runs as $UserId" }
           }
-          if (-not (Test-Task $own)) { throw "the per-user MSI registered no task of this account's own ($own)" }
+          if (-not (Test-Task $own)) { throw "the per-user MSI registered no task of this account's own (Roomler-<SID>)" }
           if (Test-Task 'Roomler') { throw 'the per-user MSI registered the shared name Roomler' }
-          Write-Host "the MSI registered this account's own task: $own"
+          Write-Host "the MSI registered this account's own task, Roomler-<SID>"
 
           # 1. This account's task under the shared name, as a release before #3801
           #    left it: the account's next registration moves it to its own name.
@@ -812,7 +816,7 @@ jobs:
           & $exe service install
           if ($LASTEXITCODE -ne 0) { throw "service install exited $LASTEXITCODE" }
           if (Test-Task 'Roomler') { throw "this account's Roomler survived its registration: its principal was not read as this account" }
-          if (-not (Test-Task $own)) { throw "the registration left no $own" }
+          if (-not (Test-Task $own)) { throw "the registration left no task of this account's own" }
           Write-Host "this account's shared-name task moved to its own name"
 
           # 2. Another account's task under the shared name: no path of this account
@@ -831,14 +835,14 @@ jobs:
             & $exe service uninstall
             if ($LASTEXITCODE -ne 0) { throw "service uninstall exited $LASTEXITCODE" }
             if (-not (Test-Task 'Roomler')) { throw "service uninstall deleted another account's Roomler" }
-            if (Test-Task $own) { throw "service uninstall left this account's $own" }
+            if (Test-Task $own) { throw "service uninstall left this account's own task" }
             Write-Host "another account's shared-name task: left by install, status, the clean-up and uninstall"
           } finally {
             schtasks /Delete /TN Roomler /F 2>&1 | Out-Null
           }
           # The steps below start from what the MSI left: this account's own task.
           & $exe service install
-          if (-not (Test-Task $own)) { throw "could not register $own again" }
+          if (-not (Test-Task $own)) { throw "could not register this account's own task again" }
 
       # #3292 — Restart Manager stops nothing once the daemon runs through the
       # windowless launcher, so the MSI's StopDaemon custom action is what ends
@@ -973,9 +977,13 @@ jobs:
             throw "user PATH still contains Programs\Roomler after uninstall (HKCU\Environment PATH = '$userPath')"
           }
           # #3801: the uninstall's UnregisterAutostart removed this account's own task.
+          # The query's exit code is reset once read: the runner ends a pwsh step
+          # with the last native command's code, and here 1 (no such task) passes.
           $own = 'Roomler-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           schtasks /Query /TN $own 2>&1 | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw "this account's task $own survived the uninstall" }
+          $found = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          if ($found) { throw "this account's own task survived the uninstall" }
           Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry, MSI registry record and the task all clean'
 
       - name: Compile per-Machine MSI (wxs lint, no install)
