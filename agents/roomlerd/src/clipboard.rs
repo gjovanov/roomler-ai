@@ -1885,10 +1885,41 @@ pub(crate) fn split_into_chunks(text: &str) -> Vec<&str> {
     out
 }
 
+/// #3813 — the opt-in for every test that reaches the REAL clipboard. Such a
+/// test writes it, and a write replaces whatever the person at this machine
+/// had copied: a broad native `cargo test` once did that on a developer's own
+/// desktop. Only `1` opts in, as with the crate's other `ROOMLERD_TEST_*`
+/// variables. CI sets it by name in the steps that have a clipboard nobody
+/// uses (`docs/testing.md`).
+#[cfg(test)]
+pub(crate) const REAL_CLIPBOARD_VAR: &str = "ROOMLERD_TEST_REAL_CLIPBOARD";
+
+/// #3813 — whether a value of [`REAL_CLIPBOARD_VAR`] opts in. Kept apart from
+/// the reading, so that its test sets no variable and reaches no clipboard.
+#[cfg(test)]
+fn real_clipboard_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// #3813 — the first thing every test that reaches the real clipboard does.
+/// `true`: run. `false`: it prints that `test` skipped, and the test returns,
+/// which passes. Once opted in, a clipboard that does not open is a failure,
+/// so a step that sets the variable cannot pass by running nothing.
+#[cfg(test)]
+pub(crate) fn real_clipboard_opted_in(test: &str) -> bool {
+    let run = real_clipboard_opt_in(std::env::var_os(REAL_CLIPBOARD_VAR).as_deref());
+    if !run {
+        eprintln!("{REAL_CLIPBOARD_VAR} unset: skipping {test}, which writes the real clipboard");
+    }
+    run
+}
+
 /// FR-97 P3e-3a — the change gate against a real X server (CI's Xvfb step,
 /// `ROOMLERD_TEST_X11=1`): another client takes CLIPBOARD, as a copy does, and
-/// the gate counts it and then holds. Only under `ROOMLERD_TEST_X11=1`: taking
-/// CLIPBOARD empties the clipboard of whoever is at that display.
+/// the gate counts it and then holds. Taking CLIPBOARD empties the clipboard
+/// of whoever is at that display, so the test also waits for the real
+/// clipboard's opt-in (#3813): `ROOMLERD_TEST_X11=1` alone says only that a
+/// server is there.
 #[cfg(all(test, target_os = "linux"))]
 mod x11_gate_tests {
     use super::x11_gate::Gate;
@@ -1900,6 +1931,9 @@ mod x11_gate_tests {
     fn x11_real_the_gate_counts_a_copy() {
         if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
             eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        if !super::real_clipboard_opted_in("x11_real_the_gate_counts_a_copy") {
             return;
         }
         let mut gate = Gate::connect().expect("ROOMLERD_TEST_X11=1 but the gate did not open");
@@ -1957,10 +1991,12 @@ mod x11_gate_tests {
     }
 }
 
-/// FR-97 P2e-1 — the change gate against the real pasteboard (CI's macOS job,
-/// `ROOMLERD_TEST_MAC_PASTEBOARD=1`): a write moves the change count, as a copy
-/// does, and the gate counts it and then holds. Only under the variable: the
-/// write replaces whatever the person at this Mac had copied.
+/// FR-97 P2e-1 — the change gate against the real pasteboard (CI's macOS job):
+/// a write moves the change count, as a copy does, and the gate counts it and
+/// then holds. Only under the real clipboard's opt-in,
+/// `ROOMLERD_TEST_REAL_CLIPBOARD=1` (#3813, which replaced this test's own
+/// `ROOMLERD_TEST_MAC_PASTEBOARD`): the write replaces whatever the person at
+/// this Mac had copied.
 #[cfg(all(test, target_os = "macos"))]
 mod mac_gate_tests {
     use super::mac_gate::Gate;
@@ -1969,8 +2005,7 @@ mod mac_gate_tests {
 
     #[test]
     fn mac_real_the_gate_counts_a_copy() {
-        if std::env::var("ROOMLERD_TEST_MAC_PASTEBOARD").as_deref() != Ok("1") {
-            eprintln!("ROOMLERD_TEST_MAC_PASTEBOARD unset — skipping (CI's macOS job sets it)");
+        if !super::real_clipboard_opted_in("mac_real_the_gate_counts_a_copy") {
             return;
         }
         let mut gate = Gate::connect();
@@ -2718,9 +2753,25 @@ mod tests {
         );
     }
 
-    /// The clipboard worker init may fail on headless CI runners that
-    /// have no X server; accept that as a clean skip. If it does
-    /// construct, a basic write/read round-trip works AND — locked in
+    /// #3813 — the real clipboard's gate, decided from values alone: only
+    /// `1` opts in. Nothing here reads or sets the environment, or reaches a
+    /// clipboard.
+    #[test]
+    fn only_a_one_opts_in_to_the_real_clipboard() {
+        use std::ffi::OsStr;
+        assert!(real_clipboard_opt_in(Some(OsStr::new("1"))), "1 runs");
+        assert!(!real_clipboard_opt_in(None), "unset skips");
+        for value in ["", "0", "true", "yes", "on", " 1", "1 ", "01", "11"] {
+            assert!(
+                !real_clipboard_opt_in(Some(OsStr::new(value))),
+                "{value:?} must not opt in"
+            );
+        }
+        // The name CI's steps and docs/testing.md set: a rename shows here.
+        assert_eq!(REAL_CLIPBOARD_VAR, "ROOMLERD_TEST_REAL_CLIPBOARD");
+    }
+
+    /// A basic write/read round-trip works AND — locked in
     /// the same test because Windows `OpenClipboard` is process-wide
     /// exclusive and parallel tests would race — dropping a clone must
     /// NOT shut the worker down. The DC handler in `peer.rs` clones
@@ -2735,20 +2786,30 @@ mod tests {
     /// here are best-effort; the invariant this test locks is
     /// "worker survives a clone drop", expressed by the final write
     /// succeeding without "worker gone".
+    ///
+    /// #3813 — it writes the REAL clipboard, so it runs only under
+    /// `ROOMLERD_TEST_REAL_CLIPBOARD=1`, and a clipboard that then does not
+    /// open is a failure. Before, it ran in every native `cargo test` that
+    /// built `clipboard`, and replaced what a developer had copied; where no
+    /// clipboard opened (CI's headless Linux lane) it skipped, so no CI step
+    /// ever ran it against a clipboard.
     #[tokio::test]
     async fn write_then_read_round_trip_and_survives_clone_drop() {
-        let Ok(cb) = Clipboard::new() else {
-            eprintln!("arboard not available in this env — skipping");
+        if !real_clipboard_opted_in("write_then_read_round_trip_and_survives_clone_drop") {
             return;
-        };
+        }
+        let cb = Clipboard::new()
+            .unwrap_or_else(|e| panic!("{REAL_CLIPBOARD_VAR}=1, but no clipboard opened: {e:#}"));
         let payload = "roomler clipboard smoke test";
         cb.write(payload.to_string()).await.unwrap();
         // Soft read — another process may have already clobbered the
         // clipboard. Only enforce content equality when the read
         // actually returned our payload.
+        let mut read_back = false;
         if let Ok(back) = cb.read().await {
             if back == payload {
                 // Good — OS let us keep our own write.
+                read_back = true;
             } else {
                 eprintln!("clipboard was overwritten externally; content check skipped");
             }
@@ -2770,5 +2831,10 @@ mod tests {
             .await
             .expect("worker must still be alive after a clone was dropped");
         let _ = cb.read().await;
+        // CI's real-clipboard steps grep this line: the test got past its
+        // gate, opened a clipboard, and its last write found the worker alive.
+        eprintln!(
+            "real-clipboard: the round trip ran and outlived a clone's drop (read its own write back: {read_back})"
+        );
     }
 }
