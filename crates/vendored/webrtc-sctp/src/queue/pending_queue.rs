@@ -199,9 +199,12 @@ impl PendingQueue {
     /// stream's sequence number and buffered amount). It runs once the first
     /// chunk has room, with no await between it and that chunk's push, so an
     /// append dropped at any of its awaits before then (the lock, the room)
-    /// leaves no trace, and one let go by the queue's close commits nothing.
-    /// An empty append commits nothing: no chunk carries the number. It runs
-    /// before the push, so no ack can release bytes not yet counted.
+    /// leaves no trace, and so does one the queue's close lets go before then.
+    /// A large append the close lets go after its first chunk was queued has
+    /// committed: it returns false with part of its message queued, on an
+    /// association that is going away. An empty append commits nothing: no
+    /// chunk carries the number. The commit runs before the push, so no ack
+    /// can release bytes not yet counted.
     ///
     /// # Panics
     ///

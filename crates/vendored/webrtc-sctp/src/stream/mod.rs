@@ -283,7 +283,11 @@ impl Stream {
     ///   chunk; dropped after its first chunk was queued, it is begun: its rest
     ///   is queued as it drops, and the peer reads it whole, once, in its
     ///   place. A caller that retries such a cut write may deliver it twice;
-    /// - a write that returned `Ok` is queued whole, in order.
+    /// - a write that returned `Ok` is queued whole, in order. One that the
+    ///   association's close lets go returns an error; if it was such a large
+    ///   write with its first chunk queued, its sequence number is spent, its
+    ///   length counts in the buffered amount, and part of it stays queued, on
+    ///   an association that is going away.
     pub async fn write_sctp(&self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
         // roomler (#3716): a write holds its turn from its shutdown check until
         // its chunks are queued or it is let go, so the stream's reset never

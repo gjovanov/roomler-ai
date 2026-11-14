@@ -543,3 +543,101 @@ async fn test_stream_a_write_dropped_at_any_await_leaves_no_trace() -> Result<()
     );
     Ok(())
 }
+
+/// roomler (#3755): a stream of `queue` on an association in `state`.
+fn stream_on(name: &str, state: &Arc<AtomicU8>, queue: &Arc<PendingQueue>) -> Stream {
+    let (awake_tx, _awake_rx) = mpsc::channel(1);
+    Stream::new(
+        name.to_owned(),
+        1,
+        1200,
+        Arc::new(AtomicU32::new(65536)),
+        Arc::clone(state),
+        Arc::new(awake_tx),
+        Arc::clone(queue),
+    )
+}
+
+/// roomler (#3755): a write refused because the association is not
+/// established leaves no trace: the refusal comes before the commit, so the
+/// stream's sequence number and `buffered_amount` are as they were and nothing
+/// is queued. The next write, once the association is up, takes the number.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_a_write_refused_before_the_association_is_up_leaves_no_trace() -> Result<()> {
+    let queue = Arc::new(PendingQueue::new());
+    let state = Arc::new(AtomicU8::new(AssociationState::CookieWait as u8));
+    let s = stream_on("refused_before_up", &state, &queue);
+    let trace = |s: &Stream| {
+        (
+            s.sequence_number.load(Ordering::SeqCst),
+            s.buffered_amount(),
+            queue.len(),
+        )
+    };
+    let before = trace(&s);
+    let refused = s
+        .write_sctp(
+            &Bytes::from_static(b"early"),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await;
+    assert_eq!(
+        refused,
+        Err(Error::ErrPayloadDataStateNotExist),
+        "the write must be refused"
+    );
+    assert_eq!(
+        trace(&s),
+        before,
+        "the refused write left a trace: (sequence number, buffered_amount, chunks)"
+    );
+
+    state.store(AssociationState::Established as u8, Ordering::SeqCst);
+    s.write_sctp(
+        &Bytes::from_static(b"next"),
+        PayloadProtocolIdentifier::Binary,
+    )
+    .await?;
+    assert_eq!(
+        queue.peek().map(|c| c.stream_sequence_number),
+        Some(before.0),
+        "the next write must take the number the refused one did not spend"
+    );
+    Ok(())
+}
+
+/// roomler (#3755): an empty write queues no chunk, so it spends no sequence
+/// number: no chunk would carry it, and the receiver of an ordered stream
+/// would wait for it forever. The next write takes it.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_an_empty_write_spends_no_sequence_number() -> Result<()> {
+    let queue = Arc::new(PendingQueue::new());
+    let state = Arc::new(AtomicU8::new(AssociationState::Established as u8));
+    let s = stream_on("empty_write", &state, &queue);
+    let ssn = s.sequence_number.load(Ordering::SeqCst);
+    assert_eq!(
+        s.write_sctp(&Bytes::new(), PayloadProtocolIdentifier::Binary)
+            .await?,
+        0
+    );
+    assert_eq!(
+        (
+            s.sequence_number.load(Ordering::SeqCst),
+            s.buffered_amount(),
+            queue.len()
+        ),
+        (ssn, 0, 0),
+        "the empty write left a trace: (sequence number, buffered_amount, chunks)"
+    );
+    s.write_sctp(
+        &Bytes::from_static(b"next"),
+        PayloadProtocolIdentifier::Binary,
+    )
+    .await?;
+    assert_eq!(
+        queue.peek().map(|c| c.stream_sequence_number),
+        Some(ssn),
+        "the next write must take the number the empty one did not spend"
+    );
+    Ok(())
+}
