@@ -5444,4 +5444,315 @@ mod tests {
             .await;
         assert!(opened.is_err(), "a forward through the SYSTEM service");
     }
+
+    /// #3815 — the SSH server logs what reaches it from outside escaped, by
+    /// #3812's rule (`docs/security-baseline.md`): what a client sends (the
+    /// user it logs in as, its terminal, a subsystem's name, where it asks to
+    /// forward to), the server's name for who asked (`caller`), and the
+    /// account a policy names. A line break in any of them stays inside its
+    /// own log line, and a control character is never written as it came.
+    ///
+    /// Each case runs on one thread (`#[tokio::test]`), where
+    /// [`crate::peer::files_log_tests::Logged`] hears every line the server,
+    /// the client and the exec engine write. At the end of the file, so no
+    /// line above moves.
+    mod wire_text_log_tests {
+        use super::*;
+        use crate::peer::files_log_tests::Logged;
+        use roomler_ai_remote_control::models::{ConsentMode, SshServiceCeiling};
+
+        /// What follows each line break below: a log line starting with it
+        /// is one the text started.
+        const AFTER_A_BREAK: &str = "SECOND LINE";
+
+        /// `s` as a log line holds it: quoted and escaped.
+        fn escaped(s: &str) -> String {
+            format!("{s:?}")
+        }
+
+        /// The start of [`escaped`], for a value that begins with `s`.
+        fn escaped_start(s: &str) -> String {
+            let quoted = escaped(s);
+            quoted[..quoted.len() - 1].to_string()
+        }
+
+        /// The first line of `log` holding `message`.
+        fn line_with<'a>(log: &'a str, message: &str) -> &'a str {
+            log.lines()
+                .find(|l| l.contains(message))
+                .unwrap_or_else(|| panic!("no {message:?} line in:\n{log}"))
+        }
+
+        /// No line of `log` starts with what followed a line break, and the
+        /// control character `raw` is nowhere in it as it came.
+        fn assert_one_line_each(log: &str, raw: char) {
+            let strays: Vec<&str> = log
+                .lines()
+                .filter(|l| l.trim_start().starts_with(AFTER_A_BREAK))
+                .collect();
+            assert!(
+                strays.is_empty(),
+                "text from outside started a log line of its own: {strays:#?}\nin:\n{log}"
+            );
+            assert!(
+                !log.contains(raw),
+                "{raw:?} reached the log as it came:\n{log}"
+            );
+        }
+
+        /// [`connect`] as `user`, and where the server sees it come from.
+        /// `Err` = refused.
+        async fn connect_as(
+            addr: std::net::SocketAddr,
+            key: PrivateKey,
+            user: &str,
+        ) -> (
+            Result<russh::client::Handle<TestClient>, ()>,
+            std::net::SocketAddr,
+        ) {
+            let config = Arc::new(russh::client::Config::default());
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let from = stream.local_addr().unwrap();
+            let mut session = russh::client::connect_stream(config, stream, TestClient)
+                .await
+                .expect("ssh handshake");
+            let hash = session.best_supported_rsa_hash().await.unwrap().flatten();
+            let res = session
+                .authenticate_publickey(
+                    user,
+                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                )
+                .await
+                .expect("auth exchange");
+            (if res.success() { Ok(session) } else { Err(()) }, from)
+        }
+
+        /// A grant from `caller` for the key `line`, as the server pushes one.
+        fn grant_from(
+            caller: &str,
+            line: &str,
+            account_mode: &str,
+            account: Option<&str>,
+            consent: ConsentMode,
+        ) {
+            super::super::record_grant(
+                format!("g-{}", rand::random::<u32>()),
+                line.to_string(),
+                caller.to_string(),
+                account_mode.to_string(),
+                account.map(str::to_string),
+                Some(consent),
+                now_ms() + 30_000,
+                0,
+            )
+            .expect("a grant with a valid key is held");
+        }
+
+        /// A client's own strings: the user it logs in as (admitted by the
+        /// key list, and refused), the terminal it asks for, a subsystem's
+        /// name, and two places it asks to forward to (one the allowlist
+        /// refuses, one it lets through to a connect that fails). The
+        /// key-list session's `caller` holds the client's user too.
+        #[tokio::test]
+        async fn a_clients_user_term_subsystem_and_host_never_start_a_log_line_of_their_own() {
+            const USER: &str = "alice\nSECOND LINE from a user\u{1b}[2J";
+            const TERM: &str = "xterm\nSECOND LINE from a term\u{1b}[2J";
+            const SUBSYSTEM: &str = "netconf\nSECOND LINE from a subsystem\u{1b}[2J";
+            const REFUSED_HOST: &str = "db\nSECOND LINE from a host\u{1b}[2J";
+            // `.invalid` never resolves (RFC 6761), so this forward passes
+            // the allowlist and then fails at its connect.
+            const ALLOWED_HOST: &str = "db\nSECOND LINE from an allowed host\u{1b}[2J.invalid";
+            const REFUSED_USER: &str = "mallory\nSECOND LINE from a refused user\u{1b}[2J";
+
+            let log = Logged::start(tracing::Level::INFO);
+            let (key, line) = client_key(150);
+            let mut cfg = cfg_with(vec![line]);
+            cfg.forward_acl = acl_allowing(ALLOWED_HOST, 5432, 5432);
+            let addr = serve_one(&cfg).await;
+            let (session, from) = connect_as(addr, key, USER).await;
+            let session = session.expect("the listed key is admitted");
+
+            let mut channel = session.channel_open_session().await.unwrap();
+            channel
+                .request_pty(true, TERM, 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            channel.request_subsystem(true, SUBSYSTEM).await.unwrap();
+            // The server answers in order: the subsystem's refusal comes
+            // after the terminal's request is logged, and after its own line.
+            while let Some(msg) = channel.wait().await {
+                if matches!(msg, russh::ChannelMsg::Failure) {
+                    break;
+                }
+            }
+            assert!(
+                session
+                    .channel_open_direct_tcpip(REFUSED_HOST, 5432, "127.0.0.1", 5555)
+                    .await
+                    .is_err(),
+                "a forward the allowlist does not name is refused"
+            );
+            // Its outcome is the resolver's; the line is what is asserted.
+            let _ = session
+                .channel_open_direct_tcpip(ALLOWED_HOST, 5432, "127.0.0.1", 5556)
+                .await;
+
+            let (key, _) = client_key(151);
+            let addr = serve_one(&cfg_with(Vec::new())).await;
+            let (refused, _) = connect_as(addr, key, REFUSED_USER).await;
+            assert!(refused.is_err(), "a key with no grant and no listing");
+
+            let text = log.text();
+            assert_one_line_each(&text, '\u{1b}');
+            let caller = format!("ssh:{USER}@{from} (key-list)");
+            let lines: [(&str, Vec<String>); 5] = [
+                (
+                    "ssh: authenticated (ssh_authorized_keys)",
+                    vec![format!("user={}", escaped(USER))],
+                ),
+                (
+                    "ssh: pty requested",
+                    vec![format!("term={}", escaped(TERM))],
+                ),
+                (
+                    "ssh: refused an unsupported request",
+                    vec![format!("request={}", escaped(SUBSYSTEM))],
+                ),
+                (
+                    "ssh: forward refused",
+                    vec![
+                        format!("caller={}", escaped(&caller)),
+                        format!("host={}", escaped(REFUSED_HOST)),
+                        // The reason names the host it refused.
+                        format!("why={}", escaped_start(&format!("{REFUSED_HOST}:5432"))),
+                    ],
+                ),
+                (
+                    "ssh: rejected — no live grant for this key",
+                    vec![format!("user={}", escaped(REFUSED_USER))],
+                ),
+            ];
+            for (message, fields) in &lines {
+                let at = line_with(&text, message);
+                for field in fields {
+                    assert!(at.contains(field.as_str()), "{field} on {at:?}");
+                }
+            }
+            let allowed = format!("host={}", escaped(ALLOWED_HOST));
+            assert!(
+                text.lines()
+                    .any(|l| (l.contains("ssh: forward could not connect")
+                        || l.contains("ssh: forward opened"))
+                        && l.contains(&allowed)),
+                "{allowed} on the allowed forward's line:\n{text}"
+            );
+        }
+
+        /// The server's name for who asked (`caller`), as a grant brings it:
+        /// on the grant's own lines, through the question to the person at
+        /// the device, and into the exec engine's lines, both here and on the
+        /// SYSTEM service's port (FR-105), where the worker is asked.
+        #[tokio::test]
+        async fn a_callers_name_never_starts_a_log_line_of_its_own() {
+            const CALLER: &str = "Mallory\nSECOND LINE from a caller\u{7}";
+            let _lock = grant_test().await;
+            let _slot = exec_slot().await;
+            let log = Logged::start(tracing::Level::INFO);
+
+            // Asked here: the person at the device approves.
+            let (key, line) = client_key(152);
+            let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
+            grant_from(CALLER, &line, "daemon", None, ConsentMode::Prompt);
+            let operator = tokio::spawn(async move {
+                for _ in 0..250 {
+                    if questions_up(&broker)
+                        .iter()
+                        .any(|id| broker.record_decision(id, true))
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                false
+            });
+            let (session, from) = connect_as(addr, key, "roomler").await;
+            let session = session.expect("the grant admits its key");
+            let (out, err, _) = exec_over(&session, "echo caller-ran").await;
+            assert!(out.contains("caller-ran"), "stdout {out:?}, stderr {err:?}");
+            assert!(operator.await.unwrap(), "the person was asked");
+
+            // Asked through the worker, on the SYSTEM service's port.
+            let (key, line) = client_key(153);
+            grant_from(CALLER, &line, "daemon", None, ConsentMode::Prompt);
+            let (stream, _) = through_the_service(SshServiceCeiling::System, true, None);
+            let session = connect_over(stream, key)
+                .await
+                .expect("the grant admits its key");
+            let (out, err, _) = exec_over(&session, "echo through-the-service").await;
+            assert!(
+                out.contains("through-the-service"),
+                "stdout {out:?}, stderr {err:?}"
+            );
+
+            let text = log.text();
+            assert_one_line_each(&text, '\u{7}');
+            // The grant's own name for who asked, and the session's: `ssh:`,
+            // that name, and where the connection came from.
+            let named = format!("caller={}", escaped(CALLER));
+            let attributed = format!("caller={}", escaped(&format!("ssh:{CALLER}@{from}")));
+            for (message, field) in [
+                ("ssh: grant recorded", &named),
+                ("ssh: authenticated (server grant)", &named),
+                ("ssh: asking the person at the device", &named),
+                ("consent prompt surface (ssh)", &named),
+                ("ssh: operator approved the session", &named),
+                ("exec: streaming command", &attributed),
+                ("ssh: exec finished", &attributed),
+                (
+                    "ssh-service: the person at the device approved the session",
+                    &named,
+                ),
+            ] {
+                let at = line_with(&text, message);
+                assert!(at.contains(field.as_str()), "{field} on {at:?}");
+            }
+        }
+
+        /// The account a policy names, which an admin typed and the server
+        /// delivers: the exec engine's refusal and the session's last line
+        /// hold it escaped. This host has no such account, so nothing runs.
+        #[tokio::test]
+        async fn a_named_accounts_name_never_starts_a_log_line_of_its_own() {
+            const ACCOUNT: &str = "nobody\nSECOND LINE from an account\u{1b}[2J";
+            let _lock = grant_test().await;
+            let _slot = exec_slot().await;
+            let log = Logged::start(tracing::Level::INFO);
+
+            let (key, line) = client_key(154);
+            let addr = serve_one(&cfg_with(Vec::new())).await;
+            grant_from(
+                "alice@example.com",
+                &line,
+                "named",
+                Some(ACCOUNT),
+                ConsentMode::Auto,
+            );
+            let (session, _) = connect_as(addr, key, "roomler").await;
+            let session = session.expect("the grant admits its key");
+            let (out, err, exit) = exec_over(&session, "echo should-not-run").await;
+            assert!(!out.contains("should-not-run"), "it ran: {out:?}, {err:?}");
+            assert_eq!(exit, Some(1), "stderr {err:?}");
+
+            let text = log.text();
+            assert_one_line_each(&text, '\u{1b}');
+            let run_as = format!("run_as={}", escaped(&format!("named:{ACCOUNT}")));
+            for message in [
+                "exec: refusing to run — the requested identity is unavailable",
+                "ssh: exec finished",
+            ] {
+                let at = line_with(&text, message);
+                assert!(at.contains(&run_as), "{run_as} on {at:?}");
+            }
+        }
+    }
 }
