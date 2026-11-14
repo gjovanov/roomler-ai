@@ -813,7 +813,9 @@ impl RunAs {
 ///
 /// #3822 — `async`: `console_user` asks who is at the screen
 /// ([`console_account`]) at the same point as before, after every gate, and on
-/// Linux without holding the caller's async worker.
+/// Linux without holding the caller's async worker. #3853 — and `named` and
+/// `console_user` look their account up the same way, off the worker, 1.5 s
+/// at most (`unix_priv::session_account`).
 pub(crate) async fn apply_run_as(
     cmd: &mut tokio::process::Command,
     who: &RunAs,
@@ -827,7 +829,7 @@ pub(crate) async fn apply_run_as(
         RunAs::Daemon => Ok(()),
 
         #[cfg(unix)]
-        RunAs::Named(account) => unix_priv::drop_to(cmd, account),
+        RunAs::Named(account) => unix_priv::drop_to(cmd, account).await,
         #[cfg(not(unix))]
         RunAs::Named(account) => Err(format!(
             "cannot run as the local account {account:?}: becoming an arbitrary user on Windows \
@@ -853,7 +855,9 @@ pub(crate) async fn apply_run_as(
         // there, when that person is root, and by a daemon that is neither
         // root nor them.
         #[cfg(unix)]
-        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account().await?, false),
+        RunAs::ConsoleUser => {
+            unix_priv::drop_to_console(cmd, &console_account().await?, false).await
+        }
         #[cfg(not(any(windows, unix)))]
         RunAs::ConsoleUser => {
             Err("account_mode `console_user` has no console to read on this platform".into())
@@ -877,8 +881,10 @@ pub(crate) async fn apply_run_as_at_home(
     if ssh_starts_in_home() {
         return match who {
             RunAs::Daemon => Ok(()),
-            RunAs::Named(account) => unix_priv::drop_to_in(cmd, account, true),
-            RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account().await?, true),
+            RunAs::Named(account) => unix_priv::drop_to_in(cmd, account, true).await,
+            RunAs::ConsoleUser => {
+                unix_priv::drop_to_console(cmd, &console_account().await?, true).await
+            }
         };
     }
     apply_run_as(cmd, who).await
@@ -904,16 +910,27 @@ pub(crate) fn ssh_starts_in_home() -> bool {
 /// caller's async worker. Only a person's answer is an account
 /// ([`console_person`]): no answer in time, or a lookup that failed, refuses
 /// with the try-again text, and nothing else ever stands in for the person.
+///
+/// #3853 — on macOS, who owns `/dev/console` is a `stat` child: asked through
+/// one lookup in flight ([`ask_console_owner`], on a thread named
+/// `console-owner`), [`ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most, with the same
+/// try-again text when it gives no answer ([`console_owner`]).
 #[cfg(unix)]
 async fn console_account() -> Result<String, String> {
-    // A test stands the console's owner in for its own task.
-    #[cfg(all(target_os = "macos", test))]
-    let who = match mac_console_stand_in::now() {
-        Some(stood) => stood.owner_now(),
-        None => crate::companion::console_user_name().map_err(|e| format!("{e:#}")),
+    #[cfg(target_os = "macos")]
+    let who = {
+        let wait = ACCOUNT_LOOKUP_WAIT;
+        // A test stands the console's owner in for its own task, with a
+        // lookup in flight of its own.
+        #[cfg(test)]
+        let asked = match mac_console_stand_in::now() {
+            Some(stood) => stood.ask(wait).await,
+            None => ask_console_owner(wait).await,
+        };
+        #[cfg(not(test))]
+        let asked = ask_console_owner(wait).await;
+        console_owner(asked, wait)
     };
-    #[cfg(all(target_os = "macos", not(test)))]
-    let who = crate::companion::console_user_name().map_err(|e| format!("{e:#}"));
     #[cfg(target_os = "linux")]
     let who = {
         let wait = crate::files::SEAT_LOOKUP_WAIT;
@@ -987,6 +1004,59 @@ fn console_person(
     }
 }
 
+/// #3853 — who owns `/dev/console` (`companion::console_user_name`, a `stat`
+/// child) for exec's and SSH's `console_user` on a Mac, asked from an async
+/// task through one lookup in flight on a thread named `console-owner`,
+/// `wait` at most: a `stat` that does not return holds that one thread, never
+/// the caller's async worker, and the asks that come while it hangs start no
+/// other. Only a lookup that began after the question answers it. What no
+/// answer means is [`console_owner`]'s to say.
+#[cfg(target_os = "macos")]
+async fn ask_console_owner(
+    wait: std::time::Duration,
+) -> crate::one_in_flight::Asked<Result<String, String>> {
+    static OWNER: crate::one_in_flight::OneInFlight<Result<String, String>> =
+        crate::one_in_flight::OneInFlight::new("console-owner");
+    OWNER
+        .ask(wait, || {
+            crate::companion::console_user_name().map_err(|e| format!("{e:#}"))
+        })
+        .await
+}
+
+/// #3853 — the account `console_user` runs as on a Mac, from what the console
+/// owner lookup answered within `wait`: a person's, and nothing else. Nobody
+/// at the screen (the login window, a system account) says why, as before; no
+/// answer in time, or a lookup that panicked, says to try again
+/// (`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`, the words #3822 gives on Linux). The
+/// lookup goes on, on its own thread, and a retry asks again.
+#[cfg(target_os = "macos")]
+fn console_owner(
+    asked: crate::one_in_flight::Asked<Result<String, String>>,
+    wait: std::time::Duration,
+) -> Result<String, String> {
+    use crate::one_in_flight::Asked;
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN as TRY_AGAIN;
+    match asked {
+        Asked::Answer(who) => who,
+        Asked::Failed(why) => {
+            warn!(%why, "exec: the console owner lookup failed — console_user is refused, try again");
+            Err(format!(
+                "{TRY_AGAIN} (the console owner lookup failed: {why})"
+            ))
+        }
+        Asked::OutOfTime => {
+            warn!(
+                ?wait,
+                "exec: who owns /dev/console gave no answer in time — console_user is refused, try again"
+            );
+            Err(format!(
+                "{TRY_AGAIN} (`stat /dev/console` gave no answer within {wait:?})"
+            ))
+        }
+    }
+}
+
 /// #3822 — the seat0 lookup stood in for `console_user`, for the tasks of one
 /// test: what logind and the account database answer, asked where the daemon
 /// asks its own. A task-local, so the tests beside it, and the daemon's own
@@ -1043,14 +1113,18 @@ pub(crate) mod console_stand_in {
 /// stood in.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod mac_console_stand_in {
+    use crate::one_in_flight::{Asked, OneInFlight};
     use std::sync::Arc;
 
     /// What the console's owner is, or why nobody is.
     type Owner = dyn Fn() -> Result<String, String> + Send + Sync;
 
+    /// The console's owner stood in, with a lookup in flight of its own: one
+    /// a test holds up never holds up the tests beside it.
     #[derive(Clone)]
     pub(crate) struct StandIn {
         owner: Arc<Owner>,
+        flight: Arc<OneInFlight<Result<String, String>>>,
     }
 
     impl StandIn {
@@ -1059,12 +1133,15 @@ pub(crate) mod mac_console_stand_in {
         ) -> Self {
             Self {
                 owner: Arc::new(owner),
+                flight: Arc::new(OneInFlight::new("console-owner")),
             }
         }
 
-        /// The console's owner, asked where `console_account` asks it.
-        pub(super) fn owner_now(&self) -> Result<String, String> {
-            (self.owner)()
+        /// The console's owner, asked as `console_account` asks the daemon's:
+        /// through its own lookup in flight, `wait` at most.
+        pub(super) async fn ask(&self, wait: std::time::Duration) -> Asked<Result<String, String>> {
+            let owner = self.owner.clone();
+            self.flight.ask(wait, move || owner()).await
         }
     }
 
@@ -1137,6 +1214,11 @@ pub(crate) use unix_priv::account_name;
 /// here — `resolve`, `Account`, `drop_body` — stays private, so the crate has
 /// exactly one way to drop privilege and no way to assemble a partial one.
 ///
+/// #3853 — exec's and SSH's sessions resolve their account off the async
+/// worker: `session_account` runs the lookup on a thread of its own, one in
+/// flight per account name, 1.5 s at most. Still in the parent and still
+/// before the fork, so the rule above holds as it was.
+///
 /// ⚠️ The cfg mirrors its ONE consumer (`capture::portal`) exactly. A helper
 /// gated more loosely than the code that uses it is dead on every other lane,
 /// and `-D warnings` turns that into a build failure in CI rather than here —
@@ -1151,26 +1233,29 @@ pub(crate) use unix_priv::drop_to_std;
 
 /// #3853 — how long an exec or an SSH session waits for the account database
 /// to resolve the account it runs as (`named`, and `console_user` after the
-/// seat lookup): `files::SEAT_LOOKUP_WAIT`'s 1.5 s.
-#[cfg(all(unix, test))]
+/// seat lookup): `files::SEAT_LOOKUP_WAIT`'s 1.5 s. On a Mac it also bounds
+/// `console_user`'s look at who owns `/dev/console`.
+#[cfg(unix)]
 pub(crate) const ACCOUNT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// #3853 — the try-again words of a refusal whose account the account
 /// database did not resolve: no answer in time, or a lookup that failed.
-#[cfg(all(unix, test))]
+#[cfg(unix)]
 pub(crate) const ACCOUNT_LOOKUP_TRY_AGAIN: &str =
     "Could not look up the account to run as in this computer's account database. Try again.";
 
 #[cfg(unix)]
 mod unix_priv {
+    use crate::one_in_flight::{Asked, OneInFlightPerKey};
     use std::ffi::CString;
 
     /// A resolved local account: everything the child needs, pre-computed.
     ///
     /// `Debug` is for the tests' `unwrap_err()`; nothing secret lives here —
     /// uid, gid, group list and home path are all readable from `/etc/passwd`
-    /// by anyone on the box.
-    #[derive(Debug)]
+    /// by anyone on the box. #3853 — `Clone`: one lookup's answer is shared
+    /// by every session that asked for the account while it ran.
+    #[derive(Debug, Clone)]
     struct Account {
         uid: libc::uid_t,
         gid: libc::gid_t,
@@ -1179,10 +1264,43 @@ mod unix_priv {
         name: String,
     }
 
-    /// Look up an account by name.
+    /// #3853 — why an account did not resolve.
+    #[derive(Debug, Clone)]
+    enum Unresolved {
+        /// The account database answered, and the name is not an account a
+        /// session may run as: a NUL byte, no such account, uid 0. The same
+        /// words as ever; asking again gives the same answer.
+        Refused(String),
+        /// The lookup itself failed: the account database returned an error
+        /// (`getpwnam_r` other than not found). Asking again may answer.
+        Failed(String),
+    }
+
+    impl Unresolved {
+        #[cfg(any(target_os = "linux", test))]
+        fn into_text(self) -> String {
+            match self {
+                Self::Refused(why) | Self::Failed(why) => why,
+            }
+        }
+    }
+
+    /// Look up an account by name: [`lookup`], its refusal in words. For
+    /// the callers that resolve inline (FR-85's and FR-97's), which run on a
+    /// lookup thread or a blocking thread of their own.
+    #[cfg(any(target_os = "linux", test))]
     fn resolve(account: &str) -> Result<Account, String> {
-        let c_name = CString::new(account)
-            .map_err(|_| format!("account name {account:?} contains a NUL byte"))?;
+        lookup(account).map_err(Unresolved::into_text)
+    }
+
+    /// Look up an account by name (`getpwnam_r`, then `getgrouplist`): the
+    /// account, or why not. Blocking, for as long as the account database
+    /// takes: exec and SSH call it only off the async worker
+    /// ([`session_account`]).
+    fn lookup(account: &str) -> Result<Account, Unresolved> {
+        let c_name = CString::new(account).map_err(|_| {
+            Unresolved::Refused(format!("account name {account:?} contains a NUL byte"))
+        })?;
 
         // `getpwnam_r` with a buffer we grow rather than `getpwnam`, which
         // returns a pointer into static storage another thread can overwrite.
@@ -1208,15 +1326,17 @@ mod unix_priv {
                 continue;
             }
             if rc != 0 {
-                return Err(format!(
+                return Err(Unresolved::Failed(format!(
                     "looking up local account {account:?} failed: {}",
                     std::io::Error::from_raw_os_error(rc)
-                ));
+                )));
             }
             break;
         }
         if result.is_null() {
-            return Err(format!("no local account named {account:?} on this host"));
+            return Err(Unresolved::Refused(format!(
+                "no local account named {account:?} on this host"
+            )));
         }
 
         let uid = pwd.pw_uid;
@@ -1227,10 +1347,10 @@ mod unix_priv {
         // must be an explicit choice in the policy rather than a side effect
         // of naming an account that happens to be uid 0.
         if uid == 0 {
-            return Err(format!(
+            return Err(Unresolved::Refused(format!(
                 "account {account:?} is uid 0; use account_mode `daemon` if running as root is \
                  really intended"
-            ));
+            )));
         }
 
         let home = unsafe { cstr_to_string(pwd.pw_dir) };
@@ -1349,16 +1469,84 @@ mod unix_priv {
             .into_owned()
     }
 
-    /// The account an exec or an SSH session runs as (`named`, and
-    /// `console_user` after the seat lookup). #3853's seam, at master's
-    /// behaviour: looked up here, on the caller's own thread, with no time
-    /// limit. A test stands the account database in first.
-    fn session_account(account: &str) -> Result<Account, String> {
+    /// #3853 — the account lookups of exec's and SSH's sessions in flight,
+    /// one per account name, each on a thread named `account-lookup`
+    /// (`/proc/<pid>/task/*/comm` shows it).
+    static ACCOUNTS: OneInFlightPerKey<String, Result<Account, Unresolved>> =
+        OneInFlightPerKey::new("account-lookup");
+
+    /// #3853 — the account an exec or an SSH session runs as (`named`, and
+    /// `console_user` after the seat lookup), resolved off the async worker:
+    /// [`lookup`] on a thread of its own, through the one lookup in flight
+    /// for this account's name ([`ACCOUNTS`]), awaited from the caller's task
+    /// [`super::ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most.
+    ///
+    /// - **Keyed by the name**, exactly as it is looked up: `named:ana` and a
+    ///   `console_user` session whose person is `ana` share one lookup. While
+    ///   the account database hangs, the asks for an account hold one thread,
+    ///   however many there are.
+    /// - **Only a lookup that began after this question answers it**
+    ///   (`one_in_flight`'s rule): one already running is waited out, and its
+    ///   answer, older than the question, is never taken.
+    /// - **Still in the parent, before the fork**: the [`Account`] crosses to
+    ///   this task and the child only makes bare syscalls over memory the
+    ///   drop already owns (`drop_body`), as before.
+    ///
+    /// What came back, or did not, becomes the account or the refusal in
+    /// [`in_time`].
+    async fn session_account(account: &str) -> Result<Account, String> {
+        let wait = super::ACCOUNT_LOOKUP_WAIT;
+        let name = account.to_string();
+        // A test stands the account database in for its own task, with
+        // lookups in flight of its own.
         #[cfg(test)]
-        if let Some(stood) = account_stand_in::now() {
-            stood.before_the_lookup(account)?;
-        }
-        resolve(account)
+        let asked = match account_stand_in::now() {
+            Some(stood) => stood.ask(name, wait).await,
+            None => {
+                ACCOUNTS
+                    .ask(name.clone(), wait, move || lookup(&name))
+                    .await
+            }
+        };
+        #[cfg(not(test))]
+        let asked = ACCOUNTS
+            .ask(name.clone(), wait, move || lookup(&name))
+            .await;
+        in_time(asked, account, wait)
+    }
+
+    /// #3853 — what the account lookup answered within `wait`, as the
+    /// account a session runs as: only an account it resolved.
+    ///
+    /// - A name the account database refused (no such account, uid 0, a NUL
+    ///   byte) is refused in the words it always had.
+    /// - No answer in time, an error from the account database, or a lookup
+    ///   that panicked says to try again (`ACCOUNT_LOOKUP_TRY_AGAIN`), with
+    ///   why and the account's name. The lookup goes on, on its own thread,
+    ///   and a retry asks again.
+    ///
+    /// No arm gives another account: not root, not the daemon's own, not an
+    /// account a lookup resolved before the question.
+    fn in_time(
+        asked: Asked<Result<Account, Unresolved>>,
+        account: &str,
+        wait: std::time::Duration,
+    ) -> Result<Account, String> {
+        use super::ACCOUNT_LOOKUP_TRY_AGAIN as TRY_AGAIN;
+        let why = match asked {
+            Asked::Answer(Ok(acct)) => return Ok(acct),
+            Asked::Answer(Err(Unresolved::Refused(why))) => return Err(why),
+            Asked::Answer(Err(Unresolved::Failed(why))) => why,
+            Asked::Failed(why) => format!("the account lookup failed: {why}"),
+            Asked::OutOfTime => {
+                format!("the account database gave no answer within {wait:?}")
+            }
+        };
+        tracing::warn!(
+            %account, %why,
+            "exec: the account to run as was not looked up — refused, try again"
+        );
+        Err(format!("cannot run as {account:?}: {TRY_AGAIN} ({why})"))
     }
 
     /// #3853 — the account database stood in for the account lookups of
@@ -1369,14 +1557,23 @@ mod unix_priv {
     /// daemon's own lookups, are never stood in.
     #[cfg(test)]
     pub(crate) mod account_stand_in {
+        use super::{Account, Unresolved, lookup};
+        use crate::one_in_flight::{Asked, OneInFlightPerKey};
         use std::sync::Arc;
 
         /// What the account database does with a lookup of an account.
         type Database = dyn Fn(&str) -> Result<(), String> + Send + Sync;
 
+        /// Lookups in flight, one per account name, as the daemon's.
+        type Lookups = OneInFlightPerKey<String, Result<Account, Unresolved>>;
+
+        /// The account database stood in, with lookups in flight of its own:
+        /// one a test holds up never holds up the tests beside it, which ask
+        /// the daemon's (`ACCOUNTS`).
         #[derive(Clone)]
         pub(crate) struct StandIn {
             database: Arc<Database>,
+            lookups: &'static Lookups,
         }
 
         impl StandIn {
@@ -1385,12 +1582,27 @@ mod unix_priv {
             ) -> Self {
                 Self {
                     database: Arc::new(database),
+                    lookups: Box::leak(Box::new(OneInFlightPerKey::new("account-lookup"))),
                 }
             }
 
-            /// The account database, asked where the lookup runs.
-            pub(super) fn before_the_lookup(&self, account: &str) -> Result<(), String> {
-                (self.database)(account)
+            /// `account` looked up as `session_account` looks it up: the
+            /// account database asked first (its `Err` is a failed lookup),
+            /// then the real lookup, through this stand-in's own lookups in
+            /// flight, `wait` at most.
+            pub(super) async fn ask(
+                &self,
+                account: String,
+                wait: std::time::Duration,
+            ) -> Asked<Result<Account, Unresolved>> {
+                let database = self.database.clone();
+                let key = account.clone();
+                self.lookups
+                    .ask(key, wait, move || {
+                        database(&account).map_err(Unresolved::Failed)?;
+                        lookup(&account)
+                    })
+                    .await
             }
         }
 
@@ -1464,18 +1676,24 @@ mod unix_priv {
     /// `pre_exec` here is tokio's own inherent method on `Command`; the
     /// `CommandExt` import that `drop_to_std` needs does not affect it,
     /// because an inherent method wins over a trait method.
-    pub(super) fn drop_to(cmd: &mut tokio::process::Command, account: &str) -> Result<(), String> {
-        drop_to_in(cmd, account, false)
+    ///
+    /// #3853 — `async`: the account is looked up off the caller's worker,
+    /// 1.5 s at most ([`session_account`]), and a refusal configures nothing.
+    pub(super) async fn drop_to(
+        cmd: &mut tokio::process::Command,
+        account: &str,
+    ) -> Result<(), String> {
+        drop_to_in(cmd, account, false).await
     }
 
     /// [`drop_to`], and with `at_home` (FR-97 P5b) the child starts in the
     /// account's home ([`start_in_home`]).
-    pub(super) fn drop_to_in(
+    pub(super) async fn drop_to_in(
         cmd: &mut tokio::process::Command,
         account: &str,
         at_home: bool,
     ) -> Result<(), String> {
-        let acct = session_account(account)?;
+        let acct = session_account(account).await?;
         cmd.env("HOME", &acct.home)
             .env("USER", &acct.name)
             .env("LOGNAME", &acct.name);
@@ -1493,14 +1711,15 @@ mod unix_priv {
     /// command as itself, which changes no identity, and could not drop
     /// anyway: `setgroups` needs root even to keep its own groups. Any other
     /// daemon cannot become them, and says so. uid 0 is refused by
-    /// [`resolve`], as for a named account. With `at_home` (P5b) the child
-    /// starts in their home.
-    pub(super) fn drop_to_console(
+    /// [`lookup`], as for a named account. With `at_home` (P5b) the child
+    /// starts in their home. #3853 — their account is looked up off the
+    /// caller's worker, 1.5 s at most ([`session_account`]).
+    pub(super) async fn drop_to_console(
         cmd: &mut tokio::process::Command,
         account: &str,
         at_home: bool,
     ) -> Result<(), String> {
-        let acct = session_account(account)?;
+        let acct = session_account(account).await?;
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
         let must_drop = console_drop(unsafe { libc::geteuid() }, &acct)?;
         cmd.env("HOME", &acct.home)

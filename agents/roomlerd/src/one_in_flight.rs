@@ -139,6 +139,7 @@ impl<T: Clone> Flight<T> {
     }
 
     /// [`Self::ended_by`] on a blocking thread.
+    #[cfg(any(target_os = "linux", test))]
     fn ended_by_blocking(&self, deadline: Instant) -> Option<Result<T, String>> {
         let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
@@ -189,6 +190,7 @@ impl<T: Clone + Send + 'static> OneInFlight<T> {
     }
 
     /// [`Self::ask`] from a blocking thread.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn ask_blocking<F>(&self, wait: Duration, lookup: F) -> Asked<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -210,7 +212,7 @@ impl<T: Clone + Send + 'static> OneInFlight<T> {
     /// by nobody: a refresh for the callers that may not wait at all
     /// ([`Remembered::now`]). Whoever asks meanwhile takes its answer by this
     /// module's rules.
-    #[cfg(any(feature = "recording", test))]
+    #[cfg(any(all(target_os = "linux", feature = "recording"), test))]
     pub(crate) fn start_unless_running<F>(&self, lookup: F)
     where
         F: FnOnce() -> T + Send + 'static,
@@ -278,7 +280,7 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 /// wait at all, over one [`OneInFlight`] (the module's rules). The daemon's
 /// are statics, so the methods take `&'static self`: the lookup's own thread
 /// stores what it answers.
-#[cfg(any(feature = "recording", test))]
+#[cfg(any(all(target_os = "linux", feature = "recording"), test))]
 pub(crate) struct Remembered<T> {
     /// How long an answer counts as current.
     window: Duration,
@@ -289,7 +291,7 @@ pub(crate) struct Remembered<T> {
     lookups: OneInFlight<T>,
 }
 
-#[cfg(any(feature = "recording", test))]
+#[cfg(any(all(target_os = "linux", feature = "recording"), test))]
 impl<T: Clone + Send + 'static> Remembered<T> {
     /// Lookups on a thread named `thread_name`, each answer current for
     /// `window`.
@@ -367,6 +369,128 @@ impl<T: Clone + Send + 'static> Remembered<T> {
             }
             drop(slot);
             answer
+        }
+    }
+}
+
+/// #3853 — [`OneInFlight`]'s rules for each key on its own: at most one
+/// lookup in flight for a key, its answer shared by whoever asks for that key
+/// while it runs, and never by a caller who asked before it began. A lookup
+/// for one key never waits on, joins or answers another key's.
+///
+/// A key's entry lives only while its lookup runs. The lookup's own thread
+/// removes it as the lookup ends, answered, failed or panicked, so the map
+/// holds the keys whose lookups run and nothing else, whatever keys were
+/// asked before.
+///
+/// Exec's and SSH's account lookups are keyed by the account's name
+/// (`exec::unix_priv`). While the account database hangs, the asks for one
+/// account hold one thread, however many there are, and each other account
+/// asked holds one of its own. The daemon's is a static, so the methods take
+/// `&'static self`: the lookup's own thread removes its key.
+pub(crate) struct OneInFlightPerKey<K, T> {
+    /// What each lookup's thread is called.
+    thread_name: &'static str,
+    /// The lookup running for each key.
+    running: Mutex<std::collections::BTreeMap<K, Arc<Flight<T>>>>,
+}
+
+impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerKey<K, T> {
+    pub(crate) const fn new(thread_name: &'static str) -> Self {
+        Self {
+            thread_name,
+            running: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// The answer of a lookup for `key` that began at or after this call,
+    /// within `wait`: [`OneInFlight::ask`]'s rules, for `key` alone.
+    pub(crate) async fn ask<F>(&'static self, key: K, wait: Duration, lookup: F) -> Asked<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let asked = Instant::now();
+        let deadline = asked + wait;
+        // A lookup for this key that began before this question is waited
+        // out, its answer left to the callers it was asked for.
+        while let Some(earlier) = self.running_from_before(&key, asked) {
+            if earlier.ended_by(deadline).await.is_none() {
+                return Asked::OutOfTime;
+            }
+        }
+        // Then the lookup for this key that began since, or this caller's own.
+        match self.join_or_start(key, lookup).ended_by(deadline).await {
+            Some(how) => how.into(),
+            None => Asked::OutOfTime,
+        }
+    }
+
+    /// How many keys have a lookup running: everything the map holds.
+    #[cfg(test)]
+    pub(crate) fn keys_in_flight(&self) -> usize {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// The lookup running for `key`, when it began before `asked`.
+    fn running_from_before(&self, key: &K, asked: Instant) -> Option<Arc<Flight<T>>> {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .filter(|flight| flight.is_running() && flight.began < asked)
+            .cloned()
+    }
+
+    /// The lookup running for `key`, or `lookup`, started now.
+    fn join_or_start<F>(&'static self, key: K, lookup: F) -> Arc<Flight<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(flight) = running.get(&key).filter(|flight| flight.is_running()) {
+            return flight.clone();
+        }
+        let flight = Arc::new(Flight::new());
+        running.insert(key.clone(), flight.clone());
+        drop(running);
+        self.start(key, flight.clone(), lookup);
+        flight
+    }
+
+    /// `lookup` on a thread of its own, which ends `flight` however it goes
+    /// and then removes `key`'s entry.
+    fn start<F>(&'static self, key: K, flight: Arc<Flight<T>>, lookup: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let ends = flight.clone();
+        let ended = key.clone();
+        let started = std::thread::Builder::new()
+            .name(self.thread_name.to_string())
+            .spawn(move || {
+                let how = std::panic::catch_unwind(std::panic::AssertUnwindSafe(lookup))
+                    .map_err(|panic| format!("it panicked: {}", panic_text(panic.as_ref())));
+                ends.end(how);
+                self.forget(&ended, &ends);
+            });
+        if let Err(e) = started {
+            flight.end(Err(format!("its thread did not start: {e}")));
+            self.forget(&key, &flight);
+        }
+    }
+
+    /// `key`'s entry goes once `flight`, its lookup, has ended, unless a
+    /// newer lookup for the key has already taken its place.
+    fn forget(&self, key: &K, flight: &Arc<Flight<T>>) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if running
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(entry, flight))
+        {
+            running.remove(key);
         }
     }
 }
@@ -750,5 +874,120 @@ mod tests {
         let worst = rx.recv_timeout(LONG).expect("the timer kept waking");
         assert!(worst < Duration::from_millis(500), "it woke {worst:?} late");
         assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3853 — a [`OneInFlightPerKey`] for a test: `'static`, as the
+    /// daemon's is.
+    fn per_key() -> &'static OneInFlightPerKey<&'static str, u32> {
+        Box::leak(Box::new(OneInFlightPerKey::new("test-per-key")))
+    }
+
+    /// #3853 — while lookups hang, the asks for one key share its one
+    /// lookup, in a row or at once, and another key gets a lookup of its
+    /// own. Once they are let go, no entry is left behind, and the next ask
+    /// starts a lookup of its own, whose end leaves none either.
+    #[tokio::test]
+    async fn asks_for_one_key_share_its_lookup_and_another_key_gets_its_own() {
+        let lookups = per_key();
+        let (ana, bob) = (Gate::default(), Gate::default());
+        let _opened = (OpenedAtTheEnd(ana.clone()), OpenedAtTheEnd(bob.clone()));
+        for _ in 0..3 {
+            assert_eq!(
+                lookups.ask("ana", SHORT, ana.lookup(1)).await,
+                Asked::OutOfTime
+            );
+        }
+        let (a, b, c) = tokio::join!(
+            lookups.ask("ana", SHORT, ana.lookup(2)),
+            lookups.ask("ana", SHORT, ana.lookup(3)),
+            lookups.ask("bob", SHORT, bob.lookup(4)),
+        );
+        assert_eq!(
+            [a, b, c],
+            [Asked::OutOfTime, Asked::OutOfTime, Asked::OutOfTime]
+        );
+        assert_eq!(
+            (ana.began(), bob.began()),
+            (1, 1),
+            "one lookup a key, however many asked"
+        );
+        assert_eq!(lookups.keys_in_flight(), 2, "an entry for each hung key");
+        ana.open();
+        bob.open();
+        eventually("the released lookups leave no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+        assert_eq!(
+            lookups.ask("ana", LONG, ana.lookup(5)).await,
+            Asked::Answer(5)
+        );
+        assert_eq!(ana.began(), 2, "the next ask's own lookup");
+        eventually("an answered lookup leaves no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+    }
+
+    /// #3853 — a lookup for a key that began before an ask never answers it:
+    /// the ask waits it out, starting nothing, and takes a fresh lookup's
+    /// answer, while the caller it began for takes its own. Another key's
+    /// lookup, hung meanwhile, neither holds the ask up nor answers it.
+    #[tokio::test]
+    async fn a_lookup_for_the_key_begun_before_the_ask_never_answers_it() {
+        let lookups = per_key();
+        let (earlier, fresh, other) = (Gate::default(), Gate::default(), Gate::default());
+        let _opened = (
+            OpenedAtTheEnd(earlier.clone()),
+            OpenedAtTheEnd(fresh.clone()),
+            OpenedAtTheEnd(other.clone()),
+        );
+        let first = tokio::spawn(lookups.ask("ana", LONG, earlier.lookup(1)));
+        while earlier.began() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let hung_other = tokio::spawn(lookups.ask("bob", LONG, other.lookup(9)));
+        let later = tokio::spawn(lookups.ask("ana", LONG, fresh.lookup(2)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            (earlier.began(), fresh.began(), other.began()),
+            (1, 0, 1),
+            "the later ask waits, starting nothing"
+        );
+        earlier.open();
+        assert_eq!(first.await.unwrap(), Asked::Answer(1));
+        while fresh.began() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        fresh.open();
+        assert_eq!(
+            later.await.unwrap(),
+            Asked::Answer(2),
+            "a fresh lookup's answer, never the one begun before the ask"
+        );
+        eventually("only the hung key's entry is left", || {
+            lookups.keys_in_flight() == 1
+        });
+        other.open();
+        assert_eq!(hung_other.await.unwrap(), Asked::Answer(9));
+        eventually("the ended lookups leave no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+    }
+
+    /// #3853 — a lookup that panics ends as any other: its caller is told it
+    /// failed, its key's entry goes, and the next ask is answered afresh.
+    #[tokio::test]
+    async fn a_lookup_that_panics_leaves_no_entry() {
+        let lookups = per_key();
+        let failed = lookups
+            .ask("ana", LONG, || -> u32 { panic!("a lookup that fails") })
+            .await;
+        assert!(
+            matches!(&failed, Asked::Failed(why) if why.contains("a lookup that fails")),
+            "{failed:?}"
+        );
+        eventually("a lookup that panicked leaves no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+        assert_eq!(lookups.ask("ana", LONG, || 7).await, Asked::Answer(7));
     }
 }
