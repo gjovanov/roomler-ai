@@ -46,7 +46,11 @@
 #     message cut after its first chunk queues its rest as it drops
 #     (`BegunMessage`), owing the rest's bytes before it reads the room
 #     (`PendingQueue::overdraft`, which the free room and then `pop` pay
-#     back), so no room is free while anything is owed, on any runtime. A
+#     back). A `pop` that decided what it pays before the debt was recorded
+#     gives its chunk back after the drop read the room: one chunk of room
+#     free per racing drop while the rest is owed, one rest added per race
+#     (a large message that begins on it, cut while owed), so at most
+#     (1 + races) times the largest message owed; exact at rest. A
 #     write that must wait for room wakes the write loop first: on an
 #     association with nothing in flight nothing else woke it, and a
 #     message larger than the room left waited forever.
@@ -55,7 +59,8 @@
 #     src/association/association_internal.rs and src/queue/pending_queue.rs:
 #     the regression tests (a cut write, a cut large write, writers cut at
 #     random on one thread and on two, the queue's accounting at rest, pops
-#     racing a cut message's drop, a refused and an empty write).
+#     during a cut message's drop and one split around it, a refused and an
+#     empty write).
 
 [package]
 edition = "2021"
