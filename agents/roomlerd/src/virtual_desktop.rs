@@ -3397,4 +3397,374 @@ mod supervise_tests {
             kind.name()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #3665: every process the desktop started stays within reach of its
+    // teardown, whatever became of its parent, and every one that exits is
+    // collected. Stand-ins only: no X server, and never `:99`.
+    // -----------------------------------------------------------------------
+
+    /// An executable shell script `<dir>/<name>`: a window manager, a startup
+    /// app or a server stand-in.
+    fn script(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// A FIFO at `path`: a server stand-in's connection to its clients.
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `mkfifo(3)` with a NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo {}", path.display());
+    }
+
+    /// The pid a script of this test wrote to `<dir>/<name>`, once it is there.
+    fn pid_in(dir: &Path, name: &str) -> i32 {
+        let mut pid = None;
+        wait_for(name, || {
+            pid = std::fs::read_to_string(dir.join(name))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            pid.is_some()
+        });
+        pid.unwrap()
+    }
+
+    /// The live process whose pid a script of this test wrote to
+    /// `<dir>/<name>`, as `/proc` describes it: its start time is what every
+    /// later look of the test, and its cleanup, check against.
+    fn recorded(dir: &Path, name: &str) -> ProcInfo {
+        let pid = pid_in(dir, name);
+        let mut info = None;
+        wait_for(name, || {
+            info = read_proc_stat(pid);
+            info.is_some()
+        });
+        info.unwrap()
+    }
+
+    /// `info` still runs as the process the test recorded: not gone, not a
+    /// zombie, and not a later process under a recycled pid.
+    fn still_running(info: &ProcInfo) -> bool {
+        is_running(info.pid) && RealProcs.same_process_now(info)
+    }
+
+    /// The process `info` recorded has been reaped: `/proc` no longer lists
+    /// it, as a zombie or at all (a later process under its pid is another).
+    fn reaped(info: &ProcInfo) -> bool {
+        !RealProcs.same_process_now(info)
+    }
+
+    /// What `at-spi-bus-launcher` is in the field, as one line of shell: a
+    /// child that leaves the desktop's process group and session (`setsid`),
+    /// ignores SIGTERM, and writes its pid to `<dir>/gc.pid`. `trap '' TERM`
+    /// survives the `exec`, so the `sleep` is as deaf as the shell was.
+    fn deaf_setsid_child(dir: &Path) -> String {
+        format!(
+            "setsid sh -c 'trap \"\" TERM; echo $$ > \"{}/gc.pid\"; exec sleep 300' &",
+            dir.display()
+        )
+    }
+
+    /// The escape in the field is a `setsid`. A host without the program
+    /// cannot build the case; the pure `select_targets` tests still run there.
+    fn have_setsid(test: &str) -> bool {
+        if binary_on_path("setsid").is_some() {
+            return true;
+        }
+        eprintln!("SKIP {test}: `setsid` is not on PATH");
+        false
+    }
+
+    /// Processes this test started that no tree recorded (a grandchild that
+    /// left the desktop's group): SIGKILLed when the test leaves, whatever an
+    /// assertion did. Each one only while `/proc` still shows the process the
+    /// test recorded (its start time), and never pid 0 or 1
+    /// (`RealProcs::signal`).
+    struct KillAtTheEnd(Vec<ProcInfo>);
+    impl Drop for KillAtTheEnd {
+        fn drop(&mut self) {
+            for info in &self.0 {
+                if RealProcs.same_process_now(info) {
+                    RealProcs.signal(info.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// #3665, the issue's first path. The X server exits, and a startup app
+    /// exits on the X I/O error that follows, before the supervisor reads
+    /// `/proc`. It leaves behind a child that had left the desktop's group
+    /// (`setsid`) and ignores SIGTERM, as `at-spi-bus-launcher` does. That
+    /// child now belongs to whoever adopts orphans here, in a session of its
+    /// own, so no parent link from anything the daemon recorded leads to it.
+    ///
+    /// The supervisor's teardown must still end it, within the teardown's
+    /// bound ([`TEARDOWN_GRACE`], a second for the SIGKILL to land, a second
+    /// for the reap), and the stop after it must leave nothing the desktop
+    /// started.
+    ///
+    /// The server stand-in closes its clients' connection (a FIFO) first and
+    /// exits only when the test says so. So the order the field CAN take, the
+    /// clients gone before the supervisor looks, is the order every run takes.
+    #[test]
+    fn an_orphan_of_an_app_that_died_with_its_server_does_not_outlive_the_teardown() {
+        if !have_setsid("an_orphan_of_an_app_that_died_with_its_server…") {
+            return;
+        }
+        let dir = scratch("orphan-x");
+        let d = dir.display();
+        mkfifo(&dir.join("x.fifo"));
+        let server = script(
+            &dir,
+            "x",
+            &format!(
+                "exec 3<>\"{d}/x.fifo\"\n\
+                 while [ ! -e \"{d}/x.close\" ]; do sleep 0.05; done\n\
+                 exec 3>&-\n\
+                 while [ ! -e \"{d}/x.exit\" ]; do sleep 0.05; done\n\
+                 exit 1"
+            ),
+        );
+        // A client: holds the connection, says its pid, exits on its end.
+        let on_the_display = |pid_file: &str| {
+            format!(
+                "exec 4<\"{d}/x.fifo\"\n\
+                 echo $$ > \"{d}/{pid_file}\"\n\
+                 read -r line <&4\n\
+                 exit 0"
+            )
+        };
+        let wm_script = script(&dir, "wm", &on_the_display("wm.pid"));
+        // The deaf child is started BEFORE the app opens the connection, so it
+        // holds no end of it.
+        let app_script = script(
+            &dir,
+            "app",
+            &format!("{}\n{}", deaf_setsid_child(&dir), on_the_display("app.pid")),
+        );
+        let desk = Arc::new(Desktop::new(
+            ":460".into(),
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: wm_script,
+                    startup: vec![app_script],
+                },
+                // Every start after the exit fails at once: the test is about
+                // the teardown before it.
+                ..plan(stand_in(&dir, "exit 1"))
+            },
+        ));
+        let _stop = StopAtTheEnd(desk.clone());
+
+        let mut cmd = Command::new(&server);
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = desk
+            .spawn_server(&mut cmd)
+            .unwrap()
+            .expect("the daemon is not stopping");
+        let x = XServer {
+            pid: child.id() as i32,
+            kind: Server::Xvfb,
+            tail: StderrTail::follow(child.stderr.take()),
+            since: Instant::now(),
+        };
+        let x_pid = x.pid;
+        desk.start_clients();
+        let wm = pid_in(&dir, "wm.pid");
+        let app = pid_in(&dir, "app.pid");
+        let gc = recorded(&dir, "gc.pid");
+        let _gc = KillAtTheEnd(vec![gc]);
+        assert_eq!(gc.pgid, gc.pid, "the child leads a group of its own");
+
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::spawn(move || supervise(&desk, Some(x)))
+        };
+        // The connection drops: the window manager and the app exit, and the
+        // app's child goes to whoever adopts orphans here.
+        std::fs::write(dir.join("x.close"), "").unwrap();
+        wait_for("the app's child to lose its parent", || {
+            read_proc_stat(gc.pid).is_some_and(|p| p.ppid != app)
+        });
+        // Now the server exits, and the supervisor takes the desktop down.
+        std::fs::write(dir.join("x.exit"), "").unwrap();
+        let exited = Instant::now();
+        wait_for("the supervisor's teardown, and the start after it", || {
+            !runs(&dir).is_empty()
+        });
+        let took = exited.elapsed();
+        let gc_after_teardown = still_running(&gc);
+
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let gc_after_stop = still_running(&gc);
+        let left: Vec<i32> = [x_pid, wm, app]
+            .into_iter()
+            .chain(runs(&dir))
+            .filter(|pid| !collected(*pid))
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !gc_after_teardown,
+            "the supervisor's teardown ({took:?}) left the app's SIGTERM-deaf orphan {} running",
+            gc.pid
+        );
+        assert!(took < Duration::from_secs(10), "the teardown took {took:?}");
+        assert!(
+            !gc_after_stop,
+            "the stop left the app's orphan {} running",
+            gc.pid
+        );
+        assert!(left.is_empty(), "the stop left these uncollected: {left:?}");
+    }
+
+    /// #3665, the issue's second path. A startup app exits on its own while
+    /// the desktop runs, and leaves such a child behind. The next stop must
+    /// end it, within the same bound.
+    #[test]
+    fn an_orphan_of_an_app_that_exited_by_itself_is_reached_by_the_next_stop() {
+        if !have_setsid("an_orphan_of_an_app_that_exited_by_itself…") {
+            return;
+        }
+        let dir = scratch("orphan-self");
+        let d = dir.display();
+        let app_script = script(
+            &dir,
+            "app",
+            &format!(
+                "{}\n\
+                 echo $$ > \"{d}/app.pid\"\n\
+                 while [ ! -s \"{d}/gc.pid\" ]; do sleep 0.05; done\n\
+                 exit 0",
+                deaf_setsid_child(&dir)
+            ),
+        );
+        let desk = Arc::new(Desktop::new(
+            ":461".into(),
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: "true".into(),
+                    startup: vec![app_script],
+                },
+                ..plan(stand_in(&dir, "exit 1"))
+            },
+        ));
+        let _stop = StopAtTheEnd(desk.clone());
+        let mut server = Command::new("sleep");
+        server
+            .arg("300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let x_pid = desk
+            .spawn_server(&mut server)
+            .unwrap()
+            .expect("the daemon is not stopping")
+            .id() as i32;
+        desk.start_clients();
+        let app = pid_in(&dir, "app.pid");
+        let gc = recorded(&dir, "gc.pid");
+        let _gc = KillAtTheEnd(vec![gc]);
+        wait_for("the app's child to lose its parent", || {
+            read_proc_stat(gc.pid).is_some_and(|p| p.ppid != app)
+        });
+
+        let asked = Instant::now();
+        desk.stop();
+        let took = asked.elapsed();
+        let gc_after_stop = still_running(&gc);
+        let server_left = !collected(x_pid);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !gc_after_stop,
+            "the stop ({took:?}) left the orphan {} of an app that had exited running",
+            gc.pid
+        );
+        assert!(took < Duration::from_secs(10), "the stop took {took:?}");
+        assert!(!server_left, "the stop left the server {x_pid} uncollected");
+    }
+
+    /// #3665, the issue's third path. The window manager and a startup app
+    /// exit while the desktop runs. Each is collected at once, so no zombie
+    /// of either waits under the daemon for the next teardown, and neither
+    /// number is in the roots the teardown signals without a look (the
+    /// `is_root` shortcut in [`kill_tree_with`]).
+    #[test]
+    fn a_window_manager_and_an_app_that_exit_are_collected() {
+        let dir = scratch("exits");
+        let d = dir.display();
+        let leaves = |pid_file: &str, code: u8| {
+            format!(
+                "echo $$ > \"{d}/{pid_file}\"\n\
+                 while [ ! -e \"{d}/go\" ]; do sleep 0.05; done\n\
+                 exit {code}"
+            )
+        };
+        let wm_script = script(&dir, "wm", &leaves("wm.pid", 0));
+        let app_script = script(&dir, "app", &leaves("app.pid", 3));
+        let desk = Arc::new(Desktop::new(
+            ":462".into(),
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: wm_script,
+                    startup: vec![app_script],
+                },
+                ..plan(stand_in(&dir, "exit 1"))
+            },
+        ));
+        let _stop = StopAtTheEnd(desk.clone());
+        let mut server = Command::new("sleep");
+        server
+            .arg("300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _server = desk
+            .spawn_server(&mut server)
+            .unwrap()
+            .expect("the daemon is not stopping");
+        desk.start_clients();
+        let wm = recorded(&dir, "wm.pid");
+        let app = recorded(&dir, "app.pid");
+
+        std::fs::write(dir.join("go"), "").unwrap();
+        let bound = Instant::now() + Duration::from_secs(2);
+        while !(reaped(&wm) && reaped(&app)) && Instant::now() < bound {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (wm_reaped, app_reaped) = (reaped(&wm), reaped(&app));
+        let roots = desk
+            .state()
+            .tree
+            .as_ref()
+            .map(|t| t.roots.clone())
+            .unwrap_or_default();
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            wm_reaped,
+            "the window manager {} exited and is still a zombie under the daemon",
+            wm.pid
+        );
+        assert!(
+            app_reaped,
+            "the startup app {} exited and is still a zombie under the daemon",
+            app.pid
+        );
+        assert!(
+            !roots.contains(&wm.pid) && !roots.contains(&app.pid),
+            "a collected child is still in the tree's roots: {roots:?}"
+        );
+    }
 }
