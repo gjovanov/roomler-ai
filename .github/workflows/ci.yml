@@ -1533,7 +1533,7 @@ jobs:
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power::
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only

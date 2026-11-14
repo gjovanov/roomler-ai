@@ -579,7 +579,7 @@ off while the machine stayed up (FR-55's keeper holds
 display sleep, on purpose). The capture worker now takes
 `power::DisplayAwake` for its whole life
 (`agents/roomlerd/src/capture/scrap_backend.rs:160`,
-`agents/roomlerd/src/power.rs:372`): `IOPMAssertionDeclareUserActivity` wakes
+`agents/roomlerd/src/power.rs:539`): `IOPMAssertionDeclareUserActivity` wakes
 the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
 so a view-only session, which injects no input to count as activity, does not
 go dark at the display-sleep timeout. Only capture takes it: an SSH session or
@@ -816,7 +816,7 @@ machine awake while a session is live, per OS:
 | `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10802`](../agents/roomlerd/src/peer.rs#L10802)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1594`](../ui/src/composables/useRemoteControl.ts#L1594) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
-| Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:758`](../agents/roomlerd/src/power.rs#L758)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
+| Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:948`](../agents/roomlerd/src/power.rs#L948)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
 
 ⚠️ **The Linux and macOS hints are advisory and never the pump's `LockState`.**
 The pump's overlay and the input path keep reading the Windows probe, which
