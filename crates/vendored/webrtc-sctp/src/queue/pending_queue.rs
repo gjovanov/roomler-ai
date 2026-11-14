@@ -48,6 +48,16 @@ pub(crate) struct PendingQueue {
     // the chunks popped there).
     #[cfg(test)]
     pub(crate) pops_in_drop: Option<(usize, usize)>,
+    // roomler (#3755): the tests' pause in `pop`, between what it pays of the
+    // overdraft and the room it gives back: once armed, the next `pop` meets
+    // the test at this barrier twice there (it has decided; it goes on).
+    #[cfg(test)]
+    pub(crate) pop_pause: std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    // roomler (#3755): the tests' count of large messages that began while
+    // something was owed, which only a `pop` racing a drop allows
+    // (`BegunMessage`).
+    #[cfg(test)]
+    began_while_owed: AtomicUsize,
 
     unordered_queue: RwLock<PendingBaseQueue>,
     ordered_queue: RwLock<PendingBaseQueue>,
@@ -72,6 +82,10 @@ impl PendingQueue {
             overdraft: Default::default(), // roomler (#3755)
             #[cfg(test)]
             pops_in_drop: None, // roomler (#3755)
+            #[cfg(test)]
+            pop_pause: Default::default(), // roomler (#3755)
+            #[cfg(test)]
+            began_while_owed: Default::default(), // roomler (#3755)
             unordered_queue: Default::default(),
             ordered_queue: Default::default(),
             queue_len: Default::default(),
@@ -127,6 +141,40 @@ impl PendingQueue {
             if self.pop(c.beginning_fragment, c.unordered).is_none() {
                 return;
             }
+        }
+    }
+
+    /// roomler (#3755): an armed `pop_pause` holds this `pop` between what it
+    /// pays of the overdraft and the room it gives back, the way a preemption,
+    /// or the semaphore's own lock held by a drop on another thread, can hold
+    /// the write loop there.
+    #[cfg(test)]
+    fn pause_in_pop(&self) {
+        let pause = self
+            .pop_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pause) = pause {
+            pause.wait();
+            pause.wait();
+        }
+    }
+
+    /// roomler (#3755): the large messages that began while something was
+    /// owed.
+    #[cfg(test)]
+    pub(crate) fn began_while_owed(&self) -> usize {
+        self.began_while_owed.load(Ordering::SeqCst)
+    }
+
+    /// roomler (#3755): counts a large message that begins while something is
+    /// owed. Its caller holds `semaphore_lock`, so no drop adds to the debt
+    /// meanwhile.
+    #[cfg(test)]
+    fn count_a_begin_while_owed(&self) {
+        if self.overdraft.load(Ordering::SeqCst) > 0 {
+            self.began_while_owed.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -283,6 +331,9 @@ impl PendingQueue {
         // roomler (#3755): no await from here to the push of the first chunk.
         commit();
         self.push_chunk(first);
+        // roomler (#3755): counted for the tests, under the queue's lock.
+        #[cfg(test)]
+        self.count_a_begin_while_owed();
         let mut begun = BegunMessage {
             rest: chunks,
             queue: self,
@@ -294,6 +345,11 @@ impl PendingQueue {
             // roomler (#3755): `take_room`, which wakes the write loop if it waits.
             // roomler (#3716): `None` = closed by the association's close; was an unwrap.
             // The chunks queued so far are the association's to drop.
+            // roomler (#3755): dropped while it waits, this wait goes before
+            // `begun` (it was made after it), so the room it holds is free
+            // again when `begun`'s drop reads the room. Keep that order: the
+            // other way round, that room would come back after the drop paid
+            // the debt, free while the rest is owed, on one thread too.
             let Some(permits) = self.take_room(user_data_len, wake).await else {
                 return false;
             };
@@ -434,6 +490,9 @@ impl PendingQueue {
                     (d > 0).then_some(d - d.min(user_data_len))
                 })
                 .map_or(0, |d| d.min(user_data_len));
+            // roomler (#3755): the tests' pause between the two steps.
+            #[cfg(test)]
+            self.pause_in_pop();
             self.semaphore.add_permits(user_data_len - owed);
         }
 
@@ -465,16 +524,25 @@ impl PendingQueue {
 ///
 /// The rest's bytes are owed first (`PendingQueue::overdraft`). Then the room
 /// that is free pays what it can of the debt, and `pop` pays the remainder
-/// before it gives room again. A `pop` that runs alongside the drop, on
-/// another thread, so pays the debt instead of giving room, and what the pops
-/// and the free room pay beyond the rest's bytes is room again. Once the drop
-/// is done no room is free while anything is owed, on any runtime: no writer
-/// gets room until the debt is paid, a large message begins only on a queue
-/// that owes nothing, and the overdraft is at most the rest of one cut
-/// message. At rest the accounting is exact: room + queued bytes - overdraft
-/// == the limit. Nothing is queued once the queue was closed (#3716): the
-/// association is going away. The drop never awaits, needs no runtime and does
-/// not panic, short of a poisoned queue lock, as `pop`.
+/// before it gives room again. A `pop` that decides what it pays during the
+/// drop, on another thread, so pays the debt instead of giving room, and what
+/// the pops and the free room pay beyond the rest's bytes is room again.
+///
+/// One race is left. A `pop` decides what it pays, then gives the rest of its
+/// chunk back as room: two steps. One that decided before the debt was
+/// recorded gives its room back after the drop read the room, so one chunk of
+/// room (at most `max_payload_size`) can be free per racing drop while the
+/// rest is owed. A writer can take it, a large message's first chunk included,
+/// and such a message, cut while the debt is owed, adds its own rest: one rest
+/// per race. The overdraft is so at most (1 + races) times the largest
+/// message. Drops hold the queue's lock to the end, so they run one at a time.
+/// On a runtime of one thread no `pop` runs during a drop, so no room is free
+/// while anything is owed there. At rest the accounting is exact: room +
+/// queued bytes - overdraft == the limit.
+///
+/// A drop that finds the queue closed (#3716) queues nothing: the association
+/// is going away. The drop never awaits, needs no runtime and does not panic,
+/// short of a poisoned queue lock, as `pop`.
 struct BegunMessage<'a> {
     rest: std::vec::IntoIter<ChunkPayloadData>,
     queue: &'a PendingQueue,
@@ -491,9 +559,11 @@ impl Drop for BegunMessage<'_> {
         let queue = self.queue;
         let n: usize = self.rest.as_slice().iter().map(|c| c.user_data.len()).sum();
         // Owed first, before the room is read and before anything is queued:
-        // from here on a `pop` pays the debt instead of giving room, so no
-        // room it frees during this drop is left free while the rest is owed,
+        // a `pop` that decides from here on pays the debt instead of giving
+        // room, so the room it frees is not left free while the rest is owed,
         // and no `pop` of the rest returns room for bytes that never had it.
+        // A `pop` that decided before gives its chunk back as room, after the
+        // read below if it is late: the one race of the type's doc.
         queue.overdraft.fetch_add(n, Ordering::SeqCst);
         // roomler (#3755): step 0, the debt was recorded.
         #[cfg(test)]
@@ -508,8 +578,8 @@ impl Drop for BegunMessage<'_> {
                 free as usize
             }
             Err(TryAcquireError::Closed) => {
-                // Nothing is queued once the queue was closed: the debt goes,
-                // and what a `pop` paid of it is room again.
+                // The drop found the queue closed, so it queues nothing: the
+                // debt goes, and what a `pop` paid of it is room again.
                 let owed = queue
                     .overdraft
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {

@@ -3332,9 +3332,13 @@ fn check_cut_writes(
 /// whole.
 ///
 /// The pending queue's overdraft is sampled while the writers run, and must
-/// stay within `max_owed` bytes; once the association drained, its accounting
-/// must be at rest.
-async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Result<Vec<String>> {
+/// stay within its bound at every sample: (1 + the large messages that began
+/// while something was owed) times the largest message, as the queue counts
+/// them (`PendingQueue::began_while_owed`). Each of those needs a `pop` that
+/// raced a drop (`BegunMessage`), which a runtime of one thread never runs
+/// (`one_thread`: the count must stay 0). Once the association drained, its
+/// accounting must be at rest.
+async fn cut_writes_round(seed: u64, one_thread: bool) -> Result<Vec<String>> {
     const SI: u16 = 1;
     const WRITERS: u8 = 3;
     const WRITES: u32 = 20;
@@ -3353,19 +3357,26 @@ async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Resul
         let queue = Arc::clone(&s0.pending_queue);
 
         // The queue's room and overdraft, sampled while the writers run: the
-        // most of each seen.
+        // most room seen, and the first overdraft past its bound. The count is
+        // read after the overdraft: a message is counted as it begins, before
+        // its drop can add its rest, and the count only grows, so the bound
+        // read is never older than the overdraft it checks.
         let sampling = Arc::new(AtomicBool::new(true));
         let sampler = tokio::spawn({
             let queue = Arc::clone(&queue);
             let sampling = Arc::clone(&sampling);
             async move {
-                let (mut room, mut owed) = (0, 0);
+                let (mut room, mut past) = (0, None);
                 while sampling.load(Ordering::SeqCst) {
                     room = queue.room().max(room);
-                    owed = queue.overdraft().max(owed);
+                    let owed = queue.overdraft();
+                    let bound = (1 + queue.began_while_owed()) * LARGEST_CUT_TEST_MESSAGE;
+                    if owed > bound && past.is_none() {
+                        past = Some((owed, bound));
+                    }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                (room, owed)
+                (room, past)
             }
         });
 
@@ -3444,19 +3455,27 @@ async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Resul
         }
         sampling.store(false, Ordering::SeqCst);
         match sampler.await {
-            Ok((room, owed)) => {
+            Ok((room, past)) => {
                 if room > SMALL_QUEUE {
                     findings.push(format!(
                         "the queue had room {room} while the writers ran, more than its {SMALL_QUEUE}"
                     ));
                 }
-                if owed > max_owed {
+                if let Some((owed, bound)) = past {
                     findings.push(format!(
-                        "the queue owed {owed} bytes while the writers ran, more than {max_owed}"
+                        "the queue owed {owed} bytes while the writers ran, more than its bound {bound}"
                     ));
                 }
             }
             Err(err) => findings.push(format!("the sampler ended in: {err}")),
+        }
+        // roomler (#3755): on one thread no `pop` runs during a drop, so no
+        // large message begins while anything is owed.
+        let begun_owing = queue.began_while_owed();
+        if one_thread && begun_owing > 0 {
+            findings.push(format!(
+                "{begun_owing} large message(s) began while a cut one was owed, on one thread"
+            ));
         }
         link_up.store(false, Ordering::SeqCst);
         if let Err(err) = link.await {
@@ -3513,7 +3532,7 @@ async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Resul
 async fn test_assoc_writes_cut_at_any_wait_keep_the_stream_whole() -> Result<()> {
     let mut findings = Vec::new();
     for seed in [0x3755_u64, 1, 2, 3] {
-        for finding in cut_writes_round(seed, true, LARGEST_CUT_TEST_MESSAGE).await? {
+        for finding in cut_writes_round(seed, true).await? {
             findings.push(format!("seed {seed:#x}: {finding}"));
         }
     }
@@ -3532,16 +3551,17 @@ const LARGEST_CUT_TEST_MESSAGE: usize = 5_500 + 14_500;
 /// `pop` runs on one thread while a cut write queues the rest of its message
 /// on the other. The same property, but for the order the writes returned in,
 /// which the writers can no longer log in the order they were queued; and the
-/// pending queue's accounting, at rest once drained. A `pop` that runs
-/// alongside a cut write's drop pays the debt the drop has already recorded,
-/// so no room is free while a cut message is owed on two threads either, and
-/// the overdraft sampled while the writers run stays under one of the largest
-/// messages, as on one thread.
+/// pending queue's accounting, at rest once drained. A `pop` that decides
+/// during a cut write's drop pays the debt the drop has already recorded; one
+/// that decided before can leave its chunk free while the rest is owed, and a
+/// large message that begins on it adds its own rest (`BegunMessage`). So the
+/// overdraft sampled while the writers run stays under (1 + those messages)
+/// times the largest message: one largest message when no `pop` raced a drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting() -> Result<()> {
     let mut findings = Vec::new();
     for seed in [0x3755_u64, 4, 5] {
-        for finding in cut_writes_round(seed, false, LARGEST_CUT_TEST_MESSAGE).await? {
+        for finding in cut_writes_round(seed, false).await? {
             findings.push(format!("seed {seed:#x}: {finding}"));
         }
     }
