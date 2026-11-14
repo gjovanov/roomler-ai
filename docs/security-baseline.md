@@ -1138,7 +1138,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:2288` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:2843` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;

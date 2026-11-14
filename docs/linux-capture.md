@@ -1683,10 +1683,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:2155`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:2710`) — the same `loginctl` walk the FR-27
 consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
-most (`graphical_session_within`, `companion.rs:4683`). It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:2208-2211`),
+most (`graphical_session_within`, `companion.rs:5238`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:2763-2766`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
