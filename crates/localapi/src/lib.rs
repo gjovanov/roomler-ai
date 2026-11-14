@@ -2799,8 +2799,9 @@ pub trait LocalApiState: Send + Sync {
     /// #2871 (review) — is `uid` the person at this device's seat RIGHT NOW:
     /// on Linux the person signed in at seat0, on a Mac the console user?
     /// Asked fresh by the person-at-the-device socket before it applies a
-    /// `ConfigSet` ([`Scope::Person`]): its listener follows the seat on a
-    /// poll, so a connection can outlive its person's turn at the seat.
+    /// `ConfigSet` ([`Scope::Person`]), and since #3845 before it takes a
+    /// `ConsentDecide`: its listener follows the seat on a poll, so a
+    /// connection can outlive its person's turn at the seat.
     /// #3796 — or not known yet ([`AtTheSeat::NotKnownYet`]): a daemon that
     /// asks other processes, which may not answer, waits a bounded time.
     /// Default: no — a daemon that cannot say changes nothing there.
@@ -3554,16 +3555,18 @@ pub enum AtTheSeat {
     /// Someone else, nobody, or a daemon that cannot say.
     No,
     /// Who is at the seat gave no answer within the daemon's wait (logind
-    /// stopped, say): not known yet. A `ConfigSet` is refused with
+    /// stopped, say), or the daemon's lookup failed (#3845): not known yet.
+    /// A `ConfigSet` or a `ConsentDecide` is refused with
     /// [`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`], which asks for a retry, never
     /// as if the person had left.
     NotKnownYet,
 }
 
-/// #3711, #3796 — the answer when who is signed in at this computer's screen
-/// is not known in time on a Linux system install: a read, a received file
-/// and a files folder's set (`roomlerd`'s `files::CANNOT_TELL`), and a
-/// `ConfigSet` over the person-at-the-device socket. A retry asks again.
+/// #3711, #3796, #3830 — the answer when who is signed in at this computer's
+/// screen is not known in time on a Linux system install: a read, a received
+/// file, a files folder's set (`files::CANNOT_TELL`), a recording's start
+/// (`Refusal::NotKnownYet`), and a `ConfigSet` or (#3845) a `ConsentDecide`
+/// over the person socket. A retry asks again.
 pub const CANNOT_TELL_WHO_IS_AT_THE_SCREEN: &str =
     "Could not tell who is signed in at this computer's screen. Try again.";
 
@@ -3589,6 +3592,18 @@ fn not_at_the_seat_now(key: &str) -> Response {
              now (the seat changed since this connection opened). Change it from the device's \
              screen, or as an administrator: `sudo roomler config set {key} <value>`"
         ),
+    }
+}
+
+/// #3845 — the answer to a consent answer on the person-at-the-device socket
+/// from an account that is not the person at the seat now: the seat changed
+/// while this connection stayed open, or nobody is signed in there.
+fn not_at_the_seat_to_answer() -> Response {
+    Response::Error {
+        message: "The answer was not taken: only the person signed in at this device's own \
+                  screen answers a request to see or control it, and that is not this account \
+                  right now (the seat changed since this connection opened)."
+            .into(),
     }
 }
 
@@ -3785,6 +3800,23 @@ where
                 }
                 Ok(Request::ConfigSet { key, value }) => {
                     state.config_set(&key, value.as_deref()).await
+                }
+                // #3845 — and so is a consent answer, an approval or a denial:
+                // it lets someone see and control this screen, so it must come
+                // from whoever is at the seat NOW, never over a connection that
+                // outlived its person's turn there. Root is root everywhere.
+                Ok(Request::ConsentDecide { session_id, allow })
+                    if scope.is_person() && !peer.is_root() =>
+                {
+                    match still_at_the_seat(state, &peer).await {
+                        AtTheSeat::Yes => Response::ConsentDecided {
+                            ok: state.consent_decide(&session_id, allow),
+                        },
+                        AtTheSeat::No => not_at_the_seat_to_answer(),
+                        AtTheSeat::NotKnownYet => Response::Error {
+                            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+                        },
+                    }
                 }
                 Ok(Request::ExternalPasswordSet { .. } | Request::ExternalPasswordClear)
                     if !peer.is_console_user() =>
@@ -8795,7 +8827,8 @@ mod tests {
         let r = ask_scoped(SEAT, r#"{"t":"config_get"}"#).await;
         assert!(!is_person_refusal(&r), "{r:?}");
         assert!(matches!(&r, Response::Error { message } if message.contains("not supported")));
-        // The banner's Disconnect and the consent answer reach the state.
+        // The banner's Disconnect and the consent answer pass the allowlist
+        // (a consent answer then asks the seat, #3845: its own test).
         for j in [
             r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
             r#"{"t":"consent_decide","d":{"session_id":"6ac95ff543d358ac1a427048","allow":false}}"#,
@@ -9181,6 +9214,9 @@ mod tests {
                 AtTheSeat::No
             }
         }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            Mock.consent_decide(session_id, allow)
+        }
     }
 
     /// #3796 — a daemon that could not tell in time who is at the seat: its
@@ -9199,6 +9235,9 @@ mod tests {
         }
         async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
             AtTheSeat::NotKnownYet
+        }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            Mock.consent_decide(session_id, allow)
         }
     }
 
@@ -9322,6 +9361,58 @@ mod tests {
         // And the safety surface is served without asking.
         let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana, r#"{"t":"status"}"#).await;
         assert!(matches!(r, Response::Status(_)), "{r:?}");
+    }
+
+    /// #3845 — a consent answer over the person socket lets its sender see
+    /// and control this screen, so the seat is asked again first, as before a
+    /// `ConfigSet`: from the person at the seat it is taken; from someone who
+    /// left, or with nobody there, it is refused in words; with no answer in
+    /// time, with the try-again text, a deny as much as an approval. Root and
+    /// the daemon's own endpoint are not asked.
+    #[tokio::test]
+    async fn a_consent_answer_over_the_person_socket_comes_from_whoever_is_at_the_seat_now() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":false}}"#;
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), approve).await;
+        assert_eq!(
+            r,
+            Response::ConsentDecided { ok: true },
+            "the person at the seat"
+        );
+        for (at_seat, what) in [(Some(502), "another person"), (None, "nobody")] {
+            let r = ask_state_scoped_as(SeatAt(at_seat), SEAT, ana.clone(), approve).await;
+            let Response::Error { message } = &r else {
+                panic!("{what} at the seat: {r:?}")
+            };
+            assert!(message.contains("was not taken"), "{what}: {message}");
+            assert!(
+                message.contains("not this account right now"),
+                "{what}: {message}"
+            );
+        }
+        let try_again = Response::Error {
+            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+        };
+        for line in [approve, deny] {
+            let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana.clone(), line).await;
+            assert_eq!(r, try_again, "{line}");
+        }
+        // Root on the person socket is not asked.
+        let root = ClientPeer {
+            uid: Some(0),
+            gid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+        // The daemon's own endpoint never asks the seat.
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana, approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
     }
 
     /// #2871 — the person's view of a configuration listing marks every key

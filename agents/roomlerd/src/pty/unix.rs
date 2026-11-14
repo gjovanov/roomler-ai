@@ -184,7 +184,11 @@ impl PtyProcess {
     /// identity rules — and every refusal, such as `console_user` with nobody
     /// at the screen — are identical here. There is deliberately no separate
     /// privilege story for interactive sessions.
-    pub fn spawn(
+    ///
+    /// #3822 — `async`: `console_user` asks who is at the screen from the
+    /// caller's task (`exec::apply_run_as_at_home`). Windows' spawn takes the
+    /// person's token itself and stays a plain call.
+    pub async fn spawn(
         command: Option<&str>,
         term: &str,
         size: WinSize,
@@ -263,7 +267,7 @@ impl PtyProcess {
         }
 
         // FR-97 P5b — a person's shell starts in their home, as sshd's does.
-        crate::exec::apply_run_as_at_home(&mut cmd, run_as)?;
+        crate::exec::apply_run_as_at_home(&mut cmd, run_as).await?;
 
         // The shell keeps its terminal on 0-2 and nothing else: in the child,
         // after every step above, each descriptor above stderr is marked
@@ -482,6 +486,7 @@ mod tests {
             },
             &crate::exec::RunAs::Daemon,
         )
+        .await
         .expect("a pty session");
 
         let mut out = Vec::new();
@@ -510,6 +515,7 @@ mod tests {
             WinSize { cols: 80, rows: 24 },
             &crate::exec::RunAs::Daemon,
         )
+        .await
         .expect("a pty session");
 
         let mut out = Vec::new();
@@ -539,6 +545,7 @@ mod tests {
             WinSize { cols: 80, rows: 24 },
             &crate::exec::RunAs::Daemon,
         )
+        .await
         .expect("a pty session");
         let handle = pty.handle();
 
@@ -573,6 +580,7 @@ mod tests {
             WinSize { cols: 80, rows: 24 },
             &crate::exec::RunAs::Daemon,
         )
+        .await
         .expect("a pty session");
         pty.handle()
             .resize(WinSize {
@@ -589,15 +597,16 @@ mod tests {
     /// `console_user` with nobody at the screen (FR-97 P5a) is the refusal
     /// every CI runner meets; a desktop running the tests as the person at it
     /// can honour it, so there this test proves nothing and says so.
-    #[test]
-    fn the_identity_rules_are_the_same_ones_exec_enforces() {
+    #[tokio::test]
+    async fn the_identity_rules_are_the_same_ones_exec_enforces() {
         let who = crate::exec::RunAs::ConsoleUser;
         let mut probe = tokio::process::Command::new("/bin/true");
-        let Err(exec_says) = crate::exec::apply_run_as(&mut probe, &who) else {
+        let Err(exec_says) = crate::exec::apply_run_as(&mut probe, &who).await else {
             eprintln!("skipped: someone is at this machine's screen, so console_user can run");
             return;
         };
         let err = PtyProcess::spawn(None, "xterm", WinSize { cols: 80, rows: 24 }, &who)
+            .await
             .expect_err("the pty must refuse what exec refuses");
         assert_eq!(err, exec_says, "the same refusal, in the same words");
         assert!(
@@ -634,6 +643,7 @@ mod tests {
         /// Run `script` as a session's command; what its terminal printed.
         async fn session_output(script: &str) -> String {
             let mut pty = PtyProcess::spawn(Some(script), "xterm", SIZE, &RunAs::Daemon)
+                .await
                 .expect("a pty session");
             let mut out = Vec::new();
             let mut buf = [0u8; 4096];
@@ -700,6 +710,7 @@ mod tests {
         #[tokio::test]
         async fn a_plain_child_started_during_a_session_holds_no_pty() {
             let mut session = PtyProcess::spawn(Some("sleep 30"), "xterm", SIZE, &RunAs::Daemon)
+                .await
                 .expect("a pty session");
             let mut child = std::process::Command::new("sleep")
                 .arg("30")
@@ -726,6 +737,7 @@ mod tests {
         #[tokio::test]
         async fn a_second_session_holds_nothing_of_the_first() {
             let mut first = PtyProcess::spawn(Some("sleep 30"), "xterm", SIZE, &RunAs::Daemon)
+                .await
                 .expect("the first session");
             let listing = session_output("ls -l /proc/self/fd").await;
             first.kill_group();

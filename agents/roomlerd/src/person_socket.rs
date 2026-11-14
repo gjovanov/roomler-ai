@@ -28,6 +28,16 @@
 //!
 //! What the socket serves is decided in `localapi` ([`localapi::person_may`]).
 //!
+//! **Not known is not nobody (#3845).** On Linux who is at the seat is
+//! logind's answer, from another process, which may not come: a paused
+//! logind, and `loginctl`'s D-Bus call gives up after 25 s. A look that
+//! fails or runs out of time ([`Look::NotKnown`]) keeps the socket where it
+//! is, with no close, start or move until the seat answers, and the poll says
+//! so once a run. Only the seat's own answer is nobody ([`look_of`]).
+//! Failing closed stays: every change and every consent answer over the
+//! socket asks the seat again first ([`at_the_seat_now`]), and while it is
+//! not known the person is told to try again.
+//!
 //! **A Mac (FR-97 P2g).** A two-half Mac's companion talks to its per-user
 //! half, whose enrollment has no overlay node: only root can hold a utun, so
 //! the machine is on the private network through its root half alone. The
@@ -71,6 +81,17 @@ use tunnel_core::localapi::{NodeStatus, Response};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const POLL: Duration = Duration::from_secs(5);
 
+/// #3845 — how long the poll waits for a look at the seat: the time between
+/// looks. A look takes tens of milliseconds, longer on a loaded host, and a
+/// look cut short is not known, which leaves the socket where it is. So the
+/// poll waits longer than the check a person waits on
+/// (`files::SEAT_LOOKUP_WAIT`, 1.5 s), and it still follows a slow logind.
+/// The lookup runs on the flight's own thread ([`look_at_the_seat`]), so
+/// the wait holds no async worker. A hung logind holds that one thread,
+/// however often the poll and the checks ask.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LOOK_WAIT: Duration = POLL;
+
 /// Is any NON-root user logged in? logind gives every logged-in user a
 /// `/run/user/<uid>`, so its absence is a free answer of "nobody to serve".
 pub fn any_user_runtime_dir(root: &std::path::Path) -> bool {
@@ -109,10 +130,30 @@ pub enum Step {
     Move(u32),
 }
 
+/// #3845 — what a look at the seat found ([`person_at_the_seat`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Look {
+    /// The person signed in at the seat, never root.
+    Person(u32),
+    /// Nobody to serve, as the seat itself answered: nobody is signed in at
+    /// it, or root is, who reaches the daemon's own socket. Also where no
+    /// person is logged in at all.
+    Nobody,
+    /// Not known, and why: the lookup failed, or gave no answer in time.
+    NotKnown(String),
+}
+
 /// Pure: the listener follows the person at the seat. Root at the seat is
-/// nobody to serve here.
-pub fn step(serving: Option<u32>, at_seat: Option<u32>) -> Step {
-    let want = at_seat.filter(|&u| u != 0);
+/// nobody to serve here. #3845 — a look that could not tell keeps what is
+/// served, a person's socket or none: not known is not nobody. The check
+/// before each change and each consent answer still refuses while it is not
+/// known ([`at_the_seat_now`]).
+pub fn step(serving: Option<u32>, look: &Look) -> Step {
+    let want = match look {
+        Look::Person(uid) => Some(*uid).filter(|&u| u != 0),
+        Look::Nobody => None,
+        Look::NotKnown(_) => return Step::Keep,
+    };
     match (serving, want) {
         (a, b) if a == b => Step::Keep,
         (None, Some(u)) => Step::Start(u),
@@ -340,112 +381,137 @@ pub async fn or_machine_peers(
 /// Who is at the seat now: on Linux the person signed in at seat0 (logind's
 /// `ActiveSession` there, when it is a person's: `companion::seat0_uid`, the
 /// rule received files and `console_user` already use), on a Mac the console
-/// user. `None` for nobody, and for root.
+/// user. Nobody for nobody, and for root. Blocking: on Linux, logind.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn person_at_the_seat() -> Option<u32> {
+fn person_at_the_seat() -> Look {
     #[cfg(target_os = "linux")]
     {
         // This runs on EVERY Linux root daemon, servers and cluster nodes
         // included. Where no non-root user is logged in at all there is
         // nobody to serve, and no `loginctl` to spawn.
         if !any_user_runtime_dir(std::path::Path::new("/run/user")) {
-            return None;
+            return Look::Nobody;
         }
         // #2871 (review) — seat0's person, never the first active graphical
         // session anywhere: logind calls every seatless session active, so on
         // a host with remote logins (xrdp, GNOME Remote Login) that was
         // whoever logind listed first, and since design A this socket sets
         // the person's own config keys.
-        crate::companion::seat0_uid().ok().filter(|&u| u != 0)
+        look_of(crate::companion::seat0_uid())
     }
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt;
         // `/dev/console`'s owner, as the FR-43 supervisor reads it: uid 0 is
         // the login window, which is nobody to serve.
-        std::fs::metadata("/dev/console")
+        match std::fs::metadata("/dev/console")
             .ok()
             .map(|m| m.uid())
             .filter(|&u| u != 0)
+        {
+            Some(uid) => Look::Person(uid),
+            None => Look::Nobody,
+        }
+    }
+}
+
+/// #3845 — the pure half of [`person_at_the_seat`] on Linux: what logind
+/// said of seat0 (`companion::seat0_uid`). Nobody only when the seat says so
+/// (an empty seat, the login screen, a session that is not a person's, a host
+/// with no logind and so no seat: `companion::is_nobody_at_the_screen`, the
+/// rule a received file follows too), and when root is there. Any other
+/// failure (logind or the bus did not answer, `loginctl`'s D-Bus call timed
+/// out) cannot tell who is there.
+#[cfg(any(target_os = "linux", test))]
+fn look_of(found: anyhow::Result<u32>) -> Look {
+    match found {
+        Ok(0) => Look::Nobody,
+        Ok(uid) => Look::Person(uid),
+        Err(e) if crate::companion::is_nobody_at_the_screen(&e) => Look::Nobody,
+        Err(e) => Look::NotKnown(format!("{e:#}")),
     }
 }
 
 /// #2871 (review) — is `uid` the person at the seat RIGHT NOW? The person
-/// socket asks before it applies a config change
-/// (`LocalApiState::at_the_seat_now`): its listener follows the seat on a
-/// [`POLL`], so a person who switched away still holds an open connection
-/// until the next look, and must not change settings that are the next
-/// person's by then.
+/// socket asks before it applies a config change, and since #3845 before it
+/// takes a consent answer (`LocalApiState::at_the_seat_now`): its listener
+/// follows the seat on a [`POLL`], so a person who switched away still holds
+/// an open connection until the next look, and must neither change settings
+/// that are the next person's by then nor answer for their screen.
 ///
 /// #3796 — on Linux the lookup is logind's, another process, which may not
 /// answer (a stopped logind). It is asked as a received file's is: one
 /// lookup in flight ([`PERSON_AT_SEAT0`]), each check waiting
 /// `files::SEAT_LOOKUP_WAIT` at most. With no answer in that time, who is
 /// at the seat is not known yet, and the change is refused with the
-/// try-again text (`AtTheSeat::NotKnownYet`). A Mac looks at `/dev/console`.
+/// try-again text (`AtTheSeat::NotKnownYet`). #3845 — and so is every other
+/// look that cannot tell ([`seat_for`]). A Mac looks at `/dev/console`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn at_the_seat_now(uid: u32) -> tunnel_core::localapi::AtTheSeat {
     #[cfg(target_os = "linux")]
-    {
-        // Asked here, on the thread a test stood the lookup in on.
-        #[cfg(test)]
-        if let Some(stood) = stand_in::lookup_now() {
-            let lookup = stood.lookup;
-            let asked = stood
-                .flight
-                .ask(crate::files::SEAT_LOOKUP_WAIT, move || lookup())
-                .await;
-            return seat_for(uid, asked);
-        }
-        seat_for(
-            uid,
-            PERSON_AT_SEAT0
-                .ask(crate::files::SEAT_LOOKUP_WAIT, person_at_the_seat)
-                .await,
-        )
-    }
+    let wait = crate::files::SEAT_LOOKUP_WAIT;
     #[cfg(target_os = "macos")]
-    {
-        let at_seat = tokio::task::spawn_blocking(person_at_the_seat)
-            .await
-            .ok()
-            .flatten();
-        if at_seat == Some(uid) {
-            tunnel_core::localapi::AtTheSeat::Yes
-        } else {
-            tunnel_core::localapi::AtTheSeat::No
-        }
-    }
+    let wait = LOOK_WAIT;
+    seat_for(uid, look_at_the_seat(wait).await)
 }
 
 /// #3796 — the one lookup of who is at seat0 in flight for the person
-/// socket's checks ([`at_the_seat_now`]), on a thread named `seat0-person`.
-/// Its 5 s poll ([`run`]) asks on its own, one look at a time.
+/// socket, on a thread named `seat0-person`. #3845 — the checks
+/// ([`at_the_seat_now`]) and the 5 s poll ([`follow_the_seat`]) both ask
+/// through it, so a hung logind holds one thread for both.
 #[cfg(target_os = "linux")]
-static PERSON_AT_SEAT0: crate::one_in_flight::OneInFlight<Option<u32>> =
+static PERSON_AT_SEAT0: crate::one_in_flight::OneInFlight<Look> =
     crate::one_in_flight::OneInFlight::new("seat0-person");
 
-/// #3796 — what a check answers for `uid` from what the lookup gave it.
+/// #3845 — a look at the seat, `wait` at most, through the one lookup in
+/// flight ([`PERSON_AT_SEAT0`]). No answer in time, or a lookup that
+/// panicked, is not known.
 #[cfg(target_os = "linux")]
-fn seat_for(
-    uid: u32,
-    asked: crate::one_in_flight::Asked<Option<u32>>,
-) -> tunnel_core::localapi::AtTheSeat {
+async fn look_at_the_seat(wait: Duration) -> Look {
     use crate::one_in_flight::Asked;
-    use tunnel_core::localapi::AtTheSeat;
-    match asked {
-        Asked::Answer(at_seat) if at_seat == Some(uid) => AtTheSeat::Yes,
-        Asked::Answer(_) => AtTheSeat::No,
-        // As before: a lookup that failed names nobody at the seat.
-        Asked::Failed(why) => {
-            tracing::warn!(%why, "person socket: the seat lookup failed — nobody at the seat");
-            AtTheSeat::No
+    // Asked here, on the thread a test stood the lookup in on.
+    #[cfg(test)]
+    let asked = match stand_in::lookup_now() {
+        Some(stood) => {
+            let lookup = stood.lookup;
+            stood.flight.ask(wait, move || lookup()).await
         }
-        Asked::OutOfTime => {
+        None => PERSON_AT_SEAT0.ask(wait, person_at_the_seat).await,
+    };
+    #[cfg(not(test))]
+    let asked = PERSON_AT_SEAT0.ask(wait, person_at_the_seat).await;
+    match asked {
+        Asked::Answer(look) => look,
+        Asked::Failed(why) => Look::NotKnown(format!("the lookup failed: {why}")),
+        Asked::OutOfTime => Look::NotKnown(format!("no answer within {wait:?}")),
+    }
+}
+
+/// A Mac's look ([`look_at_the_seat`]): `/dev/console`'s owner, one `stat`,
+/// on a blocking thread.
+#[cfg(target_os = "macos")]
+async fn look_at_the_seat(_wait: Duration) -> Look {
+    tokio::task::spawn_blocking(person_at_the_seat)
+        .await
+        .unwrap_or(Look::Nobody)
+}
+
+/// #3796 — what a check answers for `uid` from a look at the seat. #3845 —
+/// a look that could not tell, however that came about (no answer in time,
+/// `loginctl` failed, the lookup panicked), is not known: a retry asks
+/// again, never "the seat changed".
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seat_for(uid: u32, look: Look) -> tunnel_core::localapi::AtTheSeat {
+    use tunnel_core::localapi::AtTheSeat;
+    match look {
+        Look::Person(at_seat) if at_seat == uid => AtTheSeat::Yes,
+        Look::Person(_) | Look::Nobody => AtTheSeat::No,
+        Look::NotKnown(why) => {
             tracing::warn!(
                 uid,
-                wait = ?crate::files::SEAT_LOOKUP_WAIT,
-                "person socket: who is at the seat gave no answer in time — a change is refused, try again"
+                "person socket: who is at the seat is not known ({}): a change or a consent \
+                 answer is refused, try again",
+                why.escape_debug()
             );
             AtTheSeat::NotKnownYet
         }
@@ -455,22 +521,23 @@ fn seat_for(
 /// #3796 — who is at the seat, as the person socket's check asks it, stood in
 /// on one thread: the lookup itself runs where the real one runs, in a flight
 /// of the stand-in's own, so a test sees how long a `ConfigSet` waits for it,
-/// and how many lookups began.
+/// and how many lookups began. #3845 — and as its poll asks it.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod stand_in {
+    use super::Look;
     use crate::one_in_flight::OneInFlight;
     use std::sync::{Arc, Mutex, PoisonError};
 
-    /// The lookup stood in: the uid of the person at the seat, or nobody.
-    type Asked = Arc<dyn Fn() -> Option<u32> + Send + Sync>;
+    /// The lookup stood in: what a look at the seat finds.
+    type Asked = Arc<dyn Fn() -> Look + Send + Sync>;
 
     /// The lookup stood in on a thread, with its own lookup in flight.
     pub(super) struct StoodLookup {
         pub(super) lookup: Asked,
-        pub(super) flight: Arc<OneInFlight<Option<u32>>>,
+        pub(super) flight: Arc<OneInFlight<Look>>,
     }
 
-    type Stands = (std::thread::ThreadId, Asked, Arc<OneInFlight<Option<u32>>>);
+    type Stands = (std::thread::ThreadId, Asked, Arc<OneInFlight<Look>>);
 
     static ASKED: Mutex<Option<Stands>> = Mutex::new(None);
 
@@ -491,7 +558,7 @@ pub(crate) mod stand_in {
 
     /// Stand `lookup` in for who is at the seat, on this thread only.
     pub(crate) async fn person_at_the_seat(
-        lookup: impl Fn() -> Option<u32> + Send + Sync + 'static,
+        lookup: impl Fn() -> Look + Send + Sync + 'static,
     ) -> Stood {
         let turn = TURN.lock().await;
         *ASKED.lock().unwrap_or_else(PoisonError::into_inner) = Some((
@@ -525,8 +592,7 @@ struct Listener {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Listener {
-    fn start(uid: u32, state: Arc<dyn LocalApiState>) -> Self {
-        let path = localapi::person_socket_path(uid);
+    fn start(uid: u32, path: std::path::PathBuf, state: Arc<dyn LocalApiState>) -> Self {
         let (stop, rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             if let Err(e) = localapi::serve_person_socket(path.clone(), uid, state, rx).await {
@@ -547,7 +613,7 @@ impl Listener {
 
 /// Run until `shutdown`. Inert unless this is a root daemon with the switch on.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run(state: Arc<dyn LocalApiState>, shutdown: watch::Receiver<bool>) {
     if !enabled_by_env(std::env::var("ROOMLERD_PERSON_SOCKET").ok().as_deref()) {
         tracing::info!("person socket: off (ROOMLERD_PERSON_SOCKET) — FR-27 P11");
         return;
@@ -556,19 +622,79 @@ pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bo
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
+    follow_the_seat(state, shutdown, Following::the_daemons()).await
+}
+
+/// #3845 — how [`follow_the_seat`] follows the seat: the daemon's, or a
+/// test's, which looks more often and makes its sockets in a folder of its
+/// own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Following {
+    /// The time between looks ([`POLL`]).
+    every: Duration,
+    /// How long a look waits for its answer ([`LOOK_WAIT`]).
+    wait: Duration,
+    /// Where the socket for a uid is made (`localapi::person_socket_path`).
+    path: Box<dyn Fn(u32) -> std::path::PathBuf + Send + Sync>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Following {
+    fn the_daemons() -> Self {
+        Self {
+            every: POLL,
+            wait: LOOK_WAIT,
+            path: Box::new(localapi::person_socket_path),
+        }
+    }
+}
+
+/// Serves the person at the seat a socket of their own, and moves it as the
+/// seat changes, until `shutdown`.
+///
+/// #3845 — each look is [`look_at_the_seat`], [`LOOK_WAIT`] at most, through
+/// the lookup in flight the checks share. It used to wait on a blocking
+/// thread for as long as `loginctl` took, and read a look that failed as
+/// nobody, which closed the person's socket while logind hung. A look that
+/// cannot tell now keeps what is served ([`step`]). A run of them is said
+/// once as it begins and once as it ends, never on every look.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn follow_the_seat(
+    state: Arc<dyn LocalApiState>,
+    mut shutdown: watch::Receiver<bool>,
+    following: Following,
+) {
     let mut current: Option<Listener> = None;
     let mut failed: Option<(u32, Instant)> = None;
+    // #3845 — when the run of looks that could not tell began, while one runs.
+    let mut not_known_since: Option<Instant> = None;
     loop {
         // A listener that ended on its own was not served: note it, and let
         // the step below see "nobody served" so it retries after the pause.
         if let Some(l) = current.take_if(|l| l.task.is_finished()) {
             failed = Some((l.uid, Instant::now()));
         }
-        let at_seat = tokio::task::spawn_blocking(person_at_the_seat)
-            .await
-            .ok()
-            .flatten();
-        match step(current.as_ref().map(|l| l.uid), at_seat) {
+        let look = look_at_the_seat(following.wait).await;
+        match (&look, not_known_since) {
+            (Look::NotKnown(why), None) => {
+                tracing::warn!(
+                    serving = ?current.as_ref().map(|l| l.uid),
+                    "person socket: who is at the seat is not known ({}); serving as before",
+                    why.escape_debug()
+                );
+                not_known_since = Some(Instant::now());
+            }
+            (Look::NotKnown(_), Some(_)) => {}
+            (Look::Person(_) | Look::Nobody, Some(since)) => {
+                tracing::info!(
+                    after = ?since.elapsed(),
+                    "person socket: who is at the seat is known again"
+                );
+                not_known_since = None;
+            }
+            (Look::Person(_) | Look::Nobody, None) => {}
+        }
+        match step(current.as_ref().map(|l| l.uid), &look) {
             Step::Keep => {}
             Step::Stop => {
                 if let Some(l) = current.take() {
@@ -593,13 +719,13 @@ pub async fn run(state: Arc<dyn LocalApiState>, mut shutdown: watch::Receiver<bo
                 }
                 let too_soon = failed.is_some_and(|(u, at)| u == uid && at.elapsed() < RETRY_AFTER);
                 if !too_soon {
-                    current = Some(Listener::start(uid, state.clone()));
+                    current = Some(Listener::start(uid, (following.path)(uid), state.clone()));
                     failed = None;
                 }
             }
         }
         tokio::select! {
-            _ = tokio::time::sleep(POLL) => {}
+            _ = tokio::time::sleep(following.every) => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
@@ -648,14 +774,67 @@ mod tests {
     /// The listener follows the person at the seat; root and nobody get none.
     #[test]
     fn the_socket_follows_the_person_at_the_seat() {
-        assert_eq!(step(None, None), Step::Keep);
-        assert_eq!(step(None, Some(1000)), Step::Start(1000));
-        assert_eq!(step(Some(1000), Some(1000)), Step::Keep);
-        assert_eq!(step(Some(1000), Some(1001)), Step::Move(1001));
-        assert_eq!(step(Some(1000), None), Step::Stop);
+        use Look::{Nobody, Person};
+        assert_eq!(step(None, &Nobody), Step::Keep);
+        assert_eq!(step(None, &Person(1000)), Step::Start(1000));
+        assert_eq!(step(Some(1000), &Person(1000)), Step::Keep);
+        assert_eq!(step(Some(1000), &Person(1001)), Step::Move(1001));
+        assert_eq!(step(Some(1000), &Nobody), Step::Stop);
         // Root at the seat reaches the daemon's own socket.
-        assert_eq!(step(None, Some(0)), Step::Keep);
-        assert_eq!(step(Some(1000), Some(0)), Step::Stop);
+        assert_eq!(step(None, &Person(0)), Step::Keep);
+        assert_eq!(step(Some(1000), &Person(0)), Step::Stop);
+    }
+
+    /// #3845 — a look that could not tell who is at the seat is not nobody:
+    /// the socket stays where it is, served or not, until the seat answers.
+    #[test]
+    fn a_look_that_cannot_tell_keeps_what_is_served() {
+        let not_known = Look::NotKnown(
+            "loginctl show-seat seat0 failed: Failed to get properties: Connection timed out"
+                .into(),
+        );
+        assert_eq!(step(Some(1000), &not_known), Step::Keep, "never a Stop");
+        assert_eq!(step(None, &not_known), Step::Keep, "never a Start");
+    }
+
+    /// #3845 — what a look at seat0 makes of logind's answer: nobody only
+    /// when the seat itself says so, or root is there; any other failure
+    /// cannot tell who is at the seat.
+    #[test]
+    fn only_the_seats_own_answer_is_nobody() {
+        use crate::companion::{loginctl_did_not_start, loginctl_failed, nobody_at_the_screen};
+        use std::io::{Error, ErrorKind};
+        let seat0 = ["show-seat", "seat0"];
+        assert_eq!(look_of(Ok(1000)), Look::Person(1000));
+        assert_eq!(
+            look_of(Ok(0)),
+            Look::Nobody,
+            "root has the daemon's own socket"
+        );
+        // An empty seat, the login screen: the seat's own answer.
+        let empty = nobody_at_the_screen("seat0 has no active session".into());
+        assert_eq!(look_of(Err(empty)), Look::Nobody);
+        // A host with no logind has no seat.
+        let not_installed = loginctl_did_not_start(Error::from(ErrorKind::NotFound));
+        assert_eq!(look_of(Err(not_installed)), Look::Nobody);
+        let no_systemd = loginctl_failed(
+            &seat0,
+            "System has not been booted with systemd as init system (PID 1). Can't operate.",
+        );
+        assert_eq!(look_of(Err(no_systemd)), Look::Nobody);
+        // logind or the bus did not answer: not known, and why.
+        let timed_out = loginctl_failed(&seat0, "Failed to get properties: Connection timed out\n");
+        assert_eq!(
+            look_of(Err(timed_out)),
+            Look::NotKnown(
+                "loginctl show-seat seat0 failed: Failed to get properties: Connection timed out"
+                    .into()
+            )
+        );
+        let refused = loginctl_did_not_start(Error::from(ErrorKind::PermissionDenied));
+        assert!(
+            matches!(look_of(Err(refused)), Look::NotKnown(ref why) if why.contains("spawning loginctl")),
+        );
     }
 
     fn devices(overlay: &str) -> Response {
@@ -839,5 +1018,471 @@ mod tests {
             matches!(answer, Response::Upstream { ref code, .. } if code == "server_unreachable"),
             "{answer:?}"
         );
+    }
+}
+
+/// #3845 — the poll and the person socket of a Linux system install, with
+/// who is at the seat stood in: the real poll ([`follow_the_seat`]), the real
+/// socket (`localapi::serve_person_socket`, made in a folder of the test's
+/// own, for the account the test runs as) and the real check before a change
+/// or a consent answer ([`at_the_seat_now`]). Run as an account that is not
+/// root, since root is never asked whether it is at the seat: CI's agent lane
+/// (`rust-agent`, "Test agent under vp9-444") runs them as the runner.
+#[cfg(all(test, target_os = "linux"))]
+mod following_the_seat_tests {
+    use super::*;
+    use crate::peer::files_log_tests::Logged;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tunnel_core::localapi::{AtTheSeat, CANNOT_TELL_WHO_IS_AT_THE_SCREEN, FlowInfo, PeerInfo};
+
+    /// The time between the test poll's looks.
+    const EVERY: Duration = Duration::from_millis(50);
+    /// How long the test poll waits for a look.
+    const WAIT: Duration = Duration::from_millis(150);
+    /// Time for several looks, hung ones included.
+    const SEVERAL_LOOKS: Duration = Duration::from_millis(1200);
+    /// Long enough that only something stuck runs out of it.
+    const LONG: Duration = Duration::from_secs(10);
+    /// What `loginctl` says when logind did not answer its D-Bus call in time.
+    const TIMED_OUT: &str =
+        "loginctl show-seat seat0 failed: Failed to get properties: Connection timed out";
+
+    const STATUS: &str = r#"{"t":"status"}"#;
+    const SET: &str = r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"on"}}"#;
+    const ANSWER: &str =
+        r#"{"t":"consent_decide","d":{"session_id":"38450000000000000000aaaa","allow":true}}"#;
+
+    /// The account the test runs as, or `None` (and the test returns) as root.
+    fn me() -> Option<u32> {
+        // SAFETY: getuid and geteuid never fail.
+        let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+        if uid == 0 || euid == 0 {
+            eprintln!("skipped: run as an account that is not root, which the seat is asked about");
+            return None;
+        }
+        Some(euid)
+    }
+
+    /// Who is at the seat, as a test stands it in: what each look finds, or
+    /// nothing until the test says (a logind that does not answer). It counts
+    /// the lookups that began, and the most that ran at once.
+    #[derive(Clone)]
+    struct TheSeat(Arc<SeatState>);
+
+    struct SeatState {
+        /// What a look finds; `None` holds it.
+        finds: Mutex<Option<Look>>,
+        changed: Condvar,
+        began: AtomicUsize,
+        running: AtomicUsize,
+        most_at_once: AtomicUsize,
+    }
+
+    impl TheSeat {
+        fn finding(look: Look) -> Self {
+            Self(Arc::new(SeatState {
+                finds: Mutex::new(Some(look)),
+                changed: Condvar::new(),
+                began: AtomicUsize::new(0),
+                running: AtomicUsize::new(0),
+                most_at_once: AtomicUsize::new(0),
+            }))
+        }
+
+        /// From now on every look finds `look`, one that was held included.
+        fn finds(&self, look: Look) {
+            *self.0.finds.lock().unwrap_or_else(PoisonError::into_inner) = Some(look);
+            self.0.changed.notify_all();
+        }
+
+        /// From now on every look waits, as on a logind that does not answer.
+        fn hangs(&self) {
+            *self.0.finds.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+
+        /// The lookup the stand-in runs.
+        fn lookup(&self) -> impl Fn() -> Look + Send + Sync + 'static {
+            let seat = self.0.clone();
+            move || {
+                seat.began.fetch_add(1, SeqCst);
+                let now = seat.running.fetch_add(1, SeqCst) + 1;
+                seat.most_at_once.fetch_max(now, SeqCst);
+                let finds = seat.finds.lock().unwrap_or_else(PoisonError::into_inner);
+                let found = seat
+                    .changed
+                    .wait_while(finds, |finds| finds.is_none())
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                    .unwrap_or(Look::Nobody);
+                seat.running.fetch_sub(1, SeqCst);
+                found
+            }
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(SeqCst)
+        }
+
+        fn most_at_once(&self) -> usize {
+            self.0.most_at_once.load(SeqCst)
+        }
+    }
+
+    /// Lets every held look go when a test ends, however it ends.
+    struct LetGoAtTheEnd(TheSeat);
+
+    impl Drop for LetGoAtTheEnd {
+        fn drop(&mut self) {
+            self.0.finds(Look::Nobody);
+        }
+    }
+
+    /// The daemon's side of the socket here: the real check of who is at the
+    /// seat, and a configuration and a consent prompt that count what
+    /// reaches them.
+    #[derive(Default)]
+    struct Counted {
+        sets: AtomicUsize,
+        answers: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LocalApiState for Counted {
+        fn status(&self) -> NodeStatus {
+            serde_json::from_str(
+                r#"{"node_id":"d","name":"seat","version":"0.4.0","mode":"service","connected":true}"#,
+            )
+            .unwrap()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn at_the_seat_now(&self, uid: u32) -> AtTheSeat {
+            at_the_seat_now(uid).await
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            self.answers.fetch_add(1, SeqCst);
+            true
+        }
+        async fn config_set(&self, key: &str, value: Option<&str>) -> Response {
+            self.sets.fetch_add(1, SeqCst);
+            Response::ConfigUpdated {
+                entry: serde_json::from_value(serde_json::json!({
+                    "key": key, "value": value, "kind": "tribool",
+                    "restart_required": false, "description": "",
+                }))
+                .unwrap(),
+            }
+        }
+    }
+
+    /// The poll, following the seat for `state` with its sockets in `dir`,
+    /// a look each `every`. The sender stops it.
+    fn follow(
+        state: &Arc<Counted>,
+        dir: &Path,
+        every: Duration,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let (stop, shutdown) = watch::channel(false);
+        let state: Arc<dyn LocalApiState> = state.clone();
+        let dir = dir.to_path_buf();
+        let following = Following {
+            every,
+            wait: WAIT,
+            path: Box::new(move |uid| dir.join(uid.to_string()).join("roomler.sock")),
+        };
+        (
+            stop,
+            tokio::spawn(follow_the_seat(state, shutdown, following)),
+        )
+    }
+
+    /// The folder `uid`'s socket is made in under `dir`, made for them (it is
+    /// theirs: the test runs as them), and the socket's path.
+    fn socket_for(dir: &Path, uid: u32) -> PathBuf {
+        let folder = dir.join(uid.to_string());
+        std::fs::create_dir(&folder).unwrap();
+        folder.join("roomler.sock")
+    }
+
+    /// One request over the socket at `path`, as this process, answered
+    /// within `within`; or why it was not.
+    async fn ask(path: &Path, line: &str, within: Duration) -> Result<Response, String> {
+        let asked = async {
+            let stream = tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(|e| format!("connecting: {e}"))?;
+            let (read, mut write) = stream.into_split();
+            write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .map_err(|e| format!("writing: {e}"))?;
+            let answer = tokio::io::BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .map_err(|e| format!("reading: {e}"))?
+                .ok_or_else(|| "the socket closed with no answer".to_string())?;
+            serde_json::from_str::<Response>(&answer).map_err(|e| format!("{e}: {answer}"))
+        };
+        tokio::time::timeout(within, asked)
+            .await
+            .map_err(|_| format!("no answer within {within:?}"))?
+    }
+
+    /// Whether the socket at `path` answers a status read.
+    async fn served(path: &Path) -> bool {
+        matches!(
+            ask(path, STATUS, Duration::from_secs(2)).await,
+            Ok(Response::Status(_))
+        )
+    }
+
+    /// Until the socket at `path` is served, or with `false` is not, `LONG`
+    /// at most.
+    async fn until_served(path: &Path, want: bool, what: &str) {
+        let deadline = Instant::now() + LONG;
+        while served(path).await != want {
+            assert!(Instant::now() < deadline, "{what}: not within {LONG:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `line`, from this account, is refused with the try-again text within
+    /// the check's own wait.
+    async fn told_to_try_again(path: &Path, line: &str, what: &str) {
+        let bound = crate::files::SEAT_LOOKUP_WAIT + Duration::from_secs(1);
+        let began = Instant::now();
+        let answer = ask(path, line, bound).await;
+        let waited = began.elapsed();
+        assert!(
+            matches!(&answer, Ok(Response::Error { message }) if message == CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+            "{what}: expected the try-again text, got {answer:?}"
+        );
+        assert!(waited < bound, "{what}: waited {waited:?}");
+    }
+
+    /// How many lines of `text` hold `needle`.
+    fn lines_with(text: &str, needle: &str) -> usize {
+        text.lines().filter(|line| line.contains(needle)).count()
+    }
+
+    /// Stops the poll and waits for it, `LONG` at most.
+    async fn stop_following(stop: watch::Sender<bool>, poll: tokio::task::JoinHandle<()>) {
+        let _ = stop.send(true);
+        tokio::time::timeout(LONG, poll)
+            .await
+            .expect("the poll stops")
+            .expect("the poll ran to its end");
+    }
+
+    /// #3845 — logind stops answering, and then `loginctl`'s D-Bus call gives
+    /// up, as on a paused logind. Neither is nobody at the seat: the person's
+    /// socket stays served the whole time, the poll says once that who is at
+    /// the seat is not known, and the person's change is told to try again
+    /// instead of meeting a closed socket. The poll's looks and the checks
+    /// share one lookup in flight. Once logind answers, the same change goes
+    /// through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hung_logind_keeps_the_socket_served_and_the_person_is_told_to_try_again() {
+        let Some(me) = me() else { return };
+        let log = Logged::start(tracing::Level::INFO);
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_for(dir.path(), me);
+        let state = Arc::new(Counted::default());
+        let (stop, poll) = follow(&state, dir.path(), EVERY);
+        until_served(&path, true, "the person's socket").await;
+
+        // logind stops answering: every look hangs.
+        let before_the_hang = seat.began();
+        seat.hangs();
+        tokio::time::sleep(SEVERAL_LOOKS).await;
+        assert!(served(&path).await, "served while logind hangs");
+        told_to_try_again(&path, SET, "a change while logind hangs").await;
+        let during_the_hang = seat.began() - before_the_hang;
+
+        // Then `loginctl` gives up, as its D-Bus call does after 25 s, and
+        // goes on failing at once while logind stays stopped.
+        seat.finds(Look::NotKnown(TIMED_OUT.into()));
+        tokio::time::sleep(SEVERAL_LOOKS).await;
+        assert!(
+            served(&path).await,
+            "served after the lookup failed: not known is not nobody"
+        );
+        told_to_try_again(&path, SET, "a change after the lookup failed").await;
+        assert_eq!(state.sets.load(SeqCst), 0, "nothing set while not known");
+        let text = log.text();
+        assert_eq!(
+            lines_with(
+                &text,
+                "who is at the seat is not known (no answer within 150ms); serving as before"
+            ),
+            1,
+            "one line for the whole run:\n{text}"
+        );
+        assert_eq!(lines_with(&text, "; serving as before"), 1, "{text}");
+        assert_eq!(lines_with(&text, "nobody at the seat now"), 0, "{text}");
+        assert!(
+            during_the_hang <= 1,
+            "the poll's looks and a check while logind hung: one lookup between them, not \
+             {during_the_hang}"
+        );
+        assert_eq!(seat.most_at_once(), 1, "never two lookups at once");
+
+        // logind answers again: the same change goes through.
+        seat.finds(Look::Person(me));
+        match ask(&path, SET, LONG).await {
+            Ok(Response::ConfigUpdated { entry }) => assert_eq!(entry.value.as_deref(), Some("on")),
+            other => panic!("the person at the seat, once logind answers: {other:?}"),
+        }
+        assert_eq!(state.sets.load(SeqCst), 1);
+        let deadline = Instant::now() + LONG;
+        while lines_with(&log.text(), "who is at the seat is known again") == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no end of the run:\n{}",
+                log.text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(served(&path).await);
+        stop_following(stop, poll).await;
+    }
+
+    /// #3845's control: when the seat itself answers that nobody is there
+    /// (the login screen, an empty seat), the socket closes as before, with
+    /// its one line, and nothing says "not known".
+    #[tokio::test(flavor = "current_thread")]
+    async fn nobody_at_the_seat_still_closes_the_socket() {
+        let Some(me) = me() else { return };
+        let log = Logged::start(tracing::Level::INFO);
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_for(dir.path(), me);
+        let state = Arc::new(Counted::default());
+        let (stop, poll) = follow(&state, dir.path(), EVERY);
+        until_served(&path, true, "the person's socket").await;
+
+        seat.finds(Look::Nobody);
+        until_served(&path, false, "the socket closes for nobody at the seat").await;
+        let text = log.text();
+        assert_eq!(
+            lines_with(&text, "nobody at the seat now; closing"),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            lines_with(&text, "who is at the seat is not known"),
+            0,
+            "{text}"
+        );
+        stop_following(stop, poll).await;
+    }
+
+    /// #3845 — the person at the seat changes while logind cannot be read:
+    /// the socket stays with the person it was made for, and moves only once
+    /// logind answers, in one move and never by way of "nobody".
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_seat_that_changed_while_not_known_moves_only_once_logind_answers() {
+        let Some(me) = me() else { return };
+        let other = me + 1;
+        let log = Logged::start(tracing::Level::INFO);
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_for(dir.path(), me);
+        let state = Arc::new(Counted::default());
+        let (stop, poll) = follow(&state, dir.path(), EVERY);
+        until_served(&path, true, "the person's socket").await;
+
+        // logind cannot be read, and meanwhile someone else has the seat.
+        seat.finds(Look::NotKnown(TIMED_OUT.into()));
+        tokio::time::sleep(SEVERAL_LOOKS).await;
+        assert!(
+            served(&path).await,
+            "still the socket of the person it was made for"
+        );
+        let text = log.text();
+        assert_eq!(
+            lines_with(&text, "the person at the seat changed"),
+            0,
+            "{text}"
+        );
+        assert_eq!(lines_with(&text, "nobody at the seat now"), 0, "{text}");
+
+        // logind answers: the other person is at the seat. Their socket is
+        // not made here (their folder is not theirs), which is beside the
+        // point: the person who left loses theirs, in one move.
+        seat.finds(Look::Person(other));
+        until_served(&path, false, "the socket leaves the person who left").await;
+        let text = log.text();
+        let moved: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("the person at the seat changed"))
+            .collect();
+        assert_eq!(moved.len(), 1, "{text}");
+        assert!(
+            moved[0].contains(&format!("from={me}")) && moved[0].contains(&format!("to={other}")),
+            "{}",
+            moved[0]
+        );
+        assert_eq!(lines_with(&text, "nobody at the seat now"), 0, "{text}");
+        stop_following(stop, poll).await;
+    }
+
+    /// #3845 — a consent answer lets someone see and control this screen, so
+    /// the person socket asks again, as before a change, whether whoever
+    /// answers is the person at the seat NOW. This poll looks once and then
+    /// not for an hour, so the socket stays with the person it was made for
+    /// while the seat changes under it: from someone who left it is refused
+    /// in words, while who is there is not known it is told to try again,
+    /// and from the person at the seat it goes through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_consent_answer_comes_from_whoever_is_at_the_seat_now() {
+        let Some(me) = me() else { return };
+        let seat = TheSeat::finding(Look::Person(me));
+        let _let_go = LetGoAtTheEnd(seat.clone());
+        let _stood = stand_in::person_at_the_seat(seat.lookup()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_for(dir.path(), me);
+        let state = Arc::new(Counted::default());
+        let (stop, poll) = follow(&state, dir.path(), Duration::from_secs(3600));
+        until_served(&path, true, "the person's socket").await;
+
+        seat.finds(Look::Person(me + 1));
+        let answer = ask(&path, ANSWER, LONG).await;
+        assert!(
+            matches!(&answer, Ok(Response::Error { message }) if message.contains("not this account right now")),
+            "an answer from the person who left: {answer:?}"
+        );
+        seat.hangs();
+        told_to_try_again(&path, ANSWER, "an answer while logind hangs").await;
+        seat.finds(Look::NotKnown(TIMED_OUT.into()));
+        told_to_try_again(&path, ANSWER, "an answer while logind cannot be read").await;
+        assert_eq!(
+            state.answers.load(SeqCst),
+            0,
+            "no answer reached the prompt"
+        );
+
+        seat.finds(Look::Person(me));
+        assert_eq!(
+            ask(&path, ANSWER, LONG).await,
+            Ok(Response::ConsentDecided { ok: true })
+        );
+        assert_eq!(state.answers.load(SeqCst), 1);
+        stop_following(stop, poll).await;
     }
 }

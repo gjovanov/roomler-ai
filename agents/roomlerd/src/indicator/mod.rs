@@ -76,6 +76,44 @@ pub struct PromptView {
     pub expires_at: std::time::Instant,
 }
 
+/// #3857 — FR-93 P6f's notification prompt on its way up
+/// ([`ViewerIndicator::start_notification_prompt`]): whether it came up, once
+/// its show has ended ([`Self::outcome`]).
+pub struct NotificationPrompt(Showing);
+
+/// Where a notification prompt's show is.
+enum Showing {
+    /// Over before it began, or never begun: its outcome.
+    Settled(Result<(), String>),
+    /// Running on a thread of the blocking pool.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    Running(tokio::task::JoinHandle<Result<(), String>>),
+}
+
+impl NotificationPrompt {
+    /// A show already over: `outcome`.
+    pub(crate) fn settled(outcome: Result<(), String>) -> Self {
+        Self(Showing::Settled(outcome))
+    }
+
+    /// Whether the notification came up, or why not, once its show has
+    /// ended. Never "up" for a show that did not see it up.
+    pub async fn outcome(self) -> Result<(), String> {
+        match self.0 {
+            Showing::Settled(outcome) => outcome,
+            #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+            Showing::Running(show) => show
+                .await
+                .unwrap_or_else(|e| Err(format!("its show ended with no answer: {e}"))),
+        }
+    }
+
+    /// Whether the notification came up ([`Self::outcome`]).
+    pub async fn shown(self) -> bool {
+        self.outcome().await.is_ok()
+    }
+}
+
 /// FR-85 P3 — where a recording in progress is shown on this device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordingShown {
@@ -238,22 +276,57 @@ impl ViewerIndicator {
     /// Answers arrive on the same `ConsentSender` as the native panel's, and
     /// [`Self::hide_prompt`] takes it down.
     pub async fn show_notification_prompt(&self, view: PromptView) -> bool {
+        self.start_notification_prompt(view).shown().await
+    }
+
+    /// #3857 — [`Self::show_notification_prompt`], started now and waited for
+    /// later ([`NotificationPrompt::outcome`]). Nothing here waits: the show
+    /// runs on a thread of the blocking pool, as it always did, so the WS loop
+    /// that starts one reads its next frame while the session helper starts
+    /// (logind, the account database, the person's session bus).
+    pub fn start_notification_prompt(&self, view: PromptView) -> NotificationPrompt {
         #[cfg(all(target_os = "linux", feature = "portal-capture"))]
         {
             let Some(n) = self.notify.clone() else {
-                return false;
+                return NotificationPrompt::settled(Err(
+                    "this handle has no notification prompts".into()
+                ));
             };
-            // Posting waits for the session helper's first line; off the
-            // runtime's threads.
-            tokio::task::spawn_blocking(move || n.show(&view))
-                .await
-                .unwrap_or(false)
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return NotificationPrompt::settled(Err(
+                    "no runtime to put the notification up from".into(),
+                ));
+            };
+            // On the books before the show starts: a `hide_prompt` from here
+            // on (the question answered elsewhere, its session ended, its
+            // socket closed) stops the show, however far it has got.
+            let generation = n.coming(&view.session_hex);
+            // A test stands the session walk in for its own task or thread;
+            // the show runs on the blocking pool, so the stand-in goes with it.
+            #[cfg(test)]
+            let stood = crate::companion::session_walk_stand_in::now();
+            let show = move || n.show(&view, generation);
+            #[cfg(test)]
+            let show = move || match stood {
+                Some(stood) => crate::companion::session_walk_stand_in::blocking(&stood, show),
+                None => show(),
+            };
+            NotificationPrompt(Showing::Running(runtime.spawn_blocking(show)))
         }
         #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
         {
             let _ = view;
-            false
+            NotificationPrompt::settled(Err(
+                "no notification prompts on this platform or in this build".into(),
+            ))
         }
+    }
+
+    /// #3857 — whether a notification prompt is up for `session_hex`: what a
+    /// test reads to know nothing was left on the screen.
+    #[cfg(all(test, target_os = "linux", feature = "portal-capture"))]
+    pub(crate) fn notification_is_up(&self, session_hex: &str) -> bool {
+        self.notify.as_ref().is_some_and(|n| n.is_up(session_hex))
     }
 
     /// Take a consent prompt down — it was answered, timed out, or resolved

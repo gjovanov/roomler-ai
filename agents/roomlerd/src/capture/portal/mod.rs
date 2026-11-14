@@ -1292,6 +1292,9 @@ pub mod helper {
     ///
     /// `NoSession` is split out because it is the one arm that is a legitimate
     /// answer rather than a failure, and every caller maps it differently.
+    /// #3857 — so a session walk that gave no answer in time is `Other`, with
+    /// its reason: who is at the screen is then not known, not nobody.
+    #[derive(Debug)]
     pub(crate) enum SpawnError {
         NoSession,
         Other(String),
@@ -1316,21 +1319,45 @@ pub mod helper {
     ) -> Result<std::process::Child, SpawnError> {
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
         let euid = unsafe { libc::geteuid() };
+        spawn_child_in(&helper_session(euid)?, euid, extra_args, piped_stdin)
+    }
+
+    /// #3857 — the graphical session the helper runs in, from the walk every
+    /// caller on a blocking thread shares
+    /// ([`crate::companion::graphical_session_within`]). logind's own "nobody"
+    /// is [`SpawnError::NoSession`], as ever; a walk that gave no answer in
+    /// time is `Other`, with its reason.
+    pub(crate) fn helper_session(
+        euid: u32,
+    ) -> Result<crate::companion::GraphicalSession, SpawnError> {
+        use crate::companion::NoGraphicalSession;
         // A per-user daemon may open the portal only in its OWN session, so it
         // looks for that one: on a machine where two people are logged in,
         // "the first active session" could be the other person's.
-        let found = if euid == 0 {
-            crate::companion::graphical_session()
-        } else {
-            crate::companion::graphical_session_matching(Some(euid), false)
-        };
-        let sess = match found {
-            Ok(s) => s,
-            Err(e) => {
+        let want_uid = (euid != 0).then_some(euid);
+        match crate::companion::graphical_session_within(want_uid, false) {
+            Ok(s) => Ok(s),
+            Err(NoGraphicalSession::Answered(e)) => {
                 tracing::debug!(%e, "portal: no graphical session to run the helper in");
-                return Err(SpawnError::NoSession);
+                Err(SpawnError::NoSession)
             }
-        };
+            Err(NoGraphicalSession::NotKnown(why)) => {
+                tracing::warn!(%why, "portal: the helper's graphical session is not known");
+                Err(SpawnError::Other(why))
+            }
+        }
+    }
+
+    /// #3857 — [`spawn_child`] in `sess`, the session [`helper_session`]
+    /// found: a caller whose reason to start the helper can end while logind
+    /// answers (the notification prompt's question) asks for the two one at
+    /// a time.
+    pub(crate) fn spawn_child_in(
+        sess: &crate::companion::GraphicalSession,
+        euid: u32,
+        extra_args: &[&str],
+        piped_stdin: bool,
+    ) -> Result<std::process::Child, SpawnError> {
         let exe = std::env::current_exe()
             .map_err(|e| SpawnError::Other(format!("resolving our own path: {e}")))?;
 
@@ -1697,6 +1724,75 @@ pub mod helper {
                 .spawn()
                 .expect_err("setgroups must refuse an unprivileged caller");
             assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        }
+
+        /// #3857 — the helper's session comes from the walk every blocking
+        /// caller shares (capture, audio, keep busy, the notification
+        /// prompt): with logind held, a root daemon and a per-user one are
+        /// each refused within the walk's wait, with the reason, as not
+        /// known, never as nobody at the screen.
+        ///
+        /// Red before #3857: the walk ran on the caller's thread for as long
+        /// as logind held it.
+        #[test]
+        fn a_held_walk_refuses_the_helper_within_its_wait_with_its_reason() {
+            use crate::companion::SESSION_WALK_WAIT;
+            use crate::companion::session_walk_stand_in::{
+                Held, OpenedAtTheEnd, StandIn, ana, blocking,
+            };
+            let held = Held::default();
+            let _opened = OpenedAtTheEnd(held.clone());
+            let stood = StandIn::held(&held, ana());
+            for euid in [0, 4242] {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stood = stood.clone();
+                std::thread::spawn(move || {
+                    let asked = std::time::Instant::now();
+                    let found = blocking(&stood, || helper_session(euid));
+                    let _ = tx.send((found, asked.elapsed()));
+                });
+                let (found, waited) = rx
+                    .recv_timeout(SESSION_WALK_WAIT + std::time::Duration::from_secs(1))
+                    .unwrap_or_else(|_| panic!("euid {euid}: no answer within the walk's wait"));
+                match found {
+                    Err(SpawnError::Other(why)) => assert!(
+                        why.contains("no answer"),
+                        "euid {euid}: the reason says logind gave no answer: {why}"
+                    ),
+                    other => panic!("euid {euid}: logind held, and the helper got {other:?}"),
+                }
+                assert!(
+                    waited >= SESSION_WALK_WAIT,
+                    "euid {euid}: refused in {waited:?}, before the walk's wait"
+                );
+            }
+        }
+
+        /// The control: a walk in time gives the helper its session as
+        /// before. Root asks for anyone's, a per-user daemon for its own
+        /// uid's, neither for persons only, and logind's "nobody" is
+        /// `NoSession`.
+        #[test]
+        fn a_walk_in_time_gives_the_helper_its_session_as_today() {
+            use crate::companion::session_walk_stand_in::{StandIn, ana, blocking};
+            let stood = StandIn::new(|want_uid, users_only| {
+                assert!(!users_only, "the helper never asks for persons only");
+                match want_uid {
+                    None | Some(4242) => Ok(ana()),
+                    Some(_) => Err(
+                        "no active graphical session — nobody is at this machine's screen".into(),
+                    ),
+                }
+            });
+            assert_eq!(blocking(&stood, || helper_session(0)).ok(), Some(ana()));
+            assert_eq!(blocking(&stood, || helper_session(4242)).ok(), Some(ana()));
+            assert!(
+                matches!(
+                    blocking(&stood, || helper_session(1000)),
+                    Err(SpawnError::NoSession)
+                ),
+                "logind's own nobody stays NoSession"
+            );
         }
     }
 }

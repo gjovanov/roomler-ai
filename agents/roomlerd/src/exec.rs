@@ -810,7 +810,16 @@ impl RunAs {
 /// than growing a second identity model for interactive sessions. Every
 /// refusal here — `console_user` with nobody at the screen, `named` on
 /// Windows — is a refusal there too, in the same words.
-pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), String> {
+///
+/// #3822 — `async`: `console_user` asks who is at the screen
+/// ([`console_account`]) at the same point as before, after every gate, and on
+/// Linux without holding the caller's async worker. #3853 — and `named` and
+/// `console_user` look their account up the same way, off the worker, 1.5 s
+/// at most (`unix_priv::session_account`).
+pub(crate) async fn apply_run_as(
+    cmd: &mut tokio::process::Command,
+    who: &RunAs,
+) -> Result<(), String> {
     // Only the Unix drop path configures the command. On Windows every
     // non-daemon mode is currently a refusal, so nothing is set — which is the
     // point: refusing configures nothing and spawns nothing.
@@ -820,7 +829,7 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
         RunAs::Daemon => Ok(()),
 
         #[cfg(unix)]
-        RunAs::Named(account) => unix_priv::drop_to(cmd, account),
+        RunAs::Named(account) => unix_priv::drop_to(cmd, account).await,
         #[cfg(not(unix))]
         RunAs::Named(account) => Err(format!(
             "cannot run as the local account {account:?}: becoming an arbitrary user on Windows \
@@ -846,7 +855,9 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
         // there, when that person is root, and by a daemon that is neither
         // root nor them.
         #[cfg(unix)]
-        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, false),
+        RunAs::ConsoleUser => {
+            unix_priv::drop_to_console(cmd, &console_account().await?, false).await
+        }
         #[cfg(not(any(windows, unix)))]
         RunAs::ConsoleUser => {
             Err("account_mode `console_user` has no console to read on this platform".into())
@@ -862,7 +873,7 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// was, `/`, which is sshd's fallback too. Off with
 /// `ROOMLERD_SSH_START_IN_HOME=0`. Windows' `console_user` starts in the
 /// profile through its own spawn (`win_console`, `pty::windows`).
-pub(crate) fn apply_run_as_at_home(
+pub(crate) async fn apply_run_as_at_home(
     cmd: &mut tokio::process::Command,
     who: &RunAs,
 ) -> Result<(), String> {
@@ -870,11 +881,13 @@ pub(crate) fn apply_run_as_at_home(
     if ssh_starts_in_home() {
         return match who {
             RunAs::Daemon => Ok(()),
-            RunAs::Named(account) => unix_priv::drop_to_in(cmd, account, true),
-            RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, true),
+            RunAs::Named(account) => unix_priv::drop_to_in(cmd, account, true).await,
+            RunAs::ConsoleUser => {
+                unix_priv::drop_to_console(cmd, &console_account().await?, true).await
+            }
         };
     }
-    apply_run_as(cmd, who)
+    apply_run_as(cmd, who).await
 }
 
 /// FR-97 P5b — does a person's SSH session start in their home? Default on;
@@ -885,22 +898,266 @@ pub(crate) fn ssh_starts_in_home() -> bool {
 }
 
 /// FR-97 P5a — the account of the person at this machine's screen, for
-/// `console_user` off Windows (D7): logind's seat0 on Linux
-/// (`companion::seat0_user`), the owner of `/dev/console` on macOS
-/// (`companion::console_user_name`). The error names the mode and why
-/// nobody is there.
+/// `console_user` off Windows (D7): logind's seat0 on Linux, the owner of
+/// `/dev/console` on macOS (`companion::console_user_name`). The error names
+/// the mode and why nobody is there.
+///
+/// #3822 — on Linux, logind and the account database are other processes,
+/// and either may not answer (a stopped logind, a stalled SSSD or LDAP). So
+/// the person is asked as a received file asks: through the one seat0 lookup
+/// in flight (`files::ask_seat0`, on a thread named `seat0-lookup`), awaited
+/// from this task, `files::SEAT_LOOKUP_WAIT` (1.5 s) at most, never on the
+/// caller's async worker. Only a person's answer is an account
+/// ([`console_person`]): no answer in time, or a lookup that failed, refuses
+/// with the try-again text, and nothing else ever stands in for the person.
+///
+/// #3853 — on macOS, who owns `/dev/console` is a `stat` child: asked through
+/// one lookup in flight ([`ask_console_owner`], on a thread named
+/// `console-owner`), [`ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most, with the same
+/// try-again text when it gives no answer ([`console_owner`]).
 #[cfg(unix)]
-fn console_account() -> Result<String, String> {
+async fn console_account() -> Result<String, String> {
     #[cfg(target_os = "macos")]
-    let who = crate::companion::console_user_name();
-    #[cfg(not(target_os = "macos"))]
-    let who = crate::companion::seat0_user();
-    who.map_err(|e| {
+    let who = {
+        let wait = ACCOUNT_LOOKUP_WAIT;
+        // A test stands the console's owner in for its own task, with a
+        // lookup in flight of its own.
+        #[cfg(test)]
+        let asked = match mac_console_stand_in::now() {
+            Some(stood) => stood.ask(wait).await,
+            None => ask_console_owner(wait).await,
+        };
+        #[cfg(not(test))]
+        let asked = ask_console_owner(wait).await;
+        console_owner(asked, wait)
+    };
+    #[cfg(target_os = "linux")]
+    let who = {
+        let wait = crate::files::SEAT_LOOKUP_WAIT;
+        // A test stands the lookup in for its own task, with a lookup in
+        // flight of its own.
+        #[cfg(test)]
+        let asked = match console_stand_in::now() {
+            Some(stood) => stood.ask(wait).await,
+            None => crate::files::ask_seat0(wait).await,
+        };
+        #[cfg(not(test))]
+        let asked = crate::files::ask_seat0(wait).await;
+        console_person(asked, wait)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let who: Result<String, String> = Err("this platform has no seat to read".into());
+    who.map_err(|why| {
         format!(
             "account_mode `console_user` runs as the person at this machine's screen, and cannot \
-             here: {e:#}"
+             here: {why}"
         )
     })
+}
+
+/// #3822 — the account `console_user` runs as, from what the seat0 lookup
+/// answered within `wait`: a person's, and nothing else.
+///
+/// - Nobody at the screen says why, in seat0's own words, as before.
+/// - Root at the screen is refused: `console_user` never runs as root.
+/// - A lookup that could not tell who is there, failed, or gave no answer in
+///   time says to try again (`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`, #3711's
+///   words for a received file), with why. The lookup goes on, on its own
+///   thread, and a retry asks again.
+///
+/// No arm gives another account: not root, not the daemon's own, not the
+/// person a lookup found before. A seat0 name that resolves to another uid
+/// than logind's session is nobody (#3688's rule, `files::seat_of`).
+#[cfg(target_os = "linux")]
+fn console_person(
+    asked: crate::one_in_flight::Asked<crate::files::Seat>,
+    wait: std::time::Duration,
+) -> Result<String, String> {
+    use crate::files::Seat;
+    use crate::one_in_flight::Asked;
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN as TRY_AGAIN;
+    match asked {
+        Asked::Answer(Seat::Person { account, .. }) => Ok(account.name),
+        Asked::Answer(Seat::Nobody(why)) => Err(why),
+        Asked::Answer(Seat::Root) => Err(
+            "root is the person signed in at this machine's screen, and console_user never runs \
+             as root; use account_mode `daemon` if running as root is really intended"
+                .into(),
+        ),
+        Asked::Answer(Seat::CannotTell(why)) => {
+            tracing::debug!(%why, "exec: who is at seat0 is not known — console_user is refused");
+            Err(format!("{TRY_AGAIN} ({why})"))
+        }
+        Asked::Failed(why) => {
+            warn!(%why, "exec: the seat0 lookup failed — console_user is refused, try again");
+            Err(format!("{TRY_AGAIN} (the seat0 lookup failed: {why})"))
+        }
+        Asked::OutOfTime | Asked::Answer(Seat::OutOfTime(_)) => {
+            warn!(
+                ?wait,
+                "exec: who is at seat0 gave no answer in time — console_user is refused, try again"
+            );
+            Err(format!(
+                "{TRY_AGAIN} (logind and the account database gave no answer within {wait:?})"
+            ))
+        }
+    }
+}
+
+/// #3853 — who owns `/dev/console` (`companion::console_user_name`, a `stat`
+/// child) for exec's and SSH's `console_user` on a Mac, asked from an async
+/// task through one lookup in flight on a thread named `console-owner`,
+/// `wait` at most: a `stat` that does not return holds that one thread, never
+/// the caller's async worker, and the asks that come while it hangs start no
+/// other. Only a lookup that began after the question answers it. What no
+/// answer means is [`console_owner`]'s to say.
+#[cfg(target_os = "macos")]
+async fn ask_console_owner(
+    wait: std::time::Duration,
+) -> crate::one_in_flight::Asked<Result<String, String>> {
+    static OWNER: crate::one_in_flight::OneInFlight<Result<String, String>> =
+        crate::one_in_flight::OneInFlight::new("console-owner");
+    OWNER
+        .ask(wait, || {
+            crate::companion::console_user_name().map_err(|e| format!("{e:#}"))
+        })
+        .await
+}
+
+/// #3853 — the account `console_user` runs as on a Mac, from what the console
+/// owner lookup answered within `wait`: a person's, and nothing else. Nobody
+/// at the screen (the login window, a system account) says why, as before; no
+/// answer in time, or a lookup that panicked, says to try again
+/// (`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`, the words #3822 gives on Linux). The
+/// lookup goes on, on its own thread, and a retry asks again.
+#[cfg(target_os = "macos")]
+fn console_owner(
+    asked: crate::one_in_flight::Asked<Result<String, String>>,
+    wait: std::time::Duration,
+) -> Result<String, String> {
+    use crate::one_in_flight::Asked;
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN as TRY_AGAIN;
+    match asked {
+        Asked::Answer(who) => who,
+        Asked::Failed(why) => {
+            warn!(%why, "exec: the console owner lookup failed — console_user is refused, try again");
+            Err(format!(
+                "{TRY_AGAIN} (the console owner lookup failed: {why})"
+            ))
+        }
+        Asked::OutOfTime => {
+            warn!(
+                ?wait,
+                "exec: who owns /dev/console gave no answer in time — console_user is refused, try again"
+            );
+            Err(format!(
+                "{TRY_AGAIN} (`stat /dev/console` gave no answer within {wait:?})"
+            ))
+        }
+    }
+}
+
+/// #3822 — the seat0 lookup stood in for `console_user`, for the tasks of one
+/// test: what logind and the account database answer, asked where the daemon
+/// asks its own. A task-local, so the tests beside it, and the daemon's own
+/// lookup, are never stood in.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod console_stand_in {
+    use crate::files::Seat;
+    use crate::one_in_flight::{Asked, OneInFlight};
+    use std::sync::Arc;
+
+    /// A seat0 lookup stood in, with a lookup in flight of its own: one a
+    /// test holds up never holds up the tests beside it, which ask the
+    /// daemon's (`files::ask_seat0`).
+    #[derive(Clone)]
+    pub(crate) struct StandIn {
+        lookup: Arc<dyn Fn() -> Seat + Send + Sync>,
+        flight: Arc<OneInFlight<Seat>>,
+    }
+
+    impl StandIn {
+        pub(crate) fn new(lookup: impl Fn() -> Seat + Send + Sync + 'static) -> Self {
+            Self {
+                lookup: Arc::new(lookup),
+                flight: Arc::new(OneInFlight::new("seat0-lookup")),
+            }
+        }
+
+        /// The lookup, asked as `console_account` asks the daemon's: through
+        /// its own lookup in flight, `wait` at most.
+        pub(super) async fn ask(&self, wait: std::time::Duration) -> Asked<Seat> {
+            let lookup = self.lookup.clone();
+            self.flight.ask(wait, move || lookup()).await
+        }
+    }
+
+    tokio::task_local! {
+        static STOOD: StandIn;
+    }
+
+    /// `run`, its `console_user` lookups asking `stood`.
+    pub(crate) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
+        STOOD.scope(stood, run).await
+    }
+
+    /// The lookup stood in for this task, if there is one.
+    pub(super) fn now() -> Option<StandIn> {
+        STOOD.try_with(StandIn::clone).ok()
+    }
+}
+
+/// #3853 — who owns `/dev/console` (`companion::console_user_name`, a `stat`
+/// child) stood in for `console_user` on a Mac, for the tasks of one test. A
+/// task-local, so the tests beside it, and the daemon's own lookup, are never
+/// stood in.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod mac_console_stand_in {
+    use crate::one_in_flight::{Asked, OneInFlight};
+    use std::sync::Arc;
+
+    /// What the console's owner is, or why nobody is.
+    type Owner = dyn Fn() -> Result<String, String> + Send + Sync;
+
+    /// The console's owner stood in, with a lookup in flight of its own: one
+    /// a test holds up never holds up the tests beside it.
+    #[derive(Clone)]
+    pub(crate) struct StandIn {
+        owner: Arc<Owner>,
+        flight: Arc<OneInFlight<Result<String, String>>>,
+    }
+
+    impl StandIn {
+        pub(crate) fn new(
+            owner: impl Fn() -> Result<String, String> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                owner: Arc::new(owner),
+                flight: Arc::new(OneInFlight::new("console-owner")),
+            }
+        }
+
+        /// The console's owner, asked as `console_account` asks the daemon's:
+        /// through its own lookup in flight, `wait` at most.
+        pub(super) async fn ask(&self, wait: std::time::Duration) -> Asked<Result<String, String>> {
+            let owner = self.owner.clone();
+            self.flight.ask(wait, move || owner()).await
+        }
+    }
+
+    tokio::task_local! {
+        static STOOD: StandIn;
+    }
+
+    /// `run`, its `console_user` lookups asking `stood`.
+    pub(crate) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
+        STOOD.scope(stood, run).await
+    }
+
+    /// The console's owner stood in for this task, if there is one.
+    pub(super) fn now() -> Option<StandIn> {
+        STOOD.try_with(StandIn::clone).ok()
+    }
 }
 
 /// FR-97 P3d — a received file lands under the person's home: the lookup that
@@ -943,6 +1200,10 @@ pub(crate) async fn run_console_user_program(
 /// too, so there is one way an account becomes ids (and uid 0 is refused).
 #[cfg(all(target_os = "linux", feature = "recording"))]
 pub(crate) use unix_priv::account_name;
+/// #3855 — the account database stood in, for the tests of the blocking
+/// callers in other modules (Remote Apps, the recorder).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use unix_priv::account_stand_in;
 /// Unix privilege drop.
 ///
 /// Split into a "resolve everything first, then apply" shape for one specific
@@ -957,6 +1218,11 @@ pub(crate) use unix_priv::account_name;
 /// here — `resolve`, `Account`, `drop_body` — stays private, so the crate has
 /// exactly one way to drop privilege and no way to assemble a partial one.
 ///
+/// #3853 — exec's and SSH's sessions resolve their account off the async
+/// worker: `session_account` runs the lookup on a thread of its own, one in
+/// flight per account name, 1.5 s at most. Still in the parent and still
+/// before the fork, so the rule above holds as it was.
+///
 /// ⚠️ The cfg mirrors its ONE consumer (`capture::portal`) exactly. A helper
 /// gated more loosely than the code that uses it is dead on every other lane,
 /// and `-D warnings` turns that into a build failure in CI rather than here —
@@ -969,16 +1235,31 @@ pub(crate) use unix_priv::account_name;
 #[cfg(target_os = "linux")]
 pub(crate) use unix_priv::drop_to_std;
 
+/// #3853 — how long an exec or an SSH session waits for the account database
+/// to resolve the account it runs as (`named`, and `console_user` after the
+/// seat lookup): `files::SEAT_LOOKUP_WAIT`'s 1.5 s. On a Mac it also bounds
+/// `console_user`'s look at who owns `/dev/console`.
+#[cfg(unix)]
+pub(crate) const ACCOUNT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// #3853 — the try-again words of a refusal whose account the account
+/// database did not resolve: no answer in time, or a lookup that failed.
+#[cfg(unix)]
+pub(crate) const ACCOUNT_LOOKUP_TRY_AGAIN: &str =
+    "Could not look up the account to run as in this computer's account database. Try again.";
+
 #[cfg(unix)]
 mod unix_priv {
+    use crate::one_in_flight::{Asked, OneInFlightPerKey};
     use std::ffi::CString;
 
     /// A resolved local account: everything the child needs, pre-computed.
     ///
     /// `Debug` is for the tests' `unwrap_err()`; nothing secret lives here —
     /// uid, gid, group list and home path are all readable from `/etc/passwd`
-    /// by anyone on the box.
-    #[derive(Debug)]
+    /// by anyone on the box. #3853 — `Clone`: one lookup's answer is shared
+    /// by every session that asked for the account while it ran.
+    #[derive(Debug, Clone)]
     struct Account {
         uid: libc::uid_t,
         gid: libc::gid_t,
@@ -987,10 +1268,69 @@ mod unix_priv {
         name: String,
     }
 
-    /// Look up an account by name.
+    /// #3853 — why an account did not resolve.
+    #[derive(Debug, Clone)]
+    enum Unresolved {
+        /// The account database answered, and the name is not an account a
+        /// session may run as: a NUL byte, no such account, uid 0. The same
+        /// words as ever; asking again gives the same answer.
+        Refused(String),
+        /// The lookup itself failed: the account database returned an error
+        /// (`getpwnam_r` other than not found). Asking again may answer.
+        Failed(String),
+    }
+
+    impl Unresolved {
+        #[cfg(test)]
+        fn into_text(self) -> String {
+            match self {
+                Self::Refused(why) | Self::Failed(why) => why,
+            }
+        }
+    }
+
+    /// Look up an account by name, inline: [`lookup`], its refusal in
+    /// words. #3855 — the tests' only: every caller in the daemon asks
+    /// through a lookup in flight ([`account_blocking`], `session_account`).
+    #[cfg(test)]
     fn resolve(account: &str) -> Result<Account, String> {
-        let c_name = CString::new(account)
-            .map_err(|_| format!("account name {account:?} contains a NUL byte"))?;
+        lookup(account).map_err(Unresolved::into_text)
+    }
+
+    /// #3855 — the account of a caller on a blocking thread of its own:
+    /// `drop_to_std` (Remote Apps on a person's desktop, the recorder's
+    /// launch, the portal's session helper, the tray's session environment)
+    /// and `account_ids` / `account_home` (the recorder's and received files'
+    /// identity). [`lookup`] through the same lookup in flight for the
+    /// account's name as exec's and SSH's ([`ACCOUNTS`]), waited for
+    /// [`super::ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most, its answer or refusal
+    /// as [`in_time`] gives them. While the account database hangs, the asks
+    /// for an account hold that one lookup's thread, however many there are,
+    /// and each caller's own thread no longer than the wait.
+    #[cfg(target_os = "linux")]
+    fn account_blocking(account: &str) -> Result<Account, String> {
+        let wait = super::ACCOUNT_LOOKUP_WAIT;
+        let name = account.to_string();
+        // A test stands the account database in for its own thread, with
+        // lookups in flight of its own.
+        #[cfg(test)]
+        let asked = match account_stand_in::here() {
+            Some(stood) => stood.ask_blocking(name, wait),
+            None => ACCOUNTS.ask_blocking(name.clone(), wait, move || lookup(&name)),
+        };
+        #[cfg(not(test))]
+        let asked = ACCOUNTS.ask_blocking(name.clone(), wait, move || lookup(&name));
+        in_time(asked, account, wait)
+    }
+
+    /// Look up an account by name (`getpwnam_r`, then `getgrouplist`): the
+    /// account, or why not. Blocking, for as long as the account database
+    /// takes: exec and SSH call it only off the async worker
+    /// ([`session_account`]).
+    fn lookup(account: &str) -> Result<Account, Unresolved> {
+        let c_name = CString::new(account).map_err(|_| {
+            Unresolved::Refused(format!("account name {account:?} contains a NUL byte"))
+        })?;
 
         // `getpwnam_r` with a buffer we grow rather than `getpwnam`, which
         // returns a pointer into static storage another thread can overwrite.
@@ -1016,15 +1356,17 @@ mod unix_priv {
                 continue;
             }
             if rc != 0 {
-                return Err(format!(
+                return Err(Unresolved::Failed(format!(
                     "looking up local account {account:?} failed: {}",
                     std::io::Error::from_raw_os_error(rc)
-                ));
+                )));
             }
             break;
         }
         if result.is_null() {
-            return Err(format!("no local account named {account:?} on this host"));
+            return Err(Unresolved::Refused(format!(
+                "no local account named {account:?} on this host"
+            )));
         }
 
         let uid = pwd.pw_uid;
@@ -1035,10 +1377,10 @@ mod unix_priv {
         // must be an explicit choice in the policy rather than a side effect
         // of naming an account that happens to be uid 0.
         if uid == 0 {
-            return Err(format!(
+            return Err(Unresolved::Refused(format!(
                 "account {account:?} is uid 0; use account_mode `daemon` if running as root is \
                  really intended"
-            ));
+            )));
         }
 
         let home = unsafe { cstr_to_string(pwd.pw_dir) };
@@ -1100,26 +1442,67 @@ mod unix_priv {
     }
 
     /// FR-85 P1e-unix — an account's uid, primary gid and supplementary
-    /// groups, resolved as [`resolve`] resolves them (uid 0 refused).
+    /// groups, resolved as [`lookup`] resolves them (uid 0 refused). #3855 —
+    /// through [`account_blocking`], 1.5 s at most.
     #[cfg(target_os = "linux")]
     pub(crate) fn account_ids(
         account: &str,
     ) -> Result<(libc::uid_t, libc::gid_t, Vec<libc::gid_t>), String> {
-        let a = resolve(account)?;
+        let a = account_blocking(account)?;
         Ok((a.uid, a.gid, a.groups))
     }
 
-    /// FR-97 P3d — an account's home directory, resolved as [`resolve`]
+    /// FR-97 P3d — an account's home directory, resolved as [`lookup`]
     /// resolves it (uid 0 refused, so nothing is ever pointed at root's home).
+    /// #3855 — through [`account_blocking`], 1.5 s at most.
     #[cfg(target_os = "linux")]
     pub(crate) fn account_home(account: &str) -> Result<std::path::PathBuf, String> {
-        Ok(std::path::PathBuf::from(resolve(account)?.home))
+        Ok(std::path::PathBuf::from(account_blocking(account)?.home))
     }
 
-    /// FR-85 P1e-unix — the name of the account with `uid` (`getpwuid_r`,
-    /// the buffer grown as [`resolve`] grows its own).
+    /// #3855 — the recorder's uid lookups in flight, one per uid, each on a
+    /// thread named `account-lookup`, as [`ACCOUNTS`] is per name.
+    #[cfg(all(target_os = "linux", feature = "recording"))]
+    static NAMES: OneInFlightPerKey<libc::uid_t, Result<String, Unresolved>> =
+        OneInFlightPerKey::new("account-lookup");
+
+    /// FR-85 P1e-unix — the name of the account with `uid`, for the
+    /// recorder, which is handed a uid. #3855 — [`name_of`] through the one
+    /// lookup in flight for that uid ([`NAMES`]), waited for
+    /// [`super::ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most from the caller's
+    /// blocking thread; no answer in time, or an error from the account
+    /// database, is refused with the try-again words.
     #[cfg(all(target_os = "linux", feature = "recording"))]
     pub(crate) fn account_name(uid: libc::uid_t) -> Result<String, String> {
+        use super::ACCOUNT_LOOKUP_TRY_AGAIN as TRY_AGAIN;
+        let wait = super::ACCOUNT_LOOKUP_WAIT;
+        #[cfg(test)]
+        let asked = match account_stand_in::here() {
+            Some(stood) => stood.ask_name_blocking(uid, wait),
+            None => NAMES.ask_blocking(uid, wait, move || name_of(uid)),
+        };
+        #[cfg(not(test))]
+        let asked = NAMES.ask_blocking(uid, wait, move || name_of(uid));
+        let why = match asked {
+            Asked::Answer(Ok(name)) => return Ok(name),
+            Asked::Answer(Err(Unresolved::Refused(why))) => return Err(why),
+            Asked::Answer(Err(Unresolved::Failed(why))) => why,
+            Asked::Failed(why) => format!("the account lookup failed: {why}"),
+            Asked::OutOfTime => format!("the account database gave no answer within {wait:?}"),
+        };
+        tracing::warn!(
+            uid, %why,
+            "the account with this uid was not looked up — refused, try again"
+        );
+        Err(format!("cannot resolve uid {uid}: {TRY_AGAIN} ({why})"))
+    }
+
+    /// The name of the account with `uid` (`getpwuid_r`, the buffer grown as
+    /// [`lookup`] grows its own): the lookup itself, blocking for as long as
+    /// the account database takes. No such account is a refusal; an error
+    /// from the account database is a failed lookup.
+    #[cfg(all(target_os = "linux", feature = "recording"))]
+    fn name_of(uid: libc::uid_t) -> Result<String, Unresolved> {
         let mut buf = vec![0 as libc::c_char; 1024];
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -1134,15 +1517,17 @@ mod unix_priv {
                 continue;
             }
             if rc != 0 {
-                return Err(format!(
+                return Err(Unresolved::Failed(format!(
                     "looking up uid {uid} failed: {}",
                     std::io::Error::from_raw_os_error(rc)
-                ));
+                )));
             }
             break;
         }
         if result.is_null() {
-            return Err(format!("no local account has uid {uid}"));
+            return Err(Unresolved::Refused(format!(
+                "no local account has uid {uid}"
+            )));
         }
         // SAFETY: `pw_name` points into `buf`, which is still alive.
         Ok(unsafe { cstr_to_string(pwd.pw_name) })
@@ -1155,6 +1540,233 @@ mod unix_priv {
         unsafe { std::ffi::CStr::from_ptr(p) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// #3853 — the account lookups of exec's and SSH's sessions in flight,
+    /// one per account name, each on a thread named `account-lookup`
+    /// (`/proc/<pid>/task/*/comm` shows it). #3855 — and of the callers on
+    /// blocking threads ([`account_blocking`]): an ask for `ana` from an exec
+    /// and one from the recorder's launch share one lookup.
+    static ACCOUNTS: OneInFlightPerKey<String, Result<Account, Unresolved>> =
+        OneInFlightPerKey::new("account-lookup");
+
+    /// #3853 — the account an exec or an SSH session runs as (`named`, and
+    /// `console_user` after the seat lookup), resolved off the async worker:
+    /// [`lookup`] on a thread of its own, through the one lookup in flight
+    /// for this account's name ([`ACCOUNTS`]), awaited from the caller's task
+    /// [`super::ACCOUNT_LOOKUP_WAIT`] (1.5 s) at most.
+    ///
+    /// - **Keyed by the name**, exactly as it is looked up: `named:ana` and a
+    ///   `console_user` session whose person is `ana` share one lookup. While
+    ///   the account database hangs, the asks for an account hold one thread,
+    ///   however many there are.
+    /// - **Only a lookup that began after this question answers it**
+    ///   (`one_in_flight`'s rule): one already running is waited out, and its
+    ///   answer, older than the question, is never taken.
+    /// - **Still in the parent, before the fork**: the [`Account`] crosses to
+    ///   this task and the child only makes bare syscalls over memory the
+    ///   drop already owns (`drop_body`), as before.
+    ///
+    /// What came back, or did not, becomes the account or the refusal in
+    /// [`in_time`].
+    async fn session_account(account: &str) -> Result<Account, String> {
+        let wait = super::ACCOUNT_LOOKUP_WAIT;
+        let name = account.to_string();
+        // A test stands the account database in for its own task, with
+        // lookups in flight of its own.
+        #[cfg(test)]
+        let asked = match account_stand_in::now() {
+            Some(stood) => stood.ask(name, wait).await,
+            None => {
+                ACCOUNTS
+                    .ask(name.clone(), wait, move || lookup(&name))
+                    .await
+            }
+        };
+        #[cfg(not(test))]
+        let asked = ACCOUNTS
+            .ask(name.clone(), wait, move || lookup(&name))
+            .await;
+        in_time(asked, account, wait)
+    }
+
+    /// #3853 — what the account lookup answered within `wait`, as the
+    /// account a session runs as: only an account it resolved.
+    ///
+    /// - A name the account database refused (no such account, uid 0, a NUL
+    ///   byte) is refused in the words it always had.
+    /// - No answer in time, an error from the account database, or a lookup
+    ///   that panicked says to try again (`ACCOUNT_LOOKUP_TRY_AGAIN`), with
+    ///   why and the account's name. The lookup goes on, on its own thread,
+    ///   and a retry asks again.
+    ///
+    /// No arm gives another account: not root, not the daemon's own, not an
+    /// account a lookup resolved before the question.
+    fn in_time(
+        asked: Asked<Result<Account, Unresolved>>,
+        account: &str,
+        wait: std::time::Duration,
+    ) -> Result<Account, String> {
+        use super::ACCOUNT_LOOKUP_TRY_AGAIN as TRY_AGAIN;
+        let why = match asked {
+            Asked::Answer(Ok(acct)) => return Ok(acct),
+            Asked::Answer(Err(Unresolved::Refused(why))) => return Err(why),
+            Asked::Answer(Err(Unresolved::Failed(why))) => why,
+            Asked::Failed(why) => format!("the account lookup failed: {why}"),
+            Asked::OutOfTime => {
+                format!("the account database gave no answer within {wait:?}")
+            }
+        };
+        tracing::warn!(
+            %account, %why,
+            "the account to run as was not looked up — refused, try again"
+        );
+        Err(format!("cannot run as {account:?}: {TRY_AGAIN} ({why})"))
+    }
+
+    /// #3853 — the account database stood in for the account lookups of
+    /// exec's and SSH's sessions, for the tasks of one test: before each real
+    /// lookup (`getpwnam_r`, `getgrouplist`), `database` holds it (a stalled
+    /// SSSD), fails it (`Err`: the account database answered with an error)
+    /// or lets it run (`Ok`). A task-local, so the tests beside it, and the
+    /// daemon's own lookups, are never stood in.
+    #[cfg(test)]
+    pub(crate) mod account_stand_in {
+        use super::{Account, Unresolved, lookup};
+        use crate::one_in_flight::{Asked, OneInFlightPerKey};
+        use std::sync::Arc;
+
+        /// What the account database does with a lookup of an account.
+        type Database = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+
+        /// Lookups in flight, one per account name, as the daemon's.
+        type Lookups = OneInFlightPerKey<String, Result<Account, Unresolved>>;
+
+        /// #3855 — uid lookups in flight, one per uid, as the daemon's.
+        #[cfg(all(target_os = "linux", feature = "recording"))]
+        type Names = OneInFlightPerKey<libc::uid_t, Result<String, Unresolved>>;
+
+        /// The account database stood in, with lookups in flight of its own:
+        /// one a test holds up never holds up the tests beside it, which ask
+        /// the daemon's (`ACCOUNTS`).
+        #[derive(Clone)]
+        pub(crate) struct StandIn {
+            database: Arc<Database>,
+            lookups: &'static Lookups,
+            #[cfg(all(target_os = "linux", feature = "recording"))]
+            names: &'static Names,
+        }
+
+        impl StandIn {
+            pub(crate) fn new(
+                database: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+            ) -> Self {
+                Self {
+                    database: Arc::new(database),
+                    lookups: Box::leak(Box::new(OneInFlightPerKey::new("account-lookup"))),
+                    #[cfg(all(target_os = "linux", feature = "recording"))]
+                    names: Box::leak(Box::new(OneInFlightPerKey::new("account-lookup"))),
+                }
+            }
+
+            /// `account` looked up as `session_account` looks it up: the
+            /// account database asked first (its `Err` is a failed lookup),
+            /// then the real lookup, through this stand-in's own lookups in
+            /// flight, `wait` at most.
+            pub(super) async fn ask(
+                &self,
+                account: String,
+                wait: std::time::Duration,
+            ) -> Asked<Result<Account, Unresolved>> {
+                let database = self.database.clone();
+                let key = account.clone();
+                self.lookups
+                    .ask(key, wait, move || {
+                        database(&account).map_err(Unresolved::Failed)?;
+                        lookup(&account)
+                    })
+                    .await
+            }
+
+            /// #3855 — [`Self::ask`] from a blocking thread
+            /// (`account_blocking`), through the same lookups in flight: an
+            /// ask from a blocking thread and one from a task share a lookup.
+            #[cfg(target_os = "linux")]
+            pub(super) fn ask_blocking(
+                &self,
+                account: String,
+                wait: std::time::Duration,
+            ) -> Asked<Result<Account, Unresolved>> {
+                let database = self.database.clone();
+                let key = account.clone();
+                self.lookups.ask_blocking(key, wait, move || {
+                    database(&account).map_err(Unresolved::Failed)?;
+                    lookup(&account)
+                })
+            }
+
+            /// #3855 — `account_name`'s lookup of `uid`, the account
+            /// database asked about `uid N` first, through this stand-in's
+            /// own uid lookups in flight, `wait` at most.
+            #[cfg(all(target_os = "linux", feature = "recording"))]
+            pub(super) fn ask_name_blocking(
+                &self,
+                uid: libc::uid_t,
+                wait: std::time::Duration,
+            ) -> Asked<Result<String, Unresolved>> {
+                let database = self.database.clone();
+                self.names.ask_blocking(uid, wait, move || {
+                    database(&format!("uid {uid}")).map_err(Unresolved::Failed)?;
+                    super::name_of(uid)
+                })
+            }
+        }
+
+        tokio::task_local! {
+            static STOOD: StandIn;
+        }
+
+        /// `run`, its account lookups asking `stood`.
+        pub(crate) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
+            STOOD.scope(stood, run).await
+        }
+
+        /// The account database stood in for this task, if there is one.
+        pub(super) fn now() -> Option<StandIn> {
+            STOOD.try_with(StandIn::clone).ok()
+        }
+
+        #[cfg(target_os = "linux")]
+        std::thread_local! {
+            /// #3855 — the account database stood in for the blocking
+            /// lookups of one thread ([`blocking`]).
+            static HERE: std::cell::RefCell<Option<StandIn>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        /// #3855 — `run` on THIS thread, its blocking account lookups
+        /// (`drop_to_std`, `account_ids`, `account_home`, `account_name`)
+        /// asking `stood`. What stood here before comes back after.
+        #[cfg(target_os = "linux")]
+        pub(crate) fn blocking<R>(stood: &StandIn, run: impl FnOnce() -> R) -> R {
+            /// Puts back what stood here before, however `run` ends.
+            struct Restore(Option<StandIn>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let before = self.0.take();
+                    HERE.with(|here| *here.borrow_mut() = before);
+                }
+            }
+            let _restore = Restore(HERE.with(|here| here.replace(Some(stood.clone()))));
+            run()
+        }
+
+        /// #3855 — the account database stood in for this thread, if there
+        /// is one.
+        #[cfg(target_os = "linux")]
+        pub(super) fn here() -> Option<StandIn> {
+            HERE.with(|here| here.borrow().clone())
+        }
     }
 
     /// The drop itself, as a closure a `Command` of either flavour installs.
@@ -1212,18 +1824,24 @@ mod unix_priv {
     /// `pre_exec` here is tokio's own inherent method on `Command`; the
     /// `CommandExt` import that `drop_to_std` needs does not affect it,
     /// because an inherent method wins over a trait method.
-    pub(super) fn drop_to(cmd: &mut tokio::process::Command, account: &str) -> Result<(), String> {
-        drop_to_in(cmd, account, false)
+    ///
+    /// #3853 — `async`: the account is looked up off the caller's worker,
+    /// 1.5 s at most ([`session_account`]), and a refusal configures nothing.
+    pub(super) async fn drop_to(
+        cmd: &mut tokio::process::Command,
+        account: &str,
+    ) -> Result<(), String> {
+        drop_to_in(cmd, account, false).await
     }
 
     /// [`drop_to`], and with `at_home` (FR-97 P5b) the child starts in the
     /// account's home ([`start_in_home`]).
-    pub(super) fn drop_to_in(
+    pub(super) async fn drop_to_in(
         cmd: &mut tokio::process::Command,
         account: &str,
         at_home: bool,
     ) -> Result<(), String> {
-        let acct = resolve(account)?;
+        let acct = session_account(account).await?;
         cmd.env("HOME", &acct.home)
             .env("USER", &acct.name)
             .env("LOGNAME", &acct.name);
@@ -1241,14 +1859,15 @@ mod unix_priv {
     /// command as itself, which changes no identity, and could not drop
     /// anyway: `setgroups` needs root even to keep its own groups. Any other
     /// daemon cannot become them, and says so. uid 0 is refused by
-    /// [`resolve`], as for a named account. With `at_home` (P5b) the child
-    /// starts in their home.
-    pub(super) fn drop_to_console(
+    /// [`lookup`], as for a named account. With `at_home` (P5b) the child
+    /// starts in their home. #3853 — their account is looked up off the
+    /// caller's worker, 1.5 s at most ([`session_account`]).
+    pub(super) async fn drop_to_console(
         cmd: &mut tokio::process::Command,
         account: &str,
         at_home: bool,
     ) -> Result<(), String> {
-        let acct = resolve(account)?;
+        let acct = session_account(account).await?;
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
         let must_drop = console_drop(unsafe { libc::geteuid() }, &acct)?;
         cmd.env("HOME", &acct.home)
@@ -1320,6 +1939,10 @@ mod unix_priv {
     /// supplementary groups, which is precisely the retention bug `drop_body`
     /// documents. One privilege story, as with exec / pty / sftp.
     ///
+    /// #3855 — the account is looked up through [`account_blocking`], 1.5 s
+    /// at most, still in the parent and before the fork: no answer in time
+    /// configures nothing and says to try again.
+    ///
     /// Gated to match its consumer — see the re-export above for why.
     #[cfg(target_os = "linux")]
     pub(crate) fn drop_to_std(
@@ -1327,7 +1950,7 @@ mod unix_priv {
         account: &str,
     ) -> Result<(), String> {
         use std::os::unix::process::CommandExt as _;
-        let acct = resolve(account)?;
+        let acct = account_blocking(account)?;
         cmd.env("HOME", &acct.home)
             .env("USER", &acct.name)
             .env("LOGNAME", &acct.name);
@@ -1545,7 +2168,7 @@ impl ExecEngine {
 
         info!(
             request_id = %req.request_id,
-            caller = %req.caller,
+            caller = ?req.caller,
             shell = %req.shell,
             timeout_ms,
             "fleet-rpc: running command"
@@ -1647,7 +2270,7 @@ impl ExecEngine {
 
         info!(
             request_id = %req.request_id,
-            caller = %req.caller,
+            caller = ?req.caller,
             shell = %req.shell,
             "exec: streaming command"
         );
@@ -1796,14 +2419,14 @@ impl ExecEngine {
         // FR-97 P5b — an SSH session with no directory of its own starts in
         // the person's home, as sshd starts it.
         let applied = if req.start_in_home && req.cwd.is_none() {
-            apply_run_as_at_home(&mut cmd, &req.run_as)
+            apply_run_as_at_home(&mut cmd, &req.run_as).await
         } else {
-            apply_run_as(&mut cmd, &req.run_as)
+            apply_run_as(&mut cmd, &req.run_as).await
         };
         if let Err(e) = applied {
             warn!(
-                request_id = %req.request_id, caller = %req.caller,
-                run_as = %req.run_as.label(),
+                request_id = %req.request_id, caller = ?req.caller,
+                run_as = ?req.run_as.label(),
                 "exec: refusing to run — the requested identity is unavailable"
             );
             return ExecOutcome::failed(e);
@@ -2222,7 +2845,7 @@ mod tests {
         // person at it can honour it, so there this half proves nothing and
         // says so rather than pass.
         #[cfg(unix)]
-        if console_account().is_ok() {
+        if console_account().await.is_ok() {
             eprintln!("skipped: someone is at this machine's screen, so console_user can run");
             return;
         }
@@ -4196,5 +4819,1482 @@ pub(crate) mod session_lifetime {
             .await
             .expect("the run ends once its client is gone")
             .unwrap();
+    }
+}
+
+/// #3822 — `console_user` on a Linux install while who is at seat0 cannot be
+/// had in time: logind stopped, or the account database stalled. The lookup
+/// is stood in for each test's own tasks (`console_stand_in`); everything
+/// above it is the daemon's, along the four ways a command or a session takes
+/// the person's account: Fleet RPC's exec, SSH's exec, SSH's shell and SFTP.
+/// Each probe runs as a task on a two-worker runtime like the daemon's and is
+/// waited for from the test's own thread, so a probe that holds a worker
+/// cannot also hold up its verdict (#3836's shape). As root (CI's sudo step)
+/// the person is `nobody`, whom a system install drops to; as anyone else, the
+/// account running the tests, which a per-user daemon whose own account is at
+/// the screen runs as itself.
+#[cfg(all(test, target_os = "linux"))]
+mod console_lookup_tests {
+    use super::console_stand_in::{StandIn, asking};
+    use super::*;
+    use crate::files::{SEAT_LOOKUP_WAIT, Seat};
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, Mutex as StdMutex, PoisonError};
+    use std::time::{Duration, Instant};
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN;
+
+    /// What a refusal may take past the lookup's own wait on a busy runner.
+    const SLACK: Duration = Duration::from_secs(1);
+    /// What a command that runs may take on a busy runner.
+    const RUNS_WITHIN: Duration = Duration::from_secs(10);
+    /// How late "on time" may be on a busy runner: #3836's bar.
+    const AT_ONCE: Duration = Duration::from_millis(500);
+
+    /// Lookups, counted as they begin, each held until the gate opens, as a
+    /// stopped logind holds `loginctl`. One let go finds nobody at the screen,
+    /// so nothing a test leaves behind ever runs a command.
+    #[derive(Clone, Default)]
+    struct Held(Arc<HeldState>);
+
+    #[derive(Default)]
+    struct HeldState {
+        open: StdMutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Held {
+        /// Every lookup held.
+        fn lookup(&self) -> StandIn {
+            self.after(0, Seat::Nobody(String::new()))
+        }
+
+        /// The first `quick` lookups answer `first` at once; every later one
+        /// is held.
+        fn after(&self, quick: usize, first: Seat) -> StandIn {
+            let held = self.clone();
+            StandIn::new(move || {
+                let n = held
+                    .0
+                    .began
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < quick {
+                    return first.clone();
+                }
+                let open = held.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    held.0
+                        .opened
+                        .wait_while(open, |open| !*open)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                Seat::Nobody("the held lookup was let go".into())
+            })
+        }
+
+        fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held,
+    /// and the runtime declared before it can shut down.
+    struct OpenedAtTheEnd(Held);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// A runtime like the daemon's: more than one worker, timers and I/O.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// `probe`, run as a task on `rt` whose `console_user` lookups ask
+    /// `stood`: its answer and how long it took, waited for `bound` at most
+    /// from THIS thread.
+    fn on_a_worker<T: Send + 'static>(
+        rt: &tokio::runtime::Runtime,
+        stood: &StandIn,
+        bound: Duration,
+        probe: impl Future<Output = T> + Send + 'static,
+    ) -> Result<(T, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(asking(stood.clone(), async move {
+            let answer = probe.await;
+            let _ = tx.send((answer, asked.elapsed()));
+        }));
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("no answer within {bound:?}"))
+    }
+
+    /// How a command or a session takes `console_user`'s account.
+    #[derive(Debug, Clone, Copy)]
+    enum Way {
+        /// `rc:rpc.exec`: `ExecEngine::run`.
+        FleetRpcExec,
+        /// SSH's exec channel: `ExecEngine::run_streamed`, in the person's
+        /// home.
+        SshExec,
+        /// SSH's shell: `pty::PtyProcess::spawn`.
+        #[cfg(feature = "ssh-server")]
+        SshShell,
+        /// SFTP: the account applied to the program it starts
+        /// (`apply_run_as_at_home`, as `ssh.rs` applies it to `sftp-server`).
+        Sftp,
+    }
+
+    /// Every way this build has: SSH's shell is `ssh-server`'s.
+    #[cfg(feature = "ssh-server")]
+    const WAYS: &[Way] = &[Way::FleetRpcExec, Way::SshExec, Way::SshShell, Way::Sftp];
+    #[cfg(not(feature = "ssh-server"))]
+    const WAYS: &[Way] = &[Way::FleetRpcExec, Way::SshExec, Way::Sftp];
+
+    /// A command asking for `who`, as Fleet RPC's frame (`ssh` false) or
+    /// SSH's exec channel (`ssh` true) hands it over.
+    fn as_the_person_req(who: &RunAs, command: &str, ssh: bool) -> ExecRequest {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        ExecRequest {
+            request_id: format!(
+                "i3822-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ),
+            shell: String::new(),
+            command: command.into(),
+            timeout_ms: 30_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: who.clone(),
+            start_in_home: ssh,
+            session_owned: ssh,
+        }
+    }
+
+    /// `command` asked of `way` as `console_user`: what it printed if it
+    /// ran, or why it was refused. A refusal starts nothing.
+    async fn as_the_person(way: Way, command: String) -> Result<String, String> {
+        as_who(way, RunAs::ConsoleUser, command).await
+    }
+
+    /// #3853 — `command` asked of `way` as `who`: what it printed if it ran,
+    /// or why it was refused. A refusal starts nothing.
+    async fn as_who(way: Way, who: RunAs, command: String) -> Result<String, String> {
+        match way {
+            Way::FleetRpcExec => {
+                let outcome = ExecEngine::new()
+                    .run(
+                        as_the_person_req(&who, &command, false),
+                        &Redactor::default(),
+                    )
+                    .await;
+                match (outcome.exit_code, outcome.error) {
+                    (None, Some(refused)) => Err(refused),
+                    _ => Ok(outcome.stdout),
+                }
+            }
+            Way::SshExec => {
+                let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(64);
+                let outcome = ExecEngine::new()
+                    .run_streamed(
+                        as_the_person_req(&who, &command, true),
+                        &Redactor::default(),
+                        None,
+                        sink,
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                let mut printed = Vec::new();
+                while let Ok(chunk) = chunks.try_recv() {
+                    if chunk.stream == OutStream::Stdout {
+                        printed.extend_from_slice(&chunk.bytes);
+                    }
+                }
+                match (outcome.exit_code, outcome.error) {
+                    (None, Some(refused)) => Err(refused),
+                    _ => Ok(String::from_utf8_lossy(&printed).into_owned()),
+                }
+            }
+            #[cfg(feature = "ssh-server")]
+            Way::SshShell => {
+                let mut shell = crate::pty::PtyProcess::spawn(
+                    Some(command.as_str()),
+                    "xterm",
+                    crate::pty::WinSize { cols: 80, rows: 24 },
+                    &who,
+                )
+                .await?;
+                let mut printed = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match shell.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => printed.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = shell.wait().await;
+                Ok(String::from_utf8_lossy(&printed).into_owned())
+            }
+            Way::Sftp => {
+                let mut program = tokio::process::Command::new("/bin/sh");
+                program
+                    .arg("-c")
+                    .arg(command)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                apply_run_as_at_home(&mut program, &who).await?;
+                let ran = program
+                    .output()
+                    .await
+                    .map_err(|e| format!("starting the stand-in for sftp-server: {e}"))?;
+                Ok(String::from_utf8_lossy(&ran.stdout).into_owned())
+            }
+        }
+    }
+
+    /// The person at the screen these tests stand in.
+    struct Person {
+        name: String,
+        uid: u32,
+        seat: Seat,
+    }
+
+    /// As root (CI's sudo step), `nobody`, whom a system install drops to. As
+    /// anyone else, the account running the tests, which a per-user daemon
+    /// whose own account is at the screen runs as itself.
+    fn the_person() -> Person {
+        // SAFETY: reads this process's own credentials.
+        let root = unsafe { libc::geteuid() } == 0;
+        if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+            panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+        }
+        let name = if root {
+            "nobody".to_string()
+        } else {
+            let me = std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .expect("id -un");
+            String::from_utf8_lossy(&me.stdout).trim().to_string()
+        };
+        let account = crate::fs_identity::Account::by_name(&name).expect("the person's account");
+        let home = account_home(&name).expect("the person's home");
+        Person {
+            name,
+            uid: account.uid,
+            seat: Seat::Person { account, home },
+        }
+    }
+
+    /// A folder anyone may write in, where a command that ran leaves a mark.
+    struct Marks(tempfile::TempDir);
+
+    impl Marks {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("a temp dir");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+                .expect("a folder anyone may write in");
+            Self(dir)
+        }
+
+        fn of(&self, way: Way) -> std::path::PathBuf {
+            self.0.path().join(format!("{way:?}"))
+        }
+
+        /// What `way` is asked to run: who it runs as, then its mark.
+        fn command(&self, way: Way) -> String {
+            format!("id -un; : > '{}'", self.of(way).display())
+        }
+
+        /// Who left `way`'s mark, if anyone did.
+        fn left_by(&self, way: Way) -> Option<u32> {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(self.of(way)).ok().map(|m| m.uid())
+        }
+    }
+
+    /// #3822 — with the seat0 lookup held up (a stopped logind), every way a
+    /// command or a session takes `console_user` is refused within the
+    /// lookup's own wait (`files::SEAT_LOOKUP_WAIT`) with the try-again text,
+    /// and runs nothing: not as root, not as the daemon, not as anyone. The
+    /// hang holds one lookup, however many ask.
+    ///
+    /// Red before #3822: the lookup ran on the worker that asked, for as long
+    /// as logind did not answer.
+    #[test]
+    fn a_held_seat0_lookup_refuses_every_way_within_its_wait_and_says_try_again() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = held.lookup();
+        let marks = Marks::new();
+        for &way in WAYS {
+            let (took, waited) = on_a_worker(
+                &rt,
+                &stood,
+                SEAT_LOOKUP_WAIT + SLACK,
+                as_the_person(way, marks.command(way)),
+            )
+            .unwrap_or_else(|e| panic!("{way:?}: {e}"));
+            let refused = match took {
+                Err(refused) => refused,
+                Ok(printed) => panic!("{way:?} ran while the lookup was held: {printed:?}"),
+            };
+            assert!(
+                waited >= SEAT_LOOKUP_WAIT,
+                "{way:?} was refused in {waited:?}, before its wait"
+            );
+            assert!(
+                refused.contains("account_mode `console_user`"),
+                "{way:?}: the refusal names the mode: {refused:?}"
+            );
+            assert!(
+                refused.contains(CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+                "{way:?}: the refusal says to try again: {refused:?}"
+            );
+            assert_eq!(marks.left_by(way), None, "{way:?} ran something");
+        }
+        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3822 — a held seat0 lookup holds no async worker. On a two-worker
+    /// runtime, tasks asking every way for `console_user` again and again
+    /// while the lookup hangs leave a 10 ms timer waking on time (the runtime
+    /// canary's own measure, `runtime_canary.rs`), and the hang holds one
+    /// lookup, however many ask.
+    ///
+    /// Red before #3822: each asker ran the lookup on its own worker, and two
+    /// of them held both.
+    #[test]
+    fn a_held_seat0_lookup_delays_no_timer() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = held.lookup();
+        // Two askers a way: more than the runtime has workers.
+        for &way in WAYS {
+            for _ in 0..2 {
+                rt.spawn(asking(stood.clone(), async move {
+                    for _ in 0..1_000 {
+                        let _ = as_the_person(way, "true".to_string()).await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }));
+            }
+        }
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(asked.elapsed() < RUNS_WITHIN, "no asker reached the lookup");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let tick = Duration::from_millis(10);
+        let late = on_a_worker(&rt, &stood, RUNS_WITHIN, async move {
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            worst
+        });
+        let began = held.began();
+        let (worst, _) = late.expect("a 10 ms timer kept waking while the seat0 lookup hung");
+        assert!(
+            worst < AT_ONCE,
+            "a 10 ms timer woke {worst:?} late while the seat0 lookup hung"
+        );
+        assert_eq!(began, 1, "one lookup in flight, however many asked");
+    }
+
+    /// The control: a seat0 lookup that answers in time gives the person, and
+    /// every way runs as them, as before #3822. As root (CI's sudo step) it
+    /// drops to them (`nobody`); as anyone else it runs as itself, the
+    /// per-user daemon whose own account is at the screen.
+    #[test]
+    fn a_seat0_lookup_that_answers_in_time_runs_every_way_as_the_person() {
+        let rt = runtime();
+        let person = the_person();
+        let at_the_screen = person.seat.clone();
+        let stood = StandIn::new(move || at_the_screen.clone());
+        let marks = Marks::new();
+        for &way in WAYS {
+            let (took, _) = on_a_worker(
+                &rt,
+                &stood,
+                RUNS_WITHIN,
+                as_the_person(way, marks.command(way)),
+            )
+            .unwrap_or_else(|e| panic!("{way:?}: {e}"));
+            let printed = took.unwrap_or_else(|refused| panic!("{way:?} was refused: {refused}"));
+            assert!(
+                printed.lines().any(|line| line.trim() == person.name),
+                "{way:?} ran as someone other than {}: {printed:?}",
+                person.name
+            );
+            assert_eq!(
+                marks.left_by(way),
+                Some(person.uid),
+                "{way:?} left its mark as someone other than {}",
+                person.name
+            );
+        }
+    }
+
+    /// #3822 — only a person's answer is an account. Whatever else the seat0
+    /// lookup gives, every way refuses and nothing runs: not as root, not as
+    /// the daemon, not as the person a lookup found a moment before. No answer
+    /// in time, a lookup that panicked, and logind or the account database
+    /// failing say to try again; nobody and root at the screen say what they
+    /// are.
+    ///
+    /// Red before #3822: a held lookup held its worker, a lookup that panicked
+    /// took its caller down with it, and a failing one did not say to try
+    /// again.
+    #[test]
+    fn no_answer_but_a_person_runs_anything() {
+        let rt = runtime();
+        let person = the_person();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+
+        // The person was at the screen a moment ago: the first lookup finds
+        // them, and the way it served ran as them. Every later one is held.
+        let found_then_held = held.after(1, person.seat.clone());
+        let marks = Marks::new();
+        let first = WAYS[0];
+        let (took, _) = on_a_worker(
+            &rt,
+            &found_then_held,
+            RUNS_WITHIN,
+            as_the_person(first, marks.command(first)),
+        )
+        .unwrap_or_else(|e| panic!("{first:?}: {e}"));
+        assert!(
+            took.is_ok(),
+            "{first:?} with the person at the screen: {took:?}"
+        );
+        assert_eq!(marks.left_by(first), Some(person.uid));
+
+        let cases = [
+            ("held, after the person was found", found_then_held, true),
+            (
+                "a lookup that panicked",
+                StandIn::new(|| -> Seat { panic!("a seat0 lookup that panics") }),
+                true,
+            ),
+            (
+                "logind failed",
+                StandIn::new(|| {
+                    Seat::CannotTell(
+                        "loginctl show-seat seat0 failed: Failed to connect to bus: Connection \
+                         refused"
+                            .into(),
+                    )
+                }),
+                true,
+            ),
+            (
+                "the account database failed",
+                StandIn::new(|| {
+                    Seat::CannotTell(
+                        "looking up local account \"ana\" failed: Connection timed out (os \
+                         error 110)"
+                            .into(),
+                    )
+                }),
+                true,
+            ),
+            (
+                "nobody at the screen",
+                StandIn::new(|| {
+                    Seat::Nobody(
+                        "nobody is signed in at this machine's screen (seat0 has no active \
+                         session)"
+                            .into(),
+                    )
+                }),
+                false,
+            ),
+            ("root at the screen", StandIn::new(|| Seat::Root), false),
+        ];
+        for (what, stood, says_try_again) in cases {
+            let marks = Marks::new();
+            for &way in WAYS {
+                let (took, _) = on_a_worker(
+                    &rt,
+                    &stood,
+                    SEAT_LOOKUP_WAIT + SLACK,
+                    as_the_person(way, marks.command(way)),
+                )
+                .unwrap_or_else(|e| panic!("{what}, {way:?}: {e}"));
+                let refused = match took {
+                    Err(refused) => refused,
+                    Ok(printed) => panic!("{what}: {way:?} ran: {printed:?}"),
+                };
+                assert!(
+                    refused.contains("account_mode `console_user`"),
+                    "{what}, {way:?}: the refusal names the mode: {refused:?}"
+                );
+                assert_eq!(
+                    refused.contains(CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+                    says_try_again,
+                    "{what}, {way:?}: {refused:?}"
+                );
+                assert_eq!(marks.left_by(way), None, "{what}: {way:?} ran something");
+            }
+        }
+    }
+
+    /// #3853 — `named` and `console_user` while the account database cannot
+    /// resolve the account in time: SSSD, LDAP or Active Directory stalled
+    /// behind NSS. The account lookup (`getpwnam_r`, `getgrouplist`) is
+    /// stood in for each test's own tasks (`unix_priv::account_stand_in`):
+    /// it holds, fails, or lets the real lookup run. `console_user`'s seat0
+    /// lookup finds the person at once, so what is held is the account it
+    /// named, which `drop_to_console` looks up again. Everything else is the
+    /// daemon's, along the same four ways. `named` names the person's own
+    /// account ([`the_person`]): `nobody` as root, in CI's sudo step.
+    mod account_database {
+        use super::*;
+        use crate::exec::unix_priv::account_stand_in as database;
+
+        /// The account database: every lookup recorded as it begins, by the
+        /// account it is for, and held until the database is let go, as a
+        /// stalled SSSD holds `getpwnam_r`. A lookup let go fails, so nothing
+        /// a test leaves behind ever runs a command.
+        #[derive(Clone, Default)]
+        struct Stalled(Arc<StalledState>);
+
+        #[derive(Default)]
+        struct StalledState {
+            gone: StdMutex<bool>,
+            let_go: Condvar,
+            began: StdMutex<Vec<String>>,
+        }
+
+        impl Stalled {
+            /// Every lookup held.
+            fn database(&self) -> database::StandIn {
+                self.after(0)
+            }
+
+            /// The first `quick` lookups run at once; every later one is held.
+            fn after(&self, quick: usize) -> database::StandIn {
+                let stalled = self.clone();
+                database::StandIn::new(move |account| {
+                    let n = {
+                        let mut began = stalled
+                            .0
+                            .began
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        began.push(account.to_string());
+                        began.len()
+                    };
+                    if n <= quick {
+                        return Ok(());
+                    }
+                    let gone = stalled
+                        .0
+                        .gone
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    drop(
+                        stalled
+                            .0
+                            .let_go
+                            .wait_while(gone, |gone| !*gone)
+                            .unwrap_or_else(PoisonError::into_inner),
+                    );
+                    Err("the stalled account database was let go".into())
+                })
+            }
+
+            fn let_go(&self) {
+                *self.0.gone.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                self.0.let_go.notify_all();
+            }
+
+            /// Lookups begun, for every account.
+            fn began(&self) -> usize {
+                self.0
+                    .began
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len()
+            }
+
+            /// Lookups begun for `account`.
+            fn began_for(&self, account: &str) -> usize {
+                self.0
+                    .began
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .filter(|asked| *asked == account)
+                    .count()
+            }
+        }
+
+        /// Lets the database go when dropped: a failed assertion leaves
+        /// nothing held, and the runtime declared before it can shut down.
+        struct LetGoAtTheEnd(Stalled);
+
+        impl Drop for LetGoAtTheEnd {
+            fn drop(&mut self) {
+                self.0.let_go();
+            }
+        }
+
+        /// The seat0 lookup, finding `person` at once.
+        fn at_the_screen(person: &Person) -> StandIn {
+            let seat = person.seat.clone();
+            StandIn::new(move || seat.clone())
+        }
+
+        /// `probe` as a task on `rt`, its account lookups asking `database`
+        /// and `console_user`'s seat0 lookup asking `seat`: its answer and
+        /// how long it took, waited for `bound` at most from THIS thread.
+        fn on_a_worker_asking<T: Send + 'static>(
+            rt: &tokio::runtime::Runtime,
+            seat: &StandIn,
+            database: &database::StandIn,
+            bound: Duration,
+            probe: impl Future<Output = T> + Send + 'static,
+        ) -> Result<(T, Duration), String> {
+            on_a_worker(rt, seat, bound, database::asking(database.clone(), probe))
+        }
+
+        /// Both modes that look an account up, for the person: `named` as
+        /// their account, and `console_user`, which finds them at the screen.
+        fn both_modes(person: &Person) -> [RunAs; 2] {
+            [RunAs::Named(person.name.clone()), RunAs::ConsoleUser]
+        }
+
+        /// #3853 — with the account database stalled, `named` and
+        /// `console_user` are refused every way within the account lookup's
+        /// own wait (`ACCOUNT_LOOKUP_WAIT`), with the try-again words and the
+        /// account's name, and run nothing: not as the daemon, not as
+        /// anyone.
+        ///
+        /// Red before #3853: the lookup ran on the worker that asked, for as
+        /// long as the account database did not answer.
+        #[test]
+        fn a_stalled_account_lookup_refuses_both_modes_every_way_within_its_wait() {
+            let rt = runtime();
+            let person = the_person();
+            let seat = at_the_screen(&person);
+            let stalled = Stalled::default();
+            let _let_go = LetGoAtTheEnd(stalled.clone());
+            let database = stalled.database();
+            for who in both_modes(&person) {
+                let marks = Marks::new();
+                for &way in WAYS {
+                    let (took, waited) = on_a_worker_asking(
+                        &rt,
+                        &seat,
+                        &database,
+                        ACCOUNT_LOOKUP_WAIT + SLACK,
+                        as_who(way, who.clone(), marks.command(way)),
+                    )
+                    .unwrap_or_else(|e| panic!("{who:?}, {way:?}: {e}"));
+                    let refused = match took {
+                        Err(refused) => refused,
+                        Ok(printed) => panic!("{who:?}, {way:?} ran while stalled: {printed:?}"),
+                    };
+                    assert!(
+                        waited >= ACCOUNT_LOOKUP_WAIT,
+                        "{who:?}, {way:?} was refused in {waited:?}, before its wait"
+                    );
+                    assert!(
+                        refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                        "{who:?}, {way:?}: the refusal says to try again: {refused:?}"
+                    );
+                    assert!(
+                        refused.contains(&format!("{:?}", person.name)),
+                        "{who:?}, {way:?}: the refusal names the account: {refused:?}"
+                    );
+                    assert_eq!(marks.left_by(way), None, "{who:?}, {way:?} ran something");
+                }
+            }
+        }
+
+        /// #3853 — a stalled account lookup holds no async worker. On a
+        /// two-worker runtime, tasks asking every way, as `named` and as
+        /// `console_user`, again and again while the account database
+        /// stalls, leave a 10 ms timer waking on time (#3836's measure), and
+        /// the stall holds one lookup, however many ask.
+        ///
+        /// Red before #3853: each asker ran the lookup on its own worker,
+        /// and two of them held both.
+        #[test]
+        fn a_stalled_account_lookup_delays_no_timer() {
+            let rt = runtime();
+            let person = the_person();
+            let seat = at_the_screen(&person);
+            let stalled = Stalled::default();
+            let _let_go = LetGoAtTheEnd(stalled.clone());
+            let database = stalled.database();
+            // Two askers a way and a mode: more than the runtime has workers.
+            for who in both_modes(&person) {
+                for &way in WAYS {
+                    for _ in 0..2 {
+                        let who = who.clone();
+                        let asks = async move {
+                            for _ in 0..1_000 {
+                                let _ = as_who(way, who.clone(), "true".to_string()).await;
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        };
+                        rt.spawn(asking(
+                            seat.clone(),
+                            database::asking(database.clone(), asks),
+                        ));
+                    }
+                }
+            }
+            let asked = Instant::now();
+            while stalled.began() == 0 {
+                assert!(
+                    asked.elapsed() < RUNS_WITHIN,
+                    "no asker reached the account lookup"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let tick = Duration::from_millis(10);
+            let late = on_a_worker_asking(&rt, &seat, &database, RUNS_WITHIN, async move {
+                let mut worst = Duration::ZERO;
+                for _ in 0..100 {
+                    let asked = tokio::time::Instant::now();
+                    tokio::time::sleep(tick).await;
+                    worst = worst.max(asked.elapsed().saturating_sub(tick));
+                }
+                worst
+            });
+            let began = stalled.began();
+            let (worst, _) =
+                late.expect("a 10 ms timer kept waking while the account lookup stalled");
+            assert!(
+                worst < AT_ONCE,
+                "a 10 ms timer woke {worst:?} late while the account lookup stalled"
+            );
+            assert_eq!(began, 1, "one account lookup in flight, however many asked");
+        }
+
+        /// #3853 — while the account database stalls, asks for one account
+        /// share one lookup, whichever mode and way asks: `named` and
+        /// `console_user` for the person, every way, three times over, all
+        /// at once. An ask for another account gets a lookup of its own.
+        /// Every ask is refused with the try-again words.
+        ///
+        /// Red before #3853: every ask held a worker of its own.
+        #[test]
+        fn asks_for_one_account_share_one_lookup_and_another_account_gets_its_own() {
+            let rt = runtime();
+            let person = the_person();
+            let seat = at_the_screen(&person);
+            let stalled = Stalled::default();
+            let _let_go = LetGoAtTheEnd(stalled.clone());
+            let database = stalled.database();
+            let another = "i3853-another-account";
+            let mut whos: Vec<RunAs> = Vec::new();
+            for _ in 0..3 {
+                whos.extend(both_modes(&person));
+            }
+            whos.push(RunAs::Named(another.into()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut asks = 0;
+            for who in whos {
+                for &way in WAYS {
+                    let tx = tx.clone();
+                    let label = who.label();
+                    let who = who.clone();
+                    asks += 1;
+                    let ask = async move {
+                        let _ = tx.send((label, way, as_who(way, who, "true".into()).await));
+                    };
+                    rt.spawn(asking(
+                        seat.clone(),
+                        database::asking(database.clone(), ask),
+                    ));
+                }
+            }
+            for _ in 0..asks {
+                let (label, way, took) = rx
+                    .recv_timeout(RUNS_WITHIN)
+                    .expect("every ask is answered while the account database stalls");
+                let refused = took.expect_err("nothing runs while the account database stalls");
+                assert!(
+                    refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                    "{label}, {way:?}: the refusal says to try again: {refused:?}"
+                );
+            }
+            assert_eq!(
+                stalled.began_for(&person.name),
+                1,
+                "one lookup for the person's account, however many asked"
+            );
+            assert_eq!(
+                stalled.began_for(another),
+                1,
+                "another account's own lookup"
+            );
+        }
+
+        /// The control: an account database that answers in time resolves
+        /// the account, and every way drops to it as before #3853. As root
+        /// (CI's sudo step) both modes run as the person (`nobody`). As
+        /// anyone else `console_user` runs as itself, the per-user daemon
+        /// whose own account is at the screen, and `named` is refused by the
+        /// drop itself, as before: only root changes accounts.
+        #[test]
+        fn an_account_lookup_that_answers_in_time_drops_as_before() {
+            let rt = runtime();
+            let person = the_person();
+            let seat = at_the_screen(&person);
+            let database = database::StandIn::new(|_| Ok(()));
+            // SAFETY: reads this process's own credentials.
+            let root = unsafe { libc::geteuid() } == 0;
+            for who in both_modes(&person) {
+                let marks = Marks::new();
+                for &way in WAYS {
+                    let (took, _) = on_a_worker_asking(
+                        &rt,
+                        &seat,
+                        &database,
+                        RUNS_WITHIN,
+                        as_who(way, who.clone(), marks.command(way)),
+                    )
+                    .unwrap_or_else(|e| panic!("{who:?}, {way:?}: {e}"));
+                    if root || who == RunAs::ConsoleUser {
+                        let printed = took.unwrap_or_else(|refused| {
+                            panic!("{who:?}, {way:?} was refused: {refused}")
+                        });
+                        assert!(
+                            printed.lines().any(|line| line.trim() == person.name),
+                            "{who:?}, {way:?} ran as someone other than {}: {printed:?}",
+                            person.name
+                        );
+                        assert_eq!(
+                            marks.left_by(way),
+                            Some(person.uid),
+                            "{who:?}, {way:?} left its mark as someone other than {}",
+                            person.name
+                        );
+                    } else {
+                        let refused = took.expect_err("only root drops to a named account");
+                        assert!(
+                            !refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                            "{who:?}, {way:?}: the lookup answered, the drop refused: {refused:?}"
+                        );
+                        assert_eq!(marks.left_by(way), None, "{who:?}, {way:?} ran something");
+                    }
+                }
+            }
+        }
+
+        /// #3853 — only an account the lookup resolved runs anything. A
+        /// lookup with no answer in time, one that panicked and one that
+        /// failed are refused with the try-again words; no such account and
+        /// uid 0 are refused as before, without them. In no case does
+        /// anything run: not as root, not as the daemon, not as the account
+        /// a lookup resolved a moment before.
+        ///
+        /// Red before #3853: a stalled lookup held its worker, a lookup that
+        /// panicked took its caller down with it, and a failing one did not
+        /// say to try again.
+        #[test]
+        fn no_answer_but_an_account_runs_anything() {
+            let rt = runtime();
+            let person = the_person();
+            let seat = at_the_screen(&person);
+            let stalled = Stalled::default();
+            let _let_go = LetGoAtTheEnd(stalled.clone());
+
+            // The account resolved a moment ago: the first lookup runs, and
+            // the way it served ran as the person. Every later one is held.
+            let resolved_then_stalled = stalled.after(1);
+            let marks = Marks::new();
+            let first = WAYS[0];
+            let (took, _) = on_a_worker_asking(
+                &rt,
+                &seat,
+                &resolved_then_stalled,
+                RUNS_WITHIN,
+                as_who(first, RunAs::ConsoleUser, marks.command(first)),
+            )
+            .unwrap_or_else(|e| panic!("{first:?}: {e}"));
+            assert!(
+                took.is_ok(),
+                "{first:?} with the account resolved: {took:?}"
+            );
+            assert_eq!(marks.left_by(first), Some(person.uid));
+
+            let modes = both_modes(&person).to_vec();
+            let cases = [
+                (
+                    "stalled, after the account was resolved",
+                    resolved_then_stalled,
+                    modes.clone(),
+                    true,
+                ),
+                (
+                    "a lookup that panicked",
+                    database::StandIn::new(|_| -> Result<(), String> {
+                        panic!("an account lookup that panics")
+                    }),
+                    modes.clone(),
+                    true,
+                ),
+                (
+                    "the account database failed",
+                    database::StandIn::new(|account| {
+                        Err(format!(
+                            "looking up local account {account:?} failed: Connection timed out \
+                             (os error 110)"
+                        ))
+                    }),
+                    modes,
+                    true,
+                ),
+                (
+                    "no such account",
+                    database::StandIn::new(|_| Ok(())),
+                    vec![RunAs::Named("i3853-no-such-account".into())],
+                    false,
+                ),
+                (
+                    "uid 0",
+                    database::StandIn::new(|_| Ok(())),
+                    vec![RunAs::Named("root".into())],
+                    false,
+                ),
+            ];
+            for (what, database, modes, says_try_again) in cases {
+                for who in modes {
+                    let marks = Marks::new();
+                    for &way in WAYS {
+                        let (took, _) = on_a_worker_asking(
+                            &rt,
+                            &seat,
+                            &database,
+                            ACCOUNT_LOOKUP_WAIT + SLACK,
+                            as_who(way, who.clone(), marks.command(way)),
+                        )
+                        .unwrap_or_else(|e| panic!("{what}, {who:?}, {way:?}: {e}"));
+                        let refused = match took {
+                            Err(refused) => refused,
+                            Ok(printed) => panic!("{what}: {who:?}, {way:?} ran: {printed:?}"),
+                        };
+                        assert_eq!(
+                            refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                            says_try_again,
+                            "{what}, {who:?}, {way:?}: {refused:?}"
+                        );
+                        assert_eq!(
+                            marks.left_by(way),
+                            None,
+                            "{what}: {who:?}, {way:?} ran something"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// #3855 — the callers that look an account up on a blocking thread
+        /// of their own: the drop of a synchronous child (`drop_to_std`:
+        /// Remote Apps on a person's desktop, the recorder's launch, the
+        /// portal's session helper, the tray's session environment), and an
+        /// account's ids, home and name (`account_ids`, `account_home`,
+        /// `account_name`: the recorder's and received files' identity).
+        /// Each asks the account database stood in for its own thread
+        /// (`account_stand_in::blocking`); everything above it is the
+        /// daemon's.
+        mod blocking {
+            use super::*;
+
+            /// A blocking caller, given the person's account name and uid:
+            /// what it resolved, or why it was refused.
+            type Caller = fn(&str, u32) -> Result<String, String>;
+
+            /// Every blocking caller this build has, by name.
+            fn callers() -> Vec<(&'static str, Caller)> {
+                let drop_std: Caller = |name, _| {
+                    let mut child = std::process::Command::new("id");
+                    drop_to_std(&mut child, name).map(|()| "a drop".to_string())
+                };
+                let ids: Caller =
+                    |name, _| account_ids(name).map(|(uid, gid, _)| format!("{uid}:{gid}"));
+                let home: Caller =
+                    |name, _| account_home(name).map(|home| home.display().to_string());
+                let callers = vec![
+                    ("drop_to_std", drop_std),
+                    ("account_ids", ids),
+                    ("account_home", home),
+                ];
+                #[cfg(feature = "recording")]
+                let callers = {
+                    let name_of: Caller = |_, uid| account_name(uid);
+                    let mut callers = callers;
+                    callers.push(("account_name", name_of));
+                    callers
+                };
+                callers
+            }
+
+            /// `probe` on a thread of its own whose blocking account lookups
+            /// ask `database`: its answer and how long it took, waited for
+            /// `bound` at most from THIS thread.
+            fn on_a_thread<T: Send + 'static>(
+                database: &database::StandIn,
+                bound: Duration,
+                probe: impl FnOnce() -> T + Send + 'static,
+            ) -> Result<(T, Duration), String> {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stood = database.clone();
+                let asked = Instant::now();
+                std::thread::spawn(move || {
+                    let answer = database::blocking(&stood, probe);
+                    let _ = tx.send((answer, asked.elapsed()));
+                });
+                rx.recv_timeout(bound)
+                    .map_err(|_| format!("no answer within {bound:?}"))
+            }
+
+            /// #3855 — with the account database stalled, every blocking
+            /// caller is refused within the account lookup's own wait
+            /// (`ACCOUNT_LOOKUP_WAIT`), with the try-again words: it holds
+            /// its thread no longer than that.
+            ///
+            /// Red before #3855: each looked the account up on its own
+            /// thread, for as long as the account database did not answer.
+            #[test]
+            fn a_stalled_account_lookup_refuses_every_blocking_caller_within_its_wait() {
+                let person = the_person();
+                let stalled = Stalled::default();
+                let _let_go = LetGoAtTheEnd(stalled.clone());
+                let database = stalled.database();
+                for (what, caller) in callers() {
+                    let (name, uid) = (person.name.clone(), person.uid);
+                    let (took, waited) =
+                        on_a_thread(&database, ACCOUNT_LOOKUP_WAIT + SLACK, move || {
+                            caller(&name, uid)
+                        })
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    let refused = match took {
+                        Err(refused) => refused,
+                        Ok(resolved) => panic!("{what} resolved while stalled: {resolved}"),
+                    };
+                    assert!(
+                        waited >= ACCOUNT_LOOKUP_WAIT,
+                        "{what} was refused in {waited:?}, before its wait"
+                    );
+                    assert!(
+                        refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                        "{what}: the refusal says to try again: {refused:?}"
+                    );
+                }
+            }
+
+            /// #3855 — while the account database stalls, the asks for one
+            /// account share one lookup, from blocking threads and from an
+            /// exec session alike: every blocking caller three times over,
+            /// all at once, and a `named` exec as the person. Another account
+            /// gets a lookup of its own. Every ask is refused with the
+            /// try-again words.
+            ///
+            /// Red before #3855: every blocking ask held a thread of its own
+            /// for as long as the account database stalled.
+            #[test]
+            fn blocking_asks_for_one_account_share_one_lookup() {
+                let rt = runtime();
+                let person = the_person();
+                let seat = at_the_screen(&person);
+                let stalled = Stalled::default();
+                let _let_go = LetGoAtTheEnd(stalled.clone());
+                let database = stalled.database();
+                let another = "i3855-another-account";
+                let (tx, rx) = std::sync::mpsc::channel::<(&'static str, Result<String, String>)>();
+                let mut asks = 0;
+                for _ in 0..3 {
+                    for (what, caller) in callers() {
+                        let (tx, stood) = (tx.clone(), database.clone());
+                        let (name, uid) = (person.name.clone(), person.uid);
+                        std::thread::spawn(move || {
+                            let took = database::blocking(&stood, || caller(&name, uid));
+                            let _ = tx.send((what, took));
+                        });
+                        asks += 1;
+                    }
+                }
+                {
+                    let (tx, stood) = (tx.clone(), database.clone());
+                    std::thread::spawn(move || {
+                        let took = database::blocking(&stood, || {
+                            account_ids(another).map(|(uid, ..)| uid.to_string())
+                        });
+                        let _ = tx.send(("another account", took));
+                    });
+                    asks += 1;
+                }
+                {
+                    let name = person.name.clone();
+                    let ask = async move {
+                        let took =
+                            as_who(Way::FleetRpcExec, RunAs::Named(name), "true".into()).await;
+                        let _ = tx.send(("a named exec", took));
+                    };
+                    rt.spawn(asking(
+                        seat.clone(),
+                        database::asking(database.clone(), ask),
+                    ));
+                    asks += 1;
+                }
+                for _ in 0..asks {
+                    let (what, took) = rx
+                        .recv_timeout(RUNS_WITHIN)
+                        .expect("every ask is answered while the account database stalls");
+                    let refused = match took {
+                        Err(refused) => refused,
+                        Ok(resolved) => panic!("{what} resolved while stalled: {resolved}"),
+                    };
+                    assert!(
+                        refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN),
+                        "{what}: the refusal says to try again: {refused:?}"
+                    );
+                }
+                assert_eq!(
+                    stalled.began_for(&person.name),
+                    1,
+                    "one lookup for the person's account, however many asked"
+                );
+                assert_eq!(
+                    stalled.began_for(another),
+                    1,
+                    "another account's own lookup"
+                );
+                #[cfg(feature = "recording")]
+                assert_eq!(
+                    stalled.began_for(&format!("uid {}", person.uid)),
+                    1,
+                    "one lookup for the person's uid, however many asked"
+                );
+            }
+
+            /// The control: an account database that answers in time
+            /// resolves the account for every blocking caller as before
+            /// #3855, its ids and home the person's, and the drop configures
+            /// the child. As root (CI's sudo step) that child runs as the
+            /// person (`nobody`); only root changes accounts.
+            #[test]
+            fn a_blocking_lookup_that_answers_in_time_resolves_as_before() {
+                let person = the_person();
+                let database = database::StandIn::new(|_| Ok(()));
+                for (what, caller) in callers() {
+                    let (name, uid) = (person.name.clone(), person.uid);
+                    let (took, _) = on_a_thread(&database, RUNS_WITHIN, move || caller(&name, uid))
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    let resolved = took.unwrap_or_else(|refused| panic!("{what}: {refused}"));
+                    let home = match &person.seat {
+                        Seat::Person { home, .. } => home.display().to_string(),
+                        other => panic!("the person's seat: {other:?}"),
+                    };
+                    let want = match what {
+                        "drop_to_std" => "a drop".to_string(),
+                        "account_ids" => format!("{}:", person.uid),
+                        "account_home" => home,
+                        _ => person.name.clone(),
+                    };
+                    assert!(resolved.starts_with(&want), "{what}: {resolved} for {want}");
+                }
+                // SAFETY: reads this process's own credentials.
+                if unsafe { libc::geteuid() } == 0 {
+                    let name = person.name.clone();
+                    let (printed, _) = on_a_thread(&database, RUNS_WITHIN, move || {
+                        let mut child = std::process::Command::new("id");
+                        child.arg("-un");
+                        drop_to_std(&mut child, &name)?;
+                        child
+                            .output()
+                            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                            .map_err(|e| e.to_string())
+                    })
+                    .expect("the drop answers");
+                    assert_eq!(
+                        printed,
+                        Ok(person.name.clone()),
+                        "the child ran as the person"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// #3853 — on a Mac: `console_user` while who owns `/dev/console`
+/// (`companion::console_user_name`, a `stat` child) cannot be had in time,
+/// and `named` while Open Directory cannot resolve the account in time. Each
+/// lookup is stood in for each test's own tasks (`mac_console_stand_in`,
+/// `unix_priv::account_stand_in`); everything above it is the daemon's,
+/// through the exec engine's run, as Fleet RPC's exec takes it. Each probe
+/// runs as a task on a two-worker runtime and is waited for from the test's
+/// own thread (#3836's shape). Runs as the runner's own account, which a
+/// per-user daemon whose own account is at the screen runs as.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_console_lookup_tests {
+    use super::mac_console_stand_in::{StandIn, asking};
+    use super::unix_priv::account_stand_in as database;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Condvar, Mutex as StdMutex, PoisonError};
+    use std::time::{Duration, Instant};
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN;
+
+    /// What a refusal may take past its lookup's own wait on a busy runner.
+    const SLACK: Duration = Duration::from_secs(1);
+    /// What a command that runs may take on a busy runner.
+    const RUNS_WITHIN: Duration = Duration::from_secs(10);
+
+    /// Lookups, counted as they begin, each held until the gate opens.
+    #[derive(Clone, Default)]
+    struct Gate(Arc<GateState>);
+
+    #[derive(Default)]
+    struct GateState {
+        open: StdMutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Gate {
+        fn hold(&self) {
+            self.0.began.fetch_add(1, SeqCst);
+            let open = self.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                self.0
+                    .opened
+                    .wait_while(open, |open| !*open)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+
+        fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held.
+    struct OpenedAtTheEnd(Gate);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// The account running these tests.
+    fn me() -> String {
+        let me = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .expect("id -un");
+        String::from_utf8_lossy(&me.stdout).trim().to_string()
+    }
+
+    /// `id -un` run through the exec engine as `who`, as a task on `rt`
+    /// asking `owner` and `database`: what it printed or why it was refused,
+    /// and how long it took, waited for `bound` at most from THIS thread.
+    fn run_on_a_worker(
+        rt: &tokio::runtime::Runtime,
+        owner: &StandIn,
+        database: &database::StandIn,
+        who: RunAs,
+        bound: Duration,
+    ) -> Result<(Result<String, String>, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        let req = ExecRequest {
+            request_id: "i3853-mac".into(),
+            shell: String::new(),
+            command: "id -un".into(),
+            timeout_ms: 30_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: who,
+            start_in_home: false,
+            session_owned: false,
+        };
+        let run = async move {
+            let outcome = ExecEngine::new().run(req, &Redactor::default()).await;
+            let took = match (outcome.exit_code, outcome.error) {
+                (None, Some(refused)) => Err(refused),
+                _ => Ok(outcome.stdout),
+            };
+            let _ = tx.send((took, asked.elapsed()));
+        };
+        rt.spawn(asking(
+            owner.clone(),
+            database::asking(database.clone(), run),
+        ));
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("no answer within {bound:?}"))
+    }
+
+    /// #3853 — with the console's owner held up (a `stat` that does not
+    /// return), `console_user` is refused within the lookup's own wait with
+    /// the try-again words and runs nothing, while a 10 ms timer on the same
+    /// two-worker runtime wakes on time and askers that come again and again
+    /// share one lookup.
+    ///
+    /// Red before #3853: `console_user_name` ran on the worker that asked.
+    #[test]
+    fn a_held_console_owner_lookup_refuses_in_time_and_delays_no_timer() {
+        let rt = runtime();
+        let gate = Gate::default();
+        let _opened = OpenedAtTheEnd(gate.clone());
+        let held = {
+            let gate = gate.clone();
+            StandIn::new(move || {
+                gate.hold();
+                Err("the held lookup was let go".into())
+            })
+        };
+        let database = database::StandIn::new(|_| Ok(()));
+        // Two askers again and again: as many as the runtime has workers.
+        for _ in 0..2 {
+            let ask = async move {
+                for _ in 0..1_000 {
+                    let mut probe = tokio::process::Command::new("/usr/bin/true");
+                    let _ = apply_run_as(&mut probe, &RunAs::ConsoleUser).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            rt.spawn(asking(
+                held.clone(),
+                database::asking(database.clone(), ask),
+            ));
+        }
+        let asked = Instant::now();
+        while gate.began() == 0 {
+            assert!(asked.elapsed() < RUNS_WITHIN, "no asker reached the lookup");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (took, waited) = run_on_a_worker(
+            &rt,
+            &held,
+            &database,
+            RunAs::ConsoleUser,
+            ACCOUNT_LOOKUP_WAIT + SLACK,
+        )
+        .expect("console_user is answered while the console's owner is held up");
+        let refused = took.expect_err("nothing runs while the console's owner is held up");
+        assert!(
+            waited >= ACCOUNT_LOOKUP_WAIT,
+            "refused in {waited:?}, before its wait"
+        );
+        assert!(
+            refused.contains("account_mode `console_user`")
+                && refused.contains(CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+            "the refusal names the mode and says to try again: {refused:?}"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let tick = Duration::from_millis(10);
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            let _ = tx.send(worst);
+        });
+        let worst = rx
+            .recv_timeout(RUNS_WITHIN)
+            .expect("a 10 ms timer kept waking while the console's owner was held up");
+        assert!(worst < Duration::from_millis(500), "it woke {worst:?} late");
+        assert_eq!(gate.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3853 — with the account database held up (Open Directory not
+    /// answering), `named` is refused within the account lookup's own wait
+    /// with the try-again words and the account's name, and runs nothing.
+    /// The control: with both lookups answering in time, `console_user`
+    /// runs as the person at the screen, here the runner's own account.
+    ///
+    /// Red before #3853: the account lookup ran on the worker that asked.
+    #[test]
+    fn a_held_account_lookup_refuses_named_in_time_and_the_control_runs() {
+        let rt = runtime();
+        let gate = Gate::default();
+        let _opened = OpenedAtTheEnd(gate.clone());
+        let me = me();
+        let owner = {
+            let me = me.clone();
+            StandIn::new(move || Ok(me.clone()))
+        };
+        let held = {
+            let gate = gate.clone();
+            database::StandIn::new(move |_| {
+                gate.hold();
+                Err("the held lookup was let go".into())
+            })
+        };
+        let (took, waited) = run_on_a_worker(
+            &rt,
+            &owner,
+            &held,
+            RunAs::Named(me.clone()),
+            ACCOUNT_LOOKUP_WAIT + SLACK,
+        )
+        .expect("named is answered while the account database is held up");
+        let refused = took.expect_err("nothing runs while the account database is held up");
+        assert!(
+            waited >= ACCOUNT_LOOKUP_WAIT,
+            "refused in {waited:?}, before its wait"
+        );
+        assert!(
+            refused.contains(ACCOUNT_LOOKUP_TRY_AGAIN) && refused.contains(&format!("{me:?}")),
+            "the refusal says to try again and names the account: {refused:?}"
+        );
+
+        let answers = database::StandIn::new(|_| Ok(()));
+        let (took, _) = run_on_a_worker(&rt, &owner, &answers, RunAs::ConsoleUser, RUNS_WITHIN)
+            .expect("console_user is answered");
+        let printed = took.unwrap_or_else(|refused| panic!("console_user was refused: {refused}"));
+        assert_eq!(
+            printed.trim(),
+            me,
+            "console_user ran as the person at the screen"
+        );
     }
 }

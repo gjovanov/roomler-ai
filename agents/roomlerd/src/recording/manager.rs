@@ -154,6 +154,10 @@ pub struct RecordingManager {
     /// ms ([`GRACE_POLL`]). A test lengthens it to put a second recording
     /// between two looks, which the grace must never stop.
     grace_poll_ms: AtomicU64,
+    /// #3830 (tests) — decide as a Linux root daemon whose console lookup is
+    /// this stand-in ([`launch::unix::StandIn`]).
+    #[cfg(all(test, target_os = "linux"))]
+    console_stand_in: Option<launch::unix::StandIn>,
 }
 
 /// FR-85 P3b-3 — how often the grace looks at a detached recording.
@@ -167,6 +171,9 @@ pub const REATTACH_GRACE: Duration = Duration::from_secs(60);
 
 impl RecordingManager {
     pub fn new(exe: PathBuf, config_path: PathBuf) -> Self {
+        // #3830 — a Linux system install starts its first console lookup now,
+        // off the async runtime, so the first status already has an answer.
+        launch::prime();
         Self {
             exe,
             config_path,
@@ -182,7 +189,17 @@ impl RecordingManager {
             unattended_dir: None,
             reattach_grace: REATTACH_GRACE,
             grace_poll_ms: AtomicU64::new(GRACE_POLL.as_millis() as u64),
+            #[cfg(all(test, target_os = "linux"))]
+            console_stand_in: None,
         }
+    }
+
+    /// #3830 — decide as a Linux root daemon whose console lookup is
+    /// `stand_in`: the tests that hold a lookup up.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_console_stand_in(mut self, stand_in: launch::unix::StandIn) -> Self {
+        self.console_stand_in = Some(stand_in);
+        self
     }
 
     /// FR-85 P3b-3 — how often the grace looks at a detached recording.
@@ -229,7 +246,7 @@ impl RecordingManager {
     }
 
     /// FR-85 P1f — the identity a REMOTE recording starts under: as
-    /// [`Self::identity`], except that a service with nobody signed in
+    /// [`Self::identity_now`], except that a service with nobody signed in
     /// records as itself ([`Identity::Unattended`]) instead of refusing.
     /// Never for a local recording: that needs someone at the device to ask
     /// for it. The kill switch still answers first.
@@ -237,8 +254,12 @@ impl RecordingManager {
     /// ⚠️ Only [`Refusal::NoConsoleUser`] is "nobody". A login screen
     /// ([`Refusal::LoginScreen`], decision 6) stays refused: someone may be
     /// standing at it, and an unattended recording shows them nothing.
-    pub fn identity_remote(&self) -> Result<Identity, Refusal> {
-        match self.identity() {
+    ///
+    /// #3830 — what is known now, never a wait: only what the device
+    /// advertises reads it. A start decides afresh
+    /// ([`Self::identity_remote_fresh`]).
+    fn identity_remote_now(&self) -> Result<Identity, Refusal> {
+        match self.identity_now() {
             Err(Refusal::NoConsoleUser) => Ok(Identity::Unattended),
             other => other,
         }
@@ -252,8 +273,16 @@ impl RecordingManager {
     /// viewer hides the Record control without it (P3c-2), so a device at its
     /// sign-in screen would show no control and no reason at all. A start
     /// there is refused by name instead ("… once someone signs in").
+    ///
+    /// #3830 — so can a device whose console lookup has not answered yet:
+    /// what it can do does not come and go with logind, and a start is
+    /// refused by name ([`Refusal::NotKnownYet`]). Never a wait: the
+    /// heartbeat reads it on an async worker.
     pub fn available_remote(&self) -> bool {
-        matches!(self.identity_remote(), Ok(_) | Err(Refusal::LoginScreen))
+        matches!(
+            self.identity_remote_now(),
+            Ok(_) | Err(Refusal::LoginScreen | Refusal::NotKnownYet)
+        )
     }
 
     /// FR-85 P1f — point the unattended folder somewhere else (a test's
@@ -283,7 +312,7 @@ impl RecordingManager {
     /// be recorded (decision 6) but what was made stays its controller's.
     pub async fn remote_places(&self) -> Vec<(PathBuf, Identity)> {
         let mut out = Vec::new();
-        if let Ok(identity) = self.identity()
+        if let Ok(identity) = self.identity().await
             && let Ok(choice) = self.folder_choice().await
         {
             out.push((choice.dir, identity));
@@ -327,32 +356,73 @@ impl RecordingManager {
     /// Read afresh each time: a person signs in and out. The kill switch
     /// comes first, so it answers every path — a local start, a remote one,
     /// what the device advertises, and the listing.
-    pub fn identity(&self) -> Result<Identity, Refusal> {
-        self.identity_with(false)
+    ///
+    /// #3830 — what is DECIDED on: a local start, the folder, acting as the
+    /// person. On a Linux system install who is signed in is at most 5 s
+    /// old, or asked off the async runtime and waited for 3 s at most; no
+    /// answer in that time is [`Refusal::NotKnownYet`] ([`launch::decide`]).
+    pub async fn identity(&self) -> Result<Identity, Refusal> {
+        if let Some(decided) = self.decided_already() {
+            return decided;
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(stand_in) = &self.console_stand_in {
+            return stand_in.decide().await;
+        }
+        launch::decide().await
     }
 
-    /// `fresh`: who is signed in, asked of the system now ([`launch::decide_fresh`]).
-    fn identity_with(&self, fresh: bool) -> Result<Identity, Refusal> {
-        if self.switched_off {
-            return Err(Refusal::SwitchedOff);
+    /// #3830 — [`Self::identity`] from what is known NOW, never waiting on
+    /// the system: on a Linux system install, the console lookup's last
+    /// answer, however old, and [`Refusal::NotKnownYet`] before the first
+    /// ([`launch::decide_now`]). For what is SHOWN: the state's `available`,
+    /// what the device advertises. The tray polls it, and the heartbeat reads
+    /// it, on async workers.
+    pub fn identity_now(&self) -> Result<Identity, Refusal> {
+        if let Some(decided) = self.decided_already() {
+            return decided;
         }
-        let overridden = *self
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(stand_in) = &self.console_stand_in {
+            return stand_in.decide_now();
+        }
+        launch::decide_now()
+    }
+
+    /// Who is signed in, asked of the system now ([`launch::decide_fresh`]).
+    async fn identity_fresh(&self) -> Result<Identity, Refusal> {
+        if let Some(decided) = self.decided_already() {
+            return decided;
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(stand_in) = &self.console_stand_in {
+            return stand_in.decide_fresh().await;
+        }
+        launch::decide_fresh().await
+    }
+
+    /// What answers before any fact: the kill switch, then a test's override.
+    fn decided_already(&self) -> Option<Result<Identity, Refusal>> {
+        if self.switched_off {
+            return Some(Err(Refusal::SwitchedOff));
+        }
+        *self
             .identity_override
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        overridden.unwrap_or_else(if fresh {
-            launch::decide_fresh
-        } else {
-            launch::decide
-        })
+            .unwrap_or_else(|p| p.into_inner())
     }
 
-    /// FR-85 P1f — [`Self::identity_remote`], asking the system afresh who is
-    /// signed in: what an unattended start is decided on, what the launch
-    /// re-checks, and what the watch over a running one reads. A cached
-    /// "nobody" read twice is one observation, not two.
-    pub fn identity_remote_fresh(&self) -> Result<Identity, Refusal> {
-        match self.identity_with(true) {
+    /// FR-85 P1f — the identity a REMOTE recording starts under, asking the
+    /// system afresh who is signed in: what an unattended start is decided
+    /// on, what the launch re-checks, and what the watch over a running one
+    /// reads. A cached "nobody" read twice is one observation, not two.
+    ///
+    /// #3830 — off the async runtime, through the console lookup's one lookup
+    /// in flight, 3 s at most. No answer in time is
+    /// [`Refusal::NotKnownYet`]: NOT CONFIRMED, never "nobody", so a start
+    /// is refused and the watch over an unattended recording stops it.
+    pub async fn identity_remote_fresh(&self) -> Result<Identity, Refusal> {
+        match self.identity_fresh().await {
             Err(Refusal::NoConsoleUser) => Ok(Identity::Unattended),
             other => other,
         }
@@ -367,9 +437,9 @@ impl RecordingManager {
 
     /// Can this daemon record at all (FR-85 P3 advertises remote recording
     /// only where it can)? `false` for SYSTEM with nobody signed in, and for
-    /// root.
+    /// root. #3830 — from what is known now, never a wait.
     pub fn available(&self) -> bool {
-        self.identity().is_ok()
+        self.identity_now().is_ok()
     }
 
     /// FR-85 P3 — the session a REMOTE recording in progress belongs to.
@@ -451,7 +521,8 @@ impl RecordingManager {
 
     fn snapshot(&self) -> RecordingState {
         let mut s = self.state.lock().map(|s| s.clone()).unwrap_or_default();
-        let identity = self.identity();
+        // #3830 — never a wait: the tray polls this on an async worker.
+        let identity = self.identity_now();
         s.available = identity.is_ok();
         s.unavailable_reason = identity.err().map(|r| r.message().to_string());
         // #1760 — the same capability the remote gates read, told ahead of
@@ -542,6 +613,7 @@ impl RecordingManager {
             Some((initiator, decided)) => {
                 let now = self
                     .identity_remote_fresh()
+                    .await
                     .map_err(StartError::Unavailable)?;
                 if now != decided {
                     return Err(StartError::Failed(
@@ -552,7 +624,10 @@ impl RecordingManager {
                 }
                 (Some(initiator), now)
             }
-            None => (None, self.identity().map_err(StartError::Unavailable)?),
+            None => (
+                None,
+                self.identity().await.map_err(StartError::Unavailable)?,
+            ),
         };
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()
@@ -619,8 +694,21 @@ impl RecordingManager {
             args.push(format!("--remote-user-id={}", r.controller_user_id.to_hex()).into());
             args.push(format!("--remote-user-name={}", r.controller_name).into());
         }
-        let launched = match launch::spawn(identity, &self.exe, &args, &self.child_env()) {
-            Ok(l) => l,
+        // #3830 — never on an async worker: launching as the person finds
+        // their session with `loginctl` and their account through NSS on a
+        // Linux system install, and either can hang. No timeout around it: a
+        // recorder spawned after its caller gave up would run with nothing
+        // holding it.
+        let (exe, env) = (self.exe.clone(), self.child_env());
+        let launched =
+            tokio::task::spawn_blocking(move || launch::spawn(identity, &exe, &args, &env)).await;
+        let launched = match launched {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => {
+                return Err(StartError::Failed(format!(
+                    "could not launch the recorder: {e}"
+                )));
+            }
             Err(e) => {
                 return Err(StartError::Failed(format!(
                     "could not launch the recorder: {e}"
@@ -890,7 +978,7 @@ impl RecordingManager {
     /// daemon's own answer would be SYSTEM's Videos folder, and its write
     /// probe would pass where the person's would not.
     async fn folder_choice(&self) -> Result<folder::FolderChoice, String> {
-        let identity = self.identity().map_err(|r| r.message().to_string())?;
+        let identity = self.identity().await.map_err(|r| r.message().to_string())?;
         let configured = self.configured_dir();
         if identity == Identity::Inherit {
             return tokio::task::spawn_blocking(move || folder::resolve(configured.as_deref()))
@@ -944,8 +1032,13 @@ impl RecordingManager {
         if let Some(dir) = configured {
             args.extend(["--out".into(), dir.into()]);
         }
-        let launched = launch::spawn(identity, &self.exe, &args, &self.child_env())
-            .map_err(|e| format!("could not ask the recorder for its folder: {e}"))?;
+        // #3830 — off the async runtime, as a start's launch is.
+        let (exe, env) = (self.exe.clone(), self.child_env());
+        let launched =
+            tokio::task::spawn_blocking(move || launch::spawn(identity, &exe, &args, &env))
+                .await
+                .map_err(|e| format!("could not ask the recorder for its folder: {e}"))?
+                .map_err(|e| format!("could not ask the recorder for its folder: {e}"))?;
         let launch::Launched {
             stdin,
             stdout,
@@ -999,7 +1092,7 @@ impl RecordingManager {
         &self,
         f: impl FnOnce() -> R + Send + 'static,
     ) -> Option<R> {
-        let identity = self.identity().ok()?;
+        let identity = self.identity().await.ok()?;
         self.as_identity(identity, f).await
     }
 

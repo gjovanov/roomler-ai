@@ -302,11 +302,27 @@ mod parent {
     #[derive(Clone)]
     pub(crate) struct Prompts {
         consent_tx: ConsentSender,
-        /// The helper's stdin per question: dropping it is what takes the
-        /// notification down. The number tells a re-asked question from the
-        /// one before it.
-        live: Arc<Mutex<HashMap<String, (u64, std::process::ChildStdin)>>>,
+        /// The notification per question, on its way up or up: dropping an
+        /// `Up` entry's stdin is what takes it down. The number tells a
+        /// re-asked question from the one before it.
+        live: Arc<Mutex<HashMap<String, (u64, Shown)>>>,
     }
+
+    /// #3857 — a consent question's notification.
+    enum Shown {
+        /// Its show is running (the session walk, the helper's start, the
+        /// helper's first line). Taken off the books meanwhile
+        /// ([`Prompts::dismiss`]: the question answered elsewhere, its
+        /// session ended, its socket closed), the show stops: no helper is
+        /// started for it, or the one started takes it down at once.
+        Coming,
+        /// Up. Dropping the helper's stdin takes it down.
+        Up(std::process::ChildStdin),
+    }
+
+    /// #3857 — why a notification is not up for a question that ended while
+    /// it was on its way.
+    const WITHDRAWN: &str = "its question ended while the notification was being put up";
 
     impl Prompts {
         pub(crate) fn new(consent_tx: ConsentSender) -> Self {
@@ -316,23 +332,54 @@ mod parent {
             }
         }
 
+        /// #3857 — `session_hex`'s question on the books as coming, before its
+        /// show starts, so a dismiss from here on stops the show. The number
+        /// [`Self::show`] takes. Never waits.
+        pub(crate) fn coming(&self, session_hex: &str) -> u64 {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let generation = NEXT.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut l) = self.live.lock() {
+                l.insert(session_hex.to_string(), (generation, Shown::Coming));
+            }
+            generation
+        }
+
         /// Put `view` on the person's screen as a notification with Approve
-        /// and Deny. Whether it is up. Blocks for the helper's first line, so
-        /// callers run it off the runtime.
-        pub(crate) fn show(&self, view: &PromptView) -> bool {
+        /// and Deny, for the question [`Self::coming`] numbered `generation`:
+        /// `Ok` once it is up, or why it is not. Blocks for the helper's first
+        /// line, so callers run it off the runtime.
+        pub(crate) fn show(&self, view: &PromptView, generation: u64) -> Result<(), String> {
+            let shown = self.post(view, generation);
+            if let Err(why) = &shown {
+                // This question's entry only: a re-asked question under the
+                // same id has its own.
+                self.forget(&view.session_hex, generation);
+                tracing::info!(session = %view.session_hex, %why, "no notification prompt (FR-93 P6f)");
+            }
+            shown
+        }
+
+        /// [`Self::show`]'s work, its entry left to the caller on a failure.
+        fn post(&self, view: &PromptView, generation: u64) -> Result<(), String> {
             if !enabled() {
-                tracing::info!("no notification prompt (ROOMLERD_NOTIFY_CONSENT=0, FR-93 P6f)");
-                return false;
+                return Err("notification prompts are off (ROOMLERD_NOTIFY_CONSENT=0)".into());
             }
             let now = std::time::Instant::now();
             // A question already over is not posted: nothing would take it
             // down but its own lifetime.
             if view.expires_at <= now {
-                return false;
+                return Err("its question is already over".into());
             }
-            static NEXT: AtomicU64 = AtomicU64::new(1);
-            let generation = NEXT.fetch_add(1, Ordering::Relaxed);
             let session = view.session_hex.clone();
+            let books = self.live.clone();
+            let asked = session.clone();
+            let still_wanted = move || {
+                books.lock().is_ok_and(|l| {
+                    l.get(&asked).is_some_and(|(g, shown)| {
+                        *g == generation && matches!(shown, Shown::Coming)
+                    })
+                })
+            };
             let tx = self.consent_tx.clone();
             let mut answered = false;
             let said_session = session.clone();
@@ -362,18 +409,52 @@ mod parent {
                     l.remove(&end_session);
                 }
             };
-            match launch(&consent_request(view, now), "prompt", on_said, on_end) {
-                Ok(stdin) => {
-                    if let Ok(mut l) = self.live.lock() {
-                        l.insert(session, (generation, stdin));
+            let stdin = launch(
+                &consent_request(view, now),
+                "prompt",
+                on_said,
+                on_end,
+                still_wanted,
+            )?;
+            let late = {
+                let mut l = self.live.lock().unwrap_or_else(|p| p.into_inner());
+                match l.get_mut(&session) {
+                    Some((g, shown)) if *g == generation && matches!(shown, Shown::Coming) => {
+                        *shown = Shown::Up(stdin);
+                        None
                     }
-                    true
+                    _ => Some(stdin),
                 }
-                Err(why) => {
-                    tracing::info!(%why, "no notification prompt (FR-93 P6f)");
-                    false
+            };
+            match late {
+                None => Ok(()),
+                // #3857 — its question ended while it was on its way up. The
+                // stdin goes now, so the helper closes the notification and
+                // exits, and this late "up" answers no one.
+                Some(stdin) => {
+                    drop(stdin);
+                    Err(format!("{WITHDRAWN}; it was taken down at once"))
                 }
             }
+        }
+
+        /// This question's entry, unless a newer question under its id
+        /// already took its place.
+        fn forget(&self, session_hex: &str, generation: u64) {
+            if let Ok(mut l) = self.live.lock()
+                && l.get(session_hex).is_some_and(|(g, _)| *g == generation)
+            {
+                l.remove(session_hex);
+            }
+        }
+
+        /// #3857 — whether the notification for `session_hex` is up: what a
+        /// test reads to know nothing is left on the screen.
+        #[cfg(test)]
+        pub(crate) fn is_up(&self, session_hex: &str) -> bool {
+            self.live
+                .lock()
+                .is_ok_and(|l| matches!(l.get(session_hex), Some((_, Shown::Up(_)))))
         }
 
         /// Take the notification for `session_hex` down, if one is up: its
@@ -391,14 +472,30 @@ mod parent {
     /// `on_said`, on the reader's own thread, and `on_end` runs once the helper
     /// has gone. The returned stdin is the notification's life: dropping it
     /// takes the notification down. Blocks, so callers run it off the runtime.
+    ///
+    /// #3857 — the session walk (1.5 s at most, one walk in flight), then the
+    /// helper, one at a time: a question that ended while logind answered
+    /// (`still_wanted` false) starts no helper.
     fn launch(
         req: &Request,
         what: &str,
         mut on_said: impl FnMut(&Said) + Send + 'static,
         on_end: impl FnOnce() + Send + 'static,
+        still_wanted: impl Fn() -> bool,
     ) -> Result<std::process::ChildStdin, String> {
-        use crate::capture::portal::helper::{SpawnError, spawn_child};
-        let mut child = match spawn_child(&["--notify"], true) {
+        use crate::capture::portal::helper::{SpawnError, helper_session, spawn_child_in};
+        if !still_wanted() {
+            return Err(WITHDRAWN.into());
+        }
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let spawned = helper_session(euid).and_then(|session| {
+            if !still_wanted() {
+                return Err(SpawnError::Other(WITHDRAWN.into()));
+            }
+            spawn_child_in(&session, euid, &["--notify"], true)
+        });
+        let mut child = match spawned {
             Ok(c) => c,
             Err(SpawnError::NoSession) => return Err("no graphical session".into()),
             Err(SpawnError::Other(why)) => return Err(why),
@@ -576,8 +673,12 @@ mod parent {
                     });
                 }
             };
-            let posted =
-                tokio::task::spawn_blocking(move || launch(&req, "viewing", on_said, on_end)).await;
+            // Its session's end is read after the show (`Viewing::Pending`
+            // below), so the show itself is always wanted.
+            let posted = tokio::task::spawn_blocking(move || {
+                launch(&req, "viewing", on_said, on_end, || true)
+            })
+            .await;
             match posted {
                 Ok(Ok(stdin)) => {
                     tracing::info!(%session, "being viewed: a notification says so, with Disconnect (FR-93 P6g)");

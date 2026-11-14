@@ -3951,8 +3951,8 @@ async fn run_cmd(
     if unenrolled && !config_path.exists() {
         let name = roomlerd::machine::hostname().unwrap_or_default();
         let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
-        // #3802 — the worker's stderr is the root daemon's (its launchd log),
-        // so the reason names the folder and who owns it, not only the error.
+        // #3802 — the reason names the folder and who owns it. On the macOS release build
+        // the AppKit `main` logs it through tracing and exits 1: nothing reaches stderr.
         config::save(config_path, &blank).with_context(|| {
             format!(
                 "writing the person's config {}{}",
@@ -7251,6 +7251,9 @@ fn input_smoke_cmd(
     use roomlerd::input::{Button, InputMsg};
 
     let mut inj = roomlerd::input::open_default();
+    // #3787 — a missing display is said from a thread of its own, which the
+    // daemon never waits for. This one-shot command does, so the line prints.
+    roomlerd::input::no_display::wait_for_the_line();
     println!("input-smoke: has_permission={}", inj.has_permission());
     let pause = || std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 

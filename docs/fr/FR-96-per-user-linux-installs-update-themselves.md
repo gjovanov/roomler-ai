@@ -131,9 +131,9 @@ shared successor of `macos_forward_triggers`, `:3146-3220`) as before. Linux ask
   `EROFS`. P2a adds `ReadWritePaths=-/var/tmp` (only the directory can be granted: a `ReadWritePaths` entry binds
   what exists when the sandbox is built, and the helper deletes the wake file each run). A daemon whose unit
   predates P2a logs the failure and names the cure; the push then waits for the helper's 6 h timer. CI guards
-  the grant in both sandbox cells. The system-unit cell (`ci.yml:990-1075`) has the sandboxed unit write
+  the grant in both sandbox cells. The system-unit cell (`ci.yml:1017-1102`) has the sandboxed unit write
   `/var/tmp`, and a negative control (the same sandbox without the grant) must come back read-only. The
-  user-manager cell (Fedora's configuration, `ci.yml:1129-1138`) requires a read-write `/var/tmp` mount in the
+  user-manager cell (Fedora's configuration, `ci.yml:1156-1165`) requires a read-write `/var/tmp` mount in the
   daemon's namespace. Both directions were measured on systemd 255 before landing (§8).
 - **Decided at the start.** Enabling or disabling the helper takes effect at the daemon's next start — `install.sh`
   (P3) must refresh `roomler.service`, then `systemctl --user daemon-reload` and restart the per-user daemon after
@@ -164,7 +164,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:2861-2871`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:2874-2884`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon

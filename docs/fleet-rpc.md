@@ -460,6 +460,8 @@ flowchart TD
   L -- yes --> PU["rc:rpc.exec run_as = console_user: the daemon drops<br/>to the person at its screen, ran_as = console_user"]
   PU --> T2{"someone at the screen?"}
   T2 -- no --> D6["refused on the device: nobody is signed in"]
+  T2 -- "Linux: not known within 1.5 s (#3822);<br/>macOS: no owner of /dev/console within 1.5 s (#3853)" --> D7["refused on the device: could not tell, try again"]
+  T2 -- "yes, but their account is not looked up<br/>within 1.5 s, or the lookup failed (#3853)" --> D8["refused on the device: could not look up the account, try again"]
   C -- no --> W["the process holding the agent socket runs it<br/>(Windows: the worker, ran_as = worker)"]
   V -- yes --> P["exec_pending row; rc:rpc.exec via_service to the worker"]
   P --> K{"the person's exec_enabled, consent,<br/>then the anchor's exec_enabled"}
@@ -489,7 +491,19 @@ the signed-in user back into SYSTEM.
 screen: logind's seat0 on Linux, the owner of `/dev/console` on macOS. No
 service is involved: the root daemon drops to them itself, by the drop a `named`
 SSH account takes, and refuses when nobody is at the screen
-([`roomler-ssh.md`](roomler-ssh.md) § `console_user` on Linux and macOS). The
+([`roomler-ssh.md`](roomler-ssh.md) § `console_user` on Linux and macOS). On Linux
+it asks who that is off its async worker, 1.5 s at most, through the seat0 lookup
+a received file asks, and a lookup that gives no answer in that time, or fails,
+refuses the command with "Could not tell who is signed in at this computer's
+screen. Try again." in the result's `error`, never running it as anyone else
+(#3822). A Mac asks who owns `/dev/console` the same way since #3853, and then on
+both the person's account is looked up off the async worker too, through one lookup
+in flight per account, 1.5 s at most. No answer in that time, or a lookup that
+fails, refuses the command with `cannot run as "<name>": Could not look up the
+account to run as in this computer's account database. Try again. (<why>)` in the
+result's `error` (and `exec_audit`), again never running it as anyone else
+([`roomler-ssh.md`](roomler-ssh.md) § The account is looked up off the async
+worker). The
 server says so in the frame (`rc:rpc.exec`'s `run_as`), and it is the one frame
 field an older agent must never be sent, because it would ignore the field and
 run the command as root:
@@ -499,7 +513,7 @@ run the command as root:
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:975`](../crates/modules/fleet/src/agent_exec.rs#L975) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:371`](../crates/modules/fleet/src/agent_exec.rs#L371) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5924`](../agents/roomlerd/src/signaling.rs#L5924) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5965`](../agents/roomlerd/src/signaling.rs#L5965) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running

@@ -31,6 +31,17 @@
 //! asks `e` after a lookup began waits `(d - e) + d`. It is answered only if
 //! that fits in its wait. If `d` is at most half the wait, every caller is
 //! answered.
+//!
+//! #3830 — [`Remembered`] keeps the last answer of a kind of lookup for the
+//! callers that may not wait at all, over the same one lookup in flight. A
+//! status poll or a heartbeat reads the last answer, however old, and starts
+//! a lookup when it is older than its window ([`Remembered::now`]). What
+//! decides takes an answer from inside the window, or waits for a lookup
+//! within its wait ([`Remembered::current`]). A fresh check takes only a
+//! lookup that began after it asked ([`Remembered::fresh`]). The lookup's own
+//! thread stores what it answers, so an answer that nobody waits for any more
+//! still lands, and the lock on the last answer is never held across a
+//! lookup.
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -128,6 +139,7 @@ impl<T: Clone> Flight<T> {
     }
 
     /// [`Self::ended_by`] on a blocking thread.
+    #[cfg(any(target_os = "linux", test))]
     fn ended_by_blocking(&self, deadline: Instant) -> Option<Result<T, String>> {
         let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
@@ -178,6 +190,7 @@ impl<T: Clone + Send + 'static> OneInFlight<T> {
     }
 
     /// [`Self::ask`] from a blocking thread.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn ask_blocking<F>(&self, wait: Duration, lookup: F) -> Asked<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -193,6 +206,18 @@ impl<T: Clone + Send + 'static> OneInFlight<T> {
             Some(how) => how.into(),
             None => Asked::OutOfTime,
         }
+    }
+
+    /// #3830 — `lookup`, started unless a lookup is running, and waited for
+    /// by nobody: a refresh for the callers that may not wait at all
+    /// ([`Remembered::now`]). Whoever asks meanwhile takes its answer by this
+    /// module's rules.
+    #[cfg(any(all(target_os = "linux", feature = "recording"), test))]
+    pub(crate) fn start_unless_running<F>(&self, lookup: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        drop(self.join_or_start(lookup));
     }
 
     /// The lookup running now, when it began before `asked`.
@@ -249,6 +274,256 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
         .map(|text| (*text).to_string())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "a panic with no message".into())
+}
+
+/// #3830 — the last answer of a kind of lookup, for the callers that may not
+/// wait at all, over one [`OneInFlight`] (the module's rules). The daemon's
+/// are statics, so the methods take `&'static self`: the lookup's own thread
+/// stores what it answers.
+#[cfg(any(all(target_os = "linux", feature = "recording"), test))]
+pub(crate) struct Remembered<T> {
+    /// How long an answer counts as current.
+    window: Duration,
+    /// The last answer, and when the lookup that gave it BEGAN: a lookup
+    /// that hung answers for the moment it asked, not for the moment it
+    /// ended. Locked only to read it or to replace it, never across a lookup.
+    last: Mutex<Option<(Instant, T)>>,
+    lookups: OneInFlight<T>,
+}
+
+#[cfg(any(all(target_os = "linux", feature = "recording"), test))]
+impl<T: Clone + Send + 'static> Remembered<T> {
+    /// Lookups on a thread named `thread_name`, each answer current for
+    /// `window`.
+    pub(crate) const fn new(thread_name: &'static str, window: Duration) -> Self {
+        Self {
+            window,
+            last: Mutex::new(None),
+            lookups: OneInFlight::new(thread_name),
+        }
+    }
+
+    /// The last answer, however old, and never a wait: `None` before the
+    /// first one. When there is none, or it is older than the window,
+    /// `lookup` starts unless a lookup is running, and what it answers is
+    /// stored when it ends.
+    pub(crate) fn now<F>(&'static self, lookup: F) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let last = self.last_answer();
+        if last
+            .as_ref()
+            .is_none_or(|(began, _)| began.elapsed() >= self.window)
+        {
+            self.lookups.start_unless_running(self.storing(lookup));
+        }
+        last.map(|(_, answer)| answer)
+    }
+
+    /// An answer from inside the window, or else the answer of a lookup that
+    /// began at or after this call, within `wait` ([`OneInFlight::ask`]).
+    pub(crate) async fn current<F>(&'static self, wait: Duration, lookup: F) -> Asked<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if let Some((began, answer)) = self.last_answer()
+            && began.elapsed() < self.window
+        {
+            return Asked::Answer(answer);
+        }
+        self.fresh(wait, lookup).await
+    }
+
+    /// Only the answer of a lookup that began at or after this call, within
+    /// `wait`: never the stored one, however new.
+    pub(crate) async fn fresh<F>(&'static self, wait: Duration, lookup: F) -> Asked<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.lookups.ask(wait, self.storing(lookup)).await
+    }
+
+    /// The stored answer and when its lookup began.
+    fn last_answer(&self) -> Option<(Instant, T)> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// `lookup`, storing what it answers as it ends, on its own thread.
+    fn storing<F>(&'static self, lookup: F) -> impl FnOnce() -> T + Send + 'static
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        move || {
+            let began = Instant::now();
+            let answer = lookup();
+            let mut slot = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+            // Lookups run one at a time, so each began after the one before
+            // it ended; the check only keeps an older answer from replacing
+            // a newer one.
+            if slot.as_ref().is_none_or(|(stored, _)| *stored <= began) {
+                *slot = Some((began, answer.clone()));
+            }
+            drop(slot);
+            answer
+        }
+    }
+}
+
+/// #3853 — [`OneInFlight`]'s rules for each key on its own: at most one
+/// lookup in flight for a key, its answer shared by whoever asks for that key
+/// while it runs, and never by a caller who asked before it began. A lookup
+/// for one key never waits on, joins or answers another key's.
+///
+/// A key's entry lives only while its lookup runs. The lookup's own thread
+/// removes it as the lookup ends, answered, failed or panicked, so the map
+/// holds the keys whose lookups run and nothing else, whatever keys were
+/// asked before.
+///
+/// Exec's and SSH's account lookups are keyed by the account's name
+/// (`exec::unix_priv`). While the account database hangs, the asks for one
+/// account hold one thread, however many there are, and each other account
+/// asked holds one of its own. The daemon's is a static, so the methods take
+/// `&'static self`: the lookup's own thread removes its key.
+///
+/// #3855 — so are the account lookups of the callers on blocking threads
+/// (`drop_to_std`, `account_ids`, `account_home`; uids per uid), through
+/// [`Self::ask_blocking`]: an ask from a blocking thread and one from a task
+/// share the account's lookup.
+///
+/// Unix only: Windows has no account lookup of this kind (the module compiles
+/// there for the tray's start, #3858).
+#[cfg(any(unix, test))]
+pub(crate) struct OneInFlightPerKey<K, T> {
+    /// What each lookup's thread is called.
+    thread_name: &'static str,
+    /// The lookup running for each key.
+    running: Mutex<std::collections::BTreeMap<K, Arc<Flight<T>>>>,
+}
+
+#[cfg(any(unix, test))]
+impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerKey<K, T> {
+    pub(crate) const fn new(thread_name: &'static str) -> Self {
+        Self {
+            thread_name,
+            running: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// The answer of a lookup for `key` that began at or after this call,
+    /// within `wait`: [`OneInFlight::ask`]'s rules, for `key` alone.
+    pub(crate) async fn ask<F>(&'static self, key: K, wait: Duration, lookup: F) -> Asked<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let asked = Instant::now();
+        let deadline = asked + wait;
+        // A lookup for this key that began before this question is waited
+        // out, its answer left to the callers it was asked for.
+        while let Some(earlier) = self.running_from_before(&key, asked) {
+            if earlier.ended_by(deadline).await.is_none() {
+                return Asked::OutOfTime;
+            }
+        }
+        // Then the lookup for this key that began since, or this caller's own.
+        match self.join_or_start(key, lookup).ended_by(deadline).await {
+            Some(how) => how.into(),
+            None => Asked::OutOfTime,
+        }
+    }
+
+    /// #3855 — [`Self::ask`] from a blocking thread, by the same rules and
+    /// through the same lookups: an ask for `key` from a blocking thread and
+    /// one from a task share its lookup.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn ask_blocking<F>(&'static self, key: K, wait: Duration, lookup: F) -> Asked<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let asked = Instant::now();
+        let deadline = asked + wait;
+        while let Some(earlier) = self.running_from_before(&key, asked) {
+            if earlier.ended_by_blocking(deadline).is_none() {
+                return Asked::OutOfTime;
+            }
+        }
+        match self.join_or_start(key, lookup).ended_by_blocking(deadline) {
+            Some(how) => how.into(),
+            None => Asked::OutOfTime,
+        }
+    }
+
+    /// How many keys have a lookup running: everything the map holds.
+    #[cfg(test)]
+    pub(crate) fn keys_in_flight(&self) -> usize {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// The lookup running for `key`, when it began before `asked`.
+    fn running_from_before(&self, key: &K, asked: Instant) -> Option<Arc<Flight<T>>> {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .filter(|flight| flight.is_running() && flight.began < asked)
+            .cloned()
+    }
+
+    /// The lookup running for `key`, or `lookup`, started now.
+    fn join_or_start<F>(&'static self, key: K, lookup: F) -> Arc<Flight<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(flight) = running.get(&key).filter(|flight| flight.is_running()) {
+            return flight.clone();
+        }
+        let flight = Arc::new(Flight::new());
+        running.insert(key.clone(), flight.clone());
+        drop(running);
+        self.start(key, flight.clone(), lookup);
+        flight
+    }
+
+    /// `lookup` on a thread of its own, which ends `flight` however it goes
+    /// and then removes `key`'s entry.
+    fn start<F>(&'static self, key: K, flight: Arc<Flight<T>>, lookup: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let ends = flight.clone();
+        let ended = key.clone();
+        let started = std::thread::Builder::new()
+            .name(self.thread_name.to_string())
+            .spawn(move || {
+                let how = std::panic::catch_unwind(std::panic::AssertUnwindSafe(lookup))
+                    .map_err(|panic| format!("it panicked: {}", panic_text(panic.as_ref())));
+                ends.end(how);
+                self.forget(&ended, &ends);
+            });
+        if let Err(e) = started {
+            flight.end(Err(format!("its thread did not start: {e}")));
+            self.forget(&key, &flight);
+        }
+    }
+
+    /// `key`'s entry goes once `flight`, its lookup, has ended, unless a
+    /// newer lookup for the key has already taken its place.
+    fn forget(&self, key: &K, flight: &Arc<Flight<T>>) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if running
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(entry, flight))
+        {
+            running.remove(key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,5 +768,305 @@ mod tests {
         };
         assert_ne!(on, here);
         assert_eq!(name.as_deref(), Some("seat0-lookup"));
+    }
+
+    /// #3830 — a [`Remembered`] for a test: `'static`, as the daemon's are.
+    fn remembered(window: Duration) -> &'static Remembered<u32> {
+        Box::leak(Box::new(Remembered::new("test-remembered", window)))
+    }
+
+    /// Until `done` holds, `LONG` at most.
+    fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + LONG;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}: not within {LONG:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// #3830 — `now` never waits. Before the first lookup ends it has no
+    /// answer, and it starts no second lookup while that one runs. A lookup
+    /// that nobody waits for still stores its answer, and inside the window
+    /// that answer is read with no lookup at all.
+    #[test]
+    fn now_never_waits_and_an_answer_nobody_waited_for_still_lands() {
+        let r = remembered(LONG);
+        let (first, later) = (Gate::default(), Gate::default());
+        let _opened = (OpenedAtTheEnd(first.clone()), OpenedAtTheEnd(later.clone()));
+        assert_eq!(r.now(first.lookup(1)), None, "no answer yet");
+        eventually("the lookup begins", || first.began() == 1);
+        assert_eq!(r.now(first.lookup(2)), None, "none while it hangs");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(first.began(), 1, "one lookup, however many asked");
+        first.open();
+        eventually("the answer nobody waited for is stored", || {
+            r.last_answer().map(|(_, answer)| answer) == Some(1)
+        });
+        assert_eq!(r.now(later.lookup(3)), Some(1), "inside its window");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(later.began(), 0, "no lookup inside the window");
+    }
+
+    /// #3830 — past its window the last answer still stands at once, and the
+    /// refresh it starts hangs alone: one lookup in flight.
+    #[test]
+    fn past_its_window_the_last_answer_stands_while_its_refresh_hangs() {
+        let r = remembered(Duration::ZERO);
+        let held = Gate::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        assert_eq!(r.now(|| 7), None);
+        eventually("the first answer lands and starts a refresh", || {
+            r.now(held.lookup(8)) == Some(7) && held.began() == 1
+        });
+        assert_eq!(r.now(held.lookup(9)), Some(7), "the last answer stands");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(held.began(), 1, "one refresh, however many asked");
+    }
+
+    /// #3830 — `current` takes an answer from inside its window and starts
+    /// nothing. Past it, it waits for a lookup that began after it asked,
+    /// within its wait, while what is shown is still the last answer.
+    #[tokio::test]
+    async fn current_takes_its_window_and_past_it_waits_for_a_lookup() {
+        let r = remembered(LONG);
+        let held = Gate::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        assert_eq!(r.current(LONG, || 1).await, Asked::Answer(1));
+        assert_eq!(r.current(SHORT, held.lookup(2)).await, Asked::Answer(1));
+        assert_eq!(held.began(), 0, "no lookup inside the window");
+
+        let r = remembered(Duration::ZERO);
+        assert_eq!(r.current(LONG, || 3).await, Asked::Answer(3));
+        assert_eq!(
+            r.current(SHORT, held.lookup(4)).await,
+            Asked::OutOfTime,
+            "past its window it waits for a lookup, and this one hangs"
+        );
+        assert_eq!(r.now(|| 5), Some(3), "what is shown is the last answer");
+    }
+
+    /// #3830 — `fresh` never takes the stored answer, however new: with no
+    /// lookup in time it has none, which its caller reads as not confirmed.
+    /// That lookup's late answer is stored for whoever comes next, and the
+    /// next fresh check still asks again.
+    #[tokio::test]
+    async fn fresh_never_takes_the_stored_answer() {
+        let r = remembered(LONG);
+        let held = Gate::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        assert_eq!(r.fresh(LONG, || 1).await, Asked::Answer(1));
+        assert_eq!(
+            r.fresh(SHORT, held.lookup(2)).await,
+            Asked::OutOfTime,
+            "never the answer before the question"
+        );
+        assert_eq!(r.now(|| 3), Some(1));
+        held.open();
+        eventually("the late answer is stored", || r.now(|| 3) == Some(2));
+        assert_eq!(r.fresh(LONG, || 4).await, Asked::Answer(4));
+        assert_eq!(r.now(|| 5), Some(4));
+    }
+
+    /// #3830 — a lookup that hangs holds no async worker. On a two-worker
+    /// runtime, tasks that ask `now`, `current` and `fresh` again and again
+    /// leave a 10 ms timer waking on time, and the hang holds one lookup.
+    #[test]
+    fn a_hung_lookup_holds_no_async_worker() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let held = Gate::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let r = remembered(Duration::ZERO);
+        for _ in 0..3 {
+            let held = held.clone();
+            rt.spawn(async move {
+                for n in 0..1_000 {
+                    let _ = r.now(held.lookup(n));
+                    let _ = r.current(SHORT, held.lookup(n)).await;
+                    let _ = r.fresh(SHORT, held.lookup(n)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let tick = Duration::from_millis(10);
+            let mut worst = Duration::ZERO;
+            for _ in 0..50 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            let _ = tx.send(worst);
+        });
+        let worst = rx.recv_timeout(LONG).expect("the timer kept waking");
+        assert!(worst < Duration::from_millis(500), "it woke {worst:?} late");
+        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3853 — a [`OneInFlightPerKey`] for a test: `'static`, as the
+    /// daemon's is.
+    fn per_key() -> &'static OneInFlightPerKey<&'static str, u32> {
+        Box::leak(Box::new(OneInFlightPerKey::new("test-per-key")))
+    }
+
+    /// #3853 — while lookups hang, the asks for one key share its one
+    /// lookup, in a row or at once, and another key gets a lookup of its
+    /// own. Once they are let go, no entry is left behind, and the next ask
+    /// starts a lookup of its own, whose end leaves none either.
+    #[tokio::test]
+    async fn asks_for_one_key_share_its_lookup_and_another_key_gets_its_own() {
+        let lookups = per_key();
+        let (ana, bob) = (Gate::default(), Gate::default());
+        let _opened = (OpenedAtTheEnd(ana.clone()), OpenedAtTheEnd(bob.clone()));
+        for _ in 0..3 {
+            assert_eq!(
+                lookups.ask("ana", SHORT, ana.lookup(1)).await,
+                Asked::OutOfTime
+            );
+        }
+        let (a, b, c) = tokio::join!(
+            lookups.ask("ana", SHORT, ana.lookup(2)),
+            lookups.ask("ana", SHORT, ana.lookup(3)),
+            lookups.ask("bob", SHORT, bob.lookup(4)),
+        );
+        assert_eq!(
+            [a, b, c],
+            [Asked::OutOfTime, Asked::OutOfTime, Asked::OutOfTime]
+        );
+        assert_eq!(
+            (ana.began(), bob.began()),
+            (1, 1),
+            "one lookup a key, however many asked"
+        );
+        assert_eq!(lookups.keys_in_flight(), 2, "an entry for each hung key");
+        ana.open();
+        bob.open();
+        eventually("the released lookups leave no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+        assert_eq!(
+            lookups.ask("ana", LONG, ana.lookup(5)).await,
+            Asked::Answer(5)
+        );
+        assert_eq!(ana.began(), 2, "the next ask's own lookup");
+        eventually("an answered lookup leaves no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+    }
+
+    /// #3853 — a lookup for a key that began before an ask never answers it:
+    /// the ask waits it out, starting nothing, and takes a fresh lookup's
+    /// answer, while the caller it began for takes its own. Another key's
+    /// lookup, hung meanwhile, neither holds the ask up nor answers it.
+    #[tokio::test]
+    async fn a_lookup_for_the_key_begun_before_the_ask_never_answers_it() {
+        let lookups = per_key();
+        let (earlier, fresh, other) = (Gate::default(), Gate::default(), Gate::default());
+        let _opened = (
+            OpenedAtTheEnd(earlier.clone()),
+            OpenedAtTheEnd(fresh.clone()),
+            OpenedAtTheEnd(other.clone()),
+        );
+        let first = tokio::spawn(lookups.ask("ana", LONG, earlier.lookup(1)));
+        while earlier.began() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let hung_other = tokio::spawn(lookups.ask("bob", LONG, other.lookup(9)));
+        let later = tokio::spawn(lookups.ask("ana", LONG, fresh.lookup(2)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            (earlier.began(), fresh.began(), other.began()),
+            (1, 0, 1),
+            "the later ask waits, starting nothing"
+        );
+        earlier.open();
+        assert_eq!(first.await.unwrap(), Asked::Answer(1));
+        while fresh.began() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        fresh.open();
+        assert_eq!(
+            later.await.unwrap(),
+            Asked::Answer(2),
+            "a fresh lookup's answer, never the one begun before the ask"
+        );
+        eventually("only the hung key's entry is left", || {
+            lookups.keys_in_flight() == 1
+        });
+        other.open();
+        assert_eq!(hung_other.await.unwrap(), Asked::Answer(9));
+        eventually("the ended lookups leave no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+    }
+
+    /// #3855 — asks for a key from blocking threads share its one lookup
+    /// with an ask from a task, each within its own wait, and another key's
+    /// lookup is its own. Once let go, the next blocking ask starts a lookup
+    /// of its own and is answered.
+    #[test]
+    fn blocking_asks_for_one_key_share_its_lookup() {
+        let lookups = per_key();
+        let (ana, bob) = (Gate::default(), Gate::default());
+        let _opened = (OpenedAtTheEnd(ana.clone()), OpenedAtTheEnd(bob.clone()));
+        let asks: Vec<_> = (0..3)
+            .map(|answer| {
+                let lookup = ana.lookup(answer);
+                std::thread::spawn(move || lookups.ask_blocking("ana", SHORT, lookup))
+            })
+            .collect();
+        let other = {
+            let lookup = bob.lookup(9);
+            std::thread::spawn(move || lookups.ask_blocking("bob", SHORT, lookup))
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        assert_eq!(
+            rt.block_on(lookups.ask("ana", SHORT, ana.lookup(4))),
+            Asked::OutOfTime
+        );
+        for ask in asks {
+            assert_eq!(ask.join().expect("an ask's thread"), Asked::OutOfTime);
+        }
+        assert_eq!(other.join().expect("an ask's thread"), Asked::OutOfTime);
+        assert_eq!(
+            (ana.began(), bob.began()),
+            (1, 1),
+            "one lookup a key, from threads and a task alike"
+        );
+        ana.open();
+        bob.open();
+        eventually("the released lookups leave no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+        assert_eq!(
+            lookups.ask_blocking("ana", LONG, ana.lookup(5)),
+            Asked::Answer(5)
+        );
+        assert_eq!(ana.began(), 2, "the next ask's own lookup");
+    }
+
+    /// #3853 — a lookup that panics ends as any other: its caller is told it
+    /// failed, its key's entry goes, and the next ask is answered afresh.
+    #[tokio::test]
+    async fn a_lookup_that_panics_leaves_no_entry() {
+        let lookups = per_key();
+        let failed = lookups
+            .ask("ana", LONG, || -> u32 { panic!("a lookup that fails") })
+            .await;
+        assert!(
+            matches!(&failed, Asked::Failed(why) if why.contains("a lookup that fails")),
+            "{failed:?}"
+        );
+        eventually("a lookup that panicked leaves no entry", || {
+            lookups.keys_in_flight() == 0
+        });
+        assert_eq!(lookups.ask("ana", LONG, || 7).await, Asked::Answer(7));
     }
 }

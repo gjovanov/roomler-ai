@@ -384,10 +384,10 @@ Mechanics worth knowing:
   descriptor above stderr is marked close-on-exec
   (`tunnel_core::child::inherit_only_stdio_async`,
   `crates/tunnel-core/src/child.rs:231`; registered at
-  `agents/roomlerd/src/pty/unix.rs:272`). It marks and never closes, so it
+  `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
-  (`agents/roomlerd/src/exec.rs:1816`) and `sftp-server`
-  (`agents/roomlerd/src/ssh.rs:1250`) sweep the same way. The overlay's TUN
+  (`agents/roomlerd/src/exec.rs:2439`) and `sftp-server`
+  (`agents/roomlerd/src/ssh.rs:1253`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
   never see EOF and a session whose shell exited would hang forever.
@@ -630,23 +630,27 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1246`](../agents/roomlerd/src/exec.rs#L1246)). Exec, the pty and `sftp`
+[`exec.rs:1865`](../agents/roomlerd/src/exec.rs#L1865)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:813`](../agents/roomlerd/src/exec.rs#L813)), so one rule covers all
+([`exec.rs:819`](../agents/roomlerd/src/exec.rs#L819)), so one rule covers all
 three.
 
 ```mermaid
 flowchart TD
   S["a session or command asks for console_user"] --> L{"who is at the screen?"}
-  L -- "Linux: loginctl show-seat seat0 → ActiveSession" --> K{"that session's Class"}
-  L -- "macOS: stat -f %Su /dev/console" --> M{"root, empty, or _system?"}
+  L -- "Linux: loginctl show-seat seat0 → ActiveSession,<br/>off the async worker, 1.5 s at most (#3822)" --> K{"that session's Class"}
+  L -- "Linux: no answer within 1.5 s, or the lookup failed" --> X4["refused: could not tell who is there, try again"]
+  L -- "macOS: stat -f %Su /dev/console,<br/>off the async worker, 1.5 s at most (#3853)" --> M{"root, empty, or _system?"}
+  L -- "macOS: no answer within 1.5 s" --> X4
   L -- "no logind, no seat0, no active session" --> X1["refused: nobody is signed in"]
   K -- "greeter (the login screen), or any non-user class" --> X1
   K -- user --> A["that session's Name"]
   M -- yes --> X1
   M -- no --> A
-  A --> R{"resolve the account"}
-  R -- "uid 0" --> X2["refused: never root this way"]
+  A --> R{"resolve the account, off the async worker,<br/>1.5 s at most (#3853)"}
+  R -- "no answer within 1.5 s, or the lookup failed" --> X5["refused: could not look up the account, try again"]
+  R -- "uid 0, or root's session at seat0" --> X2["refused: never root this way"]
+  R -- "Linux: not the uid logind recorded for the session" --> X1
   R -- ok --> D{"the daemon runs as"}
   D -- root --> DROP["setgroups → setgid → setuid to them"]
   D -- "that same person" --> SELF["run as itself: no change of identity"]
@@ -655,7 +659,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:1550`](../agents/roomlerd/src/companion.rs#L1550)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1076`](../agents/roomlerd/src/companion.rs#L1076)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:2832`](../agents/roomlerd/src/companion.rs#L2832)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1331`](../agents/roomlerd/src/companion.rs#L1331)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -680,12 +684,153 @@ flowchart TD
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
+**Who is at the screen is asked off the async worker, 1.5 s at most (#3822).** On
+Linux, logind and the account database are other processes, and either can stop
+answering: a stopped `systemd-logind`, an SSSD or LDAP server stalled on a large
+group. The agent used to run `loginctl` inline, on the async worker that applied
+the account, for as long as it took. It now asks through the one seat0 lookup in
+flight that a received file asks (`files::ask_seat0`, on a thread named
+`seat0-lookup`, [`files.rs:1046`](../agents/roomlerd/src/files.rs#L1046)), awaited
+from the session's own task, `SEAT_LOOKUP_WAIT` (1.5 s) at most
+(`exec::console_account`, [`exec.rs:919`](../agents/roomlerd/src/exec.rs#L919)). It
+asks at the same point as before: after every gate and the consent prompt, right
+before the drop. A hung logind holds one thread for files, exec and SSH together,
+and each later caller waits on that lookup within its own 1.5 s, starting none.
+
+Only a person's answer is an account (`exec::console_person`,
+[`exec.rs:972`](../agents/roomlerd/src/exec.rs#L972)):
+
+| The lookup answers | The command or session |
+|---|---|
+| a person | runs as them, as before |
+| nobody at the screen | refused, saying why, as before |
+| nothing within 1.5 s, a lookup that failed or panicked, logind or the account database failing | refused: "Could not tell who is signed in at this computer's screen. Try again.", with why (the words a received file gets, #3711) |
+| root's session at seat0 | refused, in words of its own since #3822 (before: the uid-0 check refused it) |
+| a name whose account has another uid than logind recorded for the session | refused as nobody since #3822 (before: it ran as that other uid) |
+
+The last two rows changed on purpose: a session and a received file now take one
+person by one rule (#3688's `files::seat_of`). Nothing ever stands in for the
+person: not root, not the daemon's own identity, not the person a lookup found
+before. A refusal reaches the caller where every refusal does: the Fleet RPC
+result's `error` (and so `exec_audit`), and `roomler-ssh: …` on the SSH client's
+stderr for a command or a shell, `roomler: …` for `sftp`. macOS reads
+`/dev/console`'s owner off the async worker too since #3853, and the account the
+person's name resolves to is looked up the same way on both
+(§ The account is looked up off the async worker, below).
+
+Tested in `exec::console_lookup_tests`, as the runner (rust-agent's "Test agent
+under vp9-444") and as root (rust-recorder's #3822 step): with the lookup held up,
+Fleet RPC's exec, SSH's exec, SSH's shell and SFTP are each refused within its wait
+with the try-again text and run nothing; a 10 ms timer stays on time on a two-worker
+runtime while they ask, and one lookup is in flight; an answer in time runs every
+way as the person; and no answer but a person's runs anything.
+`ssh::tests::a_console_user_refusal_reaches_the_ssh_clients_stderr` shows the
+refusal on a real SSH client's stderr. Field verification is owed (a paused logind
+on a Linux system install).
+
 Field-proven 2026-10-18 on candidates (FR-97 §8). On a Linux root daemon
 (Ubuntu, GDM), a command, a pty and `sftp` ran as the person signed in on seat0,
 and were refused once GDM's greeter held the seat. A per-user daemon whose own
 account was at the screen ran them as itself. On a Mac's root daemon they ran as
 the GUI user and were refused at the login window. On the release, every one of
 them had been refused as "a Windows concept".
+
+#### The account is looked up off the async worker, 1.5 s at most (#3853)
+
+`named` and `console_user` both end in an account lookup: `getpwnam_r`, then
+`getgrouplist`, which reach the account database through NSS. On a domain-joined
+Linux host that is SSSD, LDAP or Active Directory, on a Mac Open Directory, and any
+of them can stop answering. The agent used to run the lookup inline, on the async
+worker that applied the account, for as long as it took, so a stalled SSSD held that
+worker and every socket and timer on it: the shape #3830 measured for a hung logind.
+
+The lookup now runs on a thread of its own, named `account-lookup`, through one
+lookup in flight **per account name** (`one_in_flight::OneInFlightPerKey`,
+[`one_in_flight.rs:400`](../agents/roomlerd/src/one_in_flight.rs#L400); the
+daemon's `ACCOUNTS`, [`exec.rs:1550`](../agents/roomlerd/src/exec.rs#L1550)). The
+session's own task awaits it `ACCOUNT_LOOKUP_WAIT` (1.5 s) at most
+(`unix_priv::session_account`,
+[`exec.rs:1572`](../agents/roomlerd/src/exec.rs#L1572)), at the same point as
+before: after every gate and the consent prompt, right before the drop.
+
+- **Keyed by the name.** `named:ana` and a `console_user` session whose person is
+  `ana` share one lookup, and another account gets its own. While the account
+  database hangs, every retry for an account waits on the lookup already running
+  and starts none, so the hang holds one thread per account asked, however often
+  it is asked.
+- **Only a lookup that began after the question answers it** (#3796's rule). A
+  lookup already running is waited out, and its answer is left to the callers it
+  was started for. No answer from before the question, late or remembered, ever
+  names the account a command runs as.
+- **The map holds only the lookups that run.** The lookup's own thread removes its
+  account's entry as it ends, answered, failed or panicked.
+- **Fork safety is unchanged.** The account (uid, gid, groups, home, name) is still
+  resolved in the parent, now on the lookup's thread, before the fork. The child
+  only calls `setgroups`, `setgid`, `setuid`, `getuid`, `geteuid` and `chdir` over
+  memory the drop already owns.
+
+What the lookup gives decides the session (`unix_priv::in_time`,
+[`exec.rs:1605`](../agents/roomlerd/src/exec.rs#L1605)):
+
+| The lookup, within 1.5 s | The command or session |
+|---|---|
+| resolves the account | runs as it, as before |
+| no such account, uid 0, a name with a NUL byte | refused in the words it always had, with no try-again |
+| gives no answer, returns an error from the account database (`getpwnam_r` failing), or panics | refused: `cannot run as "<name>": Could not look up the account to run as in this computer's account database. Try again. (<why>)`. Nothing runs, as anyone |
+
+`console_user` asks who is at the screen first (#3822's 1.5 s on Linux; on a Mac
+the owner of `/dev/console`, a `stat` child, now asked through one lookup in flight
+on a thread named `console-owner`, `exec::ask_console_owner`,
+[`exec.rs:1015`](../agents/roomlerd/src/exec.rs#L1015), with #3822's
+try-again words when it gives no answer), then looks the person's account up as
+above, so it waits 3 s at most. The refusal reaches the caller where every refusal
+does: the Fleet RPC result's `error` (and `exec_audit`), `roomler-ssh: …` on the SSH
+client's stderr for a command or a shell, and `roomler: …` for `sftp`.
+
+Tested, with the account database stood in for each test's own tasks:
+`exec::console_lookup_tests::account_database` runs as the runner (rust-agent's
+"Test agent under vp9-444", with the shell) and as root (rust-recorder's
+#3822/#3853 step). With the database stalled, `named` and `console_user` are refused
+every way within the wait with the try-again words and run nothing. A 10 ms timer on
+a two-worker runtime stays on time while they ask, and asks for one account share
+one lookup while another account gets its own. A lookup that answers in time drops
+as before, and no answer but an account runs anything.
+`exec::mac_console_lookup_tests` (the macOS lane) does the same for the console's
+owner and for `named` on a Mac. Field verification is owed: a paused SSSD on a Linux
+system install.
+
+#### The blocking callers share the lookup, 1.5 s at most (#3855)
+
+The other callers that drop to a person, or read an account's ids, run on blocking
+threads of their own: `exec::drop_to_std` (Remote Apps on a person's desktop, the
+recorder's launch, the portal's session helper and every helper it runs, the tray's
+session environment) and `account_ids` / `account_home` (the recorder's and received
+files' identity). Each looked the account up inline, so while the account database
+hung, every ask held its blocking thread for as long as the hang lasted. They now ask
+the same lookup in flight (`unix_priv::account_blocking`,
+[`exec.rs:1311`](../agents/roomlerd/src/exec.rs#L1311), through
+`OneInFlightPerKey::ask_blocking`,
+[`one_in_flight.rs:442`](../agents/roomlerd/src/one_in_flight.rs#L442)), 1.5 s at most
+from the caller's own thread. The recorder's uid is looked up through one lookup in
+flight per uid (`account_name`, [`exec.rs:1476`](../agents/roomlerd/src/exec.rs#L1476)).
+An ask from the recorder's launch and an exec as the same account share one lookup.
+A refusal carries the try-again words above through each caller's own error:
+
+| Caller | Its thread | The refusal |
+|---|---|---|
+| Remote Apps on a person's desktop (`apps::linux`, `LinuxWm::cmd`) | `spawn_blocking` for `rc:apps.*`, the caps probe's thread for the hello | `cannot_run_as`: ``cannot run `wmctrl` as <user>: cannot run as "<user>": Could not look up …`` |
+| The recorder's launch (`spawn_as_account`) and its identity (`Account::by_uid`) | `spawn_blocking` | `could not launch the recorder: …`; acting as them logs `could not act as the recorder's identity` |
+| The portal's session helper (`capture::portal::helper::spawn_child`): capture, detection, audio, keep busy, the notification prompt and the being-viewed notice | the capture, audio and keep-busy threads, a detection thread, `spawn_blocking` | `cannot run the portal helper as the session's owner: …` |
+| The tray's session environment (the prompt's start, `docs/desktop-companion.md` §10.2; the post-install launch; the post-update restart) | `tray-start`, `spawn_blocking` | the tray starts with logind's four variables, as on any failed read |
+| Received files' person (`files::seat_now`) | `seat0-lookup` | bounded by its own 1.5 s already |
+
+Fork safety is unchanged: the account is resolved in the parent, before the fork.
+Tested in `exec::console_lookup_tests::account_database::blocking` (both lanes above):
+with the database stalled, each blocking caller is refused within 1.5 s with the
+try-again words, and blocking asks and a `named` exec for one account share one
+lookup; the control resolves as before, and as root the child runs as the person.
+Remote Apps' and the recorder's own refusals are tested where they live
+(`apps::linux`, `recording::launch`).
 
 #### Where a session starts (FR-97 P5b)
 
@@ -741,7 +886,9 @@ privilege-retention bug and looks like a successful drop from outside. The
 result is then verified (`getuid`/`geteuid`) rather than assumed. Account and
 group lookup happen in the *parent*: everything between `fork` and `exec` must
 be async-signal-safe and must not allocate, since a malloc lock held by another
-thread at fork time is never released in the child.
+thread at fork time is never released in the child. Since #3853 that lookup runs
+on the parent's `account-lookup` thread, 1.5 s at most, never on the async worker
+(§ The account is looked up off the async worker, 1.5 s at most).
 
 Naming an account that resolves to uid 0 is refused. Not because running as
 root is impossible — `daemon` already is root there — but because it has to be
@@ -1054,7 +1201,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 
 | side | where | what it does |
 |---|---|---|
-| the device | `record_grant` ([`ssh.rs:3008`](../agents/roomlerd/src/ssh.rs#L3008)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3040-3049`), so a skewed clock stays visible |
+| the device | `record_grant` ([`ssh.rs:3021`](../agents/roomlerd/src/ssh.rs#L3021)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3053-3062`), so a skewed clock stays visible |
 | the server | `decide` ([`agent_ssh.rs:445`](../crates/modules/network/src/routes/agent_ssh.rs#L445)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2575`](../crates/remote_control/src/models.rs#L2575)), on `rc:ssh.grant` (`agent_ssh.rs:465`) and in the FR-105 `ssh_pending` row the service claims (`:491`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
@@ -1087,7 +1234,7 @@ server's. These bounds hold whatever the device's clock says:
    `agents/roomlerd/src/signaling.rs:66`, checked at `:2427`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
-   (`agents/roomlerd/src/ssh.rs:2955`), and no window longer than 60 s from
+   (`agents/roomlerd/src/ssh.rs:2968`), and no window longer than 60 s from
    arrival.
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
@@ -1138,7 +1285,10 @@ roomler-ssh: this is being asked at the device already; waiting up to the rest o
 `ssh:«name» (via «device»)@«overlay ip»:«port»`, which means nothing to the
 person deciding. That identity still attributes every log line and activity
 report (`ResolvedSessionPolicy::caller`). The prompt reads `prompt_name`, and
-so does the SYSTEM service's relay to the worker.
+so does the SYSTEM service's relay to the worker. A log line holds either one
+quoted and escaped, as it holds what a client sends: a line break in a name
+stays inside its line (#3815,
+[What an SSH client sends, and what a grant names, are escaped too](security-baseline.md#what-an-ssh-client-sends-and-what-a-grant-names-are-escaped-too-3815)).
 
 ⚠️ **The broker is threaded, not discovered.** The consent broker rides
 `ssh::SessionServices` from the daemon through `overlay::maybe_start` into the
@@ -1148,7 +1298,7 @@ global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
 
 ⚠️ **Armed before it is shown (#3442).** The device registers the question with
-the broker first (`ask_here`, [`ssh.rs:2386`](../agents/roomlerd/src/ssh.rs#L2386)), then puts it up: the native panel, the
+the broker first (`ask_here`, [`ssh.rs:2396`](../agents/roomlerd/src/ssh.rs#L2396)), then puts it up: the native panel, the
 `.pending` marker the companion and `roomlerd consent --list` read, a companion
 it may have to start (up to 3 s), a notification. An answer counts from the
 moment anything shows the question. Until #3442 the question was armed last,
@@ -1156,11 +1306,11 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4428`](../agents/roomlerd/src/signaling.rs#L4428), [`:6000`](../agents/roomlerd/src/signaling.rs#L6000)), as the recording question does
+first the same way ([`signaling.rs:4428`](../agents/roomlerd/src/signaling.rs#L4428), [`:6041`](../agents/roomlerd/src/signaling.rs#L6041)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
-[`ssh.rs:2252`](../agents/roomlerd/src/ssh.rs#L2252)).** Channels of one session can ask at once: a command waits in a
+[`ssh.rs:2262`](../agents/roomlerd/src/ssh.rs#L2262)).** Channels of one session can ask at once: a command waits in a
 task of its own, so a second channel can ask while the first waits. A channel
 that asks what a question already standing for its grant asks (the same
 activity: "run a command", "open an interactive shell", "transfer files over
@@ -1169,7 +1319,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2270`](../agents/roomlerd/src/ssh.rs#L2270)), and the answer's line carries the grant ([`:2464`](../agents/roomlerd/src/ssh.rs#L2464)), so a
+question's id ([`ssh.rs:2280`](../agents/roomlerd/src/ssh.rs#L2280)), and the answer's line carries the grant ([`:2474`](../agents/roomlerd/src/ssh.rs#L2474)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same
@@ -1337,7 +1487,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:927`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:1184`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
@@ -1374,8 +1524,9 @@ silently (#3375, `docs/installation.md`,
 To check that the switch holds, try a transfer. OpenSSH's `sftp` shows the
 refusal only as `subsystem request failed on channel 0`, without the reason the
 device sends on stderr. The device's log has
-`ssh: refused an unsupported request … request=sftp` (measured on a Win11
-SystemContext guest after an update, #3375).
+`ssh: refused an unsupported request … request="sftp"`. An agent before #3815
+writes it unquoted, `request=sftp`, as measured on a Win11 SystemContext guest
+after an update (#3375).
 ⚠️ Never replace the service's registry `Environment` value by hand. On a
 SystemContext install it already holds `ROOMLERD_ENABLE_SYSTEM_SWAP=1`.
 Overwriting it turned a test device into a user-context one, whose worker,

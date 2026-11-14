@@ -661,9 +661,9 @@ The sites on it since P1:
 | A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:399` |
 | Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:652`, `crates/agent-core/src/crash_recorder.rs:539` |
 | The uploader's verdicts ledger in a SYSTEM worker's `service-logs` (`crash-verdicts.txt`) | `HeldPath::machine(.., Seal::Readable)`, then `append_file`; read with `read_file`. A link, or a file with more than one name, at its name is deleted as itself and the file made again | `crates/agent-core/src/crash_recorder.rs:750` |
-| The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:679` |
-| The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:561`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
-| The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:286` |
+| The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:727` |
+| The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:609`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
+| The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:289` |
 | #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1435` |
 
 P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
@@ -715,7 +715,7 @@ environment (a systemd drop-in); remote config cannot reach it
 The viewer chooses an upload's `id`, and the daemon names the upload's staging
 folder after it. So the id is one plain name: letters, digits, `.`, `_` and
 `-`, not starting with `.`, at most 128 bytes (`transfer_id`,
-`agents/roomlerd/src/files.rs:1638`). Every entry that takes an id from the
+`agents/roomlerd/src/files.rs:1652`). Every entry that takes an id from the
 files channel checks it first, on every OS and before anything on disk is
 touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
 other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
@@ -749,9 +749,40 @@ The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
 logged as they are. Text the server relays from a person follows the same rule:
 a fleet RPC command's `caller`, the server's name for who asked (their display
-name, or `name (via device)`). Pinned by `peer::files_log_tests` (the files
-channel) and `peer::wire_text_log_tests` (the clipboard channel, and a channel
-named with a line break).
+name, or `name (via device)`), and what an SSH grant brings (below). Pinned by
+`peer::files_log_tests` (the files channel) and `peer::wire_text_log_tests` (the
+clipboard channel, and a channel named with a line break).
+
+### What an SSH client sends, and what a grant names, are escaped too (#3815)
+
+The device's SSH server writes its log by the same rule. A client chooses its
+login name, the terminal it asks for, a subsystem's name and every place it
+asks to forward to. A grant brings two strings a person typed: `caller`, the
+server's name for who asked, and the account a `named` policy runs as, which an
+admin typed into the device's SSH policy. So each of these is logged with Debug
+escaping, on every line that holds it:
+
+| Field | What it holds | Its lines |
+|---|---|---|
+| `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
+| `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2165`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2083`) | the four `ssh: forward …` lines |
+| `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:901`, `:924`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
+| `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
+| `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
+
+Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
+question's id), which the SYSTEM service checks with `valid_object_id` before it
+logs one; the server's word for the account mode (`account_mode`: `daemon`,
+`console_user` or `named`); a key's fingerprint; the resolver's error for a
+forward, which names no host; and a refusal the worker sends back to the SYSTEM
+service, which `clean_reason` has stripped of control characters. The exec
+engine's lines serve fleet RPC too, so a fleet RPC command's `caller` is escaped
+there as well. Pinned by `ssh::tests::wire_text_log_tests`: a client's login
+name, terminal, subsystem and forward hosts; a grant's caller, through the
+question to the person at the device and on the SYSTEM service's port; and a
+named account. Each holds a line break and a control character.
 
 ### A received file's folders are its writer's own (#3688)
 
@@ -762,13 +793,13 @@ folder on its way is one another account can write
 
 - **Its default folder** is its XDG Downloads when that exists and passes, else
   `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
-  (`default_download_dir`, `agents/roomlerd/src/files.rs:4972`). The folder each
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:4986`). The folder each
   is opened to must be the writer's own: for root, one no other account may
   write; for a per-user daemon, one not every account may, unless its file
   system keeps no owners or modes, where it need only be one the daemon can
   write into. Never the temp dir. Root's home is the one its account names,
   never `HOME`, and must pass root's rule itself
-  (`own_home_and_downloads`, `files.rs:5285`); FR-84's rule judges a
+  (`own_home_and_downloads`, `files.rs:5299`); FR-84's rule judges a
   configured or a chosen folder against that home too.
 - **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
   explicit modes whatever the umask, and is used, resumed or registered by the
@@ -779,11 +810,11 @@ folder on its way is one another account can write
   mounted with fixed modes) cannot hold staging of the writer's own: its upload
   stages in the writer's own private folder, `~/.local/state/roomler/staging` or
   root's `/var/lib/roomler/staging`, and is copied across at its end
-  (`stage_held`, `files.rs:5066`). There root still never places into a
+  (`stage_held`, `files.rs:5080`). There root still never places into a
   folder another account can write, and its private folder sits only in a
   `/var/lib/roomler` that is root's and no other account may write.
 - **A root writer's resume and end** place only in a folder the rule gives it
-  now (`root_may_place_in`, `files.rs:5186`): the one the partial sits beside,
+  now (`root_may_place_in`, `files.rs:5200`): the one the partial sits beside,
   or, for one staged in root's private folder, the one its notes record. Never
   where its notes alone say.
 - **A transfer holds** its folders from its begin, or its resume, to its end, and
@@ -1070,30 +1101,30 @@ the recording verbs require the console user (FR-85).
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
-through `localapi::connect()` ([`lib.rs:4998`](../crates/localapi/src/lib.rs#L4998)), and
+through `localapi::connect()` ([`lib.rs:5030`](../crates/localapi/src/lib.rs#L5030)), and
 each check runs on the connected endpoint, before the client sends anything:
 
 | OS | The endpoint is kept when | Otherwise |
 |---|---|---|
-| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4430`](../crates/localapi/src/lib.rs#L4430) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5024`](../crates/localapi/src/lib.rs#L5024) `connect_first_trusted`) |
-| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5273`](../crates/localapi/src/lib.rs#L5273) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5305`](../crates/localapi/src/lib.rs#L5305) `connect_windows_checked`) |
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4462`](../crates/localapi/src/lib.rs#L4462) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5056`](../crates/localapi/src/lib.rs#L5056) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5305`](../crates/localapi/src/lib.rs#L5305) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5337`](../crates/localapi/src/lib.rs#L5337) `connect_windows_checked`) |
 
 - **Where a per-user endpoint lives.** Only in a directory private to its account: a
   real directory, not a link, owned by that account and writable by neither its group nor
-  anyone else ([`lib.rs:4404`](../crates/localapi/src/lib.rs#L4404)
+  anyone else ([`lib.rs:4436`](../crates/localapi/src/lib.rs#L4436)
   `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
   macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
   with no such directory (root under `sudo`, a cron job, a system service) has no
   per-user candidate and goes straight to the system socket.
 - **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
   alone. A per-user daemon serves its own per-user socket, and with no private directory
-  it serves none and logs why ([`lib.rs:4444`](../crates/localapi/src/lib.rs#L4444)
+  it serves none and logs why ([`lib.rs:4476`](../crates/localapi/src/lib.rs#L4476)
   `unix_endpoints`); `roomler`'s "not running" line then says the same
   ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
 - **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
   (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
   right to create an instance of the pipe, and the server may learn who the client is but
-  never act as it ([`lib.rs:5285`](../crates/localapi/src/lib.rs#L5285)). It works
+  never act as it ([`lib.rs:5317`](../crates/localapi/src/lib.rs#L5317)). It works
   against every daemon version.
 - ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
   and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
@@ -1107,7 +1138,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:1569` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:2843` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;
@@ -1127,11 +1158,11 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   decision) `ConfigGet` — the listing, no secret being on that surface, with every key
   the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
   the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
-  `crates/localapi/src/lib.rs:3205`): the keys the daemon's own endpoint already
+  `crates/localapi/src/lib.rs:3206`): the keys the daemon's own endpoint already
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
-  administrator's command (`not_on_the_person_socket_for_key`, `:3536`).
+  administrator's command (`not_on_the_person_socket_for_key`, `:3537`).
 
 The recording verbs (P2e) are the second widening past the safety surface, and
 **Stop** is safety on its own: without `RecordStop` the host could not end a remote
@@ -1142,9 +1173,10 @@ and `ConfigSet` of `record_dir` stays refused, so where recordings go remains ro
 a root-mode install, pending a check of the folder each time a recording starts. Since
 #2871's design A the two remote switches (`record_remote_*`) are the person's there. The
 socket follows a user switch within 5 s, so a background user's client can act for that
-long, as the consent verbs can; it acts as the person now at the seat, whose folder it is.
-A `ConfigSet` does not wait for the switch: the daemon asks the seat again, fresh, before
-it writes (`LocalApiState::at_the_seat_now`).
+long, as Disconnect and keep busy can; it acts as the person now at the seat, whose folder
+it is. A `ConfigSet` does not wait for the switch, and since #3845 neither does a consent
+answer: the daemon asks the seat again, fresh, before it writes or takes the answer
+(`LocalApiState::at_the_seat_now`).
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -1190,26 +1222,31 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
   made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2521`, by
-  `person_peer_ok`, `:4654`). The listener makes that check before a byte is read, and a
+  `person_peer_ok`, `:4686`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
-  (`serve_person_listener`, `:4718`). The gate makes the check again where the decision
+  (`serve_person_listener`, `:4750`). The gate makes the check again where the decision
   is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
   daemon asks once more, fresh, whether that uid is at the seat
-  (`LocalApiState::at_the_seat_now`, `:2807`), so a person who switched away cannot change
-  the next person's settings over a connection still open. Root is not asked. On Linux
-  that is a logind lookup, which a stalled logind can hold, so it waits 1.5 s at most, one
-  lookup in flight whoever asks (#3796). With no answer in that time the change is refused
-  with "Could not tell who is signed in at this computer's screen. Try again."
-  (`AtTheSeat::NotKnownYet`, `:3560`), never applied and never "the seat changed"
-  (`desktop-companion.md` §9.4);
-- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3179`). The
+  (`LocalApiState::at_the_seat_now`, `:2808`), so a person who switched away cannot change
+  the next person's settings over a connection still open. #3845 — it asks the same before
+  it takes a consent answer, an approval or a denial (`:3808`): an approval lets someone
+  see and control the screen, so it must come from whoever is at the seat now. Root is not
+  asked. On Linux that is a logind lookup, which a stalled logind can hold, so it waits
+  1.5 s at most, one lookup in flight whoever asks (#3796). With no answer in that time,
+  or any look that cannot tell (#3845), the change or the answer is refused with "Could not
+  tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`,
+  `:3562`), never applied and never "the seat changed" (`desktop-companion.md` §9.4). A
+  look that cannot tell also never closes the socket as if nobody were there: not known is
+  not nobody, so the socket stays where it is while nothing changes through it
+  (`desktop-companion.md` §12.3);
+- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3180`). The
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 
-An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:3881`),
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:3913`),
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would

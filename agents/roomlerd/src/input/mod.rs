@@ -682,10 +682,11 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
                 no_display::forget();
                 return Box::new(e);
             }
-            // #3787 — no display to open: one line a session, at its kind's
-            // level, where enigo printed an ERROR pair on every try.
+            // #3787 — no display to open: one line a session, at the level of
+            // what is at the screen, where enigo printed an ERROR pair on every
+            // try. It never waits here: a look at the seat says it later.
             Err(e) => match no_display::kind_of(&e) {
-                Some(kind) => no_display::say(kind),
+                Some(missing) => no_display::say(missing),
                 None => tracing::warn!(%e, "enigo init failed — input injection disabled"),
             },
         }

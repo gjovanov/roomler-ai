@@ -102,7 +102,7 @@ roomler config set display_match auto     # auto (default) | always | never
 | `never` | never |
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
-  ([`lib.rs:3269`](../crates/localapi/src/lib.rs#L3269), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
+  ([`lib.rs:3270`](../crates/localapi/src/lib.rs#L3270), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
   push it ([`models.rs:9768`](../crates/remote_control/src/models.rs#L9768)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
@@ -214,10 +214,10 @@ sequenceDiagram
 
 | When | What happens | Code |
 |---|---|---|
-| a recorder is about to launch: the person's `RecordStart`, or a remote controller's start | the hold is taken after the one-at-a-time check and before the launch. A mode a session switched goes back first, logged `the screen is handed back … why="recording"`, and that session's request then waits for the recording's end | [`manager.rs:575`](../agents/roomlerd/src/recording/manager.rs#L575) (in `start_inner`), [`display_match.rs:1491`](../agents/roomlerd/src/display_match.rs#L1491) `hold_for_recording` |
+| a recorder is about to launch: the person's `RecordStart`, or a remote controller's start | the hold is taken after the one-at-a-time check and before the launch. A mode a session switched goes back first, logged `the screen is handed back … why="recording"`, and that session's request then waits for the recording's end | [`manager.rs:650`](../agents/roomlerd/src/recording/manager.rs#L650) (in `start_inner`), [`display_match.rs:1491`](../agents/roomlerd/src/display_match.rs#L1491) `hold_for_recording` |
 | a request while the recording runs: a viewer that connects, a second viewer, an unlock | `refused: recording`, and the request waits | [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch`, [`display_match.rs:1389`](../agents/roomlerd/src/display_match.rs#L1389) `waits_for` |
 | the session whose mode went back | its watcher tells its viewer once, within a quarter second | [`display_match.rs:1581`](../agents/roomlerd/src/display_match.rs#L1581) `recording_turn`, [`peer.rs:1538`](../agents/roomlerd/src/peer.rs#L1538) |
-| the recorder stopped: it reported `stopped`, `refused` or `error`, or its output closed | the hold is let go, and each waiting request is decided again within a quarter second through the whole guard, so an attended screen still refuses | [`manager.rs:687`](../agents/roomlerd/src/recording/manager.rs#L687), [`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651) `on_tick` |
+| the recorder stopped: it reported `stopped`, `refused` or `error`, or its output closed | the hold is let go, and each waiting request is decided again within a quarter second through the whole guard, so an attended screen still refuses | [`manager.rs:775`](../agents/roomlerd/src/recording/manager.rs#L775), [`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651) `on_tick` |
 | a session that ends during the recording | what it waited for is dropped, and its close restores nothing, since the mode went back already | [`display_match.rs:1677`](../agents/roomlerd/src/display_match.rs#L1677) `forget` |
 | the viewer turns display match off | what it waited for is dropped. Before this a `locked` wait survived it, and the unlock switched a screen whose viewer had turned the match off | [`display_match.rs:1685`](../agents/roomlerd/src/display_match.rs#L1685) `turn_off` |
 

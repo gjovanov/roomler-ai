@@ -247,7 +247,7 @@ fn process_home() -> Option<String> {
 /// the person owns, a link they planted would otherwise be followed with
 /// root's rights, and the staging folder's `meta.json`, which a resume reads,
 /// is theirs to edit. "The person" is the one at seat0
-/// (`companion::seat0_user`, FR-97 P5a's definition), never whoever asked.
+/// (`companion::seat0_account`, FR-97 P5a's definition), never whoever asked.
 /// `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the daemon's own identity.
 ///
 /// #3048 — the Windows twin. A machine-wide (SystemContext) worker is
@@ -825,10 +825,11 @@ fn person_downloads_windows(
     }
 }
 
-/// #3688 — who is at seat0, as a root daemon's file steps see it.
+/// #3688 — who is at seat0, as a root daemon's file steps see it. #3822 — and
+/// as exec's and SSH's `console_user` takes it (`exec::console_account`).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Seat {
+pub(crate) enum Seat {
     /// A person, as an account (uid 0 refused) and a home.
     Person {
         account: crate::fs_identity::Account,
@@ -1021,7 +1022,8 @@ async fn linux_fs_as_within(
 /// `files:resume` (which the viewer gives 10 s) and the startup sweep (which
 /// signalling waits for). #3796 — and so do the status refresh, the set-time
 /// check ([`FsAs::now`]) and the person socket's check that its caller is
-/// still at the seat (`person_socket::at_the_seat_now`).
+/// still at the seat (`person_socket::at_the_seat_now`). #3822 — and so does
+/// every exec and SSH session as `console_user` (`exec::console_account`).
 #[cfg(target_os = "linux")]
 pub(crate) const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -1029,9 +1031,21 @@ pub(crate) const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::fr
 /// database), on a thread named `seat0-lookup`: every read, received file,
 /// files folder's set and status refresh that asks while it runs waits on it,
 /// within its own wait, and none starts another
-/// ([`crate::one_in_flight`]'s rules).
+/// ([`crate::one_in_flight`]'s rules). #3822 — and so does every exec and SSH
+/// session as `console_user` ([`ask_seat0`]).
 #[cfg(target_os = "linux")]
 static SEAT0: OneInFlight<Seat> = OneInFlight::new("seat0-lookup");
+
+/// #3822 — who is at seat0, for exec's and SSH's `console_user`
+/// (`exec::console_account`): asked from an async task through the one lookup
+/// in flight ([`SEAT0`]) that every file step asks, `wait` at most, so a hung
+/// logind holds one thread for both. The answer is #3688's rule
+/// ([`seat_now`]), so a session and a received file take one person. What no
+/// answer means is the caller's to say.
+#[cfg(target_os = "linux")]
+pub(crate) async fn ask_seat0(wait: std::time::Duration) -> Asked<Seat> {
+    SEAT0.ask(wait, seat_now).await
+}
 
 /// #3688 — `lookup` off the async worker, given `wait` at most: a wedged
 /// logind or account lookup never stalls an async worker. One that fails
@@ -9477,7 +9491,7 @@ mod seat_user_tests {
                 let (held, at_the_seat) = (held.clone(), at_the_seat.clone());
                 move || {
                     held.here();
-                    Some(at_the_seat.load(Ordering::SeqCst))
+                    crate::person_socket::Look::Person(at_the_seat.load(Ordering::SeqCst))
                 }
             })
             .await;
