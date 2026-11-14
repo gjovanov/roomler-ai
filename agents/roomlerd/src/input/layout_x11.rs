@@ -829,16 +829,20 @@ mod tests {
     /// `xvfb-run`; `ROOMLERD_TEST_X11=1` makes its absence a failure): two
     /// layouts configured as `setxkbmap` does it, read back as the snapshot
     /// the viewer gets, and a switch to the second and back.
+    ///
+    /// #3813 — it replaces the display's layouts and leaves `us` behind, so it
+    /// runs only under `ROOMLERD_TEST_X11=1`, a server nobody sits at. Before,
+    /// it ran on whatever display it reached, and a person's own lost its
+    /// layouts.
     #[test]
     fn x11_real_switch_round_trip() {
-        let Some(x) = Xkb::open() else {
-            assert!(
-                !required(),
-                "ROOMLERD_TEST_X11=1 but there is no X server with XKB"
+        if !required() {
+            eprintln!(
+                "ROOMLERD_TEST_X11 unset — skipping: this test replaces the display's keyboard layouts"
             );
-            eprintln!("no X server — skipping (ROOMLERD_TEST_X11=1 makes this a failure)");
             return;
-        };
+        }
+        let x = Xkb::open().expect("ROOMLERD_TEST_X11=1 but there is no X server with XKB");
         // xvfb depends on x11-xkb-utils, the server's own keymap compiler.
         assert!(
             setxkbmap("us,de"),
