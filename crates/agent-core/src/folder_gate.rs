@@ -1335,6 +1335,12 @@ fn the_gate_sees_what_it_is_for() {
         (r#"fn f() { std::env::var_os("tmp"); }"#, "f"),
         (r#"fn f() { std::env::var_os("HOMEDRIVE"); }"#, "f"),
         (r#"fn f() { std::env::var_os("HomePath"); }"#, "f"),
+        // OneDrive's roots.
+        (r#"fn f() { std::env::var_os("OneDrive"); }"#, "f"),
+        (
+            r#"fn f() { ["OneDriveCommercial", "OneDriveConsumer"].iter().filter_map(std::env::var_os); }"#,
+            "f",
+        ),
         // macOS and Linux: a `directories` lookup takes the folders from the
         // environment there ($HOME, $XDG_*).
         (r#"fn f() { directories::BaseDirs::new(); }"#, "f"),
@@ -1376,6 +1382,96 @@ fn the_gate_sees_what_it_is_for() {
     ] {
         if !named(source).is_empty() {
             missed.push(format!("seen as a read: {source}"));
+        }
+    }
+    // One source on one build, as `unmatched` takes its reads.
+    let on = |build: Build, source: &str| -> Vec<(Build, String, Read)> {
+        let parsed = syn::parse_file(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+        flagged(&[("t.rs".to_owned(), &parsed)], build)
+            .into_iter()
+            .map(|(file, read)| (build, file, read))
+            .collect()
+    };
+    // macOS and Linux: `HOME`, any `XDG_` variable and `std::env::home_dir`,
+    // in every shape a Windows name is read in.
+    for (source, function) in [
+        (r#"fn f() { std::env::var_os("HOME"); }"#, "f"),
+        (r#"fn f() { env::var("XDG_CONFIG_HOME").ok(); }"#, "f"),
+        (
+            r#"const NAME: &str = "XDG_STATE_HOME"; fn f() { std::env::var_os(NAME); }"#,
+            "f",
+        ),
+        (
+            r#"static NAMES: [&str; 2] = ["XDG_DATA_HOME", "HOME"]; fn f() { NAMES.iter().filter_map(std::env::var_os); }"#,
+            "f",
+        ),
+        (
+            r#"fn user_env(name: &str) -> Option<OsString> { std::env::var_os(name) } fn f() { user_env("HOME"); }"#,
+            "f",
+        ),
+        (
+            r#"fn f() { std::env::vars_os().find(|(k, _)| k == "XDG_RUNTIME_DIR"); }"#,
+            "f",
+        ),
+        (
+            r#"fn f() { std::env::vars().filter(|(k, _)| k.starts_with("XDG_")).count(); }"#,
+            "f",
+        ),
+        (
+            r#"fn f() { std::env::var_os("X"); let _ = "$HOME/.config"; }"#,
+            "f",
+        ),
+        (
+            r#"fn f() { tracing::info!(dir = ?std::env::var_os("XDG_CONFIG_HOME")); }"#,
+            "f",
+        ),
+        (
+            r#"unsafe fn f() { libc::getenv(b"HOME\0".as_ptr().cast()); }"#,
+            "f",
+        ),
+        (r#"fn f() { std::env::home_dir(); }"#, "f"),
+        (r#"use std::env::home_dir; fn f() { home_dir(); }"#, "f"),
+        (r#"use std::env::home_dir as home; fn f() { home(); }"#, "f"),
+    ] {
+        let missing: Vec<Build> = [Build::Linux, Build::Macos]
+            .into_iter()
+            .filter(|build| {
+                on(*build, source)
+                    .iter()
+                    .map(|(_, _, read)| read.function.as_str())
+                    .ne([function])
+            })
+            .collect();
+        if !missing.is_empty() {
+            missed.push(format!("not seen as a read on {missing:?}: {source}"));
+        }
+    }
+    // A row covers the reads it counts: a second folder variable read in its
+    // function is a new read.
+    const ONE: &[KnownRow] = &[("t.rs", "f", Build::Windows, Row::Right("Windows: why"))];
+    let one = r#"fn f() { std::env::var_os("APPDATA"); }"#;
+    let two = r#"fn f() { std::env::var_os("APPDATA"); std::env::var_os("LOCALAPPDATA"); }"#;
+    if !unmatched(&on(Build::Windows, one), ONE).is_empty() {
+        missed.push(format!("its row does not hold: {one}"));
+    }
+    if unmatched(&on(Build::Windows, two), ONE).is_empty() {
+        missed.push(format!("a second read is not seen: {two}"));
+    }
+    // The review's input: a tracked function whose `directories` lookup is
+    // rewritten as a read of `HOME` still reads, and its row still holds.
+    const LOCK: &[KnownRow] = &[(
+        "t.rs",
+        "unix_lock_path",
+        Build::Macos,
+        Row::Tracked(3834, "macOS: where"),
+    )];
+    for source in [
+        r#"fn unix_lock_path() -> Option<PathBuf> { Some(directories::BaseDirs::new()?.cache_dir().join("roomler")) }"#,
+        r#"fn unix_lock_path() -> Option<PathBuf> { Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches")) }"#,
+    ] {
+        let lines = unmatched(&on(Build::Macos, source), LOCK);
+        if !lines.is_empty() {
+            missed.push(format!("{lines:?}: {source}"));
         }
     }
     assert!(missed.is_empty(), "{}", missed.join("\n"));
