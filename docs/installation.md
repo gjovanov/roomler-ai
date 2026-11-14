@@ -2391,37 +2391,110 @@ console user are skipped and every root row runs as on any install
   (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
   is made by the person's own processes. On a Mac where an earlier root step made
   it, the screen worker's config write fails with an error that names the folder,
-  its owner and its mode (`agents/roomlerd/src/app.rs:3856`, `:3958`). That error
-  ends the worker's `main`, which prints it on stderr, and the worker's stderr is
-  the root daemon's, `/var/log/roomler/daemon.log`: the supervisor sets only the
-  worker's stdin (`agents/roomlerd/src/macos_supervisor.rs:938`) and closes no
-  descriptor up to stderr (`:921`), and the daemon's plist names that file
-  (`agents/roomlerd/packaging/macos/com.roomler.daemon.plist:74-75`). The worker's
-  tracing lines go to its stdout, which that plist sends to `/dev/null` (`:72-73`).
-  The supervisor's give-up line names the same folder, owner and mode, plus one
-  line of shell, which the person runs with no `sudo`
-  (`agents/roomlerd/src/macos_supervisor.rs:531`, `:587`, `:850`, read by
-  `:750`). It starts with `id -u | grep -qx <uid> &&`, so a run as root, which
-  is what a fleet exec is, changes nothing: as root the new folder would be
-  root's again. Every path in it is quoted for a POSIX shell. `<stamp>` is the
-  UTC second of the give-up, so no name it makes is a leftover of an earlier
-  round:
+  its owner and its mode (`agents/roomlerd/src/app.rs:3856`, `:3958`). No log
+  keeps that error. The macOS release build (`viewer-indicator-macos`,
+  `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
+  (`agents/roomlerd/src/app.rs:1283`), which logs the error through tracing
+  and exits 1 (`:1311-1313`). Nothing of it reaches the worker's stderr (the
+  supervisor sets only the worker's stdin,
+  `agents/roomlerd/src/macos_supervisor.rs:1376`), which is the root daemon's
+  `/var/log/roomler/daemon.log`
+  (`agents/roomlerd/packaging/macos/com.roomler.daemon.plist:74-75`). Tracing's
+  own file is in the folder the worker cannot write, and its console copy goes
+  to stdout, which that plist sends to `/dev/null` (`:72-73`). So the only
+  record of the cause is the supervisor's give-up line in the root daemon's own
+  log, in root's tree: `/var/root/Library/Application Support/live.roomler.roomler/logs`
+  (the table above).
+  The give-up line names the same folder, owner and mode
+  (`agents/roomlerd/src/macos_supervisor.rs:531`, read by `:1067` and `:1174`),
+  and says in words that only an administrator of the Mac can move it aside:
+  macOS renames a folder only for an account that may write in it, so the
+  person's own `mv` answers `Permission denied` and moves nothing, in any
+  parent folder. The line prints a command (`:616`) only under the package's
+  rule (see "A command is printed only for an administrator's own home"
+  below), read once per give-up, off the supervisor's thread and within 5 s
+  (`:1234`, `:751`): the person at the console is a member of `admin`
+  (`dseditgroup -o checkmember`, `:1280`); their home is an absolute path to a
+  folder, not a link; its `Library` and `Library/Application Support` are
+  folders of the person's own, not links, and the folder is one name inside
+  the last (`:927`); the folder is a real folder of root's that holds no
+  entry named `config.toml`, and its path holds no `"`, `$`, backtick, `\`,
+  `!`, control character, nor a Unicode format character that changes how a
+  line displays (U+200B to U+200F, U+202A to U+202E, U+2060 to U+2069, U+FEFF)
+  (`:842`); and the account name is plain, `[A-Za-z0-9._-]`
+  (`:910`). The command then follows `<name> is an administrator of this Mac
+  and can run this:`. Every path in it is quoted for a POSIX shell (`:955`),
+  with those characters left out it survives `sh -c "…"` too (`:886`), and it
+  reads as it runs (`:872`).
+  `<aside>` is `<folder>.made-by-root-<stamp>`, where `<stamp>` is the UTC
+  second of the give-up, so no name it makes is a leftover of an earlier
+  round. Each command starts with one test, before anything runs
+  (`:708-711`): `sudo test ! -h '<folder>' -a -d '<folder>' -a -O '<folder>'
+  -a ! -e '<aside>' &&`, written `<test> &&` below. Under `sudo`, `-O` means
+  owned by root. The log holds one line per give-up, each with its own
+  stamp, and the person is told to log out and back in, so an older line can
+  be run after a later one, or a hand, gave the folder back: run once the
+  folder is no longer a real folder of root's (the person's again, a link,
+  gone), a line changes nothing, where it would otherwise move the person's
+  live folder aside. The line says so in words. A second run of the same line
+  does nothing either: its `<aside>` is there by then (BSD `mv` would move the
+  live folder into it):
   - When the folder holds neither copy that `sudo roomlerd one-row --revert`
-    reads back from it: `mv '<folder>' '<folder>.made-by-root-<stamp>'`.
+    reads back from it: `<test> && sudo mv '<folder>' '<aside>'`
+    (`macos_supervisor.rs:716-721`). If the move fails, nothing moved. The
+    worker makes the folder again, as the person, at its next start.
   - When it holds `com.roomler.agent.plist.pre-one-row` or
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
-    (`agents/roomlerd/src/one_row.rs:913-921`), the new folder is built first and
-    the two are swapped last: `mkdir '<folder>.new-<stamp>' && cp
-    '<folder>/<copy>' '<folder>.new-<stamp>/' && mv '<folder>'
-    '<folder>.made-by-root-<stamp>' && { mv '<folder>.new-<stamp>' '<folder>' ||
-    mv '<folder>.made-by-root-<stamp>' '<folder>'; }`. The `cp` reads each copy
-    as the person before anything moves, so a step that fails leaves the folder
-    where it is with everything in it.
+    (`agents/roomlerd/src/one_row.rs:913-921`), the command stages first and
+    moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&
+    sudo -u '#<uid>' cp '<folder>/<copy>' … '<folder>.new-<stamp>/' && sudo mv
+    '<folder>' '<aside>' && { sudo mv '<folder>.new-<stamp>' '<folder>' || {
+    sudo mv '<aside>' '<folder>'; false; }; }`
+    (`macos_supervisor.rs:722-740`). The new folder and the copies in it are
+    made as the person, never by root, so the line does the same in the
+    administrator's own shell and as root. Nothing moves until the copies are
+    made: a `cp` that fails (a folder the person cannot enter, say) stops the
+    command with every file where the revert reads it. If the last move fails,
+    the one before it is undone, the folder is back in its place, and the
+    command still ends non-zero, so a script or `roomler exec` reads no
+    success.
+  - What stays behind when that command stops. A `cp` or a move that fails
+    leaves `<folder>.new-<stamp>`, the person's, beside the folder (the
+    undo, too, puts back only the folder), and the same printed line can never
+    finish after that: its
+    `mkdir` stops at `File exists`, with nothing moved. Once the cause is
+    fixed, remove that folder as the person
+    (`sudo -u '#<uid>' rm -r '<folder>.new-<stamp>'`) before running the line
+    again, or use the next give-up line, whose names carry a new stamp. If the
+    last move and its undo both fail, `<folder>` is missing, the old folder is
+    at `<aside>` and the copies are in `<folder>.new-<stamp>`, where the revert
+    does not read them, and the command ends non-zero: an administrator finds
+    why the moves failed before moving anything again.
+  - Both end with the restart, an administrator's command too:
+    `sudo launchctl kickstart -k system/com.roomler.daemon`, or the person
+    logs out and back in.
+  - When the account reads say no, or do not answer within 5 s, or the path
+    holds one of those characters, the line gives no command: it says that an
+    administrator of this Mac has to move the folder aside (and copy the files
+    it names back into a new folder that the person's account makes) and names
+    this section (`macos_supervisor.rs:746`).
+  - When the folder holds an entry named `config.toml` (a file, a link, a
+    folder), or a read of that name fails for any reason but "not there"
+    (`macos_supervisor.rs:1092-1095`), the line says the folder holds an entry
+    of that name, still names the copies the revert reads there, and gives no
+    command: a move would set that entry aside with the folder, and with
+    `macos_one_row` off a file of that name is this person's enrollment. The
+    product's own states never put one in a folder of root's.
   - When `lstat` says the person cannot read a copy (the conversion keeps a
     config's copy mode 600 and owned as the original, `one_row.rs:1347-1357`, so
     the copy of a file of root's), the line names it and says that a later
     revert would not restore it if the folder were moved, and gives no command.
-    Nor does it give one for a folder that is not a directory.
+    Nor does it give one for a folder that is not a directory, or for a folder
+    of another account than root: the line says it is that account's folder.
+  - Whenever the line gives no command, the supervisor logs one line after it
+    that says why, the read that refused it or the 5 s that ran out:
+    `macOS supervisor: the give-up line gives no administrator's command:
+    <why>` (`agents/roomlerd/src/macos_supervisor.rs:1832`, its words `:794`).
 - **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
   groups; `launchctl asuser` changes only the bootstrap context. `-n` because
   root needs no password and a run by the update helper has no terminal.
@@ -2458,6 +2531,43 @@ console user are skipped and every root row runs as on any install
   not links, and that `Library` is the person's own; only then makes the folder
   the person's (`sudo chown`, after `sudo mkdir` where it is missing), and the
   package is installed again.
+- **When the give-up line gives no command (#3802)** (on a Mac whose person
+  is not one of its administrators, say), an administrator of the Mac runs
+  `ls -ld '<home>' '<home>/Library' '<home>/Library/Application Support'
+  '<folder>'`, each path quoted: `Application Support` holds a space, and
+  unquoted it splits in two. Go on only when
+  each of the first three shows a real folder of the person's own (the mode
+  starts with `d`, not `l`, and the owner is the person) and the last a real
+  folder of `root`; otherwise stop, with nothing moved. A folder that holds an
+  entry named `config.toml`, or a copy the line says the person cannot read,
+  stops it too: a move would set it aside where nothing reads it. The person's
+  uid is
+  what `id -u <name>` prints. Each new name beside the folder has to be one
+  that does not exist yet, so that `ls -ld` of it answers
+  `No such file or directory` (a date and time in it, as the line's `<stamp>`,
+  does that). Then, in the line's own order, staged first and moved last:
+  1. Only where the line names copies that the revert reads, the person's
+     account makes a new folder and copies them into it:
+     `sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' && sudo -u '#<uid>' cp
+     '<folder>/<copy>' … '<folder>.new-<stamp>/'`. The `cp` reads the folder
+     as the person, so the person has to be able to enter it (root's folder at
+     mode 755 lets them). If a step fails, nothing has moved yet: stop there.
+     A `<folder>.new-<stamp>` it made stays; remove it as the person
+     (`sudo -u '#<uid>' rm -r '<folder>.new-<stamp>'`) before trying again.
+  2. `sudo test ! -h '<folder>' -a -d '<folder>' -a -O '<folder>' -a ! -e
+     '<folder>.made-by-root-<stamp>' && sudo mv '<folder>'
+     '<folder>.made-by-root-<stamp>'`, the same test the line starts with, so
+     the move happens only while the folder is still a real folder of root's;
+     then, where step 1 made a new folder,
+     `sudo mv '<folder>.new-<stamp>' '<folder>'`. If that last move fails,
+     `sudo mv '<folder>.made-by-root-<stamp>' '<folder>'` puts the folder back.
+     If both fail, `<folder>` is missing, the old folder is at
+     `<folder>.made-by-root-<stamp>` and the copies are in
+     `<folder>.new-<stamp>`: find why the moves failed before moving anything
+     again.
+  3. The daemon is restarted with
+     `sudo launchctl kickstart -k system/com.roomler.daemon`, or the person
+     logs out and back in.
 - **A rewrite that fails over the person's own item keeps it.** The item already
   there stays placed and is loaded, a `WARNING` carries the copy's error, and
   the last line does not say "installed and started". The person's account
@@ -2530,7 +2640,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:886`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:1324`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -2557,9 +2667,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:954`, `:814`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:665`, `:713`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1123`, `:503`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:531`). A person's folder that another account owns comes first, whatever the end, with the line of shell that gives it back, or the reason it gives none (#3802, `:587`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:1392`, `:1138`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:665`, `:713`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:1561`, `:503`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock (found with `pgrep -lU <uid> roomlerd`, then `sudo launchctl kickstart -k system/com.roomler.daemon`), anything else means no per-user enrollment (checked with `sudo launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps`; `macos_supervisor.rs:531`). A person's folder that another account owns comes first, whatever the end, with the administrator's command that gives it back, or the reason it gives none (#3802, `:616`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -2638,8 +2748,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1181`, `:1130`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:921` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1619`, `:1568`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:1359` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
