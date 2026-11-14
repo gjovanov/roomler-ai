@@ -340,6 +340,38 @@ pub(crate) async fn close_within_budget(
 /// experiences.
 pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
+/// #3857 — FR-93 P6f's notification for an RC prompt, as the WS loop asks for
+/// it: only where the companion cannot show the question (none up, or no
+/// marker for it to read), in FR-27's order.
+pub(crate) async fn notification_for_rc(
+    indicator: &ViewerIndicator,
+    companion_up: bool,
+    marker: bool,
+    view: crate::indicator::PromptView,
+) -> Option<crate::indicator::NotificationPrompt> {
+    if companion_up && marker {
+        return None;
+    }
+    let showing = indicator.start_notification_prompt(view);
+    Some(crate::indicator::NotificationPrompt::settled(
+        showing.outcome().await,
+    ))
+}
+
+/// #3857 — whether the notification [`notification_for_rc`] gave came up.
+pub(crate) async fn notification_shown(
+    notifying: Option<crate::indicator::NotificationPrompt>,
+    indicator: &ViewerIndicator,
+    session_hex: &str,
+    outbound: &mpsc::Sender<ClientMsg>,
+) -> bool {
+    let _ = (indicator, session_hex, outbound);
+    match notifying {
+        Some(notifying) => notifying.shown().await,
+        None => false,
+    }
+}
+
 /// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
 /// P6's controller display name and the device policy's input mode, FR-27's
 /// asking org (the "Being viewed by" banner is raised at peer-build time, not
@@ -4551,9 +4583,13 @@ async fn handle_server_msg(
                     // cannot show the question (none installed: a system
                     // daemon on Fedora, openSUSE, Arch, aarch64; or no marker
                     // for it to read).
-                    if !(companion_up && marker) {
-                        notified = indicator.show_notification_prompt(view).await;
-                    }
+                    notified = notification_shown(
+                        notification_for_rc(indicator, companion_up, marker, view).await,
+                        indicator,
+                        &session_hex,
+                        outbound_tx,
+                    )
+                    .await;
                     if notified {
                         have_surface = true;
                         if marker {
@@ -8711,5 +8747,325 @@ mod tests {
         // Nothing to tell apart: one org asks every question.
         assert_eq!(prompt_org(false, Some("Grox"), true, "primary"), None);
         assert_eq!(prompt_org(false, None, true, "primary"), None);
+    }
+}
+
+/// #3857 — FR-93 P6f's notification for an RC prompt, off the WS loop, with
+/// logind stood in for the session walk
+/// (`crate::companion::session_walk_stand_in`). The loop and the consent task
+/// are modelled as they run: the loop handles one frame before it reads the
+/// next, and for an RC prompt the companion cannot show it calls
+/// [`notification_for_rc`] as the RC path does; the consent task waits on
+/// [`notification_shown`]. Everything below them is the daemon's own. Each
+/// test runs on a two-worker runtime, the daemon's shape, and is read from
+/// the test's own thread (#3836's shape).
+#[cfg(all(test, target_os = "linux", feature = "portal-capture"))]
+mod notification_off_the_loop_tests {
+    use super::{ClientMsg, notification_for_rc, notification_shown};
+    use crate::companion::SESSION_WALK_WAIT;
+    use crate::companion::session_walk_stand_in::{Held, OpenedAtTheEnd, StandIn, ana, asking};
+    use crate::indicator::{PromptView, ViewerIndicator};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    /// What an answer may take past the walk's wait on a busy runner.
+    const SLACK: Duration = Duration::from_secs(1);
+    /// What anything that answers may take on a busy runner.
+    const RUNS_WITHIN: Duration = Duration::from_secs(10);
+    /// How late "at once" may be on a busy runner: #3836's bar.
+    const AT_ONCE: Duration = Duration::from_millis(500);
+
+    /// A runtime like the daemon's: more than one worker, timers and I/O.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// An indicator with notification prompts. The channels it answers on
+    /// stay open with it.
+    struct Indicator {
+        ind: ViewerIndicator,
+        _answers: mpsc::Receiver<(String, bool)>,
+        _disconnects: mpsc::Receiver<bson::oid::ObjectId>,
+    }
+
+    fn indicator() -> Indicator {
+        let (kill_tx, disconnects) = mpsc::channel(1);
+        let (consent_tx, answers) = mpsc::channel(4);
+        Indicator {
+            ind: ViewerIndicator::new(
+                kill_tx,
+                crate::rc_sessions::RcSessionRegistry::new(),
+                consent_tx,
+            )
+            .expect("an indicator"),
+            _answers: answers,
+            _disconnects: disconnects,
+        }
+    }
+
+    /// An RC prompt's question, open for 30 s.
+    fn view(session_hex: &str) -> PromptView {
+        PromptView {
+            session_hex: session_hex.into(),
+            title: "Remote control request".into(),
+            lead: "Alice is requesting to control this device.".into(),
+            detail: String::new(),
+            permissions: "VIEW|INPUT".into(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    /// Waits until a show has reached logind.
+    fn walk_began(held: &Held) {
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(asked.elapsed() < RUNS_WITHIN, "no show reached logind");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// #3857 — while logind holds the notification's session walk, the WS
+    /// loop handles its next frame at once: it starts the notification and
+    /// does not wait for it. The consent task hears within the walk's wait
+    /// that it did not come up.
+    ///
+    /// Red before #3857: the loop waited for the show, and the show for
+    /// logind, so no frame was read while logind held the walk.
+    #[test]
+    fn the_loop_handles_its_next_frame_while_logind_holds_the_notification() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = StandIn::held(&held, ana());
+        let at_screen = indicator();
+        let ind = at_screen.ind.clone();
+        let (frames, mut frames_rx) = mpsc::channel::<Option<u32>>(4);
+        let (handled_tx, handled) = std::sync::mpsc::channel::<(u32, Instant)>();
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<(bool, Duration)>();
+        rt.spawn(asking(stood, async move {
+            // The WS loop, as far as it goes here: a frame is handled before
+            // the next one is read. `None` is an RC request whose prompt the
+            // companion cannot show.
+            while let Some(frame) = frames_rx.recv().await {
+                let Some(n) = frame else {
+                    let asked = Instant::now();
+                    let notifying = notification_for_rc(&ind, false, true, view("a1")).await;
+                    // The consent task.
+                    let (ind, verdict_tx) = (ind.clone(), verdict_tx.clone());
+                    tokio::spawn(async move {
+                        let (outbound, inbox) = mpsc::channel::<ClientMsg>(1);
+                        let shown = notification_shown(notifying, &ind, "a1", &outbound).await;
+                        drop(inbox);
+                        let _ = verdict_tx.send((shown, asked.elapsed()));
+                    });
+                    continue;
+                };
+                let _ = handled_tx.send((n, Instant::now()));
+            }
+        }));
+        frames.blocking_send(None).expect("the loop reads frames");
+        walk_began(&held);
+        let sent = Instant::now();
+        frames
+            .blocking_send(Some(7))
+            .expect("the loop reads frames");
+        let (n, at) = handled
+            .recv_timeout(SESSION_WALK_WAIT + SLACK)
+            .expect("a frame sent while logind holds the notification is handled");
+        assert_eq!(n, 7);
+        assert!(
+            at.duration_since(sent) < AT_ONCE,
+            "the frame waited {:?} behind the notification",
+            at.duration_since(sent)
+        );
+        let (shown, waited) = verdict
+            .recv_timeout(SESSION_WALK_WAIT + SLACK)
+            .expect("the consent task hears within the walk's wait");
+        assert!(
+            !shown,
+            "a notification that did not come up is never reported up"
+        );
+        assert!(
+            waited >= SESSION_WALK_WAIT,
+            "the verdict came in {waited:?}, before the walk's wait"
+        );
+    }
+
+    /// #3857 — a request that ends while its notification is on its way up
+    /// (a `Terminate`, which takes the session's prompts down from the loop:
+    /// `hide_prompt`) drops the show. Once logind answers, no session helper
+    /// is started for it and nothing is put on the screen, and the consent
+    /// task hears once that it did not come up, and why.
+    ///
+    /// Red before #3857: the show went on to start the session helper for a
+    /// question that was over.
+    #[test]
+    fn a_request_that_ends_while_its_notification_comes_up_drops_it() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = StandIn::held(&held, ana());
+        let at_screen = indicator();
+        let ind = at_screen.ind.clone();
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<Result<(), String>>();
+        rt.spawn(asking(stood, async move {
+            let Some(notifying) = notification_for_rc(&ind, false, true, view("b2")).await else {
+                return;
+            };
+            let _ = verdict_tx.send(notifying.outcome().await);
+        }));
+        walk_began(&held);
+        // The `Terminate`: the loop takes the session's prompts down.
+        at_screen.ind.hide_prompt("b2");
+        held.open();
+        let outcome = verdict
+            .recv_timeout(SESSION_WALK_WAIT + SLACK)
+            .expect("the show answers once its walk does");
+        let why = outcome.expect_err("a question that ended is never reported up");
+        assert!(
+            why.contains("ended"),
+            "the reason says its question ended: {why}"
+        );
+        assert!(
+            !at_screen.ind.notification_is_up("b2"),
+            "nothing is left on the screen"
+        );
+        assert!(
+            verdict.recv_timeout(Duration::from_millis(200)).is_err(),
+            "one verdict, delivered once"
+        );
+    }
+
+    /// #3857 — when the prompt's control socket closes while its notification
+    /// is on its way up (the viewer gone, #2416), the consent task stops
+    /// waiting at once and takes the show down, and its late verdict reaches
+    /// no one: nothing is put up once logind answers.
+    ///
+    /// Red before #3857: the consent task waited out the show, for as long
+    /// as logind held it.
+    #[test]
+    fn a_socket_that_closes_while_the_notification_comes_up_drops_it() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = StandIn::held(&held, ana());
+        let at_screen = indicator();
+        let ind = at_screen.ind.clone();
+        let (outbound, inbox) = mpsc::channel::<ClientMsg>(1);
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<(bool, Instant)>();
+        rt.spawn(asking(stood, async move {
+            let notifying = notification_for_rc(&ind, false, true, view("c3")).await;
+            let shown = notification_shown(notifying, &ind, "c3", &outbound).await;
+            let _ = verdict_tx.send((shown, Instant::now()));
+        }));
+        walk_began(&held);
+        let closed = Instant::now();
+        // The connection's loop is gone, and its receiver with it.
+        drop(inbox);
+        let (shown, at) = verdict
+            .recv_timeout(SESSION_WALK_WAIT + SLACK)
+            .expect("the consent task hears that its socket closed");
+        assert!(!shown, "a question nobody can answer is never reported up");
+        assert!(
+            at.duration_since(closed) < AT_ONCE,
+            "the consent task waited {:?} after its socket closed",
+            at.duration_since(closed)
+        );
+        held.open();
+        // The show's own end, once logind answers.
+        std::thread::sleep(AT_ONCE);
+        assert!(
+            !at_screen.ind.notification_is_up("c3"),
+            "nothing comes up for it"
+        );
+    }
+
+    /// #3857 — prompts asking again and again while logind holds the walk
+    /// hold no async worker, and one walk between them: on a two-worker
+    /// runtime a 10 ms timer wakes on time (#3836's measure).
+    ///
+    /// Red before #3857: every show walked on a blocking thread of its own,
+    /// for as long as logind held it.
+    #[test]
+    fn prompts_while_logind_holds_the_walk_delay_no_timer_and_share_one_walk() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = StandIn::held(&held, ana());
+        let at_screen = indicator();
+        // More prompts than the runtime has workers.
+        for i in 0..4u32 {
+            let ind = at_screen.ind.clone();
+            rt.spawn(asking(stood.clone(), async move {
+                for k in 0..1_000u32 {
+                    let hex = format!("d{i}{k:04}");
+                    let notifying = notification_for_rc(&ind, false, true, view(&hex)).await;
+                    let (outbound, _inbox) = mpsc::channel::<ClientMsg>(1);
+                    let _ = notification_shown(notifying, &ind, &hex, &outbound).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }));
+        }
+        walk_began(&held);
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let tick = Duration::from_millis(10);
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            let _ = tx.send(worst);
+        });
+        let worst = rx
+            .recv_timeout(RUNS_WITHIN)
+            .expect("a 10 ms timer kept waking while logind held the walk");
+        assert!(
+            worst < AT_ONCE,
+            "a 10 ms timer woke {worst:?} late while logind held the walk"
+        );
+        assert_eq!(
+            held.began(),
+            1,
+            "one walk in flight, however many prompts asked"
+        );
+    }
+
+    /// The control: FR-93 P6f's place in FR-27's order stays. A companion
+    /// that is up with its marker to read asks for no notification; without
+    /// either, one is started, and it finds what logind says, as before.
+    #[test]
+    fn a_notification_is_asked_for_only_where_the_companion_cannot_show_the_question() {
+        let rt = runtime();
+        let stood = StandIn::new(|_, _| {
+            Err("no active graphical session — nobody is at this machine's screen".into())
+        });
+        let at_screen = indicator();
+        let outcome = |companion_up: bool, marker: bool| {
+            let ind = at_screen.ind.clone();
+            rt.block_on(asking(stood.clone(), async move {
+                match notification_for_rc(&ind, companion_up, marker, view("e5")).await {
+                    None => None,
+                    Some(notifying) => Some(notifying.outcome().await),
+                }
+            }))
+        };
+        assert_eq!(outcome(true, true), None, "the companion shows it");
+        assert_eq!(
+            outcome(false, true),
+            Some(Err("no graphical session".to_string())),
+            "no companion up: a notification, and nobody is at the screen"
+        );
+        assert_eq!(
+            outcome(true, false),
+            Some(Err("no graphical session".to_string())),
+            "no marker for the companion to read: a notification"
+        );
     }
 }

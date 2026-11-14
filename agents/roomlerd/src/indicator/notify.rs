@@ -317,18 +317,18 @@ mod parent {
         }
 
         /// Put `view` on the person's screen as a notification with Approve
-        /// and Deny. Whether it is up. Blocks for the helper's first line, so
-        /// callers run it off the runtime.
-        pub(crate) fn show(&self, view: &PromptView) -> bool {
+        /// and Deny: `Ok` once it is up, or why it is not. Blocks for the
+        /// helper's first line, so callers run it off the runtime.
+        pub(crate) fn show(&self, view: &PromptView) -> Result<(), String> {
             if !enabled() {
                 tracing::info!("no notification prompt (ROOMLERD_NOTIFY_CONSENT=0, FR-93 P6f)");
-                return false;
+                return Err("notification prompts are off (ROOMLERD_NOTIFY_CONSENT=0)".into());
             }
             let now = std::time::Instant::now();
             // A question already over is not posted: nothing would take it
             // down but its own lifetime.
             if view.expires_at <= now {
-                return false;
+                return Err("its question is already over".into());
             }
             static NEXT: AtomicU64 = AtomicU64::new(1);
             let generation = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -367,13 +367,20 @@ mod parent {
                     if let Ok(mut l) = self.live.lock() {
                         l.insert(session, (generation, stdin));
                     }
-                    true
+                    Ok(())
                 }
                 Err(why) => {
-                    tracing::info!(%why, "no notification prompt (FR-93 P6f)");
-                    false
+                    tracing::info!(%session, %why, "no notification prompt (FR-93 P6f)");
+                    Err(why)
                 }
             }
+        }
+
+        /// #3857 — whether the notification for `session_hex` is up: what a
+        /// test reads to know nothing is left on the screen.
+        #[cfg(test)]
+        pub(crate) fn is_up(&self, session_hex: &str) -> bool {
+            self.live.lock().is_ok_and(|l| l.contains_key(session_hex))
         }
 
         /// Take the notification for `session_hex` down, if one is up: its
