@@ -9491,7 +9491,7 @@ mod seat_user_tests {
                 let (held, at_the_seat) = (held.clone(), at_the_seat.clone());
                 move || {
                     held.here();
-                    Some(at_the_seat.load(Ordering::SeqCst))
+                    crate::person_socket::Look::Person(at_the_seat.load(Ordering::SeqCst))
                 }
             })
             .await;

@@ -9181,6 +9181,9 @@ mod tests {
                 AtTheSeat::No
             }
         }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            Mock.consent_decide(session_id, allow)
+        }
     }
 
     /// #3796 — a daemon that could not tell in time who is at the seat: its
@@ -9199,6 +9202,9 @@ mod tests {
         }
         async fn at_the_seat_now(&self, _uid: u32) -> AtTheSeat {
             AtTheSeat::NotKnownYet
+        }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            Mock.consent_decide(session_id, allow)
         }
     }
 
@@ -9322,6 +9328,58 @@ mod tests {
         // And the safety surface is served without asking.
         let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana, r#"{"t":"status"}"#).await;
         assert!(matches!(r, Response::Status(_)), "{r:?}");
+    }
+
+    /// #3845 — a consent answer over the person socket lets its sender see
+    /// and control this screen, so the seat is asked again first, as before a
+    /// `ConfigSet`: from the person at the seat it is taken; from someone who
+    /// left, or with nobody there, it is refused in words; with no answer in
+    /// time, with the try-again text, a deny as much as an approval. Root and
+    /// the daemon's own endpoint are not asked.
+    #[tokio::test]
+    async fn a_consent_answer_over_the_person_socket_comes_from_whoever_is_at_the_seat_now() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":false}}"#;
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), approve).await;
+        assert_eq!(
+            r,
+            Response::ConsentDecided { ok: true },
+            "the person at the seat"
+        );
+        for (at_seat, what) in [(Some(502), "another person"), (None, "nobody")] {
+            let r = ask_state_scoped_as(SeatAt(at_seat), SEAT, ana.clone(), approve).await;
+            let Response::Error { message } = &r else {
+                panic!("{what} at the seat: {r:?}")
+            };
+            assert!(message.contains("was not taken"), "{what}: {message}");
+            assert!(
+                message.contains("not this account right now"),
+                "{what}: {message}"
+            );
+        }
+        let try_again = Response::Error {
+            message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
+        };
+        for line in [approve, deny] {
+            let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, ana.clone(), line).await;
+            assert_eq!(r, try_again, "{line}");
+        }
+        // Root on the person socket is not asked.
+        let root = ClientPeer {
+            uid: Some(0),
+            gid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+        // The daemon's own endpoint never asks the seat.
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana, approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
     }
 
     /// #2871 — the person's view of a configuration listing marks every key
