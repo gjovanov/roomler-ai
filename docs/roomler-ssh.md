@@ -832,6 +832,20 @@ lookup; the control resolves as before, and as root the child runs as the person
 Remote Apps' and the recorder's own refusals are tested where they live
 (`apps::linux`, `recording::launch`).
 
+#### A session's hold on the device never waits for logind (#3871)
+
+Every SSH session, in any account mode, asks the device to stay awake while it lives:
+its handler holds the power keeper's activity count, as an exec run and a
+remote-control session do (FR-55's rule 1, [`power.md` §1](power.md)). On Linux the
+keeper takes a logind inhibitor for that, and logind may not answer. The keeper used
+to wait for it on an async worker, which on a lab host froze the whole runtime for
+20 s: every session, exec and the control connection, until the person socket's
+lookup gave up at `loginctl`'s 25 s timeout. That was the SFTP stall #3822 measured;
+SFTP was only the session that happened to start. The keeper now asks on a thread of
+its own and never waits for the answer ([`power.md` §1.1](power.md#11-the-keeper-never-waits-for-the-os-3871)).
+A session that starts while logind hangs runs as it would, and the device is held
+once logind answers.
+
 #### Where a session starts (FR-97 P5b)
 
 A person's session starts in their home, where sshd and Windows' OpenSSH start

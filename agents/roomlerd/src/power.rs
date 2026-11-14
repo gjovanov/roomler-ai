@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often the keeper re-reads the world. A poll rather than an event
 /// subscription: AC transitions and session start/stop are both cheap to
@@ -251,60 +251,110 @@ pub fn local_status() -> Option<tunnel_core::localapi::PowerStatus> {
 /// rather than a process name.
 const REASON: &str = "roomler: keeping this device reachable";
 
+/// #3871 — what the keeper asks the OS through: the platform's in the daemon
+/// ([`Backend::platform`]), a stand-in in a test.
+struct Backend<H> {
+    /// Take a stay-awake request, for as long as the OS takes to answer it:
+    /// only ever on the keeper's own thread ([`PowerKeeper::start_taking`]).
+    acquire: Arc<dyn Fn() -> std::io::Result<H> + Send + Sync>,
+    /// Let one go. Never a wait on the OS: a logind inhibitor is a file
+    /// descriptor closed, a Windows power request a handle cleared, a Mac
+    /// assertion one IOKit call.
+    release: Arc<dyn Fn(H) + Send + Sync>,
+    /// Whether the device runs on mains, `None` when this platform cannot tell.
+    /// Never over D-Bus: Linux reads `/sys/class/power_supply` itself.
+    on_ac: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+    /// Where each pass's posture goes ([`posture`]).
+    publish: Arc<dyn Fn(Posture) + Send + Sync>,
+}
+
+impl Backend<imp::Handle> {
+    fn platform() -> Self {
+        Self {
+            acquire: Arc::new(|| imp::acquire(REASON)),
+            release: Arc::new(imp::release),
+            on_ac: Arc::new(imp::on_ac),
+            publish: Arc::new(publish),
+        }
+    }
+}
+
 /// Holds (and releases) the platform's stay-awake request.
 ///
 /// Reconciling rather than toggling: the keeper computes what SHOULD be held
 /// and makes reality match, so a missed transition self-heals on the next poll
 /// instead of leaving an assertion pinned forever.
-pub struct PowerKeeper {
+///
+/// #3871 — and a pass never waits for the OS. It runs on an async worker
+/// ([`keep`]), and taking a request can block for as long as the OS takes to
+/// answer: logind's `Inhibit` waits for as long as logind does not answer. The
+/// keeper used to wait for it there, so a session that started while logind
+/// hung held that worker until logind answered, and with it the whole runtime:
+/// the keeper is woken by its own timer, so its worker was usually the one
+/// driving the runtime's I/O and timers, and no other worker took that over
+/// until something outside the runtime woke one (#3822's SFTP stall, 20 s). The
+/// request is now taken on a thread of its own, one at a time
+/// ([`Self::start_taking`]), and a pass takes its answer once it has come.
+struct PowerKeeper<H: Send + 'static> {
     policy: PowerPolicy,
-    held: Option<imp::Handle>,
+    held: Option<H>,
+    /// #3871 — the request being taken, at most one.
+    taking: Option<Taking<H>>,
     /// Logged once, not per poll: a platform that cannot do this would
     /// otherwise print a line every five seconds for the daemon's whole life.
     warned_unsupported: bool,
+    /// The OS, as this keeper asks it.
+    backend: Backend<H>,
 }
 
-impl PowerKeeper {
-    pub fn new(policy: PowerPolicy) -> Self {
+/// #3871 — a stay-awake request being taken on its own thread.
+struct Taking<H> {
+    began: Instant,
+    /// Where its thread sends the OS's answer.
+    answer: tokio::sync::oneshot::Receiver<std::io::Result<H>>,
+    /// Whether a pass has said that the OS is late to answer.
+    said_late: bool,
+}
+
+/// #3871 — a request the OS has not answered for this long is said once in
+/// the log. Nothing is held while it waits.
+const LATE_ANSWER: Duration = POLL;
+
+impl PowerKeeper<imp::Handle> {
+    fn new(policy: PowerPolicy) -> Self {
+        Self::with_backend(policy, Backend::platform())
+    }
+}
+
+impl<H: Send + 'static> PowerKeeper<H> {
+    fn with_backend(policy: PowerPolicy, backend: Backend<H>) -> Self {
         Self {
             policy,
             held: None,
+            taking: None,
             warned_unsupported: false,
+            backend,
         }
     }
 
-    /// Make the OS state match the decision. Idempotent.
-    pub fn reconcile(&mut self, session_active: bool) {
-        let on_ac = imp::on_ac();
+    /// Make the OS state match the decision. Idempotent, and #3871 — never a
+    /// wait for the OS: a request is taken on its own thread, and a pass that
+    /// finds it unanswered goes on without it, holding nothing.
+    fn reconcile(&mut self, session_active: bool) {
+        let on_ac = (self.backend.on_ac)();
         let want = should_stay_awake(Inputs {
             policy: self.policy,
             on_ac,
             session_active,
         });
+        // A request the OS answered since the last pass. One it refused is
+        // asked again at the next pass, not in this one.
+        let refused_now = self.collect() == Some(false);
         match (want, self.held.is_some()) {
-            (true, false) => match imp::acquire(REASON) {
-                Ok(h) => {
-                    tracing::info!(
-                        policy = self.policy.as_str(),
-                        on_ac = ?on_ac,
-                        session_active,
-                        "power: holding the device awake"
-                    );
-                    self.held = Some(h);
-                }
-                Err(e) => {
-                    if !self.warned_unsupported {
-                        self.warned_unsupported = true;
-                        tracing::warn!(
-                            error = %e,
-                            "power: cannot ask this OS to stay awake — the device may sleep and go offline"
-                        );
-                    }
-                }
-            },
+            (true, false) if self.taking.is_none() && !refused_now => self.start_taking(),
             (false, true) => {
                 if let Some(h) = self.held.take() {
-                    imp::release(h);
+                    (self.backend.release)(h);
                     tracing::info!(
                         policy = self.policy.as_str(),
                         "power: released the device to sleep normally"
@@ -313,24 +363,141 @@ impl PowerKeeper {
             }
             _ => {}
         }
+        self.say_if_late();
         // FR-55 P4 — what is actually held after this pass, not what was
-        // wanted: an acquire the OS refused holds nothing, and the reader of
-        // a sleep must be able to tell the two apart.
-        publish(Posture {
+        // wanted: an acquire the OS refused, or one it has not answered yet,
+        // holds nothing, and the reader of a sleep must be able to tell the two
+        // apart.
+        (self.backend.publish)(Posture {
             policy: self.policy,
             on_ac,
             held: self.held.is_some(),
         });
     }
+
+    /// #3871 — take a request on a thread of its own, `power-inhibit`, which
+    /// sends the OS's answer back. Should nobody wait for it any more (the
+    /// keeper stopped), the thread lets a granted request go itself.
+    fn start_taking(&mut self) {
+        let (send, answer) = tokio::sync::oneshot::channel();
+        let acquire = self.backend.acquire.clone();
+        let release = self.backend.release.clone();
+        let started = std::thread::Builder::new()
+            .name("power-inhibit".into())
+            .spawn(move || {
+                if let Err(Ok(unwanted)) = send.send(acquire()) {
+                    release(unwanted);
+                }
+            });
+        match started {
+            Ok(_) => {
+                self.taking = Some(Taking {
+                    began: Instant::now(),
+                    answer,
+                    said_late: false,
+                });
+            }
+            Err(e) => self.cannot_hold(&e),
+        }
+    }
+
+    /// The answer of the request being taken, when it has come
+    /// ([`Self::took`]): whether it is held now. `None` while it has not.
+    fn collect(&mut self) -> Option<bool> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let answer = match self.taking.as_mut()?.answer.try_recv() {
+            Ok(answer) => answer,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Closed) => Err(unanswered()),
+        };
+        Some(self.took(answer))
+    }
+
+    /// #3871 — the answer of the request being taken, once it comes; never,
+    /// while none is. [`keep`] waits on it beside its tick, so a request the OS
+    /// grants is held as soon as it is, not a pass later.
+    async fn answered(&mut self) -> std::io::Result<H> {
+        match self.taking.as_mut() {
+            Some(taking) => (&mut taking.answer)
+                .await
+                .unwrap_or_else(|_| Err(unanswered())),
+            None => std::future::pending().await,
+        }
+    }
+
+    /// The request being taken came back with `answer`. Granted, it is held,
+    /// and a pass that follows at once lets it go if nothing wants it any more
+    /// (the session ended while the OS took its time). Refused, that is said
+    /// once. Whether it is held now.
+    fn took(&mut self, answer: std::io::Result<H>) -> bool {
+        let waited = self.taking.take().map(|taking| taking.began.elapsed());
+        match answer {
+            Ok(h) => {
+                tracing::info!(
+                    policy = self.policy.as_str(),
+                    waited_ms = waited.map_or(0, |w| w.as_millis() as u64),
+                    "power: holding the device awake"
+                );
+                if let Some(earlier) = self.held.replace(h) {
+                    (self.backend.release)(earlier);
+                }
+                true
+            }
+            Err(e) => {
+                self.cannot_hold(&e);
+                false
+            }
+        }
+    }
+
+    fn cannot_hold(&mut self, e: &std::io::Error) {
+        if !self.warned_unsupported {
+            self.warned_unsupported = true;
+            tracing::warn!(
+                error = %e,
+                "power: cannot ask this OS to stay awake — the device may sleep and go offline"
+            );
+        }
+    }
+
+    /// #3871 — said once a request, [`LATE_ANSWER`] after it began: the OS has
+    /// not answered, and nothing is held until it does.
+    fn say_if_late(&mut self) {
+        if let Some(taking) = self.taking.as_mut()
+            && !taking.said_late
+            && taking.began.elapsed() >= LATE_ANSWER
+        {
+            taking.said_late = true;
+            tracing::warn!(
+                waited_ms = taking.began.elapsed().as_millis() as u64,
+                "power: the OS has not answered the request to stay awake (on Linux, logind's \
+                 Inhibit); nothing is held until it does, and the keeper goes on (#3871)"
+            );
+        }
+    }
 }
 
-impl Drop for PowerKeeper {
+/// A request whose thread ended with no answer: it panicked.
+fn unanswered() -> std::io::Error {
+    std::io::Error::other("the request's thread ended without an answer")
+}
+
+impl<H: Send + 'static> Drop for PowerKeeper<H> {
     /// Release on the way out. An assertion that outlives the daemon would be a
     /// machine that never sleeps again until reboot — the exact
     /// "worse than the bug it fixes" shape FR-43's orphan taught.
+    ///
+    /// #3871 — a request still being taken is closed, so its thread lets it go
+    /// when it lands; one that landed just before is let go here.
     fn drop(&mut self) {
         if let Some(h) = self.held.take() {
-            imp::release(h);
+            (self.backend.release)(h);
+        }
+        if let Some(mut taking) = self.taking.take() {
+            taking.answer.close();
+            if let Ok(Ok(h)) = taking.answer.try_recv() {
+                (self.backend.release)(h);
+            }
         }
     }
 }
@@ -429,14 +596,24 @@ pub async fn run(
     policy: PowerPolicy,
     sessions: Option<crate::rc_sessions::RcSessionRegistry>,
     activity: ActivityCounter,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // NOTE: no early return for `Never`. That policy means "do not keep this
     // machine awake FOR THE MESH" — a live session must still hold it, and
     // returning here would have made `never` silently mean "let sessions die
     // too". The keeper is cheap: one `load` and one platform call every 5 s.
     tracing::info!(policy = policy.as_str(), "power: keeper started (FR-55)");
-    let mut keeper = PowerKeeper::new(policy);
+    keep(PowerKeeper::new(policy), sessions, activity, POLL, shutdown).await
+}
+
+/// [`run`]'s loop for `keeper`: a pass every `every`, until `shutdown`.
+async fn keep<H: Send + 'static>(
+    mut keeper: PowerKeeper<H>,
+    sessions: Option<crate::rc_sessions::RcSessionRegistry>,
+    activity: ActivityCounter,
+    every: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
         // Two independent sources, because they cover different work: the
         // registry knows about rc sessions, and the counter about SSH sessions
@@ -447,13 +624,27 @@ pub async fn run(
             .unwrap_or(false)
             || activity.load(Ordering::Relaxed) > 0;
         keeper.reconcile(session_active);
-        tokio::select! {
-            _ = tokio::time::sleep(POLL) => {}
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    // `keeper` drops here, releasing the assertion.
-                    tracing::info!("power: keeper stopping");
-                    return;
+        let next_pass = tokio::time::sleep(every);
+        tokio::pin!(next_pass);
+        loop {
+            tokio::select! {
+                _ = &mut next_pass => break,
+                // #3871 — the answer to the request taken on its own thread.
+                // Granted, a pass follows at once, so the device is held now,
+                // or let go if the session ended meanwhile. Refused, the next
+                // pass asks again, so an OS that refuses is asked once a pass.
+                answer = keeper.answered() => {
+                    if keeper.took(answer) {
+                        break;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    // A sender gone is a daemon going away too.
+                    if changed.is_err() || *shutdown.borrow() {
+                        // `keeper` drops here, releasing the assertion.
+                        tracing::info!("power: keeper stopping");
+                        return;
+                    }
                 }
             }
         }
@@ -739,20 +930,19 @@ mod imp {
         _fd: std::os::fd::OwnedFd,
     }
 
-    /// Ask logind for a `block` inhibitor, from a plain thread: zbus's
-    /// blocking API panics inside the tokio runtime the keeper runs on.
+    /// Ask logind for a `block` inhibitor. #3871 — only ever on the keeper's
+    /// own `power-inhibit` thread (`PowerKeeper::start_taking`), never on the
+    /// tokio runtime: zbus's blocking API panics inside one, and a call to a
+    /// logind that does not answer waits for as long as it does not (zbus sets
+    /// no timeout). This used to spawn that thread itself and join it on the
+    /// keeper's async worker, which froze the runtime while logind hung.
     ///
     /// `sleep:idle` first. A per-user daemon runs outside every login session,
     /// where logind's polkit policy grants only `idle`
     /// (`inhibit-block-sleep` is `allow_any=no`), so it falls back to that and
     /// says so. A root daemon gets both.
     pub fn acquire(reason: &str) -> std::io::Result<Handle> {
-        let why = reason.to_owned();
-        std::thread::Builder::new()
-            .name("power-inhibit".into())
-            .spawn(move || inhibit(&why))?
-            .join()
-            .map_err(|_| std::io::Error::other("the logind inhibit thread panicked"))?
+        inhibit(reason)
     }
 
     fn inhibit(why: &str) -> std::io::Result<Handle> {
@@ -790,7 +980,8 @@ mod imp {
         )))
     }
 
-    /// Closing the fd is the release.
+    /// Closing the fd is the release: a `close`, never a call to logind, so it
+    /// cannot wait on one that hangs (#3871). logind sees the fd close itself.
     pub fn release(_h: Handle) {}
 
     pub fn on_ac() -> Option<bool> {
@@ -1000,6 +1191,454 @@ mod activity_tests {
             c.load(Ordering::Relaxed),
             0,
             "a guard dropped by unwinding must still release"
+        );
+    }
+}
+
+/// #3871 — the keeper on a runtime like the daemon's, with the OS stood in: a
+/// stay-awake request that hangs as logind's `Inhibit` does while logind does
+/// not answer, for a session of either kind rule 1 counts.
+#[cfg(test)]
+mod keeper_tests {
+    use super::*;
+    use crate::rc_sessions::RcSessionRegistry;
+    use bson::oid::ObjectId;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::Instant;
+
+    /// The keeper's pass in these tests; the daemon's is [`POLL`], 5 s.
+    const EVERY: Duration = Duration::from_millis(50);
+    /// A request nobody answers gives up after this, as a D-Bus call to a
+    /// logind that never answers ends at last. It lets a keeper that waited
+    /// for its request end its run too.
+    const GIVES_UP: Duration = Duration::from_secs(4);
+    /// A pass, a held request or a release comes within this of when it is
+    /// due.
+    const BOUND: Duration = Duration::from_millis(750);
+    /// A 10 ms timer later than this means the runtime stood still. The
+    /// daemon's canary warns at 100 ms; this leaves room for a loaded runner.
+    const LATE: Duration = Duration::from_millis(200);
+    /// How long a request is left hanging while the keeper is watched.
+    const HUNG_FOR: Duration = Duration::from_millis(1500);
+
+    /// What the stood-in OS does with a request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Answer {
+        /// Nothing, until the test changes its answer (logind paused).
+        Hangs,
+        Grants,
+        Refuses,
+    }
+
+    /// The OS stood in. Each request it grants is an id, released once.
+    #[derive(Clone)]
+    struct Os(Arc<OsState>);
+
+    struct OsState {
+        answer: Mutex<Answer>,
+        answered: Condvar,
+        /// Requests that began.
+        began: AtomicUsize,
+        /// Granted requests let go.
+        released: AtomicUsize,
+        /// Each pass's posture, and when it was published.
+        passes: Mutex<Vec<(Instant, Posture)>>,
+    }
+
+    impl Os {
+        fn answering(answer: Answer) -> Self {
+            Self(Arc::new(OsState {
+                answer: Mutex::new(answer),
+                answered: Condvar::new(),
+                began: AtomicUsize::new(0),
+                released: AtomicUsize::new(0),
+                passes: Mutex::new(Vec::new()),
+            }))
+        }
+
+        fn answer(&self, answer: Answer) {
+            *self.0.answer.lock().unwrap_or_else(PoisonError::into_inner) = answer;
+            self.0.answered.notify_all();
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(SeqCst)
+        }
+
+        fn released(&self) -> usize {
+            self.0.released.load(SeqCst)
+        }
+
+        /// The postures published at or after `since`.
+        fn passes_since(&self, since: Instant) -> Vec<(Instant, Posture)> {
+            self.0
+                .passes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(at, _)| *at >= since)
+                .copied()
+                .collect()
+        }
+
+        /// One request, answered as the OS answers it now, or as it comes to
+        /// answer it while the request waits.
+        fn request(&self) -> std::io::Result<u32> {
+            let id = self.0.began.fetch_add(1, SeqCst) as u32;
+            let gives_up = Instant::now() + GIVES_UP;
+            let mut answer = self.0.answer.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                match *answer {
+                    Answer::Grants => return Ok(id),
+                    Answer::Refuses => return Err(std::io::Error::other("refused")),
+                    Answer::Hangs => {}
+                }
+                let Some(left) = gives_up
+                    .checked_duration_since(Instant::now())
+                    .filter(|left| !left.is_zero())
+                else {
+                    return Err(std::io::Error::other("no answer: the call timed out"));
+                };
+                answer = self
+                    .0
+                    .answered
+                    .wait_timeout(answer, left)
+                    .map(|(answer, _)| answer)
+                    .unwrap_or_else(|e| e.into_inner().0);
+            }
+        }
+
+        fn backend(&self) -> Backend<u32> {
+            let (asks, lets_go, records) = (self.clone(), self.clone(), self.clone());
+            Backend {
+                acquire: Arc::new(move || asks.request()),
+                release: Arc::new(move |_| {
+                    lets_go.0.released.fetch_add(1, SeqCst);
+                }),
+                on_ac: Arc::new(|| Some(true)),
+                publish: Arc::new(move |p| {
+                    records
+                        .0
+                        .passes
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((Instant::now(), p));
+                }),
+            }
+        }
+    }
+
+    /// The two kinds of session rule 1 counts, each as the keeper reads it.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        /// A remote-control session: its row in the registry.
+        Rc,
+        /// An SSH session (or an exec run): its hold on the activity counter.
+        Ssh,
+    }
+
+    /// The device's live sessions, as [`run`] is handed them.
+    struct Device {
+        registry: RcSessionRegistry,
+        activity: ActivityCounter,
+        kill: crate::rc_sessions::KillSender,
+        _killed: tokio::sync::mpsc::Receiver<ObjectId>,
+    }
+
+    /// A session that is live while this is.
+    enum Live {
+        Rc(RcSessionRegistry, ObjectId),
+        Ssh(#[allow(dead_code)] ActivityGuard),
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            if let Live::Rc(registry, id) = self {
+                registry.remove(id);
+            }
+        }
+    }
+
+    impl Device {
+        fn new() -> Self {
+            let (kill, killed) = tokio::sync::mpsc::channel(4);
+            Self {
+                registry: RcSessionRegistry::new(),
+                activity: new_activity_counter(),
+                kill,
+                _killed: killed,
+            }
+        }
+
+        fn start(&self, kind: Kind) -> Live {
+            match kind {
+                Kind::Rc => {
+                    let id = ObjectId::new();
+                    self.registry.insert(
+                        id,
+                        "a viewer".into(),
+                        "view".into(),
+                        "an org".into(),
+                        self.kill.clone(),
+                    );
+                    Live::Rc(self.registry.clone(), id)
+                }
+                Kind::Ssh => Live::Ssh(ActivityGuard::new(&self.activity)),
+            }
+        }
+
+        /// The keeper of `os` running for this device, a pass every [`EVERY`].
+        fn keeper(
+            &self,
+            os: &Os,
+        ) -> (
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let (stop, stopped) = tokio::sync::watch::channel(false);
+            let keeper = PowerKeeper::with_backend(PowerPolicy::Never, os.backend());
+            let task = tokio::spawn(keep(
+                keeper,
+                Some(self.registry.clone()),
+                self.activity.clone(),
+                EVERY,
+                stopped,
+            ));
+            (stop, task)
+        }
+    }
+
+    /// A 10 ms timer beside the keeper, as the daemon's runtime canary is:
+    /// how late its latest wake came, at most.
+    fn canary() -> (Arc<Mutex<Duration>>, tokio::task::JoinHandle<()>) {
+        let worst = Arc::new(Mutex::new(Duration::ZERO));
+        let record = worst.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let due = Instant::now() + Duration::from_millis(10);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let late = Instant::now().saturating_duration_since(due);
+                let mut worst = record.lock().unwrap_or_else(PoisonError::into_inner);
+                *worst = (*worst).max(late);
+            }
+        });
+        (worst, task)
+    }
+
+    /// Wait until `done`, `within` at most, or fail saying `what`.
+    async fn until(within: Duration, what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + within;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}: not within {within:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The keeper's first pass, with nothing live: nothing wanted.
+    async fn first_pass(os: &Os) {
+        until(BOUND, "the keeper's first pass", || {
+            !os.0
+                .passes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        })
+        .await;
+    }
+
+    /// #3871 — logind paused while a session of `kind` is live: the request to
+    /// stay awake hangs, and neither the keeper nor the runtime waits for it.
+    /// The passes go on at their pace and publish nothing held, a 10 ms timer
+    /// beside them stays on time, and one request is in flight however many
+    /// passes want one. Once the OS answers, the request is held; once the
+    /// session ends, it is let go. As in the field, the person socket's poll
+    /// has a lookup in flight on a blocking thread when the session starts.
+    async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(kind: Kind) {
+        let os = Os::answering(Answer::Hangs);
+        let device = Device::new();
+        let (worst, canary) = canary();
+        let (stop, keeper) = device.keeper(&os);
+        first_pass(&os).await;
+        let poll = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2500)));
+
+        // The session starts between two passes.
+        let session = device.start(kind);
+        let started = Instant::now();
+        tokio::time::sleep(HUNG_FOR).await;
+        let passes = os.passes_since(started);
+        let first = passes.first().map(|(at, _)| at.duration_since(started));
+        let late = *worst.lock().unwrap_or_else(PoisonError::into_inner);
+        eprintln!(
+            "{kind:?}: watched {:?} while the request hung: first pass after {first:?}, {} passes, \
+             {} held, {} requests began, the 10 ms timer at most {late:?} late",
+            started.elapsed(),
+            passes.len(),
+            passes.iter().filter(|(_, p)| p.held).count(),
+            os.began(),
+        );
+        assert!(
+            first.is_some_and(|first| first <= EVERY + BOUND),
+            "{kind:?}: the keeper's pass after the session started came after {first:?}, not \
+             within {:?}: it waited for the request",
+            EVERY + BOUND
+        );
+        assert!(
+            passes.len() >= 10,
+            "{kind:?}: {} passes in {HUNG_FOR:?}, one every {EVERY:?} wanted",
+            passes.len()
+        );
+        assert!(
+            passes.iter().all(|(_, p)| !p.held),
+            "{kind:?}: nothing is published as held while the request hangs"
+        );
+        assert_eq!(os.began(), 1, "{kind:?}: one request in flight");
+        assert!(
+            late <= LATE,
+            "{kind:?}: the 10 ms timer woke {late:?} late: the runtime stood still"
+        );
+
+        // The OS answers: held at once, not a pass later.
+        let answered = Instant::now();
+        os.answer(Answer::Grants);
+        until(BOUND, "held once the OS answers", || {
+            os.passes_since(answered).iter().any(|(_, p)| p.held)
+        })
+        .await;
+
+        // The session ends: let go at the next pass.
+        drop(session);
+        let ended = Instant::now();
+        until(EVERY + BOUND, "let go once the session ended", || {
+            os.released() == 1
+        })
+        .await;
+        until(EVERY + BOUND, "published as not held", || {
+            os.passes_since(ended).last().is_some_and(|(_, p)| !p.held)
+        })
+        .await;
+
+        let _ = stop.send(true);
+        keeper.await.expect("the keeper ends");
+        canary.abort();
+        poll.await.expect("the stood-in poll lookup ends");
+        assert_eq!(os.began(), 1, "{kind:?}: one request in all");
+        assert_eq!(os.released(), 1, "{kind:?}: the one held, let go once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime_rc() {
+        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(Kind::Rc).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime_ssh() {
+        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(Kind::Ssh).await;
+    }
+
+    /// #3871 — a request the OS answers only after the session has ended is
+    /// let go as soon as it lands, and never published as held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_answered_after_the_session_ended_is_let_go_at_once() {
+        let os = Os::answering(Answer::Hangs);
+        let device = Device::new();
+        let (stop, keeper) = device.keeper(&os);
+        first_pass(&os).await;
+        let session = device.start(Kind::Ssh);
+        until(EVERY + BOUND, "the request began", || os.began() == 1).await;
+        drop(session);
+        tokio::time::sleep(EVERY * 3).await;
+
+        let answered = Instant::now();
+        os.answer(Answer::Grants);
+        until(BOUND, "the late request let go", || os.released() == 1).await;
+        tokio::time::sleep(EVERY * 3).await;
+        let passes = os.passes_since(answered);
+        assert!(
+            passes.iter().all(|(_, p)| !p.held),
+            "a request that landed after the session ended is never published as held"
+        );
+        let _ = stop.send(true);
+        keeper.await.expect("the keeper ends");
+        assert_eq!(os.began(), 1, "one request in all");
+    }
+
+    /// #3871 — a keeper that stops while its request still hangs stops at
+    /// once, and the request is let go when it lands: nothing it took
+    /// outlives it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_still_hanging_when_the_keeper_stops_is_let_go_when_it_lands() {
+        let os = Os::answering(Answer::Hangs);
+        let device = Device::new();
+        let (stop, keeper) = device.keeper(&os);
+        first_pass(&os).await;
+        let _session = device.start(Kind::Rc);
+        until(EVERY + BOUND, "the request began", || os.began() == 1).await;
+
+        let stopping = Instant::now();
+        let _ = stop.send(true);
+        let stopped = tokio::time::timeout(BOUND, keeper).await;
+        let took = stopping.elapsed();
+        assert!(
+            stopped.is_ok() && took <= BOUND,
+            "the keeper stopped {took:?} after it was told to, not within {BOUND:?}: it waited \
+             for its request"
+        );
+        os.answer(Answer::Grants);
+        until(BOUND, "the request let go once it landed", || {
+            os.released() == 1
+        })
+        .await;
+    }
+
+    /// The control: an OS that grants at once is held on the first pass that
+    /// wants it, as before, and let go when the session ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_the_os_grants_at_once_is_held_at_once() {
+        for kind in [Kind::Rc, Kind::Ssh] {
+            let os = Os::answering(Answer::Grants);
+            let device = Device::new();
+            let (stop, keeper) = device.keeper(&os);
+            first_pass(&os).await;
+            let session = device.start(kind);
+            let started = Instant::now();
+            until(EVERY + BOUND, "held while the session is live", || {
+                os.passes_since(started).iter().any(|(_, p)| p.held)
+            })
+            .await;
+            drop(session);
+            until(EVERY + BOUND, "let go once the session ended", || {
+                os.released() == 1
+            })
+            .await;
+            let _ = stop.send(true);
+            keeper.await.expect("the keeper ends");
+            assert_eq!(os.began(), 1, "{kind:?}: one request");
+        }
+    }
+
+    /// An OS that refuses is asked again once a pass, never in a loop: a
+    /// refusal that comes back at once must not spin the keeper.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_request_is_asked_again_once_a_pass() {
+        let os = Os::answering(Answer::Refuses);
+        let device = Device::new();
+        let (stop, keeper) = device.keeper(&os);
+        first_pass(&os).await;
+        let _session = device.start(Kind::Ssh);
+        let started = Instant::now();
+        tokio::time::sleep(EVERY * 10).await;
+        let (began, watched) = (os.began(), started.elapsed());
+        let _ = stop.send(true);
+        keeper.await.expect("the keeper ends");
+        let most = (watched.as_millis() / EVERY.as_millis()) as usize + 2;
+        assert!(
+            (2..=most).contains(&began),
+            "{began} requests in {watched:?}: one a pass ({EVERY:?}) wanted, at most {most}"
+        );
+        assert!(
+            os.passes_since(started).iter().all(|(_, p)| !p.held),
+            "a refused request is never held"
         );
     }
 }

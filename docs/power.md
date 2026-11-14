@@ -47,6 +47,73 @@ or releases one OS request:
 and no external display sleeps whatever the policy says. That is an OS limit,
 and the places where the policy is set say so (§2).
 
+### 1.1 The keeper never waits for the OS (#3871)
+
+A pass of the keeper runs on the daemon's async runtime
+([`power.rs:610`](../agents/roomlerd/src/power.rs#L610) `keep`). Taking a request
+can block for as long as the OS takes to answer it, and on Linux that is for as
+long as logind does not answer: zbus sets no timeout on `Inhibit`. Until #3871 the
+keeper took it on a `power-inhibit` thread and **joined** that thread on its async
+worker. A session that started while logind hung held that worker until logind
+answered, and with it the whole runtime. The keeper is woken by its own timer, so
+its worker was usually the one driving the runtime's I/O and timers, and tokio
+hands that role only to a worker that parks ([`stall-watch.md` §10](stall-watch.md)).
+On a lab host an SFTP session's start froze every session, exec and the control
+connection for 20 s. It ended when the person socket's lookup gave up at
+`loginctl`'s 25 s timeout and woke another worker (#3822, read per thread:
+`Thread::join` ← `PowerKeeper::reconcile` ← `power::run`). It was a race, because
+the keeper reads the sessions every 5 s and asked only when a pass fell inside one.
+
+Now a pass never waits:
+
+```mermaid
+sequenceDiagram
+    participant K as keeper, an async task
+    participant T as power-inhibit thread
+    participant L as logind
+    K->>K: a pass finds a live session, an RC row or an SSH or exec hold
+    K->>T: take a request, none being in flight
+    K->>K: publish held false, and go on
+    T->>L: Inhibit
+    Note over L: paused, no answer
+    K->>K: each later pass, still waiting, held false
+    Note over K: 5 s on, said once in the log
+    L-->>T: the inhibitor's file descriptor
+    T-->>K: the answer, over a oneshot
+    K->>K: a pass at once, held true
+    K->>K: the pass after the session ends closes the fd, held false
+```
+
+| Rule | Where |
+|---|---|
+| A pass starts the request on `power-inhibit` and goes on | [`power.rs:381`](../agents/roomlerd/src/power.rs#L381) `start_taking` |
+| One request at a time: a pass that finds one running leaves it running | [`power.rs:343`](../agents/roomlerd/src/power.rs#L343) `reconcile` |
+| `held` is published only once the OS granted the request. While it waits, nothing is held | `reconcile`, [`power.rs:432`](../agents/roomlerd/src/power.rs#L432) `took` |
+| A granted request is held at once: the loop waits on its answer beside its 5 s tick | [`power.rs:636`](../agents/roomlerd/src/power.rs#L636) |
+| A request granted after every session ended is let go by the pass that follows at once, and never published as held | `took`, then `reconcile` |
+| A refused request is asked again at the next pass, never in a loop | `reconcile` |
+| A keeper that stops while its request runs closes the channel, and the thread lets the request go when it lands | [`power.rs:485`](../agents/roomlerd/src/power.rs#L485) `Drop`, `start_taking` |
+| A request unanswered for 5 s is said once: `power: the OS has not answered the request to stay awake …` | [`power.rs:465`](../agents/roomlerd/src/power.rs#L465) `say_if_late` |
+
+Nothing else a pass does waits on the OS. `on_ac` reads `/sys/class/power_supply`
+on Linux (no D-Bus, no UPower), `GetSystemPowerStatus` on Windows and IOKit's
+power source on a Mac. Releasing a logind inhibitor closes its file descriptor
+([`power.rs:985`](../agents/roomlerd/src/power.rs#L985)), which logind notices by
+itself. A Windows power request and a Mac assertion are released with one local
+call.
+
+Tested in `power::keeper_tests`
+([`power.rs:1202`](../agents/roomlerd/src/power.rs#L1202)) on a two-worker
+runtime with the OS stood in, on Linux, Windows and macOS. With the request
+unanswered, for an RC row and for an SSH hold, the passes go on at their pace and
+publish nothing held, a 10 ms timer beside them stays within 200 ms, and one
+request is in flight. Once answered, it is held at once and let go when the
+session ends. A request answered after the session ended is let go and never
+published as held. A keeper that stops while its request hangs stops at once, and
+the request is let go when it lands. A refused request is asked once a pass.
+Field verification is owed: a paused logind under a daemon-mode SSH session on a
+Linux system install.
+
 ## 2. `power_policy`
 
 | value | holds the machine awake | |
@@ -111,9 +178,10 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:686`](../crates/remote_control/src/signaling.rs#L686)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4929`](../agents/roomlerd/src/app.rs#L4929)) and
+anything connects ([`app.rs:4957`](../agents/roomlerd/src/app.rs#L4957)) and
 after every pass, with what it actually holds, not what it wanted
-([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
+([`power.rs:371`](../agents/roomlerd/src/power.rs#L371)). A request the OS has
+not answered yet holds nothing (§1.1).
 
 - `policy` is a string, so a policy a newer agent knows reaches an older
   dashboard as a word it can print.
@@ -243,6 +311,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
 
 | test | proves |
 |---|---|
+| `power::keeper_tests` (`roomlerd`) | the keeper never waits for the OS: a request logind does not answer holds neither the keeper nor the runtime, and is held once answered (§1.1) |
 | `power_brief_rides_the_heartbeat_and_is_optional`, `the_sleep_announcement_carries_the_posture_and_belongs_to_fleet` (`remote_control`) | the wire, both ways, and that a pre-P4 heartbeat still parses |
 | `an_announced_sleep_rides_the_offline_row_and_nothing_else_changes` (`fleet` `presence`) | the presence row, and the pre-P4 shape without a reason |
 | `sleep_notice::tests` (`roomlerd`) | the goodbye registry, the hold, the bound, the inhibitor rule |
