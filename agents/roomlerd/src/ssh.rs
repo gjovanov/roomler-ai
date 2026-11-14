@@ -3814,7 +3814,7 @@ mod tests {
         let mark = marks.path().join("ran");
 
         // A command.
-        let mut command = session.channel_open_session().await.unwrap();
+        let command = session.channel_open_session().await.unwrap();
         command
             .exec(true, format!(": > '{}'", mark.display()).as_str())
             .await
@@ -3832,7 +3832,7 @@ mod tests {
         assert!(!mark.exists(), "the refused command ran");
 
         // A shell: asked to leave at once, in case it starts.
-        let mut shell = session.channel_open_session().await.unwrap();
+        let shell = session.channel_open_session().await.unwrap();
         shell
             .request_pty(true, "xterm", 80, 24, 0, 0, &[])
             .await
