@@ -1117,23 +1117,6 @@ jobs:
             if ($sig.Status -ne 'Valid') { throw "the DLL in the MSI is not signed: $($sig.Status)" }
           }
 
-      # TEMPORARY (#3810): the Windows job loses its runner on attempt 1, so
-      # that the check job's message is read on this pull request's own run.
-      # Reverted before the merge.
-      - name: "TEMPORARY proof (#3810): print the runner's processes"
-        if: ${{ github.run_attempt == '1' }}
-        shell: pwsh
-        run: |
-          Get-CimInstance Win32_Process | Where-Object Name -like 'Runner.*' |
-            Format-Table -AutoSize ProcessId, ParentProcessId, Name, CommandLine | Out-String -Width 400
-
-      - name: "TEMPORARY proof (#3810): the runner is lost, its listener and worker stopped"
-        if: ${{ github.run_attempt == '1' }}
-        shell: pwsh
-        run: |
-          Get-Process Runner.Listener, Runner.Worker -ErrorAction SilentlyContinue | Stop-Process -Force
-          Start-Sleep 3600
-
       - name: "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)"
         # The per-Machine MSI's first INSTALL coverage. A person running
         # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
