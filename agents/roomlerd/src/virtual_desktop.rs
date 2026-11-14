@@ -1277,7 +1277,7 @@ impl Desktop {
         } else {
             "daemon"
         };
-        info!(display = self.display.as_str(), wm = %cfg.wm, apps = cfg.startup.len(), ?pgid, keeper = ?x.keeper, started_by = clients, "virtual-desktop ready");
+        info!(display = self.display.as_str(), wm = %cfg.wm, apps = cfg.startup.len(), ?pgid, vd_keeper = ?x.keeper, started_by = clients, "virtual-desktop ready");
         Ok(x)
     }
 
@@ -1393,14 +1393,14 @@ impl Desktop {
                 if self.keeper_off.load(std::sync::atomic::Ordering::Relaxed) {
                     warn!(
                         display = self.display.as_str(),
-                        "virtual-desktop: no keeper in this daemon's life, after two that exited by themselves — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)"
+                        "virtual-desktop: no vd-keeper for the rest of this daemon's life, after two that exited by themselves — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)"
                     );
                     None
                 } else {
                     match self.start_keeper(cmd) {
                         Ok(keeper) => keeper,
                         Err(why) => {
-                            warn!(display = self.display.as_str(), %why, "virtual-desktop: no keeper — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)");
+                            warn!(display = self.display.as_str(), %why, "virtual-desktop: no vd-keeper — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)");
                             None
                         }
                     }
@@ -1562,10 +1562,10 @@ fn follow_keeper(
                     }
                 }
                 if let Some(said) = line.strip_prefix("warn: ") {
-                    warn!(keeper = pid, "virtual-desktop keeper: {said}");
+                    warn!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}");
                 } else {
                     let said = line.strip_prefix("info: ").unwrap_or(&line);
-                    info!(keeper = pid, "virtual-desktop keeper: {said}");
+                    info!(vd_keeper = pid, "virtual-desktop vd-keeper: {said}");
                 }
             }
         })
@@ -1630,7 +1630,7 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
             let up_for = x.since.elapsed();
             let why = match &gone {
                 Gone::Server(exit) => format!("its X server ({}) exited: {exit}", x.kind.name()),
-                Gone::Keeper(exit) => format!("its keeper exited: {exit}"),
+                Gone::Keeper(exit) => format!("its keeper process (vd-keeper) exited: {exit}"),
             };
             if !desk.set_down(why) {
                 // A deliberate stop killed it; the tree is `stop`'s.
@@ -1658,7 +1658,7 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
                     // starts it again, as a server's does.
                     warn!(
                         display = desk.display.as_str(),
-                        keeper = ?x.keeper,
+                        vd_keeper = ?x.keeper,
                         %exit,
                         up_for_s = up_for.as_secs(),
                         "virtual-desktop: the desktop's keeper exited — the desktop is down until it is started again"
@@ -1668,7 +1668,7 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             display = desk.display.as_str(),
-                            "virtual-desktop: the keeper exited by itself twice soon after its desktop started — for the rest of this daemon's life the daemon starts the window manager and the apps itself (#3665)"
+                            "virtual-desktop: the desktop's keeper (vd-keeper) exited by itself twice soon after its desktop started — for the rest of this daemon's life the daemon starts the window manager and the apps itself (#3665)"
                         );
                     }
                 }
@@ -1839,7 +1839,7 @@ fn wait_desktop_exit(x: &XServer) -> Gone {
                 pid,
                 group,
                 server = x.pid,
-                keeper,
+                vd_keeper = keeper,
                 "virtual-desktop: a child of the daemon that the desktop did not start is in the desktop's process group — it is left to its own waiter, and the supervisor waits for the X server alone from now on"
             );
             break;
@@ -4599,7 +4599,10 @@ mod supervise_tests {
             [x_pid, keeper].into_iter().collect(),
             "the daemon's children in the desktop's group"
         );
-        assert_eq!(why, "its keeper exited: signal 9 (killed)");
+        assert_eq!(
+            why,
+            "its keeper process (vd-keeper) exited: signal 9 (killed)"
+        );
         assert!(x_gone, "the server {x_pid} was not collected");
         assert!(keeper_gone, "the keeper {keeper} was not collected");
         assert!(
@@ -4817,7 +4820,188 @@ mod supervise_tests {
             "the third start is the daemon's own"
         );
         assert!(collected(server), "the stop left the server running");
-        println!("x11-real: after two keeper exits the desktop on {display} ran without one");
+        println!("x11-real: after two vd-keeper exits the desktop on {display} ran without one");
+    }
+
+    /// The role a test runs this binary in to stand in for an X client: the
+    /// variable names the test's scratch directory.
+    const X_CLIENT_ROLE_ENV: &str = "ROOMLERD_TEST_VD_X_CLIENT";
+
+    /// An X client, as far as its server can tell: it connects to `DISPLAY`,
+    /// completes the connection setup that [`x_answers`] starts, writes its
+    /// pid once it is connected, and then waits on the connection. When the
+    /// server goes, the connection ends, and it exits as an X client does on
+    /// its I/O error. It leaves by itself after a minute, should the test
+    /// that started it be gone.
+    #[test]
+    fn x_client_role() {
+        use std::io::{Read as _, Write as _};
+        let Some(dir) = std::env::var_os(X_CLIENT_ROLE_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let display = std::env::var("DISPLAY").unwrap_or_default();
+        let sock = Path::new(X11_UNIX_DIR).join(format!("X{}", display.trim_start_matches(':')));
+        let Ok(mut conn) = std::os::unix::net::UnixStream::connect(sock) else {
+            std::process::exit(3);
+        };
+        // The setup `x_answers` sends. A reply that starts with 1 is a
+        // success; its length in 4-byte units is at bytes 6 and 7.
+        let mut head = [0u8; 8];
+        if conn
+            .write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .is_err()
+            || conn.read_exact(&mut head).is_err()
+            || head[0] != 1
+        {
+            std::process::exit(3);
+        }
+        let mut rest = vec![0u8; usize::from(u16::from_le_bytes([head[6], head[7]])) * 4];
+        if conn.read_exact(&mut rest).is_err() {
+            std::process::exit(3);
+        }
+        std::fs::write(dir.join("xclient.pid"), std::process::id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(60)));
+        let mut buf = [0u8; 256];
+        loop {
+            match conn.read(&mut buf) {
+                // The connection ended: the server is gone.
+                Ok(0) => std::process::exit(1),
+                Ok(_) if Instant::now() < deadline => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    std::process::exit(2)
+                }
+                Err(_) => std::process::exit(1),
+                Ok(_) => std::process::exit(2),
+            }
+        }
+    }
+
+    /// One run of the issue's first path against a real X server, with the
+    /// clients started as `clients` says. The server is killed, and the
+    /// startup app, an X client ([`x_client_role`]), exits on the end of its
+    /// connection. It leaves behind a child that had left the desktop's group
+    /// (`setsid`) and ignores SIGTERM. Only then does the supervisor look:
+    /// the order the field can take, made the order every run takes. The
+    /// display, and whether that child still ran after the supervisor's
+    /// teardown and after the stop that follows.
+    fn an_x_clients_orphan_after(clients: Clients) -> (String, bool, bool) {
+        let dir = scratch("orphan-real-x");
+        let d = dir.display();
+        let exe = std::env::current_exe().expect("the test binary");
+        // The child is started BEFORE the app connects, so it holds no end of
+        // the connection.
+        let app = script(
+            &dir,
+            "app",
+            &format!(
+                "{}\nexport {X_CLIENT_ROLE_ENV}=\"{d}\"\n\
+                 exec \"{}\" virtual_desktop::supervise_tests::x_client_role \
+                 --exact --nocapture --test-threads=1",
+                deaf_setsid_child(&dir),
+                exe.display()
+            ),
+        );
+        let display = pick_display(X11_UNIX_DIR);
+        let by_keeper = matches!(clients, Clients::Keeper(_));
+        let desk = Arc::new(Desktop::new(
+            display.clone(),
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: "true".into(),
+                    startup: vec![app],
+                },
+                ready_timeout: READY_TIMEOUT,
+                delay_floor: Duration::from_millis(100),
+                clients,
+                ..plan("Xvfb".into())
+            },
+        ));
+        let _stop = StopAtTheEnd(desk.clone());
+        let first = desk.bring_up().expect("the X server comes up");
+        let x_pid = first.pid;
+        assert_eq!(
+            first.keeper.is_some(),
+            by_keeper,
+            "the desktop's keeper started the clients"
+        );
+        let client = recorded(&dir, "xclient.pid");
+        let gc = recorded(&dir, "gc.pid");
+        let _gc = KillAtTheEnd(vec![gc]);
+        assert_eq!(gc.pgid, gc.pid, "the child leads a group of its own");
+
+        // SAFETY: SIGKILL to a child of this test, which nothing has
+        // collected: no supervisor runs yet.
+        unsafe {
+            libc::kill(x_pid, libc::SIGKILL);
+        }
+        wait_for("the X client to exit and leave its child", || {
+            read_proc_stat(gc.pid).is_some_and(|p| p.ppid != client.pid)
+        });
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::spawn(move || supervise(&desk, Some(first)))
+        };
+        let server_now = |desk: &Desktop| {
+            let st = desk.state();
+            st.up
+                .and_then(|_| st.tree.as_ref().and_then(|t| t.roots.first().copied()))
+        };
+        wait_for("the teardown, and the desktop back on a new server", || {
+            server_now(&desk).is_some_and(|pid| pid != x_pid)
+        });
+        let after_teardown = still_running(&gc);
+        desk.stop();
+        supervisor.join().expect("the supervisor left cleanly");
+        let after_stop = still_running(&gc);
+        assert!(collected(x_pid), "the killed server was left a zombie");
+        let _ = std::fs::remove_dir_all(&dir);
+        (display, after_teardown, after_stop)
+    }
+
+    /// #3665, the issue's first path, against a real Xvfb (the CI Xvfb lane).
+    /// Started directly, as before #3665 and under the kill switch, the
+    /// SIGTERM-deaf orphan of an X client outlives the supervisor's teardown
+    /// and the stop: the case is real, and this test can fail. Started by the
+    /// desktop's keeper, the same orphan is ended by the teardown.
+    #[test]
+    fn a_killed_x_server_takes_the_orphan_of_its_x_client_with_it() {
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        if !have_setsid("a_killed_x_server_takes_the_orphan_of_its_x_client_with_it") {
+            return;
+        }
+        let (_, teardown, stop) = an_x_clients_orphan_after(Clients::Direct);
+        assert!(
+            teardown && stop,
+            "started directly, the orphan should outlive the teardown and the stop \
+             (teardown {teardown}, stop {stop}): the case did not happen, so the \
+             run with the desktop's keeper proves nothing"
+        );
+        let (display, teardown, stop) =
+            an_x_clients_orphan_after(Clients::Keeper(KeeperCmd::test()));
+        assert!(
+            !teardown,
+            "with the desktop's keeper, the orphan outlived the supervisor's teardown"
+        );
+        assert!(
+            !stop,
+            "with the desktop's keeper, the orphan outlived the stop"
+        );
+        println!(
+            "x11-real: a killed X server on {display} took the orphan of its X client with it \
+             (started directly, the orphan outlived it)"
+        );
     }
 
     /// The role a test runs this binary in to stand in for the daemon: the
