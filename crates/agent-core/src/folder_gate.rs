@@ -16,6 +16,7 @@
 //! one of these, unless it is listed in [`KNOWN`] with the reason. A stale row
 //! fails too, so the list cannot rot.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use syn::visit::{self, Visit};
@@ -372,6 +373,8 @@ fn the_gate_sees_what_it_is_for() {
             .map(|r| r.function)
             .collect()
     };
+    // Every case is read, and every miss is listed at once.
+    let mut missed = Vec::new();
     for (source, function) in [
         (r#"fn f() { std::env::var_os("PROGRAMDATA"); }"#, "f"),
         (r#"fn f() { std::env::var("ProgramFiles").ok(); }"#, "f"),
@@ -413,12 +416,96 @@ fn the_gate_sees_what_it_is_for() {
             r#"static S: X = X::new(|| std::env::var_os("APPDATA"));"#,
             "S",
         ),
+        // #3778: the name and the read in two items.
+        (
+            r#"const NAME: &str = "APPDATA"; fn f() { std::env::var_os(NAME); }"#,
+            "f",
+        ),
+        (
+            r#"static NAMES: [&str; 2] = ["TEMP", "TMP"]; fn f() { NAMES.iter().filter_map(std::env::var_os); }"#,
+            "f",
+        ),
+        (
+            r#"impl T { const DIR: &str = "LOCALAPPDATA"; fn g() { std::env::var_os(Self::DIR); } }"#,
+            "g",
+        ),
+        (
+            r#"fn node_env(name: &str) -> Option<OsString> { std::env::var_os(name) } fn f() { node_env("APPDATA"); }"#,
+            "f",
+        ),
+        // A walk of the whole environment.
+        (
+            r#"fn f() { std::env::vars().find(|(k, _)| k.eq_ignore_ascii_case("APPDATA")); }"#,
+            "f",
+        ),
+        (
+            r#"fn f() { env::vars_os().filter(|(k, _)| k == "USERPROFILE").count(); }"#,
+            "f",
+        ),
+        // The name inside a longer string, a read through another API, a
+        // renamed import.
+        (
+            r#"fn f() { std::env::var_os("X"); let _ = r"%LOCALAPPDATA%\roomler"; }"#,
+            "f",
+        ),
+        (
+            r#"unsafe fn f() { GetEnvironmentVariableW(PCWSTR(wide("APPDATA").as_ptr()), None); }"#,
+            "f",
+        ),
+        (
+            r#"unsafe fn f() { ExpandEnvironmentStringsW(PCWSTR(wide(r"%ProgramData%\roomler").as_ptr()), None); }"#,
+            "f",
+        ),
+        (
+            r#"use std::env::var_os as folder; fn f() { folder("APPDATA"); }"#,
+            "f",
+        ),
+        (
+            r#"use std::env as e; fn f() { e::var_os("APPDATA"); }"#,
+            "f",
+        ),
+        // Anything inside a macro's arguments.
+        (
+            r#"fn f() { let dir = format!(r"{}\roomler", std::env::var("APPDATA").unwrap()); }"#,
+            "f",
+        ),
+        (
+            r#"fn f() { tracing::info!(dir = ?std::env::var_os("APPDATA"), "found"); }"#,
+            "f",
+        ),
+        (
+            r#"unsafe fn f() { GetEnvironmentVariableW(w!("APPDATA"), None); }"#,
+            "f",
+        ),
+        // Names that also name folders.
+        (r#"fn f() { std::env::var_os("TEMP"); }"#, "f"),
+        (r#"fn f() { std::env::var_os("tmp"); }"#, "f"),
+        (r#"fn f() { std::env::var_os("HOMEDRIVE"); }"#, "f"),
+        (r#"fn f() { std::env::var_os("HomePath"); }"#, "f"),
+        // macOS and Linux: a `directories` lookup takes the folders from the
+        // environment there ($HOME, $XDG_*).
+        (r#"fn f() { directories::BaseDirs::new(); }"#, "f"),
+        (
+            r#"use directories::ProjectDirs; fn f() { ProjectDirs::from("ai", "roomler", "x"); }"#,
+            "f",
+        ),
+        (
+            r#"#[cfg(target_os = "macos")] fn f() { directories::UserDirs::new(); }"#,
+            "f",
+        ),
+        (
+            r#"#[cfg(unix)] fn f() { directories::BaseDirs::new(); }"#,
+            "f",
+        ),
     ] {
-        assert_eq!(named(source), [function], "{source}");
+        if named(source) != [function] {
+            missed.push(format!("not seen as a read: {source}"));
+        }
     }
     for source in [
         r#"fn f() { p.join("AppData").join("Local"); }"#,
-        r#"fn f() { node_env("APPDATA"); }"#,
+        // A helper that takes the name and does not read the environment.
+        r#"fn node_env(name: &str) -> String { name.to_owned() } fn f() { node_env("APPDATA"); }"#,
         r#"fn f() { cmd.env("APPDATA", x); }"#,
         r#"fn f() { std::env::var_os("SystemRoot"); }"#,
         r#"#[cfg(test)] mod tests { fn f() { std::env::var_os("ProgramData"); } }"#,
@@ -427,7 +514,279 @@ fn the_gate_sees_what_it_is_for() {
         r#"#[cfg(not(windows))] fn f() { std::env::var_os("APPDATA"); }"#,
         r#"fn f() { #[cfg(unix)] { std::env::var_os("ProgramData"); } }"#,
         r#"#![cfg(unix)] fn f() { std::env::var_os("ProgramData"); }"#,
+        // A doc comment is not code.
+        "/// Reads %APPDATA%.\nfn f() { std::env::var_os(\"X\"); }",
+        // On Windows `directories` asks the system for the known folders.
+        r#"#[cfg(windows)] fn f() { directories::BaseDirs::new(); }"#,
+        // A type is not a lookup.
+        r#"fn f(dirs: &ProjectDirs) -> &Path { dirs.config_dir() }"#,
     ] {
-        assert!(named(source).is_empty(), "{source}");
+        if !named(source).is_empty() {
+            missed.push(format!("seen as a read: {source}"));
+        }
     }
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
+}
+
+/// The package whose link graph the gate follows: the daemon.
+const ROOT: &str = "roomlerd";
+
+/// Packages in this repository that [`ROOT`] links and the gate does not
+/// scan: `(package, why)`. A stale row fails, as a stale [`KNOWN`] row does.
+const NOT_SCANNED: &[(&str, &str)] = &[
+    ("rtp", VENDORED),
+    ("scrap", VENDORED),
+    ("webrtc", VENDORED),
+    ("webrtc-ice", VENDORED),
+    ("webrtc-sctp", VENDORED),
+    ("wintun-bindings", VENDORED),
+];
+
+const VENDORED: &str = "a vendored fork of third-party code, patched in at the workspace \
+                        root (`[patch.crates-io]`): linked, not first-party code";
+
+/// A workspace member: the files its library and binaries start from, and
+/// the packages it names as normal dependencies, on every target and behind
+/// every feature.
+#[derive(Default)]
+struct Member {
+    lib: Vec<PathBuf>,
+    bin: Vec<PathBuf>,
+    normal: BTreeSet<String>,
+}
+
+/// The packages in this repository that [`ROOT`] links, read from the
+/// workspace's own records so that the test needs neither the network nor a
+/// registry cache: `cargo metadata --no-deps --offline` reads only the
+/// members' manifests (their targets, and each dependency with its kind),
+/// and `Cargo.lock` holds the resolved edges through the packages that are
+/// not members (a registry crate, a vendored fork).
+struct Graph {
+    members: BTreeMap<String, Member>,
+    /// Every linked package without a registry source: a member, or a fork
+    /// patched in by path.
+    linked: BTreeSet<String>,
+}
+
+impl Graph {
+    fn read(root: &Path) -> Self {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let out = std::process::Command::new(cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--offline",
+                "--format-version",
+                "1",
+            ])
+            .arg("--manifest-path")
+            .arg(root.join("Cargo.toml"))
+            .output()
+            .expect("cargo metadata");
+        assert!(
+            out.status.success(),
+            "cargo metadata: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+        Self::from(&out.stdout, &lock)
+    }
+
+    fn from(metadata: &[u8], lock: &str) -> Self {
+        let metadata: serde_json::Value = serde_json::from_slice(metadata).expect("metadata JSON");
+        let mut members = BTreeMap::new();
+        for package in metadata["packages"].as_array().expect("packages") {
+            let mut member = Member::default();
+            for target in package["targets"].as_array().expect("targets") {
+                let src = PathBuf::from(target["src_path"].as_str().expect("src_path"));
+                let kind = |k: &str| {
+                    target["kind"]
+                        .as_array()
+                        .is_some_and(|v| v.contains(&k.into()))
+                };
+                // A library of any crate type except a proc-macro, which runs
+                // in the compiler and is not linked.
+                if ["lib", "rlib", "dylib", "cdylib", "staticlib"]
+                    .into_iter()
+                    .any(kind)
+                {
+                    member.lib.push(src);
+                } else if kind("bin") {
+                    member.bin.push(src);
+                }
+            }
+            for dependency in package["dependencies"].as_array().expect("dependencies") {
+                // `kind` is null for a normal dependency, "dev" or "build"
+                // otherwise; `target` and `optional` are not looked at.
+                if dependency["kind"].is_null() {
+                    member
+                        .normal
+                        .insert(dependency["name"].as_str().expect("name").into());
+                }
+            }
+            members.insert(package["name"].as_str().expect("name").into(), member);
+        }
+        let lock: toml::Table = toml::from_str(lock).expect("Cargo.lock TOML");
+        // (name, version, from a registry, dependencies as the lock writes them)
+        let packages: Vec<(&str, &str, bool, Vec<&str>)> = lock["package"]
+            .as_array()
+            .expect("[[package]]")
+            .iter()
+            .map(|p| {
+                let deps = p.get("dependencies").and_then(toml::Value::as_array);
+                (
+                    p["name"].as_str().expect("name"),
+                    p["version"].as_str().expect("version"),
+                    p.get("source").is_some(),
+                    deps.into_iter()
+                        .flatten()
+                        .filter_map(toml::Value::as_str)
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut queue: Vec<usize> = packages
+            .iter()
+            .position(|p| p.0 == ROOT && !p.2)
+            .into_iter()
+            .collect();
+        assert!(!queue.is_empty(), "{ROOT} is not in Cargo.lock");
+        let mut seen = BTreeSet::new();
+        let mut linked = BTreeSet::new();
+        while let Some(at) = queue.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            let (name, _, registry, deps) = &packages[at];
+            if !registry {
+                linked.insert(name.to_string());
+            }
+            // The lock records a member's dev and build dependencies too, so
+            // a member's edges are only the normal ones its manifest names.
+            // Another package's are all the lock records: the lock holds no
+            // dev-dependency of a package that is not a member.
+            let normal = members.get(*name).filter(|_| !registry).map(|m| &m.normal);
+            for dep in deps {
+                // "name", "name version" or "name version (source)".
+                let mut parts = dep.split(' ');
+                let (dep, version) = (parts.next().unwrap_or_default(), parts.next());
+                if normal.is_some_and(|normal| !normal.contains(dep)) {
+                    continue;
+                }
+                queue.extend(packages.iter().enumerate().filter_map(|(i, p)| {
+                    (p.0 == dep && version.is_none_or(|v| p.1 == v)).then_some(i)
+                }));
+            }
+        }
+        Self { members, linked }
+    }
+}
+
+/// The packages the gate scans.
+fn scanned(graph: &Graph, root: &Path) -> BTreeSet<String> {
+    graph
+        .members
+        .iter()
+        .filter(|(_, m)| {
+            m.lib.iter().chain(&m.bin).any(|src| {
+                let src = src.canonicalize().unwrap_or_else(|_| src.clone());
+                FOLDERS.iter().any(|f| src.starts_with(root.join(f)))
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+#[test]
+fn the_scan_is_what_roomlerd_links() {
+    let root = repo_root();
+    let graph = Graph::read(&root);
+    let scanned = scanned(&graph, &root);
+    let unscanned: Vec<&String> = graph
+        .linked
+        .iter()
+        .filter(|p| !scanned.contains(*p) && !NOT_SCANNED.iter().any(|(n, _)| n == p))
+        .collect();
+    assert!(
+        unscanned.is_empty(),
+        "packages in this repository that {ROOT} links and the gate does not scan; scan \
+         them, or list each in NOT_SCANNED with why: {unscanned:?}"
+    );
+    for (package, _) in NOT_SCANNED {
+        assert!(
+            graph.linked.contains(*package),
+            "a stale NOT_SCANNED row: {package}"
+        );
+    }
+    for package in &scanned {
+        assert!(
+            graph.linked.contains(package),
+            "the gate scans {package}, which {ROOT} does not link"
+        );
+    }
+}
+
+/// The walk on a made-up workspace: normal dependencies on every target and
+/// behind every feature count, a dev- or build-dependency does not, and a
+/// fork is reached through the registry crate that depends on it.
+#[test]
+fn the_walk_follows_what_is_linked() {
+    let member = |name: &str, deps: &str| {
+        format!(
+            r#"{{"name":"{name}","targets":[{{"kind":["lib"],"src_path":"/r/{name}/src/lib.rs"}}],"dependencies":[{deps}]}}"#
+        )
+    };
+    let metadata = format!(
+        r#"{{"packages":[{},{},{},{},{},{}]}}"#,
+        member(
+            ROOT,
+            r#"{"name":"a","kind":null},{"name":"b","kind":null,"target":"cfg(windows)","optional":true},{"name":"c","kind":"dev"},{"name":"d","kind":"build"},{"name":"reg","kind":null}"#
+        ),
+        member("a", ""),
+        member("b", ""),
+        member("c", ""),
+        member("d", ""),
+        member("e", ""),
+    );
+    let lock = format!(
+        r#"
+[[package]]
+name = "{ROOT}"
+version = "0.1.0"
+dependencies = ["a", "b", "c", "d", "reg"]
+[[package]]
+name = "a"
+version = "0.1.0"
+[[package]]
+name = "b"
+version = "0.1.0"
+[[package]]
+name = "c"
+version = "0.1.0"
+dependencies = ["e"]
+[[package]]
+name = "d"
+version = "0.1.0"
+[[package]]
+name = "e"
+version = "0.1.0"
+[[package]]
+name = "reg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = ["fork 2.0.0"]
+[[package]]
+name = "fork"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+[[package]]
+name = "fork"
+version = "2.0.0"
+"#
+    );
+    let graph = Graph::from(metadata.as_bytes(), &lock);
+    assert_eq!(
+        graph.linked.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["a", "b", "fork", ROOT]
+    );
 }
