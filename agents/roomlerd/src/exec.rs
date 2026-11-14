@@ -811,8 +811,9 @@ impl RunAs {
 /// refusal here — `console_user` with nobody at the screen, `named` on
 /// Windows — is a refusal there too, in the same words.
 ///
-/// #3822 — `async`, so `console_user` asks who is at the screen
-/// ([`console_account`]) from the caller's task, at the same point as before.
+/// #3822 — `async`: `console_user` asks who is at the screen
+/// ([`console_account`]) at the same point as before, after every gate, and on
+/// Linux without holding the caller's async worker.
 pub(crate) async fn apply_run_as(
     cmd: &mut tokio::process::Command,
     who: &RunAs,
@@ -852,7 +853,7 @@ pub(crate) async fn apply_run_as(
         // there, when that person is root, and by a daemon that is neither
         // root nor them.
         #[cfg(unix)]
-        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, false),
+        RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account().await?, false),
         #[cfg(not(any(windows, unix)))]
         RunAs::ConsoleUser => {
             Err("account_mode `console_user` has no console to read on this platform".into())
@@ -877,7 +878,7 @@ pub(crate) async fn apply_run_as_at_home(
         return match who {
             RunAs::Daemon => Ok(()),
             RunAs::Named(account) => unix_priv::drop_to_in(cmd, account, true),
-            RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, true),
+            RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account().await?, true),
         };
     }
     apply_run_as(cmd, who).await
@@ -891,32 +892,93 @@ pub(crate) fn ssh_starts_in_home() -> bool {
 }
 
 /// FR-97 P5a — the account of the person at this machine's screen, for
-/// `console_user` off Windows (D7): logind's seat0 on Linux
-/// (`companion::seat0_user`), the owner of `/dev/console` on macOS
-/// (`companion::console_user_name`). The error names the mode and why
-/// nobody is there.
+/// `console_user` off Windows (D7): logind's seat0 on Linux, the owner of
+/// `/dev/console` on macOS (`companion::console_user_name`). The error names
+/// the mode and why nobody is there.
+///
+/// #3822 — on Linux, logind and the account database are other processes,
+/// and either may not answer (a stopped logind, a stalled SSSD or LDAP). So
+/// the person is asked as a received file asks: through the one seat0 lookup
+/// in flight (`files::ask_seat0`, on a thread named `seat0-lookup`), awaited
+/// from this task, `files::SEAT_LOOKUP_WAIT` (1.5 s) at most, never on the
+/// caller's async worker. Only a person's answer is an account
+/// ([`console_person`]): no answer in time, or a lookup that failed, refuses
+/// with the try-again text, and nothing else ever stands in for the person.
 #[cfg(unix)]
-fn console_account() -> Result<String, String> {
-    // #3822 — a test's seat0 lookup, asked where this asks logind.
-    #[cfg(all(test, target_os = "linux"))]
-    if let Some(stood) = console_stand_in::now() {
-        return stood.ask_here().map_err(|e| {
-            format!(
-                "account_mode `console_user` runs as the person at this machine's screen, and \
-                 cannot here: {e}"
-            )
-        });
-    }
+async fn console_account() -> Result<String, String> {
     #[cfg(target_os = "macos")]
-    let who = crate::companion::console_user_name();
-    #[cfg(not(target_os = "macos"))]
-    let who = crate::companion::seat0_user();
-    who.map_err(|e| {
+    let who = crate::companion::console_user_name().map_err(|e| format!("{e:#}"));
+    #[cfg(target_os = "linux")]
+    let who = {
+        let wait = crate::files::SEAT_LOOKUP_WAIT;
+        // A test stands the lookup in for its own task, with a lookup in
+        // flight of its own.
+        #[cfg(test)]
+        let asked = match console_stand_in::now() {
+            Some(stood) => stood.ask(wait).await,
+            None => crate::files::ask_seat0(wait).await,
+        };
+        #[cfg(not(test))]
+        let asked = crate::files::ask_seat0(wait).await;
+        console_person(asked, wait)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let who: Result<String, String> = Err("this platform has no seat to read".into());
+    who.map_err(|why| {
         format!(
             "account_mode `console_user` runs as the person at this machine's screen, and cannot \
-             here: {e:#}"
+             here: {why}"
         )
     })
+}
+
+/// #3822 — the account `console_user` runs as, from what the seat0 lookup
+/// answered within `wait`: a person's, and nothing else.
+///
+/// - Nobody at the screen says why, in seat0's own words, as before.
+/// - Root at the screen is refused: `console_user` never runs as root.
+/// - A lookup that could not tell who is there, failed, or gave no answer in
+///   time says to try again (`CANNOT_TELL_WHO_IS_AT_THE_SCREEN`, #3711's
+///   words for a received file), with why. The lookup goes on, on its own
+///   thread, and a retry asks again.
+///
+/// No arm gives another account: not root, not the daemon's own, not the
+/// person a lookup found before. A seat0 name that resolves to another uid
+/// than logind's session is nobody (#3688's rule, `files::seat_of`).
+#[cfg(target_os = "linux")]
+fn console_person(
+    asked: crate::one_in_flight::Asked<crate::files::Seat>,
+    wait: std::time::Duration,
+) -> Result<String, String> {
+    use crate::files::Seat;
+    use crate::one_in_flight::Asked;
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN as TRY_AGAIN;
+    match asked {
+        Asked::Answer(Seat::Person { account, .. }) => Ok(account.name),
+        Asked::Answer(Seat::Nobody(why)) => Err(why),
+        Asked::Answer(Seat::Root) => Err(
+            "root is the person signed in at this machine's screen, and console_user never runs \
+             as root; use account_mode `daemon` if running as root is really intended"
+                .into(),
+        ),
+        Asked::Answer(Seat::CannotTell(why)) => {
+            tracing::debug!(%why, "exec: who is at seat0 is not known — console_user is refused");
+            Err(format!("{TRY_AGAIN} ({why})"))
+        }
+        Asked::Failed(why) => {
+            warn!(%why, "exec: the seat0 lookup failed — console_user is refused, try again");
+            Err(format!("{TRY_AGAIN} (the seat0 lookup failed: {why})"))
+        }
+        Asked::OutOfTime | Asked::Answer(Seat::OutOfTime(_)) => {
+            warn!(
+                ?wait,
+                "exec: who is at seat0 gave no answer in time — console_user is refused, try again"
+            );
+            Err(format!(
+                "{TRY_AGAIN} (logind and the account database gave no answer within {wait:?})"
+            ))
+        }
+    }
 }
 
 /// #3822 — the seat0 lookup stood in for `console_user`, for the tasks of one
@@ -926,30 +988,31 @@ fn console_account() -> Result<String, String> {
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod console_stand_in {
     use crate::files::Seat;
+    use crate::one_in_flight::{Asked, OneInFlight};
     use std::sync::Arc;
 
-    /// A seat0 lookup stood in.
+    /// A seat0 lookup stood in, with a lookup in flight of its own: one a
+    /// test holds up never holds up the tests beside it, which ask the
+    /// daemon's (`files::ask_seat0`).
     #[derive(Clone)]
     pub(crate) struct StandIn {
         lookup: Arc<dyn Fn() -> Seat + Send + Sync>,
+        flight: Arc<OneInFlight<Seat>>,
     }
 
     impl StandIn {
         pub(crate) fn new(lookup: impl Fn() -> Seat + Send + Sync + 'static) -> Self {
             Self {
                 lookup: Arc::new(lookup),
+                flight: Arc::new(OneInFlight::new("seat0-lookup")),
             }
         }
 
-        /// The lookup, asked on this thread, as `console_account` asks
-        /// `companion::seat0_user`: the name that would answer, or why not.
-        pub(super) fn ask_here(&self) -> Result<String, String> {
-            match (self.lookup)() {
-                Seat::Person { account, .. } => Ok(account.name),
-                Seat::Root => Ok("root".into()),
-                Seat::Nobody(why) | Seat::CannotTell(why) => Err(why),
-                Seat::OutOfTime(wait) => Err(format!("no answer within {wait:?}")),
-            }
+        /// The lookup, asked as `console_account` asks the daemon's: through
+        /// its own lookup in flight, `wait` at most.
+        pub(super) async fn ask(&self, wait: std::time::Duration) -> Asked<Seat> {
+            let lookup = self.lookup.clone();
+            self.flight.ask(wait, move || lookup()).await
         }
     }
 
@@ -2287,7 +2350,7 @@ mod tests {
         // person at it can honour it, so there this half proves nothing and
         // says so rather than pass.
         #[cfg(unix)]
-        if console_account().is_ok() {
+        if console_account().await.is_ok() {
             eprintln!("skipped: someone is at this machine's screen, so console_user can run");
             return;
         }
