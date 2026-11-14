@@ -1063,10 +1063,10 @@ model on Windows, so the three agree on what the mode means.
 (`exec.rs:819`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
-  `user` (`companion::seat0_account`, `companion.rs:2277`). It is not `graphical_session`, which takes the first
+  `user` (`companion::seat0_account`, `companion.rs:2832`). It is not `graphical_session`, which takes the first
   active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
   read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
-  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:1113`),
+  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:1331`),
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).
@@ -1270,7 +1270,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1612-1628`).
+  test (`ci.yml:1616-1632`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;

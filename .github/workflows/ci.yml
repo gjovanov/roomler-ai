@@ -1485,12 +1485,16 @@ jobs:
       # and `named` are refused within 1.5 s with the try-again text, off the
       # async worker, one lookup in flight; with both answering, the command
       # runs as the runner, the person at its own screen.
+      # #3858: and `companion::tray_start_tests::`: with the process list, the
+      # console's owner, the account database or launchd held up, the tray's
+      # start for a prompt fails within 2.5 s naming the step, off the async
+      # worker, one start in flight; in time, it runs launchctl as today.
       - name: cargo check + test the agent's Mac-only units
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests::
 
       # #3757 — a Mac's root daemon declines the `files` channel of a session
       # no GUI worker serves; every other process serves it as before. In the
