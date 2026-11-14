@@ -402,7 +402,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `postinstall:145-163`, `:401`, `:486` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
 | `postinstall:262-265`, `:301` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
 | `macos_supervisor.rs:850-857` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
-| `agents/roomlerd/src/files.rs:235`, `:5236-5240`, `:5317-5321`, `:7484`; `agents/roomlerd/src/recording/folder.rs:161-162` | `BaseDirs` and `UserDirs`, from `$HOME`: whether a root command reaches them is not read yet | not determined |
+| `agents/roomlerd/src/files.rs:235`, `:5250-5254`, `:5331-5335`, `:7498`; `agents/roomlerd/src/recording/folder.rs:161-162` | `BaseDirs` and `UserDirs`, from `$HOME`: whether a root command reaches them is not read yet | not determined |
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.

@@ -293,7 +293,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | X1 | `exec` and SSH `daemon` mode run as the machine | 🟡 the console worker: the signed-in user on attended installs (#2021) | ✅ root | 🟡 root on the `-daemon` row, the user on the other | Two identities, one per row | FR-94; FR-43 P3 |
-| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:813`), for SSH and exec's `run_as` | P5a |
+| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:817`), for SSH and exec's `run_as` | P5a |
 | X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1379`) | P4b |
 
 ### 2.6 Install, update, ops, architectures
@@ -1009,12 +1009,12 @@ test of the SIGKILL property itself.
   - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
   - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`** (built). `sftp-server` runs through the `CreateProcessAsUserW` + three-pipe path
-  the exec code already uses (`exec::run_console_user_program`, `exec.rs:927`), instead of `tokio::process`
+  the exec code already uses (`exec::run_console_user_program`, `exec.rs:1055`), instead of `tokio::process`
   (`ssh.rs:1379`).
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
-  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3440`). A service starts
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3568`). A service starts
     in System32, where a bare `put` cannot land.
   - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
     channels', so a closed channel or a dropped session kills the tree.
@@ -1056,21 +1056,21 @@ test of the SIGKILL property itself.
 
 `console_user` on Linux and macOS: resolve the active seat's user (Linux: logind's seat0 active session) or the
 console user (macOS: `SCDynamicStoreCopyConsoleUser`) and route into the existing `unix_priv::drop_to`
-(`exec.rs:954-970`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
+(`exec.rs:1082-1098`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
 model on Windows, so the three agree on what the mode means.
 
 **P5a (built).** One rule for SSH's `account_mode` and Fleet RPC's `run_as`, through `apply_run_as`
-(`exec.rs:813`), so exec, the pty and `sftp` all take it:
+(`exec.rs:817`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
-  `user` (`companion::seat0_user`, `companion.rs:1587`). It is not `graphical_session`, which takes the first
+  `user` (`companion::seat0_account`, `companion.rs:1593`). It is not `graphical_session`, which takes the first
   active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
   read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
   `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:1113`),
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).
-- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1246`). A root daemon drops to the person;
+- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1374`). A root daemon drops to the person;
   uid 0 is refused, as for `named`. A per-user daemon whose own account is at the screen runs the command as
   itself, which changes no identity; it could not drop anyway, since `setgroups` needs root even to keep its own
   groups. A per-user daemon whose owner is not at the screen is refused.
@@ -1270,7 +1270,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1580-1596`).
+  test (`ci.yml:1597-1613`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;
