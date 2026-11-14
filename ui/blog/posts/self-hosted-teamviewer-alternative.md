@@ -6,7 +6,9 @@ description: "Why I built Roomler: an open-source, self-hosted TeamViewer altern
 date: 2026-09-25T22:45:13Z
 updated: 2026-09-29T22:20:00Z
 author: goran
-tags: [teamviewer, remote-desktop, self-hosting, open-source, unattended-access]
+tags: [teamviewer, remote-desktop, self-hosting, open-source, unattended-access, teamviewer-alternative]
+hero: self-hosted-teamviewer-alternative-hero.svg
+heroAlt: Your laptop at home shows the office PC's live desktop in a browser tab, encrypted end to end, while nobody is at the office PC and no one-time password is needed
 ogImage: self-hosted-teamviewer-alternative-og.png
 ogImageAlt: A browser tab showing the live desktop of an office PC, connected directly and encrypted end to end
 related: [/docs/compare/teamviewer/, /docs/remote-desktop/unattended-access/, /docs/start/self-hosting/]
@@ -30,7 +32,7 @@ She goes on explaining to me, that she usually receives a TeamViewer one-time-pa
 
 This time however (as many other times), has accidently closed the TeamViewer session and with it she lost the opportunity to finish her important work that night. No one was there at that time at the remote machine, that could send her another one-time password. Had to wait till Monday.
 
-> “There must be a better way “ — she says
+> “There must be a better way” — she says
 
 ⚡That hit me like a thunder.
 
@@ -125,7 +127,7 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull
 docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
 ```
 
-## 🧩 ️Plugins & Add-ons — The Extras
+## 🧩 Plugins & Add-ons — The Extras
 
 - **Secure Mesh Network**: To the **daemon**, that is installed on the remotely controlled machine, optionally (via Rust compile time features) you can inlcude a private WireGuard-style mesh between your machines. Think of it **Tailscale- or Netbird-Alternative** (see: [how it compares to Tailscale](/docs/compare/tailscale/); [how it compares to Netbird](/docs/compare/netbird/)) — more about it in the upcoming posts.
 - **Team Collaboration — Video Conferencing & Chat**: To the **control plane** server, there is optional plug&play team collaboration feature — video conferencing & chat — more about it in the upcoming posts.
