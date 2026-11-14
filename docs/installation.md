@@ -233,7 +233,7 @@ wizard's and `install.ps1`'s) and the tunnel CLI's installers do
 which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
-- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:399`);
 - every self-update, and the daemon's own refresh of its companion (`download_asset`,
   `agents/roomlerd/src/updater.rs:1400`).
 
@@ -1191,7 +1191,7 @@ depends on the run (#3115):
 | A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
 | A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` survives whole: the SystemContext switch and every entry `set-service-env-var` wrote |
 | A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first. From 0.4.200 its `Environment` comes back: the new package reads it before the removal and writes it into the new entry ([below](#what-the-services-environment-keeps-3375)) |
-| An uninstall | `UnregisterService` (`main.wxs:639`) | retired (`lifecycle.rs:384`, `retire`), its `Environment` with it |
+| An uninstall | `UnregisterService` (`main.wxs:641`) | retired (`lifecycle.rs:384`, `retire`), its `Environment` with it |
 
 **The waits are derived from the host's own shutdown**, so the two cannot drift
 apart (`lifecycle.rs:81`, pinned by the test
@@ -1279,20 +1279,20 @@ whatever an operator set there, such as the SFTP kill switch
 `ROOMLERD_SFTP_AS_USER=0` ([roomler-ssh.md](roomler-ssh.md)).
 
 Up to 0.4.199 a major upgrade kept the switch alone. The old product's removal
-ran its `UnregisterService` (`main.wxs:639`), which deleted the service, its
+ran its `UnregisterService` (`main.wxs:641`), which deleted the service, its
 registry key and the `Environment` in it. The new `RegisterService` created an
 entry with none, and the SystemContext action after it wrote the switch back.
 Every other entry lapsed at the next release, and nothing said so.
 
 From 0.4.200 the per-Machine MSI carries the block across with three actions
-(`agents/roomlerd/wix-perMachine/main.wxs:558`), two of them in a custom-action
+(`agents/roomlerd/wix-perMachine/main.wxs:560`), two of them in a custom-action
 DLL, `agents/roomler-msi-ca`:
 
 | Action | Runs | Does |
 |---|---|---|
-| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:346`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:588`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
-| `SetRestoreServiceEnvironment` (`main.wxs:621`) | after `RegisterService` | hands that value to the restore as its `CustomActionData` |
-| `RestoreServiceEnvironment` (`msi.rs:356`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:624`) | puts the carried entries back into the new service's `Environment` and writes it once |
+| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:346`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:590`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
+| `SetRestoreServiceEnvironment` (`main.wxs:623`) | after `RegisterService` | hands that value to the restore as its `CustomActionData` |
+| `RestoreServiceEnvironment` (`msi.rs:356`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:626`) | puts the carried entries back into the new service's `Environment` and writes it once |
 
 Each SystemContext action restarts the service, so what was carried is in
 effect from its first start. The capture belongs to the NEW package, so the
@@ -1324,7 +1324,7 @@ No value reaches a command line or the MSI's log:
 
 - the restore runs in the DLL and reads `CustomActionData`, so `roomlerd.exe`
   never gets the values as arguments;
-- both properties are in `MsiHiddenProperties` (`main.wxs:559`), the restore's
+- both properties are in `MsiHiddenProperties` (`main.wxs:561`), the restore's
   under the action's own name, which is the name Windows Installer logs
   `CustomActionData` under, and the restore is `HideTarget`;
 - the DLL's log lines name entries, never values:
@@ -1342,9 +1342,9 @@ CRT (`+crt-static`) and imports only what Windows ships, so it loads on a
 machine with no VC++ runtime. The release lane reads it out of the built MSI,
 checks its imports with a negative control, and checks that it carries the
 payload's signature (`.github/workflows/release-agent.yml:2202`). `ROOMLER_TEST_CA_FAIL=capture` or
-`=restore` (`main.wxs:561`) fails one of the two on purpose; installer-smoke uses
+`=restore` (`main.wxs:563`) fails one of the two on purpose; installer-smoke uses
 it to show an upgrade completing through either failure
-(`.github/workflows/installer-smoke.yml:1042`). Its only effect is that nothing is
+(`.github/workflows/installer-smoke.yml:1120`). Its only effect is that nothing is
 carried.
 
 ```mermaid
@@ -1389,7 +1389,7 @@ to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6059`,
 
 | The run | The action that runs | What that entry does to the upgrade |
 |---|---|---|
-| `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on | `EnableSystemContext`, `Return="check"` (`main.wxs:450`) | fails it, and the MSI rolls the upgrade back |
+| `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on | `EnableSystemContext`, `Return="check"` (`main.wxs:452`) | fails it, and the MSI rolls the upgrade back |
 | `ENABLE_SYSTEM_CONTEXT=0`, or no property (a hand-run upgrade, or the updater while SystemContext is off) | `DisableSystemContext` or `KeepSystemContext`, both `Return="ignore"` | the upgrade completes, and the service does not reach RUNNING |
 
 The cure in both cases is to remove the entry with
@@ -1465,12 +1465,12 @@ own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:123`):
 
 | Custom action | The verb | When it runs |
 |---|---|---|
-| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:402`, sequenced at `:607`) | `cleanup-legacy-install --target-flavour perMachine` | every install, repair and upgrade, first after `InstallFiles` |
-| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, `:591`) | `service install --as-service` | every install, repair and upgrade, right after `CleanupLegacyPerUser` |
-| `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:445`, `:630`), and its rollback partner `RollbackSystemContext` (`:463`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
-| `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:482`, `:633`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
-| `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:506`, `:636`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
-| `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:639`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
+| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:404`, sequenced at `:609`) | `cleanup-legacy-install --target-flavour perMachine` | every install, repair and upgrade, first after `InstallFiles` |
+| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, `:593`) | `service install --as-service` | every install, repair and upgrade, right after `CleanupLegacyPerUser` |
+| `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:447`, `:632`), and its rollback partner `RollbackSystemContext` (`:465`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
+| `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:484`, `:635`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
+| `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:508`, `:638`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
+| `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:641`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
 
 The order is the built MSI's `InstallExecuteSequence`, not the order of the file.
 `CleanupLegacyPerUser` and `RegisterService` are both `After='InstallFiles'`, and WiX v3 (which
@@ -3128,7 +3128,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
   either flavour and the companion it placed in `C:\Program Files\Roomler`
   (`roomler-desktop.exe` with its `.old` and `.version`). A run that is not
   elevated removes this account's install only, and names what it left with
-  the way on (`scripts/install.ps1:519-531`, #3247). Either way the settings in
+  the way on (`scripts/install.ps1:550-562`, #3247). Either way the settings in
   `C:\ProgramData\roomler` stay, and so does an anchored device's SYSTEM
   service anchor, the registry key `HKLM\SOFTWARE\Roomler\ExecService` (#3737):
   no installer touches `HKLM\SOFTWARE\Roomler`, so an upgrade keeps it too.
