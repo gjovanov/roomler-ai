@@ -679,10 +679,19 @@ pub fn stop_system() -> Result<String> {
 //
 // Schema is pinned to v1.2 (compatible all the way back to Win 7) so
 // the same XML works on every Win10 / Win11 build we ship to.
+//
+// #3801: the task is each account's own, `Roomler-<SID>`, and every path finds
+// it through one rule (`service/user_task.rs`).
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
+pub(crate) mod user_task;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::Schtasks;
+
+#[cfg(target_os = "windows")]
 mod windows {
+    use super::user_task;
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
@@ -698,21 +707,45 @@ mod windows {
         cmd
     }
 
-    /// Canonical scheduled-task name after the P3D rename.
-    pub const NEW_TASK_NAME: &str = "Roomler";
-    /// Pre-rename scheduled-task name, retired best-effort by `install()`
-    /// and deleted by `uninstall()`.
-    // RETIRED-NAME-ANCHOR: without this the pre-rename scheduled task survives an
-    // upgrade forever, so the host runs TWO daemons. See docs/fr/FR-21.
-    pub const LEGACY_TASK_NAME: &str = "RoomlerAgent";
+    /// #3801 — the SID of the account this process runs as, from its token:
+    /// what its task is named for, and what a legacy task's principal must be
+    /// for this process to act on it.
+    fn own_account() -> Result<String> {
+        crate::win_token::own_user_sid().context("reading this process's account from its token")
+    }
+
+    /// #3801 — the task library through `schtasks.exe` from System32: the
+    /// real side of `user_task::Library`.
+    pub(crate) struct Schtasks;
+
+    impl user_task::Library for Schtasks {
+        fn exists(&self, name: &str) -> bool {
+            task_exists(name)
+        }
+
+        fn status(&self, name: &str) -> Result<AutostartStatus> {
+            query_task(name)
+        }
+
+        fn create(&mut self, name: &str, xml: &str) -> Result<()> {
+            create_task(name, xml)
+        }
+
+        fn delete(&mut self, name: &str) -> Result<()> {
+            delete_task(name)
+        }
+    }
 
     /// `enrolled`: a config exists, so a started daemon has something to do. A
     /// fresh MSI has none, and starts nothing until `enroll` and `service start`.
     pub fn install(enrolled: bool) -> Result<()> {
         let exe = std::env::current_exe().context("locating current exe")?;
         let user = current_user_qualified().context("resolving current user")?;
+        let account = own_account()?;
         let mut command = task_command(&exe);
-        if command != exe && applocker_exe_policy_in_force() && launcher_is_blocked(&command, &user)
+        if command != exe
+            && applocker_exe_policy_in_force()
+            && launcher_is_blocked(&command, &user, &account)
         {
             eprintln!(
                 "This machine's AppLocker policy does not let {} start, so the task runs {} \
@@ -730,14 +763,22 @@ mod windows {
         } else {
             String::new()
         };
-        let xml = render_task_xml(&exe_str, &user, &start_soon);
-        let xml_path = write_temp_xml(&xml).context("writing temp XML")?;
+        let name = user_task::autostart(&account);
+        let xml = render_task_xml(&name, &exe_str, &user, &start_soon);
+        // #3801: the account's own task, then a legacy one of its own retired,
+        // never another account's.
+        user_task::register(&mut Schtasks, &account, &xml)
+    }
+
+    /// `schtasks /Create /XML /F`: register `xml` as `name`.
+    fn create_task(name: &str, xml: &str) -> Result<()> {
+        let xml_path = write_temp_xml(xml).context("writing temp XML")?;
 
         let result = schtasks()
             .args([
                 "/Create",
                 "/TN",
-                NEW_TASK_NAME,
+                name,
                 "/XML",
                 xml_path.to_string_lossy().as_ref(),
                 "/F",
@@ -758,43 +799,29 @@ mod windows {
             ));
         }
         let _ = std::fs::remove_file(&xml_path);
-        // New task is registered — retire the pre-rename task best-effort.
-        // Idempotent: a fresh install (no legacy task) just no-ops here.
-        let _ = schtasks()
-            .args(["/Delete", "/TN", LEGACY_TASK_NAME, "/F"])
-            .output();
         Ok(())
     }
 
+    /// Delete this account's tasks, idempotently: its own, and a legacy one
+    /// of its own (#3801), whichever a host carries.
     pub fn uninstall() -> Result<()> {
-        // Delete BOTH the new and legacy tasks. Each tolerates "not found"
-        // so an idempotent uninstall works on a migrated host (only the
-        // new task exists), a pre-rename host (only the legacy), or a
-        // half-migrated host (both).
-        delete_task(NEW_TASK_NAME)?;
-        delete_task(LEGACY_TASK_NAME)?;
-        let _ = delete_task(LAUNCHER_CHECK_TASK);
-        Ok(())
+        user_task::unregister(&mut Schtasks, &own_account()?)
     }
 
-    /// FR-84 D3 — `schtasks /Run` the task: the canonical name, or the
-    /// legacy one on a host that still runs it. A non-admin user may run a
-    /// task registered under their own account, which is how the perUser
-    /// MSI registers it. The scheduler spawns the daemon; this process is
-    /// not its parent.
+    /// FR-84 D3 — `schtasks /Run` this account's task (#3801: its own, or a
+    /// legacy one of its own on a host that still runs it). A non-admin user
+    /// may run a task registered under their own account, which is how the
+    /// perUser MSI registers it. The scheduler spawns the daemon; this
+    /// process is not its parent.
     pub fn start() -> Result<()> {
-        let name = if task_exists(NEW_TASK_NAME) {
-            NEW_TASK_NAME
-        } else if task_exists(LEGACY_TASK_NAME) {
-            LEGACY_TASK_NAME
-        } else {
+        let Some(name) = user_task::own_autostart(&Schtasks, &own_account()?) else {
             bail!(
                 "no auto-start task is registered (run `roomlerd service install` first, \
                  or start the service from an elevated prompt)"
             );
         };
         let output = schtasks()
-            .args(["/Run", "/TN", name])
+            .args(["/Run", "/TN", name.as_str()])
             .output()
             .context("running schtasks /Run")?;
         if !output.status.success() {
@@ -889,13 +916,10 @@ mod windows {
         (ok != 0).then_some(session)
     }
 
-    /// `schtasks /End` the registered task: a hard stop.
+    /// `schtasks /End` this account's task (#3801: never another account's):
+    /// a hard stop.
     fn end_task() -> Result<()> {
-        let name = if task_exists(NEW_TASK_NAME) {
-            NEW_TASK_NAME
-        } else if task_exists(LEGACY_TASK_NAME) {
-            LEGACY_TASK_NAME
-        } else {
+        let Some(name) = user_task::own_autostart(&Schtasks, &own_account()?) else {
             bail!(
                 "no per-user auto-start task is registered, so there is no task to end. A \
                  device that runs as the Roomler service stops with `roomlerd service stop \
@@ -903,7 +927,7 @@ mod windows {
             );
         };
         let output = schtasks()
-            .args(["/End", "/TN", name])
+            .args(["/End", "/TN", name.as_str()])
             .output()
             .context("running schtasks /End")?;
         if !output.status.success() {
@@ -986,13 +1010,10 @@ mod windows {
         !String::from_utf8_lossy(&out.stdout).contains(name)
     }
 
+    /// This account's task (#3801): its own first, then a legacy one of its
+    /// own, so a host from before the rename still reports Installed.
     pub fn status() -> Result<AutostartStatus> {
-        // Query the new task first; fall back to the legacy task so a
-        // pre-rename host mid-migration still reports Installed.
-        match query_task(NEW_TASK_NAME)? {
-            AutostartStatus::NotInstalled => query_task(LEGACY_TASK_NAME),
-            other => Ok(other),
-        }
+        user_task::status(&Schtasks, &own_account()?)
     }
 
     fn query_task(name: &str) -> Result<AutostartStatus> {
@@ -1062,9 +1083,6 @@ mod windows {
         }
     }
 
-    /// Registered only for the seconds [`launcher_is_blocked`] runs. One that a killed
-    /// install leaves behind starts nothing that matters, and the next one replaces it.
-    const LAUNCHER_CHECK_TASK: &str = "Roomler launcher check";
     /// `ERROR_ACCESS_DISABLED_BY_POLICY`, a task's result when policy refuses its file.
     const BLOCKED_BY_POLICY: u32 = 0x8007_04EC;
     /// `SCHED_S_TASK_HAS_NOT_RUN`: the check has not started yet.
@@ -1084,9 +1102,14 @@ mod windows {
     /// (measured: the blocked launcher ran every action). A task is the one start with
     /// the token the real task gets, so a throwaway one tries it, for seconds. Only a
     /// clear block answers true: a person who is not signed in keeps the launcher.
-    fn launcher_is_blocked(launcher: &Path, user: &str) -> bool {
-        const TASK: &str = LAUNCHER_CHECK_TASK;
-        let xml = render_launcher_check_xml(&launcher.to_string_lossy(), user);
+    ///
+    /// The check is a task of the account's own (`user_task::launcher_check`, #3801),
+    /// registered only for the seconds this runs. One that a killed install leaves
+    /// behind starts nothing that matters, and the account's next one replaces it.
+    fn launcher_is_blocked(launcher: &Path, user: &str, account: &str) -> bool {
+        let task = user_task::launcher_check(account);
+        let task = task.as_str();
+        let xml = render_launcher_check_xml(task, &launcher.to_string_lossy(), user);
         let Ok(path) = write_temp_xml(&xml) else {
             return false;
         };
@@ -1097,30 +1120,33 @@ mod windows {
         let created = ok(&[
             "/Create",
             "/TN",
-            TASK,
+            task,
             "/XML",
             &path.to_string_lossy(),
             "/F",
         ]);
         let _ = std::fs::remove_file(&path);
         let mut result = None;
-        if created.is_some() && ok(&["/Run", "/TN", TASK]).is_some() {
+        if created.is_some() && ok(&["/Run", "/TN", task]).is_some() {
             for _ in 0..20 {
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                result = ok(&["/Query", "/TN", TASK, "/V", "/FO", "CSV", "/NH"])
+                result = ok(&["/Query", "/TN", task, "/V", "/FO", "CSV", "/NH"])
                     .and_then(|o| last_result(&String::from_utf8_lossy(&o.stdout)));
                 if result.is_some_and(|r| r != TASK_HAS_NOT_RUN) {
                     break;
                 }
             }
         }
-        let _ = ok(&["/Delete", "/TN", TASK, "/F"]);
+        let _ = ok(&["/Delete", "/TN", task, "/F"]);
         result == Some(BLOCKED_BY_POLICY)
     }
 
     /// The real task with one change: what it asks the launcher to do.
-    fn render_launcher_check_xml(launcher: &str, user: &str) -> String {
-        render_task_xml(launcher, user, "").replace("run --supervisor task", "--version")
+    fn render_launcher_check_xml(name: &str, launcher: &str, user: &str) -> String {
+        // RED (#3801): the document keeps the URI it always had.
+        let _ = name;
+        render_task_xml(user_task::SHARED, launcher, user, "")
+            .replace("run --supervisor task", "--version")
     }
 
     /// The `Last Result` of a `schtasks /Query /V /FO CSV /NH` listing: the seventh
@@ -1159,10 +1185,11 @@ mod windows {
             .collect()
     }
 
-    /// Build the Task Scheduler XML that `schtasks /XML` consumes.
-    /// Pure function — no I/O — so the test suite can pin the shape
-    /// without touching the registry.
-    fn render_task_xml(exe_path: &str, user: &str, start_soon: &str) -> String {
+    /// Build the Task Scheduler XML that `schtasks /XML` consumes, for the task
+    /// `name` (its `<URI>`). Pure function — no I/O — so the test suite can pin
+    /// the shape without touching the registry.
+    fn render_task_xml(name: &str, exe_path: &str, user: &str, start_soon: &str) -> String {
+        let name_xml = xml_escape(name);
         let exe_xml = xml_escape(exe_path);
         let user_xml = xml_escape(user);
         // Schema 1.2 is the broadest compatible version (Win 7+). The
@@ -1174,7 +1201,7 @@ mod windows {
   <RegistrationInfo>
     <Author>roomlerd</Author>
     <Description>Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control (auto-start on logon).</Description>
-    <URI>\Roomler</URI>
+    <URI>\{name_xml}</URI>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -1255,9 +1282,13 @@ mod windows {
     mod tests {
         use super::*;
 
+        /// A made-up account's task, and its launcher check (#3801).
+        const TASK: &str = "Roomler-S-1-5-21-1111111111-2222222222-3333333333-1001";
+        const CHECK: &str = "Roomler launcher check-S-1-5-21-1111111111-2222222222-3333333333-1001";
+
         #[test]
         fn xml_template_pins_resilience_settings() {
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
+            let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", "");
             // The five settings the resilience plan was specifically
             // about — losing any of these is the regression we're
             // guarding against.
@@ -1289,7 +1320,7 @@ mod windows {
             // Win-version compat), so these are out — the resilience-
             // critical settings (RestartOnFailure, battery, etc.)
             // are all Schema 1.2 native and survive.
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
+            let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", "");
             assert!(
                 !xml.contains("DisallowStartOnRemoteAppSession"),
                 "DisallowStartOnRemoteAppSession is Schema 1.3+; must not appear in a 1.2 document"
@@ -1302,7 +1333,7 @@ mod windows {
 
         #[test]
         fn xml_template_escapes_special_chars_in_paths_and_user() {
-            let xml = render_task_xml("C:\\Users\\Joe & Sons\\app.exe", "DOM\\joe<sons", "");
+            let xml = render_task_xml(TASK, "C:\\Users\\Joe & Sons\\app.exe", "DOM\\joe<sons", "");
             assert!(
                 xml.contains("Joe &amp; Sons"),
                 "ampersand should be entity-encoded"
@@ -1325,7 +1356,7 @@ mod windows {
         /// refuses to restart.
         #[test]
         fn xml_template_marks_the_worker_as_task_supervised() {
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
+            let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", "");
             assert!(
                 xml.contains("<Arguments>run --supervisor task</Arguments>"),
                 "the task action must carry the supervisor flag: {xml}"
@@ -1348,7 +1379,7 @@ mod windows {
             assert_eq!(soon.matches("<TimeTrigger>").count(), 3);
             assert_eq!(soon.matches("<Enabled>true</Enabled>").count(), 3);
 
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", &soon);
+            let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", &soon);
             let triggers_end = xml.find("</Triggers>").unwrap();
             let last_event = xml.find("</EventTrigger>").unwrap();
             let first_time = xml.find("<TimeTrigger>").unwrap();
@@ -1364,7 +1395,7 @@ mod windows {
         /// starting the companion's first run.
         #[test]
         fn a_registration_with_no_config_starts_nothing() {
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
+            let xml = render_task_xml(TASK, "C:\\path\\agent.exe", "DOMAIN\\user", "");
             assert!(!xml.contains("<TimeTrigger>"), "{xml}");
             assert!(xml.contains("<LogonTrigger>") && xml.contains("</Triggers>"));
         }
@@ -1380,7 +1411,7 @@ mod windows {
             let launcher = dir.path().join("roomlerdw.exe");
             std::fs::write(&launcher, b"x").unwrap();
             assert_eq!(task_command(&exe), launcher);
-            let xml = render_task_xml(&task_command(&exe).to_string_lossy(), "DOM\\u", "");
+            let xml = render_task_xml(TASK, &task_command(&exe).to_string_lossy(), "DOM\\u", "");
             assert!(xml.contains("roomlerdw.exe</Command>"), "{xml}");
             assert!(
                 xml.contains("<Arguments>run --supervisor task</Arguments>"),
@@ -1408,7 +1439,7 @@ mod windows {
 
         #[test]
         fn the_launcher_check_only_asks_for_a_version() {
-            let xml = render_launcher_check_xml("C:\\P\\roomlerdw.exe", "DOM\\u");
+            let xml = render_launcher_check_xml(CHECK, "C:\\P\\roomlerdw.exe", "DOM\\u");
             assert!(xml.contains("<Arguments>--version</Arguments>"), "{xml}");
             assert!(xml.contains("<Command>C:\\P\\roomlerdw.exe</Command>"));
             assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
