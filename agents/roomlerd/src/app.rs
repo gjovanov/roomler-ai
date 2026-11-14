@@ -1281,6 +1281,7 @@ fn answer_stall_watch_cost() -> Option<i32> {
 /// clean shutdown is a `process::exit` after its drain.
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
 pub fn main() -> Result<()> {
+    roomlerd::one_row_home::answer_if_asked();
     if let Some(code) = answer_stall_watch_cost() {
         std::process::exit(code);
     }
@@ -1362,6 +1363,7 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    roomlerd::one_row_home::answer_if_asked();
     // #3702 — on the service account, the process's folder variables are the
     // machine's and the service account's own, before this process has a
     // second thread: the runtime below starts its workers.

@@ -35,9 +35,9 @@ spec designs the whole of it and returns no option to him.
 
 | # | macOS says | Raised by | When |
 |---|---|---|---|
-| 1 | "Screen Recording" / "“roomlerd” would like to record this computer's screen and audio." [Open System Settings] [Deny] | the agent's start-up preflight (code: `agents/roomlerd/src/app.rs:3751-3783`, run at `:3943`; `CGRequestScreenCaptureAccess`, `crates/agent-core/src/tcc.rs:64-66`), which also opens the pane (`app.rs:3772`) | 51 s after the install's password (10 Nov); on 0.4.211 the alert and System Settings cover the wizard's Done page completely (11 Nov) |
-| 2 | the switch, then the password, then "“roomlerd” may not be able to record the contents of your screen until it is quit." [Quit & Reopen] [Later]; after Quit & Reopen, Finder: "The application “roomlerd” is not open anymore." [OK] | macOS; the restart is ours (`agents/roomlerd/src/macos_quit.rs:3-74`), Finder's error comes from LaunchServices' reopen, whose process leaves at once (`app.rs:3794`) | every first grant (2 Nov, 10 Nov, 11 Nov) |
-| 3 | "Device Control and Data Access" / "“roomlerd” would like to control this Mac and access your data." [Open System Settings] [Deny] | the relaunched agent's preflight (`app.rs:3753`); macOS 27's pane for Accessibility | 1 s after the relaunch, under Finder's false error (10 Nov); it stays on screen after the grant until answered (11 Nov) |
+| 1 | "Screen Recording" / "“roomlerd” would like to record this computer's screen and audio." [Open System Settings] [Deny] | the agent's start-up preflight (code: `agents/roomlerd/src/app.rs:3753-3785`, run at `:3945`; `CGRequestScreenCaptureAccess`, `crates/agent-core/src/tcc.rs:64-66`), which also opens the pane (`app.rs:3774`) | 51 s after the install's password (10 Nov); on 0.4.211 the alert and System Settings cover the wizard's Done page completely (11 Nov) |
+| 2 | the switch, then the password, then "“roomlerd” may not be able to record the contents of your screen until it is quit." [Quit & Reopen] [Later]; after Quit & Reopen, Finder: "The application “roomlerd” is not open anymore." [OK] | macOS; the restart is ours (`agents/roomlerd/src/macos_quit.rs:3-74`), Finder's error comes from LaunchServices' reopen, whose process leaves at once (`app.rs:3796`) | every first grant (2 Nov, 10 Nov, 11 Nov) |
+| 3 | "Device Control and Data Access" / "“roomlerd” would like to control this Mac and access your data." [Open System Settings] [Deny] | the relaunched agent's preflight (`app.rs:3755`); macOS 27's pane for Accessibility | 1 s after the relaunch, under Finder's false error (10 Nov); it stays on screen after the grant until answered (11 Nov) |
 | 4 | "“roomlerd” is requesting to bypass the system private window picker and directly access your screen and audio." [Allow] [Open System Settings] | the first capture of a session; nothing in our code handles it (#3240 row 3) | at the first remote session (2 Nov, 11 Nov); macOS's own record sets the next one 30 days later (11 Nov, read from replayd's file, not seen) |
 | 5 | "Allow “roomlerd” to find devices on local networks?" [Don't Allow] [Allow] | the session's network paths (below) | at the first remote session (2 Nov, 11 Nov) |
 
@@ -149,7 +149,7 @@ what is missing.
   stay up (which process the verb restarts on a one-row Mac is to verify in P1). "Live" counts everything the
   restarted process serves: a remote-control session, an SSH session, a tunnel forward. The step's text before the
   switch: "macOS will offer Quit & Reopen: choose Later. Roomler restarts roomlerd for you." For a person who chooses
-  Quit & Reopen anyway, the process LaunchServices starts (`app.rs:3824`) takes LaunchServices' open event before it
+  Quit & Reopen anyway, the process LaunchServices starts (`app.rs:3826`) takes LaunchServices' open event before it
   leaves, so Finder has nothing to report (#3240 row 9 was triaged "Discard" as owned by the OS; the operator's
   decision takes it back; that the open event is what Finder waits for is to verify in the field).
 - **Where it lives.** The companion's banner (`index.html:102-130`) becomes this section; its "or choose Quit &
@@ -169,7 +169,7 @@ what is missing.
   controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
   caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other
   app's grants.
-- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:3973`), so after
+- **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:3975`), so after
   our own update and after a macOS update without a separate trigger; and when a session's capture fails with
   `permission`.
 

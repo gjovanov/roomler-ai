@@ -3478,7 +3478,9 @@ pub fn machine_global_config_path() -> PathBuf {
 
 /// Sibling copy of the last config that both saved AND parsed, kept so an
 /// unreadable live file can be recovered without re-enrolling the host.
-fn prev_path(path: &std::path::Path) -> PathBuf {
+/// Public for a writer that keeps the outgoing config itself under the name
+/// [`load`] recovers from (`roomlerd one-row-home convert`).
+pub fn prev_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("toml.prev")
 }
 
@@ -3880,29 +3882,48 @@ fn parse_failure(raw: &str, e: &toml::de::Error) -> String {
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
+    parse_raw(&raw, &path.display().to_string())
+}
+
+/// FR-147 — a config's text, parsed by [`try_load`]'s rules, for a reader
+/// that holds the bytes and not the file: `sudo roomlerd one-row` parses what
+/// a person's own process read in that person's home. `origin` names the
+/// text in errors and log lines in place of a path. The keys this build does
+/// not know are noted from the text itself. No `.prev` repair: that rewrite
+/// ([`load`]'s) belongs to the file's own agent.
+pub fn parse_text(raw: &str, origin: &str) -> Result<AgentConfig> {
+    let cfg = parse_raw(raw, origin)?;
+    if let Some(keys) = unknown_keys_said(raw) {
+        tracing::warn!(
+            origin = %origin,
+            keys = %keys,
+            "config keys this build does not know: ignored here, and kept in the file through every save"
+        );
+    }
+    Ok(cfg)
+}
+
+/// What [`try_load`] does with the text it read, `origin` standing for its
+/// path: every reader parses through here.
+fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
     // An all-NUL file of the correct length is the signature of a power loss
     // between `rename` and the data reaching disk. `toml` reports it as a
     // parse error at line 1, which reads like a hand-edit typo; name it.
     if !raw.is_empty() && raw.bytes().all(|b| b == 0) {
         anyhow::bail!(
             "config at {} is {} bytes of NUL (truncated by an unclean shutdown)",
-            path.display(),
+            origin,
             raw.len()
         );
     }
-    let mut cfg: AgentConfig = toml::from_str(&raw).map_err(|e| {
-        anyhow::anyhow!(
-            "parsing config at {}: {}",
-            path.display(),
-            parse_failure(&raw, &e)
-        )
-    })?;
+    let mut cfg: AgentConfig = toml::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("parsing config at {}: {}", origin, parse_failure(raw, &e)))?;
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
     for (field, was) in cfg.secure_server_urls() {
         tracing::warn!(
-            path = %path.display(),
+            path = %origin,
             field = %field,
             was = %was,
             "a plaintext server URL in the config is read as TLS; set \
@@ -4118,6 +4139,10 @@ fn private_text(file: &std::path::Path) -> Option<String> {
 /// after the save's own repair): what any other account could have put in a
 /// file there never reaches the machine config, as the fold refuses such a
 /// config ([`read_merge_base`]).
+///
+/// This half chooses the base and reads it; [`keep_unknown_keys`] makes the
+/// text from what it read, as it does for [`serialise_over`], which is handed
+/// the outgoing bytes and reads no file.
 fn serialise_for(
     path: &std::path::Path,
     base: &std::path::Path,
@@ -4155,10 +4180,25 @@ fn serialise_for(
         );
         return Ok(plain);
     };
+    Ok(keep_unknown_keys(path, base, &raw, plain, &unknown).0)
+}
+
+/// #2078 — `plain`, the text of the config being saved, with every key of
+/// `unknown` copied in from `raw`, the text of `base` it replaces at `path`;
+/// and the dotted names of those keys it could not keep. `plain` alone when
+/// `unknown` is empty, and when the merge fails (every key is then one it did
+/// not keep). A key not kept is said, with a fixed string.
+fn keep_unknown_keys(
+    path: &std::path::Path,
+    base: &std::path::Path,
+    raw: &str,
+    plain: String,
+    unknown: &[Vec<KeyStep>],
+) -> (String, Vec<String>) {
     if unknown.is_empty() {
-        return Ok(plain);
+        return (plain, Vec::new());
     }
-    match merge_unknown_keys(&raw, &plain, &unknown) {
+    match merge_unknown_keys(raw, &plain, unknown) {
         Ok((merged, lost)) => {
             if !lost.is_empty() {
                 tracing::warn!(
@@ -4169,7 +4209,7 @@ fn serialise_for(
                      the org, route or table that held them is not in it"
                 );
             }
-            Ok(merged)
+            (merged, lost)
         }
         Err(why) => {
             let keys: Vec<String> = unknown.iter().map(|s| dotted(s)).collect();
@@ -4180,9 +4220,30 @@ fn serialise_for(
                 why,
                 "config keys this build does not know were NOT kept through this save"
             );
-            Ok(plain)
+            (plain, keys)
         }
     }
+}
+
+/// FR-147 — the text [`save`] writes over a config file that holds
+/// `outgoing`, made from those bytes alone: it reads no file. For a caller
+/// that has read the live file once and checked it, and must write over the
+/// bytes it checked and nothing read later (`roomlerd one-row-home convert`).
+/// Also returns the dotted names of the keys this build does not know that it
+/// could not keep; `origin` names the file where that is said. An `outgoing`
+/// that does not read as a config holds no key this can see: the text is
+/// `cfg` alone, as [`save`] writes when neither the file nor its last good
+/// copy reads.
+pub fn serialise_over(
+    cfg: &AgentConfig,
+    outgoing: &str,
+    origin: &std::path::Path,
+) -> Result<(String, Vec<String>)> {
+    let plain = toml::to_string_pretty(cfg).context("serialising config")?;
+    let Some(unknown) = unknown_keys(outgoing) else {
+        return Ok((plain, Vec::new()));
+    };
+    Ok(keep_unknown_keys(origin, origin, outgoing, plain, &unknown))
 }
 
 /// #2078 — names the keys this build ignores in the config it runs on, once per
@@ -4233,18 +4294,9 @@ fn note_unknown_keys(path: &PathBuf) {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
-    let Some(unknown) = unknown_keys(&raw) else {
+    let Some(keys) = unknown_keys_said(&raw) else {
         return;
     };
-    let keys = unknown
-        .iter()
-        .map(|s| dotted(s))
-        .filter(|k| !is_retired_key(k))
-        .collect::<Vec<_>>();
-    if keys.is_empty() {
-        return;
-    }
-    let keys = keys.join(", ");
     {
         let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
         if noted.iter().any(|(p, k)| p == path && *k == keys) {
@@ -4257,6 +4309,18 @@ fn note_unknown_keys(path: &PathBuf) {
         keys = %keys,
         "config keys this build does not know: ignored here, and kept in the file through every save"
     );
+}
+
+/// The keys in `raw` this build does not know, the retired ones left out,
+/// joined for one log line. `None` when there are none, or `raw` does not
+/// parse as a config.
+fn unknown_keys_said(raw: &str) -> Option<String> {
+    let keys = unknown_keys(raw)?
+        .iter()
+        .map(|s| dotted(s))
+        .filter(|k| !is_retired_key(k))
+        .collect::<Vec<_>>();
+    (!keys.is_empty()).then(|| keys.join(", "))
 }
 
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
@@ -4847,6 +4911,51 @@ machine_name = "devbox"
         .to_string()
     }
 
+    /// FR-147 — `parse_text` is `try_load` without the file: the same config
+    /// from the same text, the same TLS rule, a key this build does not know
+    /// still ignored, and nothing read or written beside it.
+    #[test]
+    fn parse_text_reads_what_try_load_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = format!(
+            "{}\nnot_a_key_of_this_build = 1\n",
+            minimal_toml().replace("https://roomler.ai", "http://roomler.example")
+        );
+        std::fs::write(&path, &text).unwrap();
+        let from_file = try_load(&path).expect("try_load");
+        let from_text = parse_text(&text, "the person's config").expect("parse_text");
+        assert_eq!(
+            toml::to_string(&from_text).unwrap(),
+            toml::to_string(&from_file).unwrap()
+        );
+        assert!(
+            from_text.server_url.starts_with("https://roomler.example"),
+            "{}",
+            from_text.server_url
+        );
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "parse_text left nothing beside the file");
+    }
+
+    /// Its errors name `origin`, never a path, and keep `try_load`'s words:
+    /// the NUL signature, and a parse error by line with no quoted text.
+    #[test]
+    fn parse_text_names_its_origin_in_its_errors() {
+        let nul = format!(
+            "{:#}",
+            parse_text("\0\0\0\0", "uid 501's config").unwrap_err()
+        );
+        assert!(nul.contains("uid 501's config is 4 bytes of NUL"), "{nul}");
+        let broken = "server_url = \"https://roomler.ai\"\nagent_token = \"secret-value\n";
+        let said = format!("{:#}", parse_text(broken, "uid 501's config").unwrap_err());
+        assert!(
+            said.starts_with("parsing config at uid 501's config: TOML parse error at line"),
+            "{said}"
+        );
+        assert!(!said.contains("secret-value"), "{said}");
+    }
+
     /// Locks the devbox incident (2026-08-12): an unclean shutdown left
     /// config.toml the right LENGTH and entirely NUL, and the worker exit-1'd
     /// every 60 s for hours because a bricked config had no recovery path.
@@ -5104,6 +5213,51 @@ machine_name = "devbox"
             std::fs::read_to_string(&path).unwrap(),
             toml::to_string_pretty(&cfg).unwrap()
         );
+    }
+
+    /// FR-147 — what [`serialise_over`] makes from the bytes a caller holds is
+    /// exactly what [`save`] writes over a file holding them: with nothing
+    /// unknown in them, with a key this build does not know, and with one it
+    /// cannot keep, which it names.
+    #[test]
+    fn serialise_over_makes_what_a_save_writes_over_the_same_bytes() {
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        let plain = toml::to_string_pretty(&cfg).unwrap();
+        let mut with_gone = cfg.clone();
+        with_gone.orgs.push(org_fixture("gone", "tid-gone"));
+        let mut table: toml::Table =
+            toml::from_str(&toml::to_string_pretty(&with_gone).unwrap()).unwrap();
+        table["orgs"].as_array_mut().unwrap()[1]
+            .as_table_mut()
+            .unwrap()
+            .insert("a_key_from_a_newer_build".into(), 1.into());
+        let in_a_gone_org = toml::to_string_pretty(&table).unwrap();
+        let cases = [
+            ("nothing unknown", plain.clone(), false, Vec::<&str>::new()),
+            (
+                "a key this build does not know",
+                format!("a_key_from_a_newer_build = 1\n{plain}"),
+                true,
+                Vec::new(),
+            ),
+            (
+                "a key in an org this save no longer holds",
+                in_a_gone_org,
+                false,
+                vec!["orgs.1.a_key_from_a_newer_build"],
+            ),
+        ];
+        for (case, outgoing, kept, lost) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &outgoing).unwrap();
+            let (made, not_kept) = serialise_over(&cfg, &outgoing, &path).unwrap();
+            save(&path, &cfg).unwrap();
+            assert_eq!(made, std::fs::read_to_string(&path).unwrap(), "{case}");
+            assert_eq!(made.contains("a_key_from_a_newer_build"), kept, "{case}");
+            assert_eq!(not_kept, lost, "{case}");
+        }
     }
 
     /// #2078 — a key a newer build wrote into an org's entry follows THAT org,

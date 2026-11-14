@@ -110,7 +110,7 @@ working two-row.
 | Keep | writes root's records, in root's tree only | nothing: no `.pre-one-row` in a home |
 | LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as today (`:1395-1407`) | the plist is removed by `convert` |
 | Root's file | `config::save` of `/etc/roomler/config.toml`, as today | nothing |
-| People's files | nothing | `convert`: removes `<P>` and saves its config with the enrollments taken out (`without_enrollments`, `:265-277`) through its own `config::save`, each only over the bytes root kept. The files are born the person's |
+| People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:265-277`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and those bytes are kept as the config's `.prev`, 0600, as a save keeps the outgoing file; it reads no file again by path. The files are born the person's |
 | Restart, verify, report | as today (`:731-739`, `:797-892`) | nothing |
 | Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then the bootstrap (D6) |
 | `--revert` | its file back from its kept copy; its records removed after the restart answers | `put-back`, or `put-back-legacy` on a Mac converted by 0.4.200 to 0.4.219 |
@@ -144,11 +144,11 @@ sequenceDiagram
 |---|---|---|
 | Program | `/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`, the package's binary (`scripts/install.sh:134`), never `current_exe()`. Started only when `lstat` reads a regular file of uid 0 that group and others cannot write | the binary of root's own tree, whatever path the command was typed by |
 | Arguments | `one-row-home <verb> --uid <uid> --gid <pw_gid> --version <its version> [the verb's]` | the child checks itself against them |
-| Dispatch | read from the raw argv as the first statement of both `main`s (`agents/roomlerd/src/app.rs:1283`, `:1364`), before `answer_stall_watch_cost` (`:1284`, `:1370`), any runtime and AppKit (`:1299-1333`). Synchronous: no tokio, no `logging::init` (`:1588`), no legacy-tree migration (`:1549`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
+| Dispatch | read from the raw argv as the first statement of both `main`s (`agents/roomlerd/src/app.rs:1283`, `:1365`), before `answer_stall_watch_cost` (`:1285`, `:1372`), any runtime and AppKit (`:1300-1334`). Synchronous: no tokio, no `logging::init` (`:1590`), no legacy-tree migration (`:1551`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
 | Credentials | set by our own `pre_exec` hook, not by `Command::uid` and `Command::gid` | std empties the group list, and macOS turns an empty list into `[0]`: the child would keep group 0 |
 | Environment | `env_clear()` | the child reads no `HOME` and no knob. Its home is `appdirs::own_home()` (`appdirs.rs:862`), the account database's home for its own uid |
 | Working directory | `/` | a folder of root's, whatever the caller's was |
-| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:216-228`) | the child holds none of root's open files |
+| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:367-379`) | the child holds none of root's open files |
 | Session, umask | `setsid()`, `umask(0o077)` | no controlling terminal; files born private |
 
 The hook allocates nothing and runs, each call checked (a failure is `spawn`'s error, and nothing runs): `setsid()`,
@@ -193,7 +193,7 @@ with "nothing has changed" (exit 1).
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
 | R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3825's person-run line, built from the child's report (`folder_not_theirs`, `macos_supervisor.rs:724`). P2 replaces it |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
-| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2. Without R4 the worker's first save (`app.rs:3956`) fails after the restart, and the conversion undoes itself |
+| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2. Without R4 the worker's first save (`app.rs:3958`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
@@ -253,31 +253,32 @@ Today root's own kept copy is written in place, at its final name (`one_row.rs:1
 
 ### Root and the person's child
 
-Every reply is one JSON object with `"v":1`, `version`, `uid`, `gid` and `groups`, plus the verb's fields. It is
-parsed with unknown fields refused.
+Every reply is one JSON object with `"v":1`, `version`, `uid`, `gid` and `groups`, and the verb's answer under the
+verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
 
 | Verb | stdin | Reply | Exit |
 |---|---|---|---|
-| `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path, and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and for the last two whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode; `legacy`: which old copies exist | 0 |
-| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the new config's sha256; whether the plist was removed | 0; 3 when either live file is not the expected bytes (it checks both before it changes either) |
+| `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path (it starts with `/` and does not end with one), and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and for the last two whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode, where a link reads as `not_regular`; `legacy`: each name an old copy is kept under, reported as a folder is: kind, uid, mode and whether the person can write it (`other` with no uid and no mode when it could not be looked at) | 0 |
+| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the sha256 of the config it wrote; whether the plist was removed | 0; 3 when either live file is not the expected bytes, or is no longer a regular file (it checks both before it changes either) |
 | `put-back` | the kept bytes and modes of both files | the sha256 of each file written | 0; 4 when `<L>` is not writable |
-| `put-back-legacy` | none | which old copies it moved | 0; 4 as in `--revert` below |
+| `put-back-legacy` | none | which old copies it moved | 0; 3 when anything but a file is at an old copy's name, and then nothing is renamed; 4 as in `--revert` below |
 | all | | | 2: usage, a failed identity check or another version; 4: not writable (stderr: path, owner, mode); 1: any other error |
 
 - **Bounds.** A config of 256 KiB and a plist of 64 KiB; larger is exit 1. Root sends at most 1 MiB, reads at most
   1 MiB of stdout, and keeps 16 KiB of stderr while draining the rest.
 - **Transport.** `tunnel_core::child::output_bounded_fed(cmd, stdin, deadline, cap)`, new beside `output_bounded`
-  (`child.rs:75-95`, whose stdin is `/dev/null` and whose cap is 16 MiB, `:46`). stdin is written from its own
+  (`child.rs:86-111`, whose stdin is `/dev/null` and whose cap is 16 MiB, `:48`). stdin is written from its own
   thread, then closed, and a broken pipe fails the step. The deadline is 30 s and the cap 1 MiB; at the deadline the
   child is killed and reaped.
 - **The child's reads** open with `O_NONBLOCK`, check that the file is a regular one, and read at most the bound
   plus one byte: a FIFO, a device or a huge file is an error, not a wait. Its writes are a temporary file in the same
   folder, `fsync`, `rename`, as `config::save` does. `put-back` makes the plist with its recorded mode less group
   and other write (0644 when none was recorded), and `<L>` 0755 when it is missing: launchd ignores a plist that
-  group or others can write, and the package sets 644 (`postinstall:335-336`).
+  group or others can write, and the package sets 644 (`postinstall:335-336`). It writes the config with its
+  recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:3880-3900`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4231-4234`), and no `.prev` repair, which belongs to the person's own agent
+  (`crates/agent-core/src/config.rs:3882-3921`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4292-4295`), and no `.prev` repair, which belongs to the person's own agent
   (`:3505-3517`). A config that does not parse stops Read, as today (`one_row.rs:1240-1242`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
@@ -535,7 +536,7 @@ Each carries its recommendation and awaits the operator.
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3505-3517`) could bring it back: its own issue.
+  previous file), and the person's agent's `.prev` repair (`config.rs:3507-3519`) could bring it back: its own issue.
 - Linux and Windows: their root steps take their folders from the system already (#3702). The uninstall's Linux arm
   (`scripts/install.sh:1885-1894`) removes people's folders as root the same way, and is not in this FR.
 

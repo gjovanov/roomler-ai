@@ -870,7 +870,50 @@ pub fn own_home() -> Option<PathBuf> {
 /// folder through it ([`macos_config_dir_in_home`]).
 #[cfg(unix)]
 pub fn account_home(uid: u32) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
+    with_passwd(uid, |entry| {
+        // SAFETY: the entry's strings point into the buffer `with_passwd`
+        // holds for this call.
+        let home = PathBuf::from(unsafe { passwd_text(entry.pw_dir) }?);
+        home.is_absolute().then_some(home)
+    })
+}
+
+/// FR-147 — an account as the account database names it (`getpwuid_r`),
+/// never the environment: what `sudo roomlerd one-row` starts a person's own
+/// process with ([`account_entry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountEntry {
+    pub uid: u32,
+    /// `pw_name`, as the database spells it.
+    pub name: std::ffi::OsString,
+    /// `pw_gid`: the account's primary group.
+    pub gid: u32,
+    /// `pw_dir`, as the database names it; whether it is an absolute folder
+    /// is the reader's to check.
+    pub home: PathBuf,
+}
+
+/// FR-147 — `uid`'s entry in the account database: its name, its primary
+/// group and its home. `None` when there is no entry, or it has no name or no
+/// home.
+#[cfg(unix)]
+pub fn account_entry(uid: u32) -> Option<AccountEntry> {
+    with_passwd(uid, |entry| {
+        // SAFETY: as in `account_home`.
+        let (name, home) = unsafe { (passwd_text(entry.pw_name)?, passwd_text(entry.pw_dir)?) };
+        Some(AccountEntry {
+            uid,
+            name,
+            gid: entry.pw_gid,
+            home: PathBuf::from(home),
+        })
+    })
+}
+
+/// `getpwuid_r` of `uid`, and `read` of the entry while the buffer its
+/// strings point into is alive. `None` when the database has no entry.
+#[cfg(unix)]
+fn with_passwd<T>(uid: u32, read: impl FnOnce(&libc::passwd) -> Option<T>) -> Option<T> {
     let mut buf: Vec<libc::c_char> = vec![0; 1024];
     loop {
         // SAFETY: an all-zero `passwd` is a valid value of a plain C struct;
@@ -886,15 +929,27 @@ pub fn account_home(uid: u32) -> Option<PathBuf> {
             buf.resize(buf.len() * 2, 0);
             continue;
         }
-        if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
+        if rc != 0 || found.is_null() {
             return None;
         }
-        // SAFETY: `pw_dir` points into `buf`, NUL-terminated by `getpwuid_r`,
-        // and `buf` outlives this borrow.
-        let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
-        let home = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
-        return home.is_absolute().then_some(home);
+        return read(&entry);
     }
+}
+
+/// One of a `passwd` entry's strings, as bytes; `None` for a null pointer.
+///
+/// # Safety
+/// `text` is null, or points to a NUL-terminated string that outlives the
+/// call (`with_passwd`'s buffer).
+#[cfg(unix)]
+unsafe fn passwd_text(text: *const libc::c_char) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    if text.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's promise.
+    let text = unsafe { std::ffi::CStr::from_ptr(text) };
+    Some(std::ffi::OsStr::from_bytes(text.to_bytes()).to_os_string())
 }
 
 /// #3702 — may the one-time folder move run in this process over `folders`?
@@ -2197,6 +2252,29 @@ mod tests {
                 assert_eq!(ours, theirs, "{name} with HOME {home:?}: a folder moved");
             }
         }
+    }
+
+    /// FR-147 — `account_entry` reads the entry `account_home` reads: the
+    /// same home where that one names one, and nothing for a uid the database
+    /// does not have. (A runner whose uid has no entry has neither.)
+    #[cfg(unix)]
+    #[test]
+    fn account_entry_names_the_home_account_home_names() {
+        // SAFETY: a read of this process's own credentials.
+        let uid = unsafe { libc::getuid() };
+        let entry = account_entry(uid);
+        assert_eq!(
+            account_home(uid),
+            entry
+                .as_ref()
+                .map(|e| e.home.clone())
+                .filter(|h| h.is_absolute())
+        );
+        if let Some(entry) = entry {
+            assert_eq!(entry.uid, uid);
+            assert!(!entry.name.is_empty());
+        }
+        assert_eq!(account_entry(4_000_000_123), None);
     }
 }
 

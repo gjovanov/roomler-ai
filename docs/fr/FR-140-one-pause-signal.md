@@ -183,7 +183,7 @@ On the frozen end's pair to a lab node that kept running, which rode `/derp` in 
 #3540, closed into this FR on 2026-11-08: a 30–65 s freeze during a remote session forces an exit through the
 encoder's and the capture's 30 s thresholds, because the async watchdog resets its pumps only once a scan is more than
 5 + 60 = 65 s late (`watchdog.rs:561`); under that, the pause counts against each pump's age. On master both pumps
-are registered inactive (`agents/roomlerd/src/app.rs:4518-4519`) and nothing gates them on (only the signaling pump
+are registered inactive (`agents/roomlerd/src/app.rs:4520-4521`) and nothing gates them on (only the signaling pump
 is gated, `signaling.rs:816`, `:823`), so the class is dormant and no field RED is possible on the release. Its RED is
 a unit test at the pin with a 30 s pump gated on. Its proposal is P4 here: take the scan's own lateness off every
 pump's age, still catch a real stall at most one scan later, and pin both with an injected-clock test like

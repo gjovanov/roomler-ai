@@ -383,7 +383,7 @@ Mechanics worth knowing:
 - **The shell sweeps.** In the child, after the privilege drop, every
   descriptor above stderr is marked close-on-exec
   (`tunnel_core::child::inherit_only_stdio_async`,
-  `crates/tunnel-core/src/child.rs:231`; registered at
+  `crates/tunnel-core/src/child.rs:382`; registered at
   `agents/roomlerd/src/pty/unix.rs:272`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
   (`agents/roomlerd/src/exec.rs:1816`) and `sftp-server`
