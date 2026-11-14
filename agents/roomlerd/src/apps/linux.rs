@@ -841,6 +841,71 @@ mod tests {
         }
     }
 
+    /// #3855 — Remote Apps runs every command on a person's desktop as them
+    /// (`exec::drop_to_std`). With the account database stalled, finding the
+    /// desktop is refused within the account lookup's wait, as a drop that
+    /// cannot be installed (`CannotRunAs`), with the try-again words, and
+    /// nothing runs.
+    ///
+    /// Red before #3855: the probe looked the account up on its own thread
+    /// for as long as the account database did not answer.
+    #[test]
+    fn a_stalled_account_lookup_refuses_the_desktop_within_its_wait() {
+        use crate::exec::account_stand_in as database;
+        use std::sync::{Arc, Condvar, Mutex, PoisonError};
+        type Gate = Arc<(Mutex<bool>, Condvar)>;
+        /// Lets the stalled database go when dropped.
+        struct LetGo(Gate);
+        impl Drop for LetGo {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                self.0.1.notify_all();
+            }
+        }
+        let gate: Gate = Arc::default();
+        let _let_go = LetGo(gate.clone());
+        let stalled = database::StandIn::new(move |_| {
+            let (gone, let_go) = &*gate;
+            let gone = gone.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                let_go
+                    .wait_while(gone, |gone| !*gone)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            Err("the stalled account database was let go".into())
+        });
+        let target = Target::Session {
+            display: ":0".into(),
+            wayland: false,
+            xauthority: None,
+            user: "i3855-person".into(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let probed = database::blocking(&stalled, || probe(&target));
+            let _ = tx.send((probed, asked.elapsed()));
+        });
+        let wait = crate::exec::ACCOUNT_LOOKUP_WAIT;
+        let (probed, waited) = rx
+            .recv_timeout(wait + std::time::Duration::from_secs(1))
+            .expect("the desktop's probe answers within the account lookup's wait");
+        assert!(waited >= wait, "refused in {waited:?}, before its wait");
+        match probed {
+            Probe::CannotRun(detail) => {
+                assert!(
+                    detail.contains(crate::exec::ACCOUNT_LOOKUP_TRY_AGAIN),
+                    "the refusal says to try again: {detail}"
+                );
+                assert!(
+                    detail.contains("cannot run `wmctrl` as i3855-person"),
+                    "the refusal names the command and the account: {detail}"
+                );
+            }
+            _ => panic!("a drop that cannot be installed is CannotRun"),
+        }
+    }
+
     #[test]
     fn parse_hex_accepts_x11_ids() {
         assert_eq!(parse_hex("0x03400007"), Some(0x03400007));

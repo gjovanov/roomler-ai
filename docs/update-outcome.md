@@ -178,7 +178,7 @@ record's file. Two topologies split roles:
   (`com.roomler.update`, FR-96 / P4); the per-user half answers its own
   `<log_dir>`, where no root install ever writes. `roomler status` as the
   console user therefore reads `Absent` for the per-user half, and
-  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:248`) lends it
+  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:289`) lends it
   the root half's **network** fields only, never its install record — the
   verdict is per daemon, and the half that answers must not claim another's.
 
@@ -258,7 +258,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7079`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7120`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries

@@ -1792,10 +1792,7 @@ pub(crate) mod unix {
         args: &[OsString],
         env: &[(String, String)],
     ) -> std::io::Result<Launched> {
-        let session =
-            crate::companion::graphical_session_matching(Some(uid), true).map_err(|e| {
-                std::io::Error::other(format!("the session signed in as uid {uid}: {e:#}"))
-            })?;
+        let session = session_of(uid)?;
         // The two a session is made of (the uid drop is what makes them
         // usable: the runtime dir is 0700, the bus checks `SO_PEERCRED`),
         // the display, and the X cookie without which an X11 capture gets
@@ -1820,6 +1817,17 @@ pub(crate) mod unix {
             session_env.push(("XAUTHORITY".to_string(), xa.to_string_lossy().into_owned()));
         }
         spawn_as_account(&session.name, &session_env, exe, args, env)
+    }
+
+    /// #3857 — the session signed in as `uid`, from the walk every caller on
+    /// a blocking thread shares
+    /// ([`crate::companion::graphical_session_within`]), 1.5 s at most: with
+    /// logind hung, the launch is refused with the reason in that time, and
+    /// asks while it hangs hold one walk. logind's own answer keeps its words.
+    fn session_of(uid: u32) -> std::io::Result<crate::companion::GraphicalSession> {
+        crate::companion::graphical_session_within(Some(uid), true).map_err(|e| {
+            std::io::Error::other(format!("the session signed in as uid {uid}: {}", e.words()))
+        })
     }
 
     /// Where X servers put their sockets.
@@ -1903,6 +1911,150 @@ pub(crate) mod unix {
 
         fn nobody() -> Account {
             Account::by_name("nobody").expect("the `nobody` account")
+        }
+
+        /// #3857 — the recorder's launch takes the person's session from the
+        /// walk every blocking caller shares: with logind held, it is refused
+        /// within the walk's wait, with the reason and the uid, and nothing
+        /// is launched.
+        ///
+        /// Red before #3857: the walk ran on the launch's thread for as long
+        /// as logind held it.
+        #[test]
+        fn a_held_walk_refuses_the_recorders_session_within_its_wait() {
+            use crate::companion::SESSION_WALK_WAIT;
+            use crate::companion::session_walk_stand_in::{
+                Held, OpenedAtTheEnd, StandIn, ana, blocking,
+            };
+            let held = Held::default();
+            let _opened = OpenedAtTheEnd(held.clone());
+            let stood = StandIn::held(&held, ana());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let asked = std::time::Instant::now();
+                let found = blocking(&stood, || session_of(4242));
+                let _ = tx.send((found, asked.elapsed()));
+            });
+            let (found, waited) = rx
+                .recv_timeout(SESSION_WALK_WAIT + std::time::Duration::from_secs(1))
+                .expect("the launch is refused within the walk's wait");
+            let why = found
+                .expect_err("logind held, and a session came back")
+                .to_string();
+            assert!(
+                why.contains("uid 4242") && why.contains("no answer"),
+                "the refusal names the uid and says logind gave no answer: {why}"
+            );
+            assert!(
+                waited >= SESSION_WALK_WAIT,
+                "refused in {waited:?}, before the walk's wait"
+            );
+        }
+
+        /// The control: a walk in time gives the recorder the session signed
+        /// in as the uid, asked for persons only, and logind's own "nobody"
+        /// keeps its words.
+        #[test]
+        fn a_walk_in_time_gives_the_recorder_its_session_as_today() {
+            use crate::companion::session_walk_stand_in::{StandIn, ana, blocking};
+            let stood = StandIn::new(|want_uid, users_only| {
+                assert!(users_only, "the recorder asks for persons only");
+                match want_uid {
+                    Some(4242) => Ok(ana()),
+                    _ => Err(
+                        "no active graphical session — nobody is at this machine's screen".into(),
+                    ),
+                }
+            });
+            assert_eq!(blocking(&stood, || session_of(4242)).ok(), Some(ana()));
+            let why = blocking(&stood, || session_of(1000))
+                .expect_err("nobody at the screen")
+                .to_string();
+            assert_eq!(
+                why,
+                "the session signed in as uid 1000: no active graphical session — nobody is at \
+                 this machine's screen"
+            );
+        }
+
+        /// #3855 — the recorder launches as the person through the one drop
+        /// (`exec::drop_to_std`), and acts as them through their ids
+        /// (`Account::by_uid`: `exec::account_name`, then
+        /// `exec::account_ids`), each on a blocking thread. With the
+        /// account database stalled, both are refused within the account
+        /// lookup's wait with the try-again words, and nothing is launched.
+        ///
+        /// Red before #3855: each looked the account up on its blocking
+        /// thread for as long as the account database did not answer.
+        #[test]
+        fn a_stalled_account_lookup_refuses_the_recorder_within_its_wait() {
+            use crate::exec::account_stand_in as database;
+            use std::sync::{Arc, Condvar, Mutex, PoisonError};
+            type Gate = Arc<(Mutex<bool>, Condvar)>;
+            /// Lets the stalled database go when dropped.
+            struct LetGo(Gate);
+            impl Drop for LetGo {
+                fn drop(&mut self) {
+                    *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                    self.0.1.notify_all();
+                }
+            }
+            let gate: Gate = Arc::default();
+            let _let_go = LetGo(gate.clone());
+            let stalled = database::StandIn::new(move |_| {
+                let (gone, let_go) = &*gate;
+                let gone = gone.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    let_go
+                        .wait_while(gone, |gone| !*gone)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                Err("the stalled account database was let go".into())
+            });
+            type Probe = Box<dyn FnOnce() -> Result<(), String> + Send>;
+            let probes: [(&str, Probe); 2] = [
+                (
+                    "the launch",
+                    Box::new(|| {
+                        spawn_as_account("i3855-person", &[], Path::new("/bin/true"), &[], &[])
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
+                ),
+                (
+                    "acting as them",
+                    Box::new(|| {
+                        super::super::as_identity(
+                            super::super::Identity::SessionUser { uid: 4_000_000 },
+                            || (),
+                        )
+                    }),
+                ),
+            ];
+            let wait = crate::exec::ACCOUNT_LOOKUP_WAIT;
+            for (what, probe) in probes {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stood = stalled.clone();
+                let asked = std::time::Instant::now();
+                std::thread::spawn(move || {
+                    let took = database::blocking(&stood, probe);
+                    let _ = tx.send((took, asked.elapsed()));
+                });
+                let (took, waited) = rx
+                    .recv_timeout(wait + Duration::from_secs(1))
+                    .unwrap_or_else(|_| {
+                        panic!("{what}: no answer within the account lookup's wait")
+                    });
+                let refused = took.expect_err("nothing resolves while the database stalls");
+                assert!(
+                    waited >= wait,
+                    "{what} was refused in {waited:?}, before its wait"
+                );
+                assert!(
+                    refused.contains(crate::exec::ACCOUNT_LOOKUP_TRY_AGAIN),
+                    "{what}: the refusal says to try again: {refused}"
+                );
+            }
         }
 
         /// FR-85 P2e — logind's word first, then the person's own server,

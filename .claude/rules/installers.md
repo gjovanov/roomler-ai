@@ -126,6 +126,14 @@ spawns stays out of that job, or `msiexec` dies with it on an update. It must no
 tree: where neither tree holds a config folder, a new local data folder decides the tree
 (`appdirs::use_old_segment`), so a log folder made from outside the daemon moves a legacy host's
 logs, markers and stores to the empty new tree, which is why stderr capture lives in the daemon.
+⚠️ **The per-user task is each account's own, `Roomler-<SID>`, and every path finds it through one
+resolver** (#3801, `agents/roomlerd/src/service/user_task.rs`): `service install`, `start`, `stop`,
+`status` and `uninstall`, so the MSI's actions, the wizard, the tray and the updater's watcher, and the
+per-user arm of `cleanup-legacy-install`. Every account's install held `Roomler` (and the pre-P3d
+name before it), so a task under one of those is acted on only when its principal is the account acting: a
+definition this process is refused, one that does not parse, or one that names another account is left.
+Never delete, end or `/Create /F` a task by a shared name, and match a task's name whole: `Roomler` is a
+prefix of every account's own name (`account_of`).
 ⚠️ **The per-Machine MSI carries the service's `Environment` across an upgrade, and that may never fail
 one** (#3375, `docs/installation.md`). The old product's removal deletes the service, so
 `CaptureServiceEnvironment` (`agents/roomler-msi-ca`) reads the block before `InstallInitialize`, and

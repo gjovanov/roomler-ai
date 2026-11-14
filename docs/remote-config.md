@@ -648,15 +648,15 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3205`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3206`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
    of the folder each time a recording starts. **Gate 4 is not among them.**
    `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
    read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
-   `:3443`), and a `ConfigSet` of them is refused by name with the
-   administrator's command (`not_on_the_person_socket_for_key`, `:3487`): on a
+   `:3444`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3488`): on a
    root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
    on both OSes. The pane shows the root daemon's value of the switch, marked,
    instead of another daemon's — on a two-half Mac the machine-side rows come
