@@ -476,6 +476,18 @@ it — which is exactly the hole this closes. Both are peer-to-peer control-DC
 JSON, not `ClientMsg`/`ServerMsg` variants, so neither touches the server wire
 or the composition baseline.
 
+⚠️ **A retry sends the notice once.** `send_control_notice`
+(`agents/roomlerd/src/peer.rs:6225`) bounds each attempt with a timeout, and on
+a congested path the timeout cuts a send that is still waiting for room in
+the SCTP queue. Such a send leaves nothing on the control channel (#3755):
+no stream sequence number spent, nothing half-queued. So the next attempt is
+the only copy the viewer reads, and every later control message still
+arrives. Before the fix, a cut send left a gap in the ordered stream, and the
+browser held every later control message behind it for the rest of the
+session. The same holds for the idle warning and `rc:ended`, which have a
+budget and no retry: cut, they are simply not sent. Details:
+[`tunnels.md`](tunnels.md#%EF%B8%8F-a-send-cut-short-leaves-its-stream-whole-3755).
+
 ⚠️ **A viewer that shares another session's pipeline is told too** (#3260).
 Two DC sessions of one host with the same profile share one capture and one
 encoder ([`multi-org.md` §6](multi-org.md#6-p5--shared-floor-encoder-shipped-rc303-325)).
