@@ -3176,13 +3176,16 @@ mod tests {
 
     /// A scripted process table. `deaf` pids ignore SIGTERM (at-spi);
     /// `recycled` pids LOOK running but fail the identity check — the number
-    /// now belongs to somebody else's process.
+    /// now belongs to somebody else's process. `born_at_end` lists processes
+    /// that appear as another one ends: an orphan's child that a subreaper
+    /// adopts in the middle of a teardown.
     #[cfg(target_os = "linux")]
     struct MockProcs {
         table: Vec<ProcInfo>,
         running: std::collections::BTreeSet<i32>,
         deaf: std::collections::BTreeSet<i32>,
         recycled: std::collections::BTreeSet<i32>,
+        born_at_end: Vec<(i32, ProcInfo)>,
         events: Vec<Ev>,
     }
 
@@ -3194,12 +3197,21 @@ mod tests {
                 running: table.iter().map(|p| p.pid).collect(),
                 deaf: deaf.iter().copied().collect(),
                 recycled: recycled.iter().copied().collect(),
+                born_at_end: Vec::new(),
                 events: Vec::new(),
             }
         }
         fn deliver(&mut self, pid: i32, sig: i32) {
             if sig == libc::SIGKILL || !self.deaf.contains(&pid) {
                 self.running.remove(&pid);
+                let (born, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.born_at_end)
+                    .into_iter()
+                    .partition(|(at, _)| *at == pid);
+                self.born_at_end = later;
+                for (_, p) in born {
+                    self.table.push(p);
+                    self.running.insert(p.pid);
+                }
             }
         }
     }
@@ -3250,6 +3262,38 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn desktop_tree() -> [ProcInfo; 3] {
         [pi(200, 7, 200), pi(300, 200, 200), pi(400, 300, 400)]
+    }
+
+    /// #3665, condition 4 (review R1-4) — the keeper's teardown loops until it
+    /// has no child left. Here the window manager (300, the keeper's child)
+    /// is deaf to SIGTERM, and as its SIGKILL lands a process of its own is
+    /// left behind, deaf too, and adopted by the keeper (400): born after the
+    /// first pass took its snapshot. A later pass ends it. Without the loop
+    /// the teardown would give up with it running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_keepers_teardown_ends_what_is_born_during_its_first_pass() {
+        // The keeper is 100.
+        let me = 100;
+        let mut m = MockProcs::new(&[pi(300, me, 200)], &[300, 400], &[]);
+        m.born_at_end.push((300, pi(400, me, 400)));
+        let mut collect = |p: &mut dyn Procs| {
+            if p.snapshot().iter().any(|i| i.ppid == me) {
+                keeper::Left::Some
+            } else {
+                keeper::Left::None
+            }
+        };
+        let ended =
+            keeper::teardown_with(&mut m, me, None, Duration::from_millis(30), &mut collect);
+
+        assert_eq!(ended, Ok(()), "{:?}", m.events);
+        assert!(
+            m.events.contains(&Ev::Signal(400, libc::SIGKILL)),
+            "the adopted orphan was never killed: {:?}",
+            m.events
+        );
+        assert!(!m.running.contains(&400));
     }
 
     /// Rule 1 of `kill_tree_with`: every signal — both passes, both `killpg`s
@@ -4511,6 +4555,50 @@ mod supervise_tests {
         );
     }
 
+    /// Review R1-12 — a keeper that is not ready in time is a strike, as an
+    /// early exit is: after two in a row the daemon starts the clients itself
+    /// for the rest of its life, and no later start waits for a keeper again.
+    #[test]
+    fn two_keepers_not_ready_in_time_turn_the_keeper_off() {
+        let dir = scratch("keeper-slow");
+        let d = dir.display();
+        let slow = script(
+            &dir,
+            "keeper",
+            &format!("echo $$ >> \"{d}/keeper.pids\"\nexec sleep 300"),
+        );
+        let wm_body = format!("echo $$ >> \"{d}/wm.pids\"\nexec sleep 300");
+        let (desk, _x_pid) = desktop_with(
+            &dir,
+            ":476",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::script(&slow)),
+            Duration::from_millis(300),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let off = |desk: &Desktop| desk.keeper_off.load(std::sync::atomic::Ordering::Relaxed);
+        let first = desk.start_clients();
+        let off_after_one = off(&desk);
+        let second = desk.start_clients();
+        let off_after_two = off(&desk);
+        let third = desk.start_clients();
+        let count = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let keepers = count("keeper.pids");
+        wait_for("the third window manager", || count("wm.pids") == 3);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((first, second, third), (None, None, None));
+        assert!(!off_after_one, "one slow keeper turned the keeper off");
+        assert!(off_after_two, "two slow keepers in a row did not");
+        assert_eq!(keepers, 2, "a keeper was started after the keeper was off");
+    }
+
     /// #3665, condition 3 — a keeper that refuses before it is ready (as the
     /// keeper does when it cannot adopt orphans) says why, is collected, and
     /// leaves the tree; the start after it is direct.
@@ -5276,7 +5364,12 @@ mod supervise_tests {
                 ..plan(stand_in(&dir, "exit 1"))
             },
         );
-        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let Some(keeper) = desk.start_clients() else {
+            // No keeper: the clients started directly are this role's own,
+            // and must not outlive it (review R1-5).
+            desk.stop();
+            std::process::exit(4);
+        };
         std::fs::write(dir.join("server.pid"), x_pid.to_string()).unwrap();
         std::fs::write(dir.join("keeper.pid"), keeper.to_string()).unwrap();
         std::thread::sleep(Duration::from_secs(60));
@@ -5291,10 +5384,47 @@ mod supervise_tests {
     /// a keeper whose writes could fail or block would leave the orphan.
     #[test]
     fn a_killed_daemon_leaves_nothing_of_its_desktop() {
-        if !have_setsid("a_killed_daemon_leaves_nothing_of_its_desktop") {
+        a_killed_daemon_leaves_nothing("a_killed_daemon_leaves_nothing_of_its_desktop", false);
+    }
+
+    /// Review R1-9 — the same, while something besides the daemon holds the
+    /// write end of the keeper's input (here this test; on a host, a process
+    /// that came by it some other way). No end of input comes, and the keeper
+    /// learns that the daemon is gone from its parent, at its next poll.
+    #[test]
+    fn a_killed_daemon_leaves_nothing_of_its_desktop_while_its_input_is_held() {
+        a_killed_daemon_leaves_nothing(
+            "a_killed_daemon_leaves_nothing_of_its_desktop_while_its_input_is_held",
+            true,
+        );
+    }
+
+    /// A write end of `keeper`'s input of this process's own, opened through
+    /// the descriptor of `daemon` that is the same pipe.
+    fn hold_keepers_input(daemon: i32, keeper: i32) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let pipe = fd_target(keeper, 0).expect("the keeper's input");
+        let fd = fds_of(daemon)
+            .into_iter()
+            .find(|(_, target)| *target == pipe)
+            .map(|(fd, _)| fd)
+            .expect("the daemon holds the keeper's input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(format!("/proc/{daemon}/fd/{fd}"))
+            .expect("a write end of the keeper's input")
+    }
+
+    fn a_killed_daemon_leaves_nothing(test: &str, hold_input: bool) {
+        if !have_setsid(test) {
             return;
         }
-        let dir = scratch("daemon-killed");
+        let dir = scratch(if hold_input {
+            "daemon-killed-held"
+        } else {
+            "daemon-killed"
+        });
         let d = dir.display();
         script(
             &dir,
@@ -5317,6 +5447,9 @@ mod supervise_tests {
         let names = ["server.pid", "keeper.pid", "wm.pid", "app.pid", "gc.pid"];
         let desktop: Vec<ProcInfo> = names.iter().map(|n| recorded(&dir, n)).collect();
         ours.0.extend(desktop.iter().copied());
+        // Held to the end of the test, so that the daemon's death closes
+        // nothing the keeper reads.
+        let _held = hold_input.then(|| hold_keepers_input(daemon.id() as i32, desktop[1].pid));
 
         // SAFETY: SIGKILL to this test's own child, not yet waited for.
         unsafe {
@@ -5496,8 +5629,9 @@ mod supervise_tests {
     }
 
     /// Bring a desktop up on `:472` with `clients`, read what its window
-    /// manager got, and stop it.
-    fn seen_by_a_client(dir: &Path, clients: Clients) -> Seen {
+    /// manager got, and stop it. Also what `start_clients` gave, and the
+    /// window manager's parent: the one difference the two paths keep.
+    fn seen_by_a_client(dir: &Path, clients: Clients) -> (Seen, Option<i32>, i32) {
         let d = dir.display();
         let _ = std::fs::remove_file(dir.join("wm.pid"));
         let (desk, x_pid) = desktop_planned(
@@ -5517,7 +5651,7 @@ mod supervise_tests {
             },
         );
         let _stop = StopAtTheEnd(desk.clone());
-        desk.start_clients();
+        let keeper = desk.start_clients();
         let wm = recorded(dir, "wm.pid");
         let mut environ: Vec<String> = std::fs::read(format!("/proc/{}/environ", wm.pid))
             .unwrap_or_default()
@@ -5539,13 +5673,19 @@ mod supervise_tests {
             fds: fds_of(wm.pid),
         };
         desk.stop();
-        seen
+        (seen, keeper, wm.ppid)
+    }
+
+    /// Is SIGHUP in a `/proc/<pid>/status` signal mask?
+    fn has_sighup(mask: Option<&str>) -> bool {
+        mask.and_then(|m| u64::from_str_radix(m, 16).ok())
+            .is_some_and(|m| m & (1 << (libc::SIGHUP - 1)) != 0)
     }
 
     /// Run in a process of its own ([`a_client_sees_the_same_on_both_paths`]),
-    /// where no other test can change the environment between the two
-    /// looks: reads what a client gets on each path, and says whether they
-    /// match.
+    /// where no other test can change the environment or the signals between
+    /// the two looks: reads what a client gets on each path, and says whether
+    /// each path was taken and what they got matches.
     #[test]
     fn same_on_both_paths_role() {
         let Some(dir) =
@@ -5554,20 +5694,41 @@ mod supervise_tests {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
-        let by_keeper = seen_by_a_client(&dir, Clients::Keeper(KeeperCmd::test()));
-        let by_daemon = seen_by_a_client(&dir, Clients::Direct);
-        let verdict = if by_keeper == by_daemon {
-            "same".to_string()
-        } else {
+        // Review R1-7: a daemon that ignores SIGHUP (one started under
+        // `nohup`) passes that on to the clients it starts.
+        // SAFETY: a signal disposition, in this role's process of its own.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+        let me = std::process::id() as i32;
+        let (by_keeper, keeper, keepers_wm_parent) =
+            seen_by_a_client(&dir, Clients::Keeper(KeeperCmd::test()));
+        let (by_daemon, direct, daemons_wm_parent) = seen_by_a_client(&dir, Clients::Direct);
+        // Review R1-3: each path was the one taken.
+        let verdict = if keeper.is_none() || keeper != Some(keepers_wm_parent) {
+            format!(
+                "not the keeper's path: the keeper {keeper:?}, the window manager's parent {keepers_wm_parent}"
+            )
+        } else if direct.is_some() || daemons_wm_parent != me {
+            format!(
+                "not the direct path: the keeper {direct:?}, the window manager's parent {daemons_wm_parent}, the daemon {me}"
+            )
+        } else if !has_sighup(by_daemon.ignored.as_deref()) {
+            format!("the daemon's own client does not ignore SIGHUP: {by_daemon:#?}")
+        } else if by_keeper != by_daemon {
             format!("keeper {by_keeper:#?}\ndaemon {by_daemon:#?}")
+        } else {
+            "same".to_string()
         };
         std::fs::write(dir.join("verdict"), verdict).unwrap();
     }
 
     /// #3665, condition 6 — a client started by the keeper gets exactly what
     /// one started by the daemon gets: environment, working directory,
-    /// umask, ignored and blocked signals, process group, session and open
-    /// descriptors. What differs is its parent, which is the point.
+    /// umask, ignored and blocked signals (a SIGHUP the daemon ignores among
+    /// them), process group, session and open descriptors. What differs is
+    /// its parent, which is the point: the role checks that it is the keeper
+    /// on one path and the daemon on the other.
     #[test]
     fn a_client_sees_the_same_on_both_paths() {
         let dir = scratch("same");
@@ -5700,7 +5861,9 @@ mod supervise_tests {
             .stderr(Stdio::null());
         let mut leader = leader.spawn().unwrap();
         let group = leader.id() as i32;
-        let leader_info = read_proc_stat(group).expect("the group's leader");
+        // From here on a failed assertion leaves nothing of this test running
+        // (review R1-5): the leader at once, the window manager once known.
+        let mut ours = KillAtTheEnd(vec![read_proc_stat(group).expect("the group's leader")]);
         let mut cmd = KeeperCmd::test().command();
         cmd.process_group(group)
             .stdin(Stdio::piped())
@@ -5717,10 +5880,23 @@ mod supervise_tests {
         };
         let mut input = keeper.stdin.take().unwrap();
         input.write_all(job.line().as_bytes()).unwrap();
-        let mut lines = std::io::BufReader::new(keeper.stderr.take().unwrap()).lines();
-        let first = lines.next().and_then(|l| l.ok());
+        // Its lines on a thread of their own, read to the end: a keeper that
+        // never speaks fails this test instead of hanging it.
+        let (said, heard) = std::sync::mpsc::channel();
+        let stderr = keeper.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if said.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let first = heard.recv_timeout(Duration::from_secs(20)).ok();
         let wm = recorded(&dir, "wm.pid");
-        let mut ours = KillAtTheEnd(vec![leader_info, wm]);
+        ours.0.push(wm);
 
         // The daemon's teardown: the keeper's input ends.
         let asked = Instant::now();
