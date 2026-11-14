@@ -8692,6 +8692,9 @@ mod tests {
             r#"{"t":"config_set","d":{"key":"rc_audio","value":"false"}}"#,
             r#"{"t":"config_set","d":{"key":"external_access_enabled","value":"false"}}"#,
             r#"{"t":"config_set","d":{"key":"external_consent_mode","value":"ask"}}"#,
+            // #3831 — what this device can encode, the Overview's card: the
+            // probe's cached summary, read-only, never a probe.
+            r#"{"t":"encoder_caps"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -8755,7 +8758,6 @@ mod tests {
                 value: None,
             },
             Request::ConfigCleanupStale,
-            Request::EncoderCaps,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
@@ -8862,6 +8864,82 @@ mod tests {
             }
             other => panic!("expected Peers on the full socket, got {other:?}"),
         }
+    }
+
+    /// #3831 — a daemon whose probe has answered: [`Mock`]'s answers, with the
+    /// summary its cache holds.
+    struct Encodes;
+    #[async_trait]
+    impl LocalApiState for Encodes {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn encoder_caps(&self) -> Option<EncoderCapsSummary> {
+            Some(EncoderCapsSummary {
+                state: "ready".into(),
+                cells: vec![EncoderCell {
+                    codec: "h264".into(),
+                    backend: "vaapi".into(),
+                    chroma: vec!["yuv420".into()],
+                    hardware: true,
+                }],
+                hw_encoders: vec!["ffmpeg-h264_vaapi".into()],
+                codecs: vec!["h264".into()],
+                probe_ms: Some(640),
+                probe_cached: true,
+                denied: vec!["hevc_vaapi:yuv444".into()],
+                encoder_preference: Some("auto".into()),
+            })
+        }
+    }
+
+    /// #3831 — on a Linux system install the companion runs as the person and
+    /// reaches the root daemon over its person socket, where its encoding card
+    /// read `Error`: the socket refused `encoder_caps`. The answer is the
+    /// probe's cached summary and nothing else, so the person socket now
+    /// serves it whole, to its person and to root, exactly as the daemon's own
+    /// socket does; a verb outside the list is still refused with the `sudo`
+    /// text.
+    #[tokio::test]
+    async fn the_person_socket_serves_the_cached_encoder_summary() {
+        let want = Response::EncoderCaps(Encodes.encoder_caps().unwrap());
+        let person = ClientPeer {
+            uid: Some(501),
+            ..ClientPeer::UNKNOWN
+        };
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        for peer in [person.clone(), root] {
+            let r =
+                ask_state_scoped_as(Encodes, SEAT, peer.clone(), r#"{"t":"encoder_caps"}"#).await;
+            assert!(
+                !is_person_refusal(&r),
+                "refused on the person socket: {r:?}"
+            );
+            assert_eq!(r, want, "the cached summary, whole, as {peer:?}");
+        }
+        let full = ask_state_scoped_as(
+            Encodes,
+            Scope::Full,
+            ClientPeer::UNKNOWN,
+            r#"{"t":"encoder_caps"}"#,
+        )
+        .await;
+        assert_eq!(full, want, "the daemon's own socket answers the same");
+        let r = ask_state_scoped_as(Encodes, SEAT, person, r#"{"t":"route_list"}"#).await;
+        assert!(is_person_refusal(&r), "{r:?}");
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("sudo roomler")),
+            "{r:?}"
+        );
     }
 
     /// #2871 — the console person's keys are ONE table, and that table is the
