@@ -45,6 +45,27 @@ pub fn requested() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
+mod keeper;
+
+/// #3665 — `roomlerd vd-keeper`, the desktop's keeper ([`keeper`]): the daemon
+/// runs its own binary with this one hidden argument to start the window
+/// manager and the startup apps. The exit code when this process is a keeper,
+/// `None` otherwise.
+///
+/// Answered first in `main`, from raw argv: a keeper builds no runtime, reads
+/// no config, opens no log and takes no lock. The argument is matched whole,
+/// and nothing may follow it.
+pub fn answer_keeper() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        if keeper::is_keeper_argv(std::env::args_os()) {
+            return Some(keeper::run());
+        }
+    }
+    None
+}
+
 /// How long the graceful teardown waits after SIGTERM before it SIGKILLs
 /// whatever is left. Small on purpose: the virtual desktop's D-Bus tree —
 /// `at-spi-bus-launcher` in particular — ignores SIGTERM, so the SIGKILL is
@@ -366,9 +387,13 @@ struct TreeHandle {
     /// The process group all our children were placed in (`None` if we could
     /// not create one — then only the parent-link closure is used).
     pgid: Option<i32>,
-    /// The pids of the processes the daemon spawned directly (Xvfb, the WM,
-    /// the startup apps).
+    /// The pids of the processes the daemon spawned directly: the X server,
+    /// and the keeper or, without one, the window manager and the startup
+    /// apps.
     roots: Vec<i32>,
+    /// The desktop's keeper (#3665), one of `roots`: the parent of the window
+    /// manager and the apps, and of everything they leave behind.
+    keeper: Option<i32>,
 }
 
 /// One process, as `/proc` reports it, for [`select_targets`] — and, through
@@ -812,6 +837,10 @@ struct Plan {
     delay_floor: Duration,
     delay_ceil: Duration,
     stable_after: Duration,
+    /// Who starts the window manager and the startup apps (#3665).
+    clients: Clients,
+    /// How long a start waits for the keeper to say it is ready.
+    keeper_ready_timeout: Duration,
 }
 
 #[cfg(target_os = "linux")]
@@ -826,7 +855,80 @@ impl Plan {
             delay_floor: RESTART_DELAY_FLOOR,
             delay_ceil: RESTART_DELAY_CEIL,
             stable_after: STABLE_AFTER,
+            clients: if tunnel_core::env::flag("VIRTUAL_DESKTOP_KEEPER", true) {
+                Clients::Keeper(KeeperCmd::daemon())
+            } else {
+                Clients::Direct
+            },
+            keeper_ready_timeout: KEEPER_READY_TIMEOUT,
         }
+    }
+}
+
+/// How long a start waits for the keeper's `ready`. It starts nothing before
+/// it, so this is a few milliseconds on a working host; a keeper that says
+/// nothing in this time is killed, and the daemon starts the clients itself.
+#[cfg(target_os = "linux")]
+const KEEPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The keeper's own grace, inside the daemon's: it has ended what it started
+/// before the daemon's teardown looks again.
+#[cfg(target_os = "linux")]
+const KEEPER_GRACE: Duration = Duration::from_millis(1500);
+
+/// The longest job the daemon sends a keeper: one atomic write to an empty
+/// pipe (`PIPE_BUF`), so the write never waits for the keeper.
+#[cfg(target_os = "linux")]
+const KEEPER_JOB_MAX: usize = 4096;
+
+/// Who starts the window manager and the startup apps.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+enum Clients {
+    /// The desktop's keeper (#3665, [`keeper`]), run with this command. A
+    /// keeper that cannot run falls back to [`Clients::Direct`] for that
+    /// start, with a warning that says why.
+    Keeper(KeeperCmd),
+    /// The daemon itself, as before #3665: the kill switch,
+    /// `ROOMLERD_VIRTUAL_DESKTOP_KEEPER=0`.
+    Direct,
+}
+
+/// The command that runs a keeper.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct KeeperCmd {
+    program: std::path::PathBuf,
+    args: Vec<std::ffi::OsString>,
+    arg0: Option<std::ffi::OsString>,
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+#[cfg(target_os = "linux")]
+impl KeeperCmd {
+    /// The daemon's own binary, through `/proc/self/exe`: the kernel's link to
+    /// the image this daemon runs, which still execs after a package upgrade
+    /// replaced the file on disk (and keeps keeper and daemon one build).
+    fn daemon() -> Self {
+        Self {
+            program: "/proc/self/exe".into(),
+            args: vec![keeper::VERB.into()],
+            arg0: Some("roomlerd".into()),
+            env: Vec::new(),
+        }
+    }
+
+    fn command(&self) -> Command {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        if let Some(arg0) = &self.arg0 {
+            cmd.arg0(arg0);
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd
     }
 }
 
@@ -884,6 +986,11 @@ struct State {
     /// stuck in the kernel). Asked for again at the next kill; never
     /// signalled again.
     unreaped: Vec<i32>,
+    /// The write end of the keeper's input (#3665). Its end is the keeper's
+    /// signal to take the whole desktop down: dropped by every kill of the
+    /// tree, and closed by the kernel when the daemon dies however it dies.
+    /// Created close-on-exec, so no other program holds it.
+    lifeline: Option<std::process::ChildStdin>,
 }
 
 /// One virtual desktop: a display that is its own for the daemon's life, and
@@ -907,6 +1014,9 @@ struct Desktop {
     xorg_failed: std::sync::atomic::AtomicBool,
     /// This desktop made Xorg's private directory, so its stop removes it.
     xorg_dir_made: std::sync::atomic::AtomicBool,
+    /// The keeper is not tried again in this daemon's life: the clients are
+    /// started directly, as before #3665.
+    keeper_off: std::sync::atomic::AtomicBool,
 }
 
 /// An X server this daemon started, while it answers.
@@ -916,6 +1026,8 @@ struct XServer {
     kind: Server,
     tail: StderrTail,
     since: Instant,
+    /// The keeper that started this server's clients, when one did.
+    keeper: Option<i32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -932,6 +1044,7 @@ impl Desktop {
             wake: std::sync::Condvar::new(),
             xorg_failed: std::sync::atomic::AtomicBool::new(false),
             xorg_dir_made: std::sync::atomic::AtomicBool::new(false),
+            keeper_off: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -979,6 +1092,7 @@ impl Desktop {
         st.tree = Some(TreeHandle {
             pgid: group_of(&child),
             roots: vec![child.id() as i32],
+            keeper: None,
         });
         Ok(Some(child))
     }
@@ -1001,17 +1115,74 @@ impl Desktop {
         Ok(true)
     }
 
+    /// Spawn the keeper INTO the desktop's group `group` and record it as a
+    /// root and as the keeper, under the same one lock as
+    /// [`Self::spawn_server`]. `Ok(None)` when the daemon is stopping, or the
+    /// tree is gone or is another one's.
+    #[allow(clippy::zombie_processes)] // reaped by `kill_tree`, as the server is
+    fn spawn_keeper(&self, cmd: &mut Command, group: i32) -> std::io::Result<Option<Child>> {
+        let mut st = self.state();
+        if st.stopping {
+            return Ok(None);
+        }
+        let Some(tree) = st.tree.as_mut().filter(|t| t.pgid == Some(group)) else {
+            return Ok(None);
+        };
+        join_group(cmd, Some(group));
+        let child = cmd.spawn()?;
+        let pid = child.id() as i32;
+        tree.roots.push(pid);
+        tree.keeper = Some(pid);
+        Ok(Some(child))
+    }
+
+    /// A keeper that did not say it was ready: SIGKILL it, collect it, and
+    /// take it out of the tree, all while no kill of the tree can run (`op`)
+    /// and in one step under `st`, so no later teardown signals its number.
+    /// Nothing happens when the tree no longer lists it: the kill that took
+    /// the tree owns it.
+    fn discard_keeper(&self, pid: i32) {
+        let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state();
+        if !st.tree.as_ref().is_some_and(|t| t.keeper == Some(pid)) {
+            return;
+        }
+        // Our child, unreaped while the tree lists it, so its pid is ours.
+        RealProcs.signal(pid, libc::SIGKILL);
+        let by = Instant::now() + Duration::from_secs(1);
+        let mut gone = RealProcs.reap(&[pid]);
+        while !gone && Instant::now() < by {
+            std::thread::sleep(Duration::from_millis(5));
+            gone = RealProcs.reap(&[pid]);
+        }
+        if let Some(tree) = st.tree.as_mut() {
+            tree.roots.retain(|r| *r != pid);
+            tree.keeper = None;
+        }
+        if !gone {
+            st.unreaped.push(pid);
+        }
+    }
+
     /// Take the recorded tree and bring it down: SIGTERM, the grace, SIGKILL,
     /// and only then the reap ([`kill_tree_with`]'s two rules). Whoever comes
     /// second waits for the first and finds nothing recorded.
     fn kill_recorded_tree(&self) {
         let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
-        let (handle, mut waiting) = {
+        let (handle, lifeline, mut waiting) = {
             let mut st = self.state();
-            (st.tree.take(), std::mem::take(&mut st.unreaped))
+            (
+                st.tree.take(),
+                st.lifeline.take(),
+                std::mem::take(&mut st.unreaped),
+            )
         };
         // Children an earlier kill could not collect in its bound: ask again.
         waiting.retain(|pid| !RealProcs.reap(&[*pid]));
+        // The keeper's input ends here, so it takes down what it started at
+        // once, inside the grace below; its own exit then ends that grace
+        // early (#3665).
+        drop(lifeline);
         if let Some(handle) = handle
             && !kill_tree(&handle.roots, handle.pgid, TEARDOWN_GRACE)
         {
@@ -1089,9 +1260,9 @@ impl Desktop {
         preflight(cfg, &self.plan.xvfb, try_xorg)
             .map_err(|e| NoDesktop::because(format!("{e:#}")))?;
         let (w, h) = parse_resolution(&cfg.resolution);
-        let x = self.start_server(try_xorg, w, h)?;
+        let mut x = self.start_server(try_xorg, w, h)?;
         info!(display = self.display.as_str(), resolution = %cfg.resolution, server = ?x.kind, "virtual-desktop: X server up");
-        self.start_clients();
+        x.keeper = self.start_clients();
         let pgid = {
             let mut st = self.state();
             if st.stopping {
@@ -1101,7 +1272,12 @@ impl Desktop {
             st.why_down.clear();
             st.tree.as_ref().and_then(|t| t.pgid)
         };
-        info!(display = self.display.as_str(), wm = %cfg.wm, apps = cfg.startup.len(), ?pgid, "virtual-desktop ready");
+        let clients = if x.keeper.is_some() {
+            "keeper"
+        } else {
+            "daemon"
+        };
+        info!(display = self.display.as_str(), wm = %cfg.wm, apps = cfg.startup.len(), ?pgid, keeper = ?x.keeper, started_by = clients, "virtual-desktop ready");
         Ok(x)
     }
 
@@ -1177,6 +1353,7 @@ impl Desktop {
                 kind,
                 tail,
                 since: Instant::now(),
+                keeper: None,
             }),
             Err(not_ready) => {
                 self.kill_recorded_tree();
@@ -1205,12 +1382,132 @@ impl Desktop {
         }
     }
 
-    /// The window manager and the startup apps, on a server that answers.
-    fn start_clients(&self) {
+    /// The window manager and the startup apps, on a server that answers:
+    /// by the desktop's keeper (#3665), or by the daemon itself where the
+    /// kill switch is set or no keeper can run here. The keeper's pid when it
+    /// started them.
+    fn start_clients(&self) -> Option<i32> {
+        let cfg = &self.plan.cfg;
+        let keeper = match &self.plan.clients {
+            Clients::Keeper(cmd) => {
+                if self.keeper_off.load(std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        display = self.display.as_str(),
+                        "virtual-desktop: no keeper in this daemon's life, after two that exited by themselves — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)"
+                    );
+                    None
+                } else {
+                    match self.start_keeper(cmd) {
+                        Ok(keeper) => keeper,
+                        Err(why) => {
+                            warn!(display = self.display.as_str(), %why, "virtual-desktop: no keeper — the daemon starts the window manager and the apps, and what they leave behind is out of the teardown's reach (#3665)");
+                            None
+                        }
+                    }
+                }
+            }
+            Clients::Direct => None,
+        };
+        if keeper.is_none() {
+            self.start_clients_directly();
+        }
+        // An app that maps while openbox is still starting can stay unmanaged,
+        // and so invisible, until X traffic next wakes it (`WM_NUDGE_AT_MS`).
+        if !cfg.startup.is_empty() {
+            nudge_wm_after_startup(&self.display);
+        }
+        keeper
+    }
+
+    /// Start the keeper and hand it the clients: `Ok(Some(pid))` once it
+    /// said it is ready, `Ok(None)` when the daemon is stopping (nothing is
+    /// started then, either way), `Err` with the reason it cannot run. A
+    /// keeper that did not get as far as `ready` is gone when this returns.
+    fn start_keeper(&self, kc: &KeeperCmd) -> std::result::Result<Option<i32>, String> {
+        use std::io::Write as _;
+        let cfg = &self.plan.cfg;
+        let group = {
+            let st = self.state();
+            match st.tree.as_ref() {
+                None => return Ok(None),
+                Some(t) => t.pgid.filter(|g| *g > 1),
+            }
+        };
+        let Some(group) = group else {
+            return Err("the desktop has no process group of its own".into());
+        };
+        let job = keeper::Job {
+            display: self.display.clone(),
+            group,
+            wm: cfg.wm.clone(),
+            apps: cfg.startup.clone(),
+            grace_ms: KEEPER_GRACE.as_millis() as u64,
+        }
+        .line();
+        if job.len() > KEEPER_JOB_MAX {
+            return Err(format!(
+                "its job is {} bytes, more than {KEEPER_JOB_MAX}",
+                job.len()
+            ));
+        }
+        let mut cmd = kc.command();
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = match self.spawn_keeper(&mut cmd, group) {
+            Ok(Some(child)) => child,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(format!("it could not be started: {e}")),
+        };
+        let pid = child.id() as i32;
+        let (input, ready) = (child.stdin.take(), follow_keeper(child.stderr.take(), pid));
+        let armed = (|| -> std::result::Result<std::process::ChildStdin, String> {
+            let ready = ready?;
+            let mut input = input.ok_or("it has no input")?;
+            input
+                .write_all(job.as_bytes())
+                .map_err(|e| format!("its job could not be sent: {e}"))?;
+            match ready.recv_timeout(self.plan.keeper_ready_timeout) {
+                Ok(Ok(())) => Ok(input),
+                Ok(Err(why)) => Err(format!("it refused: {why}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                    "it did not say it was ready within {:?}",
+                    self.plan.keeper_ready_timeout
+                )),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("it exited before it said it was ready".to_string())
+                }
+            }
+        })();
+        match armed {
+            Ok(input) => {
+                // The lifeline is kept only for the tree it belongs to: a stop
+                // that took the tree meanwhile also took the keeper, and the
+                // input dropped here ends whatever is left of it.
+                let mut st = self.state();
+                if !st.stopping && st.tree.as_ref().is_some_and(|t| t.keeper == Some(pid)) {
+                    st.lifeline = Some(input);
+                    Ok(Some(pid))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(why) => {
+                self.discard_keeper(pid);
+                Err(why)
+            }
+        }
+    }
+
+    /// The window manager and the startup apps, as the daemon's own children,
+    /// in the desktop's group: what the daemon did before #3665. Each gets
+    /// `/dev/null` on stdin too, as the keeper's children do.
+    fn start_clients_directly(&self) {
         let cfg = &self.plan.cfg;
         let mut wm_cmd = Command::new(&cfg.wm);
         wm_cmd
             .env("DISPLAY", &self.display)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         with_wslg_pulse(&mut wm_cmd);
@@ -1221,6 +1518,7 @@ impl Desktop {
             let mut app_cmd = Command::new(app);
             app_cmd
                 .env("DISPLAY", &self.display)
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             with_wslg_pulse(&mut app_cmd);
@@ -1228,12 +1526,51 @@ impl Desktop {
                 warn!(%app, %e, "virtual-desktop: startup app failed to launch");
             }
         }
-        // An app that maps while openbox is still starting can stay unmanaged,
-        // and so invisible, until X traffic next wakes it (`WM_NUDGE_AT_MS`).
-        if !cfg.startup.is_empty() {
-            nudge_wm_after_startup(&self.display);
-        }
     }
+}
+
+/// Follow a keeper's stderr on a thread of its own: its first `ready` or
+/// `refused: <why>` line goes to the receiver this returns, and every other
+/// line to the log, a `warn: ` line as a warning. The thread ends with the
+/// keeper's stderr.
+#[cfg(target_os = "linux")]
+fn follow_keeper(
+    stderr: Option<std::process::ChildStderr>,
+    pid: i32,
+) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String> {
+    use std::io::BufRead as _;
+    let stderr = stderr.ok_or("it has no stderr")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("vd-keeper-log".into())
+        .spawn(move || {
+            let mut tx = Some(tx);
+            for line in std::io::BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if tx.is_some() {
+                    let answer = if line == "ready" {
+                        Some(Ok(()))
+                    } else {
+                        line.strip_prefix("refused: ")
+                            .map(|why| Err(why.to_string()))
+                    };
+                    if let Some(answer) = answer {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(answer);
+                        }
+                        continue;
+                    }
+                }
+                if let Some(said) = line.strip_prefix("warn: ") {
+                    warn!(keeper = pid, "virtual-desktop keeper: {said}");
+                } else {
+                    let said = line.strip_prefix("info: ").unwrap_or(&line);
+                    info!(keeper = pid, "virtual-desktop keeper: {said}");
+                }
+            }
+        })
+        .map_err(|e| format!("its output could not be followed: {e}"))?;
+    Ok(rx)
 }
 
 /// Bring the virtual desktop up — the X server, the window manager, the
@@ -2959,6 +3296,42 @@ mod supervise_tests {
             delay_floor: Duration::from_millis(20),
             delay_ceil: Duration::from_millis(80),
             stable_after: Duration::from_secs(60),
+            // The daemon's default (#3665). The keeper is this test binary,
+            // re-run in its role; generous, since a loaded host starts it
+            // late.
+            clients: Clients::Keeper(KeeperCmd::test()),
+            keeper_ready_timeout: Duration::from_secs(20),
+        }
+    }
+
+    impl KeeperCmd {
+        /// The keeper as a test runs it: this test binary, re-run to run
+        /// [`keeper::tests::keeper_role`] alone.
+        fn test() -> Self {
+            Self {
+                program: std::env::current_exe().expect("the test binary"),
+                args: [
+                    "virtual_desktop::keeper::tests::keeper_role",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                arg0: None,
+                env: vec![(keeper::TEST_ROLE_ENV.into(), "1".into())],
+            }
+        }
+
+        /// A script of the test's own in the keeper's place.
+        fn script(path: &str) -> Self {
+            Self {
+                program: path.into(),
+                args: Vec::new(),
+                arg0: None,
+                env: Vec::new(),
+            }
         }
     }
 
@@ -3569,14 +3942,15 @@ mod supervise_tests {
             .spawn_server(&mut cmd)
             .unwrap()
             .expect("the daemon is not stopping");
-        let x = XServer {
+        let mut x = XServer {
             pid: child.id() as i32,
             kind: Server::Xvfb,
             tail: StderrTail::follow(child.stderr.take()),
             since: Instant::now(),
+            keeper: None,
         };
         let x_pid = x.pid;
-        desk.start_clients();
+        x.keeper = desk.start_clients();
         let wm = pid_in(&dir, "wm.pid");
         let app = pid_in(&dir, "app.pid");
         let gc = recorded(&dir, "gc.pid");
@@ -3765,6 +4139,220 @@ mod supervise_tests {
         assert!(
             !roots.contains(&wm.pid) && !roots.contains(&app.pid),
             "a collected child is still in the tree's roots: {roots:?}"
+        );
+    }
+
+    /// A desktop around a `sleep` in the server's place, with `wm_body` as
+    /// the window manager's script and `clients` and `ready_timeout` as given.
+    /// The desktop, and the server's pid.
+    fn desktop_with(
+        dir: &Path,
+        display: &str,
+        wm_body: &str,
+        clients: Clients,
+        ready_timeout: Duration,
+    ) -> (Arc<Desktop>, i32) {
+        let wm = script(dir, "wm", wm_body);
+        let desk = Arc::new(Desktop::new(
+            display.into(),
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm,
+                    startup: vec![],
+                },
+                clients,
+                keeper_ready_timeout: ready_timeout,
+                ..plan(stand_in(dir, "exit 1"))
+            },
+        ));
+        let mut server = Command::new("sleep");
+        server
+            .arg("300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let x_pid = desk
+            .spawn_server(&mut server)
+            .unwrap()
+            .expect("the daemon is not stopping")
+            .id() as i32;
+        (desk, x_pid)
+    }
+
+    /// The recorded tree's roots now.
+    fn roots_of(desk: &Desktop) -> Vec<i32> {
+        desk.state()
+            .tree
+            .as_ref()
+            .map(|t| t.roots.clone())
+            .unwrap_or_default()
+    }
+
+    /// #3665 — the keeper is the parent of the window manager, in the
+    /// desktop's group, and the tree's roots are the server and the keeper.
+    #[test]
+    fn the_keeper_is_the_parent_of_the_clients() {
+        let dir = scratch("keeper-parent");
+        let wm_body = format!("echo $$ > \"{}/wm.pid\"\nexec sleep 300", dir.display());
+        let (desk, x_pid) = desktop_with(
+            &dir,
+            ":463",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::test()),
+            Duration::from_secs(20),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients();
+        let wm = recorded(&dir, "wm.pid");
+        let roots = roots_of(&desk);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let keeper = keeper.expect("the keeper said it was ready");
+        assert_eq!(wm.ppid, keeper, "the window manager is the keeper's child");
+        assert_eq!(
+            wm.pgid, x_pid,
+            "the window manager is in the desktop's group"
+        );
+        assert_eq!(
+            roots,
+            vec![x_pid, keeper],
+            "the roots are the server and the keeper"
+        );
+        assert!(
+            collected(keeper),
+            "the stop left the keeper {keeper} uncollected"
+        );
+    }
+
+    /// #3665 — the kill switch starts the window manager as before: the
+    /// daemon's own child, in the desktop's group, one of the roots.
+    #[test]
+    fn the_kill_switch_starts_the_clients_as_before() {
+        let dir = scratch("direct");
+        let wm_body = format!("echo $$ > \"{}/wm.pid\"\nexec sleep 300", dir.display());
+        let (desk, x_pid) = desktop_with(
+            &dir,
+            ":464",
+            &wm_body,
+            Clients::Direct,
+            Duration::from_secs(20),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients();
+        let wm = recorded(&dir, "wm.pid");
+        let roots = roots_of(&desk);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(keeper, None, "the kill switch runs no keeper");
+        assert_eq!(wm.ppid, std::process::id() as i32, "the daemon's own child");
+        assert_eq!(wm.pgid, x_pid, "in the desktop's group");
+        assert_eq!(roots, vec![x_pid, wm.pid]);
+    }
+
+    /// #3665, condition 3 — a keeper that never says it is ready is killed and
+    /// collected within the wait, leaves the tree in the same step, and the
+    /// daemon starts the window manager itself.
+    #[test]
+    fn a_keeper_that_never_says_ready_is_collected_and_the_clients_start_directly() {
+        let dir = scratch("keeper-silent");
+        let d = dir.display();
+        let silent = script(
+            &dir,
+            "keeper",
+            &format!("echo $$ > \"{d}/keeper.pid\"\nread -r job\nexec sleep 300"),
+        );
+        let wm_body = format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300");
+        let (desk, x_pid) = desktop_with(
+            &dir,
+            ":465",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::script(&silent)),
+            Duration::from_millis(500),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let asked = Instant::now();
+        let keeper = desk.start_clients();
+        let took = asked.elapsed();
+        let silent_pid = pid_in(&dir, "keeper.pid");
+        let wm = recorded(&dir, "wm.pid");
+        let roots = roots_of(&desk);
+        let still_keeper = desk.state().tree.as_ref().and_then(|t| t.keeper);
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(keeper, None);
+        assert!(
+            took >= Duration::from_millis(500) && took < Duration::from_secs(5),
+            "the wait took {took:?}"
+        );
+        assert!(
+            collected(silent_pid),
+            "the silent keeper {silent_pid} was not collected"
+        );
+        assert_eq!(still_keeper, None);
+        assert_eq!(
+            roots,
+            vec![x_pid, wm.pid],
+            "the silent keeper left the roots"
+        );
+        assert_eq!(
+            wm.ppid,
+            std::process::id() as i32,
+            "the window manager was started directly"
+        );
+    }
+
+    /// #3665, condition 3 — a keeper that refuses says why, is collected, and
+    /// leaves the tree; the start after it is direct.
+    #[test]
+    fn a_keeper_that_refuses_falls_back_with_its_reason() {
+        let dir = scratch("keeper-refuses");
+        let d = dir.display();
+        let refuses = script(
+            &dir,
+            "keeper",
+            &format!(
+                "echo $$ > \"{d}/keeper.pid\"\nread -r job\n\
+                 echo 'refused: no subreaper on this host' >&2\nexit 2"
+            ),
+        );
+        let wm_body = format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300");
+        let (desk, x_pid) = desktop_with(
+            &dir,
+            ":466",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::script(&refuses)),
+            Duration::from_secs(20),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let why = desk.start_keeper(&KeeperCmd::script(&refuses));
+        let refused_pid = pid_in(&dir, "keeper.pid");
+        let roots_after = roots_of(&desk);
+        let keeper = desk.start_clients();
+        let wm = recorded(&dir, "wm.pid");
+        desk.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(&why, Err(w) if w.contains("no subreaper on this host")),
+            "{why:?}"
+        );
+        assert!(
+            collected(refused_pid),
+            "the keeper {refused_pid} was not collected"
+        );
+        assert_eq!(
+            roots_after,
+            vec![x_pid],
+            "the refusing keeper left the roots"
+        );
+        assert_eq!(keeper, None);
+        assert_eq!(
+            wm.ppid,
+            std::process::id() as i32,
+            "the window manager was started directly"
         );
     }
 }

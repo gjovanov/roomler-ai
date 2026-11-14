@@ -1362,6 +1362,14 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    // #3665 — the virtual desktop's keeper is this binary, re-run by the
+    // daemon with one hidden argument. It must not become a second daemon.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(code) = roomlerd::virtual_desktop::answer_keeper() {
+            std::process::exit(code);
+        }
+    }
     // #3702 — on the service account, the process's folder variables are the
     // machine's and the service account's own, before this process has a
     // second thread: the runtime below starts its workers.
