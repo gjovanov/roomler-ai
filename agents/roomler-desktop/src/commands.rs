@@ -1138,6 +1138,8 @@ fn process_is_root() -> bool {
 /// the callers would fall back to is not that daemon's, and may be a stale
 /// copy no daemon reads: writing it reports a success the daemon refused
 /// (#2871's failure, on Linux). One `Status` on the same connection.
+/// #3831 — the encoding card asks it too, of a daemon that refused
+/// `encoder_caps` there (one older than #3831).
 async fn refused_by_root_daemon(client: &mut localapi::Client) -> bool {
     let Ok(status) = client.status().await else {
         return false;
@@ -1237,8 +1239,9 @@ fn daemon_message(message: &str) -> String {
 pub struct EncoderCapsView {
     /// The daemon answered the verb.
     pub available: bool,
-    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb), or
-    /// the failing stage and error.
+    /// Why not: `daemon_unreachable`, `old_daemon` (predates the verb),
+    /// `root_only` (#3831: a root daemon's person socket that refuses the
+    /// verb), or the failing stage and error.
     pub reason: Option<String>,
     /// The daemon's answer, verbatim (`state`, `cells`, `denied`, …).
     pub caps: Option<localapi::EncoderCapsSummary>,
@@ -1305,12 +1308,14 @@ impl EncoderCapsView {
     }
 }
 
+/// The encoding card's name in the refresh ledger.
+const ENCODER_CAPS_SURFACE: &str = "encoder_caps";
+
 /// FR-84 D4 — what this device can encode, from the daemon's CACHED probe
 /// (the verb never starts one). The card polls this only while the answer
 /// is `not_probed`, and re-reads it when the daemon comes back or changes.
 #[tauri::command]
 pub async fn cmd_encoder_caps() -> EncoderCapsView {
-    const SURFACE: &str = "encoder_caps";
     let mut client = match localapi::connect().await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1318,23 +1323,78 @@ pub async fn cmd_encoder_caps() -> EncoderCapsView {
         }
         Err(e) => {
             return EncoderCapsView::unavailable(refresh_failed(
-                SURFACE,
+                ENCODER_CAPS_SURFACE,
                 describe_io("connect", &e),
             ));
         }
     };
-    match client.encoder_caps().await {
-        Ok(caps) => {
-            refresh_ok(SURFACE);
+    let reply = client.request(&localapi::Request::EncoderCaps).await;
+    // #3831 — only an ANSWER that refuses is asked about, and the way the
+    // config verbs ask it (#2891): one `Status` on the same connection. A
+    // reply that never came is a failure whatever the daemon is.
+    let refused_by_root = match &reply {
+        Ok(localapi::Response::Error { message }) if !older_than_the_verb(message) => {
+            refused_by_root_daemon(&mut client).await
+        }
+        _ => false,
+    };
+    encoder_caps_view(reply, refused_by_root)
+}
+
+/// Pure: what the encoding card shows for the daemon's reply to
+/// `encoder_caps`. `Ok` is an answer the daemon gave; `Err` is no answer at
+/// all, the transport's failure (a write, a read, a closed connection).
+/// `refused_by_root`: [`refused_by_root_daemon`], asked on the same
+/// connection after an answer that refuses.
+fn encoder_caps_view(
+    reply: std::io::Result<localapi::Response>,
+    refused_by_root: bool,
+) -> EncoderCapsView {
+    match reply {
+        Ok(localapi::Response::EncoderCaps(caps)) => {
+            refresh_ok(ENCODER_CAPS_SURFACE);
             EncoderCapsView::from_summary(caps)
         }
         // A daemon older than the verb: not a failure, a version.
-        Err(e) if e.to_string().contains("unknown variant") => {
+        Ok(localapi::Response::Error { message }) if older_than_the_verb(&message) => {
             EncoderCapsView::unavailable("old_daemon".into())
         }
-        Err(e) => {
-            EncoderCapsView::unavailable(refresh_failed(SURFACE, describe_io("encoder_caps", &e)))
+        // #3831 — refused by a ROOT daemon this unprivileged app reached
+        // over its person socket: a Linux system install whose daemon
+        // predates #3831, when that socket served no `encoder_caps`. An
+        // answer, not a failure: the card says whose the encoders are.
+        Ok(localapi::Response::Error { .. }) if refused_by_root => {
+            EncoderCapsView::unavailable("root_only".into())
         }
+        Ok(other) => encoder_caps_failed(&not_the_summary(other)),
+        Err(e) => encoder_caps_failed(&e),
+    }
+}
+
+/// A daemon that predates a verb cannot parse the request, and says so in
+/// its `bad request` answer.
+fn older_than_the_verb(message: &str) -> bool {
+    message.contains("unknown variant")
+}
+
+/// The card's `Error`: a failure, said with its stage and logged once a
+/// streak.
+fn encoder_caps_failed(e: &std::io::Error) -> EncoderCapsView {
+    EncoderCapsView::unavailable(refresh_failed(
+        ENCODER_CAPS_SURFACE,
+        describe_io("encoder_caps", e),
+    ))
+}
+
+/// A reply that is not the summary, in the words the client's typed helper
+/// gives it: the daemon's own `Error` as `localapi error: <message>`
+/// ([`daemon_message`]), anything else as an unexpected response.
+fn not_the_summary(reply: localapi::Response) -> std::io::Error {
+    match reply {
+        localapi::Response::Error { message } => {
+            std::io::Error::other(format!("localapi error: {message}"))
+        }
+        other => std::io::Error::other(format!("localapi: unexpected response: {other:?}")),
     }
 }
 
@@ -4656,6 +4716,120 @@ mod tests {
             view.caps.as_ref().unwrap().denied.len(),
             2,
             "the verbatim list travels whole"
+        );
+    }
+
+    /// The failures the refresh ledger holds for the encoding card's streak.
+    fn encoder_caps_failures() -> u32 {
+        REFRESH_LEDGER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .streaks
+            .get(ENCODER_CAPS_SURFACE)
+            .map_or(0, |s| s.failures)
+    }
+
+    /// #3831 — on a Linux system install this app reaches the root daemon over
+    /// its person socket, and a daemon older than #3831 refuses `encoder_caps`
+    /// there. That refusal is an ANSWER, confirmed to be a root daemon's by
+    /// `refused_by_root_daemon` (one `Status`): the card's state is
+    /// `root_only`, which it words plainly, never `Error`, and the refresh
+    /// ledger is not told the card failed. Only an answer reads that way. No
+    /// answer at all (the transport failed) stays a failure whatever the
+    /// daemon is, so a hiccup on a daemon that serves the verb shows the real
+    /// error; and the same answer from a daemon that is not a root one reached
+    /// over its person socket stays a failure too.
+    #[test]
+    fn a_person_socket_refusal_is_root_only_and_no_answer_stays_a_failure() {
+        let refusal = || {
+            Ok(localapi::Response::Error {
+                message: "this is the person-at-the-device socket of a system install: … run \
+                          `sudo roomler …`"
+                    .into(),
+            })
+        };
+        // The answer, from a root daemon this unprivileged app reached.
+        let before = encoder_caps_failures();
+        let view = encoder_caps_view(refusal(), true);
+        assert!(!view.available);
+        assert_eq!(view.reason.as_deref(), Some("root_only"));
+        assert!(view.caps.is_none() && view.denied_cells.is_empty());
+        assert_eq!(
+            encoder_caps_failures(),
+            before,
+            "a refusal is not a failure"
+        );
+        // The same answer, from a daemon that is not that one: a failure.
+        let view = encoder_caps_view(refusal(), false);
+        assert!(!view.available);
+        let reason = view.reason.unwrap();
+        assert!(
+            reason.starts_with("encoder_caps: localapi error: this is the person-at-the-device"),
+            "{reason}"
+        );
+        assert_eq!(encoder_caps_failures(), before + 1);
+        // No answer at all: a failure, even with a root daemon on the line.
+        for lost in [
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "localapi: connection closed before a response",
+            ),
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ] {
+            let kind = lost.kind();
+            let view = encoder_caps_view(Err(lost), true);
+            let reason = view.reason.unwrap();
+            assert_ne!(reason, "root_only", "{kind:?}");
+            assert!(reason.starts_with("encoder_caps: "), "{reason}");
+        }
+        assert_eq!(encoder_caps_failures(), before + 4);
+        // A daemon older than the verb is a version, on any socket.
+        for root in [true, false] {
+            let old = Ok(localapi::Response::Error {
+                message: "bad request: unknown variant `encoder_caps`, expected one of `status`"
+                    .into(),
+            });
+            assert_eq!(
+                encoder_caps_view(old, root).reason.as_deref(),
+                Some("old_daemon")
+            );
+        }
+        // The summary is the card's matrix, and ends the streak.
+        let view = encoder_caps_view(
+            Ok(localapi::Response::EncoderCaps(
+                localapi::EncoderCapsSummary {
+                    state: "ready".into(),
+                    ..Default::default()
+                },
+            )),
+            true,
+        );
+        assert!(view.available && view.reason.is_none());
+        assert_eq!(encoder_caps_failures(), 0);
+    }
+
+    /// #3831 — the page words `root_only` as a plain, muted state, before its
+    /// `Error` fallback can take it.
+    #[test]
+    fn the_encoding_card_words_root_only_plainly() {
+        let js = include_str!("front/overview.js");
+        let branch = js
+            .find("view.reason === 'root_only'")
+            .expect("overview.js does not word root_only");
+        let sentence = js
+            .find("The encoders are shown to this device's administrator.")
+            .expect("overview.js does not say whose the encoders are");
+        let error = js
+            .find("encChip('Error'")
+            .expect("the card's Error fallback");
+        assert!(
+            branch < sentence && sentence < error,
+            "{branch} {sentence} {error}"
+        );
+        assert!(
+            js[branch..sentence].contains("encChip('Unavailable', 'chip-muted')"),
+            "root_only is a plain state, not a warning"
         );
     }
 
