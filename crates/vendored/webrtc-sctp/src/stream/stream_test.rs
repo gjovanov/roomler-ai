@@ -463,8 +463,16 @@ async fn test_stream_a_write_dropped_at_any_await_leaves_no_trace() -> Result<()
     assert!(queue.room() >= 1200, "room for the first chunk only");
     let filler = queue.len();
     let ssn = s.sequence_number.load(Ordering::SeqCst);
+    let holders = Arc::strong_count(&queue);
     let cut = cut_at_wait(s.write_sctp(&large, PayloadProtocolIdentifier::Binary), 1).await;
     assert!(cut.is_none(), "the large write never waited part way");
+    // roomler (#3755): its rest was queued as it dropped, by nothing that
+    // outlives the drop.
+    assert_eq!(
+        Arc::strong_count(&queue),
+        holders,
+        "the cut write left the queue with another holder"
+    );
     assert!(
         queue.len() > filler,
         "the large write must be cut part way, its first chunk queued"
@@ -511,6 +519,20 @@ async fn test_stream_a_write_dropped_at_any_await_leaves_no_trace() -> Result<()
             "after the large message (sequence number {ssn}) the stream sent {after_large:?}, \
              not the next message numbered {}",
             ssn.wrapping_add(1)
+        ));
+    }
+    // roomler (#3755): once drained, the queue is at rest: all of its room
+    // back, nothing owed, nothing queued.
+    let at_rest = (
+        queue.room(),
+        queue.overdraft(),
+        queue.get_num_bytes(),
+        queue.len(),
+    );
+    if at_rest != (QUEUE, 0, 0, 0) {
+        findings.push(format!(
+            "the drained queue's (room, overdraft, bytes, chunks) is {at_rest:?}, \
+             not ({QUEUE}, 0, 0, 0)"
         ));
     }
 

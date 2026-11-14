@@ -448,6 +448,267 @@ async fn test_pending_queue_append() -> Result<()> {
     Ok(())
 }
 
+// roomler (#3755): an append dropped at one of its awaits. Before its first
+// chunk has room it leaves no trace; after it, the message is begun and its
+// rest is queued as it drops, owing the room it lacks, which `pop` pays back
+// before it gives room again. At rest: room + queued bytes - overdraft is the
+// queue's size.
+
+/// The queues of these tests: a message of 5461 bytes or more is queued chunk
+/// by chunk (two thirds of the queue).
+const LIMIT: usize = 8 * 1024;
+
+/// Message `ssn` of one ordered stream, cut the way `Stream::packetize` cuts
+/// one: `n` chunks of `len` bytes, chunk `k` filled with `k`.
+fn make_message(ssn: u16, n: usize, len: usize) -> Vec<ChunkPayloadData> {
+    (0..n)
+        .map(|k| ChunkPayloadData {
+            stream_identifier: 1,
+            stream_sequence_number: ssn,
+            beginning_fragment: k == 0,
+            ending_fragment: k + 1 == n,
+            user_data: Bytes::from(vec![k as u8; len]),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Queues one small message of each of `sizes` bytes, numbered from 0.
+async fn fill(pq: &PendingQueue, wake: &tokio::sync::mpsc::Sender<()>, sizes: &[usize]) {
+    for (ssn, &len) in sizes.iter().enumerate() {
+        assert!(
+            pq.append(make_message(ssn as u16, 1, len), wake, || {})
+                .await
+        );
+    }
+}
+
+/// Polls `fut` once, with a waker that does nothing.
+fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+    fut.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+/// Takes every chunk out of `pq` the way the association's write loop does.
+fn pop_all(pq: &PendingQueue) -> Vec<ChunkPayloadData> {
+    let mut out = Vec::new();
+    while let Some(c) = pq.peek() {
+        match pq.pop(c.beginning_fragment, c.unordered) {
+            Some(c) => out.push(c),
+            None => break,
+        }
+    }
+    out
+}
+
+/// The queue's accounting: (room, overdraft, queued bytes, queued chunks).
+fn accounts(pq: &PendingQueue) -> (usize, usize, usize, usize) {
+    (pq.room(), pq.overdraft(), pq.get_num_bytes(), pq.len())
+}
+
+/// Room for one chunk of a 6000-byte message, not two: 6692 bytes queued.
+const ROOM_FOR_ONE_CHUNK: [usize; 2] = [3346, 3346];
+
+/// The 6000-byte message of these tests, number 2: six chunks of 1000 bytes.
+fn large() -> Vec<ChunkPayloadData> {
+    make_message(2, 6, 1000)
+}
+
+#[tokio::test]
+async fn test_pending_queue_an_append_cut_before_it_has_room_leaves_no_trace() {
+    let pq = PendingQueue::with_limit(LIMIT);
+    let (wake, _woken) = tokio::sync::mpsc::channel(1);
+    fill(&pq, &wake, &[4096, 4096]).await;
+    let before = accounts(&pq);
+    assert_eq!(before, (0, 0, LIMIT, 2), "the queue must be full");
+
+    for (what, message) in [("small", make_message(2, 1, 100)), ("large", large())] {
+        let mut commits = 0;
+        {
+            let mut append = std::pin::pin!(pq.append(message, &wake, || commits += 1));
+            assert!(
+                poll_once(append.as_mut()).is_pending(),
+                "the {what} append found room"
+            );
+        }
+        assert_eq!(commits, 0, "the cut {what} append committed its write");
+        assert_eq!(accounts(&pq), before, "the cut {what} append left a trace");
+        assert!(
+            !pq.is_locked(),
+            "the cut {what} append kept the queue's lock"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_pending_queue_a_begun_message_dropped_queues_its_rest_and_owes_the_room() {
+    let pq = PendingQueue::with_limit(LIMIT);
+    let (wake, mut woken) = tokio::sync::mpsc::channel(1);
+    fill(&pq, &wake, &ROOM_FOR_ONE_CHUNK).await;
+    let _ = woken.try_recv();
+
+    let mut commits = 0;
+    {
+        let mut append = std::pin::pin!(pq.append(large(), &wake, || commits += 1));
+        assert!(
+            poll_once(append.as_mut()).is_pending(),
+            "the append never waited for room"
+        );
+        assert_eq!(
+            pq.len(),
+            3,
+            "the append must be cut with its first chunk queued"
+        );
+    }
+    assert_eq!(commits, 1, "the begun message's commit must run once");
+    let (room, overdraft, bytes, len) = accounts(&pq);
+    assert_eq!(
+        (bytes, len),
+        (6692 + 6000, 8),
+        "the rest must be queued as it drops"
+    );
+    assert!(
+        overdraft > 0 && overdraft <= 5000,
+        "the rest owes the room it lacks, at most its 5000 bytes: {overdraft}"
+    );
+    assert_eq!(room + bytes - overdraft, LIMIT, "room + queued - overdraft");
+    assert!(
+        !pq.is_locked(),
+        "the queue's lock must be free once the rest is queued"
+    );
+    assert!(woken.try_recv().is_ok(), "the write loop must be woken");
+
+    // A pop pays the overdraft before it gives room: this one, 3346 bytes,
+    // gives none.
+    let first = pq.peek().expect("a chunk");
+    assert!(pq.pop(first.beginning_fragment, first.unordered).is_some());
+    assert_eq!(
+        pq.room(),
+        room,
+        "a pop gave room while the overdraft was owed"
+    );
+
+    let rest = pop_all(&pq);
+    assert_eq!(rest.len(), 7);
+    for (k, c) in rest[1..].iter().enumerate() {
+        assert!(
+            c.stream_sequence_number == 2
+                && c.user_data[0] == k as u8
+                && c.beginning_fragment == (k == 0)
+                && c.ending_fragment == (k == 5),
+            "the begun message must go out whole and in order: chunk {k} is {c:?}"
+        );
+    }
+    assert_eq!(
+        accounts(&pq),
+        (LIMIT, 0, 0, 0),
+        "the drained queue is not at rest"
+    );
+}
+
+#[tokio::test]
+async fn test_pending_queue_a_begun_message_dropped_after_close_queues_nothing() {
+    // Dropped, and let go by the close while it waits.
+    for repoll in [false, true] {
+        let pq = PendingQueue::with_limit(LIMIT);
+        let (wake, _woken) = tokio::sync::mpsc::channel(1);
+        fill(&pq, &wake, &ROOM_FOR_ONE_CHUNK).await;
+        {
+            let mut append = std::pin::pin!(pq.append(large(), &wake, || {}));
+            assert!(poll_once(append.as_mut()).is_pending());
+            assert_eq!(
+                pq.len(),
+                3,
+                "the append must be cut with its first chunk queued"
+            );
+            pq.close();
+            if repoll {
+                assert_eq!(
+                    poll_once(append.as_mut()),
+                    std::task::Poll::Ready(false),
+                    "the close must let the append go"
+                );
+            }
+        }
+        assert_eq!(
+            pq.len(),
+            3,
+            "a begun message queued its rest after the close"
+        );
+        assert_eq!(
+            pq.overdraft(),
+            0,
+            "a begun message owed room after the close"
+        );
+        assert!(!pq.is_locked(), "the queue's lock must be free");
+    }
+}
+
+#[test]
+fn test_pending_queue_a_begun_message_dropped_outside_any_runtime_queues_its_rest() {
+    let pq = PendingQueue::with_limit(LIMIT);
+    let (wake, mut woken) = tokio::sync::mpsc::channel(1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    rt.block_on(fill(&pq, &wake, &ROOM_FOR_ONE_CHUNK));
+    let _ = woken.try_recv();
+    let mut append = Box::pin(pq.append(large(), &wake, || {}));
+    assert!(rt.block_on(async { poll_once(append.as_mut()).is_pending() }));
+    assert_eq!(
+        pq.len(),
+        3,
+        "the append must be cut with its first chunk queued"
+    );
+    drop(rt);
+
+    drop(append);
+    let (room, overdraft, bytes, len) = accounts(&pq);
+    assert_eq!(
+        (bytes, len),
+        (6692 + 6000, 8),
+        "the rest must be queued as it drops"
+    );
+    assert_eq!(room + bytes - overdraft, LIMIT, "room + queued - overdraft");
+    assert!(!pq.is_locked(), "the queue's lock must be free");
+    assert!(woken.try_recv().is_ok(), "the write loop must be woken");
+}
+
+#[test]
+fn test_pending_queue_a_begun_message_dropped_while_unwinding_queues_its_rest() {
+    let pq = PendingQueue::with_limit(LIMIT);
+    let (wake, _woken) = tokio::sync::mpsc::channel(1);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            fill(&pq, &wake, &ROOM_FOR_ONE_CHUNK).await;
+            let mut append = std::pin::pin!(pq.append(large(), &wake, || {}));
+            assert!(poll_once(append.as_mut()).is_pending());
+            assert_eq!(
+                pq.len(),
+                3,
+                "the append must be cut with its first chunk queued"
+            );
+            panic!("begun");
+        })
+    }));
+    let payload = unwound.expect_err("the runtime must have unwound");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"begun"),
+        "it must unwind from the panic with a begun message alive"
+    );
+    let (room, overdraft, bytes, len) = accounts(&pq);
+    assert_eq!(
+        (bytes, len),
+        (6692 + 6000, 8),
+        "the rest must be queued as it unwinds"
+    );
+    assert_eq!(room + bytes - overdraft, LIMIT, "room + queued - overdraft");
+    assert!(!pq.is_locked(), "the queue's lock must be free");
+}
+
 ///////////////////////////////////////////////////////////////////
 //reassembly_queue_test
 ///////////////////////////////////////////////////////////////////

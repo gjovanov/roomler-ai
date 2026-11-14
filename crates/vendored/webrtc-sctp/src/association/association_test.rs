@@ -2828,6 +2828,33 @@ async fn link_until_done<T>(
     task.is_finished()
 }
 
+/// The pending queue's accounting once the association drained, as a finding
+/// unless it is at rest: all of its room back, nothing owed, nothing queued. A
+/// cut write that kept room, or returned room it never had, shows here.
+fn queue_at_rest(queue: &PendingQueue, limit: usize) -> Option<String> {
+    let (room, overdraft, bytes, chunks) = (
+        queue.room(),
+        queue.overdraft(),
+        queue.get_num_bytes(),
+        queue.len(),
+    );
+    (room != limit || overdraft != 0 || bytes != 0 || chunks != 0).then(|| {
+        format!(
+            "the drained pending queue is not at rest: room {room} of {limit}, \
+             overdraft {overdraft}, {bytes} bytes in {chunks} chunks queued"
+        )
+    })
+}
+
+/// Polls `weak` for up to five seconds: whether what it points to is gone.
+async fn gone_within_5s<T>(weak: &std::sync::Weak<T>) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while weak.strong_count() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    weak.strong_count() == 0
+}
+
 /// roomler (#3755) AC1: a notice cut by its budget while the association's
 /// pending queue is full. The queue is shared by every stream of the
 /// association: the video fills it while the link holds every packet, and the
@@ -2949,6 +2976,7 @@ async fn test_assoc_a_write_cut_by_its_timeout_leaves_no_gap() -> Result<()> {
                 }
             }
         }
+        findings.extend(queue_at_rest(&queue, SMALL_QUEUE));
         Ok(())
     }
     .await;
@@ -2983,9 +3011,11 @@ async fn test_assoc_a_large_write_cut_part_way_is_never_read_in_part() -> Result
         .use_pending_queue_of(SMALL_QUEUE);
 
     let mut findings: Vec<String> = Vec::new();
+    let mut weak_queue = std::sync::Weak::new();
     let outcome: Result<()> = async {
         let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
         let queue = Arc::clone(&s0.pending_queue);
+        weak_queue = Arc::downgrade(&queue);
 
         // More than the whole queue: its first chunks go in, then it waits for
         // room, and it is cut there.
@@ -2993,11 +3023,19 @@ async fn test_assoc_a_large_write_cut_part_way_is_never_read_in_part() -> Result
             .map(|i| (i % 251) as u8)
             .collect::<Vec<u8>>()
             .into();
+        let holders = Arc::strong_count(&queue);
         let cut = cut_at_wait(s0.write_sctp(&big, PayloadProtocolIdentifier::Binary), 1).await;
         assert!(
             cut.is_none(),
             "the large write never waited, or this proves nothing"
         );
+        // Its rest was queued as it dropped, by nothing that outlives the drop.
+        let held = Arc::strong_count(&queue);
+        if held != holders {
+            findings.push(format!(
+                "the cut write left the pending queue with {held} holders, not {holders}"
+            ));
+        }
         assert!(
             queue.room() < SMALL_QUEUE,
             "the write must be cut part way, its first chunks queued, or this proves nothing"
@@ -3065,11 +3103,18 @@ async fn test_assoc_a_large_write_cut_part_way_is_never_read_in_part() -> Result
                 "the stream's buffered_amount is {left} once everything was acknowledged, not 0"
             ));
         }
+        findings.extend(queue_at_rest(&queue, SMALL_QUEUE));
         Ok(())
     }
     .await;
 
     close_association_pair(&br, a0, a1).await;
+    if !gone_within_5s(&weak_queue).await {
+        findings.push(format!(
+            "the pending queue still has {} holders 5 s after its association closed",
+            weak_queue.strong_count()
+        ));
+    }
     outcome?;
     assert!(
         findings.is_empty(),
@@ -3211,7 +3256,13 @@ fn parse_cut_test_message(m: &[u8]) -> Option<(u8, u32)> {
 }
 
 /// The AC3 property over what the writers logged and what the peer read.
-fn check_cut_writes(log: &[(u8, u32, CutWrite)], read: &[Vec<u8>]) -> Vec<String> {
+/// `returned_order`: the log is in the order the writes were queued, as on a
+/// runtime of one thread, so the writes that returned `Ok` are read in it.
+fn check_cut_writes(
+    log: &[(u8, u32, CutWrite)],
+    read: &[Vec<u8>],
+    returned_order: bool,
+) -> Vec<String> {
     let mut findings = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut last_of: HashMap<u8, u32> = HashMap::new();
@@ -3252,7 +3303,7 @@ fn check_cut_writes(log: &[(u8, u32, CutWrite)], read: &[Vec<u8>]) -> Vec<String
             first.0,
             first.1
         ));
-    } else {
+    } else if returned_order {
         let read_written: Vec<(u8, u32)> = read_ids
             .iter()
             .filter(|id| written.contains(id))
@@ -3279,7 +3330,11 @@ fn check_cut_writes(log: &[(u8, u32, CutWrite)], read: &[Vec<u8>]) -> Vec<String
 
 /// One round of AC3 with `seed`: the findings, none when the stream stayed
 /// whole.
-async fn cut_writes_round(seed: u64) -> Result<Vec<String>> {
+///
+/// The pending queue's overdraft is sampled while the writers run, and must
+/// stay within `max_owed` bytes; once the association drained, its accounting
+/// must be at rest.
+async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Result<Vec<String>> {
     const SI: u16 = 1;
     const WRITERS: u8 = 3;
     const WRITES: u32 = 20;
@@ -3295,6 +3350,24 @@ async fn cut_writes_round(seed: u64) -> Result<Vec<String>> {
     let mut findings: Vec<String> = Vec::new();
     let outcome: Result<()> = async {
         let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+        let queue = Arc::clone(&s0.pending_queue);
+
+        // The queue's room and overdraft, sampled while the writers run: the
+        // most of each seen.
+        let sampling = Arc::new(AtomicBool::new(true));
+        let sampler = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            let sampling = Arc::clone(&sampling);
+            async move {
+                let (mut room, mut owed) = (0, 0);
+                while sampling.load(Ordering::SeqCst) {
+                    room = queue.room().max(room);
+                    owed = queue.overdraft().max(owed);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                (room, owed)
+            }
+        });
 
         // The link moves all along.
         let link_up = Arc::new(AtomicBool::new(true));
@@ -3362,6 +3435,19 @@ async fn cut_writes_round(seed: u64) -> Result<Vec<String>> {
         if all_done.is_err() {
             findings.push("the writers did not finish within 40 s".to_owned());
         }
+        sampling.store(false, Ordering::SeqCst);
+        if let Ok((room, owed)) = sampler.await {
+            if room > SMALL_QUEUE {
+                findings.push(format!(
+                    "the queue had room {room} while the writers ran, more than its {SMALL_QUEUE}"
+                ));
+            }
+            if owed > max_owed {
+                findings.push(format!(
+                    "the queue owed {owed} bytes while the writers ran, more than {max_owed}"
+                ));
+            }
+        }
         link_up.store(false, Ordering::SeqCst);
         let _ = link.await;
         if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
@@ -3375,13 +3461,14 @@ async fn cut_writes_round(seed: u64) -> Result<Vec<String>> {
             read.push(buf[..n].to_vec());
         }
         let log = log.lock().unwrap().clone();
-        findings.extend(check_cut_writes(&log, &read));
+        findings.extend(check_cut_writes(&log, &read, one_thread));
         let left = s0.buffered_amount();
         if left != 0 {
             findings.push(format!(
                 "the stream's buffered_amount is {left} once everything was acknowledged, not 0"
             ));
         }
+        findings.extend(queue_at_rest(&queue, SMALL_QUEUE));
         Ok(())
     }
     .await;
@@ -3398,17 +3485,51 @@ async fn cut_writes_round(seed: u64) -> Result<Vec<String>> {
 /// must read only whole messages, each writer's in the order written, none
 /// twice, and every write that returned `Ok`, in the order they returned. A
 /// cut write is never read, or read whole and once, in its place.
+///
+/// On one thread a `pop` never runs inside a cut write's drop, so the room
+/// that is free while a cut message is owed is less than a chunk, and no
+/// large message begins on it: the overdraft is at most the rest of one
+/// message, under the largest a round writes.
 #[tokio::test(flavor = "current_thread")]
 async fn test_assoc_writes_cut_at_any_wait_keep_the_stream_whole() -> Result<()> {
     let mut findings = Vec::new();
     for seed in [0x3755_u64, 1, 2, 3] {
-        for finding in cut_writes_round(seed).await? {
+        for finding in cut_writes_round(seed, true, LARGEST_CUT_TEST_MESSAGE).await? {
             findings.push(format!("seed {seed:#x}: {finding}"));
         }
     }
     assert!(
         findings.is_empty(),
         "#3755 AC3, writes cut at any wait:\n  - {}",
+        findings.join("\n  - ")
+    );
+    Ok(())
+}
+
+/// The largest message an AC3 round writes, in bytes.
+const LARGEST_CUT_TEST_MESSAGE: usize = 5_500 + 14_500;
+
+/// roomler (#3755): AC3 on a runtime of two threads, where the write loop's
+/// `pop` runs on one thread while a cut write queues the rest of its message
+/// on the other. The same property, but for the order the writes returned in,
+/// which the writers can no longer log in the order they were queued; and the
+/// pending queue's accounting, at rest once drained. While the writers run,
+/// the overdraft is sampled against two of the largest messages, not one: a
+/// `pop` running alongside a cut write's drop can leave up to a chunk of room
+/// free while the cut message is owed, and a second large message that begins
+/// on it and is cut too owes its rest as well. Each such race adds at most one
+/// message, and the queue pays the overdraft back before it gives room again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting() -> Result<()> {
+    let mut findings = Vec::new();
+    for seed in [0x3755_u64, 4, 5] {
+        for finding in cut_writes_round(seed, false, 2 * LARGEST_CUT_TEST_MESSAGE).await? {
+            findings.push(format!("seed {seed:#x}: {finding}"));
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "#3755, writes cut on two threads:\n  - {}",
         findings.join("\n  - ")
     );
     Ok(())

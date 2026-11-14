@@ -97,6 +97,12 @@ impl PendingQueue {
         self.overdraft.load(Ordering::SeqCst)
     }
 
+    /// roomler (#3755): whether an append holds the queue's lock now.
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.semaphore_lock.try_lock().is_err()
+    }
+
     /// roomler (#3716): lets go every writer parked in flow control. Their
     /// permits come back only when the peer acknowledges, so on a dead path a
     /// writer waited forever, holding `semaphore_lock` (which a stream's reset
@@ -428,9 +434,15 @@ impl PendingQueue {
 /// (`pop` keeps it selected).
 ///
 /// The rest takes the room that is free and owes the shortfall
-/// (`PendingQueue::overdraft`). No writer gets room until `pop` has paid it
-/// back, so at most one message is ever owed. Nothing is queued once the queue
-/// was closed (#3716): the association is going away. The drop never awaits,
+/// (`PendingQueue::overdraft`), and `pop` pays the overdraft back before it
+/// gives room again. So while a cut message is owed no writer gets room, but
+/// for one race: on a runtime of several threads, a `pop` running alongside
+/// this drop can leave up to a chunk of room free, a large message can begin
+/// on it, and if that one is cut too, it owes its rest as well. The overdraft
+/// is the rest of one cut message plus one more for each such race, and it
+/// only shrinks as the queue drains. At rest the accounting is exact: room +
+/// queued bytes - overdraft == the limit. Nothing is queued once the queue was
+/// closed (#3716): the association is going away. The drop never awaits,
 /// needs no runtime and does not panic, short of a poisoned queue lock, as
 /// `pop`.
 struct BegunMessage<'a> {
