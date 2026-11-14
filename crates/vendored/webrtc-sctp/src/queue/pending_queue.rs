@@ -43,6 +43,11 @@ pub(crate) struct PendingQueue {
     // append was dropped (`BegunMessage`); `pop` pays them back before it
     // gives room again. At rest: room + queued bytes - overdraft == the limit.
     overdraft: AtomicUsize,
+    // roomler (#3755): the tests' stand-in for a write loop that pops on
+    // another thread while a begun message's drop runs: (the drop's step,
+    // the chunks popped there).
+    #[cfg(test)]
+    pub(crate) pops_in_drop: Option<(usize, usize)>,
 
     unordered_queue: RwLock<PendingBaseQueue>,
     ordered_queue: RwLock<PendingBaseQueue>,
@@ -65,6 +70,8 @@ impl PendingQueue {
             semaphore: Semaphore::new(QUEUE_BYTES_LIMIT),
             append_large_at: QUEUE_APPEND_LARGE,
             overdraft: Default::default(), // roomler (#3755)
+            #[cfg(test)]
+            pops_in_drop: None, // roomler (#3755)
             unordered_queue: Default::default(),
             ordered_queue: Default::default(),
             queue_len: Default::default(),
@@ -101,6 +108,26 @@ impl PendingQueue {
     #[cfg(test)]
     pub(crate) fn is_locked(&self) -> bool {
         self.semaphore_lock.try_lock().is_err()
+    }
+
+    /// roomler (#3755): at step `step` of a begun message's drop, pops what
+    /// `pops_in_drop` says, the way the write loop does.
+    #[cfg(test)]
+    fn pop_in_drop(&self, step: usize) {
+        let Some((at, pops)) = self.pops_in_drop else {
+            return;
+        };
+        if at != step {
+            return;
+        }
+        for _ in 0..pops {
+            let Some(c) = self.peek() else {
+                return;
+            };
+            if self.pop(c.beginning_fragment, c.unordered).is_none() {
+                return;
+            }
+        }
     }
 
     /// roomler (#3716): lets go every writer parked in flow control. Their
@@ -464,6 +491,9 @@ impl Drop for BegunMessage<'_> {
         // what is counted here is there to take.
         let free =
             u32::try_from(self.queue.semaphore.available_permits().min(n)).unwrap_or(u32::MAX);
+        // roomler (#3755): step 0, the room was read.
+        #[cfg(test)]
+        self.queue.pop_in_drop(0);
         let taken = match self.queue.semaphore.try_acquire_many(free) {
             Ok(permits) => {
                 permits.forget();
@@ -472,6 +502,9 @@ impl Drop for BegunMessage<'_> {
             Err(TryAcquireError::Closed) => return,
             Err(TryAcquireError::NoPermits) => 0,
         };
+        // roomler (#3755): step 1, the room was taken.
+        #[cfg(test)]
+        self.queue.pop_in_drop(1);
         // Owed before it is queued, so a `pop` of the rest can never return
         // room for bytes that never had it.
         self.queue

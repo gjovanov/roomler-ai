@@ -709,6 +709,74 @@ fn test_pending_queue_a_begun_message_dropped_while_unwinding_queues_its_rest() 
     assert!(!pq.is_locked(), "the queue's lock must be free");
 }
 
+/// roomler (#3755): the write loop pops on another thread while a begun
+/// message's drop runs. What it pops then pays the cut message's debt before
+/// it gives room, so once the drop is done no room is free while anything is
+/// owed, and a writer that comes next waits until the debt is paid. The queue's
+/// `pops_in_drop` stands in for that thread: it pops 0 to 3 chunks at each
+/// step of the drop in turn.
+#[tokio::test]
+async fn test_pending_queue_no_room_is_free_while_a_cut_message_is_owed() {
+    let mut findings = Vec::new();
+    for step in 0..3 {
+        for pops in 0..=3 {
+            let mut pq = PendingQueue::with_limit(LIMIT);
+            pq.pops_in_drop = Some((step, pops));
+            let (wake, _woken) = tokio::sync::mpsc::channel(1);
+            fill(&pq, &wake, &ROOM_FOR_ONE_CHUNK).await;
+            {
+                let mut append = std::pin::pin!(pq.append(large(), &wake, || {}));
+                assert!(
+                    poll_once(append.as_mut()).is_pending(),
+                    "the append never waited for room"
+                );
+                assert_eq!(
+                    pq.len(),
+                    3,
+                    "the append must be cut with its first chunk queued"
+                );
+            }
+            let at = format!("{pops} chunk(s) popped at step {step} of the drop");
+            let (room, overdraft, bytes, _) = accounts(&pq);
+            if room > 0 && overdraft > 0 {
+                findings.push(format!(
+                    "{at}: {room} bytes of room free while {overdraft} are owed"
+                ));
+            }
+            if room + bytes != LIMIT + overdraft {
+                findings.push(format!(
+                    "{at}: room {room} + queued {bytes} - overdraft {overdraft} is not {LIMIT}"
+                ));
+            }
+            // The queue then sends what the pops left of the chunks queued
+            // before the drop, and the cut message's rest, in order.
+            let sent: Vec<(u16, u8)> = pop_all(&pq)
+                .iter()
+                .map(|c| (c.stream_sequence_number, c.user_data[0]))
+                .collect();
+            let expected: Vec<(u16, u8)> = [(0, 0), (1, 0), (2, 0)]
+                .into_iter()
+                .skip(pops)
+                .chain((1..6).map(|k| (2, k)))
+                .collect();
+            if sent != expected {
+                findings.push(format!("{at}: the queue sent {sent:?}, not {expected:?}"));
+            }
+            if accounts(&pq) != (LIMIT, 0, 0, 0) {
+                findings.push(format!(
+                    "{at}: the drained queue is {:?}, not at rest",
+                    accounts(&pq)
+                ));
+            }
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "#3755, pops racing a begun message's drop:\n  - {}",
+        findings.join("\n  - ")
+    );
+}
+
 ///////////////////////////////////////////////////////////////////
 //reassembly_queue_test
 ///////////////////////////////////////////////////////////////////
