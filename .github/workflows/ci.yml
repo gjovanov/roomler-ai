@@ -987,6 +987,23 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" files::seat_user_tests
 
+      - name: "Exec and SSH as the console user on a Linux system install (#3822) — as root, a held seat0 lookup refuses in time and nothing runs"
+        # #3822. A root daemon's `console_user` asks who is at seat0 through
+        # the one lookup in flight a received file asks, off the async
+        # worker, 1.5 s at most. With that lookup held up, Fleet RPC's exec,
+        # SSH's exec and SFTP are refused with the try-again text and run
+        # nothing, as root or as anyone; with a lookup that answers, they drop
+        # to the person (`nobody` here). Only root drops to another account,
+        # so the lib test binary runs under sudo, and ROOMLERD_TEST_REQUIRE_ROOT
+        # fails a test that is not root rather than letting it run as itself.
+        # SSH's shell is `ssh-server`'s: rust-agent's "Test agent under
+        # vp9-444" runs the same tests with it, as the runner.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/i3822.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/i3822.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" exec::console_lookup_tests
+
       - name: The Linux user unit's sandbox (FR-85 P2c) — it starts on a fresh host, and the recorder writes ~/Videos
         # FR-85 P2c. `roomler.service` (the per-user install; what
         # `install.sh --role daemon` enables without `--system`) runs the

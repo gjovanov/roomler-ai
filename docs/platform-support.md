@@ -145,10 +145,10 @@ and never outliving the daemon (FR-97 P0e).
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
 | `exec` and SSH `daemon` mode | 🟡 SYSTEM on a SystemContext install, or once anchored (FR-94); the signed-in person on an attended one | ✅ root | ✅ root on the root half's row | `docs/fleet-rpc.md`, Who runs the command |
-| `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:887-891`); Windows: `docs/roomler-ssh.md` |
+| `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:894-906`); Windows: `docs/roomler-ssh.md` |
 | `named:<account>` | ⛔ | ✅ | ✅ | §8 |
 | SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1226-1230` |
-| A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:880` |
+| A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:887` |
 
 ## 6. The desktop: companion, power, files
 
