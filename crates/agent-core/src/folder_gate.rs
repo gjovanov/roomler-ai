@@ -29,9 +29,14 @@
 //!   `static` that holds it;
 //! - on macOS and Linux, a `directories` lookup ([`LOOKUPS`]).
 //!
-//! A read that is right where it is is listed in [`KNOWN`] with the reason,
-//! and a linked package that is not scanned in [`NOT_SCANNED`]. A stale row
-//! fails too, so neither list can rot.
+//! Every read outside `appdirs` has a row in [`KNOWN`] for each build that
+//! flags it, of one of two kinds ([`Row`]): **right**, with the reason it is
+//! right where it is, or **tracked**, when it is not right for an entry point
+//! the row names, with the one issue that removes it. The gate prints how many
+//! tracked rows there are and the issues they name, so the number is in every
+//! run's log. A linked package that is not scanned is listed in
+//! [`NOT_SCANNED`]. A row whose read is gone fails as stale, of either kind,
+//! so no list can rot.
 //!
 //! What it does not see: a helper called with method syntax (`x.helper(..)`:
 //! a parser does not know the receiver's type, and `cmd.env("APPDATA", x)`
@@ -91,44 +96,199 @@ const LOOKUPS: &[&str] = &["ProjectDirs", "BaseDirs", "UserDirs"];
 /// The module that reads them.
 const READER: &str = "crates/agent-core/src/appdirs.rs";
 
-/// Reads outside [`READER`]: `(file, function, why)`.
-const KNOWN: &[(&str, &str, &str)] = &[
+/// What a row of [`KNOWN`] says of its read.
+#[derive(Clone, Copy, Debug)]
+enum Row {
+    /// Right where it is, for this reason.
+    Right(&'static str),
+    /// Not right for the entry point the text names, until the issue
+    /// removes it. The text states the platform, the account that runs the
+    /// entry point and the folder the read returns there.
+    Tracked(u32, &'static str),
+}
+
+/// A read outside [`READER`] on one build: `(file, function, build, row)`.
+type KnownRow = (&'static str, &'static str, Build, Row);
+
+/// Reads outside [`READER`], one row for each build that flags one.
+const KNOWN: &[KnownRow] = &[
     (
         "crates/agent-core/src/files_dir.rs",
         "from_env",
-        "the received-files denylist's Windows roots, in the process that checks \
-         a path: not a folder a step writes, and on the service account the \
-         values are the system's own once `appdirs::pin_system_folders` ran",
+        Build::Windows,
+        Row::Right(
+            "Windows: the received-files denylist's roots, in the process that \
+             checks a path: not a folder a step writes, and on the service account \
+             the values are the system's own once `appdirs::pin_system_folders` ran",
+        ),
     ),
     (
         "crates/agent-core/src/companion_autostart.rs",
         "program_files_dirs",
-        "how the desktop companion was installed, read by the companion as the \
-         person: not a folder a step writes",
-    ),
-    (
-        "agents/roomler-cli/src/config.rs",
-        "default_config_path",
-        "the `roomler` command's per-user config on macOS and Linux, read by the \
-         command as the person who runs it",
+        Build::Windows,
+        Row::Right(
+            "Windows: how the desktop companion was installed, read by the \
+             companion as the person: not a folder a step writes",
+        ),
     ),
     (
         "agents/roomler-cli/src/update.rs",
         "sudo_user_config_path",
-        "the `roomler` command's self-update under sudo, finding the config of \
-         the person who ran it",
+        Build::Linux,
+        Row::Right(
+            "Linux: `sudo roomler self-update` runs as root and re-bases the path \
+             onto the home the account database gives `SUDO_USER`, so it names \
+             that person's config; `HOME` only names the path's tail",
+        ),
+    ),
+    (
+        "agents/roomler-cli/src/update.rs",
+        "sudo_user_config_path",
+        Build::Macos,
+        Row::Right(
+            "macOS: `sudo roomler self-update` runs as root and re-bases the path \
+             onto the home the account database gives `SUDO_USER`, so it names \
+             that person's config; `HOME` only names the path's tail",
+        ),
     ),
     (
         "agents/roomlerd/src/files.rs",
         "private_staging_root",
-        "a per-user daemon's own state folder on Linux; root's is the fixed \
-         `/var/lib/roomler/staging`",
+        Build::Linux,
+        Row::Right(
+            "Linux: root (the system service, `sudo`) takes `/var/lib/roomler/staging` \
+             or the seat person's home from the account database first; only a \
+             daemon that is not root, the person's own, reads its own \
+             `XDG_STATE_HOME` or `HOME`",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/files.rs",
+        "process_home",
+        Build::Linux,
+        Row::Right(
+            "Linux: reached only by a process that is not root, which names its \
+             own home; root, `sudo roomlerd run` too, takes its home from the \
+             account database first (`account_home` in `writer_context`)",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/files.rs",
+        "own_home_and_downloads",
+        Build::Linux,
+        Row::Right(
+            "Linux: read only by a daemon that is not root, the person's own, so \
+             it names the person's home and Downloads; root takes its home from \
+             the account database first (`account_home`)",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/recording/folder.rs",
+        "default_choice",
+        Build::Linux,
+        Row::Right(
+            "Linux: resolved only by a recorder that runs as the person (the \
+             daemon itself when it is the person, or the root daemon's child, \
+             given the person's `HOME` from the account database), so it names \
+             the person's folders",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/recording/folder.rs",
+        "default_choice",
+        Build::Macos,
+        Row::Right(
+            "macOS: resolved only by a recorder that runs as the daemon's own \
+             account, the person (a root daemon launches no recorder), so it \
+             names the person's folders",
+        ),
+    ),
+    // FR-147: on a Mac, a root step of ours does nothing inside a person's
+    // home.
+    (
+        "agents/roomlerd/src/files.rs",
+        "process_home",
+        Build::Macos,
+        Row::Tracked(
+            3834,
+            "macOS: `sudo roomlerd run` runs as root and keeps the caller's `HOME`, \
+             so the daemon's active home is the caller's, not root's `/var/root`",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/files.rs",
+        "default_download_dir",
+        Build::Macos,
+        Row::Tracked(
+            3834,
+            "macOS: `sudo roomlerd run` runs as root and keeps the caller's `HOME`, \
+             so this names the caller's `~/Downloads`, not root's",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/instance_lock.rs",
+        "unix_lock_path",
+        Build::Macos,
+        Row::Tracked(
+            3834,
+            "macOS: `sudo roomlerd run` runs as root and keeps the caller's `HOME`, \
+             so its lock is in the caller's `~/Library/Caches`, not root's",
+        ),
     ),
     (
         "agents/roomlerd/src/service.rs",
+        "plist_path",
+        Build::Macos,
+        Row::Tracked(
+            3834,
+            "macOS: `sudo roomlerd service install` or `uninstall` runs as root and \
+             keeps the caller's `HOME`, so this names the caller's \
+             `~/Library/LaunchAgents`, not root's",
+        ),
+    ),
+    (
+        "agents/roomler-cli/src/config.rs",
+        "default_config_path",
+        Build::Macos,
+        Row::Tracked(
+            3834,
+            "macOS: `sudo roomler enroll`, `forward` or `socks5` without `--config` \
+             runs as root and keeps the caller's `HOME`, so this names the caller's \
+             tunnel config, not root's",
+        ),
+    ),
+    // Linux: a root command run through a `sudo` that keeps `HOME`.
+    (
+        "agents/roomlerd/src/service.rs",
         "user_unit_path_for",
-        "a systemd user unit, which lives in the person's own config folder: \
-         the per-user install, run as that person",
+        Build::Linux,
+        Row::Tracked(
+            3866,
+            "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomlerd service \
+             install`, `start` or `stop` (root, no packaged unit) names the caller's \
+             `systemd/user` folder here",
+        ),
+    ),
+    (
+        "agents/roomler-cli/src/config.rs",
+        "default_config_path",
+        Build::Linux,
+        Row::Tracked(
+            3866,
+            "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomler enroll`, \
+             `forward` or `socks5` (root, no `--config`) names the caller's tunnel \
+             config here",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/instance_lock.rs",
+        "unix_lock_path",
+        Build::Linux,
+        Row::Tracked(
+            3866,
+            "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomlerd run` \
+             (root) takes its lock in the caller's folders here",
+        ),
     ),
 ];
 
@@ -902,46 +1062,160 @@ fn files<'s>(
         .collect()
 }
 
+/// What `rows` leave unmatched in `reads` (`(build, file, read)`): a read
+/// with no row of either kind for its build, a row, of either kind, whose
+/// read is gone (stale), and a row whose text does not start with its
+/// build's platform. One line each.
+fn unmatched(reads: &[(Build, String, Read)], rows: &[KnownRow]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (build, file, read) in reads {
+        if !rows
+            .iter()
+            .any(|(f, function, b, _)| f == file && *function == read.function && b == build)
+        {
+            lines.push(format!(
+                "{build:?}: {file}: {} names {:?}",
+                read.function, read.names
+            ));
+        }
+    }
+    for (file, function, build, row) in rows {
+        let (Row::Right(text) | Row::Tracked(_, text)) = row;
+        if !text
+            .to_ascii_lowercase()
+            .starts_with(&format!("{}: ", build.os()))
+        {
+            lines.push(format!(
+                "a row whose text does not start with its platform: {build:?}: {file}: {function}"
+            ));
+        }
+        if !reads
+            .iter()
+            .any(|(b, f, read)| b == build && f == file && read.function == *function)
+        {
+            let kind = match row {
+                Row::Right(_) => "right".to_owned(),
+                Row::Tracked(issue, _) => format!("tracked #{issue}"),
+            };
+            lines.push(format!("a stale {kind} row: {build:?}: {file}: {function}"));
+        }
+    }
+    lines
+}
+
+/// The line the gate prints on every run: how many tracked rows `rows` hold
+/// and the issues they name, with each one's count.
+fn tracked(rows: &[KnownRow]) -> String {
+    let mut issues: BTreeMap<u32, usize> = BTreeMap::new();
+    for (_, _, _, row) in rows {
+        if let Row::Tracked(issue, _) = row {
+            *issues.entry(*issue).or_default() += 1;
+        }
+    }
+    let named: Vec<String> = issues
+        .iter()
+        .map(|(issue, count)| format!("#{issue} ({count})"))
+        .collect();
+    format!(
+        "folder gate: {} tracked rows, naming {}",
+        issues.values().sum::<usize>(),
+        if named.is_empty() {
+            "no issue".to_owned()
+        } else {
+            named.join(", ")
+        }
+    )
+}
+
 #[test]
 fn only_appdirs_reads_a_folder_variable() {
     let root = repo_root();
     let graph = Graph::read(&root);
     let mut sources = Sources::default();
-    let mut unknown = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut reads = Vec::new();
     for build in BUILDS {
         let files = files(&mut sources, &root, &graph, build);
         assert!(
             files.iter().any(|(f, _)| f == READER),
             "the {build:?} scan reaches {READER}"
         );
-        for (file, read) in flagged(&files, build) {
-            if KNOWN
-                .iter()
-                .any(|(f, function, _)| *f == file && *function == read.function)
-            {
-                seen.insert((file, read.function));
-            } else {
-                unknown.push(format!(
-                    "{build:?}: {file}: {} names {:?}",
-                    read.function, read.names
-                ));
-            }
-        }
-    }
-    assert!(
-        unknown.is_empty(),
-        "a folder read outside appdirs; take the folder from `appdirs` (the machine's \
-         from the system, the service account's profile from the profile list), or list \
-         the read in KNOWN with why:\n{}",
-        unknown.join("\n")
-    );
-    for (file, function, _) in KNOWN {
-        assert!(
-            seen.contains(&(file.to_string(), function.to_string())),
-            "a stale KNOWN row: {file} {function}"
+        reads.extend(
+            flagged(&files, build)
+                .into_iter()
+                .map(|(file, read)| (build, file, read)),
         );
     }
+    // Written to the stream itself: the harness keeps back what a passing
+    // test prints with `println!`, and this line belongs in every log.
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{}", tracked(KNOWN));
+    }
+    let lines = unmatched(&reads, KNOWN);
+    assert!(
+        lines.is_empty(),
+        "a folder read outside appdirs; take the folder from `appdirs` (the machine's \
+         from the system, the service account's profile from the profile list), or give \
+         the read a row in KNOWN for its build: right, with why, or tracked, with the \
+         issue that removes it. A row whose read is gone is stale:\n{}",
+        lines.join("\n")
+    );
+}
+
+/// The row cases of [`the_gate_sees_what_it_is_for`].
+fn rows_hold_their_reads() {
+    let read = |build, function: &str| {
+        (
+            build,
+            "a.rs".to_owned(),
+            Read {
+                function: function.to_owned(),
+                names: vec!["BaseDirs::new".to_owned()],
+            },
+        )
+    };
+    const ROWS: &[KnownRow] = &[
+        ("a.rs", "right", Build::Linux, Row::Right("Linux: why")),
+        (
+            "a.rs",
+            "tracked",
+            Build::Macos,
+            Row::Tracked(1, "macOS: where"),
+        ),
+    ];
+    // A tracked row with its read present passes, as a right row does.
+    let both = [read(Build::Linux, "right"), read(Build::Macos, "tracked")];
+    assert_eq!(unmatched(&both, ROWS), Vec::<String>::new());
+    // A tracked row whose read is gone fails as stale.
+    assert_eq!(
+        unmatched(&[read(Build::Linux, "right")], ROWS),
+        ["a stale tracked #1 row: Macos: a.rs: tracked"]
+    );
+    // A read with no row of either kind fails: a row for another build is
+    // not its row.
+    assert_eq!(
+        unmatched(
+            &[
+                read(Build::Linux, "right"),
+                read(Build::Macos, "tracked"),
+                read(Build::Linux, "tracked"),
+            ],
+            ROWS
+        ),
+        [r#"Linux: a.rs: tracked names ["BaseDirs::new"]"#]
+    );
+    // A row's text states its platform: a row copied to another build fails.
+    const COPIED: &[KnownRow] = &[("a.rs", "right", Build::Macos, Row::Right("Linux: why"))];
+    assert_eq!(
+        unmatched(&[read(Build::Macos, "right")], COPIED),
+        ["a row whose text does not start with its platform: Macos: a.rs: right"]
+    );
+    // The line every run prints.
+    assert_eq!(tracked(ROWS), "folder gate: 1 tracked rows, naming #1 (1)");
+    assert_eq!(
+        tracked(&ROWS[..1]),
+        "folder gate: 0 tracked rows, naming no issue"
+    );
 }
 
 #[test]
@@ -1105,6 +1379,7 @@ fn the_gate_sees_what_it_is_for() {
         }
     }
     assert!(missed.is_empty(), "{}", missed.join("\n"));
+    rows_hold_their_reads();
 }
 
 /// The package whose link graph the gate follows: the daemon.
