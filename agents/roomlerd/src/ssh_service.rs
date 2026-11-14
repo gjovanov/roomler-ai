@@ -675,7 +675,7 @@ pub(crate) async fn claim_grant(
                 consent_mode,
             } = claimed;
             tracing::info!(
-                %grant_id, %caller, %account_mode,
+                %grant_id, ?caller, %account_mode,
                 "ssh-service: claimed a grant for the SYSTEM service's SSH"
             );
             // No named account: the service never serves one.
