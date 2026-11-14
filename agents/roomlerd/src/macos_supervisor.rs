@@ -592,7 +592,9 @@ pub fn gave_up_reason(
 /// new folder beside it and copies them into it, and only then is the folder
 /// moved aside and the new one put in its place. So a copy the person cannot
 /// reach stops the command with everything where it was, where the revert
-/// still finds it, and if the last move fails the one before it is undone. It
+/// still finds it, and if the last move fails, the one before it is undone
+/// and the command still ends in failure (`false`), so a script reads no
+/// success where nothing was fixed. It
 /// does the same in an administrator's own shell and as root. The names it
 /// makes carry [`FolderNotTheirs::stamp`], so no earlier print made them. Each
 /// command starts with one `sudo test`, before anything runs: that the folder
@@ -720,9 +722,9 @@ fn move_aside(f: &FolderNotTheirs) -> String {
     format!(
         "{only}{holds}, so the command copies {} into a new folder that the person's account \
          makes.{can}{as_person} mkdir {new} && {as_person} cp {copies}{into} && sudo mv \
-         {folder} {aside} && {{ sudo mv {new} {folder} || sudo mv {aside} {folder}; }} \
-         ({inert}; nothing moves until the copies are made, and if the last move fails the one \
-         before it is undone).{restart}",
+         {folder} {aside} && {{ sudo mv {new} {folder} || {{ sudo mv {aside} {folder}; false; \
+         }}; }} ({inert}; nothing moves until the copies are made, and if the last move fails, \
+         the one before it is undone and the command fails).{restart}",
         if one { "it" } else { "them" },
     )
 }
@@ -3039,7 +3041,7 @@ mod tests {
     /// person's account makes a new folder beside it and copies them in, out
     /// of the folder before it moves; then the folder is moved aside and the
     /// new one put in its place, and if that last move fails the one before
-    /// it is undone.
+    /// it is undone and the command still fails (`false`).
     fn kept_line(path: &str, q: &str, admin: &str, copies: &[&str]) -> String {
         let aside = format!("{q}.made-by-root-{STAMP}");
         let new = format!("{q}.new-{STAMP}");
@@ -3053,9 +3055,9 @@ mod tests {
              nowhere else, so the command copies {it} into a new folder that the person's \
              account makes. {admin} is an administrator of this Mac and can run this: {}sudo -u \
              '#501' mkdir '{new}' && sudo -u '#501' cp {from}'{new}/' && sudo mv '{q}' \
-             '{aside}' && {{ sudo mv '{new}' '{q}' || sudo mv '{aside}' '{q}'; }} ({INERT}; \
-             nothing moves until the copies are made, and if the last move fails the one before \
-             it is undone).{RESTART}",
+             '{aside}' && {{ sudo mv '{new}' '{q}' || {{ sudo mv '{aside}' '{q}'; false; }}; }} \
+             ({INERT}; nothing moves until the copies are made, and if the last move fails, the \
+             one before it is undone and the command fails).{RESTART}",
             cause(path),
             copies.join(" and "),
             guard(q),
@@ -3077,11 +3079,11 @@ mod tests {
                  '{F}' -a -O '{F}' -a ! -e '{F}.made-by-root-{STAMP}' && sudo -u '#501' mkdir \
                  '{F}.new-{STAMP}' && sudo -u '#501' cp \
                  '{F}/com.roomler.agent.plist.pre-one-row' '{F}.new-{STAMP}/' && sudo mv '{F}' \
-                 '{F}.made-by-root-{STAMP}' && {{ sudo mv '{F}.new-{STAMP}' '{F}' || sudo mv \
-                 '{F}.made-by-root-{STAMP}' '{F}'; }} (once the folder is no longer a real \
-                 folder of root's, as when it is the person's again, it changes nothing; nothing \
-                 moves until the copies are made, and if the last move fails the one before it is \
-                 undone).{RESTART}",
+                 '{F}.made-by-root-{STAMP}' && {{ sudo mv '{F}.new-{STAMP}' '{F}' || {{ sudo mv \
+                 '{F}.made-by-root-{STAMP}' '{F}'; false; }}; }} (once the folder is no longer a \
+                 real folder of root's, as when it is the person's again, it changes nothing; \
+                 nothing moves until the copies are made, and if the last move fails, the one \
+                 before it is undone and the command fails).{RESTART}",
                 cause(F)
             )
         );
