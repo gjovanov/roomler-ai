@@ -29,8 +29,11 @@
 //!
 //! When installing **perMachine**, the helper cleans **perUser**
 //! leftovers:
-//! - Scheduled Task `RoomlerAgent` (`schtasks /Delete /TN RoomlerAgent
-//!   /F`). Runs as SYSTEM, can see + delete the user-scope task.
+//! - #3801: the Scheduled Tasks of the account signed in to the step's
+//!   session, and no other account's: its `Roomler-<SID>`, and `Roomler` or
+//!   `RoomlerAgent` when their principal is that account
+//!   (`service::user_task::clean_up_choice`). Another account's task, or one
+//!   whose account it cannot read, stays, with a line that says so.
 //! - The session user's data dirs at `AppData\Local\roomler\
 //!   roomler-agent\` and `AppData\Roaming\roomler\roomler-agent\` (and the
 //!   `roomler` segment; `needs-attention.txt` goes with the Roaming one),
@@ -381,34 +384,21 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 // ──────────────────────────────────────────────────────────────────
 #[cfg(target_os = "windows")]
 fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
-    // 1. Scheduled Task — registered by the perUser MSI's
+    // 1. Scheduled Tasks — registered by the perUser MSI's
     //    `RegisterAutostart` custom action: `RoomlerAgent` pre-P3d,
-    //    `Roomler` since the P3d rename (P4b hygiene: both scrubbed).
-    //    perMachine MSI's CA runs as SYSTEM so it can see + delete
-    //    the task without impersonation. NB reachable via operator
-    //    CLI only — the MSI CA always exits through the same-flavour
-    //    fast path (module docs) — so this can never race the SAME
-    //    install's freshly-registered task.
-    for task_name in ["RoomlerAgent", "Roomler"] {
-        if scheduled_task_exists(task_name) {
-            if dry_run {
-                report
-                    .removed
-                    .push(format!("[dry-run] schtasks /Delete /TN {task_name} /F"));
-            } else {
-                match delete_scheduled_task(task_name) {
-                    Ok(()) => report.removed.push(format!("Scheduled Task {task_name}")),
-                    Err(e) => report
-                        .errors
-                        .push(format!("schtasks /Delete {task_name}: {e}")),
-                }
-            }
-        } else {
-            report
-                .skipped
-                .push(format!("Scheduled Task {task_name} not present"));
-        }
-    }
+    //    `Roomler` since the P3d rename, `Roomler-<SID>` since #3801. Only
+    //    those of the account this arm cleans: every account's install
+    //    held the shared names, so one is removed only when its principal
+    //    is that account. NB reachable via operator CLI only — the MSI CA
+    //    always exits through the same-flavour fast path (module docs) — so
+    //    this can never race the SAME install's freshly-registered task.
+    let cleaned = account_cleaned();
+    clean_up_user_tasks(
+        &mut crate::service::Schtasks,
+        cleaned.as_deref().map_err(|why| *why),
+        report,
+        dry_run,
+    );
 
     // 2. The data dirs below the profile the system records for the
     //    session's account (FR-145: by its SID, never by its user name), as
@@ -440,6 +430,64 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
         report
             .skipped
             .push("system-context feature off — user data dir reach-through skipped".to_string());
+    }
+}
+
+/// #3801 — the account the per-user arm cleans: the one signed in to the
+/// step's session, whose data trees it removes too ([`plan_per_user_removal`]).
+/// `Err`: why it cannot tell that account, and so removes no Scheduled Task.
+#[cfg(target_os = "windows")]
+fn account_cleaned() -> Result<String, &'static str> {
+    #[cfg(feature = "system-context")]
+    {
+        use crate::system_context::user_profile;
+        if user_profile::session_user_name().is_none() {
+            return Err("nobody is signed in to this step's session");
+        }
+        user_profile::session_account_sid()
+            .ok_or("this step cannot tell the account signed in to its session")
+    }
+    #[cfg(not(feature = "system-context"))]
+    Err("this build cannot read the account signed in to the step's session")
+}
+
+/// #3801 — the per-user arm's Scheduled Tasks: those of `cleaned`, the account
+/// it cleans ([`account_cleaned`]; `Err`: why it cannot tell that account),
+/// and no other account's. The choice is `user_task::clean_up_choice`; every
+/// task it finds has its line in `report`, and no line names an account.
+#[cfg(target_os = "windows")]
+fn clean_up_user_tasks(
+    lib: &mut impl crate::service::user_task::Library,
+    cleaned: Result<&str, &str>,
+    report: &mut CleanupReport,
+    dry_run: bool,
+) {
+    use crate::service::user_task::{Verdict, clean_up_choice};
+    for choice in clean_up_choice(lib, cleaned) {
+        let shown = &choice.shown;
+        match choice.verdict {
+            Verdict::Remove if dry_run => report
+                .removed
+                .push(format!("[dry-run] schtasks /Delete /TN {shown} /F")),
+            Verdict::Remove => match lib.delete(&choice.name) {
+                Ok(()) => report.removed.push(format!("Scheduled Task {shown}")),
+                Err(e) => report.errors.push(format!("schtasks /Delete {shown}: {e}")),
+            },
+            Verdict::Absent => report
+                .skipped
+                .push(format!("Scheduled Task {shown} not present")),
+            Verdict::Another => report.skipped.push(format!(
+                "Scheduled Task {shown} left in place: it runs as another account"
+            )),
+            Verdict::Unknown => report.skipped.push(format!(
+                "Scheduled Task {shown} left in place: this step cannot tell which account it \
+                 runs as"
+            )),
+            Verdict::NoAccount(why) => report.skipped.push(format!(
+                "Scheduled Task {shown} left in place: {why}, so this step removes no account's \
+                 task"
+            )),
+        }
     }
 }
 
@@ -698,32 +746,6 @@ fn cleanup_per_machine_service_logs(
         });
         report_removal("service log dir", &path, removal, dry_run, report);
     }
-}
-
-#[cfg(target_os = "windows")]
-fn scheduled_task_exists(name: &str) -> bool {
-    // schtasks returns 0 when the task exists, non-zero otherwise.
-    // We don't need the output — exit code suffices.
-    std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "windows")]
-fn delete_scheduled_task(name: &str) -> Result<()> {
-    let status = std::process::Command::new("schtasks")
-        .args(["/Delete", "/TN", name, "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("schtasks /Delete exited {:?}", status.code());
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1375,6 +1397,145 @@ mod tests {
         let a_upper = tmp.path().join("ALPHA");
         assert!(same_dir(&a, &a_upper));
         assert!(!same_dir(&a, &b));
+    }
+
+    // ── #3801 the per-user arm's Scheduled Tasks ─────────────────
+
+    /// Two made-up accounts of one machine, each with a per-user install, and
+    /// the operator who runs the clean-up for the first.
+    #[cfg(target_os = "windows")]
+    const ACCOUNT_A: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+    #[cfg(target_os = "windows")]
+    const ACCOUNT_B: &str = "S-1-5-21-1111111111-2222222222-3333333333-1002";
+    #[cfg(target_os = "windows")]
+    const OPERATOR: &str = "S-1-5-21-1111111111-2222222222-3333333333-500";
+
+    /// #3801 — the per-user arm, run for A on a machine where B has a per-user
+    /// install too, removes A's tasks and leaves B's, in each state two such
+    /// installs can be in: both on their own task, A on its own and B still on
+    /// the shared name an older release registered, and the other way round.
+    /// Its report says what it left, and names neither account.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_user_clean_up_removes_its_accounts_task_and_leaves_anothers() {
+        use crate::service::user_task::{RETIRED, SHARED, fake::Library as Fake};
+        let a = format!("Roomler-{ACCOUNT_A}");
+        let b = format!("Roomler-{ACCOUNT_B}");
+        let states = [
+            (
+                "both on their own task",
+                vec![(a.as_str(), ACCOUNT_A), (b.as_str(), ACCOUNT_B)],
+            ),
+            (
+                "B on the shared name",
+                vec![(a.as_str(), ACCOUNT_A), (SHARED, ACCOUNT_B)],
+            ),
+            (
+                "A on the shared names",
+                vec![
+                    (SHARED, ACCOUNT_A),
+                    (RETIRED, ACCOUNT_A),
+                    (b.as_str(), ACCOUNT_B),
+                ],
+            ),
+        ];
+        for (state, tasks) in &states {
+            for dry_run in [false, true] {
+                let mut lib = Fake::new(OPERATOR, true);
+                for (name, sid) in tasks {
+                    lib = lib.with(name, Some(*sid));
+                }
+                let mut report = CleanupReport::default();
+                clean_up_user_tasks(&mut lib, Ok(ACCOUNT_A), &mut report, dry_run);
+                let said = report.summary();
+                for (name, sid) in tasks {
+                    let mine = *sid == ACCOUNT_A;
+                    assert_eq!(
+                        lib.owner(name).is_some(),
+                        !mine || dry_run,
+                        "{state}, dry run {dry_run}: {name}: {said}"
+                    );
+                    if !mine {
+                        assert!(!lib.asked_for(name), "{state}: {:?}", lib.asked);
+                    }
+                }
+                let own = tasks.iter().filter(|(_, sid)| *sid == ACCOUNT_A).count();
+                assert_eq!(report.removed.len(), own, "{state}: {said}");
+                assert_eq!(
+                    report
+                        .skipped
+                        .iter()
+                        .filter(|line| line.contains("left in place: it runs as another account"))
+                        .count(),
+                    1,
+                    "{state}: {said}"
+                );
+                assert!(report.errors.is_empty(), "{state}: {said}");
+                for sid in [ACCOUNT_A, ACCOUNT_B] {
+                    assert!(!said.contains(sid), "the report names an account: {said}");
+                }
+            }
+        }
+    }
+
+    /// #3801 — a task under a shared name whose account the clean-up cannot
+    /// read is left in place, and the report says why: another account's,
+    /// listed to the person running it with its definition refused, or one
+    /// whose definition names no account.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_user_clean_up_leaves_a_task_whose_account_it_cannot_read() {
+        use crate::service::user_task::{SHARED, fake::Library as Fake};
+        let cases = [
+            (
+                "refused",
+                Fake::new(ACCOUNT_A, false).with_seen_by_all(SHARED, Some(ACCOUNT_B)),
+            ),
+            ("unparsable", Fake::new(OPERATOR, true).with(SHARED, None)),
+        ];
+        for (case, mut lib) in cases {
+            let mut report = CleanupReport::default();
+            clean_up_user_tasks(&mut lib, Ok(ACCOUNT_A), &mut report, false);
+            let said = report.summary();
+            assert!(lib.owner(SHARED).is_some(), "{case}: {said}");
+            assert!(!lib.asked_for(SHARED), "{case}: {:?}", lib.asked);
+            assert!(
+                report.skipped.iter().any(|line| line
+                    .starts_with("Scheduled Task Roomler left in place")
+                    && line.contains("cannot tell which account it runs as")),
+                "{case}: {said}"
+            );
+        }
+    }
+
+    /// #3801 — with no account to clean (nobody signed in to the step's
+    /// session, or an account it cannot tell), the per-user arm removes no
+    /// Scheduled Task, and each one it leaves has a line that says why.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn with_no_account_to_clean_the_per_user_clean_up_removes_no_task() {
+        use crate::service::user_task::{RETIRED, SHARED, fake::Library as Fake};
+        let why = "nobody is signed in to this step's session";
+        let a = format!("Roomler-{ACCOUNT_A}");
+        let mut lib = Fake::new(OPERATOR, true)
+            .with(SHARED, Some(ACCOUNT_A))
+            .with(RETIRED, Some(ACCOUNT_B))
+            .with(&a, Some(ACCOUNT_A));
+        let mut report = CleanupReport::default();
+        clean_up_user_tasks(&mut lib, Err(why), &mut report, false);
+        let said = report.summary();
+        assert!(lib.asked.is_empty(), "{:?}", lib.asked);
+        assert!(report.removed.is_empty(), "{said}");
+        assert_eq!(
+            report
+                .skipped
+                .iter()
+                .filter(|line| line.contains("left in place") && line.contains(why))
+                .count(),
+            3,
+            "{said}"
+        );
+        assert!(!said.contains(ACCOUNT_A), "{said}");
     }
 }
 // RETIRED-NAME-ANCHOR-END

@@ -395,7 +395,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 |---|---|---|
 | `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
 | `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run` | write |
-| `agents/roomlerd/src/service.rs:2253-2285` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2283-2285`): under `sudo`, a root-owned `<L>` and plist, the #3763 state | write |
+| `agents/roomlerd/src/service.rs:2398-2430` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2428-2430`): under `sudo`, a root-owned `<L>` and plist, the #3763 state | write |
 | `scripts/install.sh:1952-1973` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1519-1527`) | remove |
 | `scripts/install.sh:1986-1993` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1567`) as root | remove |
 | `scripts/install.sh:1081` | `as_root grep` of the console person's `config.toml` | read |

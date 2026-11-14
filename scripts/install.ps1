@@ -360,8 +360,11 @@ function Install-Daemon {
     # Kick the autostart so the daemon picks up the fresh config now
     # rather than at the next logon / service cycle. Best-effort.
     if ($Role -eq 'daemon-user') {
-        Say "starting the Scheduled Task 'Roomler'"
-        schtasks /Run /TN Roomler | Out-Null
+        # #3801: the task is this account's own (Roomler-<SID>; Roomler on a
+        # release before it), and the daemon knows which, so it starts it.
+        Say "starting this account's Scheduled Task"
+        & $daemon service start | Out-Null
+        if ($LASTEXITCODE -ne 0) { Warn "roomlerd service start exited $LASTEXITCODE; the daemon starts at the next sign-in" }
     } else {
         Say "restarting the 'Roomler' service so it picks up the enrollment"
         try { Restart-Service -Name Roomler -Force } catch { Warn "Restart-Service Roomler: $_" }
@@ -457,6 +460,24 @@ function Install-TunnelClient {
 
 # --- uninstall: every Roomler install this account can see ------------------
 
+# #3801 -- does the Scheduled Task $Name run as the account $Sid? Every
+# account's per-user install held the shared name before #3801, so one under it
+# is this account's only when its principal says so: a SID, or an account name
+# resolved to one. A definition this account may not read, one that does not
+# parse and a name that does not resolve are not its own.
+function Test-OwnTask([string]$Name, [string]$Sid) {
+    try {
+        $out = schtasks /Query /TN $Name /XML 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $out) { return $false }
+        $id = ([xml]($out -join "`n")).Task.Principals.Principal.UserId
+        if (-not $id) { return $false }
+        if ($id -notmatch '^S-1-') {
+            $id = (New-Object System.Security.Principal.NTAccount($id)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        return ($id -eq $Sid)
+    } catch { return $false }
+}
+
 function Uninstall-Roomler {
     # 1) MSI products, both hives. HKCU = perUser flavour (visible only to
     #    the account that installed it -- the reason -Uninstall exists);
@@ -495,7 +516,17 @@ function Uninstall-Roomler {
         # redirected turns that stderr into a TERMINATING error, so a
         # schtasks that complains (a task not running, or already gone)
         # aborted the whole uninstall before msiexec ran (measured, FR-133).
-        if ($p.Hive -eq 'HKCU') { try { schtasks /End /TN Roomler 2>$null | Out-Null } catch {} }
+        # #3801: only this account's tasks. Its own name is Roomler-<SID>; the
+        # shared Roomler of a release before #3801 is ended only when it runs
+        # as this account, because an elevated run would end another
+        # account's daemon too.
+        if ($p.Hive -eq 'HKCU') {
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            foreach ($t in @("Roomler-$sid", 'Roomler')) {
+                if ($t -eq 'Roomler' -and -not (Test-OwnTask $t $sid)) { continue }
+                try { schtasks /End /TN $t 2>$null | Out-Null } catch {}
+            }
+        }
         else { try { Stop-Service -Name Roomler -Force -ErrorAction SilentlyContinue } catch {} }
         Say ("uninstalling '" + $p.Name + "' " + $p.Version + " (" + $p.Code + ", " + $p.Hive + ")")
         $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList ("/x " + $p.Code + " /qn /norestart") -Wait -PassThru
