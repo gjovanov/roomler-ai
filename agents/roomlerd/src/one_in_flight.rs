@@ -393,6 +393,10 @@ impl<T: Clone + Send + 'static> Remembered<T> {
 /// (`drop_to_std`, `account_ids`, `account_home`; uids per uid), through
 /// [`Self::ask_blocking`]: an ask from a blocking thread and one from a task
 /// share the account's lookup.
+///
+/// Unix only: Windows has no account lookup of this kind (the module compiles
+/// there for the tray's start, #3858).
+#[cfg(any(unix, test))]
 pub(crate) struct OneInFlightPerKey<K, T> {
     /// What each lookup's thread is called.
     thread_name: &'static str,
@@ -400,6 +404,7 @@ pub(crate) struct OneInFlightPerKey<K, T> {
     running: Mutex<std::collections::BTreeMap<K, Arc<Flight<T>>>>,
 }
 
+#[cfg(any(unix, test))]
 impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerKey<K, T> {
     pub(crate) const fn new(thread_name: &'static str) -> Self {
         Self {
