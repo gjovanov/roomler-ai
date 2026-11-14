@@ -189,7 +189,8 @@ const KNOWN: &[KnownRow] = &[
         Row::Right(
             "Linux: `sudo roomler self-update` runs as root and re-bases the path \
              onto the home the account database gives `SUDO_USER`, so it names \
-             that person's config; `HOME` only names the path's tail",
+             that person's config; the `directories` lookup only names the home it \
+             is re-based from",
         ),
     ),
     (
@@ -200,7 +201,8 @@ const KNOWN: &[KnownRow] = &[
         Row::Right(
             "macOS: `sudo roomler self-update` runs as root and re-bases the path \
              onto the home the account database gives `SUDO_USER`, so it names \
-             that person's config; `HOME` only names the path's tail",
+             that person's config; the `directories` lookup only names the home it \
+             is re-based from",
         ),
     ),
     (
@@ -247,16 +249,6 @@ const KNOWN: &[KnownRow] = &[
              recorder started as the console person), that person's own OneDrive \
              roots; on the service account (the unattended recorder), the \
              service's own, none by default; compared, not a folder a step writes",
-        ),
-    ),
-    (
-        "agents/roomlerd/src/capture/portal/screencast.rs",
-        "for_current_user",
-        Build::Linux,
-        &["HOME", "XDG_STATE_HOME"],
-        Row::Right(
-            "Linux: the portal helper as the session's person: that person's state \
-             folder",
         ),
     ),
     (
@@ -347,9 +339,8 @@ const KNOWN: &[KnownRow] = &[
         &["ProjectDirs::from"],
         Row::Tracked(
             3834,
-            "macOS: `sudo roomler enroll`, `forward` or `socks5` without `--config` \
-             runs as root and keeps the caller's `HOME`, so this names the caller's \
-             tunnel config, not root's",
+            "macOS: a `roomler` command typed with `sudo` keeps the caller's `HOME`, \
+             so this names the caller's tunnel config, not root's",
         ),
     ),
     (
@@ -363,7 +354,8 @@ const KNOWN: &[KnownRow] = &[
              so this names the caller's Movies folder, not root's",
         ),
     ),
-    // Linux: a root command run through a `sudo` that keeps `HOME`.
+    // Linux: a root command run through a `sudo` that keeps `HOME`, or with
+    // `-E` the XDG variables.
     (
         "agents/roomlerd/src/service.rs",
         "user_unit_path_for",
@@ -383,9 +375,8 @@ const KNOWN: &[KnownRow] = &[
         &["ProjectDirs::from"],
         Row::Tracked(
             3866,
-            "Linux: where `sudo` keeps the caller's `HOME`, `sudo roomler enroll`, \
-             `forward` or `socks5` (root, no `--config`) names the caller's tunnel \
-             config here",
+            "Linux: where `sudo` keeps the caller's `HOME`, a `roomler` command typed \
+             with `sudo` names the caller's tunnel config here",
         ),
     ),
     (
@@ -419,6 +410,17 @@ const KNOWN: &[KnownRow] = &[
             3866,
             "Linux: a root command typed with `sudo -E` keeps the caller's \
              `XDG_RUNTIME_DIR`, so this names the caller's runtime folder",
+        ),
+    ),
+    (
+        "agents/roomlerd/src/capture/portal/screencast.rs",
+        "for_current_user",
+        Build::Linux,
+        &["HOME", "XDG_STATE_HOME"],
+        Row::Tracked(
+            3866,
+            "Linux: a root command typed with `sudo -E` keeps the caller's XDG \
+             variables, so this names the caller's folder",
         ),
     ),
     // Linux: a root daemon that needs the seat person's settings.
@@ -1830,10 +1832,10 @@ fn the_gate_sees_what_it_is_for() {
     // A `mod` whose file a `cfg_attr` moves is refused, as `#[path]` is.
     let moved = r#"#[cfg_attr(windows, path = "w.rs")] mod imp;"#;
     let moved = syn::parse_file(moved).unwrap_or_else(|e| panic!("{moved}: {e}"));
-    if let Some(syn::Item::Mod(m)) = moved.items.first() {
-        if !m.attrs.iter().any(|a| moves_file(&a.meta)) {
-            missed.push("a mod file moved by cfg_attr is not refused".to_owned());
-        }
+    if let Some(syn::Item::Mod(m)) = moved.items.first()
+        && !m.attrs.iter().any(|a| moves_file(&a.meta))
+    {
+        missed.push("a mod file moved by cfg_attr is not refused".to_owned());
     }
     // The first review's input: a tracked function whose `directories`
     // lookup is rewritten as a read of `HOME` still reads, so its row is not
