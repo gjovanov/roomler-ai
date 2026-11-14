@@ -965,7 +965,7 @@ mod console_tests {
         let e = session_person_uid("3", seatless).unwrap_err().to_string();
         assert!(e.contains("not on seat0"), "{e}");
         // The uid is logind's, from the session the name comes from; a text
-        // console at seat0 is the person at the device too (`seat0_user`).
+        // console at seat0 is the person at the device too (`seat0_account`).
         assert_eq!(session_person_uid("2", ana).unwrap(), 1000);
         let tty = "Id=5\nName=ops\nUser=1003\nSeat=seat0\nType=tty\nClass=user\nRemote=no\n";
         assert_eq!(session_person_uid("5", tty).unwrap(), 1003);
@@ -1583,14 +1583,12 @@ fn show_field(text: &str, key: &str) -> Option<String> {
 /// and its active session is the one showing, as Windows' console session
 /// is. `Err` says why nobody is there: no logind, an empty seat, the login
 /// screen.
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn seat0_user() -> Result<String> {
-    seat0_account().map(|(name, _)| name)
-}
-
-/// #3688 — [`seat0_user`], with the uid logind recorded for that session: a
-/// root daemon's file steps tell root itself at the screen, whose files are
-/// the daemon's own, from a person and from nobody.
+///
+/// #3688 — with the uid logind recorded for that session: a root daemon's
+/// file steps tell root itself at the screen, whose files are the daemon's
+/// own, from a person and from nobody. #3822 — exec's and SSH's
+/// `console_user` ask it through the same lookup a received file does
+/// (`files::ask_seat0`), so a session and a file take one person by one rule.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn seat0_account() -> Result<(String, Option<u32>)> {
     let id = seat0_active_session(&loginctl_show(&["show-seat", "seat0"])?)?;
@@ -1598,7 +1596,7 @@ pub(crate) fn seat0_account() -> Result<(String, Option<u32>)> {
 }
 
 /// #2871 (review) — the uid of the person signed in at seat0, by
-/// [`seat0_user`]'s rule: whom a root daemon's person-at-the-device socket is
+/// [`seat0_account`]'s rule: whom a root daemon's person-at-the-device socket is
 /// made for, and who must still be there when a config change arrives on it.
 /// Never [`graphical_session_matching`]'s first active graphical session
 /// anywhere, which is whoever's remote login logind happens to list first.
@@ -1717,7 +1715,7 @@ pub(crate) fn is_nobody_at_the_screen(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| cause.is::<NobodyAtTheScreen>())
 }
 
-/// The pure half of [`seat0_user`]: the active session out of `loginctl
+/// The pure half of [`seat0_account`]: the active session out of `loginctl
 /// show-seat seat0`.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn seat0_active_session(seat: &str) -> Result<String> {
@@ -1728,7 +1726,7 @@ fn seat0_active_session(seat: &str) -> Result<String> {
     })
 }
 
-/// The pure half of [`seat0_user`]: the person whose session `id` is, out of
+/// The pure half of [`seat0_account`]: the person whose session `id` is, out of
 /// `loginctl show-session <id>`, or why it is nobody's. A display manager's
 /// greeter (GDM runs one as `gdm` at the login screen) is `Class=greeter`.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
