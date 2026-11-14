@@ -323,8 +323,8 @@ jobs:
       - name: Vendored scrap drift check
         run: bash scripts/revendor-scrap.sh --check
 
-      # Same invariant for the webrtc-sctp fork (the FORWARD-TSN bundled-
-      # chunk parse fix; see crates/vendored/webrtc-sctp/Cargo.toml).
+      # Same invariant for the webrtc-sctp fork (its deltas are listed in
+      # crates/vendored/webrtc-sctp/Cargo.toml; its tests: vendored-sctp).
       - name: Vendored webrtc-sctp drift check
         run: bash scripts/revendor-webrtc-sctp.sh --check
 
@@ -2973,3 +2973,31 @@ jobs:
         run: bash scripts/macos-postinstall-check.sh
       - name: Run the post-install script on both roads under bash 3.2, the version macOS ships
         run: bash scripts/macos-postinstall-check.sh --bash 3.2
+
+  vendored-sctp:
+    # #3755 — the webrtc-sctp fork's own tests, which ran in no lane: the fork
+    # is not a workspace member, so no `cargo test` here builds them, and the
+    # drift check in rust-lint compares text only. The workspace's Cargo.lock
+    # seeds the fork's standalone build, so the tests run against the versions
+    # the agent ships with (a write cut short leans on tokio's semaphore); a
+    # build of its own would take the newest. `fuzz_artifact_test` reads
+    # fuzz/artifacts, which the crates.io package does not ship. Not in the
+    # `rust` aggregator's needs: these upstream tests have never run in CI, so
+    # this job earns a record of its own before it can turn "Rust checks" red.
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: Vendored webrtc-sctp tests
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Test the fork against the workspace's pinned versions
+        run: |
+          cp Cargo.lock crates/vendored/webrtc-sctp/Cargo.lock
+          cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --skip fuzz_artifact_test
