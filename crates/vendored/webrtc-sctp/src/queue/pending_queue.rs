@@ -460,18 +460,18 @@ impl PendingQueue {
 /// §6.6); a half-popped message also stalls the whole association's queue
 /// (`pop` keeps it selected).
 ///
-/// The rest takes the room that is free and owes the shortfall
-/// (`PendingQueue::overdraft`), and `pop` pays the overdraft back before it
-/// gives room again. So while a cut message is owed no writer gets room, but
-/// for one race: on a runtime of several threads, a `pop` running alongside
-/// this drop can leave up to a chunk of room free, a large message can begin
-/// on it, and if that one is cut too, it owes its rest as well. The overdraft
-/// is the rest of one cut message plus one more for each such race, and it
-/// only shrinks as the queue drains. At rest the accounting is exact: room +
-/// queued bytes - overdraft == the limit. Nothing is queued once the queue was
-/// closed (#3716): the association is going away. The drop never awaits,
-/// needs no runtime and does not panic, short of a poisoned queue lock, as
-/// `pop`.
+/// The rest's bytes are owed first (`PendingQueue::overdraft`). Then the room
+/// that is free pays what it can of the debt, and `pop` pays the remainder
+/// before it gives room again. A `pop` that runs alongside the drop, on
+/// another thread, so pays the debt instead of giving room, and what the pops
+/// and the free room pay beyond the rest's bytes is room again. Once the drop
+/// is done no room is free while anything is owed, on any runtime: no writer
+/// gets room until the debt is paid, a large message begins only on a queue
+/// that owes nothing, and the overdraft is at most the rest of one cut
+/// message. At rest the accounting is exact: room + queued bytes - overdraft
+/// == the limit. Nothing is queued once the queue was closed (#3716): the
+/// association is going away. The drop never awaits, needs no runtime and does
+/// not panic, short of a poisoned queue lock, as `pop`.
 struct BegunMessage<'a> {
     rest: std::vec::IntoIter<ChunkPayloadData>,
     queue: &'a PendingQueue,
@@ -485,33 +485,56 @@ impl Drop for BegunMessage<'_> {
         if self.rest.len() == 0 {
             return;
         }
+        let queue = self.queue;
         let n: usize = self.rest.as_slice().iter().map(|c| c.user_data.len()).sum();
-        // The free room is taken first. This holds `semaphore_lock`, so no
+        // Owed first, before the room is read and before anything is queued:
+        // from here on a `pop` pays the debt instead of giving room, so no
+        // room it frees during this drop is left free while the rest is owed,
+        // and no `pop` of the rest returns room for bytes that never had it.
+        queue.overdraft.fetch_add(n, Ordering::SeqCst);
+        // roomler (#3755): step 0, the debt was recorded.
+        #[cfg(test)]
+        queue.pop_in_drop(0);
+        // Then the free room is taken. This holds `semaphore_lock`, so no
         // writer takes room meanwhile and the room can only grow (a `pop`):
         // what is counted here is there to take.
-        let free =
-            u32::try_from(self.queue.semaphore.available_permits().min(n)).unwrap_or(u32::MAX);
-        // roomler (#3755): step 0, the room was read.
-        #[cfg(test)]
-        self.queue.pop_in_drop(0);
-        let taken = match self.queue.semaphore.try_acquire_many(free) {
+        let free = u32::try_from(queue.semaphore.available_permits().min(n)).unwrap_or(u32::MAX);
+        let taken = match queue.semaphore.try_acquire_many(free) {
             Ok(permits) => {
                 permits.forget();
                 free as usize
             }
-            Err(TryAcquireError::Closed) => return,
+            Err(TryAcquireError::Closed) => {
+                // Nothing is queued once the queue was closed: the debt goes,
+                // and what a `pop` paid of it is room again.
+                let owed = queue
+                    .overdraft
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                        Some(d.saturating_sub(n))
+                    })
+                    .unwrap_or_else(|d| d);
+                queue.semaphore.add_permits(n.saturating_sub(owed));
+                return;
+            }
             Err(TryAcquireError::NoPermits) => 0,
         };
         // roomler (#3755): step 1, the room was taken.
         #[cfg(test)]
-        self.queue.pop_in_drop(1);
-        // Owed before it is queued, so a `pop` of the rest can never return
-        // room for bytes that never had it.
-        self.queue
+        queue.pop_in_drop(1);
+        // The room taken pays the debt. What a `pop` already paid of it is
+        // paid twice, so that much is room again.
+        let owed = queue
             .overdraft
-            .fetch_add(n.saturating_sub(taken), Ordering::SeqCst);
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                Some(d - d.min(taken))
+            })
+            .unwrap_or_else(|d| d);
+        // roomler (#3755): step 2, the room taken paid the debt.
+        #[cfg(test)]
+        queue.pop_in_drop(2);
+        queue.semaphore.add_permits(taken - owed.min(taken));
         for chunk in self.rest.by_ref() {
-            self.queue.push_chunk(chunk);
+            queue.push_chunk(chunk);
         }
         let _ = self.wake.try_send(());
     }

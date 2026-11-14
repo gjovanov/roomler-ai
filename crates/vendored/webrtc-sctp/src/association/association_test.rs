@@ -3486,10 +3486,9 @@ async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Resul
 /// twice, and every write that returned `Ok`, in the order they returned. A
 /// cut write is never read, or read whole and once, in its place.
 ///
-/// On one thread a `pop` never runs inside a cut write's drop, so the room
-/// that is free while a cut message is owed is less than a chunk, and no
-/// large message begins on it: the overdraft is at most the rest of one
-/// message, under the largest a round writes.
+/// No room is free while a cut message is owed, so no large message begins
+/// while one is: the overdraft is at most the rest of one message, under the
+/// largest a round writes.
 #[tokio::test(flavor = "current_thread")]
 async fn test_assoc_writes_cut_at_any_wait_keep_the_stream_whole() -> Result<()> {
     let mut findings = Vec::new();
@@ -3513,17 +3512,16 @@ const LARGEST_CUT_TEST_MESSAGE: usize = 5_500 + 14_500;
 /// `pop` runs on one thread while a cut write queues the rest of its message
 /// on the other. The same property, but for the order the writes returned in,
 /// which the writers can no longer log in the order they were queued; and the
-/// pending queue's accounting, at rest once drained. While the writers run,
-/// the overdraft is sampled against two of the largest messages, not one: a
-/// `pop` running alongside a cut write's drop can leave up to a chunk of room
-/// free while the cut message is owed, and a second large message that begins
-/// on it and is cut too owes its rest as well. Each such race adds at most one
-/// message, and the queue pays the overdraft back before it gives room again.
+/// pending queue's accounting, at rest once drained. A `pop` that runs
+/// alongside a cut write's drop pays the debt the drop has already recorded,
+/// so no room is free while a cut message is owed on two threads either, and
+/// the overdraft sampled while the writers run stays under one of the largest
+/// messages, as on one thread.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting() -> Result<()> {
     let mut findings = Vec::new();
     for seed in [0x3755_u64, 4, 5] {
-        for finding in cut_writes_round(seed, false, 2 * LARGEST_CUT_TEST_MESSAGE).await? {
+        for finding in cut_writes_round(seed, false, LARGEST_CUT_TEST_MESSAGE).await? {
             findings.push(format!("seed {seed:#x}: {finding}"));
         }
     }

@@ -607,9 +607,15 @@ async fn test_pending_queue_a_begun_message_dropped_queues_its_rest_and_owes_the
 
 #[tokio::test]
 async fn test_pending_queue_a_begun_message_dropped_after_close_queues_nothing() {
-    // Dropped, and let go by the close while it waits.
-    for repoll in [false, true] {
-        let pq = PendingQueue::with_limit(LIMIT);
+    // Dropped, and let go by the close while it waits; and with 0 to 3 chunks
+    // popped while the drop owes the rest (`pops_in_drop`), which must come
+    // back as room once the drop finds the queue closed.
+    for (repoll, pops) in [false, true]
+        .into_iter()
+        .flat_map(|r| (0..=3).map(move |p| (r, p)))
+    {
+        let mut pq = PendingQueue::with_limit(LIMIT);
+        pq.pops_in_drop = Some((0, pops));
         let (wake, _woken) = tokio::sync::mpsc::channel(1);
         fill(&pq, &wake, &ROOM_FOR_ONE_CHUNK).await;
         {
@@ -631,13 +637,18 @@ async fn test_pending_queue_a_begun_message_dropped_after_close_queues_nothing()
         }
         assert_eq!(
             pq.len(),
-            3,
-            "a begun message queued its rest after the close"
+            3 - pops,
+            "a begun message queued its rest after the close ({pops} popped)"
         );
         assert_eq!(
             pq.overdraft(),
             0,
-            "a begun message owed room after the close"
+            "a begun message owed room after the close ({pops} popped)"
+        );
+        assert_eq!(
+            pq.room() + pq.get_num_bytes(),
+            LIMIT,
+            "room + queued after the close ({pops} popped)"
         );
         assert!(!pq.is_locked(), "the queue's lock must be free");
     }
