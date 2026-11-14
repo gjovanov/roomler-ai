@@ -1228,7 +1228,10 @@ jobs:
         # this one runs against Xvfb: the pointer warped to a known place
         # reads back there, less its hotspot and less a monitor's origin.
         # ROOMLERD_TEST_X11 turns a missing server into a failure: the step
-        # cannot pass by running nothing.
+        # cannot pass by running nothing. Since #3813 it is also what lets a
+        # test that changes the display run at all (this one, the cursor
+        # channel's and the keyboard layout's): without it they skip, so a
+        # person's own display keeps its pointer, cursor and layouts.
         #
         # FR-92 P3 — keep busy's X11 host, against the same Xvfb: XTest motion
         # resets the MIT-SCREEN-SAVER idle counter; the whole engine
@@ -1296,6 +1299,7 @@ jobs:
           grep -q "x11-real: an XWAYLAND monitor reads as Xwayland" /tmp/x11-tests.log
           grep -q "x11-real: a dismissed prompt left the screen" /tmp/x11-tests.log
           grep -q "x11-real: the X11 pointer reached the cursor channel" /tmp/x11-tests.log
+          grep -q "x11-real: the recorder's pointer read back where it was put" /tmp/x11-tests.log
           grep -q "x11-real: the layouts .* read back, and the switch to de-DE and back took" /tmp/x11-tests.log
           grep -q "x11-real: a nudge woke a root listener" /tmp/x11-tests.log
           grep -q "x11-real: a killed X server came back on" /tmp/x11-tests.log
