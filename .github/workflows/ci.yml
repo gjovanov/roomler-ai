@@ -1303,6 +1303,7 @@ jobs:
           grep -q "x11-real: the layouts .* read back, and the switch to de-DE and back took" /tmp/x11-tests.log
           grep -q "x11-real: a nudge woke a root listener" /tmp/x11-tests.log
           grep -q "x11-real: a killed X server came back on" /tmp/x11-tests.log
+          grep -q "x11-real: after two keeper exits the desktop on" /tmp/x11-tests.log
 
       # #3813 — the real clipboard on X11. A test that writes it replaces what
       # the person at the display had copied, so each such test runs only

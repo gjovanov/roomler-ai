@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const X11_UNIX_DIR: &str = "/tmp/.X11-unix";
 
@@ -1623,11 +1623,16 @@ pub fn start(cfg: &Config) -> VirtualDesktop {
 fn supervise(desk: &Desktop, first: Option<XServer>) {
     let mut running = first;
     let mut delays = Backoff::new(desk.plan.delay_floor, desk.plan.delay_ceil);
+    let mut strikes = KeeperStrikes::default();
     loop {
         if let Some(x) = running.take() {
-            let exit = wait_exit(x.pid);
+            let gone = wait_desktop_exit(&x);
             let up_for = x.since.elapsed();
-            if !desk.set_down(format!("its X server ({}) exited: {exit}", x.kind.name())) {
+            let why = match &gone {
+                Gone::Server(exit) => format!("its X server ({}) exited: {exit}", x.kind.name()),
+                Gone::Keeper(exit) => format!("its keeper exited: {exit}"),
+            };
+            if !desk.set_down(why) {
                 // A deliberate stop killed it; the tree is `stop`'s.
                 return;
             }
@@ -1637,16 +1642,40 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
             // this is also what reaps the server.
             desk.kill_recorded_tree();
             desk.clear_lock_of(x.pid);
-            warn!(
-                display = desk.display.as_str(),
-                server = x.kind.name(),
-                %exit,
-                up_for_s = up_for.as_secs(),
-                said = %x.tail.last_lines(desk.plan.tail_wait),
-                "virtual-desktop: the X server exited — the desktop is down until it is started again"
-            );
+            match gone {
+                Gone::Server(exit) => warn!(
+                    display = desk.display.as_str(),
+                    server = x.kind.name(),
+                    %exit,
+                    up_for_s = up_for.as_secs(),
+                    said = %x.tail.last_lines(desk.plan.tail_wait),
+                    "virtual-desktop: the X server exited — the desktop is down until it is started again"
+                ),
+                Gone::Keeper(exit) => {
+                    // #3665 — the keeper is the desktop's as much as its
+                    // server is: without it, what the apps leave behind is out
+                    // of reach again. So its exit takes the desktop down and
+                    // starts it again, as a server's does.
+                    warn!(
+                        display = desk.display.as_str(),
+                        keeper = ?x.keeper,
+                        %exit,
+                        up_for_s = up_for.as_secs(),
+                        "virtual-desktop: the desktop's keeper exited — the desktop is down until it is started again"
+                    );
+                    if strikes.exited(up_for, desk.plan.stable_after) {
+                        desk.keeper_off
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        warn!(
+                            display = desk.display.as_str(),
+                            "virtual-desktop: the keeper exited by itself twice soon after its desktop started — for the rest of this daemon's life the daemon starts the window manager and the apps itself (#3665)"
+                        );
+                    }
+                }
+            }
             if up_for >= desk.plan.stable_after {
                 delays.reset();
+                strikes.reset();
             }
         }
         let delay = delays.next();
@@ -1715,6 +1744,114 @@ impl Backoff {
     fn reset(&mut self) {
         self.step = 0;
     }
+}
+
+/// #3665, condition 11 — a keeper that exits by itself soon after its desktop
+/// started, twice in a row, is not tried again in this daemon's life: the
+/// keeper path may never leave a host with less of a desktop than the daemon
+/// gave it before. The next daemon tries it again.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct KeeperStrikes {
+    early: u32,
+}
+
+/// Early keeper exits in a row that turn the keeper off.
+#[cfg(target_os = "linux")]
+const KEEPER_STRIKES: u32 = 2;
+
+#[cfg(target_os = "linux")]
+impl KeeperStrikes {
+    /// A keeper exited after its desktop ran for `up_for`. `true` when that
+    /// makes [`KEEPER_STRIKES`] early exits in a row.
+    fn exited(&mut self, up_for: Duration, stable_after: Duration) -> bool {
+        if up_for >= stable_after {
+            self.early = 0;
+            return false;
+        }
+        self.early += 1;
+        self.early >= KEEPER_STRIKES
+    }
+
+    /// A desktop ran long enough: the next early exit is the first again.
+    fn reset(&mut self) {
+        self.early = 0;
+    }
+}
+
+/// How a desktop's run ended.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Gone {
+    /// Its X server exited; how.
+    Server(String),
+    /// Its keeper exited first (#3665); how.
+    Keeper(String),
+}
+
+/// Block until the desktop's X server, or its keeper when it has one, has
+/// exited, and say which and how. Neither is reaped (`WNOWAIT`), for the
+/// reason [`wait_exit`] gives.
+///
+/// With a keeper the wait is on the desktop's process group (`P_PGID`). The
+/// daemon's only children in that group are the server and the keeper: the
+/// keeper is the parent of everything else on the desktop, and none of the
+/// daemon's other children (exec and SSH sessions, the encoder probe) is ever
+/// placed in it, so the wait can only answer for those two. Should a child of
+/// the daemon's that is neither ever be in the group, it is not this wait's to
+/// take: it is left unreaped for its own waiter, one error says so, and from
+/// then on the wait is on the server alone. With `WNOWAIT` it would otherwise
+/// answer every wait at once, and the supervisor would spin a core, as root.
+#[cfg(target_os = "linux")]
+fn wait_desktop_exit(x: &XServer) -> Gone {
+    let Some(keeper) = x.keeper else {
+        return Gone::Server(wait_exit(x.pid));
+    };
+    // The server leads the desktop's group, so its pid is the group's id, and
+    // a keeper is only ever started into that group (`Desktop::spawn_keeper`).
+    let group = x.pid;
+    loop {
+        // SAFETY: `siginfo_t` is plain data that `waitid` fills in; all-zero
+        // is a valid value for it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `waitid(2)` on our children in one group, with a live
+        // out-pointer. `WNOWAIT` leaves whichever it reports waitable.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PGID,
+                group as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `waitid` returned 0 for a child that exited, so this is
+            // a SIGCHLD-shaped `siginfo_t`: `si_pid` and `si_status` are set.
+            let (pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+            let how = describe_exit(info.si_code, status);
+            if pid == x.pid {
+                return Gone::Server(how);
+            }
+            if pid == keeper {
+                return Gone::Keeper(how);
+            }
+            error!(
+                pid,
+                group,
+                server = x.pid,
+                keeper,
+                "virtual-desktop: a child of the daemon that the desktop did not start is in the desktop's process group — it is left to its own waiter, and the supervisor waits for the X server alone from now on"
+            );
+            break;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            // Both collected by a teardown that ran meanwhile.
+            Some(libc::ECHILD) => return Gone::Server("already collected".into()),
+            _ => break,
+        }
+    }
+    Gone::Server(wait_exit(x.pid))
 }
 
 /// Block until our child `pid` has exited, and say how. It is NOT reaped
@@ -4153,8 +4290,8 @@ mod supervise_tests {
         ready_timeout: Duration,
     ) -> (Arc<Desktop>, i32) {
         let wm = script(dir, "wm", wm_body);
-        let desk = Arc::new(Desktop::new(
-            display.into(),
+        desktop_planned(
+            display,
             Plan {
                 cfg: Config {
                     resolution: "640x480".into(),
@@ -4165,7 +4302,13 @@ mod supervise_tests {
                 keeper_ready_timeout: ready_timeout,
                 ..plan(stand_in(dir, "exit 1"))
             },
-        ));
+        )
+    }
+
+    /// A desktop on `plan`, with a `sleep` in the server's place spawned and
+    /// recorded. The desktop, and the server's pid.
+    fn desktop_planned(display: &str, plan: Plan) -> (Arc<Desktop>, i32) {
+        let desk = Arc::new(Desktop::new(display.into(), plan));
         let mut server = Command::new("sleep");
         server
             .arg("300")
@@ -4355,4 +4498,326 @@ mod supervise_tests {
             "the window manager was started directly"
         );
     }
+
+    /// The server [`desktop_planned`] spawned, as `bring_up` hands it to the
+    /// supervisor, with the keeper `start_clients` returned; the desktop is
+    /// marked up, as `bring_up` marks it.
+    fn running(desk: &Desktop, x_pid: i32, keeper: Option<i32>) -> XServer {
+        // What `bring_up` records once the clients are started.
+        {
+            let mut st = desk.state();
+            st.up = Some(Server::Xvfb);
+            st.why_down.clear();
+        }
+        XServer {
+            pid: x_pid,
+            kind: Server::Xvfb,
+            tail: StderrTail::follow(None::<std::process::ChildStderr>),
+            since: Instant::now(),
+            keeper,
+        }
+    }
+
+    /// The CPU ticks (user and system) the thread of this process named
+    /// `name` has used so far.
+    fn thread_ticks(name: &str) -> Option<u64> {
+        for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+                continue;
+            };
+            if comm.trim() != name {
+                continue;
+            }
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+            // utime and stime, fields 14 and 15.
+            return Some(
+                fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?,
+            );
+        }
+        None
+    }
+
+    /// #3665, K1 — the keeper's exit is the desktop's failure, as its
+    /// server's is: the desktop goes down saying so, the server, the keeper
+    /// and what the keeper started are collected, and the desktop is started
+    /// again. Before it, the daemon's only children in the desktop's group
+    /// are the server and the keeper, which is what lets the supervisor wait
+    /// on the group.
+    #[test]
+    fn a_keeper_that_dies_takes_the_desktop_down_and_it_is_started_again() {
+        let dir = scratch("keeper-dies");
+        let d = dir.display();
+        let (desk, x_pid) = desktop_planned(
+            ":467",
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: script(
+                        &dir,
+                        "wm",
+                        &format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300"),
+                    ),
+                    startup: vec![],
+                },
+                // Long enough to read the reason before the next start.
+                delay_floor: Duration::from_millis(300),
+                delay_ceil: Duration::from_millis(300),
+                ..plan(stand_in(&dir, "exit 1"))
+            },
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let wm = recorded(&dir, "wm.pid");
+        let me = std::process::id() as i32;
+        let ours: std::collections::BTreeSet<i32> = read_proc_snapshot()
+            .into_iter()
+            .filter(|p| p.pgid == x_pid && p.ppid == me)
+            .map(|p| p.pid)
+            .collect();
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
+        };
+        // Our child, unreaped while the tree lists it.
+        RealProcs.signal(keeper, libc::SIGKILL);
+        let mut why = String::new();
+        wait_for("the desktop to go down for its keeper", || {
+            why = desk.state().why_down.clone();
+            why.contains("keeper")
+        });
+        wait_for("the next start", || !runs(&dir).is_empty());
+        let (x_gone, keeper_gone, wm_running) =
+            (collected(x_pid), collected(keeper), still_running(&wm));
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            ours,
+            [x_pid, keeper].into_iter().collect(),
+            "the daemon's children in the desktop's group"
+        );
+        assert_eq!(why, "its keeper exited: signal 9 (killed)");
+        assert!(x_gone, "the server {x_pid} was not collected");
+        assert!(keeper_gone, "the keeper {keeper} was not collected");
+        assert!(
+            !wm_running,
+            "the window manager {} outlived its keeper",
+            wm.pid
+        );
+    }
+
+    /// #3665, condition 5 — a child of the daemon's in the desktop's group
+    /// that the desktop did not start is not the supervisor's: it is left
+    /// unreaped for its own waiter, the desktop stays up, and the supervisor
+    /// does not spin on the zombie its `WNOWAIT` wait would otherwise find
+    /// again and again.
+    #[test]
+    #[allow(clippy::zombie_processes)] // the stray is collected by `try_wait`
+    fn a_child_the_desktop_did_not_record_does_not_spin_the_supervisor() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = scratch("stray");
+        let wm_body = format!("echo $$ > \"{}/wm.pid\"\nexec sleep 300", dir.display());
+        let (desk, x_pid) = desktop_with(
+            &dir,
+            ":468",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::test()),
+            Duration::from_secs(20),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::Builder::new()
+                .name("vd-sup-stray".into())
+                .spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
+                .unwrap()
+        };
+        let mut stray = Command::new("true");
+        stray.process_group(x_pid);
+        let mut stray = stray.spawn().unwrap();
+        let stray_pid = stray.id() as i32;
+        wait_for("the stray to exit", || !is_running(stray_pid));
+        std::thread::sleep(Duration::from_millis(300));
+        let before = thread_ticks("vd-sup-stray");
+        std::thread::sleep(Duration::from_secs(1));
+        let after = thread_ticks("vd-sup-stray");
+        let stray_unreaped = read_proc_stat(stray_pid).is_some();
+        let up = desk.state().up;
+        let ours_to_collect = matches!(stray.try_wait(), Ok(Some(_)));
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            stray_unreaped,
+            "the supervisor reaped a child the desktop did not start"
+        );
+        assert!(ours_to_collect, "the stray was not left to its own waiter");
+        assert_eq!(
+            up,
+            Some(Server::Xvfb),
+            "the desktop went down for a child it did not start"
+        );
+        let (before, after) = (before.expect("the thread"), after.expect("the thread"));
+        assert!(
+            after - before < 20,
+            "the supervisor spun: {} ticks in one second",
+            after - before
+        );
+    }
+
+    /// #3665, condition 9 — a service manager's stop signals every process of
+    /// the unit at once, the keeper with the rest. SIGTERM alone makes the
+    /// keeper end what it started and stay, so the supervisor sees no exit to
+    /// report and starts nothing; the daemon's own stop then ends the keeper.
+    #[test]
+    fn a_service_manager_stop_adds_no_keeper_warning() {
+        let dir = scratch("unit-stop");
+        let wm_body = format!("echo $$ > \"{}/wm.pid\"\nexec sleep 300", dir.display());
+        let (desk, x_pid) = desktop_with(
+            &dir,
+            ":469",
+            &wm_body,
+            Clients::Keeper(KeeperCmd::test()),
+            Duration::from_secs(20),
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let wm = recorded(&dir, "wm.pid");
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::spawn(move || supervise(&desk, Some(running(&desk, x_pid, Some(keeper)))))
+        };
+        // Our child, unreaped while the tree lists it.
+        RealProcs.signal(keeper, libc::SIGTERM);
+        wait_for("the keeper to end what it started", || !still_running(&wm));
+        std::thread::sleep(Duration::from_millis(500));
+        let keeper_stayed = is_running(keeper);
+        let up = desk.state().up;
+        let starts = runs(&dir).len();
+        let asked = Instant::now();
+        desk.stop();
+        let took = asked.elapsed();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(keeper_stayed, "the keeper left on SIGTERM alone");
+        assert_eq!(
+            up,
+            Some(Server::Xvfb),
+            "the desktop went down on its keeper's SIGTERM"
+        );
+        assert_eq!(starts, 0, "the desktop was started again");
+        assert!(collected(keeper), "the stop left the keeper {keeper}");
+        assert!(collected(x_pid), "the stop left the server {x_pid}");
+        assert!(took < Duration::from_secs(5), "the stop took {took:?}");
+    }
+
+    /// #3665, condition 11 — two early keeper exits in a row turn the keeper
+    /// off; a keeper or a desktop that ran long enough starts the count again.
+    #[test]
+    fn two_early_keeper_exits_in_a_row_turn_the_keeper_off() {
+        let stable = Duration::from_secs(60);
+        let early = Duration::from_secs(5);
+        let mut s = KeeperStrikes::default();
+        assert!(!s.exited(early, stable), "one early exit");
+        assert!(s.exited(early, stable), "two in a row");
+
+        let mut s = KeeperStrikes::default();
+        assert!(!s.exited(early, stable));
+        s.reset();
+        assert!(
+            !s.exited(early, stable),
+            "a desktop ran long enough in between"
+        );
+
+        let mut s = KeeperStrikes::default();
+        assert!(!s.exited(early, stable));
+        assert!(
+            !s.exited(stable, stable),
+            "a keeper that lasted is no strike"
+        );
+        assert!(!s.exited(early, stable), "and starts the count again");
+    }
+
+    /// #3665, condition 11, against a real Xvfb (the CI Xvfb lane): a keeper
+    /// that says it is ready and then leaves, twice, costs the desktop two
+    /// restarts and nothing more. The third start is the daemon's own, and
+    /// that desktop stays up.
+    #[test]
+    fn after_two_early_keeper_exits_the_desktop_starts_directly_and_stays_up() {
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        let dir = scratch("keeper-strikes");
+        let d = dir.display();
+        let brief = script(
+            &dir,
+            "keeper",
+            &format!("echo $$ >> \"{d}/keepers\"\nread -r job\necho ready >&2\nsleep 0.3\nexit 0"),
+        );
+        let display = pick_display(X11_UNIX_DIR);
+        let desk = Arc::new(Desktop::new(
+            display.clone(),
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: script(
+                        &dir,
+                        "wm",
+                        &format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300"),
+                    ),
+                    startup: vec![],
+                },
+                ready_timeout: READY_TIMEOUT,
+                delay_floor: Duration::from_millis(100),
+                clients: Clients::Keeper(KeeperCmd::script(&brief)),
+                ..plan("Xvfb".into())
+            },
+        ));
+        let _stop = StopAtTheEnd(desk.clone());
+        let first = desk.bring_up().expect("the X server comes up");
+        assert!(first.keeper.is_some(), "the first start has a keeper");
+        let supervisor = {
+            let desk = desk.clone();
+            std::thread::spawn(move || supervise(&desk, Some(first)))
+        };
+        let server_now = |desk: &Desktop| {
+            let st = desk.state();
+            st.up
+                .and_then(|_| st.tree.as_ref())
+                .filter(|t| t.keeper.is_none())
+                .and_then(|t| t.roots.first().copied())
+        };
+        wait_for("a start without a keeper", || {
+            desk.keeper_off.load(std::sync::atomic::Ordering::Relaxed)
+                && server_now(&desk).is_some()
+        });
+        let server = server_now(&desk).unwrap();
+        let wm = recorded(&dir, "wm.pid");
+        std::thread::sleep(Duration::from_secs(2));
+        let still = server_now(&desk);
+        let keepers = std::fs::read_to_string(dir.join("keepers")).unwrap_or_default();
+        desk.stop();
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(keepers.lines().count(), 2, "keepers started: {keepers:?}");
+        assert_eq!(still, Some(server), "the direct desktop did not stay up");
+        assert_eq!(
+            wm.ppid,
+            std::process::id() as i32,
+            "the third start is the daemon's own"
+        );
+        assert!(collected(server), "the stop left the server running");
+        println!("x11-real: after two keeper exits the desktop on {display} ran without one");
+    }
+
 }

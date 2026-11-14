@@ -797,7 +797,18 @@ pub(super) mod tests {
         };
         close(r);
         if ignored {
-            assert!(!say_to(w, "warn: into a broken pipe"));
+            // Another test's child holds a copy of the read end for the moment
+            // between its fork and its exec, so the pipe breaks once no such
+            // copy is left. Each write returns at once, written or not.
+            let by = Instant::now() + Duration::from_secs(5);
+            let mut broke = false;
+            while !broke && Instant::now() < by {
+                broke = !say_to(w, "warn: into a broken pipe");
+                if !broke {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert!(broke, "a write to a pipe that nobody reads did not fail");
         }
         close(w);
     }
