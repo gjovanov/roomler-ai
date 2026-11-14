@@ -558,6 +558,12 @@ async fn test_pending_queue_a_begun_message_dropped_queues_its_rest_and_owes_the
             3,
             "the append must be cut with its first chunk queued"
         );
+        // roomler (#3755): taken here, so the wake checked below is the
+        // drop's own, not the one the wait for room sent.
+        assert!(
+            woken.try_recv().is_ok(),
+            "the append waiting for room must wake the write loop"
+        );
     }
     assert_eq!(commits, 1, "the begun message's commit must run once");
     let (room, overdraft, bytes, len) = accounts(&pq);
@@ -575,7 +581,10 @@ async fn test_pending_queue_a_begun_message_dropped_queues_its_rest_and_owes_the
         !pq.is_locked(),
         "the queue's lock must be free once the rest is queued"
     );
-    assert!(woken.try_recv().is_ok(), "the write loop must be woken");
+    assert!(
+        woken.try_recv().is_ok(),
+        "the drop must wake the write loop for the rest it queued"
+    );
 
     // A pop pays the overdraft before it gives room: this one, 3346 bytes,
     // gives none.
@@ -670,6 +679,12 @@ fn test_pending_queue_a_begun_message_dropped_outside_any_runtime_queues_its_res
         3,
         "the append must be cut with its first chunk queued"
     );
+    // roomler (#3755): taken here, so the wake checked below is the drop's
+    // own, not the one the wait for room sent.
+    assert!(
+        woken.try_recv().is_ok(),
+        "the append waiting for room must wake the write loop"
+    );
     drop(rt);
 
     drop(append);
@@ -681,7 +696,10 @@ fn test_pending_queue_a_begun_message_dropped_outside_any_runtime_queues_its_res
     );
     assert_eq!(room + bytes - overdraft, LIMIT, "room + queued - overdraft");
     assert!(!pq.is_locked(), "the queue's lock must be free");
-    assert!(woken.try_recv().is_ok(), "the write loop must be woken");
+    assert!(
+        woken.try_recv().is_ok(),
+        "the drop must wake the write loop for the rest it queued"
+    );
 }
 
 #[test]

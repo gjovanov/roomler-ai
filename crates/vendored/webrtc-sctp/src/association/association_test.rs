@@ -3426,30 +3426,42 @@ async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Resul
             })
             .collect();
 
-        let all_done = tokio::time::timeout(Duration::from_secs(40), async {
-            for writer in writers {
-                let _ = writer.await;
+        // roomler (#3755): how every task of the round ended. A writer, the
+        // sampler or the link that panicked is a finding: a panic in the write
+        // path must fail the round, not leave its writes unlogged. A writer
+        // still running at the ceiling is a finding too, and is aborted then,
+        // the only abort the round makes.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        for (w, mut writer) in (0..WRITERS).zip(writers) {
+            match tokio::time::timeout_at(deadline, &mut writer).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => findings.push(format!("writer {w} ended in: {err}")),
+                Err(_) => {
+                    writer.abort();
+                    findings.push(format!("writer {w} did not finish within 40 s"));
+                }
             }
-        })
-        .await;
-        if all_done.is_err() {
-            findings.push("the writers did not finish within 40 s".to_owned());
         }
         sampling.store(false, Ordering::SeqCst);
-        if let Ok((room, owed)) = sampler.await {
-            if room > SMALL_QUEUE {
-                findings.push(format!(
-                    "the queue had room {room} while the writers ran, more than its {SMALL_QUEUE}"
-                ));
+        match sampler.await {
+            Ok((room, owed)) => {
+                if room > SMALL_QUEUE {
+                    findings.push(format!(
+                        "the queue had room {room} while the writers ran, more than its {SMALL_QUEUE}"
+                    ));
+                }
+                if owed > max_owed {
+                    findings.push(format!(
+                        "the queue owed {owed} bytes while the writers ran, more than {max_owed}"
+                    ));
+                }
             }
-            if owed > max_owed {
-                findings.push(format!(
-                    "the queue owed {owed} bytes while the writers ran, more than {max_owed}"
-                ));
-            }
+            Err(err) => findings.push(format!("the sampler ended in: {err}")),
         }
         link_up.store(false, Ordering::SeqCst);
-        let _ = link.await;
+        if let Err(err) = link.await {
+            findings.push(format!("the link ended in: {err}"));
+        }
         if !drains_within(&br, &a0, &a1, Duration::from_secs(10)).await {
             findings.push("the association never drained".to_owned());
         }
@@ -3461,6 +3473,14 @@ async fn cut_writes_round(seed: u64, one_thread: bool, max_owed: usize) -> Resul
             read.push(buf[..n].to_vec());
         }
         let log = log.lock().unwrap().clone();
+        // roomler (#3755): every write was logged, so none escaped the check.
+        let writes = usize::from(WRITERS) * WRITES as usize;
+        if log.len() != writes {
+            findings.push(format!(
+                "the writers logged {} of their {writes} writes",
+                log.len()
+            ));
+        }
         findings.extend(check_cut_writes(&log, &read, one_thread));
         let left = s0.buffered_amount();
         if left != 0 {
