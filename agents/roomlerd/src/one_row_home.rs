@@ -1375,8 +1375,12 @@ impl Fs for RealFs {
     fn read(&self, path: &Path, bound: usize) -> Held {
         use std::io::Read as _;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let (uid, mode) = match std::fs::symlink_metadata(path) {
-            Ok(m) => (Some(m.uid()), Some(m.mode() & 0o7777)),
+        let (uid, mode, regular) = match std::fs::symlink_metadata(path) {
+            Ok(m) => (
+                Some(m.uid()),
+                Some(m.mode() & 0o7777),
+                m.file_type().is_file(),
+            ),
             Err(e) if gone(&e) => return Held::Absent,
             Err(e) => {
                 return Held::Unreadable {
@@ -1397,7 +1401,9 @@ impl Fs for RealFs {
             Ok(file) => file,
             Err(e) if gone(&e) => return Held::Absent,
             Err(e) => {
-                let error = match e.raw_os_error() == Some(libc::ELOOP) {
+                // Not a file at the `lstat` (a socket's `open` is ENXIO on
+                // Linux, EOPNOTSUPP on macOS), or a link there since (ELOOP).
+                let error = match !regular || e.raw_os_error() == Some(libc::ELOOP) {
                     true => ReadError::NotRegular,
                     false => read_error(&e),
                 };
@@ -2823,6 +2829,29 @@ mod tests {
                 plist: Expect::Absent,
             };
             let out = answer_within_5s(verb, dir.path());
+            assert_eq!(out.exit, Exit::Changed, "{}", out.stderr);
+        }
+
+        /// A socket where the config was is not a file. Its `open` fails
+        /// (ENXIO on Linux, EOPNOTSUPP on macOS), and that is `not_regular`:
+        /// `convert` over it is changed (3), not any other error (1).
+        #[test]
+        fn a_socket_at_the_config_is_not_regular() {
+            let (dir, at) = a_home();
+            std::fs::remove_file(&at.config).unwrap();
+            let _socket = std::os::unix::net::UnixListener::bind(&at.config).unwrap();
+            assert!(matches!(
+                RealFs.read(&at.config, CONFIG_BOUND),
+                Held::Unreadable {
+                    error: ReadError::NotRegular,
+                    ..
+                }
+            ));
+            let verb = Verb::Convert {
+                config: Expect::of(Some(ENROLLED.as_bytes())),
+                plist: Expect::of(Some(PLIST)),
+            };
+            let out = answer(verb, dir.path(), &creds(), &[], &mut RealFs);
             assert_eq!(out.exit, Exit::Changed, "{}", out.stderr);
         }
 
