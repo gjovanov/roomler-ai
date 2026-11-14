@@ -1,24 +1,48 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! #3702 — the gate on where the daemon reads a folder variable.
+//! #3702, #3778 — the gate on where the daemon finds a folder.
 //!
-//! `%ProgramData%`, `%ProgramFiles%`, `%APPDATA%`, `%LOCALAPPDATA%` and
-//! `%USERPROFILE%` name folders, and a process's environment can name other
-//! ones. A step on the service account takes the machine's folders from the
-//! system (`appdirs::machine_program_data`, `appdirs::machine_program_files`)
-//! and its own profile from the profile list (`appdirs::system_profile`), so
-//! [`crate::appdirs`] is the one module of the daemon's two crates that reads
-//! any of these variables.
+//! `%ProgramData%`, `%ProgramFiles%`, `%APPDATA%`, `%LOCALAPPDATA%`,
+//! `%USERPROFILE%` and `%TEMP%` name folders, and a process's environment can
+//! name other ones. A step on the service account takes the machine's folders
+//! from the system (`appdirs::machine_program_data`,
+//! `appdirs::machine_program_files`) and its own profile from the profile list
+//! (`appdirs::system_profile`), so [`crate::appdirs`] is the one module of the
+//! daemon that reads any of these variables. On macOS and Linux a
+//! `directories` lookup takes the folders from the environment (`$HOME`,
+//! `$XDG_*`), so it is held to the same module.
 //!
-//! The test parses every source file of `crates/agent-core` and
-//! `agents/roomlerd`, with the `cfg` of a Windows, non-test build applied,
-//! and fails on any function outside `appdirs` that reads a variable and names
-//! one of these, unless it is listed in [`KNOWN`] with the reason. A stale row
-//! fails too, so the list cannot rot.
+//! **What the gate scans**: every package in this repository that `roomlerd`
+//! links, followed through the dependency graph ([`Graph`]), so a crate is
+//! scanned the day it is linked; in each, the files its library (and the
+//! daemon's binary) compiles, through every `mod` the build keeps. Each file
+//! is read as a Windows, a Linux and a macOS non-test build compiles it.
+//!
+//! **What counts as a read**, in a function, `const`, `static` or macro item
+//! outside `appdirs`:
+//! - on Windows, a body that reads the environment and names one of
+//!   [`FOLDER_VARIABLES`]. It reads through `std::env`'s `var`, `var_os`,
+//!   `vars` or `vars_os` (a renamed import too), one of [`OS_READS`], or a
+//!   helper of the scanned code that reads one by a name its caller gives it.
+//!   It names one in a literal, alone or inside a longer string
+//!   (`%APPDATA%\…`), in a macro's arguments, or through a `const` or
+//!   `static` that holds it;
+//! - on macOS and Linux, a `directories` lookup ([`LOOKUPS`]).
+//!
+//! A read that is right where it is is listed in [`KNOWN`] with the reason,
+//! and a linked package that is not scanned in [`NOT_SCANNED`]. A stale row
+//! fails too, so neither list can rot.
+//!
+//! What it does not see: a helper called with method syntax (`x.helper(..)`:
+//! a parser does not know the receiver's type, and `cmd.env("APPDATA", x)`
+//! sets a child's variable), a helper of a helper (which of its parameters
+//! is the key is not followed), a helper outside the scanned code, and a
+//! name put together at run time.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// The variables, with the names that mean the same folders. Windows takes a
@@ -32,10 +56,37 @@ const FOLDER_VARIABLES: &[&str] = &[
     "APPDATA",
     "LOCALAPPDATA",
     "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TEMP",
+    "TMP",
 ];
 
-/// Folders scanned whole, from the repository root.
-const FOLDERS: &[&str] = &["crates/agent-core/src", "agents/roomlerd/src"];
+/// The names that are words of prose and of file names too (`x.tmp`).
+const SHORT: &[&str] = &["TEMP", "TMP"];
+
+/// `std::env`'s readers. `var`, `var_os` and `vars_os` count alone, as an
+/// imported name; after a path, only after `env`.
+const ENV_READS: &[&str] = &["var", "var_os", "vars", "vars_os"];
+
+/// The other readers of a process's environment, whatever the path before
+/// them.
+const OS_READS: &[&str] = &[
+    "GetEnvironmentVariableA",
+    "GetEnvironmentVariableW",
+    "ExpandEnvironmentStringsA",
+    "ExpandEnvironmentStringsW",
+    "GetEnvironmentStrings",
+    "GetEnvironmentStringsA",
+    "GetEnvironmentStringsW",
+    "getenv",
+    "_wgetenv",
+    "secure_getenv",
+];
+
+/// `directories`' types, whose constructors take the folders from the
+/// environment on macOS and Linux.
+const LOOKUPS: &[&str] = &["ProjectDirs", "BaseDirs", "UserDirs"];
 
 /// The module that reads them.
 const READER: &str = "crates/agent-core/src/appdirs.rs";
@@ -55,9 +106,61 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "how the desktop companion was installed, read by the companion as the \
          person: not a folder a step writes",
     ),
+    (
+        "agents/roomler-cli/src/config.rs",
+        "default_config_path",
+        "the `roomler` command's per-user config on macOS and Linux, read by the \
+         command as the person who runs it",
+    ),
+    (
+        "agents/roomler-cli/src/update.rs",
+        "sudo_user_config_path",
+        "the `roomler` command's self-update under sudo, finding the config of \
+         the person who ran it",
+    ),
+    (
+        "agents/roomlerd/src/files.rs",
+        "private_staging_root",
+        "a per-user daemon's own state folder on Linux; root's is the fixed \
+         `/var/lib/roomler/staging`",
+    ),
+    (
+        "agents/roomlerd/src/service.rs",
+        "user_unit_path_for",
+        "a systemd user unit, which lives in the person's own config folder: \
+         the per-user install, run as that person",
+    ),
 ];
 
-/// Whether a `cfg` holds on a Windows, non-test build.
+/// A build the gate reads the sources as: a non-test build for one OS.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Build {
+    Windows,
+    Linux,
+    Macos,
+}
+
+const BUILDS: [Build; 3] = [Build::Windows, Build::Linux, Build::Macos];
+
+impl Build {
+    fn os(self) -> &'static str {
+        match self {
+            Build::Windows => "windows",
+            Build::Linux => "linux",
+            Build::Macos => "macos",
+        }
+    }
+
+    fn family(self) -> &'static str {
+        if self == Build::Windows {
+            "windows"
+        } else {
+            "unix"
+        }
+    }
+}
+
+/// Whether a `cfg` holds on a build.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Holds {
     Yes,
@@ -65,29 +168,39 @@ enum Holds {
     Maybe,
 }
 
-fn holds(meta: &syn::Meta) -> Holds {
+fn holds(meta: &syn::Meta, build: Build) -> Holds {
+    let when = |yes: bool| if yes { Holds::Yes } else { Holds::No };
     match meta {
-        syn::Meta::Path(path) if path.is_ident("test") || path.is_ident("unix") => Holds::No,
-        syn::Meta::Path(path) if path.is_ident("windows") => Holds::Yes,
+        syn::Meta::Path(path) if path.is_ident("test") => Holds::No,
+        syn::Meta::Path(path) if path.is_ident("windows") || path.is_ident("unix") => {
+            when(path.is_ident(build.family()))
+        }
         syn::Meta::Path(_) => Holds::Maybe,
-        syn::Meta::NameValue(pair)
-            if pair.path.is_ident("target_os") || pair.path.is_ident("target_family") =>
-        {
-            match &pair.value {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(value),
-                    ..
-                }) if value.value() == "windows" => Holds::Yes,
-                _ => Holds::No,
+        syn::Meta::NameValue(pair) => {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = &pair.value
+            else {
+                return Holds::Maybe;
+            };
+            let value = value.value();
+            if pair.path.is_ident("target_os") {
+                when(value == build.os())
+            } else if pair.path.is_ident("target_family") {
+                when(value == build.family())
+            } else if pair.path.is_ident("target_vendor") && value == "apple" {
+                when(build == Build::Macos)
+            } else {
+                Holds::Maybe
             }
         }
-        syn::Meta::NameValue(_) => Holds::Maybe,
         syn::Meta::List(list) => {
             let nested: Vec<Holds> = list
                 .parse_args_with(
                     syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
                 )
-                .map(|p| p.iter().map(holds).collect())
+                .map(|p| p.iter().map(|m| holds(m, build)).collect())
                 .unwrap_or_default();
             if list.path.is_ident("not") {
                 match nested.first() {
@@ -118,81 +231,323 @@ fn holds(meta: &syn::Meta) -> Holds {
     }
 }
 
-/// Is the thing these attributes sit on compiled into a Windows, non-test
-/// build? What the gate cannot tell (a feature) is: looking at too much is the
-/// safe side.
-fn compiled(attrs: &[syn::Attribute]) -> bool {
+/// Is the thing these attributes sit on compiled into `build`? What the gate
+/// cannot tell (a feature) is: looking at too much is the safe side.
+fn compiled(attrs: &[syn::Attribute], build: Build) -> bool {
     attrs.iter().all(|attr| {
         !attr.path().is_ident("cfg")
             || attr
                 .parse_args::<syn::Meta>()
-                .map_or(true, |meta| holds(&meta) != Holds::No)
+                .map_or(true, |meta| holds(&meta, build) != Holds::No)
     })
 }
 
-/// A read of the environment: `std::env::var`, `env::var_os`, or one of them
-/// imported by name, called or passed as a function.
-fn reads_a_variable(path: &syn::Path) -> bool {
-    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    match names.as_slice() {
-        [.., last] if last != "var" && last != "var_os" => false,
-        [_] => true,
-        [.., env, _] => env == "env",
-        [] => false,
-    }
+fn segments(path: &syn::Path) -> Vec<String> {
+    path.segments.iter().map(|s| s.ident.to_string()).collect()
 }
 
-/// What one function's body does: whether it reads a variable, and which of
-/// [`FOLDER_VARIABLES`] it names.
+/// What a file's `use` items name: a reader of [`ENV_READS`] imported by
+/// name, any reader renamed, `std::env` renamed, a type of [`LOOKUPS`]
+/// renamed.
 #[derive(Default)]
-struct Body {
-    reads: bool,
-    names: Vec<String>,
+struct Imports {
+    reads: BTreeSet<String>,
+    env: BTreeSet<String>,
+    lookups: BTreeSet<String>,
 }
 
-impl<'ast> Visit<'ast> for Body {
-    fn visit_expr_path(&mut self, i: &'ast syn::ExprPath) {
-        if reads_a_variable(&i.path) {
-            self.reads = true;
+impl Imports {
+    fn of(file: &syn::File) -> Self {
+        struct Uses(Imports);
+        impl<'ast> Visit<'ast> for Uses {
+            fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+                self.0.tree(&i.tree, &mut Vec::new());
+            }
         }
-        visit::visit_expr_path(self, i);
+        let mut uses = Uses(Imports::default());
+        uses.visit_file(file);
+        uses.0
     }
-    fn visit_lit_str(&mut self, i: &'ast syn::LitStr) {
-        let value = i.value();
-        if FOLDER_VARIABLES
-            .iter()
-            .any(|name| value.eq_ignore_ascii_case(name))
-        {
-            self.names.push(value);
+
+    fn tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+        let from_env = prefix.last().is_some_and(|m| m == "env");
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                self.tree(&p.tree, prefix);
+                prefix.pop();
+            }
+            syn::UseTree::Group(g) => g.items.iter().for_each(|t| self.tree(t, prefix)),
+            syn::UseTree::Name(n) => {
+                let name = n.ident.to_string();
+                if from_env && ENV_READS.contains(&name.as_str()) {
+                    self.reads.insert(name);
+                }
+            }
+            syn::UseTree::Rename(r) => {
+                let (name, alias) = (r.ident.to_string(), r.rename.to_string());
+                if name == "env" {
+                    self.env.insert(alias);
+                } else if OS_READS.contains(&name.as_str())
+                    || from_env && ENV_READS.contains(&name.as_str())
+                {
+                    self.reads.insert(alias);
+                } else if LOOKUPS.contains(&name.as_str()) {
+                    self.lookups.insert(alias);
+                }
+            }
+            syn::UseTree::Glob(_) => {}
         }
+    }
+
+    /// Whether a path names a reader of the environment.
+    fn reads(&self, path: &[String]) -> bool {
+        match path {
+            [] => false,
+            [.., last] if OS_READS.contains(&last.as_str()) => true,
+            [one] => {
+                matches!(one.as_str(), "var" | "var_os" | "vars_os") || self.reads.contains(one)
+            }
+            [.., module, last] => {
+                ENV_READS.contains(&last.as_str()) && (module == "env" || self.env.contains(module))
+            }
+        }
+    }
+
+    /// The `directories` lookup a path makes: a type of [`LOOKUPS`] and what
+    /// follows it (`BaseDirs::new`, `directories::ProjectDirs::from`).
+    fn lookup(&self, path: &[String]) -> Option<String> {
+        path.windows(2)
+            .find(|w| LOOKUPS.contains(&w[0].as_str()) || self.lookups.contains(&w[0]))
+            .map(|w| w.join("::"))
+    }
+}
+
+/// What the scan knows across files, found to a fixed point.
+#[derive(Default, PartialEq)]
+struct Known {
+    /// Functions and `macro_rules!` of the scanned code that read the
+    /// environment by a name their caller gives them.
+    helpers: BTreeSet<String>,
+    /// `const`s and `static`s that hold a folder variable's name.
+    names: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// What one item's body does.
+struct Body<'a> {
+    build: Build,
+    imports: &'a Imports,
+    known: &'a Known,
+    /// The item's parameters: a function's, or a `macro_rules!`'s `$name`s.
+    params: &'a BTreeSet<String>,
+    /// It reads the environment.
+    reads: bool,
+    /// It reads by a name its caller gives it: a reader's key that is one of
+    /// its parameters, or a reader passed as a value or a walk of the whole
+    /// environment in an item that takes any.
+    keyed: bool,
+    /// The folder variables it names.
+    names: BTreeSet<String>,
+    /// The `directories` lookups it makes.
+    lookups: BTreeSet<String>,
+}
+
+impl Body<'_> {
+    /// A path, called with `keyed` true when its first argument carries one
+    /// of the item's parameters, or used as a value with `keyed` true when
+    /// the item takes any.
+    fn path(&mut self, path: &[String], keyed: bool) {
+        let Some(last) = path.last() else { return };
+        let reader = self.imports.reads(path);
+        if reader || self.known.helpers.contains(last) {
+            self.reads = true;
+            // A helper is one that reads itself: a parameter that a helper
+            // passes on may be any of its arguments, not the key.
+            self.keyed |= keyed && reader;
+        }
+        if let Some(lookup) = self.imports.lookup(path) {
+            self.lookups.insert(lookup);
+        }
+        if let Some(names) = self.known.names.get(last) {
+            self.names.extend(names.iter().cloned());
+        }
+    }
+
+    /// Every folder variable a literal names, alone or inside a longer
+    /// string, as a word of its own in any case; one of [`SHORT`] inside a
+    /// longer string only as `%TEMP%` or `$env:TEMP`.
+    fn text(&mut self, text: &str) {
+        let text = text.to_ascii_lowercase();
+        for name in FOLDER_VARIABLES {
+            let word = name.to_ascii_lowercase();
+            if SHORT.contains(name) {
+                if text == word
+                    || text.contains(&format!("%{word}%"))
+                    || text.contains(&format!("$env:{word}"))
+                {
+                    self.names.insert((*name).to_owned());
+                }
+                continue;
+            }
+            let alone = |at: usize| {
+                let before = text[..at].chars().next_back();
+                let after = text[at + word.len()..].chars().next();
+                ![before, after]
+                    .into_iter()
+                    .flatten()
+                    .any(|c| c.is_alphanumeric() || c == '_')
+            };
+            if text.match_indices(&word).any(|(at, _)| alone(at)) {
+                self.names.insert((*name).to_owned());
+            }
+        }
+    }
+
+    fn literal(&mut self, lit: &syn::Lit) {
+        match lit {
+            syn::Lit::Str(s) => self.text(&s.value()),
+            syn::Lit::ByteStr(s) => self.text(&String::from_utf8_lossy(&s.value())),
+            syn::Lit::CStr(s) => self.text(&s.value().to_string_lossy()),
+            _ => {}
+        }
+    }
+
+    /// A macro's tokens, which the parser leaves unparsed: every literal, and
+    /// every path with the call that follows it. A method (`.name`) is
+    /// skipped, as it is outside a macro.
+    fn tokens(&mut self, tokens: TokenStream) {
+        let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+        let mut at = 0;
+        while at < tokens.len() {
+            match &tokens[at] {
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                TokenTree::Literal(literal) => self.literal(&syn::Lit::new(literal.clone())),
+                TokenTree::Punct(_) => {}
+                TokenTree::Ident(_) => {
+                    let method = at > 0
+                        && matches!(&tokens[at - 1], TokenTree::Punct(p) if p.as_char() == '.');
+                    let mut path = Vec::new();
+                    while let Some(TokenTree::Ident(ident)) = tokens.get(at) {
+                        path.push(ident.to_string());
+                        let colons = matches!(
+                            (tokens.get(at + 1), tokens.get(at + 2)),
+                            (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+                                if a.as_char() == ':' && b.as_char() == ':'
+                        );
+                        if !colons || !matches!(tokens.get(at + 3), Some(TokenTree::Ident(_))) {
+                            break;
+                        }
+                        at += 3;
+                    }
+                    if !method {
+                        let keyed = match tokens.get(at + 1) {
+                            Some(TokenTree::Group(g))
+                                if g.delimiter() == Delimiter::Parenthesis =>
+                            {
+                                self.leads_with_param(g.stream())
+                            }
+                            _ => !self.params.is_empty(),
+                        };
+                        self.path(&path, keyed);
+                    }
+                }
+            }
+            at += 1;
+        }
+    }
+
+    /// Whether a call's tokens start with one of the item's parameters
+    /// (`name`, `&name`, a `macro_rules!`'s `$name`).
+    fn leads_with_param(&self, tokens: TokenStream) -> bool {
+        let mut tokens = tokens
+            .into_iter()
+            .skip_while(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == '&'));
+        match tokens.next() {
+            Some(TokenTree::Punct(p)) if p.as_char() == '$' => true,
+            Some(TokenTree::Ident(ident)) => self.params.contains(&ident.to_string()),
+            _ => false,
+        }
+    }
+
+    /// Whether an expression carries one of the item's parameters.
+    fn mentions_param(&self, expr: &syn::Expr) -> bool {
+        struct Mentions<'p>(&'p BTreeSet<String>, bool);
+        impl<'ast> Visit<'ast> for Mentions<'_> {
+            fn visit_expr_path(&mut self, i: &'ast syn::ExprPath) {
+                self.1 |= i
+                    .path
+                    .get_ident()
+                    .is_some_and(|p| self.0.contains(&p.to_string()));
+            }
+        }
+        let mut mentions = Mentions(self.params, false);
+        mentions.visit_expr(expr);
+        mentions.1
+    }
+}
+
+impl<'ast> Visit<'ast> for Body<'_> {
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {
+        // A doc comment is not code, and a `cfg` is read where it gates.
+    }
+    fn visit_expr_path(&mut self, i: &'ast syn::ExprPath) {
+        self.path(&segments(&i.path), !self.params.is_empty());
+    }
+    fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
+        if !compiled(&i.attrs, self.build) {
+            return;
+        }
+        match &*i.func {
+            syn::Expr::Path(func) => {
+                // A walk of the whole environment takes no key: it counts as
+                // keyed in an item that takes any.
+                let keyed = match i.args.first() {
+                    Some(first) => self.mentions_param(first),
+                    None => !self.params.is_empty(),
+                };
+                self.path(&segments(&func.path), keyed);
+            }
+            func => self.visit_expr(func),
+        }
+        for arg in &i.args {
+            self.visit_expr(arg);
+        }
+    }
+    fn visit_macro(&mut self, i: &'ast syn::Macro) {
+        if segments(&i.path)
+            .last()
+            .is_some_and(|m| self.known.helpers.contains(m))
+        {
+            self.reads = true;
+            self.keyed |= self.leads_with_param(i.tokens.clone());
+        }
+        self.tokens(i.tokens.clone());
+    }
+    fn visit_lit(&mut self, i: &'ast syn::Lit) {
+        self.literal(i);
     }
     fn visit_local(&mut self, i: &'ast syn::Local) {
-        if compiled(&i.attrs) {
+        if compiled(&i.attrs, self.build) {
             visit::visit_local(self, i);
         }
     }
     fn visit_expr_block(&mut self, i: &'ast syn::ExprBlock) {
-        if compiled(&i.attrs) {
+        if compiled(&i.attrs, self.build) {
             visit::visit_expr_block(self, i);
         }
     }
     fn visit_stmt_macro(&mut self, i: &'ast syn::StmtMacro) {
-        if compiled(&i.attrs) {
+        if compiled(&i.attrs, self.build) {
             visit::visit_stmt_macro(self, i);
         }
     }
-    fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
-        if compiled(&i.attrs) {
-            visit::visit_expr_call(self, i);
-        }
-    }
     fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
-        if compiled(&i.attrs) {
+        if compiled(&i.attrs, self.build) {
             visit::visit_expr_method_call(self, i);
         }
     }
     fn visit_arm(&mut self, i: &'ast syn::Arm) {
-        if compiled(&i.attrs) {
+        if compiled(&i.attrs, self.build) {
             visit::visit_arm(self, i);
         }
     }
@@ -206,93 +561,249 @@ impl<'ast> Visit<'ast> for Body {
             syn::Item::Impl(m) => &m.attrs,
             _ => return visit::visit_item(self, i),
         };
-        if compiled(attrs) {
+        if compiled(attrs, self.build) {
             visit::visit_item(self, i);
         }
     }
 }
 
-/// One function, constant or static that reads a variable and names one of
-/// [`FOLDER_VARIABLES`]: `(function, names)`.
+/// One item of a file, as a build compiles it.
+struct Item {
+    name: String,
+    /// A function or `macro_rules!` that takes arguments.
+    takes: bool,
+    /// A `const` or `static`.
+    holds: bool,
+    reads: bool,
+    keyed: bool,
+    names: BTreeSet<String>,
+    lookups: BTreeSet<String>,
+}
+
+/// Every compiled function, `const`, `static` and macro item of a file.
+struct Items<'a> {
+    build: Build,
+    imports: &'a Imports,
+    known: &'a Known,
+    found: Vec<Item>,
+}
+
+impl Items<'_> {
+    fn item(
+        &mut self,
+        name: String,
+        params: BTreeSet<String>,
+        holds: bool,
+        visit_body: impl FnOnce(&mut Body),
+    ) {
+        let takes = !params.is_empty();
+        let mut body = Body {
+            build: self.build,
+            imports: self.imports,
+            known: self.known,
+            params: &params,
+            reads: false,
+            keyed: false,
+            names: BTreeSet::new(),
+            lookups: BTreeSet::new(),
+        };
+        visit_body(&mut body);
+        self.found.push(Item {
+            name,
+            takes,
+            holds,
+            reads: body.reads,
+            keyed: body.keyed,
+            names: body.names,
+            lookups: body.lookups,
+        });
+    }
+}
+
+/// The names a function's parameters bind (`self` is not one).
+fn params(sig: &syn::Signature) -> BTreeSet<String> {
+    struct Names(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Names {
+        fn visit_pat_ident(&mut self, i: &'ast syn::PatIdent) {
+            self.0.insert(i.ident.to_string());
+            visit::visit_pat_ident(self, i);
+        }
+    }
+    let mut names = Names(BTreeSet::new());
+    for arg in &sig.inputs {
+        if let syn::FnArg::Typed(typed) = arg {
+            names.visit_pat(&typed.pat);
+        }
+    }
+    names.0
+}
+
+impl<'ast> Visit<'ast> for Items<'_> {
+    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+        if compiled(&i.attrs, self.build) {
+            self.item(i.sig.ident.to_string(), params(&i.sig), false, |b| {
+                b.visit_block(&i.block)
+            });
+        }
+    }
+    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+        if compiled(&i.attrs, self.build) {
+            self.item(i.sig.ident.to_string(), params(&i.sig), false, |b| {
+                b.visit_block(&i.block)
+            });
+        }
+    }
+    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+        if compiled(&i.attrs, self.build)
+            && let Some(block) = &i.default
+        {
+            self.item(i.sig.ident.to_string(), params(&i.sig), false, |b| {
+                b.visit_block(block)
+            });
+        }
+    }
+    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
+        if compiled(&i.attrs, self.build) {
+            self.item(i.ident.to_string(), BTreeSet::new(), true, |b| {
+                b.visit_expr(&i.expr)
+            });
+        }
+    }
+    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
+        if compiled(&i.attrs, self.build) {
+            self.item(i.ident.to_string(), BTreeSet::new(), true, |b| {
+                b.visit_expr(&i.expr)
+            });
+        }
+    }
+    fn visit_impl_item_const(&mut self, i: &'ast syn::ImplItemConst) {
+        if compiled(&i.attrs, self.build) {
+            self.item(i.ident.to_string(), BTreeSet::new(), true, |b| {
+                b.visit_expr(&i.expr)
+            });
+        }
+    }
+    fn visit_item_macro(&mut self, i: &'ast syn::ItemMacro) {
+        // `macro_rules! name`, or a macro at item level (`thread_local!`).
+        if compiled(&i.attrs, self.build) {
+            let rules = i.mac.path.is_ident("macro_rules");
+            let name = match &i.ident {
+                Some(ident) if rules => ident.to_string(),
+                _ => format!("{}!", segments(&i.mac.path).join("::")),
+            };
+            // A `macro_rules!` takes its `$name`s, which no identifier equals.
+            let params = BTreeSet::from_iter(rules.then(|| "$".to_owned()));
+            self.item(name, params, false, |b| b.tokens(i.mac.tokens.clone()));
+        }
+    }
+    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+        if compiled(&i.attrs, self.build) {
+            visit::visit_item_mod(self, i);
+        }
+    }
+    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+        if compiled(&i.attrs, self.build) {
+            visit::visit_item_impl(self, i);
+        }
+    }
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        if compiled(&i.attrs, self.build) {
+            visit::visit_item_trait(self, i);
+        }
+    }
+}
+
+/// One function, `const`, `static` or macro item the gate flags, with the
+/// folder variables it names (on Windows) or the lookups it makes (on macOS
+/// and Linux).
 #[derive(Debug, PartialEq, Eq)]
 struct Read {
     function: String,
     names: Vec<String>,
 }
 
-/// Every compiled function of a file, by name.
-struct Functions {
-    found: Vec<Read>,
+/// Every item of `files` outside [`READER`] that `build` flags:
+/// `(file, read)`. A helper or a name-holding `const` in one file counts in
+/// every other.
+fn flagged(files: &[(String, &syn::File)], build: Build) -> Vec<(String, Read)> {
+    let files: Vec<(&String, &syn::File, Imports)> = files
+        .iter()
+        .filter(|(_, file)| compiled(&file.attrs, build))
+        .map(|(name, file)| (name, *file, Imports::of(file)))
+        .collect();
+    let mut known = Known::default();
+    let items = loop {
+        let items: Vec<Vec<Item>> = files
+            .iter()
+            .map(|(_, file, imports)| {
+                let mut items = Items {
+                    build,
+                    imports,
+                    known: &known,
+                    found: Vec::new(),
+                };
+                items.visit_file(file);
+                items.found
+            })
+            .collect();
+        let mut next = Known::default();
+        for item in items.iter().flatten() {
+            if item.takes && item.keyed {
+                next.helpers.insert(item.name.clone());
+            }
+            if item.holds && !item.reads && !item.names.is_empty() {
+                next.names
+                    .entry(item.name.clone())
+                    .or_default()
+                    .extend(item.names.iter().cloned());
+            }
+        }
+        if next == known {
+            break items;
+        }
+        known = next;
+    };
+    let mut found = Vec::new();
+    for ((file, _, _), items) in files.iter().zip(items) {
+        if file.as_str() == READER {
+            continue;
+        }
+        for item in items {
+            let names = match build {
+                Build::Windows if item.reads => item.names,
+                Build::Windows => BTreeSet::new(),
+                Build::Linux | Build::Macos => item.lookups,
+            };
+            if !names.is_empty() {
+                found.push((
+                    (*file).clone(),
+                    Read {
+                        function: item.name,
+                        names: names.into_iter().collect(),
+                    },
+                ));
+            }
+        }
+    }
+    found
 }
 
-impl Functions {
-    fn body(&mut self, name: String, visit_body: impl FnOnce(&mut Body)) {
-        let mut body = Body::default();
-        visit_body(&mut body);
-        if body.reads && !body.names.is_empty() {
-            body.names.sort();
-            body.names.dedup();
-            self.found.push(Read {
-                function: name,
-                names: body.names,
-            });
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for Functions {
-    fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-        if compiled(&i.attrs) {
-            self.body(i.sig.ident.to_string(), |b| b.visit_block(&i.block));
-        }
-    }
-    fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-        if compiled(&i.attrs) {
-            self.body(i.sig.ident.to_string(), |b| b.visit_block(&i.block));
-        }
-    }
-    fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
-        if compiled(&i.attrs)
-            && let Some(block) = &i.default
-        {
-            self.body(i.sig.ident.to_string(), |b| b.visit_block(block));
-        }
-    }
-    fn visit_item_const(&mut self, i: &'ast syn::ItemConst) {
-        if compiled(&i.attrs) {
-            self.body(i.ident.to_string(), |b| b.visit_expr(&i.expr));
-        }
-    }
-    fn visit_item_static(&mut self, i: &'ast syn::ItemStatic) {
-        if compiled(&i.attrs) {
-            self.body(i.ident.to_string(), |b| b.visit_expr(&i.expr));
-        }
-    }
-    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
-        if compiled(&i.attrs) {
-            visit::visit_item_mod(self, i);
-        }
-    }
-    fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-        if compiled(&i.attrs) {
-            visit::visit_item_impl(self, i);
-        }
-    }
-    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
-        if compiled(&i.attrs) {
-            visit::visit_item_trait(self, i);
-        }
-    }
-}
-
+/// Every item of one source that any build flags.
 fn reads_in(file: &str, source: &str) -> Vec<Read> {
     let parsed = syn::parse_file(source).unwrap_or_else(|e| panic!("{file}: {e}"));
-    if !compiled(&parsed.attrs) {
-        return Vec::new();
+    let mut reads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for build in BUILDS {
+        for (_, read) in flagged(&[(file.to_owned(), &parsed)], build) {
+            reads.entry(read.function).or_default().extend(read.names);
+        }
     }
-    let mut functions = Functions { found: Vec::new() };
-    functions.visit_file(&parsed);
-    functions.found
+    reads
+        .into_iter()
+        .map(|(function, names)| Read {
+            function,
+            names: names.into_iter().collect(),
+        })
+        .collect()
 }
 
 fn repo_root() -> PathBuf {
@@ -303,63 +814,131 @@ fn repo_root() -> PathBuf {
         .expect("the repository root")
 }
 
-/// Every `.rs` file under `dir`, as `(path from the root with /, source)`.
-fn sources_in(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|e| e.unwrap().path())
-        .collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            sources_in(root, &path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            let name = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let source = std::fs::read_to_string(&path).unwrap();
-            out.push((name, source));
+/// Source files, each parsed once.
+#[derive(Default)]
+struct Sources(BTreeMap<PathBuf, syn::File>);
+
+impl Sources {
+    /// `file` and every file of a `mod` that `build` keeps below it; `dir`
+    /// is the folder that `file`'s own `mod`s live in.
+    fn walk(&mut self, file: &Path, dir: &Path, build: Build, out: &mut BTreeSet<PathBuf>) {
+        let parsed = self.0.entry(file.to_path_buf()).or_insert_with(|| {
+            let source =
+                std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            syn::parse_file(&source).unwrap_or_else(|e| panic!("{}: {e}", file.display()))
+        });
+        if !compiled(&parsed.attrs, build) || !out.insert(file.to_path_buf()) {
+            return;
+        }
+        let mut children = Vec::new();
+        mods(&parsed.items, dir, build, &mut children);
+        for (child, child_dir) in children {
+            self.walk(&child, &child_dir, build, out);
         }
     }
+}
+
+/// The file of every `mod name;` among `items` that `build` keeps, with the
+/// folder its own `mod`s live in.
+fn mods(items: &[syn::Item], dir: &Path, build: Build, out: &mut Vec<(PathBuf, PathBuf)>) {
+    for item in items {
+        let syn::Item::Mod(m) = item else { continue };
+        if !compiled(&m.attrs, build) {
+            continue;
+        }
+        let name = m.ident.to_string();
+        assert!(
+            !m.attrs.iter().any(|a| a.path().is_ident("path")),
+            "mod {name} in {}: the gate does not follow #[path]",
+            dir.display()
+        );
+        let sub = dir.join(&name);
+        match &m.content {
+            Some((_, items)) => mods(items, &sub, build, out),
+            None => {
+                let file = [dir.join(format!("{name}.rs")), sub.join("mod.rs")]
+                    .into_iter()
+                    .find(|f| f.is_file())
+                    .unwrap_or_else(|| panic!("mod {name}: no file in {}", dir.display()));
+                out.push((file, sub));
+            }
+        }
+    }
+}
+
+/// The files the gate reads in `build`, from the root of every package it
+/// scans: `(path from the repository root with /, file)`.
+fn files<'s>(
+    sources: &'s mut Sources,
+    root: &Path,
+    graph: &Graph,
+    build: Build,
+) -> Vec<(String, &'s syn::File)> {
+    let mut paths = BTreeSet::new();
+    for package in scanned(graph) {
+        let member = &graph.members[&package];
+        // A dependency links its library; the daemon is its binary too.
+        let bins = if package == ROOT {
+            &member.bin[..]
+        } else {
+            &[]
+        };
+        for start in member.lib.iter().chain(bins) {
+            let dir = start.parent().expect("a crate root's folder");
+            sources.walk(start, dir, build, &mut paths);
+        }
+    }
+    let sources: &'s Sources = sources;
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or_else(|_| panic!("{} is outside the repository", path.display()))
+                .to_string_lossy()
+                .replace('\\', "/");
+            (name, &sources.0[&path])
+        })
+        .collect()
 }
 
 #[test]
 fn only_appdirs_reads_a_folder_variable() {
     let root = repo_root();
-    let mut sources = Vec::new();
-    for folder in FOLDERS {
-        sources_in(&root, &root.join(folder), &mut sources);
-    }
-    assert!(
-        sources.iter().any(|(f, _)| f == READER),
-        "the scan reaches {READER}"
-    );
+    let graph = Graph::read(&root);
+    let mut sources = Sources::default();
     let mut unknown = Vec::new();
-    let mut seen = Vec::new();
-    for (file, source) in sources.iter().filter(|(f, _)| f != READER) {
-        for read in reads_in(file, source) {
+    let mut seen = BTreeSet::new();
+    for build in BUILDS {
+        let files = files(&mut sources, &root, &graph, build);
+        assert!(
+            files.iter().any(|(f, _)| f == READER),
+            "the {build:?} scan reaches {READER}"
+        );
+        for (file, read) in flagged(&files, build) {
             if KNOWN
                 .iter()
-                .any(|(f, function, _)| f == file && *function == read.function)
+                .any(|(f, function, _)| *f == file && *function == read.function)
             {
-                seen.push((file.clone(), read.function));
+                seen.insert((file, read.function));
             } else {
-                unknown.push(format!("{file}: {} names {:?}", read.function, read.names));
+                unknown.push(format!(
+                    "{build:?}: {file}: {} names {:?}",
+                    read.function, read.names
+                ));
             }
         }
     }
     assert!(
         unknown.is_empty(),
-        "a folder variable read outside appdirs; take the folder from \
-         `appdirs` (the machine's from the system, the service account's \
-         profile from the profile list), or list the read in KNOWN with why:\n{}",
+        "a folder read outside appdirs; take the folder from `appdirs` (the machine's \
+         from the system, the service account's profile from the profile list), or list \
+         the read in KNOWN with why:\n{}",
         unknown.join("\n")
     );
     for (file, function, _) in KNOWN {
         assert!(
-            seen.iter().any(|(f, n)| f == file && n == function),
+            seen.contains(&(file.to_string(), function.to_string())),
             "a stale KNOWN row: {file} {function}"
         );
     }
@@ -599,6 +1178,9 @@ impl Graph {
             let mut member = Member::default();
             for target in package["targets"].as_array().expect("targets") {
                 let src = PathBuf::from(target["src_path"].as_str().expect("src_path"));
+                // The form `repo_root` has (`\\?\C:\…` on Windows), so that a
+                // file's name is its path from the root.
+                let src = src.canonicalize().unwrap_or(src);
                 let kind = |k: &str| {
                     target["kind"]
                         .as_array()
@@ -682,18 +1264,14 @@ impl Graph {
     }
 }
 
-/// The packages the gate scans.
-fn scanned(graph: &Graph, root: &Path) -> BTreeSet<String> {
+/// The packages the gate scans: every workspace member [`ROOT`] links, but
+/// a [`NOT_SCANNED`] row.
+fn scanned(graph: &Graph) -> BTreeSet<String> {
     graph
-        .members
+        .linked
         .iter()
-        .filter(|(_, m)| {
-            m.lib.iter().chain(&m.bin).any(|src| {
-                let src = src.canonicalize().unwrap_or_else(|_| src.clone());
-                FOLDERS.iter().any(|f| src.starts_with(root.join(f)))
-            })
-        })
-        .map(|(name, _)| name.clone())
+        .filter(|p| graph.members.contains_key(*p) && !NOT_SCANNED.iter().any(|(n, _)| n == p))
+        .cloned()
         .collect()
 }
 
@@ -701,7 +1279,7 @@ fn scanned(graph: &Graph, root: &Path) -> BTreeSet<String> {
 fn the_scan_is_what_roomlerd_links() {
     let root = repo_root();
     let graph = Graph::read(&root);
-    let scanned = scanned(&graph, &root);
+    let scanned = scanned(&graph);
     let unscanned: Vec<&String> = graph
         .linked
         .iter()
@@ -716,12 +1294,6 @@ fn the_scan_is_what_roomlerd_links() {
         assert!(
             graph.linked.contains(*package),
             "a stale NOT_SCANNED row: {package}"
-        );
-    }
-    for package in &scanned {
-        assert!(
-            graph.linked.contains(package),
-            "the gate scans {package}, which {ROOT} does not link"
         );
     }
 }
