@@ -810,7 +810,13 @@ impl RunAs {
 /// than growing a second identity model for interactive sessions. Every
 /// refusal here — `console_user` with nobody at the screen, `named` on
 /// Windows — is a refusal there too, in the same words.
-pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), String> {
+///
+/// #3822 — `async`, so `console_user` asks who is at the screen
+/// ([`console_account`]) from the caller's task, at the same point as before.
+pub(crate) async fn apply_run_as(
+    cmd: &mut tokio::process::Command,
+    who: &RunAs,
+) -> Result<(), String> {
     // Only the Unix drop path configures the command. On Windows every
     // non-daemon mode is currently a refusal, so nothing is set — which is the
     // point: refusing configures nothing and spawns nothing.
@@ -862,7 +868,7 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// was, `/`, which is sshd's fallback too. Off with
 /// `ROOMLERD_SSH_START_IN_HOME=0`. Windows' `console_user` starts in the
 /// profile through its own spawn (`win_console`, `pty::windows`).
-pub(crate) fn apply_run_as_at_home(
+pub(crate) async fn apply_run_as_at_home(
     cmd: &mut tokio::process::Command,
     who: &RunAs,
 ) -> Result<(), String> {
@@ -874,7 +880,7 @@ pub(crate) fn apply_run_as_at_home(
             RunAs::ConsoleUser => unix_priv::drop_to_console(cmd, &console_account()?, true),
         };
     }
-    apply_run_as(cmd, who)
+    apply_run_as(cmd, who).await
 }
 
 /// FR-97 P5b — does a person's SSH session start in their home? Default on;
@@ -891,6 +897,16 @@ pub(crate) fn ssh_starts_in_home() -> bool {
 /// nobody is there.
 #[cfg(unix)]
 fn console_account() -> Result<String, String> {
+    // #3822 — a test's seat0 lookup, asked where this asks logind.
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(stood) = console_stand_in::now() {
+        return stood.ask_here().map_err(|e| {
+            format!(
+                "account_mode `console_user` runs as the person at this machine's screen, and \
+                 cannot here: {e}"
+            )
+        });
+    }
     #[cfg(target_os = "macos")]
     let who = crate::companion::console_user_name();
     #[cfg(not(target_os = "macos"))]
@@ -901,6 +917,55 @@ fn console_account() -> Result<String, String> {
              here: {e:#}"
         )
     })
+}
+
+/// #3822 — the seat0 lookup stood in for `console_user`, for the tasks of one
+/// test: what logind and the account database answer, asked where the daemon
+/// asks its own. A task-local, so the tests beside it, and the daemon's own
+/// lookup, are never stood in.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod console_stand_in {
+    use crate::files::Seat;
+    use std::sync::Arc;
+
+    /// A seat0 lookup stood in.
+    #[derive(Clone)]
+    pub(crate) struct StandIn {
+        lookup: Arc<dyn Fn() -> Seat + Send + Sync>,
+    }
+
+    impl StandIn {
+        pub(crate) fn new(lookup: impl Fn() -> Seat + Send + Sync + 'static) -> Self {
+            Self {
+                lookup: Arc::new(lookup),
+            }
+        }
+
+        /// The lookup, asked on this thread, as `console_account` asks
+        /// `companion::seat0_user`: the name that would answer, or why not.
+        pub(super) fn ask_here(&self) -> Result<String, String> {
+            match (self.lookup)() {
+                Seat::Person { account, .. } => Ok(account.name),
+                Seat::Root => Ok("root".into()),
+                Seat::Nobody(why) | Seat::CannotTell(why) => Err(why),
+                Seat::OutOfTime(wait) => Err(format!("no answer within {wait:?}")),
+            }
+        }
+    }
+
+    tokio::task_local! {
+        static STOOD: StandIn;
+    }
+
+    /// `run`, its `console_user` lookups asking `stood`.
+    pub(crate) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
+        STOOD.scope(stood, run).await
+    }
+
+    /// The lookup stood in for this task, if there is one.
+    pub(super) fn now() -> Option<StandIn> {
+        STOOD.try_with(StandIn::clone).ok()
+    }
 }
 
 /// FR-97 P3d — a received file lands under the person's home: the lookup that
@@ -1796,9 +1861,9 @@ impl ExecEngine {
         // FR-97 P5b — an SSH session with no directory of its own starts in
         // the person's home, as sshd starts it.
         let applied = if req.start_in_home && req.cwd.is_none() {
-            apply_run_as_at_home(&mut cmd, &req.run_as)
+            apply_run_as_at_home(&mut cmd, &req.run_as).await
         } else {
-            apply_run_as(&mut cmd, &req.run_as)
+            apply_run_as(&mut cmd, &req.run_as).await
         };
         if let Err(e) = applied {
             warn!(
@@ -4196,5 +4261,535 @@ pub(crate) mod session_lifetime {
             .await
             .expect("the run ends once its client is gone")
             .unwrap();
+    }
+}
+
+/// #3822 — `console_user` on a Linux install while who is at seat0 cannot be
+/// had in time: logind stopped, or the account database stalled. The lookup
+/// is stood in for each test's own tasks (`console_stand_in`); everything
+/// above it is the daemon's, along the four ways a command or a session takes
+/// the person's account: Fleet RPC's exec, SSH's exec, SSH's shell and SFTP.
+/// Each probe runs as a task on a two-worker runtime like the daemon's and is
+/// waited for from the test's own thread, so a probe that holds a worker
+/// cannot also hold up its verdict (#3836's shape). As root (CI's sudo step)
+/// the person is `nobody`, whom a system install drops to; as anyone else, the
+/// account running the tests, which a per-user daemon whose own account is at
+/// the screen runs as itself.
+#[cfg(all(test, target_os = "linux"))]
+mod console_lookup_tests {
+    use super::console_stand_in::{StandIn, asking};
+    use super::*;
+    use crate::files::{SEAT_LOOKUP_WAIT, Seat};
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, Mutex as StdMutex, PoisonError};
+    use std::time::{Duration, Instant};
+    use tunnel_core::localapi::CANNOT_TELL_WHO_IS_AT_THE_SCREEN;
+
+    /// What a refusal may take past the lookup's own wait on a busy runner.
+    const SLACK: Duration = Duration::from_secs(1);
+    /// What a command that runs may take on a busy runner.
+    const RUNS_WITHIN: Duration = Duration::from_secs(10);
+    /// How late "on time" may be on a busy runner: #3836's bar.
+    const AT_ONCE: Duration = Duration::from_millis(500);
+
+    /// Lookups, counted as they begin, each held until the gate opens, as a
+    /// stopped logind holds `loginctl`. One let go finds nobody at the screen,
+    /// so nothing a test leaves behind ever runs a command.
+    #[derive(Clone, Default)]
+    struct Held(Arc<HeldState>);
+
+    #[derive(Default)]
+    struct HeldState {
+        open: StdMutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Held {
+        /// Every lookup held.
+        fn lookup(&self) -> StandIn {
+            self.after(0, Seat::Nobody(String::new()))
+        }
+
+        /// The first `quick` lookups answer `first` at once; every later one
+        /// is held.
+        fn after(&self, quick: usize, first: Seat) -> StandIn {
+            let held = self.clone();
+            StandIn::new(move || {
+                let n = held
+                    .0
+                    .began
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < quick {
+                    return first.clone();
+                }
+                let open = held.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(
+                    held.0
+                        .opened
+                        .wait_while(open, |open| !*open)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+                Seat::Nobody("the held lookup was let go".into())
+            })
+        }
+
+        fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        fn began(&self) -> usize {
+            self.0.began.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held,
+    /// and the runtime declared before it can shut down.
+    struct OpenedAtTheEnd(Held);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// A runtime like the daemon's: more than one worker, timers and I/O.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// `probe`, run as a task on `rt` whose `console_user` lookups ask
+    /// `stood`: its answer and how long it took, waited for `bound` at most
+    /// from THIS thread.
+    fn on_a_worker<T: Send + 'static>(
+        rt: &tokio::runtime::Runtime,
+        stood: &StandIn,
+        bound: Duration,
+        probe: impl Future<Output = T> + Send + 'static,
+    ) -> Result<(T, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(asking(stood.clone(), async move {
+            let answer = probe.await;
+            let _ = tx.send((answer, asked.elapsed()));
+        }));
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("no answer within {bound:?}"))
+    }
+
+    /// How a command or a session takes `console_user`'s account.
+    #[derive(Debug, Clone, Copy)]
+    enum Way {
+        /// `rc:rpc.exec`: `ExecEngine::run`.
+        FleetRpcExec,
+        /// SSH's exec channel: `ExecEngine::run_streamed`, in the person's
+        /// home.
+        SshExec,
+        /// SSH's shell: `pty::PtyProcess::spawn`.
+        #[cfg(feature = "ssh-server")]
+        SshShell,
+        /// SFTP: the account applied to the program it starts
+        /// (`apply_run_as_at_home`, as `ssh.rs` applies it to `sftp-server`).
+        Sftp,
+    }
+
+    /// Every way this build has: SSH's shell is `ssh-server`'s.
+    #[cfg(feature = "ssh-server")]
+    const WAYS: &[Way] = &[Way::FleetRpcExec, Way::SshExec, Way::SshShell, Way::Sftp];
+    #[cfg(not(feature = "ssh-server"))]
+    const WAYS: &[Way] = &[Way::FleetRpcExec, Way::SshExec, Way::Sftp];
+
+    /// A command asking for `console_user`, as Fleet RPC's frame (`ssh`
+    /// false) or SSH's exec channel (`ssh` true) hands it over.
+    fn as_the_person_req(command: &str, ssh: bool) -> ExecRequest {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        ExecRequest {
+            request_id: format!(
+                "i3822-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ),
+            shell: String::new(),
+            command: command.into(),
+            timeout_ms: 30_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: RunAs::ConsoleUser,
+            start_in_home: ssh,
+            session_owned: ssh,
+        }
+    }
+
+    /// `command` asked of `way` as `console_user`: what it printed if it
+    /// ran, or why it was refused. A refusal starts nothing.
+    async fn as_the_person(way: Way, command: String) -> Result<String, String> {
+        match way {
+            Way::FleetRpcExec => {
+                let outcome = ExecEngine::new()
+                    .run(as_the_person_req(&command, false), &Redactor::default())
+                    .await;
+                match (outcome.exit_code, outcome.error) {
+                    (None, Some(refused)) => Err(refused),
+                    _ => Ok(outcome.stdout),
+                }
+            }
+            Way::SshExec => {
+                let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(64);
+                let outcome = ExecEngine::new()
+                    .run_streamed(
+                        as_the_person_req(&command, true),
+                        &Redactor::default(),
+                        None,
+                        sink,
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                let mut printed = Vec::new();
+                while let Ok(chunk) = chunks.try_recv() {
+                    if chunk.stream == OutStream::Stdout {
+                        printed.extend_from_slice(&chunk.bytes);
+                    }
+                }
+                match (outcome.exit_code, outcome.error) {
+                    (None, Some(refused)) => Err(refused),
+                    _ => Ok(String::from_utf8_lossy(&printed).into_owned()),
+                }
+            }
+            #[cfg(feature = "ssh-server")]
+            Way::SshShell => {
+                let mut shell = crate::pty::PtyProcess::spawn(
+                    Some(command.as_str()),
+                    "xterm",
+                    crate::pty::WinSize { cols: 80, rows: 24 },
+                    &RunAs::ConsoleUser,
+                )
+                .await?;
+                let mut printed = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match shell.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => printed.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = shell.wait().await;
+                Ok(String::from_utf8_lossy(&printed).into_owned())
+            }
+            Way::Sftp => {
+                let mut program = tokio::process::Command::new("/bin/sh");
+                program
+                    .arg("-c")
+                    .arg(command)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                apply_run_as_at_home(&mut program, &RunAs::ConsoleUser).await?;
+                let ran = program
+                    .output()
+                    .await
+                    .map_err(|e| format!("starting the stand-in for sftp-server: {e}"))?;
+                Ok(String::from_utf8_lossy(&ran.stdout).into_owned())
+            }
+        }
+    }
+
+    /// The person at the screen these tests stand in.
+    struct Person {
+        name: String,
+        uid: u32,
+        seat: Seat,
+    }
+
+    /// As root (CI's sudo step), `nobody`, whom a system install drops to. As
+    /// anyone else, the account running the tests, which a per-user daemon
+    /// whose own account is at the screen runs as itself.
+    fn the_person() -> Person {
+        // SAFETY: reads this process's own credentials.
+        let root = unsafe { libc::geteuid() } == 0;
+        if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+            panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+        }
+        let name = if root {
+            "nobody".to_string()
+        } else {
+            let me = std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .expect("id -un");
+            String::from_utf8_lossy(&me.stdout).trim().to_string()
+        };
+        let account = crate::fs_identity::Account::by_name(&name).expect("the person's account");
+        let home = account_home(&name).expect("the person's home");
+        Person {
+            name,
+            uid: account.uid,
+            seat: Seat::Person { account, home },
+        }
+    }
+
+    /// A folder anyone may write in, where a command that ran leaves a mark.
+    struct Marks(tempfile::TempDir);
+
+    impl Marks {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("a temp dir");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+                .expect("a folder anyone may write in");
+            Self(dir)
+        }
+
+        fn of(&self, way: Way) -> std::path::PathBuf {
+            self.0.path().join(format!("{way:?}"))
+        }
+
+        /// What `way` is asked to run: who it runs as, then its mark.
+        fn command(&self, way: Way) -> String {
+            format!("id -un; : > '{}'", self.of(way).display())
+        }
+
+        /// Who left `way`'s mark, if anyone did.
+        fn left_by(&self, way: Way) -> Option<u32> {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(self.of(way)).ok().map(|m| m.uid())
+        }
+    }
+
+    /// #3822 — with the seat0 lookup held up (a stopped logind), every way a
+    /// command or a session takes `console_user` is refused within the
+    /// lookup's own wait (`files::SEAT_LOOKUP_WAIT`) with the try-again text,
+    /// and runs nothing: not as root, not as the daemon, not as anyone. The
+    /// hang holds one lookup, however many ask.
+    ///
+    /// Red before #3822: the lookup ran on the worker that asked, for as long
+    /// as logind did not answer.
+    #[test]
+    fn a_held_seat0_lookup_refuses_every_way_within_its_wait_and_says_try_again() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = held.lookup();
+        let marks = Marks::new();
+        for &way in WAYS {
+            let (took, waited) = on_a_worker(
+                &rt,
+                &stood,
+                SEAT_LOOKUP_WAIT + SLACK,
+                as_the_person(way, marks.command(way)),
+            )
+            .unwrap_or_else(|e| panic!("{way:?}: {e}"));
+            let refused = match took {
+                Err(refused) => refused,
+                Ok(printed) => panic!("{way:?} ran while the lookup was held: {printed:?}"),
+            };
+            assert!(
+                waited >= SEAT_LOOKUP_WAIT,
+                "{way:?} was refused in {waited:?}, before its wait"
+            );
+            assert!(
+                refused.contains("account_mode `console_user`"),
+                "{way:?}: the refusal names the mode: {refused:?}"
+            );
+            assert!(
+                refused.contains(CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+                "{way:?}: the refusal says to try again: {refused:?}"
+            );
+            assert_eq!(marks.left_by(way), None, "{way:?} ran something");
+        }
+        assert_eq!(held.began(), 1, "one lookup in flight, however many asked");
+    }
+
+    /// #3822 — a held seat0 lookup holds no async worker. On a two-worker
+    /// runtime, tasks asking every way for `console_user` again and again
+    /// while the lookup hangs leave a 10 ms timer waking on time (the runtime
+    /// canary's own measure, `runtime_canary.rs`), and the hang holds one
+    /// lookup, however many ask.
+    ///
+    /// Red before #3822: each asker ran the lookup on its own worker, and two
+    /// of them held both.
+    #[test]
+    fn a_held_seat0_lookup_delays_no_timer() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = held.lookup();
+        // Two askers a way: more than the runtime has workers.
+        for &way in WAYS {
+            for _ in 0..2 {
+                rt.spawn(asking(stood.clone(), async move {
+                    for _ in 0..1_000 {
+                        let _ = as_the_person(way, "true".to_string()).await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }));
+            }
+        }
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(asked.elapsed() < RUNS_WITHIN, "no asker reached the lookup");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let tick = Duration::from_millis(10);
+        let late = on_a_worker(&rt, &stood, RUNS_WITHIN, async move {
+            let mut worst = Duration::ZERO;
+            for _ in 0..100 {
+                let asked = tokio::time::Instant::now();
+                tokio::time::sleep(tick).await;
+                worst = worst.max(asked.elapsed().saturating_sub(tick));
+            }
+            worst
+        });
+        let began = held.began();
+        let (worst, _) = late.expect("a 10 ms timer kept waking while the seat0 lookup hung");
+        assert!(
+            worst < AT_ONCE,
+            "a 10 ms timer woke {worst:?} late while the seat0 lookup hung"
+        );
+        assert_eq!(began, 1, "one lookup in flight, however many asked");
+    }
+
+    /// The control: a seat0 lookup that answers in time gives the person, and
+    /// every way runs as them, as before #3822. As root (CI's sudo step) it
+    /// drops to them (`nobody`); as anyone else it runs as itself, the
+    /// per-user daemon whose own account is at the screen.
+    #[test]
+    fn a_seat0_lookup_that_answers_in_time_runs_every_way_as_the_person() {
+        let rt = runtime();
+        let person = the_person();
+        let at_the_screen = person.seat.clone();
+        let stood = StandIn::new(move || at_the_screen.clone());
+        let marks = Marks::new();
+        for &way in WAYS {
+            let (took, _) = on_a_worker(
+                &rt,
+                &stood,
+                RUNS_WITHIN,
+                as_the_person(way, marks.command(way)),
+            )
+            .unwrap_or_else(|e| panic!("{way:?}: {e}"));
+            let printed = took.unwrap_or_else(|refused| panic!("{way:?} was refused: {refused}"));
+            assert!(
+                printed.lines().any(|line| line.trim() == person.name),
+                "{way:?} ran as someone other than {}: {printed:?}",
+                person.name
+            );
+            assert_eq!(
+                marks.left_by(way),
+                Some(person.uid),
+                "{way:?} left its mark as someone other than {}",
+                person.name
+            );
+        }
+    }
+
+    /// #3822 — only a person's answer is an account. Whatever else the seat0
+    /// lookup gives, every way refuses and nothing runs: not as root, not as
+    /// the daemon, not as the person a lookup found a moment before. No answer
+    /// in time, a lookup that panicked, and logind or the account database
+    /// failing say to try again; nobody and root at the screen say what they
+    /// are.
+    ///
+    /// Red before #3822: a held lookup held its worker, a lookup that panicked
+    /// took its caller down with it, and a failing one did not say to try
+    /// again.
+    #[test]
+    fn no_answer_but_a_person_runs_anything() {
+        let rt = runtime();
+        let person = the_person();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+
+        // The person was at the screen a moment ago: the first lookup finds
+        // them, and the way it served ran as them. Every later one is held.
+        let found_then_held = held.after(1, person.seat.clone());
+        let marks = Marks::new();
+        let first = WAYS[0];
+        let (took, _) = on_a_worker(
+            &rt,
+            &found_then_held,
+            RUNS_WITHIN,
+            as_the_person(first, marks.command(first)),
+        )
+        .unwrap_or_else(|e| panic!("{first:?}: {e}"));
+        assert!(
+            took.is_ok(),
+            "{first:?} with the person at the screen: {took:?}"
+        );
+        assert_eq!(marks.left_by(first), Some(person.uid));
+
+        let cases = [
+            ("held, after the person was found", found_then_held, true),
+            (
+                "a lookup that panicked",
+                StandIn::new(|| -> Seat { panic!("a seat0 lookup that panics") }),
+                true,
+            ),
+            (
+                "logind failed",
+                StandIn::new(|| {
+                    Seat::CannotTell(
+                        "loginctl show-seat seat0 failed: Failed to connect to bus: Connection \
+                         refused"
+                            .into(),
+                    )
+                }),
+                true,
+            ),
+            (
+                "the account database failed",
+                StandIn::new(|| {
+                    Seat::CannotTell(
+                        "looking up local account \"ana\" failed: Connection timed out (os \
+                         error 110)"
+                            .into(),
+                    )
+                }),
+                true,
+            ),
+            (
+                "nobody at the screen",
+                StandIn::new(|| {
+                    Seat::Nobody(
+                        "nobody is signed in at this machine's screen (seat0 has no active \
+                         session)"
+                            .into(),
+                    )
+                }),
+                false,
+            ),
+            ("root at the screen", StandIn::new(|| Seat::Root), false),
+        ];
+        for (what, stood, says_try_again) in cases {
+            let marks = Marks::new();
+            for &way in WAYS {
+                let (took, _) = on_a_worker(
+                    &rt,
+                    &stood,
+                    SEAT_LOOKUP_WAIT + SLACK,
+                    as_the_person(way, marks.command(way)),
+                )
+                .unwrap_or_else(|e| panic!("{what}, {way:?}: {e}"));
+                let refused = match took {
+                    Err(refused) => refused,
+                    Ok(printed) => panic!("{what}: {way:?} ran: {printed:?}"),
+                };
+                assert!(
+                    refused.contains("account_mode `console_user`"),
+                    "{what}, {way:?}: the refusal names the mode: {refused:?}"
+                );
+                assert_eq!(
+                    refused.contains(CANNOT_TELL_WHO_IS_AT_THE_SCREEN),
+                    says_try_again,
+                    "{what}, {way:?}: {refused:?}"
+                );
+                assert_eq!(marks.left_by(way), None, "{what}: {way:?} ran something");
+            }
+        }
     }
 }

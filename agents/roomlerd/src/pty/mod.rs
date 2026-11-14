@@ -21,6 +21,8 @@
 //! shape the SSH server needs, so both expose exactly:
 //!
 //! * [`PtyProcess::spawn`] — start a shell on a new terminal, as `run_as`
+//!   (`async` on Unix since #3822: `console_user` asks logind who is at the
+//!   screen from the caller's task; `ssh.rs` awaits it there alone)
 //! * [`PtyProcess::read`]  — one chunk of output; `Ok(0)` = session over
 //! * [`PtyProcess::wait`]  — the exit status, in SSH's unsigned form
 //! * [`PtyProcess::kill_group`] / `Drop` — nothing outlives the session

@@ -1237,7 +1237,7 @@ mod sshd {
                 .stderr(std::process::Stdio::piped());
             // FR-97 P5b — in the person's home, where sshd starts `sftp-server`:
             // a client resolves every relative path against it.
-            if let Err(why) = crate::exec::apply_run_as_at_home(&mut cmd, &run_as) {
+            if let Err(why) = crate::exec::apply_run_as_at_home(&mut cmd, &run_as).await {
                 let _ = handle
                     .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
                     .await;
@@ -1506,8 +1506,15 @@ mod sshd {
                 return Ok(());
             }
 
-            let pty = match crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as)
-            {
+            // #3822 — a Unix spawn asks who `console_user` is (logind, on
+            // Linux) from this task, so it is awaited; a Windows spawn takes
+            // the person's token itself.
+            #[cfg(unix)]
+            let spawned =
+                crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as).await;
+            #[cfg(windows)]
+            let spawned = crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as);
+            let pty = match spawned {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(peer = %self.peer, %e, "ssh: could not start the terminal session");

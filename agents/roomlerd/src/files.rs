@@ -825,10 +825,11 @@ fn person_downloads_windows(
     }
 }
 
-/// #3688 — who is at seat0, as a root daemon's file steps see it.
+/// #3688 — who is at seat0, as a root daemon's file steps see it. #3822 — and
+/// as exec's and SSH's `console_user` takes it (`exec::console_account`).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Seat {
+pub(crate) enum Seat {
     /// A person, as an account (uid 0 refused) and a home.
     Person {
         account: crate::fs_identity::Account,
