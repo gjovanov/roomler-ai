@@ -1012,6 +1012,9 @@ fn convert(
                 )));
             }
             if !lost.is_empty() {
+                // Each name as data: a key can hold any character, and the
+                // notes go to stderr.
+                let lost: Vec<String> = lost.iter().map(|k| k.escape_debug().to_string()).collect();
                 said.push(format!(
                     "keys of {origin} this build does not know were not kept: {}",
                     lost.join(", ")
@@ -2179,6 +2182,31 @@ mod tests {
             .convert
             .unwrap();
         assert_eq!(convert.config_sha256, Some(sha256_hex(saved.as_bytes())));
+    }
+
+    /// The name of a key it could not keep is said as data: a key can hold
+    /// any character, and neither a newline nor an escape sequence in one
+    /// reaches stderr as it is.
+    #[test]
+    fn a_key_it_could_not_keep_is_said_escaped() {
+        let (mut fs, at) = a_home();
+        let outgoing = format!(
+            "{ENROLLED}\n[[orgs]]\nlabel = \"other\"\n\
+             server_url = \"https://roomler.example\"\nagent_token = \"tok-other\"\n\
+             agent_id = \"a-2\"\ntenant_id = \"t-2\"\n{}\n",
+            r#""a\nkey\u001b[31m" = 2"#
+        );
+        fs.file(&at.config, outgoing.as_bytes(), 0o600);
+        let verb = shown(&at, &fs);
+        let out = answer(verb, &at.home, &creds(), &[], &mut fs);
+        assert_eq!(out.exit, Exit::Done, "{}", out.stderr);
+        assert!(
+            out.stderr.contains(r"orgs.0.a\nkey\u{1b}[31m")
+                && !out.stderr.contains('\n')
+                && !out.stderr.contains('\u{1b}'),
+            "{}",
+            out.stderr
+        );
     }
 
     /// The outgoing config is kept as its `.prev`, 0600, as a save keeps it.
