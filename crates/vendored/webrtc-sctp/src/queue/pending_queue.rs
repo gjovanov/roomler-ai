@@ -3,6 +3,9 @@ use std::sync::atomic::Ordering;
 
 use portable_atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::{Mutex, Semaphore};
+// roomler (#3755): a write that waits for room wakes the write loop first,
+// and a begun message holds the lock while it queues its rest.
+use tokio::sync::{mpsc, MutexGuard, SemaphorePermit, TryAcquireError};
 use util::sync::RwLock;
 
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
@@ -33,6 +36,28 @@ pub(crate) struct PendingQueue {
     // The semaphore is not inside the lock because the permits need to be returned without needing a lock on the semaphore
     semaphore_lock: Mutex<()>,
     semaphore: Semaphore,
+    // roomler (#3755): `QUEUE_APPEND_LARGE`, two thirds of the queue's size;
+    // a field so that a test can make a queue small enough to fill.
+    append_large_at: usize,
+    // roomler (#3755): bytes queued without room by a begun message whose
+    // append was dropped (`BegunMessage`); `pop` pays them back before it
+    // gives room again. At rest: room + queued bytes - overdraft == the limit.
+    overdraft: AtomicUsize,
+    // roomler (#3755): the tests' stand-in for a write loop that pops on
+    // another thread while a begun message's drop runs: (the drop's step,
+    // the chunks popped there).
+    #[cfg(test)]
+    pub(crate) pops_in_drop: Option<(usize, usize)>,
+    // roomler (#3755): the tests' pause in `pop`, between what it pays of the
+    // overdraft and the room it gives back: once armed, the next `pop` meets
+    // the test at this barrier twice there (it has decided; it goes on).
+    #[cfg(test)]
+    pub(crate) pop_pause: std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    // roomler (#3755): the tests' count of large messages that began while
+    // something was owed, which only a `pop` racing a drop allows
+    // (`BegunMessage`).
+    #[cfg(test)]
+    began_while_owed: AtomicUsize,
 
     unordered_queue: RwLock<PendingBaseQueue>,
     ordered_queue: RwLock<PendingBaseQueue>,
@@ -53,12 +78,103 @@ impl PendingQueue {
         Self {
             semaphore_lock: Mutex::default(),
             semaphore: Semaphore::new(QUEUE_BYTES_LIMIT),
+            append_large_at: QUEUE_APPEND_LARGE,
+            overdraft: Default::default(), // roomler (#3755)
+            #[cfg(test)]
+            pops_in_drop: None, // roomler (#3755)
+            #[cfg(test)]
+            pop_pause: Default::default(), // roomler (#3755)
+            #[cfg(test)]
+            began_while_owed: Default::default(), // roomler (#3755)
             unordered_queue: Default::default(),
             ordered_queue: Default::default(),
             queue_len: Default::default(),
             n_bytes: Default::default(),
             selected: Default::default(),
             unordered_is_selected: Default::default(),
+        }
+    }
+
+    /// roomler (#3755): a queue of `bytes`, for the tests that need one full
+    /// (`QUEUE_BYTES_LIMIT` is 128 MiB under `cfg(test)`).
+    #[cfg(test)]
+    pub(crate) fn with_limit(bytes: usize) -> Self {
+        Self {
+            semaphore: Semaphore::new(bytes),
+            append_large_at: (bytes * 2) / 3,
+            ..Self::new()
+        }
+    }
+
+    /// roomler (#3755): the bytes a writer could queue now without waiting.
+    #[cfg(test)]
+    pub(crate) fn room(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// roomler (#3755): the bytes queued without room, not yet paid back.
+    #[cfg(test)]
+    pub(crate) fn overdraft(&self) -> usize {
+        self.overdraft.load(Ordering::SeqCst)
+    }
+
+    /// roomler (#3755): whether an append holds the queue's lock now.
+    #[cfg(test)]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.semaphore_lock.try_lock().is_err()
+    }
+
+    /// roomler (#3755): at step `step` of a begun message's drop, pops what
+    /// `pops_in_drop` says, the way the write loop does.
+    #[cfg(test)]
+    fn pop_in_drop(&self, step: usize) {
+        let Some((at, pops)) = self.pops_in_drop else {
+            return;
+        };
+        if at != step {
+            return;
+        }
+        for _ in 0..pops {
+            let Some(c) = self.peek() else {
+                return;
+            };
+            if self.pop(c.beginning_fragment, c.unordered).is_none() {
+                return;
+            }
+        }
+    }
+
+    /// roomler (#3755): an armed `pop_pause` holds this `pop` between what it
+    /// pays of the overdraft and the room it gives back, the way a preemption,
+    /// or the semaphore's own lock held by a drop on another thread, can hold
+    /// the write loop there.
+    #[cfg(test)]
+    fn pause_in_pop(&self) {
+        let pause = self
+            .pop_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pause) = pause {
+            pause.wait();
+            pause.wait();
+        }
+    }
+
+    /// roomler (#3755): the large messages that began while something was
+    /// owed.
+    #[cfg(test)]
+    pub(crate) fn began_while_owed(&self) -> usize {
+        self.began_while_owed.load(Ordering::SeqCst)
+    }
+
+    /// roomler (#3755): counts a large message that begins while something is
+    /// owed. Its caller holds `semaphore_lock`, so no drop adds to the debt
+    /// meanwhile.
+    #[cfg(test)]
+    fn count_a_begin_while_owed(&self) {
+        if self.overdraft.load(Ordering::SeqCst) > 0 {
+            self.began_while_owed.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -124,60 +240,140 @@ impl PendingQueue {
     /// Appends chunks to the back of the pending queue. False when the queue
     /// was closed (#3716) before they got their permits.
     ///
+    /// roomler (#3755): `wake` is the association's write loop, woken before
+    /// the append waits for room ([`Self::take_room`]).
+    ///
+    /// roomler (#3755): `commit` is the writer's own state change (the
+    /// stream's sequence number and buffered amount). It runs once the first
+    /// chunk has room, with no await between it and that chunk's push, so an
+    /// append dropped at any of its awaits before then (the lock, the room)
+    /// leaves no trace, and so does one the queue's close lets go before then.
+    /// A large append the close lets go after its first chunk was queued has
+    /// committed: it returns false with part of its message queued, on an
+    /// association that is going away. An empty append commits nothing: no
+    /// chunk carries the number. The commit runs before the push, so no ack
+    /// can release bytes not yet counted.
+    ///
     /// # Panics
     ///
     /// If it's a mix of unordered and ordered chunks.
-    pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) -> bool {
+    pub(crate) async fn append(
+        &self,
+        chunks: Vec<ChunkPayloadData>,
+        wake: &mpsc::Sender<()>,
+        commit: impl FnOnce(),
+    ) -> bool {
         if chunks.is_empty() {
             return true;
         }
 
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
 
-        if total_user_data_len >= QUEUE_APPEND_LARGE {
-            self.append_large(chunks).await
+        if total_user_data_len >= self.append_large_at {
+            self.append_large(chunks, wake, commit).await
         } else {
             let _sem_lock = self.semaphore_lock.lock().await;
-            let permits = self
-                .semaphore
-                .acquire_many(total_user_data_len as u32)
-                .await;
-            // roomler (#3716): closed by the association's close; was an unwrap.
-            let Ok(permits) = permits else {
+            // roomler (#3755): `take_room`, which wakes the write loop if it waits.
+            // roomler (#3716): `None` = closed by the association's close; was an unwrap.
+            let Some(permits) = self.take_room(total_user_data_len, wake).await else {
                 return false;
             };
             permits.forget();
+            // roomler (#3755): no await from here to the push.
+            commit();
             self.append_unlimited(chunks, total_user_data_len);
             true
         }
     }
 
-    // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) -> bool {
-        // lock this for the whole duration
-        let _sem_lock = self.semaphore_lock.lock().await;
+    /// roomler (#3755): permits for `n` bytes, or `None` once the queue was
+    /// closed (#3716). An append that must wait for room wakes the write loop
+    /// first: only the loop, sending what is queued, makes room, and on an
+    /// association with nothing in flight nothing else wakes it (an ack, a
+    /// timer, the end of an append). A message larger than the room left waited
+    /// there forever, its first chunks queued and never sent.
+    async fn take_room(&self, n: usize, wake: &mpsc::Sender<()>) -> Option<SemaphorePermit<'_>> {
+        match self.semaphore.try_acquire_many(n as u32) {
+            Ok(permits) => Some(permits),
+            Err(TryAcquireError::Closed) => None,
+            Err(TryAcquireError::NoPermits) => {
+                let _ = wake.try_send(());
+                self.semaphore.acquire_many(n as u32).await.ok()
+            }
+        }
+    }
 
-        for chunk in chunks.into_iter() {
-            let user_data_len = chunk.user_data.len();
-            let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // roomler (#3716): closed by the association's close; was an unwrap.
+    // If this is a very large message we append chunks one by one to allow progress while we are appending
+    //
+    // roomler (#3755): the first chunk is queued with the writer's commit, and
+    // from then on the message is begun: dropped before its last chunk is
+    // queued, it queues its rest at once (`BegunMessage`).
+    async fn append_large(
+        &self,
+        chunks: Vec<ChunkPayloadData>,
+        wake: &mpsc::Sender<()>,
+        commit: impl FnOnce(),
+    ) -> bool {
+        // lock this for the whole duration
+        let sem_lock = self.semaphore_lock.lock().await;
+
+        // roomler (#3755): the first chunk, then the begun message's rest.
+        let mut chunks = chunks.into_iter();
+        let Some(first) = chunks.next() else {
+            return true;
+        };
+        // roomler (#3755): `take_room`, which wakes the write loop if it waits.
+        // roomler (#3716): `None` = closed by the association's close; was an unwrap.
+        let Some(permits) = self.take_room(first.user_data.len(), wake).await else {
+            return false;
+        };
+        permits.forget();
+        // roomler (#3755): no await from here to the push of the first chunk.
+        commit();
+        self.push_chunk(first);
+        // roomler (#3755): counted for the tests, under the queue's lock.
+        #[cfg(test)]
+        self.count_a_begin_while_owed();
+        let mut begun = BegunMessage {
+            rest: chunks,
+            queue: self,
+            wake,
+            _sem_lock: sem_lock,
+        };
+
+        while let Some(user_data_len) = begun.rest.as_slice().first().map(|c| c.user_data.len()) {
+            // roomler (#3755): `take_room`, which wakes the write loop if it waits.
+            // roomler (#3716): `None` = closed by the association's close; was an unwrap.
             // The chunks queued so far are the association's to drop.
-            let Ok(permits) = permits else {
+            // roomler (#3755): dropped while it waits, this wait goes before
+            // `begun` (it was made after it), so the room it holds is free
+            // again when `begun`'s drop reads the room. Keep that order: the
+            // other way round, that room would come back after the drop paid
+            // the debt, free while the rest is owed, on one thread too.
+            let Some(permits) = self.take_room(user_data_len, wake).await else {
                 return false;
             };
             permits.forget();
-
-            if chunk.unordered {
-                let mut unordered_queue = self.unordered_queue.write();
-                unordered_queue.push_back(chunk);
-            } else {
-                let mut ordered_queue = self.ordered_queue.write();
-                ordered_queue.push_back(chunk);
+            if let Some(chunk) = begun.rest.next() {
+                self.push_chunk(chunk);
             }
-            self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
-            self.queue_len.fetch_add(1, Ordering::SeqCst);
         }
         true
+    }
+
+    /// roomler (#3755): queues one chunk. The caller holds `semaphore_lock`
+    /// and has accounted for its bytes: permits, or the overdraft.
+    fn push_chunk(&self, chunk: ChunkPayloadData) {
+        let user_data_len = chunk.user_data.len();
+        if chunk.unordered {
+            let mut unordered_queue = self.unordered_queue.write();
+            unordered_queue.push_back(chunk);
+        } else {
+            let mut ordered_queue = self.ordered_queue.write();
+            ordered_queue.push_back(chunk);
+        }
+        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+        self.queue_len.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Assumes that A) enough permits have been acquired and forget from the semaphore and that the semaphore_lock is held
@@ -286,7 +482,18 @@ impl PendingQueue {
             let user_data_len = p.user_data.len();
             self.n_bytes.fetch_sub(user_data_len, Ordering::SeqCst);
             self.queue_len.fetch_sub(1, Ordering::SeqCst);
-            self.semaphore.add_permits(user_data_len);
+            // roomler (#3755): the overdraft is paid first, and only the rest
+            // becomes room again. One load while nothing is owed.
+            let owed = self
+                .overdraft
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                    (d > 0).then_some(d - d.min(user_data_len))
+                })
+                .map_or(0, |d| d.min(user_data_len));
+            // roomler (#3755): the tests' pause between the two steps.
+            #[cfg(test)]
+            self.pause_in_pop();
+            self.semaphore.add_permits(user_data_len - owed);
         }
 
         popped
@@ -302,5 +509,106 @@ impl PendingQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// roomler (#3755): a large message whose first chunk is queued, so its
+/// writer's commit (the stream's sequence number) is spent. Dropped before its
+/// last chunk is queued (a timeout, a `select!` arm, a task abort), it queues
+/// the rest at once, in place, while it still holds `semaphore_lock`, so
+/// nothing interleaves and the peer reads the message whole, once. Without
+/// it, the receiver of an ordered stream waits for the missing fragments
+/// forever, and every later message of the stream waits behind them (RFC 4960
+/// §6.6); a half-popped message also stalls the whole association's queue
+/// (`pop` keeps it selected).
+///
+/// The rest's bytes are owed first (`PendingQueue::overdraft`). Then the room
+/// that is free pays what it can of the debt, and `pop` pays the remainder
+/// before it gives room again. A `pop` that decides what it pays during the
+/// drop, on another thread, so pays the debt instead of giving room, and what
+/// the pops and the free room pay beyond the rest's bytes is room again.
+///
+/// One race is left. A `pop` decides what it pays, then gives the rest of its
+/// chunk back as room: two steps. One that decided before the debt was
+/// recorded gives its room back after the drop read the room, so one chunk of
+/// room (at most `max_payload_size`) can be free per racing drop while the
+/// rest is owed. A writer can take it, a large message's first chunk included,
+/// and such a message, cut while the debt is owed, adds its own rest: one rest
+/// per race. The overdraft is so at most (1 + races) times the largest
+/// message. Drops hold the queue's lock to the end, so they run one at a time.
+/// On a runtime of one thread no `pop` runs during a drop, so no room is free
+/// while anything is owed there. At rest the accounting is exact: room +
+/// queued bytes - overdraft == the limit.
+///
+/// A drop that finds the queue closed (#3716) queues nothing: the association
+/// is going away. The drop never awaits, needs no runtime and does not panic,
+/// short of a poisoned queue lock, as `pop`.
+struct BegunMessage<'a> {
+    rest: std::vec::IntoIter<ChunkPayloadData>,
+    queue: &'a PendingQueue,
+    wake: &'a mpsc::Sender<()>,
+    // A field, so it is released after `drop` has queued the rest.
+    _sem_lock: MutexGuard<'a, ()>,
+}
+
+impl Drop for BegunMessage<'_> {
+    fn drop(&mut self) {
+        if self.rest.len() == 0 {
+            return;
+        }
+        let queue = self.queue;
+        let n: usize = self.rest.as_slice().iter().map(|c| c.user_data.len()).sum();
+        // Owed first, before the room is read and before anything is queued:
+        // a `pop` that decides from here on pays the debt instead of giving
+        // room, so the room it frees is not left free while the rest is owed,
+        // and no `pop` of the rest returns room for bytes that never had it.
+        // A `pop` that decided before gives its chunk back as room, after the
+        // read below if it is late: the one race of the type's doc.
+        queue.overdraft.fetch_add(n, Ordering::SeqCst);
+        // roomler (#3755): step 0, the debt was recorded.
+        #[cfg(test)]
+        queue.pop_in_drop(0);
+        // Then the free room is taken. This holds `semaphore_lock`, so no
+        // writer takes room meanwhile and the room can only grow (a `pop`):
+        // what is counted here is there to take.
+        let free = u32::try_from(queue.semaphore.available_permits().min(n)).unwrap_or(u32::MAX);
+        let taken = match queue.semaphore.try_acquire_many(free) {
+            Ok(permits) => {
+                permits.forget();
+                free as usize
+            }
+            Err(TryAcquireError::Closed) => {
+                // The drop found the queue closed, so it queues nothing: the
+                // debt goes, and what a `pop` paid of it is room again.
+                let owed = queue
+                    .overdraft
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                        Some(d.saturating_sub(n))
+                    })
+                    .unwrap_or_else(|d| d);
+                queue.semaphore.add_permits(n.saturating_sub(owed));
+                return;
+            }
+            Err(TryAcquireError::NoPermits) => 0,
+        };
+        // roomler (#3755): step 1, the room was taken.
+        #[cfg(test)]
+        queue.pop_in_drop(1);
+        // The room taken pays the debt. What a `pop` already paid of it is
+        // paid twice, so that much is room again.
+        let owed = queue
+            .overdraft
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                Some(d - d.min(taken))
+            })
+            .unwrap_or_else(|d| d);
+        // roomler (#3755): step 2, the room taken paid the debt.
+        #[cfg(test)]
+        queue.pop_in_drop(2);
+        queue.semaphore.add_permits(taken - owed.min(taken));
+        for chunk in self.rest.by_ref() {
+            queue.push_chunk(chunk);
+        }
+        let _ = self.wake.try_send(());
     }
 }

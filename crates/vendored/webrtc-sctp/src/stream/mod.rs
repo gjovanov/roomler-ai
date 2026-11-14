@@ -272,6 +272,22 @@ impl Stream {
     /// Writes `p` to the DTLS connection with the given Payload Protocol Identifier.
     ///
     /// Returns an error if the write half of this stream is shutdown or `p` is too large.
+    ///
+    /// roomler (#3755): cancelling a write (a timeout, a `select!` arm, a task
+    /// abort) is safe:
+    /// - dropped at any await before its first chunk is queued (its turn, the
+    ///   queue's lock, room in the queue), the write leaves no trace: the
+    ///   stream's sequence number and buffered amount are as if it had never
+    ///   been called, nothing of it is sent, and the next write is delivered;
+    /// - a write of two thirds of the queue's size or more is queued chunk by
+    ///   chunk; dropped after its first chunk was queued, it is begun: its rest
+    ///   is queued as it drops, and the peer reads it whole, once, in its
+    ///   place. A caller that retries such a cut write may deliver it twice;
+    /// - a write that returned `Ok` is queued whole, in order. One that the
+    ///   association's close lets go returns an error; if it was such a large
+    ///   write with its first chunk queued, its sequence number is spent, its
+    ///   length counts in the buffered amount, and part of it stays queued, on
+    ///   an association that is going away.
     pub async fn write_sctp(&self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
         // roomler (#3716): a write holds its turn from its shutdown check until
         // its chunks are queued or it is let go, so the stream's reset never
@@ -282,7 +298,8 @@ impl Stream {
         }
         let _turn = self.write_turn.lock().await;
         let chunks = self.prepare_write(p, ppi)?;
-        self.send_payload_data(chunks).await?;
+        // roomler (#3755): the length, for the commit once the write has room.
+        self.send_payload_data(chunks, p.len()).await?;
 
         Ok(p.len())
     }
@@ -354,6 +371,17 @@ impl Stream {
             i += fragment_size;
         }
 
+        // roomler (#3755): the sequence number is only read here; the queue
+        // spends it (`commit_write`) once the first chunk has room.
+        chunks
+    }
+
+    /// roomler (#3755): a write's state change, made by the pending queue once
+    /// the write's first chunk has room, with no await between it and that
+    /// chunk's push (`PendingQueue::append`). `packetize` made it, so a write
+    /// dropped while it waited for room spent its sequence number, and the
+    /// receiver of an ordered stream waited for that number forever.
+    fn commit_write(&self, unordered: bool, len: usize) {
         // RFC 4960 Sec 6.6
         // Note: When transmitting ordered and unordered data, an endpoint does
         // not increment its Stream Sequence Number when transmitting a DATA
@@ -362,10 +390,8 @@ impl Stream {
             self.sequence_number.fetch_add(1, Ordering::SeqCst);
         }
 
-        let old_value = self.buffered_amount.fetch_add(raw.len(), Ordering::SeqCst);
-        log::trace!("[{}] bufferedAmount = {}", self.name, old_value + raw.len());
-
-        chunks
+        let old_value = self.buffered_amount.fetch_add(len, Ordering::SeqCst);
+        log::trace!("[{}] bufferedAmount = {}", self.name, old_value + len);
     }
 
     /// Closes both read and write halves of this stream.
@@ -493,7 +519,10 @@ impl Stream {
         let _ = self.awake_write_loop_ch.try_send(());
     }
 
-    async fn send_payload_data(&self, chunks: Vec<ChunkPayloadData>) -> Result<()> {
+    // roomler (#3755): `len` is the write's, committed with its first chunk.
+    async fn send_payload_data(&self, chunks: Vec<ChunkPayloadData>, len: usize) -> Result<()> {
+        // roomler (#3755): nothing is committed yet, so this refusal leaves no
+        // trace either (it used to follow `packetize`'s commit).
         let state = self.get_state();
         if state != AssociationState::Established {
             return Err(Error::ErrPayloadDataStateNotExist);
@@ -502,7 +531,16 @@ impl Stream {
         // NOTE: append is used here instead of push in order to prevent chunks interlacing.
         // roomler (#3716): false = the association closed while this write
         // waited in flow control; it is let go with an error, not kept forever.
-        if !self.pending_queue.append(chunks).await {
+        // roomler (#3755): the queue wakes the write loop if it waits for room,
+        // and commits the write once its first chunk has room.
+        let unordered = chunks.first().is_some_and(|c| c.unordered);
+        if !self
+            .pending_queue
+            .append(chunks, &self.awake_write_loop_ch, || {
+                self.commit_write(unordered, len)
+            })
+            .await
+        {
             return Err(Error::ErrPayloadDataStateNotExist);
         }
 
