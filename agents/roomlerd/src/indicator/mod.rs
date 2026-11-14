@@ -297,11 +297,15 @@ impl ViewerIndicator {
                     "no runtime to put the notification up from".into(),
                 ));
             };
+            // On the books before the show starts: a `hide_prompt` from here
+            // on (the question answered elsewhere, its session ended, its
+            // socket closed) stops the show, however far it has got.
+            let generation = n.coming(&view.session_hex);
             // A test stands the session walk in for its own task or thread;
             // the show runs on the blocking pool, so the stand-in goes with it.
             #[cfg(test)]
             let stood = crate::companion::session_walk_stand_in::now();
-            let show = move || n.show(&view);
+            let show = move || n.show(&view, generation);
             #[cfg(test)]
             let show = move || match stood {
                 Some(stood) => crate::companion::session_walk_stand_in::blocking(&stood, show),

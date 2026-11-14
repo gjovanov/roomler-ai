@@ -659,7 +659,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:2273`](../agents/roomlerd/src/companion.rs#L2273)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1113`](../agents/roomlerd/src/companion.rs#L1113)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:2277`](../agents/roomlerd/src/companion.rs#L2277)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1113`](../agents/roomlerd/src/companion.rs#L1113)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -1303,7 +1303,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4428`](../agents/roomlerd/src/signaling.rs#L4428), [`:6000`](../agents/roomlerd/src/signaling.rs#L6000)), as the recording question does
+first the same way ([`signaling.rs:4428`](../agents/roomlerd/src/signaling.rs#L4428), [`:6041`](../agents/roomlerd/src/signaling.rs#L6041)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,

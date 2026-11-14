@@ -340,38 +340,6 @@ pub(crate) async fn close_within_budget(
 /// experiences.
 pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
-/// #3857 — FR-93 P6f's notification for an RC prompt, as the WS loop asks for
-/// it: only where the companion cannot show the question (none up, or no
-/// marker for it to read), in FR-27's order.
-pub(crate) async fn notification_for_rc(
-    indicator: &ViewerIndicator,
-    companion_up: bool,
-    marker: bool,
-    view: crate::indicator::PromptView,
-) -> Option<crate::indicator::NotificationPrompt> {
-    if companion_up && marker {
-        return None;
-    }
-    let showing = indicator.start_notification_prompt(view);
-    Some(crate::indicator::NotificationPrompt::settled(
-        showing.outcome().await,
-    ))
-}
-
-/// #3857 — whether the notification [`notification_for_rc`] gave came up.
-pub(crate) async fn notification_shown(
-    notifying: Option<crate::indicator::NotificationPrompt>,
-    indicator: &ViewerIndicator,
-    session_hex: &str,
-    outbound: &mpsc::Sender<ClientMsg>,
-) -> bool {
-    let _ = (indicator, session_hex, outbound);
-    match notifying {
-        Some(notifying) => notifying.shown().await,
-        None => false,
-    }
-}
-
 /// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
 /// P6's controller display name and the device policy's input mode, FR-27's
 /// asking org (the "Being viewed by" banner is raised at peer-build time, not
@@ -4460,6 +4428,10 @@ async fn handle_server_msg(
             let prompt = (!owner_side_consent)
                 .then(|| consent_broker.request_with_mode(&session_hex, effective_mode));
             let mut have_surface = true;
+            // #3857 — what the consent task below finishes for a prompt: the
+            // native panel's verdict, the notification this loop started if it
+            // started one, and the marker's word for that once it is up.
+            let mut surfaces = None;
             if will_prompt {
                 // FR-27 — NATIVE surface first, companion as the fallback.
                 //
@@ -4517,7 +4489,7 @@ async fn handle_server_msg(
                     expires_at: std::time::Instant::now() + host_window,
                 };
                 let native = indicator.show_prompt(view.clone());
-                let mut prompt = crate::consent::PendingPrompt {
+                let prompt = crate::consent::PendingPrompt {
                     kind: crate::consent::PromptKind::RemoteControl,
                     asked_by: &controller_name,
                     permissions: permissions.wire_names(),
@@ -4555,7 +4527,8 @@ async fn handle_server_msg(
                     tracing::warn!(session = %session_hex, %e, native, "could not write the .pending consent marker");
                 }
 
-                let mut notified = false;
+                let mut notifying = None;
+                let mut mark_up = None;
                 if !native {
                     // FR-27 — the marker only helps if something is READING it.
                     // Nothing used to start the companion, so a device set to
@@ -4583,27 +4556,39 @@ async fn handle_server_msg(
                     // cannot show the question (none installed: a system
                     // daemon on Fedora, openSUSE, Arch, aarch64; or no marker
                     // for it to read).
-                    notified = notification_shown(
-                        notification_for_rc(indicator, companion_up, marker, view).await,
-                        indicator,
-                        &session_hex,
-                        outbound_tx,
-                    )
-                    .await;
-                    if notified {
-                        have_surface = true;
-                        if marker {
-                            prompt.surface = crate::consent::PromptSurface::Notification;
-                            if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
-                                tracing::warn!(session = %session_hex, %e, "could not mark the consent prompt as shown by a notification");
+                    //
+                    // #3857 — STARTED here, and waited for by the consent task
+                    // below, before the prompt's window starts, as when this
+                    // loop waited for it. Its show asks logind, the account
+                    // database and the person's session bus, any of which can
+                    // hang, and this loop reads its next frame meanwhile.
+                    notifying = notification_for_rc(indicator, companion_up, marker, view).await;
+                    // The marker says so once a notification is up.
+                    mark_up = marker.then(|| {
+                        let (broker, hex) = (consent_broker.clone(), session_hex.clone());
+                        let (asked_by, permissions, detail, org) = (
+                            controller_name.clone(),
+                            prompt.permissions.clone(),
+                            prompt.detail.clone(),
+                            prompt.org.clone(),
+                        );
+                        move || {
+                            let shown = crate::consent::PendingPrompt {
+                                kind: crate::consent::PromptKind::RemoteControl,
+                                asked_by: &asked_by,
+                                permissions,
+                                detail,
+                                org,
+                                timeout: host_window,
+                                surface: crate::consent::PromptSurface::Notification,
+                            };
+                            if let Err(e) = broker.write_prompt(&hex, &shown) {
+                                tracing::warn!(session = %hex, %e, "could not mark the consent prompt as shown by a notification");
                             }
                         }
-                    }
+                    });
                 }
-                info!(
-                    session = %session_hex, native, notified, have_surface,
-                    "consent prompt surface"
-                );
+                surfaces = Some((native, notifying, mark_up));
                 // FR-34 — a LOCKED host has the panel on the (currently
                 // invisible) secure desktop, so the operator must UNLOCK the
                 // machine before they can see and approve it. That is the
@@ -4645,6 +4630,26 @@ async fn handle_server_msg(
                 // FR-52 P4 — only an external session carries the config in.
                 let external_cfg = external_consent.map(|_| remote_cfg.clone());
                 tokio::spawn(async move {
+                    // #3857 — the notification the loop started: its verdict,
+                    // here, before the prompt's clock starts at its first look
+                    // below, as when the loop waited for it. A socket that
+                    // closes first drops it (`notification_shown`), and a
+                    // `Terminate` takes it down from the loop.
+                    let mut have_surface = have_surface;
+                    if let Some((native, notifying, mark_up)) = surfaces {
+                        let notified =
+                            notification_shown(notifying, &ind, &session_hex, &outbound).await;
+                        if notified {
+                            have_surface = true;
+                            if let Some(mark_up) = mark_up {
+                                mark_up();
+                            }
+                        }
+                        info!(
+                            session = %session_hex, native, notified, have_surface,
+                            "consent prompt surface"
+                        );
+                    }
                     let decision =
                         await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
                     // FR-27 — take the native panel down however the question
@@ -7525,6 +7530,51 @@ fn end_in_gap(
             table.queue_end(end.terminate(sid));
             indicator.hide_session(sid.to_hex());
         }
+    }
+}
+
+/// #3857 — FR-93 P6f's notification for an RC prompt, as the WS loop asks for
+/// it: only where the companion cannot show the question (none up, or no
+/// marker for it to read), in FR-27's order. STARTED, and never waited for
+/// here: its show asks logind, the account database and the person's session
+/// bus, any of which can hang (logind's D-Bus timeout is 25 s), and the loop
+/// reads its next frame meanwhile. Its verdict is the consent task's to wait
+/// for ([`notification_shown`]).
+pub(crate) async fn notification_for_rc(
+    indicator: &ViewerIndicator,
+    companion_up: bool,
+    marker: bool,
+    view: crate::indicator::PromptView,
+) -> Option<crate::indicator::NotificationPrompt> {
+    (!(companion_up && marker)).then(|| indicator.start_notification_prompt(view))
+}
+
+/// #3857 — the consent task's wait for the notification the loop started
+/// ([`notification_for_rc`]): whether it came up. When the prompt's control
+/// socket closes first (the viewer gone, #2416), `false` at once, and the show
+/// is taken down here (`hide_prompt`): a show still on its way starts no
+/// helper, or ends the one it started, and its late verdict reaches no one. A
+/// `Terminate` takes it down from the loop the same way.
+pub(crate) async fn notification_shown(
+    notifying: Option<crate::indicator::NotificationPrompt>,
+    indicator: &ViewerIndicator,
+    session_hex: &str,
+    outbound: &mpsc::Sender<ClientMsg>,
+) -> bool {
+    let Some(notifying) = notifying else {
+        return false;
+    };
+    tokio::select! {
+        biased;
+        () = outbound.closed() => {
+            indicator.hide_prompt(session_hex);
+            info!(
+                session = %session_hex,
+                "the notification prompt's control socket closed while it was being put up — taken down (#3857)"
+            );
+            false
+        }
+        shown = notifying.shown() => shown,
     }
 }
 

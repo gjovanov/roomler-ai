@@ -2169,334 +2169,6 @@ pub(crate) fn graphical_session_matching(
     graphical_session_via(want_uid, users_only, &loginctl_stdout)
 }
 
-/// #3857 — what [`graphical_session_within`] gave instead of a session.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "portal-capture", feature = "recording")
-))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NoGraphicalSession {
-    /// logind answered, and no session matched: the walk's own words
-    /// ([`graphical_session_via`]), as they always were. Nobody is at the
-    /// screen, or only the login screen is.
-    Answered(String),
-    /// No answer in time, or a walk that ended with none. Who is at the
-    /// screen is not known, which is never "nobody" (#3688).
-    NotKnown(String),
-}
-
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "portal-capture", feature = "recording")
-))]
-impl NoGraphicalSession {
-    /// Why there is no session, in words: what the recorder's launch says.
-    #[cfg_attr(not(feature = "recording"), allow(dead_code))]
-    pub(crate) fn words(&self) -> &str {
-        match self {
-            Self::Answered(why) | Self::NotKnown(why) => why,
-        }
-    }
-}
-
-/// #3857 — how long a caller on a blocking thread waits for the graphical
-/// session walk ([`graphical_session_within`]): the seat and account lookups'
-/// 1.5 s (`files::SEAT_LOOKUP_WAIT`, `exec::ACCOUNT_LOOKUP_WAIT`). logind's
-/// own D-Bus timeout is 25 s, and every `loginctl` waits it out. A healthy
-/// walk is a few `loginctl` processes, tens of milliseconds, far less than
-/// half of this, and half is what one walk in flight needs to answer every
-/// caller (`one_in_flight`'s cost). On the consent path the tray's start
-/// (2.5 s at most) and this wait together stay inside the 5 s the hub waits
-/// past a prompt's window (`CONSENT_VERDICT_GRACE`), so the agent's
-/// `no_prompt_surface` reaches the controller ahead of the hub's own timer.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "portal-capture", feature = "recording")
-))]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const SESSION_WALK_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
-
-/// #3857 — the graphical session for a caller on a blocking thread: the
-/// portal's session helper (`capture::portal::helper::spawn_child`, so the
-/// capture, the audio, keep busy and the notification prompt) and the
-/// recorder's launch (`recording::launch::unix::spawn_session_user`).
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "portal-capture", feature = "recording")
-))]
-pub(crate) fn graphical_session_within(
-    want_uid: Option<u32>,
-    users_only: bool,
-) -> std::result::Result<GraphicalSession, NoGraphicalSession> {
-    // A test stands the walk in for its own thread or task.
-    #[cfg(test)]
-    if let Some(stood) = session_walk_stand_in::now() {
-        return stood
-            .walk_now(want_uid, users_only)
-            .map_err(NoGraphicalSession::Answered);
-    }
-    graphical_session_matching(want_uid, users_only)
-        .map_err(|e| NoGraphicalSession::Answered(format!("{e:#}")))
-}
-
-/// #3857 — the graphical session walk stood in for one test: `walk` in place
-/// of `loginctl`'s ([`graphical_session_matching`]). Installed for a thread
-/// ([`blocking`]: the portal helper's and the recorder's callers ask from
-/// their own) or for a task ([`asking`]: the notification prompt's start,
-/// which carries it onto the blocking thread its show runs on). Never the
-/// daemon's own walks, and never the tests beside it.
-#[cfg(all(
-    test,
-    target_os = "linux",
-    any(feature = "portal-capture", feature = "recording")
-))]
-pub(crate) mod session_walk_stand_in {
-    use super::GraphicalSession;
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::sync::{Arc, Condvar, Mutex, PoisonError};
-
-    /// The walk: `(want_uid, users_only)` in, a session or logind's words out.
-    type Walk = dyn Fn(Option<u32>, bool) -> Result<GraphicalSession, String> + Send + Sync;
-
-    /// A walk stood in.
-    #[derive(Clone)]
-    pub(crate) struct StandIn {
-        walk: Arc<Walk>,
-    }
-
-    impl StandIn {
-        pub(crate) fn new(
-            walk: impl Fn(Option<u32>, bool) -> Result<GraphicalSession, String> + Send + Sync + 'static,
-        ) -> Self {
-            Self {
-                walk: Arc::new(walk),
-            }
-        }
-
-        /// A walk that logind holds until `held` opens, then answers
-        /// `session`. Each walk that begins is counted in `held`.
-        pub(crate) fn held(held: &Held, session: GraphicalSession) -> Self {
-            let held = held.clone();
-            Self::new(move |_, _| {
-                held.hold();
-                Ok(session.clone())
-            })
-        }
-
-        /// The walk, on this thread, for as long as it takes.
-        pub(super) fn walk_now(
-            &self,
-            want_uid: Option<u32>,
-            users_only: bool,
-        ) -> Result<GraphicalSession, String> {
-            (self.walk)(want_uid, users_only)
-        }
-    }
-
-    /// A held logind: each walk that reaches it is counted, and held until
-    /// the gate opens.
-    #[derive(Clone, Default)]
-    pub(crate) struct Held(Arc<HeldState>);
-
-    #[derive(Default)]
-    struct HeldState {
-        open: Mutex<bool>,
-        opened: Condvar,
-        began: AtomicUsize,
-    }
-
-    impl Held {
-        fn hold(&self) {
-            self.0.began.fetch_add(1, SeqCst);
-            let open = self.0.open.lock().unwrap_or_else(PoisonError::into_inner);
-            drop(
-                self.0
-                    .opened
-                    .wait_while(open, |open| !*open)
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
-        }
-
-        pub(crate) fn open(&self) {
-            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
-            self.0.opened.notify_all();
-        }
-
-        /// Walks that reached logind.
-        pub(crate) fn began(&self) -> usize {
-            self.0.began.load(SeqCst)
-        }
-    }
-
-    /// Opens the gate when dropped: a failed assertion leaves nothing held,
-    /// and a runtime declared before it can shut down.
-    pub(crate) struct OpenedAtTheEnd(pub(crate) Held);
-
-    impl Drop for OpenedAtTheEnd {
-        fn drop(&mut self) {
-            self.0.open();
-        }
-    }
-
-    /// The person at the screen, as logind reports them.
-    pub(crate) fn ana() -> GraphicalSession {
-        GraphicalSession {
-            uid: 4242,
-            name: "ana".into(),
-            display: Some(":0".into()),
-            wayland_display: None,
-        }
-    }
-
-    tokio::task_local! {
-        static STOOD: StandIn;
-    }
-
-    std::thread_local! {
-        static HERE: std::cell::RefCell<Option<StandIn>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// `run`, the walks its task asks for taking `stood`'s.
-    pub(crate) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
-        STOOD.scope(stood, run).await
-    }
-
-    /// `run` on THIS thread, the walks it asks for taking `stood`'s. What
-    /// stood here before comes back after.
-    pub(crate) fn blocking<R>(stood: &StandIn, run: impl FnOnce() -> R) -> R {
-        /// Puts back what stood here before, however `run` ends.
-        struct Restore(Option<StandIn>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let before = self.0.take();
-                HERE.with(|here| *here.borrow_mut() = before);
-            }
-        }
-        let _restore = Restore(HERE.with(|here| here.replace(Some(stood.clone()))));
-        run()
-    }
-
-    /// The walk stood in for this thread, or else for this task.
-    pub(crate) fn now() -> Option<StandIn> {
-        HERE.with(|here| here.borrow().clone())
-            .or_else(|| STOOD.try_with(StandIn::clone).ok())
-    }
-}
-
-/// #3857 — the graphical session walk of the callers on blocking threads,
-/// with logind stood in ([`session_walk_stand_in`]). Each ask runs on a
-/// thread of its own, as the portal helper's and the recorder's callers ask.
-#[cfg(all(
-    test,
-    target_os = "linux",
-    any(feature = "portal-capture", feature = "recording")
-))]
-mod session_walk_tests {
-    use super::session_walk_stand_in::{Held, OpenedAtTheEnd, StandIn, ana, blocking};
-    use super::{
-        GraphicalSession, NoGraphicalSession, SESSION_WALK_WAIT, graphical_session_within,
-    };
-    use std::time::{Duration, Instant};
-
-    /// What an ask may take past the walk's wait on a busy runner.
-    const SLACK: Duration = Duration::from_secs(1);
-    /// What a walk that answers may take on a busy runner.
-    const RUNS_WITHIN: Duration = Duration::from_secs(10);
-
-    type Walked = Result<GraphicalSession, NoGraphicalSession>;
-
-    /// `graphical_session_within` on a thread of its own, taking `stood`'s
-    /// walk: what it answered, and how long that took.
-    fn ask_on_a_thread(
-        stood: &StandIn,
-        want_uid: Option<u32>,
-        users_only: bool,
-    ) -> std::sync::mpsc::Receiver<(Walked, Duration)> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let stood = stood.clone();
-        std::thread::spawn(move || {
-            let asked = Instant::now();
-            let walked = blocking(&stood, || graphical_session_within(want_uid, users_only));
-            let _ = tx.send((walked, asked.elapsed()));
-        });
-        rx
-    }
-
-    /// #3857 — while logind holds a walk, asks at once and in a row share
-    /// it: each is told the session is not known within its own wait, never
-    /// that nobody is there, and none starts another walk. Once logind
-    /// answers, the late walk answers nobody, and the next ask walks afresh.
-    ///
-    /// Red before #3857: every ask walked on its own thread, for as long as
-    /// logind held it.
-    #[test]
-    fn asks_while_a_walk_hangs_share_it() {
-        let held = Held::default();
-        let _opened = OpenedAtTheEnd(held.clone());
-        let stood = StandIn::held(&held, ana());
-        let at_once: Vec<_> = (0..4)
-            .map(|_| ask_on_a_thread(&stood, None, false))
-            .collect();
-        for asked in at_once {
-            let (walked, waited) = asked
-                .recv_timeout(SESSION_WALK_WAIT + SLACK)
-                .expect("every ask at once is answered while logind holds the walk");
-            match walked {
-                Err(NoGraphicalSession::NotKnown(why)) => assert!(
-                    why.contains("no answer"),
-                    "the reason says logind gave no answer: {why}"
-                ),
-                other => panic!("logind held the walk, and it answered {other:?}"),
-            }
-            assert!(
-                waited >= SESSION_WALK_WAIT,
-                "an ask gave up in {waited:?}, before its wait"
-            );
-        }
-        for _ in 0..2 {
-            let (walked, _) = ask_on_a_thread(&stood, None, false)
-                .recv_timeout(SESSION_WALK_WAIT + SLACK)
-                .expect("an ask in a row is answered while logind holds the walk");
-            assert!(
-                matches!(walked, Err(NoGraphicalSession::NotKnown(_))),
-                "logind held the walk, and it answered {walked:?}"
-            );
-        }
-        assert_eq!(held.began(), 1, "one walk, however many asked");
-        held.open();
-        let (walked, _) = ask_on_a_thread(&stood, None, false)
-            .recv_timeout(RUNS_WITHIN)
-            .expect("the next ask is answered");
-        assert_eq!(walked, Ok(ana()), "a walk of its own");
-        assert_eq!(held.began(), 2, "the held walk, and the next ask's own");
-    }
-
-    /// The control: a walk in time answers as before. The session it found,
-    /// for the uid and the class each caller asks for, and logind's own words
-    /// when nobody is there.
-    #[test]
-    fn a_walk_in_time_answers_as_today() {
-        const NOBODY: &str = "no active graphical session — nobody is at this machine's screen";
-        let stood = StandIn::new(|want_uid, users_only| match (want_uid, users_only) {
-            (None, false) | (Some(4242), _) => Ok(ana()),
-            _ => Err(NOBODY.into()),
-        });
-        let ask = |want_uid, users_only| {
-            ask_on_a_thread(&stood, want_uid, users_only)
-                .recv_timeout(RUNS_WITHIN)
-                .expect("a walk in time is answered")
-                .0
-        };
-        assert_eq!(ask(None, false), Ok(ana()), "root's walk: anyone's session");
-        assert_eq!(ask(Some(4242), true), Ok(ana()), "the person's own");
-        assert_eq!(
-            ask(Some(1000), true),
-            Err(NoGraphicalSession::Answered(NOBODY.into())),
-            "logind's own words when nobody is there"
-        );
-    }
-}
-
 /// `loginctl <args> --no-pager`'s stdout. The exit status is not read: a
 /// `show-session` of a session that ended mid-walk prints nothing, and the walk
 /// goes on to the next one.
@@ -4945,5 +4617,397 @@ mod too_old_tests {
                 || sync_enabled_in(None)
             ));
         }
+    }
+}
+
+/// #3857 — what [`graphical_session_within`] gave instead of a session.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoGraphicalSession {
+    /// logind answered, and no session matched: the walk's own words
+    /// ([`graphical_session_via`]), as they always were. Nobody is at the
+    /// screen, or only the login screen is.
+    Answered(String),
+    /// No answer in time, or a walk that ended with none. Who is at the
+    /// screen is not known, which is never "nobody" (#3688).
+    NotKnown(String),
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+impl NoGraphicalSession {
+    /// Why there is no session, in words: what the recorder's launch says.
+    #[cfg_attr(not(feature = "recording"), allow(dead_code))]
+    pub(crate) fn words(&self) -> &str {
+        match self {
+            Self::Answered(why) | Self::NotKnown(why) => why,
+        }
+    }
+}
+
+/// #3857 — how long a caller on a blocking thread waits for the graphical
+/// session walk ([`graphical_session_within`]): the seat and account lookups'
+/// 1.5 s (`files::SEAT_LOOKUP_WAIT`, `exec::ACCOUNT_LOOKUP_WAIT`). logind's
+/// own D-Bus timeout is 25 s, and every `loginctl` waits it out. A healthy
+/// walk is a few `loginctl` processes, tens of milliseconds, far less than
+/// half of this, and half is what one walk in flight needs to answer every
+/// caller (`one_in_flight`'s cost). On the consent path the tray's start
+/// (2.5 s at most) and this wait together stay inside the 5 s the hub waits
+/// past a prompt's window (`CONSENT_VERDICT_GRACE`), so the agent's
+/// `no_prompt_surface` reaches the controller ahead of the hub's own timer.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+pub(crate) const SESSION_WALK_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// #3857 — the graphical session for a caller on a blocking thread: the
+/// portal's session helper (`capture::portal::helper::spawn_child`, so the
+/// capture, the audio, keep busy and the notification prompt) and the
+/// recorder's launch (`recording::launch::unix::spawn_session_user`).
+///
+/// The walk ([`graphical_session_matching`]) runs on the thread of the one
+/// walk in flight for what is asked ([`SESSION_WALKS`]), and this waits
+/// [`SESSION_WALK_WAIT`] at most. Before, each caller walked on its own
+/// thread for as long as logind took, and a stopped logind answers each
+/// `loginctl` only at its D-Bus timeout, about 25 s.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+pub(crate) fn graphical_session_within(
+    want_uid: Option<u32>,
+    users_only: bool,
+) -> std::result::Result<GraphicalSession, NoGraphicalSession> {
+    let wait = SESSION_WALK_WAIT;
+    // A test stands the walk in for its own thread or task, with walks in
+    // flight of its own.
+    #[cfg(test)]
+    if let Some(stood) = session_walk_stand_in::now() {
+        return walked_in_time(stood.ask_blocking(want_uid, users_only, wait), wait);
+    }
+    let asked = SESSION_WALKS.ask_blocking((want_uid, users_only), wait, move || {
+        graphical_session_matching(want_uid, users_only).map_err(|e| format!("{e:#}"))
+    });
+    walked_in_time(asked, wait)
+}
+
+/// #3857 — the graphical session walks in flight, one for each kind of ask
+/// (the uid asked for, and whether only a person's session will do), each on
+/// a thread named `session-walk` (`one_in_flight`'s rules). While logind
+/// hangs, the callers that ask the same hold that one walk's thread however
+/// many they are, and each waits [`SESSION_WALK_WAIT`] at most. A root
+/// daemon's portal helper asks `(None, false)`, a per-user daemon's its own
+/// uid, and the recorder the person's uid, persons only.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+static SESSION_WALKS: crate::one_in_flight::OneInFlightPerKey<
+    (Option<u32>, bool),
+    std::result::Result<GraphicalSession, String>,
+> = crate::one_in_flight::OneInFlightPerKey::new("session-walk");
+
+/// #3857 — what a caller that waited `wait` takes from the walk in flight:
+/// the session, logind's own words when none matched, or "not known" with
+/// the reason when the walk gave no answer in time or ended with none. The
+/// walk goes on on its own thread, and its late answer reaches no one.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+fn walked_in_time(
+    asked: crate::one_in_flight::Asked<std::result::Result<GraphicalSession, String>>,
+    wait: std::time::Duration,
+) -> std::result::Result<GraphicalSession, NoGraphicalSession> {
+    use crate::one_in_flight::Asked;
+    match asked {
+        Asked::Answer(Ok(session)) => Ok(session),
+        Asked::Answer(Err(words)) => Err(NoGraphicalSession::Answered(words)),
+        Asked::Failed(why) => Err(NoGraphicalSession::NotKnown(format!(
+            "the graphical session walk ended with no answer: {why}"
+        ))),
+        Asked::OutOfTime => Err(NoGraphicalSession::NotKnown(format!(
+            "logind (`loginctl`) gave no answer about the graphical session within {wait:?}; the \
+             walk goes on on its own thread, and the next ask waits for it"
+        ))),
+    }
+}
+
+/// #3857 — the graphical session walk stood in for one test: `walk` in place
+/// of `loginctl`'s ([`graphical_session_matching`]). Installed for a thread
+/// ([`blocking`]: the portal helper's and the recorder's callers ask from
+/// their own) or for a task ([`asking`]: the notification prompt's start,
+/// which carries it onto the blocking thread its show runs on). Never the
+/// daemon's own walks, and never the tests beside it.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+pub(crate) mod session_walk_stand_in {
+    use super::GraphicalSession;
+    use crate::one_in_flight::{Asked, OneInFlightPerKey};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+    /// The walk: `(want_uid, users_only)` in, a session or logind's words out.
+    type Walk = dyn Fn(Option<u32>, bool) -> Result<GraphicalSession, String> + Send + Sync;
+
+    /// Walks in flight, one per kind of ask, as the daemon's.
+    type Walks = OneInFlightPerKey<(Option<u32>, bool), Result<GraphicalSession, String>>;
+
+    /// A walk stood in, with walks in flight of its own: one a test holds up
+    /// never holds up the tests beside it, which ask the daemon's.
+    #[derive(Clone)]
+    pub(crate) struct StandIn {
+        walk: Arc<Walk>,
+        walks: &'static Walks,
+    }
+
+    impl StandIn {
+        pub(crate) fn new(
+            walk: impl Fn(Option<u32>, bool) -> Result<GraphicalSession, String> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                walk: Arc::new(walk),
+                walks: Box::leak(Box::new(OneInFlightPerKey::new("session-walk"))),
+            }
+        }
+
+        /// A walk that logind holds until `held` opens, then answers
+        /// `session`. Each walk that begins is counted in `held`.
+        pub(crate) fn held(held: &Held, session: GraphicalSession) -> Self {
+            let held = held.clone();
+            Self::new(move |_, _| {
+                held.hold();
+                Ok(session.clone())
+            })
+        }
+
+        /// The walk, through this stand-in's walks in flight, as the
+        /// daemon's goes through its own: `wait` at most.
+        pub(super) fn ask_blocking(
+            &self,
+            want_uid: Option<u32>,
+            users_only: bool,
+            wait: std::time::Duration,
+        ) -> Asked<Result<GraphicalSession, String>> {
+            let walk = self.walk.clone();
+            self.walks
+                .ask_blocking((want_uid, users_only), wait, move || {
+                    walk(want_uid, users_only)
+                })
+        }
+    }
+
+    /// A held logind: each walk that reaches it is counted, and held until
+    /// the gate opens.
+    #[derive(Clone, Default)]
+    pub(crate) struct Held(Arc<HeldState>);
+
+    #[derive(Default)]
+    struct HeldState {
+        open: Mutex<bool>,
+        opened: Condvar,
+        began: AtomicUsize,
+    }
+
+    impl Held {
+        fn hold(&self) {
+            self.0.began.fetch_add(1, SeqCst);
+            let open = self.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                self.0
+                    .opened
+                    .wait_while(open, |open| !*open)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+
+        pub(crate) fn open(&self) {
+            *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.0.opened.notify_all();
+        }
+
+        /// Walks that reached logind.
+        pub(crate) fn began(&self) -> usize {
+            self.0.began.load(SeqCst)
+        }
+    }
+
+    /// Opens the gate when dropped: a failed assertion leaves nothing held,
+    /// and a runtime declared before it can shut down.
+    pub(crate) struct OpenedAtTheEnd(pub(crate) Held);
+
+    impl Drop for OpenedAtTheEnd {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    /// The person at the screen, as logind reports them.
+    pub(crate) fn ana() -> GraphicalSession {
+        GraphicalSession {
+            uid: 4242,
+            name: "ana".into(),
+            display: Some(":0".into()),
+            wayland_display: None,
+        }
+    }
+
+    tokio::task_local! {
+        static STOOD: StandIn;
+    }
+
+    std::thread_local! {
+        static HERE: std::cell::RefCell<Option<StandIn>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// `run`, the walks its task asks for taking `stood`'s: the notification
+    /// prompt's tests, so a build without the notification has no reader.
+    #[cfg_attr(not(feature = "portal-capture"), allow(dead_code))]
+    pub(crate) async fn asking<F: std::future::Future>(stood: StandIn, run: F) -> F::Output {
+        STOOD.scope(stood, run).await
+    }
+
+    /// `run` on THIS thread, the walks it asks for taking `stood`'s. What
+    /// stood here before comes back after.
+    pub(crate) fn blocking<R>(stood: &StandIn, run: impl FnOnce() -> R) -> R {
+        /// Puts back what stood here before, however `run` ends.
+        struct Restore(Option<StandIn>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let before = self.0.take();
+                HERE.with(|here| *here.borrow_mut() = before);
+            }
+        }
+        let _restore = Restore(HERE.with(|here| here.replace(Some(stood.clone()))));
+        run()
+    }
+
+    /// The walk stood in for this thread, or else for this task.
+    pub(crate) fn now() -> Option<StandIn> {
+        HERE.with(|here| here.borrow().clone())
+            .or_else(|| STOOD.try_with(StandIn::clone).ok())
+    }
+}
+
+/// #3857 — the graphical session walk of the callers on blocking threads,
+/// with logind stood in ([`session_walk_stand_in`]). Each ask runs on a
+/// thread of its own, as the portal helper's and the recorder's callers ask.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "portal-capture", feature = "recording")
+))]
+mod session_walk_tests {
+    use super::session_walk_stand_in::{Held, OpenedAtTheEnd, StandIn, ana, blocking};
+    use super::{
+        GraphicalSession, NoGraphicalSession, SESSION_WALK_WAIT, graphical_session_within,
+    };
+    use std::time::{Duration, Instant};
+
+    /// What an ask may take past the walk's wait on a busy runner.
+    const SLACK: Duration = Duration::from_secs(1);
+    /// What a walk that answers may take on a busy runner.
+    const RUNS_WITHIN: Duration = Duration::from_secs(10);
+
+    type Walked = Result<GraphicalSession, NoGraphicalSession>;
+
+    /// `graphical_session_within` on a thread of its own, taking `stood`'s
+    /// walk: what it answered, and how long that took.
+    fn ask_on_a_thread(
+        stood: &StandIn,
+        want_uid: Option<u32>,
+        users_only: bool,
+    ) -> std::sync::mpsc::Receiver<(Walked, Duration)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stood = stood.clone();
+        std::thread::spawn(move || {
+            let asked = Instant::now();
+            let walked = blocking(&stood, || graphical_session_within(want_uid, users_only));
+            let _ = tx.send((walked, asked.elapsed()));
+        });
+        rx
+    }
+
+    /// #3857 — while logind holds a walk, asks at once and in a row share
+    /// it: each is told the session is not known within its own wait, never
+    /// that nobody is there, and none starts another walk. Once logind
+    /// answers, the late walk answers nobody, and the next ask walks afresh.
+    ///
+    /// Red before #3857: every ask walked on its own thread, for as long as
+    /// logind held it.
+    #[test]
+    fn asks_while_a_walk_hangs_share_it() {
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let stood = StandIn::held(&held, ana());
+        let at_once: Vec<_> = (0..4)
+            .map(|_| ask_on_a_thread(&stood, None, false))
+            .collect();
+        for asked in at_once {
+            let (walked, waited) = asked
+                .recv_timeout(SESSION_WALK_WAIT + SLACK)
+                .expect("every ask at once is answered while logind holds the walk");
+            match walked {
+                Err(NoGraphicalSession::NotKnown(why)) => assert!(
+                    why.contains("no answer"),
+                    "the reason says logind gave no answer: {why}"
+                ),
+                other => panic!("logind held the walk, and it answered {other:?}"),
+            }
+            assert!(
+                waited >= SESSION_WALK_WAIT,
+                "an ask gave up in {waited:?}, before its wait"
+            );
+        }
+        for _ in 0..2 {
+            let (walked, _) = ask_on_a_thread(&stood, None, false)
+                .recv_timeout(SESSION_WALK_WAIT + SLACK)
+                .expect("an ask in a row is answered while logind holds the walk");
+            assert!(
+                matches!(walked, Err(NoGraphicalSession::NotKnown(_))),
+                "logind held the walk, and it answered {walked:?}"
+            );
+        }
+        assert_eq!(held.began(), 1, "one walk, however many asked");
+        held.open();
+        let (walked, _) = ask_on_a_thread(&stood, None, false)
+            .recv_timeout(RUNS_WITHIN)
+            .expect("the next ask is answered");
+        assert_eq!(walked, Ok(ana()), "a walk of its own");
+        assert_eq!(held.began(), 2, "the held walk, and the next ask's own");
+    }
+
+    /// The control: a walk in time answers as before. The session it found,
+    /// for the uid and the class each caller asks for, and logind's own words
+    /// when nobody is there.
+    #[test]
+    fn a_walk_in_time_answers_as_today() {
+        const NOBODY: &str = "no active graphical session — nobody is at this machine's screen";
+        let stood = StandIn::new(|want_uid, users_only| match (want_uid, users_only) {
+            (None, false) | (Some(4242), _) => Ok(ana()),
+            _ => Err(NOBODY.into()),
+        });
+        let ask = |want_uid, users_only| {
+            ask_on_a_thread(&stood, want_uid, users_only)
+                .recv_timeout(RUNS_WITHIN)
+                .expect("a walk in time is answered")
+                .0
+        };
+        assert_eq!(ask(None, false), Ok(ana()), "root's walk: anyone's session");
+        assert_eq!(ask(Some(4242), true), Ok(ana()), "the person's own");
+        assert_eq!(
+            ask(Some(1000), true),
+            Err(NoGraphicalSession::Answered(NOBODY.into())),
+            "logind's own words when nobody is there"
+        );
     }
 }

@@ -529,7 +529,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7149`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:7190`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2620`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -1210,7 +1210,7 @@ bus asking it anything gets `no-session-bus`, which is the architecture rather
 than a misconfiguration. So the daemon spawns **itself** — the hidden
 `roomlerd portal-helper` subcommand — as the console user, with that session's
 `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY` and `WAYLAND_DISPLAY`
-(`capture/portal/mod.rs:1313`), through a verified privilege drop rather than
+(`capture/portal/mod.rs:1316`), through a verified privilege drop rather than
 `CommandExt::uid()` (which leaves the child in root's supplementary groups — a
 silent retention bug, not a visible failure).
 
@@ -1222,7 +1222,7 @@ never started, and the cascade fell through to Xwayland's empty root — a black
 stream on every per-user install that set `portal_capture`. Every FR-45 field
 run was under root, which hid it until the vmtest per-user cell ran with the
 keys set (#1719 run B). The rule is now three-way (`run_as`,
-`capture/portal/mod.rs:1414`): root drops, the session's owner runs as itself,
+`capture/portal/mod.rs:1441`): root drops, the session's owner runs as itself,
 anyone else is refused with both uids named — and a per-user daemon looks up
 its **own** session, not the first active one.
 
@@ -1320,7 +1320,7 @@ checked before the daemon acts on it:
 | A frame | The payload is exactly its header's rows, `stride × height` bytes (256 MiB at most), in a pixel format the daemon knows | The frame is refused before its payload is read. The refusal is the reason the capture ends, and the media pump logs it as it rebuilds the capturer | `FrameHeader::decode`, `portal/wire.rs:114`; `read_frame`, `portal/backend.rs:587`; `stream_end`, `backend.rs:750` |
 | A frame, the helper's half | The helper sends exactly those rows: a longer buffer is cut after the last row, a buffer missing only the last row's padding gets it as zeros, and a shorter one is sent as it is, for the daemon to refuse | — | `payload`, `portal/wire.rs:136`, called at `portal/pipewire.rs:830` |
 | The handshake | At most 64 lines, each at most 64 KiB (`HANDSHAKE_LINE_MAX`), the size FR-142 gives a control frame. The longest legitimate line is the failure reason, one sentence; a `StreamStarted` line is about 200 bytes | The open fails with the limit named | `read_stream_handshake`, `portal/mod.rs:1212`; the line reader, `line_limit.rs:85` |
-| A one-shot answer: the probe, the screencast session report, the notification probe | 64 KiB in all (`ANSWER_MAX`), the handshake line's limit. The largest answer, the session report, is about 1 KiB | The caller is told why. The rest of the output is read and dropped, so the helper never waits on a full pipe | `read_answer`, `portal/mod.rs:1483`; `spawn_in_session`, `:1463` |
+| A one-shot answer: the probe, the screencast session report, the notification probe | 64 KiB in all (`ANSWER_MAX`), the handshake line's limit. The largest answer, the session report, is about 1 KiB | The caller is told why. The rest of the output is read and dropped, so the helper never waits on a full pipe | `read_answer`, `portal/mod.rs:1510`; `spawn_in_session`, `:1490` |
 
 ### 4.3 Input rides the same session (P4)
 
@@ -1683,9 +1683,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:2151`) — the same `loginctl` walk the FR-27
-consent companion uses. It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:2204-2207`),
+(`agents/roomlerd/src/companion.rs:2155`) — the same `loginctl` walk the FR-27
+consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
+most (`graphical_session_within`, `companion.rs:4683`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:2208-2211`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
