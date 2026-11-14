@@ -1144,7 +1144,7 @@ impl Desktop {
     fn discard_keeper(&self, pid: i32) {
         let _op = self.op.lock().unwrap_or_else(|e| e.into_inner());
         let mut st = self.state();
-        if !st.tree.as_ref().is_some_and(|t| t.keeper == Some(pid)) {
+        if st.tree.as_ref().is_none_or(|t| t.keeper != Some(pid)) {
             return;
         }
         // Our child, unreaped while the tree lists it, so its pid is ours.
@@ -1273,7 +1273,7 @@ impl Desktop {
             st.tree.as_ref().and_then(|t| t.pgid)
         };
         let clients = if x.keeper.is_some() {
-            "keeper"
+            "vd-keeper"
         } else {
             "daemon"
         };
@@ -4023,6 +4023,7 @@ mod supervise_tests {
     /// exits only when the test says so. So the order the field CAN take, the
     /// clients gone before the supervisor looks, is the order every run takes.
     #[test]
+    #[allow(clippy::zombie_processes)] // the server is reaped by the supervisor's teardown
     fn an_orphan_of_an_app_that_died_with_its_server_does_not_outlive_the_teardown() {
         if !have_setsid("an_orphan_of_an_app_that_died_with_its_server…") {
             return;
@@ -4211,6 +4212,7 @@ mod supervise_tests {
     /// number is in the roots the teardown signals without a look (the
     /// `is_root` shortcut in [`kill_tree_with`]).
     #[test]
+    #[allow(clippy::zombie_processes)] // the server is reaped by the stop's `kill_tree`
     fn a_window_manager_and_an_app_that_exit_are_collected() {
         let dir = scratch("exits");
         let d = dir.display();
@@ -5356,6 +5358,7 @@ mod supervise_tests {
     /// ends it, and leaves by itself (exit 0) within its deadline instead of
     /// waiting for a child it would never see go.
     #[test]
+    #[allow(clippy::zombie_processes)] // the keeper is reaped by `try_wait`, or killed and waited for
     fn the_keepers_teardown_ends_an_orphan_adopted_during_it() {
         use std::io::{BufRead as _, Write as _};
         use std::os::unix::process::CommandExt as _;
