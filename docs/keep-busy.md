@@ -395,18 +395,20 @@ does not spawn `loginctl` forever.
 | **CLI** (`roomler-cli/src/cli.rs` L336) | `roomler keep-busy status\|off [--json]`, and (P10) `roomler keep-busy on [--pattern P] [--size s\|m\|l] [--speed slow\|normal\|fast] [--resume-after SECONDS] [--auto-off MINUTES]` |
 | **LocalAPI** | All three verbs are on the person-socket allowlist, so a Linux system install's companion reaches them. Off is open to every peer the endpoint admits, because it is the safe direction (`roomler exec` included). **On** is the console person's alone (below). On a supervised Mac the root daemon asks the GUI worker for status and off (below) |
 
-**Who may turn it ON here (P10).** Whoever stands where the person does: the
-console session on Windows, the person's own uid elsewhere. Never root, and
-(P10b) never SYSTEM. `ClientPeer::may_start_keep_busy` (`crates/localapi`)
-answers per endpoint:
+**Who may turn it ON here (P10).** Whoever stands where the person does: on
+Windows the session whose screen the daemon shows (a machine-wide install's
+worker runs in the console session, a per-user daemon in its person's own
+session, over RDP too: `desktop-companion.md` §12.4), the person's own uid
+elsewhere. Never root, and (P10b) never SYSTEM.
+`ClientPeer::may_start_keep_busy` (`crates/localapi`) answers per endpoint:
 
 ```mermaid
 flowchart TD
   P[a LocalAPI keep_busy_on] --> R{peer is root?}
   R -- yes --> X[refused: sudo, and roomler exec on Unix]
   R -- no --> W{Windows peer?}
-  W -- yes --> S{the active console session, and not session 0?}
-  S -- no --> X2[refused: an RDP guest, a service in session 0]
+  W -- yes --> S{the session whose screen the daemon shows, and not session 0?}
+  S -- no --> X2[refused: another session, a service in session 0]
   S -- yes --> A{"the token's account (P10b)"}
   A -- "a person" --> OK[the engine starts it: set_by = the person at this computer]
   A -- "SYSTEM, LocalService, NetworkService" --> X4[refused: roomler exec in SystemContext mode]
