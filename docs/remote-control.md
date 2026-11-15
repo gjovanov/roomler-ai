@@ -2382,7 +2382,10 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    session helper, and a walk with no answer in time means no notification, with
    the reason in the log. A question that ends while its notification is on the
    way gets none, and nothing comes up late (#3857,
-   `docs/desktop-companion.md` §10.3).
+   `docs/desktop-companion.md` §10.3). A helper that has not posted within 5 s
+   is let go with its stdin closed, which takes down a notification it did
+   post, and is killed 1 s later if it is still there. What it posts expires at
+   the question's end (#3886, `docs/desktop-companion.md` §10.3.1).
 4. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
 5. **none** — reported as `no_prompt_surface`, not as a deny.
 

@@ -35,6 +35,11 @@
 //! - **The daemon takes it down** (answered elsewhere, timed out, the session
 //!   gone) by closing the helper's stdin. The helper closes the notification
 //!   and exits, so no Approve button outlives its question.
+//! - **A helper the daemon gives up on** (no "up" within 5 s) is let go the
+//!   same way, and killed only if it is still there 1 s later (#3886): a
+//!   notification it did post, its line late, comes down with it. It posts
+//!   nothing once its stdin has closed, and what it posts expires by itself at
+//!   the question's end, on a server that keeps the spec's `expire_timeout`.
 //!
 //! Kill switch `ROOMLERD_NOTIFY_CONSENT=0`.
 
@@ -50,8 +55,9 @@ pub struct Request {
     pub actions: Vec<(String, String)>,
     /// 0 low, 1 normal, 2 critical.
     pub urgency: u8,
-    /// How long the helper keeps it up at most. A backstop: the daemon closes
-    /// it first.
+    /// How long the helper keeps it up at most, from the request's arrival,
+    /// and when the notification expires by itself (#3886). A backstop: the
+    /// daemon closes it first.
     pub lifetime_ms: u64,
 }
 
@@ -291,12 +297,19 @@ mod parent {
     use std::collections::HashMap;
     use std::io::{BufRead, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
     use std::time::Duration;
 
     /// How long posting may take: a session bus round trip or three. A wedged
     /// bus must not hold the prompt's window.
     const SHOW_BUDGET: Duration = Duration::from_secs(5);
+
+    /// #3886 — what a helper the daemon gave up on has, from the close of its
+    /// stdin, to take down a notification it did post and exit: once its
+    /// `Notify` has answered, a `CloseNotification` round trip. Only then is
+    /// it killed. Counted on a thread of its own ([`let_go`]), after the
+    /// verdict: nothing waits for it.
+    const GIVE_UP_GRACE: Duration = Duration::from_secs(1);
 
     /// The consent questions this daemon has on screen as notifications.
     #[derive(Clone)]
@@ -506,6 +519,12 @@ mod parent {
     /// #3886 — [`launch`]'s helper, once started: `req` written to its stdin,
     /// its lines read on a thread of their own, and its first line waited for
     /// `budget` at most ([`SHOW_BUDGET`]). A test hands it a stand-in.
+    ///
+    /// A helper given up on is let go the way the daemon takes any
+    /// notification down: its stdin closes, so a notification it did post,
+    /// its line still on the way, comes down too. It is killed only if it is
+    /// still there [`GIVE_UP_GRACE`] later ([`let_go`]). The verdict, "not
+    /// up", is returned at the give-up, as before.
     fn put_up(
         mut child: std::process::Child,
         req: &Request,
@@ -535,6 +554,8 @@ mod parent {
         }
         let (shown_tx, shown_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let pid = child.id();
+        let ended = Arc::new(Ended::default());
+        let reader_ended = ended.clone();
         let reader = std::thread::Builder::new()
             .name(format!("notify-{what}"))
             .spawn(move || {
@@ -556,6 +577,8 @@ mod parent {
                         None => {}
                     }
                 }
+                // Before the reap: from here on no kill is sent to its pid.
+                reader_ended.mark();
                 if let Some(s) = shown.take() {
                     let _ = s.send(Err("the helper ended without posting it".into()));
                 }
@@ -571,17 +594,65 @@ mod parent {
             Ok(Ok(())) => Ok(stdin),
             Ok(Err(why)) => Err(why),
             Err(_) => {
-                // Not yet reaped (the reader waits on it), so the pid is still
-                // this child's.
-                // SAFETY: plain `kill(2)` on our own unreaped child.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
+                // #3886 — the daemon's "take it down": a helper whose
+                // notification is up, its line late, closes it and exits.
+                drop(stdin);
+                let_go(pid, ended, GIVE_UP_GRACE);
                 Err(format!(
                     "the session helper did not post it within {} s",
                     budget.as_secs()
                 ))
             }
+        }
+    }
+
+    /// #3886 — whether a helper's stdout has closed: it has exited, or is
+    /// exiting, and its reader reaps it next. Marked under the lock BEFORE the
+    /// reap, so a kill sent under the lock while it is unmarked reaches our
+    /// own unreaped child (a zombie at worst), never a process that took its
+    /// pid.
+    #[derive(Default)]
+    struct Ended {
+        ended: Mutex<bool>,
+        marked: Condvar,
+    }
+
+    impl Ended {
+        /// Its stdout closed: no kill is sent to its pid from here on.
+        fn mark(&self) {
+            *self.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            self.marked.notify_all();
+        }
+
+        /// `SIGKILL` to `pid`, unless its stdout closes within `grace`.
+        fn kill_unless_ended_within(&self, pid: u32, grace: Duration) {
+            let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+            let (ended, _) = self
+                .marked
+                .wait_timeout_while(ended, grace, |ended| !*ended)
+                .unwrap_or_else(PoisonError::into_inner);
+            if !*ended {
+                // Unmarked, and the lock held: not yet reaped, so the pid is
+                // still this child's.
+                // SAFETY: plain `kill(2)` on our own unreaped child.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// #3886 — a helper given up on, its stdin already closed: it takes down a
+    /// notification it did post, and exits. Killed if it is still there
+    /// `grace` later, on a thread of its own, so nothing waits for it.
+    fn let_go(pid: u32, ended: Arc<Ended>, grace: Duration) {
+        let waiting = ended.clone();
+        let spawned = std::thread::Builder::new()
+            .name("notify-let-go".into())
+            .spawn(move || waiting.kill_unless_ended_within(pid, grace));
+        if spawned.is_err() {
+            // No thread to wait on: killed at once, as before #3886.
+            ended.kill_unless_ended_within(pid, Duration::ZERO);
         }
     }
 
@@ -921,7 +992,9 @@ rm -f "$UP"
 
 /// The session helper's half: `roomlerd portal-helper --notify`. Reads one
 /// [`Request`] line on stdin, posts it, says what happened on stdout, and
-/// closes the notification when stdin closes or its lifetime ends.
+/// closes the notification when stdin closes or its lifetime ends. A stdin
+/// that closed before the post (the daemon gave up on it, #3886) posts
+/// nothing.
 ///
 /// ⚠️ zbus's blocking API panics inside a tokio runtime ("Cannot start a
 /// runtime from within a runtime"), and the subcommand is reached from the
@@ -1000,6 +1073,26 @@ mod helper {
             .map_err(|e| format!("reading the request: {e}"))?;
         let req: Request =
             serde_json::from_str(first.trim()).map_err(|e| format!("the request: {e}"))?;
+        // #3886 — the question's end, counted from its arrival: this helper's
+        // own backstop, and the notification's expiry.
+        let deadline = Instant::now() + Duration::from_millis(req.lifetime_ms);
+
+        // ONE stream for the daemon's close and the server's signals (below).
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        // #3886 — the daemon's close is heard from the start: one that comes
+        // while the session bus is still being reached (the daemon gave up on
+        // this helper) is seen before anything is posted.
+        let parent = tx.clone();
+        std::thread::spawn(move || {
+            // Everything after the request is ignored; the close is the
+            // message.
+            let mut sink = String::new();
+            let mut lock = std::io::stdin().lock();
+            while matches!(lock.read_line(&mut sink), Ok(n) if n > 0) {
+                sink.clear();
+            }
+            let _ = parent.send(Event::Parent);
+        });
 
         let conn =
             zbus::blocking::Connection::session().map_err(|e| format!("no session bus: {e}"))?;
@@ -1027,11 +1120,9 @@ mod helper {
         // they arrive in the order the server sent them: a body click is
         // `ActionInvoked(default)` then `NotificationClosed`, and read the
         // other way round it would be a refusal.
-        let (tx, rx) = std::sync::mpsc::channel::<Event>();
         let signals = proxy
             .receive_all_signals()
             .map_err(|e| format!("subscribing to the notification signals: {e}"))?;
-        let t = tx.clone();
         std::thread::spawn(move || {
             for msg in signals {
                 let header = msg.header();
@@ -1049,24 +1140,25 @@ mod helper {
                     _ => None,
                 };
                 if let Some(e) = event
-                    && t.send(e).is_err()
+                    && tx.send(e).is_err()
                 {
                     return;
                 }
             }
         });
-        std::thread::spawn(move || {
-            // Everything after the request is ignored; the close is the
-            // message.
-            let mut sink = String::new();
-            let mut lock = std::io::stdin().lock();
-            while matches!(lock.read_line(&mut sink), Ok(n) if n > 0) {
-                sink.clear();
-            }
-            let _ = tx.send(Event::Parent);
-        });
 
-        let mut id = post(&proxy, &req, &body)?;
+        // #3886 — the daemon gave up on this helper before it could post:
+        // nothing goes up. Nothing is posted yet, so any other event is
+        // another notification's.
+        if rx.try_iter().any(|e| matches!(e, Event::Parent)) {
+            crate::logging::say_on_stderr(format_args!(
+                "portal-helper --notify: the daemon took it down before it was posted; nothing \
+                 posted"
+            ));
+            return Ok(());
+        }
+
+        let mut id = post(&proxy, &req, &body, deadline)?;
         say(format!("{SHOWN}{id}"));
         crate::logging::say_on_stderr(format_args!(
             "portal-helper --notify: posted notification {id}"
@@ -1078,7 +1170,6 @@ mod helper {
                 "portal-helper --notify: closed notification {id} ({why})"
             ));
         };
-        let deadline = Instant::now() + Duration::from_millis(req.lifetime_ms);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
@@ -1089,7 +1180,7 @@ mod helper {
                 // `NotificationClosed` then names an id no longer ours.
                 Ok(Event::Action(i, key)) if i == id && key == DEFAULT => {
                     close(i, "its body was clicked");
-                    id = post(&proxy, &req, &body)?;
+                    id = post(&proxy, &req, &body, deadline)?;
                     crate::logging::say_on_stderr(format_args!(
                         "portal-helper --notify: posted it again as notification {id}"
                     ));
@@ -1119,9 +1210,17 @@ mod helper {
         }
     }
 
-    /// One `Notify`: the request's words and buttons, at its urgency, never
-    /// expiring by itself (the daemon or the lifetime closes it).
-    fn post(proxy: &zbus::blocking::Proxy<'_>, req: &Request, body: &str) -> Result<u32, String> {
+    /// One `Notify`: the request's words and buttons, at its urgency. The
+    /// daemon or the lifetime closes it. #3886 — it also expires by itself at
+    /// `deadline`, the question's end, on a server that keeps the spec's
+    /// `expire_timeout`: a notification this helper could not close (killed
+    /// while its `Notify` was being answered) goes then.
+    fn post(
+        proxy: &zbus::blocking::Proxy<'_>,
+        req: &Request,
+        body: &str,
+        deadline: Instant,
+    ) -> Result<u32, String> {
         let flat: Vec<&str> = req
             .actions
             .iter()
@@ -1140,11 +1239,44 @@ mod helper {
                     body,
                     flat,
                     hints,
-                    0i32,
+                    expire_timeout(deadline.saturating_duration_since(Instant::now())),
                 ),
             )
             .and_then(|r| r.body().deserialize())
             .map_err(|e| format!("Notify: {e}"))
+    }
+
+    /// #3886 — `Notify`'s `expire_timeout` for what is `left` of the
+    /// question: milliseconds, at least 1 and at most what an `i32` holds.
+    /// ⚠️ Never 0, which is "never expires", nor -1, the server's default.
+    fn expire_timeout(left: Duration) -> i32 {
+        i32::try_from(left.as_millis()).unwrap_or(i32::MAX).max(1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::expire_timeout;
+        use std::time::Duration;
+
+        /// #3886 — the expiry is what is left of the question, in
+        /// milliseconds; a question with nothing left still expires (1 ms),
+        /// and a lifetime past what an `i32` holds is capped, never wrapped.
+        #[test]
+        fn the_notification_expires_with_its_question() {
+            assert_eq!(expire_timeout(Duration::from_secs(30)), 30_000);
+            assert_eq!(expire_timeout(Duration::from_millis(1500)), 1500);
+            assert_eq!(expire_timeout(Duration::ZERO), 1);
+            assert_eq!(expire_timeout(Duration::from_micros(400)), 1);
+            assert_eq!(
+                expire_timeout(Duration::from_secs(24 * 3600)),
+                86_400_000,
+                "the being-viewed notice's day"
+            );
+            assert_eq!(
+                expire_timeout(Duration::from_secs(40 * 24 * 3600)),
+                i32::MAX
+            );
+        }
     }
 }
 
