@@ -21,10 +21,12 @@
 # /bin/sh), Debian's bash 5 in POSIX mode, and bash 3.2.57 in POSIX mode, the
 # version of macOS's /bin/sh (a Linux build, copied out of the official image
 # bash:3.2 as macos-postinstall-check.sh --bash copies it). It runs as a person
-# in a throwaway debian:12 container with no network. Stand-ins on PATH answer
-# for curl (the feed and the downloads), sudo, dpkg, apt-get, systemctl,
+# (a privileged half as root) in a throwaway debian:12 container with no
+# network. Stand-ins on PATH answer for curl (the feed and the downloads), sudo
+# (which runs nothing but `test`, a question), dpkg, apt-get, systemctl,
 # installer, launchctl, uname, hostname, the daemon and the tunnel CLI, and
-# they record every call. A running daemon's own image, /proc/$pid/exe, cannot
+# they record every call; a case can make one of their calls read its stdin
+# first, as a binary could. A running daemon's own image, /proc/$pid/exe, cannot
 # be a stand-in (a script's is its interpreter), so where a case has one
 # running, systemctl names a MainPID that leads /proc/$pid/exe to a stand-in.
 # Each case checks the lines, the exit code, and that no control byte but
@@ -73,7 +75,7 @@ if [ "${1:-}" != --in-container ]; then
                 shift 2 ;;
             --keep) keep="$2"; shift 2 ;;
             --rewrite-calls) rewrite=1; shift ;;
-            -h|--help) sed -n '3,56p' "$0"; exit 0 ;;
+            -h|--help) sed -n '3,58p' "$0"; exit 0 ;;
             *) script="$1"; shift ;;
         esac
     done
@@ -202,6 +204,11 @@ case "$me" in
     uname | hostname | mktemp | stat | sleep) ;; # answers, not actions
     *) printf '%s\n' "$line" >>"$C/calls.log" ;;
 esac
+# #3925 — a case can make one call read its stdin first, as a binary could: the
+# call of this name whose line holds the words in stdin.<name>.
+if [ -f "$C/stdin.$me" ]; then
+    case "$line" in *"$(cat "$C/stdin.$me")"*) cat >/dev/null ;; esac
+fi
 case "$me" in
     uname)
         case "${1:-}" in
@@ -229,7 +236,13 @@ case "$me" in
             if [ -f "$C/version.reads-stdin" ]; then cat >/dev/null; fi
             cat "$C/version.out"
             exit "$(cat "$C/version.rc")"
-        fi ;;
+        fi
+        # Its enroll's help names --one-row, as a release's since FR-43 P3d.
+        if [ "$*" = "enroll --help" ]; then echo "      --one-row"; fi ;;
+    sudo)
+        # `test` is a question, not an action, so it is answered for real: a
+        # Mac case then finds no root config and enrolls the root half.
+        if [ "${1:-}" = test ]; then shift; test "$@"; exit; fi ;;
     roomler)
         if [ "${1:-}" = --version ]; then
             # A case can make its Nth --version (this one is logged above)
@@ -285,6 +298,9 @@ ln -sf "$S/standin" /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd
 mkdir -p "$S/running"
 ln -sf "$S/standin" "$S/running/exe"
 PID=..$S/running
+# What a privileged half takes with --config-from: the config its caller
+# enrolled in its own process (the stand-in daemon never reads it).
+printf 'agent_id = "check-agent"\n' >"$S/enrolled.toml"
 
 # The feed: compact JSON as the server writes it, newest release first. Every
 # asset is the same small file, so the digest checks out, and an asset's URL
@@ -353,12 +369,24 @@ SH=""
 # RUNNING_CAPS to update-helper --capabilities; RUNNING_READS_STDIN=1 makes
 # that --version read its stdin first. CLI=<answer> is what the tunnel CLI
 # prints to --version, and CLI_READS_STDIN=<n> makes its nth --version read
-# its stdin first. The records land in $RUNS/$SH/CASE.
+# its stdin first. READS='<stand-in> <words>' makes that stand-in read its
+# stdin first in the call whose line holds the words. HAS_CONFIG=1 puts an
+# earlier install's config at /etc/roomler/config.toml, HAS_PLIST=1 the root
+# half's LaunchDaemon where the package puts it, and AS_ROOT=1 runs the script
+# as root, as a privileged half runs. The records land in $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
-    rm -rf "$C" /tmp/roomler-install.*
+    rm -rf "$C" /tmp/roomler-install.* /etc/roomler /Library/LaunchDaemons
     mkdir -p "$C"
+    if [ "${HAS_CONFIG:-0}" = 1 ]; then
+        mkdir -p /etc/roomler
+        printf 'agent_id = "check-earlier"\n' >/etc/roomler/config.toml
+    fi
+    if [ "${HAS_PLIST:-0}" = 1 ]; then
+        mkdir -p /Library/LaunchDaemons
+        : >/Library/LaunchDaemons/com.roomler.daemon.plist
+    fi
     echo "$os" >"$C/os"
     echo "$arch" >"$C/arch"
     feed "$feedname" >"$C/feed.json"
@@ -373,6 +401,7 @@ run() {
     fi
     [ -z "${CLI+set}" ] || printf '%s' "$CLI" >"$C/cli.out"
     [ -z "${CLI_READS_STDIN:-}" ] || printf '%s\n' "$CLI_READS_STDIN" >"$C/cli.reads-stdin"
+    [ -z "${READS:-}" ] || printf '%s' "${READS#* }" >"$C/stdin.${READS%% *}"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -385,9 +414,11 @@ run() {
         bash) shell=(/usr/bin/bash --posix) ;;
         bash3.2) shell=(/opt/bash32/bash --posix) ;;
     esac
+    who=tester uid=1000 home=/home/tester
+    [ "${AS_ROOT:-0}" = 0 ] || who=root uid=0 home=/root
     set +e
-    cat /src/install.sh 2>/dev/null | setpriv --reuid=1000 --regid=1000 --clear-groups \
-        env -i HOME=/home/tester USER=tester LOGNAME=tester LANG=C.UTF-8 PATH="$path" \
+    cat /src/install.sh 2>/dev/null | setpriv --reuid=$uid --regid=$uid --clear-groups \
+        env -i HOME=$home USER=$who LOGNAME=$who LANG=C.UTF-8 PATH="$path" \
         "${shell[@]}" -s -- --server https://roomler.example "$@" >"$C/out.txt" 2>&1
     echo "${PIPESTATUS[1]}" >"$C/rc"
     set -e
@@ -476,9 +507,20 @@ for SH in $SHELLS; do
     # rest of the script: the script gives it none, and still ends.
     READS_STDIN=1 run deb-system/reads-stdin Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 "${sys[@]}"
     says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    # #3925 — the token enrollment every token install runs, here through
+    # sudo, reads its stdin: the script gives it none, and still ends.
+    READS='sudo [enroll]' run deb-system/reads-stdin-enroll Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 "${sys[@]}"
+    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
     # The per-user install, the desktop default, and a Mac's.
     run deb-user/match Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
     says agent-v0.4.221 0.4.221 0; done_case
+    # #3925 — the enrollment, run as the person, and then the update helper's
+    # question to the installed daemon (update-helper --capabilities), each
+    # reads its stdin.
+    READS='roomlerd [enroll]' run deb-user/reads-stdin-enroll Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
+    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    READS='roomlerd [update-helper]' run deb-user/reads-stdin-caps Linux x86_64 1 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
+    says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
     run pkg/match Darwin arm64 0 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
     says agent-v0.4.221 0.4.221 0; done_case
     run pkg/exit1 Darwin arm64 0 normal '' 1 --role daemon --token check-token
@@ -521,6 +563,10 @@ for SH in $SHELLS; do
     self "$VU"; done_case
     RUNNING=$old RUNNING_CAPS=$cap run deb-user-self/long Linux x86_64 1 normal "roomlerd $LONG"$'\n' 0 "${usr[@]}"
     self "$VU"; lines "$LONG" 0; done_case
+    # #3925 — the running image's answer to update-helper --capabilities reads
+    # its stdin.
+    READS='exe [update-helper]' RUNNING=$old RUNNING_CAPS=$cap run deb-user-self/reads-stdin-caps Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    self 0.4.221; want "==> done."; done_case
     # Another answer, from a daemon that cannot: restarted, and the line names
     # what it runs. One that answers nothing runs "an unknown version", as before.
     RUNNING=$old run deb-user-restart/normal Linux x86_64 1 normal "$new" 0 "${usr[@]}"; restart 0.4.220; done_case
@@ -530,6 +576,37 @@ for SH in $SHELLS; do
     restart "an unknown version"; done_case
     RUNNING="roomlerd $LONG"$'\n' run deb-user-restart/long Linux x86_64 1 normal "$new" 0 "${usr[@]}"
     restart "$VU"; lines "$LONG" 0; done_case
+
+    # #3925 — the privileged half of a --system install, run as root, finds an
+    # earlier config there and has the daemon fold the caller's enrollment into
+    # it: it asks whether the daemon can (adopt-enrollment --help), then has it
+    # do so (--from). Either call reads its stdin.
+    priv=(--role daemon --privileged-steps --system --config-from "$S/enrolled.toml")
+    fold="==> a config already exists at /etc/roomler/config.toml — folding the new enrollment into it (operator settings kept)"
+    AS_ROOT=1 HAS_CONFIG=1 run deb-privileged/normal Linux x86_64 1 normal "$new" 0 "${priv[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
+    AS_ROOT=1 HAS_CONFIG=1 READS='roomlerd [adopt-enrollment] [--help]' \
+        run deb-privileged/reads-stdin-ask Linux x86_64 1 normal "$new" 0 "${priv[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
+    AS_ROOT=1 HAS_CONFIG=1 READS='roomlerd [adopt-enrollment] [--from]' \
+        run deb-privileged/reads-stdin-fold Linux x86_64 1 normal "$new" 0 "${priv[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$fold"; want "==> done."; done_case
+    # #3925 — a Mac given its root half as a second row (--daemon-token): that
+    # half's enrollment, through sudo, reads its stdin.
+    two=(--role daemon --token check-token --daemon-token check-token-2)
+    rh="==> enrolling the privileged half as 'check-host-daemon' (second single-use token, overlay on)"
+    HAS_PLIST=1 run pkg-two-row/normal Darwin arm64 0 normal "$new" 0 "${two[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$rh"; want "==> done."; done_case
+    HAS_PLIST=1 READS='sudo [enroll]' run pkg-two-row/reads-stdin Darwin arm64 0 normal "$new" 0 "${two[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$rh"; want "==> done."; done_case
+    # #3925 — a Mac as one row (--one-row): the daemon's enroll --help, which
+    # says whether this release has --one-row, reads its stdin.
+    one=(--role daemon --one-row --token check-token)
+    row="==> enrolling this Mac as 'check-host' against https://roomler.example, as its one row, overlay on (token is single-use, never echoed)"
+    run pkg-one-row/normal Darwin arm64 0 normal "$new" 0 "${one[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
+    READS='roomlerd [enroll] [--help]' run pkg-one-row/reads-stdin Darwin arm64 0 normal "$new" 0 "${one[@]}"
+    says agent-v0.4.221 0.4.221 0; want "$row"; want "==> done."; done_case
 
     # The tunnel role installs the CLI, which names itself as it always has;
     # neither #3881 line belongs to it. What the CLI answers is printed when
@@ -550,6 +627,12 @@ for SH in $SHELLS; do
     lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
     CLI_READS_STDIN=3 run tunnel/reads-stdin-names Linux x86_64 1 normal '' 0 --role tunnel
     lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
+    # #3925 — given a token the CLI enrolls, and its enroll reads its stdin.
+    tun="==> enrolling this tunnel client as 'check-host' against https://roomler.example (token is single-use, never echoed)"
+    run tunnel-enroll/normal Linux x86_64 1 normal '' 0 --role tunnel --token check-token
+    lines "$R" 0; lines "$V" 0; want "$tun"; want "==> done."; done_case
+    READS='roomler [enroll]' run tunnel-enroll/reads-stdin Linux x86_64 1 normal '' 0 --role tunnel --token check-token
+    lines "$R" 0; lines "$V" 0; want "$tun"; want "==> done."; done_case
 
     # The same calls, byte for byte, in every case of a mode: neither the
     # feed's tag nor the daemon's answer changes what the script runs or how
