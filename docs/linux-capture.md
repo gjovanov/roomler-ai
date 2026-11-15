@@ -919,6 +919,45 @@ same on both paths. The issue's three
 paths failed on the code before the keeper, and each later fix's test fails
 with that fix taken out.
 
+**In the field** (2026-11-15,
+[#3665](https://github.com/gjovanov/roomler-ai/issues/3665#issuecomment-6890893043)):
+a lab guest on Ubuntu 24.04 (kernel 6.8, systemd 255, cgroup v2), the daemon as
+the shipped system unit with a person's Wayland session logged in beside it,
+and the desktop on Xvfb. The control was the published 0.4.222, which has no
+keeper. The other column is a package the release lane built from the keeper's
+branch before its merge; no file but the daemon's binary differs between the
+two packages. The window manager was openbox, and the startup app was a probe
+that can start a `setsid` child that ignores SIGTERM. A restart is timed from
+the request to the new daemon's first answer.
+
+| What was done | 0.4.222 | With the keeper |
+|---|---|---|
+| A startup app exits by itself while the desktop runs; then the window manager is sent SIGTERM | a zombie under the daemon each time, and nothing logged | no zombie, and each exit logged |
+| The X server is SIGKILLed while a startup app's deaf child runs, and the child is watched for 15 s | alive at 15 s, a child of init, in the unit's cgroup | gone 2.0 s after the server's exit |
+| `systemctl stop` then | 90.3 s: systemd times out and SIGKILLs what is left, and the unit ends `failed` | 1.6 s: the unit's cgroup is empty, and the unit ends `inactive` |
+| The same kill, then `roomler restart` | 97.8 s | 7.0 s |
+| The app starts the deaf child and exits by itself; then `roomler restart` | 95.7 s, and the child's parent is init | 7.5 s, and the child's parent is the keeper |
+| `roomler restart` with nothing left behind, the baseline of each column | 7.5 s | 7.0 s |
+| openbox and one GTK app (`gnome-calculator`); the X server is SIGKILLed | the new desktop is up 1.2 s after the kill, and nothing of the first one is left 15 s later | the same, with the keeper as a fourth process of the desktop |
+
+Three things the read showed beside the numbers:
+
+- With a deaf child the desktop is back 2.7 s after the X server's SIGKILL,
+  against 1.2 s without one: the keeper gives the child its grace of 1.5 s
+  before SIGKILL.
+- systemd words the 90 s timeout by who went first. A daemon that exits by
+  itself (`roomler restart`) leaves the unit in `stop-sigterm`. Under
+  `systemctl stop` the daemon exits on the signal and the unit waits for what
+  is left in its cgroup, in `final-sigterm`. A journal search for one wording
+  misses the other.
+- A plain window manager with one GTK app left nothing behind when its X
+  server was killed, on either build. The orphan needs an app that starts a
+  child in a session of its own.
+
+Not measured: a full desktop environment (which of its helpers outlive their
+X server), the per-user unit and a daemon that no service manager owns (the
+tests cover both), and arm64.
+
 ## 3. The DRM arm (FR-36)
 
 Read the scanout plane from the kernel: `drmModeGetFB2` → `PrimeHandleToFD` →
