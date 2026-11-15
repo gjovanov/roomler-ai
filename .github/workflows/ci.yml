@@ -1274,6 +1274,13 @@ jobs:
         # features so that step runs in this build (arboard is pure Rust on
         # Linux).
         #
+        # #3665 — the virtual desktop's teardown, each test on an Xvfb of the
+        # desktop's own (never this one): a killed X server takes the
+        # SIGTERM-deaf `setsid` orphan of its X client with it, which the
+        # direct start (the kill switch) is shown not to do; and after two
+        # early exits of the desktop's keeper (vd-keeper) the desktop starts
+        # without one and stays up. Both `x11-real:` lines are grepped.
+        #
         # `-noreset`: without it Xvfb regenerates whenever its last client
         # disconnects, and a test that connects during the regeneration gets
         # ConnectionReset (os 104) — the flake that failed 0.4.148's bump
@@ -1303,6 +1310,8 @@ jobs:
           grep -q "x11-real: the layouts .* read back, and the switch to de-DE and back took" /tmp/x11-tests.log
           grep -q "x11-real: a nudge woke a root listener" /tmp/x11-tests.log
           grep -q "x11-real: a killed X server came back on" /tmp/x11-tests.log
+          grep -q "x11-real: after two vd-keeper exits the desktop on" /tmp/x11-tests.log
+          grep -q "x11-real: a killed X server on .* took the orphan of its X client with it" /tmp/x11-tests.log
 
       # #3813 — the real clipboard on X11. A test that writes it replaces what
       # the person at the display had copied, so each such test runs only
