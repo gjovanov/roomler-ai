@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ask GitHub to re-run the installer smoke's Windows job once, when that job
-# ended without every step reporting an end (#3810).
+# ended without every step reporting an end, if no guard below refuses (#3810).
 #
 # Run by the workflow installer-smoke-rerun
 # (.github/workflows/installer-smoke-rerun.yml) when an installer-smoke run
@@ -27,6 +27,7 @@
 #       job does not read the annotations).
 #   G3  read last, right before the re-run is asked: no smoke run created
 #       after this one exists for the same branch, event and head repository.
+#       A reply that holds no list of runs is refused, as at G2.
 #       Whether a re-run enters the smoke's concurrency group again, GitHub's
 #       documentation does not say; if it does, there it could cancel the
 #       newer run. A push between this read and the re-run is not seen.
@@ -41,10 +42,11 @@
 # log. After that comes ONE line, also written to the job summary, in this
 # script's own words, with nothing of the run but numbers (its id, attempt and
 # job ids, step counts) and GitHub's status words: what it did, and why. A
-# read or a re-run that failed is also a `::warning`. It always exits 0: a red
-# run of this workflow would sit on the default branch's head, where the
-# smoke run's reader does not look, and the smoke's check job says where to
-# look when no attempt 2 follows.
+# read or a re-run that failed is also a `::warning`. It exits 0 on every path
+# it controls (a cancel or the job's timeout ends it otherwise): a red run of
+# this workflow would sit on the default branch's head, where the smoke run's
+# reader does not look, and the smoke's check job says where to look when no
+# attempt 2 follows.
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -63,12 +65,17 @@ fi
 tmp=$(mktemp -d)
 closed=no
 trap '[ "$closed" = yes ] || echo "::$token::"; rm -rf "$tmp"' EXIT
+# The decision replaces the control characters in every name it prints, but
+# that alone makes no line safe outside this block (a command can sit
+# mid-line), so the block stays.
 echo "::stop-commands::$token"
 exec 2>&1
 
+# Closes the block first and marks it closed after: a signal between the two
+# then prints a second close at worst, never none.
 end() { # LINE [warning]
-  closed=yes
   echo "::$token::"
+  closed=yes
   [ "${2-}" != warning ] || echo "::warning title=installer-smoke-rerun::$1"
   echo "$1"
   echo "$1" >>"$summary"
@@ -122,6 +129,8 @@ created=$(jq -r '.created_at // empty' "$tmp/run.json")
   stop 'its branch, event, head repository, workflow or creation time could not be read.' warning
 gh api -X GET "repos/$repo/actions/workflows/$workflow/runs" -f branch="$branch" -f event="$event" \
   -f created=">$created" -f per_page=100 >"$tmp/newer.json" ||
+  stop 'the newer runs of its branch could not be read.' warning
+jq -e '.workflow_runs | type == "array"' "$tmp/newer.json" >/dev/null 2>&1 ||
   stop 'the newer runs of its branch could not be read.' warning
 newer=$(jq -r --arg r "$head_repo" --arg c "$created" --argjson id "$run" \
   '[.workflow_runs[] | select(.id != $id and .head_repository.full_name == $r and .created_at > $c)] | first | .id // empty' \

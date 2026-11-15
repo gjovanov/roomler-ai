@@ -29,7 +29,8 @@
 #   G3  no newer smoke run exists for the same branch, event and head
 #       repository, read last, right before the re-run is asked.
 # The script's header says what each guard does not see. It writes ONE line
-# to its summary: what it did, and why, and it always ends 0.
+# to its summary, what it did and why, and ends 0 on every path it controls;
+# a cancel or the job's timeout ends it otherwise.
 name: installer-smoke-rerun
 
 on:
@@ -40,14 +41,15 @@ on:
 permissions: {}
 
 # One run of this workflow at a time for one smoke run: a second delivery of
-# the same event waits, then reads that run's live attempt and refuses.
+# the same event waits, then runs the guards again; once the first re-run was
+# accepted and the run reads attempt 2, it refuses at G1.
 concurrency:
   group: installer-smoke-rerun-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
   rerun:
-    name: Re-run the installer smoke's Windows job once when not every step of it reported an end (#3810)
+    name: Re-run the installer smoke's Windows job once when not every step of it reported an end, if no guard refuses (#3810)
     if: ${{ github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -64,7 +66,7 @@ jobs:
             scripts/job-steps-ended-rerun.sh
           sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Read the run, and ask GitHub to re-run its Windows job once if not every step of it reported an end
+      - name: Read the run, and ask GitHub to re-run its Windows job once if not every step of it reported an end and no guard refuses
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

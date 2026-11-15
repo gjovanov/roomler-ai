@@ -3,11 +3,12 @@
 #
 # The installer smoke's Windows job (.github/workflows/installer-smoke.yml) is
 # re-run once, as attempt 2 of its run, when it ended without every step
-# reporting an end. This script is that decision, and its only copy: the
-# smoke's check job prints its lines in the run, and the workflow
-# installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml, through
+# reporting an end, if no guard of the re-run refuses. This script is that
+# decision, and its only copy: the smoke's check job prints its lines in the
+# run, and the workflow installer-smoke-rerun
+# (.github/workflows/installer-smoke-rerun.yml, through
 # scripts/job-steps-ended-rerun.sh) asks GitHub to re-run that one job when it
-# reads `incomplete` on attempt 1.
+# reads `incomplete` on attempt 1 and none of its guards refuses.
 #
 # The rule:
 #   complete    GitHub lists at least one step of the job, and the status of
@@ -22,7 +23,9 @@
 # that reported no end is printed with the API's own status word. Every string
 # the API gives (a step's name first) is printed with each control character,
 # U+0000 to U+001F and U+007F, replaced by a space, so that no name can start a
-# line of its own: a pull request's own workflow file names its steps.
+# line of its own: a pull request's own workflow file names its steps. That
+# alone makes no line safe outside a stop-commands block (a command can sit
+# mid-line), so scripts/job-steps-ended-rerun.sh keeps its block.
 #
 # Usage:
 #   job-steps-ended.sh --job NAME --attempt N --repo OWNER/REPO --run ID

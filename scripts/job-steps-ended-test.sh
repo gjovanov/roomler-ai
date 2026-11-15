@@ -367,6 +367,8 @@ while [ $# -gt 0 ]; do
 done
 set -- "${args[@]}"
 printf '%s\n' "$*" >>"$GH_LOG"
+# A cancel or the job's timeout, as the runner sends it: SIGTERM to the script.
+[ -z "${GH_TERM_PARENT-}" ] || { kill -TERM "$PPID"; exit 1; }
 reply() { if [ -n "$jqx" ]; then jq -r "$jqx" "$1"; else cat "$1"; fi; }
 [ "$1" = api ] || exit 1
 shift
@@ -383,6 +385,7 @@ printf '%s\n' '{"id": 7, "run_attempt": 1, "head_branch": "lab/BRANCH-MARK", "ev
   "head_repository": {"full_name": "fork/r"}, "workflow_id": 99, "created_at": "2026-11-14T20:51:18Z",
   "status": "completed", "conclusion": "failure", "display_title": "TITLE-MARK"}' >"$D/run.json"
 jq '.run_attempt = 2' "$D/run.json" >"$D/run-attempt-2.json"
+jq '.head_repository = null' "$D/run.json" >"$D/run-no-head-repo.json"
 # Attempt 1's jobs: the macOS job FIRST, the Windows job under the listener's
 # name, and the check job with a given conclusion (or none).
 jobs_from() { # FIXTURE CHECK-CONCLUSION|none [no = no Windows job]
@@ -397,7 +400,9 @@ jobs_from "$F/madeup-control-chars.json" failure >"$D/jobs-control-chars.json"
 for c in skipped cancelled none; do jobs_from "$F/jobs-43606061432.json" "$c" >"$D/jobs-check-$c.json"; done
 jobs_from "$F/jobs-43606061432.json" failure no >"$D/jobs-no-windows.json"
 jq --arg lw "$L_WIN" '(.jobs[] | select(.name == $lw) | .status) = "in_progress"' "$D/jobs.json" >"$D/jobs-running.json"
+jq --arg lw "$L_WIN" '(.jobs[] | select(.name == $lw) | .id) = "9/../8"' "$D/jobs.json" >"$D/jobs-id-not-a-number.json"
 printf 'not json\n' >"$D/jobs-garbage.json"
+: >"$D/runs-empty.json"
 printf '%s\n' '{"total_count": 3, "jobs": "not a list"}' >"$D/jobs-not-a-list.json"
 printf '%s\n' '{"total_count": 0, "workflow_runs": []}' >"$D/runs-none.json"
 printf '%s\n' '{"total_count": 1, "workflow_runs": [{"id": 8, "head_repository": {"full_name": "fork/r"},
@@ -496,6 +501,24 @@ rcase 'the run cannot be read: a warning' 0 1 "$NO the run could not be read." "
 rcase 'the jobs cannot be read: a warning' 0 1 "$NO its jobs could not be read." "$(lines "$G1" "$JOBS")" GH_FAIL_JOBS=1
 rcase 'the newer runs cannot be read: a warning' 1 1 "$NO the newer runs of its branch could not be read." \
   "$(lines "$G1" "$JOBS" "$G3")" GH_FAIL_RUNS=1
+rcase 'G3, an empty reply: refused, with a warning, no re-run' 1 1 "$NO the newer runs of its branch could not be read." \
+  "$(lines "$G1" "$JOBS" "$G3")" GH_RUNS="$D/runs-empty.json"
+rcase 'G3, a reply that is not JSON: refused, with a warning, no re-run' 1 1 \
+  "$NO the newer runs of its branch could not be read." "$(lines "$G1" "$JOBS" "$G3")" GH_RUNS="$D/jobs-garbage.json"
+rcase 'a run with no head repository: refused before G3, with a warning' 1 1 \
+  "$NO its branch, event, head repository, workflow or creation time could not be read." \
+  "$(lines "$G1" "$JOBS")" GH_RUN="$D/run-no-head-repo.json"
+rcase 'a Windows job id that is not a number: refused before the decision, with a warning' 0 1 \
+  "$NO its jobs could not be read." "$(lines "$G1" "$JOBS")" GH_JOBS="$D/jobs-id-not-a-number.json"
+# A cancel or the job's timeout ends the script with SIGTERM: the EXIT trap
+# still closes the block, so no later line of the step is swallowed.
+rr GH_TERM_PARENT=1
+t=$(head -n 1 <<<"$out")
+t=${t#::stop-commands::}
+[ "$rc" -ne 0 ] && [[ $t =~ ^[0-9a-f]{32}$ ]] && [ "$(tail -n 1 <<<"$out")" = "::$t::" ] &&
+  [ "$(grep -cxF "::$t::" <<<"$out")" -eq 1 ] && [ -z "$sum" ] && [ "$log" = "$G1" ] &&
+  ok 're-run: ended by SIGTERM: the EXIT trap closes the block' ||
+  bad 're-run: ended by SIGTERM' "exit $rc, summary \"$sum\"" "$out"$'\n'"-- gh was asked:"$'\n'"$log"
 rcase 'GitHub refuses the re-run: a warning' 1 1 "$NO GitHub refused the re-run of its Windows job (job $WID)." \
   "$(lines "$G1" "$JOBS" "$G3" "api -X POST repos/o/r/actions/jobs/$WID/rerun")" GH_FAIL_POST=1
 rr RUN_ID='7;x'
