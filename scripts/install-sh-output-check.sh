@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: MPL-2.0
 #
 # What the served install script says about the release it resolved and the
-# daemon it installed (#3881), read against stand-ins.
+# daemon it installed (#3881), and about the versions its binaries name
+# (#3919), read against stand-ins.
 #
 # scripts/install.sh is what `curl -fsSL <server>/install.sh | sh -s -- ...`
 # runs. It names the release that holds the file it downloads, as the server's
 # feed (/api/agent/latest-release) names it, and after an install it prints
-# the installed daemon's own `--version`. Both lines are information. What the
-# feed and the binary say is printed only when it fits a small alphabet and 64
+# the installed daemon's own `--version`. A re-run that finds the per-user
+# daemon running says which version it runs or moves onto, and the tunnel
+# role names its CLI's version. These lines are information. What the feed
+# and the binaries say is printed only when it fits a small alphabet and 64
 # characters, and in fixed words otherwise. No answer may change a command the
 # script runs or its exit code.
 #
@@ -20,8 +23,11 @@
 # bash:3.2 as macos-postinstall-check.sh --bash copies it). It runs as a person
 # in a throwaway debian:12 container with no network. Stand-ins on PATH answer
 # for curl (the feed and the downloads), sudo, dpkg, apt-get, systemctl,
-# installer, launchctl, uname, hostname and the daemon, and they record every
-# call. Each case checks the lines, the exit code, and that no control byte but
+# installer, launchctl, uname, hostname, the daemon and the tunnel CLI, and
+# they record every call. A running daemon's own image, /proc/$pid/exe, cannot
+# be a stand-in (a script's is its interpreter), so where a case has one
+# running, systemctl names a MainPID that leads /proc/$pid/exe to a stand-in.
+# Each case checks the lines, the exit code, and that no control byte but
 # newline and tab reached its output (stdout and stderr). The cases of one mode
 # must record the same calls, byte for byte, whatever the feed's tag or the
 # daemon's answer, and under every shell those calls must equal the mode's
@@ -67,7 +73,7 @@ if [ "${1:-}" != --in-container ]; then
                 shift 2 ;;
             --keep) keep="$2"; shift 2 ;;
             --rewrite-calls) rewrite=1; shift ;;
-            -h|--help) sed -n '3,50p' "$0"; exit 0 ;;
+            -h|--help) sed -n '3,56p' "$0"; exit 0 ;;
             *) script="$1"; shift ;;
         esac
     done
@@ -225,7 +231,20 @@ case "$me" in
             exit "$(cat "$C/version.rc")"
         fi ;;
     roomler)
-        if [ "${1:-}" = --version ]; then echo "roomler 0.4.215"; fi ;;
+        if [ "${1:-}" = --version ]; then
+            if [ -f "$C/cli.out" ]; then cat "$C/cli.out"; else echo "roomler 0.4.215"; fi
+        fi ;;
+    systemctl)
+        # A case with a per-user daemon running names its MainPID.
+        if [ "$*" = "--user show -p MainPID --value roomler.service" ] && [ -f "$C/mainpid" ]; then
+            cat "$C/mainpid"
+        fi ;;
+    exe)
+        # That daemon's own image, reached as /proc/$pid/exe.
+        case "${1:-}" in
+            --version) cat "$C/running.out" ;;
+            update-helper) if [ -f "$C/running.caps" ]; then cat "$C/running.caps"; fi ;;
+        esac ;;
     curl)
         out="" url=""
         while [ $# -gt 0 ]; do
@@ -254,6 +273,10 @@ for t in dpkg apt-get; do ln -sf "$S/standin" "$DPKG/$t"; done
 ln -sf "$S/standin" /usr/bin/roomlerd
 mkdir -p /Library/Roomler/roomlerd.app/Contents/MacOS
 ln -sf "$S/standin" /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd
+# A running per-user daemon's MainPID: /proc/$PID/exe is $S/running/exe.
+mkdir -p "$S/running"
+ln -sf "$S/standin" "$S/running/exe"
+PID=..$S/running
 
 # The feed: compact JSON as the server writes it, newest release first. Every
 # asset is the same small file, so the digest checks out, and an asset's URL
@@ -309,6 +332,7 @@ R="==> release named by the server's feed:"
 V="==> installed daemon's own --version:"
 N="==> NOTE: the installed daemon's"
 UNREADABLE="unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
+VU="a version that is $UNREADABLE" # the same words, where a line names a version
 
 FAILED=0
 TOTAL=0
@@ -316,7 +340,10 @@ SH=""
 # run CASE OS ARCH DEBIAN FEED ANSWER RC ARGS...: one run of the script under
 # $SH. CASE is MODE/VARIANT; ANSWER and RC are what the daemon's --version
 # prints and exits with, and READS_STDIN=1 before `run` makes it read its
-# stdin first. The records land in $RUNS/$SH/CASE.
+# stdin first. RUNNING=<answer> before `run` (empty counts) puts a per-user
+# daemon there, already running, whose own image prints that to --version and
+# RUNNING_CAPS to update-helper --capabilities; CLI=<answer> is what the
+# tunnel CLI prints to --version. The records land in $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
@@ -328,6 +355,12 @@ run() {
     printf '%s' "$answer" >"$C/version.out"
     echo "$answer_rc" >"$C/version.rc"
     [ "${READS_STDIN:-0}" = 0 ] || : >"$C/version.reads-stdin"
+    if [ -n "${RUNNING+set}" ]; then
+        printf '%s\n' "$PID" >"$C/mainpid"
+        printf '%s' "$RUNNING" >"$C/running.out"
+        [ -z "${RUNNING_CAPS:-}" ] || printf '%s' "$RUNNING_CAPS" >"$C/running.caps"
+    fi
+    [ -z "${CLI+set}" ] || printf '%s' "$CLI" >"$C/cli.out"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -374,6 +407,12 @@ done_case() {
 }
 # One release line, one version line, and the NOTE N times (0 or 1).
 says() { want "$R $1"; want "$V $2"; lines "$R" 1; lines "$V" 1; lines "$N" "$3"; }
+# What a per-user re-run says of the daemon it found running, naming $1.
+same() { want "==> the running daemon (pid $PID) already runs $1: nothing to restart"; }
+self() { want "==> the running daemon (pid $PID) restarts onto $1 by itself, once nothing it serves would be cut"; }
+restart() {
+    want "==> restarting the running daemon (pid $PID): it runs $1, which cannot restart onto a new binary by itself (a remote or SSH session to this device drops for a few seconds)"
+}
 
 for SH in $SHELLS; do
     # A Debian host, download only: the release line names the release that
@@ -436,12 +475,56 @@ for SH in $SHELLS; do
     READS_STDIN=1 run pkg/reads-stdin Darwin arm64 0 normal $'roomlerd 0.4.221\n' 0 --role daemon --token check-token
     says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
 
+    # #3919 — a per-user re-run finds the daemon already running, and says
+    # which version it runs or moves onto: as the binary names it when that
+    # fits the alphabet, in fixed words otherwise. The script still compares
+    # the two answers as they came, so the cases of a mode run the same calls.
+    usr=(--role daemon --token check-token)
+    new=$'roomlerd 0.4.221\n'
+    old=$'roomlerd 0.4.220\n'
+    # The same answer from the running image: nothing to restart.
+    RUNNING=$new run deb-user-same/normal Linux x86_64 1 normal "$new" 0 "${usr[@]}"; same 0.4.221; done_case
+    a="roomlerd 0.4.221$ESC[2J"$'\n'
+    RUNNING=$a run deb-user-same/esc Linux x86_64 1 normal "$a" 0 "${usr[@]}"; same "$VU"; done_case
+    a=$'roomlerd \n'
+    RUNNING=$a run deb-user-same/empty Linux x86_64 1 normal "$a" 0 "${usr[@]}"; same "$VU"; done_case
+    a="roomlerd $LONG"$'\n'
+    RUNNING=$a run deb-user-same/long Linux x86_64 1 normal "$a" 0 "${usr[@]}"
+    same "$VU"; lines "$LONG" 0; done_case
+    # Another answer, from a daemon that restarts onto a new version by
+    # itself (it lists restart-on-replace): left to it.
+    cap=$'restart-on-replace\n'
+    RUNNING=$old RUNNING_CAPS=$cap run deb-user-self/normal Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    self 0.4.221; done_case
+    RUNNING=$old RUNNING_CAPS=$cap run deb-user-self/esc Linux x86_64 1 normal "roomlerd 0.4.221$ESC[2J"$'\n' 0 "${usr[@]}"
+    self "$VU"; done_case
+    RUNNING=$old RUNNING_CAPS=$cap run deb-user-self/empty Linux x86_64 1 normal $'roomlerd \n' 0 "${usr[@]}"
+    self "$VU"; done_case
+    RUNNING=$old RUNNING_CAPS=$cap run deb-user-self/long Linux x86_64 1 normal "roomlerd $LONG"$'\n' 0 "${usr[@]}"
+    self "$VU"; lines "$LONG" 0; done_case
+    # Another answer, from a daemon that cannot: restarted, and the line names
+    # what it runs. One that answers nothing runs "an unknown version", as before.
+    RUNNING=$old run deb-user-restart/normal Linux x86_64 1 normal "$new" 0 "${usr[@]}"; restart 0.4.220; done_case
+    RUNNING="roomlerd 0.4.220$ESC[2J"$'\n' run deb-user-restart/esc Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    restart "$VU"; done_case
+    RUNNING='' run deb-user-restart/empty Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    restart "an unknown version"; done_case
+    RUNNING="roomlerd $LONG"$'\n' run deb-user-restart/long Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    restart "$VU"; lines "$LONG" 0; done_case
+
     # The tunnel role installs the CLI, which names itself as it always has;
-    # neither new line belongs to it.
+    # neither #3881 line belongs to it. What the CLI answers is printed when
+    # it fits the alphabet after its `roomler ` name (#3919).
     run tunnel-dl/normal Linux x86_64 1 normal '' 0 --role tunnel --download-only
     lines "$R" 0; lines "$V" 0; lines "$N" 0; done_case
     run tunnel/normal Linux x86_64 1 normal '' 0 --role tunnel
     lines "$R" 0; lines "$V" 0; lines "$N" 0; want "==> installed: roomler 0.4.215"; done_case
+    CLI="roomler 0.4.215$ESC[2J"$'\n' run tunnel/esc Linux x86_64 1 normal '' 0 --role tunnel
+    want "==> installed: $VU"; done_case
+    CLI='' run tunnel/empty Linux x86_64 1 normal '' 0 --role tunnel
+    want "==> installed: $VU"; done_case
+    CLI="roomler $LONG"$'\n' run tunnel/long Linux x86_64 1 normal '' 0 --role tunnel
+    want "==> installed: $VU"; lines "$LONG" 0; done_case
 
     # The same calls, byte for byte, in every case of a mode: neither the
     # feed's tag nor the daemon's answer changes what the script runs or how

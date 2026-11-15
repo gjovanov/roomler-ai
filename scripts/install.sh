@@ -624,15 +624,15 @@ restart_old_user_daemon() {
     running="$("/proc/$pid/exe" --version 2>/dev/null || true)"
     if [ "$running" = "$installed" ]; then
         if [ "$helper_changed" = 0 ]; then
-            say "the running daemon (pid $pid) already runs ${installed#roomlerd }: nothing to restart"
+            say "the running daemon (pid $pid) already runs $(printable_version "${installed#roomlerd }"): nothing to restart"
             return 0
         fi
         why="the root update helper was just turned on, and the daemon decides at its start who installs its updates"
     elif "/proc/$pid/exe" update-helper --capabilities 2>/dev/null | grep -qx 'restart-on-replace'; then
-        say "the running daemon (pid $pid) restarts onto ${installed#roomlerd } by itself, once nothing it serves would be cut"
+        say "the running daemon (pid $pid) restarts onto $(printable_version "${installed#roomlerd }") by itself, once nothing it serves would be cut"
         return 0
     else
-        rv="${running#roomlerd }"
+        rv="${running:+$(printable_version "${running#roomlerd }")}"
         why="it runs ${rv:-an unknown version}, which cannot restart onto a new binary by itself"
     fi
     say "restarting the running daemon (pid $pid): $why (a remote or SSH session to this device drops for a few seconds)"
@@ -1265,7 +1265,7 @@ require_tunnel_cli() {
         echo "error: the roomler CLI did not install: no working \`roomler\` on PATH" >&2
         exit 1
     fi
-    say "installed: $(roomler --version 2>/dev/null | head -n 1)"
+    say "installed: $(printable_version "$(roomler --version 2>/dev/null | head -n 1)" 'roomler ')"
 }
 
 install_tunnel_tarball() {
@@ -2093,6 +2093,18 @@ report_installed_version() {
         else
             say_unreadable "installed daemon's own --version"
         fi
+    fi
+}
+
+# #3919 — a version a binary printed, for the lines that name one elsewhere (a
+# running per-user daemon's, the tunnel CLI's): as it came when it fits the
+# alphabet (once a leading $2, if given, is set aside), fixed words otherwise.
+# Only what is printed passes here: comparisons use the answers as they came.
+printable_version() {
+    if fits_alphabet "${1#"${2:-}"}"; then
+        printf '%s\n' "$1"
+    else
+        printf '%s\n' "a version that is unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
     fi
 }
 
