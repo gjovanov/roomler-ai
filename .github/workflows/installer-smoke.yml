@@ -1121,14 +1121,12 @@ jobs:
       # attempt 1 only, so that the default branch's listener re-runs it once
       # and attempt 2 is read on this lab pull request.
       - name: "TEMPORARY proof (#3810): print the runner's processes"
-        if: ${{ github.run_attempt == '1' }}
         shell: pwsh
         run: |
           Get-CimInstance Win32_Process | Where-Object Name -like 'Runner.*' |
             Format-Table -AutoSize ProcessId, ParentProcessId, Name, CommandLine | Out-String -Width 400
 
       - name: "TEMPORARY proof (#3810): the runner is lost, its listener and worker stopped"
-        if: ${{ github.run_attempt == '1' }}
         shell: pwsh
         run: |
           Get-Process Runner.Listener, Runner.Worker -ErrorAction SilentlyContinue | Stop-Process -Force
