@@ -7574,6 +7574,10 @@ pub(crate) async fn rc_surfaces_up(
     if let Some((starting, view)) = behind {
         let up = starting.up().await;
         companion = Some(up);
+        // FR-93 P6f — the last on-screen surface: a desktop notification with
+        // Approve and Deny, where the companion cannot show the question (none
+        // installed: a system daemon on Fedora, openSUSE, Arch, aarch64; or no
+        // marker for it to read).
         let notifying = if still_asked() && !outbound.is_closed() {
             notification_for_rc(indicator, up, marker, view).await
         } else {
