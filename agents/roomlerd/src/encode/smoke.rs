@@ -338,14 +338,15 @@ pub struct Judged {
 }
 
 impl Judged {
-    /// The encoder, when what opened is what was asked for; else why not. An
-    /// encoder that did not pass is dropped unused, and it is never an FFmpeg
-    /// one: an FFmpeg encoder always produces what its cell asks for.
+    /// The encoder, when what opened is what was asked for; else why not, as
+    /// a [`Failed`] inside the error. An encoder that did not pass is dropped
+    /// unused, and it is never an FFmpeg one: an FFmpeg encoder always
+    /// produces what its cell asks for.
     pub fn into_ok(
         self,
         plan: &CellPlan,
         req: &Request<'_>,
-    ) -> Result<(Box<dyn VideoEncoder>, OpenedId), Failed> {
+    ) -> anyhow::Result<(Box<dyn VideoEncoder>, OpenedId)> {
         match (self.verdict, self.enc, self.opened) {
             (Verdict::Ok, Some(enc), Some(id)) => Ok((enc, id)),
             (verdict, _, opened) => Err(Failed {
@@ -355,7 +356,8 @@ impl Judged {
                 opened,
                 tried: self.tried,
                 why: self.why,
-            }),
+            }
+            .into()),
         }
     }
 }
