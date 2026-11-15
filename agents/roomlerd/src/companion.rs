@@ -655,6 +655,10 @@ fn service_sync_enabled() -> bool {
 /// counts as reportable, so the field's absence never stands for "could not
 /// tell". #3814: with whether the retry is off where it runs
 /// ([`retry_off_where_it_runs`]), read only for a tray reported too old.
+///
+/// #3908 — the tray's version is the one the refresh goes by
+/// ([`known_beside`]): the EXE's own when the marker does not name this
+/// daemon's.
 #[cfg(target_os = "windows")]
 pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
     if !pipe_refuses_old_companions() {
@@ -663,27 +667,43 @@ pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
     let dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
-    let (exe_present, marker) = match &dir {
-        Some(dir) => (
-            dir.join(DESKTOP_EXE).try_exists().unwrap_or(true),
-            std::fs::read_to_string(dir.join(VERSION_MARKER)).ok(),
-        ),
-        // No folder of its own to look in: a tray of unknown version.
-        None => (true, None),
-    };
     let by_service =
         crate::supervision::current() == Some(crate::supervision::Supervision::WindowsScm);
-    too_old_to_connect(exe_present, true, marker.as_deref(), by_service).map(|reported| {
-        tunnel_core::localapi::CompanionTooOld {
-            retry_off: retry_off_where_it_runs(
-                by_service,
-                crate::win_identity::own_token_is_local_system(),
-                sync_enabled,
-                service_sync_enabled,
-            ),
-            ..reported
-        }
+    too_old_beside(
+        dir.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        by_service,
+        &EXE_VERSIONS,
+    )
+    .map(|reported| tunnel_core::localapi::CompanionTooOld {
+        retry_off: retry_off_where_it_runs(
+            by_service,
+            crate::win_identity::own_token_is_local_system(),
+            sync_enabled,
+            service_sync_enabled,
+        ),
+        ..reported
     })
+}
+
+/// #3908 — [`too_old_to_connect`] for the companion in `dir`, by the version
+/// [`known_beside`] knows for it now. `None` for `dir`: no folder of its own
+/// to look in, so a tray of unknown version.
+#[cfg(target_os = "windows")]
+fn too_old_beside(
+    dir: Option<&std::path::Path>,
+    own: &str,
+    by_service: bool,
+    versions: &'static ExeVersions,
+) -> Option<tunnel_core::localapi::CompanionTooOld> {
+    let (exe_present, version) = match dir {
+        Some(dir) => (
+            dir.join(DESKTOP_EXE).try_exists().unwrap_or(true),
+            known_beside(dir, own, versions).version,
+        ),
+        None => (true, None),
+    };
+    too_old_to_connect(exe_present, true, version.as_deref(), by_service)
 }
 
 /// #3781 — does this daemon's pipe refuse a companion older than
@@ -727,6 +747,128 @@ async fn sibling_version() -> Option<String> {
         })
     });
     tokio::time::timeout(LOOK_WAIT, read).await.ok()?.ok()?
+}
+
+/// #3908 — what the companion EXE beside this daemon states in its own
+/// version resource, for the readers that may not wait for that read:
+/// `roomler status` ([`too_old_here`]) and the heartbeat
+/// ([`installed_version`]). One for the process, shared by both.
+#[cfg(target_os = "windows")]
+static EXE_VERSIONS: ExeVersions = ExeVersions::new("companion-ver", exe_version);
+
+/// #3908 — the EXE's version as its last read stated it, for the files that
+/// read was made for ([`Stamp`]), and the read itself ([`exe_version`] in the
+/// daemon): on a thread of its own, one at a time
+/// ([`crate::one_in_flight::OneInFlight`]), waited for by nobody. A read that
+/// hangs (a filter driver holding the EXE) holds that one thread however
+/// often the readers ask, and they answer from the marker meanwhile.
+#[cfg(target_os = "windows")]
+pub(crate) struct ExeVersions {
+    read: fn(&std::path::Path) -> Option<String>,
+    /// The last read's answer and the files it was made for. Locked only to
+    /// look at it or to replace it, never across a read.
+    last: std::sync::Mutex<Option<(Stamp, Option<String>)>>,
+    reads: crate::one_in_flight::OneInFlight<()>,
+}
+
+// RED (#3908): the readers take `now` in the next commit.
+#[allow(dead_code)]
+#[cfg(target_os = "windows")]
+impl ExeVersions {
+    pub(crate) const fn new(
+        thread_name: &'static str,
+        read: fn(&std::path::Path) -> Option<String>,
+    ) -> Self {
+        Self {
+            read,
+            last: std::sync::Mutex::new(None),
+            reads: crate::one_in_flight::OneInFlight::new(thread_name),
+        }
+    }
+
+    /// What the EXE in `dir` states, as read for the files there now, and
+    /// never a wait: `None` when no read was made for them yet. The read then
+    /// starts, unless one is running, and its answer is kept as it ends.
+    fn now(&'static self, dir: &std::path::Path) -> Option<Option<String>> {
+        let stamp = Stamp::of(dir);
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((read_for, stated)) = last
+            && read_for == stamp
+        {
+            return Some(stated);
+        }
+        let (read, exe) = (self.read, dir.join(DESKTOP_EXE));
+        self.reads.start_unless_running(move || {
+            let stated = read(&exe);
+            *self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stamp, stated));
+        });
+        None
+    }
+
+    /// Once the read running now, if any, has ended: a test's folder is
+    /// removed with nothing in it mapped.
+    #[cfg(test)]
+    fn drained(&self) {
+        let _ = self
+            .reads
+            .ask_blocking(std::time::Duration::from_secs(10), || ());
+    }
+}
+
+/// #3908 — the files a read of the EXE's version was made for: the marker's
+/// last write, and the EXE's last write and size. A swap whose marker write
+/// fails changes the EXE and not the marker, so the marker's alone would keep
+/// the version read before that swap for the process's life.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    marker: Option<std::time::SystemTime>,
+    exe: Option<(std::time::SystemTime, u64)>,
+}
+
+// RED (#3908): read through `ExeVersions::now` from the next commit.
+#[allow(dead_code)]
+#[cfg(target_os = "windows")]
+impl Stamp {
+    fn of(dir: &std::path::Path) -> Self {
+        let written = |name: &str| {
+            let meta = std::fs::metadata(dir.join(name)).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        };
+        Self {
+            marker: written(VERSION_MARKER).map(|(at, _)| at),
+            exe: written(DESKTOP_EXE),
+        }
+    }
+}
+
+/// #3908 — the companion's version as [`known_beside`] reads it now.
+/// `settled` is false while the EXE's version, which the answer needs, is
+/// still being read: the answer is then the marker's.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BesideNow {
+    pub(crate) version: Option<String>,
+    pub(crate) settled: bool,
+}
+
+/// #3908 — the companion's version in `dir`, for the readers that may not
+/// wait. RED: the marker alone, as before #3908.
+#[cfg(target_os = "windows")]
+fn known_beside(dir: &std::path::Path, own: &str, versions: &'static ExeVersions) -> BesideNow {
+    let _ = (own, versions);
+    let marker = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok();
+    BesideNow {
+        version: marker.as_deref().and_then(sanitize_version),
+        settled: true,
+    }
 }
 
 /// #3850 — the version the EXE at `exe` states in its own version resource
@@ -1210,20 +1352,40 @@ impl Companion {
 /// ⚠️ Deliberately does NOT run the companion binary. `--version` on a GUI
 /// binary is a process spawn on every heartbeat and, on Linux, a GTK-linked
 /// executable started by a root daemon with no display; both are worse than a
-/// file read. Every arm reads metadata the installer already wrote.
+/// file read. Every arm reads metadata the installer already wrote. #3908: on
+/// Windows that includes the EXE's own version resource, mapped as data on a
+/// thread of its own, never run.
 ///
 /// Cached for [`VERSION_TTL`]: the answer only changes when a package manager
 /// runs, and the heartbeat is every 30 s.
 pub fn installed_version() -> Option<String> {
-    use std::time::Instant;
+    kept_version(&VERSION_CACHE, || {
+        #[cfg(target_os = "windows")]
+        {
+            let now = installed_version_inner();
+            (now.version, now.settled)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            (installed_version_inner(), true)
+        }
+    })
+}
 
-    if let Some((at, ref v)) = *VERSION_CACHE.lock().unwrap()
+/// [`installed_version`] over `cache`: the answer it holds while that is
+/// younger than [`VERSION_TTL`], else `read`'s. RED (#3908): kept whether
+/// `read` says it is settled or not, as before.
+fn kept_version(
+    cache: &std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
+    read: impl FnOnce() -> (Option<String>, bool),
+) -> Option<String> {
+    if let Some((at, ref v)) = *cache.lock().unwrap()
         && at.elapsed() < VERSION_TTL
     {
         return v.clone();
     }
-    let v = installed_version_inner();
-    *VERSION_CACHE.lock().unwrap() = Some((Instant::now(), v.clone()));
+    let (v, _settled) = read();
+    *cache.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
     v
 }
 
@@ -1241,17 +1403,35 @@ pub(crate) fn forget_installed_version() {
     *VERSION_CACHE.lock().unwrap() = None;
 }
 
-/// Windows: the sidecar marker [`refresh_if_stale`] writes on every swap. A
-/// wizard-placed EXE with no marker reads as `None`, which is honest — the
-/// daemon genuinely does not know what version it is until it swaps it once.
+/// Windows: the version the refresh goes by (#3908, [`known_beside`]): the
+/// sidecar marker [`refresh_if_stale`] writes on every swap when it names
+/// this daemon's version, else what the EXE states in its own version
+/// resource, else the marker's words. `None` with no EXE, or when neither
+/// names a version.
 #[cfg(target_os = "windows")]
-fn installed_version_inner() -> Option<String> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+fn installed_version_inner() -> BesideNow {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return BesideNow {
+            version: None,
+            settled: true,
+        };
+    };
+    installed_beside(&dir, env!("CARGO_PKG_VERSION"), &EXE_VERSIONS)
+}
+
+/// #3908 — [`installed_version`]'s answer for the companion in `dir`.
+#[cfg(target_os = "windows")]
+fn installed_beside(dir: &std::path::Path, own: &str, versions: &'static ExeVersions) -> BesideNow {
     if !dir.join(DESKTOP_EXE).exists() {
-        return None;
+        return BesideNow {
+            version: None,
+            settled: true,
+        };
     }
-    let raw = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok()?;
-    sanitize_version(&raw)
+    known_beside(dir, own, versions)
 }
 
 /// macOS: `CFBundleShortVersionString` out of the app bundle's `Info.plist`.
@@ -1327,7 +1507,7 @@ fn sanitize_version(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod version_tests {
-    use super::sanitize_version;
+    use super::{kept_version, sanitize_version};
 
     #[test]
     fn blank_and_whitespace_are_absent_not_empty() {
@@ -1353,6 +1533,30 @@ mod version_tests {
             Some("scriptalert1script".into())
         );
         assert_eq!(sanitize_version(&"9".repeat(200)).unwrap().len(), 32);
+    }
+
+    /// #3908 — the heartbeat keeps an answer for `VERSION_TTL` only once it
+    /// is settled. One read from the marker while the EXE's version is still
+    /// being read goes out once, and the next heartbeat reads again.
+    ///
+    /// Red before #3908: every answer was kept, so the marker's version went
+    /// out for ten minutes after each start.
+    #[test]
+    fn the_heartbeat_keeps_only_a_settled_answer() {
+        let cache = std::sync::Mutex::new(None);
+        assert_eq!(
+            kept_version(&cache, || (Some("0.4.212".into()), false)).as_deref(),
+            Some("0.4.212")
+        );
+        assert_eq!(
+            kept_version(&cache, || (Some("0.4.223".into()), true)).as_deref(),
+            Some("0.4.223"),
+            "the marker's answer was not kept"
+        );
+        assert_eq!(
+            kept_version(&cache, || panic!("a settled answer is kept")).as_deref(),
+            Some("0.4.223")
+        );
     }
 }
 
@@ -6208,8 +6412,9 @@ mod version_resource_tests {
 
     /// A resource with `strings` in its one string table, as the release's
     /// companion carries one: `VS_FIXEDFILEINFO`, then `StringFileInfo` and
-    /// `VarFileInfo`.
-    fn resource(strings: &[(&str, &str)]) -> Vec<u8> {
+    /// `VarFileInfo`. #3908: also the version resource of the EXEs
+    /// `beside_version_tests` builds.
+    pub(super) fn resource(strings: &[(&str, &str)]) -> Vec<u8> {
         let mut fixed = 0xFEEF_04BDu32.to_le_bytes().to_vec();
         fixed.resize(52, 0);
         let strings: Vec<Vec<u8>> = strings
@@ -6397,6 +6602,370 @@ mod version_resource_tests {
         std::fs::write(&text, "not a program").expect("write");
         assert_eq!(super::exe_version(&text), None);
         assert_eq!(super::exe_version(&dir.path().join("missing.exe")), None);
+    }
+}
+
+/// #3908 — `roomler status` ([`too_old_here`], through `too_old_beside`) and
+/// the heartbeat ([`installed_version`], through `installed_beside`) read the
+/// companion's version by the refresh's rule ([`known_version`], #3850): the
+/// marker when it names this daemon's version, else what the EXE states in
+/// its own version resource, else the marker's words. Each test has a folder
+/// of its own with a real EXE in it: a copy of this test's own executable,
+/// given the version resource the test needs with `UpdateResourceW`.
+///
+/// Red before #3908: both read the marker alone.
+#[cfg(all(test, target_os = "windows"))]
+mod beside_version_tests {
+    use super::version_resource_tests::resource;
+    use super::{
+        BesideNow, DESKTOP_EXE, ExeVersions, MIN_COMPANION_VERSION, Stamp, VERSION_MARKER,
+        installed_beside, known_version, too_old_beside,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::PoisonError;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+    use tunnel_core::localapi::CompanionTooOld;
+
+    /// This daemon's version, which the release's current tray states.
+    const OWN: &str = env!("CARGO_PKG_VERSION");
+    /// A tray too old to connect: `MIN_COMPANION_VERSION` is 0.4.216.
+    const OLD: &str = "0.4.212";
+    /// A tray of another version that connects.
+    const EARLIER: &str = "0.4.220";
+    /// How long a test waits for a read of the EXE to land.
+    const LAND: Duration = Duration::from_secs(20);
+
+    /// A folder as a system install has the companion beside the daemon: its
+    /// EXE and its version marker, read through a cache of the folder's own.
+    /// Removed on every path: once no read runs, with its marker writable
+    /// again.
+    struct Beside {
+        dir: tempfile::TempDir,
+        versions: &'static ExeVersions,
+    }
+
+    impl Beside {
+        fn new(read: fn(&Path) -> Option<String>) -> Self {
+            Self {
+                dir: tempfile::tempdir().expect("tempdir"),
+                versions: Box::leak(Box::new(ExeVersions::new("test-exe-ver", read))),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// The EXE: a copy of this test's executable whose one resource is
+        /// `res`, as its version resource, written beside and renamed into
+        /// place as a swap puts one there. Stamped with its own last write: a
+        /// copy keeps the source's.
+        fn exe(&self, res: &[u8]) -> PathBuf {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::System::LibraryLoader::{
+                BeginUpdateResourceW, EndUpdateResourceW, UpdateResourceW,
+            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::RT_VERSION;
+
+            let staged = self.path().join("staged.exe");
+            let this = std::env::current_exe().expect("this test's executable");
+            std::fs::copy(this, &staged).expect("copy this test's executable");
+            let wide: Vec<u16> = staged
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let len = u32::try_from(res.len()).expect("a test resource fits a u32");
+            // SAFETY: `wide` is NUL-terminated and outlives every call, the
+            // update is ended exactly once, and UpdateResourceW copies `res`,
+            // which outlives it. TRUE: the copy's own resources all go, so
+            // the version resource is the test's alone.
+            unsafe {
+                let update = BeginUpdateResourceW(wide.as_ptr(), 1);
+                assert!(
+                    !update.is_null(),
+                    "BeginUpdateResourceW: {}",
+                    std::io::Error::last_os_error()
+                );
+                let put = UpdateResourceW(
+                    update,
+                    RT_VERSION,
+                    std::ptr::without_provenance(1),
+                    0x0409,
+                    res.as_ptr().cast(),
+                    len,
+                );
+                let not_put = std::io::Error::last_os_error();
+                let ended = EndUpdateResourceW(update, i32::from(put == 0));
+                assert!(put != 0, "UpdateResourceW: {not_put}");
+                assert!(
+                    ended != 0,
+                    "EndUpdateResourceW: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let exe = self.path().join(DESKTOP_EXE);
+            retried("stamp the EXE's last write", || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&staged)?
+                    .set_modified(std::time::SystemTime::now())
+            });
+            retried("rename the EXE into place", || {
+                std::fs::rename(&staged, &exe)
+            });
+            exe
+        }
+
+        /// The marker, reading `text`, read-only as on the device in #3850:
+        /// the daemon cannot write it.
+        fn read_only_marker(&self, text: &str) {
+            self.writable_marker();
+            let marker = self.path().join(VERSION_MARKER);
+            std::fs::write(&marker, text).expect("write the marker");
+            let mut perms = std::fs::metadata(&marker).expect("marker").permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&marker, perms).expect("make the marker read-only");
+        }
+
+        /// The marker writable again, when there is one.
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "on Windows it clears the read-only attribute alone"
+        )]
+        fn writable_marker(&self) {
+            let marker = self.path().join(VERSION_MARKER);
+            if let Ok(meta) = std::fs::metadata(&marker) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&marker, perms);
+            }
+        }
+
+        /// What `installed_version` reads for this folder now.
+        fn installed(&self) -> BesideNow {
+            installed_beside(self.path(), OWN, self.versions)
+        }
+
+        /// What `status` is told about this folder now, from a daemon whose
+        /// pipe refuses an old tray, under the service.
+        fn too_old(&self) -> Option<CompanionTooOld> {
+            too_old_beside(Some(self.path()), OWN, true, self.versions)
+        }
+
+        /// [`Self::installed`] once the read of the EXE for the files there
+        /// now has landed, [`LAND`] at most.
+        fn settled(&self) -> BesideNow {
+            let deadline = Instant::now() + LAND;
+            loop {
+                let now = self.installed();
+                if now.settled || Instant::now() >= deadline {
+                    return now;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for Beside {
+        fn drop(&mut self) {
+            self.versions.drained();
+            self.writable_marker();
+        }
+    }
+
+    /// `op` until it works, [`LAND`] at most: a scanner may hold a new EXE
+    /// for a moment after it is written.
+    fn retried(what: &str, mut op: impl FnMut() -> std::io::Result<()>) {
+        let deadline = Instant::now() + LAND;
+        while let Err(e) = op() {
+            assert!(Instant::now() < deadline, "{what}: {e}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn settled(version: &str) -> BesideNow {
+        BesideNow {
+            version: Some(version.into()),
+            settled: true,
+        }
+    }
+
+    /// #3908, the issue's case: a read-only marker naming an old version,
+    /// beside an EXE of this daemon's version. Once the EXE's read lands,
+    /// status is told of no tray too old, and the heartbeat reports the EXE's
+    /// version: what the refresh reads from the same files.
+    #[test]
+    fn a_read_only_old_marker_beside_a_current_exe_reads_as_the_exe() {
+        let beside = Beside::new(super::exe_version);
+        let exe = beside.exe(&resource(&[("FileVersion", OWN), ("ProductVersion", OWN)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+
+        assert_eq!(beside.settled(), settled(OWN));
+        assert_eq!(beside.too_old(), None, "no tray too old");
+
+        let marker = std::fs::read_to_string(beside.path().join(VERSION_MARKER)).ok();
+        assert_eq!(
+            known_version(OWN, marker.as_deref(), || super::exe_version(&exe)).as_deref(),
+            Some(OWN),
+            "what the refresh reads"
+        );
+    }
+
+    /// #3908, the control: a marker naming this daemon's version reads as
+    /// today, and the EXE is not read at all, whatever it states.
+    #[test]
+    fn a_marker_naming_this_version_reads_as_today() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted(exe: &Path) -> Option<String> {
+            READS.fetch_add(1, SeqCst);
+            super::exe_version(exe)
+        }
+        let beside = Beside::new(counted);
+        beside.exe(&resource(&[("ProductVersion", OLD)]));
+        for marker in [format!("{OWN}\n"), format!("{OWN}\r\n"), OWN.to_string()] {
+            beside.read_only_marker(&marker);
+            assert_eq!(beside.installed(), settled(OWN), "{marker:?}");
+            assert_eq!(beside.too_old(), None, "{marker:?}");
+        }
+        assert_eq!(READS.load(SeqCst), 0, "the EXE is not read");
+    }
+
+    /// #3908, the control: an EXE whose version resource is malformed states
+    /// no version, so both read by the marker, as today. A marker naming an
+    /// old version is too old, by that version; with no marker, the
+    /// heartbeat reports none and status a tray of no version.
+    #[test]
+    fn a_malformed_resource_reads_by_the_marker_as_today() {
+        let good = resource(&[("FileVersion", OWN), ("ProductVersion", OWN)]);
+        for (what, res) in [
+            ("garbage", vec![0xFFu8; 64]),
+            ("cut short", good[..good.len() / 2].to_vec()),
+        ] {
+            let beside = Beside::new(super::exe_version);
+            let exe = beside.exe(&res);
+            assert_eq!(super::exe_version(&exe), None, "{what}: states no version");
+
+            beside.read_only_marker(&format!("{OLD}\n"));
+            assert_eq!(beside.settled(), settled(OLD), "{what}");
+            assert_eq!(
+                beside.too_old(),
+                Some(CompanionTooOld {
+                    installed: Some(OLD.into()),
+                    minimum: MIN_COMPANION_VERSION.into(),
+                    by_service: true,
+                    retry_off: false,
+                }),
+                "{what}"
+            );
+
+            beside.writable_marker();
+            std::fs::remove_file(beside.path().join(VERSION_MARKER)).expect("remove the marker");
+            assert_eq!(
+                beside.settled(),
+                BesideNow {
+                    version: None,
+                    settled: true
+                },
+                "{what}, no marker"
+            );
+            let reported = beside.too_old().expect("a tray of no version");
+            assert_eq!(reported.installed, None, "{what}, no marker");
+        }
+    }
+
+    /// #3908 — status and the heartbeat never wait for the EXE. While its
+    /// read is held (a scanner holding the file), every ask answers from the
+    /// marker at once and is not settled, and one read runs however often
+    /// they ask. Once it lands, the EXE's version.
+    #[test]
+    fn a_cold_read_answers_from_the_marker_and_never_waits_for_the_exe() {
+        static OPEN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+        static OPENED: std::sync::Condvar = std::sync::Condvar::new();
+        static BEGAN: AtomicUsize = AtomicUsize::new(0);
+        fn open() {
+            *OPEN.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            OPENED.notify_all();
+        }
+        fn held(exe: &Path) -> Option<String> {
+            BEGAN.fetch_add(1, SeqCst);
+            let gate = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                OPENED
+                    .wait_while(gate, |open| !*open)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            super::exe_version(exe)
+        }
+        /// Opens the gate as the test ends, before its folder goes, so a
+        /// failed assertion leaves no read held.
+        struct OpenedAtTheEnd;
+        impl Drop for OpenedAtTheEnd {
+            fn drop(&mut self) {
+                open();
+            }
+        }
+
+        let beside = Beside::new(held);
+        let _opened = OpenedAtTheEnd;
+        beside.exe(&resource(&[("ProductVersion", OWN)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+
+        // A reader that waited for the read would wait forever: this turns
+        // that wait into a failure of the timing below.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+            open();
+        });
+        let from_the_marker = BesideNow {
+            version: Some(OLD.into()),
+            settled: false,
+        };
+        for _ in 0..5 {
+            let asked = Instant::now();
+            assert_eq!(beside.installed(), from_the_marker);
+            let reported = beside.too_old().expect("too old by the marker meanwhile");
+            assert_eq!(reported.installed.as_deref(), Some(OLD));
+            let took = asked.elapsed();
+            assert!(
+                took < Duration::from_secs(2),
+                "no wait for the EXE: {took:?}"
+            );
+        }
+        let deadline = Instant::now() + LAND;
+        while BEGAN.load(SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = (beside.installed(), beside.too_old());
+        assert_eq!(BEGAN.load(SeqCst), 1, "one read, however often asked");
+
+        open();
+        assert_eq!(beside.settled(), settled(OWN));
+        assert_eq!(beside.too_old(), None);
+        assert_eq!(BEGAN.load(SeqCst), 1, "and none after it");
+    }
+
+    /// #3908 — the refresh swaps the EXE and cannot write the marker
+    /// (#3850): the EXE is read again, by its own last write, and both
+    /// readers move to the new version. Keyed on the marker alone, they would
+    /// keep the version read before the swap for the process's life.
+    #[test]
+    fn an_exe_swapped_under_a_marker_that_cannot_be_written_is_read_again() {
+        let beside = Beside::new(super::exe_version);
+        beside.exe(&resource(&[("ProductVersion", EARLIER)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+        assert_eq!(beside.settled(), settled(EARLIER));
+        assert_eq!(beside.too_old(), None, "{EARLIER} connects");
+
+        let before = Stamp::of(beside.path());
+        beside.exe(&resource(&[("ProductVersion", OWN)]));
+        let after = Stamp::of(beside.path());
+        assert_eq!(after.marker, before.marker, "the marker was not written");
+        assert_ne!(after.exe, before.exe, "the EXE was");
+
+        assert_eq!(beside.settled(), settled(OWN));
+        assert_eq!(beside.too_old(), None);
     }
 }
 

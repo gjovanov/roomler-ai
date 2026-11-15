@@ -211,8 +211,14 @@ impl<T: Clone + Send + 'static> OneInFlight<T> {
     /// #3830 — `lookup`, started unless a lookup is running, and waited for
     /// by nobody: a refresh for the callers that may not wait at all
     /// ([`Remembered::now`]). Whoever asks meanwhile takes its answer by this
-    /// module's rules.
-    #[cfg(any(all(target_os = "linux", feature = "recording"), test))]
+    /// module's rules. #3908: on Windows, the read of the companion EXE's
+    /// version for `roomler status` and the heartbeat
+    /// (`companion::ExeVersions`).
+    #[cfg(any(
+        all(target_os = "linux", feature = "recording"),
+        target_os = "windows",
+        test
+    ))]
     pub(crate) fn start_unless_running<F>(&self, lookup: F)
     where
         F: FnOnce() -> T + Send + 'static,
