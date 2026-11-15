@@ -1443,12 +1443,21 @@ pub enum Request {
     /// Remote-control sessions awaiting an operator consent decision.
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
+    /// Mutating, and the endpoint's ACL is NOT the whole boundary: an approval
+    /// lets someone see and control this screen, so it is the answer of the
+    /// person at that screen. On the daemon's own endpoint the dispatcher takes
+    /// it only from that person, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]); on the person socket only from
+    /// whoever is at the seat now (#3845). Anyone else is refused in words.
     ConsentDecide { session_id: String, allow: bool },
     /// FR-27 — remote-control sessions currently LIVE on this device.
     RcSessions,
     /// FR-27 — end a live remote-control session from the device side. This is
-    /// the Disconnect the "Being viewed by …" banner offers; mutating, and the
-    /// pipe/socket ACL is the trust boundary, like [`Self::ConsentDecide`].
+    /// the Disconnect the "Being viewed by …" banner offers. Mutating, and
+    /// gated like [`Self::ConsentDecide`] on the daemon's own endpoint: the
+    /// person at the screen, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]). The person socket serves it to
+    /// the person it was made for.
     RcDisconnect { session_id: String },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
@@ -1463,9 +1472,9 @@ pub enum Request {
     },
     /// Create a daemon-driven static forward: the daemon opens a tunnel to
     /// `node` (a hex agent id) over its own agent WS and listens on `local`,
-    /// dialing `remote` (`host:port`) from the target. Mutating — like
-    /// [`Request::ConsentDecide`], the pipe/socket ACL is the trust boundary
-    /// (P3b-2). Returns [`Response::FlowCreated`] with the assigned flow id.
+    /// dialing `remote` (`host:port`) from the target. Mutating — the
+    /// pipe/socket ACL is the trust boundary (P3b-2). Returns
+    /// [`Response::FlowCreated`] with the assigned flow id.
     CreateForward {
         node: String,
         local: u16,
@@ -2330,7 +2339,8 @@ pub struct RecordingsListing {
 /// reading status, and the wrong one for starting a screen recording: a guest
 /// in an RDP session must not be able to record the CONSOLE user's desktop.
 /// The recording verbs, and a `ConfigSet` of any `record_*` key, therefore
-/// require [`ClientPeer::is_console_user`].
+/// require [`ClientPeer::is_console_user`]; a consent answer and a Disconnect
+/// require [`ClientPeer::may_decide_for_the_screen`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientPeer {
     /// Windows: the client process's session id.
@@ -2538,22 +2548,60 @@ pub fn peer_may_set_console_key(
     }
 }
 
-/// The session whose screen this daemon shows (Windows). RED stub.
+/// The session whose screen this daemon shows, on Windows: the one whose
+/// person a consent prompt asks, and whose session a Disconnect ends.
+///
+/// - **Its own session**, when that is not session 0: a worker, which the
+///   service host starts in the active console session, or a per-user
+///   daemon, which runs where its person signed in, over RDP too. The person
+///   at the console is someone else then, and is not the one asked.
+/// - **The console session** (`WTSGetActiveConsoleSessionId`) for a daemon
+///   in session 0, the service host.
+/// - **None** when its own session cannot be read, or it runs in session 0
+///   and there is no console session: no person's screen, so only SYSTEM
+///   and an elevated administrator decide ([`peer_may_decide_for_the_screen`]).
+///
+/// Never session 0: no person sits there.
 pub fn screen_session(own_session: Option<u32>, console_session: Option<u32>) -> Option<u32> {
-    let _ = console_session;
-    own_session
+    match own_session? {
+        0 => console_session.filter(|&s| s != 0),
+        own => Some(own),
+    }
 }
 
-/// Who may answer a consent prompt or end a live session over the daemon's
-/// own endpoint. RED stub: today the endpoint's ACL is the only boundary.
+/// Who may answer a consent prompt (approve or deny) or end a live session
+/// (a Disconnect) over the daemon's own endpoint ([`Scope::Full`]).
+///
+/// Both decide what happens to a screen, and an approval lets someone see
+/// and control it, so they are the answer of the person at that screen, as
+/// on the person socket, where the seat is asked (#3845). The Windows pipe
+/// admits every interactive user (its `IU` ace), so here the peer the OS
+/// read at accept decides, never anything the client says:
+/// - **SYSTEM** (`S-1-5-18`, read from the client's token; LocalService and
+///   NetworkService are not SYSTEM) and **an administrator who elevated**:
+///   either can change the daemon itself.
+/// - **Windows**: a peer in the session whose screen this daemon shows
+///   ([`screen_session`]).
+/// - **Unix**: this daemon's own account, or root: who its owner-only socket
+///   admits, so nothing changes there.
+/// - Anything unknown: no. A peer the endpoint could not read is refused.
+///
+/// [`ClientPeer::is_root`] reads a uid, which a pipe client never has: on
+/// Windows it is false for every peer, SYSTEM's included, so SYSTEM is
+/// named here by its SID.
 pub fn peer_may_decide_for_the_screen(
     peer: &ClientPeer,
     console_session: Option<u32>,
     own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
-    let _ = (peer, screen_session(own_session, console_session), own_uid);
-    true
+    if peer.sid.as_deref() == Some(SYSTEM_SID) || peer.elevated == Some(true) {
+        return true;
+    }
+    if let Some(session) = peer.session_id {
+        return screen_session(own_session, console_session) == Some(session);
+    }
+    matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o || p == 0)
 }
 
 /// The session this process runs in (Windows), `None` when it cannot be read
@@ -3659,6 +3707,34 @@ fn not_at_the_seat_to_answer() -> Response {
     }
 }
 
+/// The answer to a consent answer (`ending` false) or a Disconnect (`ending`
+/// true) on the daemon's own endpoint from a peer
+/// [`peer_may_decide_for_the_screen`] does not admit. Nothing is decided,
+/// and the refusal is on the record.
+fn not_the_screens_person(peer: &ClientPeer, ending: bool) -> Response {
+    tracing::warn!(
+        peer_session = ?peer.session_id,
+        peer_uid = ?peer.uid,
+        peer_elevated = ?peer.elevated,
+        screen_session = ?screen_session(own_session_id(), console_session_id()),
+        verb = if ending { "rc_disconnect" } else { "consent_decide" },
+        "localapi: refused, from a caller that is not the person at this device's screen, \
+         SYSTEM or an elevated administrator"
+    );
+    let message = if ending {
+        "The session was not ended: only the person signed in at this device's screen ends a \
+         session on it from here, or SYSTEM, or an administrator from an elevated prompt. This \
+         caller is none of those."
+    } else {
+        "The answer was not taken: only the person signed in at this device's screen answers a \
+         request to see or control it, or SYSTEM, or an administrator from an elevated prompt. \
+         This caller is none of those."
+    };
+    Response::Error {
+        message: message.into(),
+    }
+}
+
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
 /// No I/O — the pipe listener (P1-cont) reads a JSON line, deserialises a
 /// [`Request`], calls this, and writes the [`Response`] back.
@@ -3740,7 +3816,8 @@ where
 
 /// [`serve_connection`] with the peer the listener identified at accept time.
 /// FR-85: the recording verbs and a `ConfigSet` of any `record_*` key require
-/// [`ClientPeer::is_console_user`]; an unknown peer fails that check.
+/// [`ClientPeer::is_console_user`]; a consent answer and a Disconnect require
+/// [`ClientPeer::may_decide_for_the_screen`]. An unknown peer fails both.
 pub async fn serve_connection_as<S>(
     stream: S,
     state: &dyn LocalApiState,
@@ -3869,6 +3946,22 @@ where
                             message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
                         },
                     }
+                }
+                // And on the daemon's own endpoint a consent answer and a
+                // Disconnect come from the person at the screen this daemon
+                // shows, SYSTEM or an elevated administrator, as the OS read
+                // the peer at accept: the Windows pipe admits every interactive
+                // user. A peer it could not read is refused. Any scope but the
+                // person socket's, so a new one starts refused.
+                Ok(Request::ConsentDecide { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, false)
+                }
+                Ok(Request::RcDisconnect { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, true)
                 }
                 Ok(Request::ExternalPasswordSet { .. } | Request::ExternalPasswordClear)
                     if !peer.is_console_user() =>
