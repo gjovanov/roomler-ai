@@ -616,12 +616,12 @@ helper_on() {
 restart_old_user_daemon() {
     pid="$1"; helper_changed="$2"
     case "$pid" in ''|0) return 0 ;; esac
-    installed="$(/usr/bin/roomlerd --version 2>/dev/null || true)"
+    installed="$(/usr/bin/roomlerd --version </dev/null 2>/dev/null || true)"
     if [ -z "$installed" ]; then
         warn "/usr/bin/roomlerd --version did not answer; leaving the running daemon (pid $pid) as it is"
         return 0
     fi
-    running="$("/proc/$pid/exe" --version 2>/dev/null || true)"
+    running="$("/proc/$pid/exe" --version </dev/null 2>/dev/null || true)"
     if [ "$running" = "$installed" ]; then
         if [ "$helper_changed" = 0 ]; then
             say "the running daemon (pid $pid) already runs $(printable_version "${installed#roomlerd }"): nothing to restart"
@@ -1256,7 +1256,7 @@ install_tunnel_macos() {
 # for another architecture, or one missing a library, is on PATH too.
 tunnel_cli_runs() {
     cli="$(command -v roomler || true)"
-    [ -n "$cli" ] && "$cli" --version >/dev/null 2>&1
+    [ -n "$cli" ] && "$cli" --version </dev/null >/dev/null 2>&1
 }
 
 # #2472 — never say "done" with nothing installed.
@@ -1265,7 +1265,7 @@ require_tunnel_cli() {
         echo "error: the roomler CLI did not install: no working \`roomler\` on PATH" >&2
         exit 1
     fi
-    say "installed: $(printable_version "$(roomler --version 2>/dev/null | head -n 1)" 'roomler ')"
+    say "installed: $(printable_version "$(roomler --version </dev/null 2>/dev/null | head -n 1)" 'roomler ')"
 }
 
 install_tunnel_tarball() {
