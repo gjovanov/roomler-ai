@@ -1,0 +1,982 @@
+{
+  "total_count": 5,
+  "jobs": [
+    {
+      "id": 132480840733,
+      "name": "per-User MSI install + uninstall (windows-latest)",
+      "run_id": 43606061432,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "cancelled",
+      "started_at": "2026-11-14T14:40:33Z",
+      "completed_at": "2026-11-14T15:25:33Z",
+      "runner_name": "GitHub Actions 1000135089",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T14:40:34Z",
+          "completed_at": "2026-11-14T14:40:35Z"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T14:40:35Z",
+          "completed_at": "2026-11-14T14:40:40Z"
+        },
+        {
+          "name": "The installer runner: a deadline on every installer run, and its evidence (#3754)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T14:40:40Z",
+          "completed_at": "2026-11-14T14:40:41Z"
+        },
+        {
+          "name": "The installer runner ends an endless process at its deadline and reports it (#3754, negative control)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-11-14T14:40:41Z",
+          "completed_at": "2026-11-14T14:41:04Z"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 5,
+          "started_at": "2026-11-14T14:41:04Z",
+          "completed_at": "2026-11-14T14:41:13Z"
+        },
+        {
+          "name": "Salt the cargo cache key with this job's definition",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 6,
+          "started_at": "2026-11-14T14:41:13Z",
+          "completed_at": "2026-11-14T14:41:13Z"
+        },
+        {
+          "name": "Restore the cargo cache (release-asset store)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 7,
+          "started_at": "2026-11-14T14:41:13Z",
+          "completed_at": "2026-11-14T14:41:34Z"
+        },
+        {
+          "name": "Install WiX Toolset v3 + cargo-wix",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 8,
+          "started_at": "2026-11-14T14:41:34Z",
+          "completed_at": "2026-11-14T14:41:38Z"
+        },
+        {
+          "name": "Build agent (release, minimal feature set)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 9,
+          "started_at": "2026-11-14T14:41:38Z",
+          "completed_at": "2026-11-14T14:46:27Z"
+        },
+        {
+          "name": "Build the roomler CLI shim for the MSI bundle (P3e lever D)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 10,
+          "started_at": "2026-11-14T14:46:27Z",
+          "completed_at": "2026-11-14T14:46:29Z"
+        },
+        {
+          "name": "Build the per-Machine MSI's custom-action DLL (#3375)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 11,
+          "started_at": "2026-11-14T14:46:29Z",
+          "completed_at": "2026-11-14T14:46:33Z"
+        },
+        {
+          "name": "Sign MSI payload binaries (local rehearsal)",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 12,
+          "started_at": "2026-11-14T14:46:33Z",
+          "completed_at": "2026-11-14T14:46:33Z"
+        },
+        {
+          "name": "Stage wintun.dll for the MSI bundle",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 13,
+          "started_at": "2026-11-14T14:46:33Z",
+          "completed_at": "2026-11-14T14:46:35Z"
+        },
+        {
+          "name": "Stage VC++ runtime DLLs for the MSI bundle",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 14,
+          "started_at": "2026-11-14T14:46:35Z",
+          "completed_at": "2026-11-14T14:46:35Z"
+        },
+        {
+          "name": "Build per-User MSI",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 15,
+          "started_at": "2026-11-14T14:46:35Z",
+          "completed_at": "2026-11-14T14:46:47Z"
+        },
+        {
+          "name": "Assert the rollback actions' order in the built MSI (#3292)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-11-14T14:46:47Z",
+          "completed_at": "2026-11-14T14:46:48Z"
+        },
+        {
+          "name": "Install the MSI (quiet, per-User)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-11-14T14:46:48Z",
+          "completed_at": "2026-11-14T14:46:50Z"
+        },
+        {
+          "name": "Assert registry UpgradeCode present (rc.27 install_detect lock)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 18,
+          "started_at": "2026-11-14T14:46:50Z",
+          "completed_at": "2026-11-14T14:46:50Z"
+        },
+        {
+          "name": "Assert install payload at the canonical path (P4b)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 19,
+          "started_at": "2026-11-14T14:46:50Z",
+          "completed_at": "2026-11-14T14:46:51Z"
+        },
+        {
+          "name": "Assert the install is self-contained (PE import audit)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 20,
+          "started_at": "2026-11-14T14:46:51Z",
+          "completed_at": "2026-11-14T14:46:51Z"
+        },
+        {
+          "name": "The per-user task is the account's own, and a shared one moves only when it is its own (#3801)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 21,
+          "started_at": "2026-11-14T14:46:51Z",
+          "completed_at": "2026-11-14T14:46:53Z"
+        },
+        {
+          "name": "Start a daemon for the uninstall to stop (#3292)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 22,
+          "started_at": "2026-11-14T14:46:53Z",
+          "completed_at": "2026-11-14T14:47:38Z"
+        },
+        {
+          "name": "Uninstall the MSI (quiet)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 23,
+          "started_at": "2026-11-14T14:47:38Z",
+          "completed_at": "2026-11-14T14:47:40Z"
+        },
+        {
+          "name": "Assert the uninstall stopped the daemon (#3292)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 24,
+          "started_at": "2026-11-14T14:47:40Z",
+          "completed_at": "2026-11-14T14:47:40Z"
+        },
+        {
+          "name": "Assert cleanup — registry + install dir gone",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 25,
+          "started_at": "2026-11-14T14:47:40Z",
+          "completed_at": "2026-11-14T14:47:41Z"
+        },
+        {
+          "name": "Compile per-Machine MSI (wxs lint, no install)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 26,
+          "started_at": "2026-11-14T14:47:41Z",
+          "completed_at": "2026-11-14T14:47:49Z"
+        },
+        {
+          "name": "The per-Machine MSI carries the service's Environment: its tables and its DLL (#3375)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 27,
+          "started_at": "2026-11-14T14:47:49Z",
+          "completed_at": "2026-11-14T14:47:50Z"
+        },
+        {
+          "name": "TEMPORARY proof (#3810): the runner's own processes, before the next step stops them",
+          "status": "in_progress",
+          "conclusion": null,
+          "number": 28,
+          "started_at": "2026-11-14T14:47:50Z",
+          "completed_at": null
+        },
+        {
+          "name": "TEMPORARY proof (#3810): the runner is lost, its listener and worker stopped",
+          "status": "pending",
+          "conclusion": null,
+          "number": 29,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 30,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "A repair over the running per-Machine service never restarts Windows, and keeps the mode and the entries (#3754, #3455)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 31,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "The per-Machine uninstall removes the service and its Environment, and no MSI log holds a carried value (#3375)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 32,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "An upgrade from the released MSIs leaves ONE entry, under the new name (FR-133 P1)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 33,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Upload this branch's MSIs (FR-133 field cell)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 34,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Upload the per-Machine MSIs for a lab replay (#3810)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 35,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Save the evidence of a failure (#3754)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 36,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Upload MSI logs on failure",
+          "status": "pending",
+          "conclusion": null,
+          "number": 37,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Publish the cargo cache (release-asset store)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 38,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "status": "pending",
+          "conclusion": null,
+          "number": 76,
+          "started_at": null,
+          "completed_at": null
+        }
+      ]
+    },
+    {
+      "id": 132480840968,
+      "name": "macOS pkg install smoke",
+      "run_id": 43606061432,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-14T14:40:32Z",
+      "completed_at": "2026-11-14T14:50:18Z",
+      "runner_name": "GitHub Actions 1000135088",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T14:40:32Z",
+          "completed_at": "2026-11-14T14:40:33Z"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T14:40:33Z",
+          "completed_at": "2026-11-14T14:40:38Z"
+        },
+        {
+          "name": "Install Rust toolchain (aarch64-apple-darwin)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T14:40:38Z",
+          "completed_at": "2026-11-14T14:40:48Z"
+        },
+        {
+          "name": "Salt the cargo cache key with this job's definition",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-11-14T14:40:48Z",
+          "completed_at": "2026-11-14T14:40:49Z"
+        },
+        {
+          "name": "Restore the cargo cache (release-asset store)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 5,
+          "started_at": "2026-11-14T14:40:49Z",
+          "completed_at": "2026-11-14T14:41:04Z"
+        },
+        {
+          "name": "Install system deps",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 6,
+          "started_at": "2026-11-14T14:41:04Z",
+          "completed_at": "2026-11-14T14:41:12Z"
+        },
+        {
+          "name": "Build the agent + the CLI shim",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 7,
+          "started_at": "2026-11-14T14:41:12Z",
+          "completed_at": "2026-11-14T14:49:17Z"
+        },
+        {
+          "name": "Record the build under test, and the check each step runs first",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 8,
+          "started_at": "2026-11-14T14:49:17Z",
+          "completed_at": "2026-11-14T14:49:18Z"
+        },
+        {
+          "name": "Stage + build the pkg",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 9,
+          "started_at": "2026-11-14T14:49:18Z",
+          "completed_at": "2026-11-14T14:49:25Z"
+        },
+        {
+          "name": "The installer gate refuses an unsupported macOS (negative control)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 10,
+          "started_at": "2026-11-14T14:49:25Z",
+          "completed_at": "2026-11-14T14:49:26Z"
+        },
+        {
+          "name": "Plant a link at the companion's login item (before the first install)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 11,
+          "started_at": "2026-11-14T14:49:26Z",
+          "completed_at": "2026-11-14T14:49:26Z"
+        },
+        {
+          "name": "Opt out of the live update channel (before the first install)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 12,
+          "started_at": "2026-11-14T14:49:26Z",
+          "completed_at": "2026-11-14T14:49:26Z"
+        },
+        {
+          "name": "Install it",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 13,
+          "started_at": "2026-11-14T14:49:26Z",
+          "completed_at": "2026-11-14T14:49:32Z"
+        },
+        {
+          "name": "Why the install failed",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 14,
+          "started_at": "2026-11-14T14:49:32Z",
+          "completed_at": "2026-11-14T14:49:32Z"
+        },
+        {
+          "name": "The login items are files of the person, and the link's target is as it was",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 15,
+          "started_at": "2026-11-14T14:49:32Z",
+          "completed_at": "2026-11-14T14:49:32Z"
+        },
+        {
+          "name": "Assert the payload landed where everything expects it",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-11-14T14:49:32Z",
+          "completed_at": "2026-11-14T14:49:33Z"
+        },
+        {
+          "name": "The pre-rename bundle is swept by an upgrade",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-11-14T14:49:33Z",
+          "completed_at": "2026-11-14T14:49:38Z"
+        },
+        {
+          "name": "Assert the LaunchAgent is registered, and the root half is not",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 18,
+          "started_at": "2026-11-14T14:49:38Z",
+          "completed_at": "2026-11-14T14:49:38Z"
+        },
+        {
+          "name": "The live update channel stays shut (the helper exits on the opt-out marker)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 19,
+          "started_at": "2026-11-14T14:49:38Z",
+          "completed_at": "2026-11-14T14:49:38Z"
+        },
+        {
+          "name": "Assert the menu-bar companion shipped and registered",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 20,
+          "started_at": "2026-11-14T14:49:38Z",
+          "completed_at": "2026-11-14T14:49:38Z"
+        },
+        {
+          "name": "Assert the CLI shim resolves the daemon inside the bundle",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 21,
+          "started_at": "2026-11-14T14:49:38Z",
+          "completed_at": "2026-11-14T14:49:38Z"
+        },
+        {
+          "name": "Assert permissions are reported as the OS granted them (the hosted image grants both)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 22,
+          "started_at": "2026-11-14T14:49:38Z",
+          "completed_at": "2026-11-14T14:49:39Z"
+        },
+        {
+          "name": "An enabled daemon must SURVIVE the next install (self-update)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 23,
+          "started_at": "2026-11-14T14:49:39Z",
+          "completed_at": "2026-11-14T14:49:53Z"
+        },
+        {
+          "name": "The update helper's opt-out removes a loaded helper (and a loaded one exits on the marker)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 24,
+          "started_at": "2026-11-14T14:49:53Z",
+          "completed_at": "2026-11-14T14:49:58Z"
+        },
+        {
+          "name": "A login item the person cannot rewrite is kept, loaded and reported",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 25,
+          "started_at": "2026-11-14T14:49:58Z",
+          "completed_at": "2026-11-14T14:50:03Z"
+        },
+        {
+          "name": "Assert the update helper is installed BY DEFAULT (the job's last install)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 26,
+          "started_at": "2026-11-14T14:50:03Z",
+          "completed_at": "2026-11-14T14:50:07Z"
+        },
+        {
+          "name": "The package's script names no path in /tmp",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 27,
+          "started_at": "2026-11-14T14:50:07Z",
+          "completed_at": "2026-11-14T14:50:07Z"
+        },
+        {
+          "name": "Publish the cargo cache (release-asset store)",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 28,
+          "started_at": "2026-11-14T14:50:07Z",
+          "completed_at": "2026-11-14T14:50:07Z"
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 56,
+          "started_at": "2026-11-14T14:50:07Z",
+          "completed_at": "2026-11-14T14:50:08Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 57,
+          "started_at": "2026-11-14T14:50:08Z",
+          "completed_at": "2026-11-14T14:50:15Z"
+        }
+      ]
+    },
+    {
+      "id": 132493111724,
+      "name": "Was the Windows job's runner lost? A lost one is retried once (#3810)",
+      "run_id": 43606061432,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-14T15:25:35Z",
+      "completed_at": "2026-11-14T15:25:39Z",
+      "runner_name": "GitHub Actions 1000135155",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T15:25:36Z",
+          "completed_at": "2026-11-14T15:25:36Z"
+        },
+        {
+          "name": "Read the job through the API, a lost runner or a step that failed by itself",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T15:25:36Z",
+          "completed_at": "2026-11-14T15:25:37Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T15:25:37Z",
+          "completed_at": "2026-11-14T15:25:37Z"
+        }
+      ]
+    },
+    {
+      "id": 132493134775,
+      "name": "per-User MSI install + uninstall (windows-latest), once more after a lost runner",
+      "run_id": 43606061432,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "cancelled",
+      "started_at": "2026-11-14T15:25:41Z",
+      "completed_at": "2026-11-14T16:10:41Z",
+      "runner_name": "GitHub Actions 1000135156",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T15:25:42Z",
+          "completed_at": "2026-11-14T15:25:43Z"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T15:25:43Z",
+          "completed_at": "2026-11-14T15:25:53Z"
+        },
+        {
+          "name": "The installer runner: a deadline on every installer run, and its evidence (#3754)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T15:25:53Z",
+          "completed_at": "2026-11-14T15:25:53Z"
+        },
+        {
+          "name": "The installer runner ends an endless process at its deadline and reports it (#3754, negative control)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-11-14T15:25:53Z",
+          "completed_at": "2026-11-14T15:26:17Z"
+        },
+        {
+          "name": "Install Rust toolchain",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 5,
+          "started_at": "2026-11-14T15:26:17Z",
+          "completed_at": "2026-11-14T15:26:28Z"
+        },
+        {
+          "name": "Salt the cargo cache key with this job's definition",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 6,
+          "started_at": "2026-11-14T15:26:28Z",
+          "completed_at": "2026-11-14T15:26:29Z"
+        },
+        {
+          "name": "Restore the cargo cache (release-asset store)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 7,
+          "started_at": "2026-11-14T15:26:29Z",
+          "completed_at": "2026-11-14T15:26:58Z"
+        },
+        {
+          "name": "Install WiX Toolset v3 + cargo-wix",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 8,
+          "started_at": "2026-11-14T15:26:58Z",
+          "completed_at": "2026-11-14T15:27:04Z"
+        },
+        {
+          "name": "Build agent (release, minimal feature set)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 9,
+          "started_at": "2026-11-14T15:27:04Z",
+          "completed_at": "2026-11-14T15:35:31Z"
+        },
+        {
+          "name": "Build the roomler CLI shim for the MSI bundle (P3e lever D)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 10,
+          "started_at": "2026-11-14T15:35:31Z",
+          "completed_at": "2026-11-14T15:35:34Z"
+        },
+        {
+          "name": "Build the per-Machine MSI's custom-action DLL (#3375)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 11,
+          "started_at": "2026-11-14T15:35:34Z",
+          "completed_at": "2026-11-14T15:35:40Z"
+        },
+        {
+          "name": "Sign MSI payload binaries (local rehearsal)",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 12,
+          "started_at": "2026-11-14T15:35:40Z",
+          "completed_at": "2026-11-14T15:35:40Z"
+        },
+        {
+          "name": "Stage wintun.dll for the MSI bundle",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 13,
+          "started_at": "2026-11-14T15:35:40Z",
+          "completed_at": "2026-11-14T15:35:42Z"
+        },
+        {
+          "name": "Stage VC++ runtime DLLs for the MSI bundle",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 14,
+          "started_at": "2026-11-14T15:35:42Z",
+          "completed_at": "2026-11-14T15:35:43Z"
+        },
+        {
+          "name": "Build per-User MSI",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 15,
+          "started_at": "2026-11-14T15:35:43Z",
+          "completed_at": "2026-11-14T15:35:59Z"
+        },
+        {
+          "name": "Assert the rollback actions' order in the built MSI (#3292)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-11-14T15:35:59Z",
+          "completed_at": "2026-11-14T15:36:00Z"
+        },
+        {
+          "name": "Install the MSI (quiet, per-User)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-11-14T15:36:00Z",
+          "completed_at": "2026-11-14T15:36:02Z"
+        },
+        {
+          "name": "Assert registry UpgradeCode present (rc.27 install_detect lock)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 18,
+          "started_at": "2026-11-14T15:36:02Z",
+          "completed_at": "2026-11-14T15:36:03Z"
+        },
+        {
+          "name": "Assert install payload at the canonical path (P4b)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 19,
+          "started_at": "2026-11-14T15:36:03Z",
+          "completed_at": "2026-11-14T15:36:04Z"
+        },
+        {
+          "name": "Assert the install is self-contained (PE import audit)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 20,
+          "started_at": "2026-11-14T15:36:04Z",
+          "completed_at": "2026-11-14T15:36:05Z"
+        },
+        {
+          "name": "The per-user task is the account's own, and a shared one moves only when it is its own (#3801)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 21,
+          "started_at": "2026-11-14T15:36:05Z",
+          "completed_at": "2026-11-14T15:36:07Z"
+        },
+        {
+          "name": "Start a daemon for the uninstall to stop (#3292)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 22,
+          "started_at": "2026-11-14T15:36:07Z",
+          "completed_at": "2026-11-14T15:36:53Z"
+        },
+        {
+          "name": "Uninstall the MSI (quiet)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 23,
+          "started_at": "2026-11-14T15:36:53Z",
+          "completed_at": "2026-11-14T15:36:56Z"
+        },
+        {
+          "name": "Assert the uninstall stopped the daemon (#3292)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 24,
+          "started_at": "2026-11-14T15:36:56Z",
+          "completed_at": "2026-11-14T15:36:56Z"
+        },
+        {
+          "name": "Assert cleanup — registry + install dir gone",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 25,
+          "started_at": "2026-11-14T15:36:56Z",
+          "completed_at": "2026-11-14T15:36:57Z"
+        },
+        {
+          "name": "Compile per-Machine MSI (wxs lint, no install)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 26,
+          "started_at": "2026-11-14T15:36:57Z",
+          "completed_at": "2026-11-14T15:37:13Z"
+        },
+        {
+          "name": "The per-Machine MSI carries the service's Environment: its tables and its DLL (#3375)",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 27,
+          "started_at": "2026-11-14T15:37:13Z",
+          "completed_at": "2026-11-14T15:37:14Z"
+        },
+        {
+          "name": "TEMPORARY proof (#3810): the runner's own processes, before the next step stops them",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 28,
+          "started_at": "2026-11-14T15:37:14Z",
+          "completed_at": "2026-11-14T15:37:15Z"
+        },
+        {
+          "name": "TEMPORARY proof (#3810): the runner is lost, its listener and worker stopped",
+          "status": "in_progress",
+          "conclusion": null,
+          "number": 29,
+          "started_at": "2026-11-14T15:37:15Z",
+          "completed_at": null
+        },
+        {
+          "name": "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 30,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "A repair over the running per-Machine service never restarts Windows, and keeps the mode and the entries (#3754, #3455)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 31,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "The per-Machine uninstall removes the service and its Environment, and no MSI log holds a carried value (#3375)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 32,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "An upgrade from the released MSIs leaves ONE entry, under the new name (FR-133 P1)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 33,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Upload this branch's MSIs (FR-133 field cell)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 34,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Upload the per-Machine MSIs for a lab replay (#3810)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 35,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Save the evidence of a failure (#3754)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 36,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Upload MSI logs on failure",
+          "status": "pending",
+          "conclusion": null,
+          "number": 37,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Publish the cargo cache (release-asset store)",
+          "status": "pending",
+          "conclusion": null,
+          "number": 38,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Post Run actions/checkout@v4",
+          "status": "pending",
+          "conclusion": null,
+          "number": 76,
+          "started_at": null,
+          "completed_at": null
+        }
+      ]
+    },
+    {
+      "id": 132505464919,
+      "name": "Was the retry's runner lost? It is not retried again (#3810)",
+      "run_id": 43606061432,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-11-14T16:10:43Z",
+      "completed_at": "2026-11-14T16:10:48Z",
+      "runner_name": "GitHub Actions 1000135269",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T16:10:44Z",
+          "completed_at": "2026-11-14T16:10:44Z"
+        },
+        {
+          "name": "Read the job through the API, a lost runner or a step that failed by itself",
+          "status": "completed",
+          "conclusion": "failure",
+          "number": 2,
+          "started_at": "2026-11-14T16:10:44Z",
+          "completed_at": "2026-11-14T16:10:45Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T16:10:45Z",
+          "completed_at": "2026-11-14T16:10:46Z"
+        }
+      ]
+    }
+  ]
+}

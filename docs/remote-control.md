@@ -2594,7 +2594,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3291`](../crates/localapi/src/lib.rs#L3291), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3450`](../crates/localapi/src/lib.rs#L3450), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -2694,7 +2694,7 @@ sequenceDiagram
   ([`peerAuthCanVerify`, `peerAuth.ts:138`](../ui/src/utils/peerAuth.ts#L138)), or every answer would read
   as a bad signature.
 - **What the device signs** ([`peer_auth_transcript`, `signaling.rs:240`](../crates/remote_control/src/signaling.rs#L240);
-  [`sign_answer`, `peer_auth.rs:265`](../agents/roomlerd/src/peer_auth.rs#L265)): the transcript above,
+  [`sign_answer`, `peer_auth.rs:276`](../agents/roomlerd/src/peer_auth.rs#L276)): the transcript above,
   ECDSA P-256 over SHA-256 as WebCrypto verifies it. The daemon signs at both places an answer leaves it, so a
   GUI worker that built the answer never holds the key.
 - **What the page does with the answer** ([`judgePeerAuth`, `peerAuth.ts:267`](../ui/src/utils/peerAuth.ts#L267),
@@ -2738,7 +2738,7 @@ changed** in every browser that pinned the old one, even when the server revives
 machine is a new identity until a person says otherwise.
 
 **The other direction: the device judges the browser (P1c).** The daemon judges the browser behind every in-org
-offer as it notes it ([`judge_offer`, `peer_auth.rs:220`](../agents/roomlerd/src/peer_auth.rs#L220)),
+offer as it notes it ([`judge_offer`, `peer_auth.rs:231`](../agents/roomlerd/src/peer_auth.rs#L231)),
 and the hub records the verdict on the session's `session_started` audit row
 ([`forward_answer`, `hub.rs:2455`](../crates/modules/fleet/src/hub.rs#L2455)). Nothing is refused
 before FR-100 P3; the record is what the fleet's audit week is counted over.
@@ -2757,7 +2757,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   nothing else ([`pick_config_path`, `app.rs:1111`](../agents/roomlerd/src/app.rs#L1111)), so no daemon copies a
   person's config, or its `peer-auth/`, to the machine-global path any more: the copy after a healthy run and the
   key adoption #3096 added to it are gone. A key is read from its file or made there
-  ([`load_or_make`, `peer_auth.rs:681`](../agents/roomlerd/src/peer_auth.rs#L681)). An administrator who moves an
+  ([`load_or_make`, `peer_auth.rs:740`](../agents/roomlerd/src/peer_auth.rs#L740)). An administrator who moves an
   enrollment to the machine-global path by hand moves its `peer-auth/` folder with it
   ([the SystemContext checklist](operator-systemcontext-smoke.md), step 2c): an enrollment that arrives without its
   key mints a new one, and every browser that pinned the device reads it as `key-changed`, though the device's
@@ -2770,6 +2770,24 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   outside a save the repair seals the keys folder and a key file only when that entry gave no account other than
   an administrator a right to change it as found; one another account could have written stays refused until an
   elevated Setup or `roomlerd enroll --machine-global` seals it.
+- **Any other config an elevated or SYSTEM daemon runs, it seals itself.** On Windows, a daemon that runs
+  elevated or as SYSTEM with a config outside the machine folder keeps `peer-auth\` sealed to SYSTEM and
+  Administrators: owner Administrators, protected, nothing inherited, and every file read and written by handle
+  ([`seal`, `peer_auth.rs:1343`](../agents/roomlerd/src/peer_auth.rs#L1343)).
+
+  | Who decides | Rule |
+  |---|---|
+  | [`keeping`, `peer_auth.rs:924`](../agents/roomlerd/src/peer_auth.rs#L924) | sealed only on Windows, elevated or SYSTEM, outside the machine folder, switch on. Unix keeps 0700/0600; the machine folder stays `machine_tree`'s |
+  | the first seal, per run | reads the folder as found, then seals it: a folder and key file Administrators or SYSTEM own are sealed in place, the key kept byte for byte, so no browser warns |
+  | | a folder or key file another account owns is never used: moved aside by handle (the folder as `peer-auth.moved-<unix>`, a file as `peer-auth.<name>.not-sealed-<UTC>` in the config folder), nothing deleted, and a new key made, which each browser that knew the old one warns about once. Where a policy gives an elevated process's files to its person (the "object creator" default owner), the first seal makes a new key |
+  | | a browser-key file is kept only when its folder and the file were closed to every other account as found; otherwise it is moved aside, and each browser reads `unknown` once more |
+  | every read after it | judged with [`verdict`, `machine_tree.rs:201`](../crates/agent-core/src/machine_tree.rs#L201) on the handle it reads through: a key file another account can change is not offered (the hello carries none, so the viewer shows **Unverified**), and a browser-key file another account can change is not read |
+  | a config folder that cannot be held as itself | redirected to a share, or reached through a link: the key is kept as before, no browser key is read or kept, and that is said once |
+  | a run neither elevated nor SYSTEM | a per-user install: nothing is sealed or changed. At a folder an elevated run sealed it offers no key, deletes nothing, and says once why and what to do: start it elevated again, or an administrator moves the folder away (a new key, one warning per browser) |
+  | `ROOMLERD_PEER_AUTH_SEAL=0` | read from the service's `Environment` value only ([`seal_enabled_in`, `peer_auth.rs:953`](../agents/roomlerd/src/peer_auth.rs#L953)), never the process's environment or the config: the switch is the service's, set where only an administrator sets it. Off keeps the behaviour from before, said once |
+
+  A later change that runs this worker with standard rights must first hand the sealed folder back to the person's
+  account (the SYSTEM host can), or each such device makes a new key once.
 - **The policy is the device owner's**: `roomler config set peer_auth off|audit` (default `audit`), live, and only
   from the person at the console. It is never pushable by the server, and `enforce` is refused by name until P3.
   `off` stops the judging, the remembering and the record; the device still signs its answers.
@@ -2796,7 +2814,11 @@ same arm of the agent's signalling loop (`kill_rx`, `agents/roomlerd/src/signali
 and that arm's job is to make the ending **final and attributed**: the viewer
 is told who ended it and does not come back on its own. Since FR-101 P4b-2 the
 same arm also ends a session that sat idle past its limit (`idle_rx`, §11.6),
-the same way and under its own reason (`DeviceEnd`).
+the same way and under its own reason (`DeviceEnd`). The banner's Disconnect
+reaches it over the LocalAPI (`RcDisconnect`), which takes it, as it takes a
+consent answer, only from the person at the screen the daemon shows, SYSTEM
+or an elevated administrator (`docs/desktop-companion.md` §12.4). The badge's
+is the daemon's own and never crosses the pipe.
 
 ```mermaid
 sequenceDiagram
@@ -6555,7 +6577,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
-| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1093)) | `EndedByItsHost` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1115)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
 | Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
@@ -7093,8 +7115,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1448`). Again in
-  the `Stop` arm (`supervisor.rs:1590`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1470`). Again in
+  the `Stop` arm (`supervisor.rs:1612`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

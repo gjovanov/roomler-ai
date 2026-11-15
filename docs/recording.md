@@ -483,10 +483,13 @@ sequenceDiagram
 - ⚠️ **The console-user gate is the listener's, not the handler's**
   (`serve_connection_as`, `crates/localapi/src/lib.rs`). The pipe ACL admits
   every Interactive User, RDP sessions included, which is right for reading
-  status and wrong for recording: a guest in an RDP session must not be able
-  to record the console user's desktop. Windows: the client's session
-  (`GetNamedPipeClientProcessId` → `ProcessIdToSessionId`) must be the active
-  console session. Unix: the peer's uid must be the daemon's, or root. An
+  status and wrong for recording: another signed-in account must not be able
+  to record the desktop the daemon shows. Windows: the client's session
+  (`GetNamedPipeClientProcessId` → `ProcessIdToSessionId`) must be the session
+  whose screen the daemon shows: its own, which for a machine-wide install's
+  worker is the console session, or the console session for a daemon in
+  session 0 (`screen_session`, `desktop-companion.md` §12.4). Unix: the peer's
+  uid must be the daemon's, or root. An
   unidentified peer fails the check. The same gate covers `ConfigSet` of any
   `record_*` key.
 - ⚠️ **On a Linux system install the person comes in on their own socket**
@@ -1660,7 +1663,7 @@ down:
 | Path | Arrives as | Its own gates | Why the local gate lets it in |
 |---|---|---|---|
 | An RC session holding `INPUT` | The person's own desktop: roomler-desktop or a terminal, worked with the host's mouse and keyboard | The host's consent to `INPUT` | The Recordings view is the person's own process |
-| `roomler exec` | Root on Linux, SYSTEM in the console session on a SystemContext host, the person on an attended Windows install | `EXEC_DEVICE` (`ADMINISTRATOR` only) and the owner's `exec_enabled` | `peer_is_console_user`: uid 0, or the console session. An anchored service, SYSTEM in session 0, does not pass |
+| `roomler exec` | Root on Linux, SYSTEM in the console session on a SystemContext host, the person on an attended Windows install | `EXEC_DEVICE` (`ADMINISTRATOR` only) and the owner's `exec_enabled` | `peer_is_console_user`: uid 0, or the session whose screen the daemon shows, here the console session. An anchored service, SYSTEM in session 0, does not pass |
 | `roomler ssh` in `console_user` mode | The console session on Windows. On Linux it drops to the person at the screen | `SSH_DEVICE` (`ADMINISTRATOR` only) and the owner's `ssh_enabled` | The console session on Windows. On a Linux system install, that person's socket (P2e). `daemon` mode is the exec row on Linux |
 
 The fourth, an agent session, left master when FR-90 was parked (FR-137).

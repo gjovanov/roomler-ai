@@ -1332,6 +1332,20 @@ impl HeldFile {
         String::from_utf8(bytes).map_err(|e| format!("reading {what}: {e}"))
     }
 
+    /// The file's content, through this handle. `Ok(None)` when it is larger
+    /// than `max_len` bytes, and nothing is read. Opened [`OpenFor::Read`].
+    pub fn read_bytes(&self, max_len: u64) -> Result<Option<Vec<u8>>, String> {
+        let len = self
+            .file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", self.path.display()))?
+            .len();
+        if len > max_len {
+            return Ok(None);
+        }
+        win::read_to_end(&self.file, &self.path, max_len).map(Some)
+    }
+
     /// Delete the file through this handle (`FileDispositionInfo`), never by
     /// its name. Opened [`OpenFor::Delete`].
     pub fn delete(self) -> Result<(), String> {
