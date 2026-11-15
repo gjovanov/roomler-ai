@@ -3005,3 +3005,25 @@ jobs:
         run: |
           cp Cargo.lock crates/vendored/webrtc-sctp/Cargo.lock
           cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --skip fuzz_artifact_test
+
+  job-steps-ended:
+    # #3810 — the installer smoke's Windows job is re-run once, as attempt 2,
+    # when it ended without every step reporting an end, if no guard of the
+    # workflow installer-smoke-rerun refuses. This job runs
+    # scripts/job-steps-ended-test.sh: the decision (scripts/job-steps-ended.sh)
+    # on real runs' API data and on made-up replies, the re-run script
+    # (scripts/job-steps-ended-rerun.sh) against a stand-in for gh, and the
+    # check of the two workflow files (the job names that the listener matches,
+    # and its shape). The test file says what each case proves. It takes
+    # seconds, so it runs on every pull request.
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: The smoke's re-run decision on real and made-up job data (#3810)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the decision on every case
+        run: bash scripts/job-steps-ended-test.sh

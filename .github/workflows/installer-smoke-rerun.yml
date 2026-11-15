@@ -1,0 +1,78 @@
+# #3810 — asks GitHub to re-run the installer smoke's Windows job ONCE when
+# that job ended without every step reporting an end.
+#
+# The smoke's Windows job runs on a hosted runner, and a job whose runner goes
+# away mid-job is closed by GitHub at its timeout with steps that reported no
+# end; its check then reads `cancelled`. Only a RE-RUN of the same run
+# (attempt 2) replaces that check, and a job cannot re-run its own run while
+# the run is in progress. So this workflow starts when a smoke run completes,
+# and scripts/job-steps-ended-rerun.sh reads the run with the decision that the
+# smoke's check job prints (scripts/job-steps-ended.sh) and, on `incomplete`,
+# asks GitHub to re-run that one job. A re-run runs the real test again, and a
+# failure that comes and goes can pass on it.
+#
+# Pull requests from forks: GitHub runs a `workflow_run` workflow only from
+# the file on the default branch, with the default branch's last commit as
+# GITHUB_SHA, and gives it its own token even when the run that triggered it
+# had a read-only one
+# (https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run).
+# This job never checks out or runs a pull request's code: its checkout is the
+# default branch's two scripts, and the run's id reaches them as an
+# environment value only, never as expression text. The re-run itself runs
+# with the privileges of the actor who started the run, not this token's
+# (https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs).
+#
+# It acts only on attempt 1 of a run that did not succeed, and only when:
+#   G1  the run reads attempt 1 when this job reads it;
+#   G2  the smoke's check job is listed in attempt 1 and reads neither
+#       `skipped` nor `cancelled`, and the Windows job is listed there;
+#   G3  no newer smoke run exists for the same branch, event and head
+#       repository, read last, right before the re-run is asked.
+# The script's header says what each guard does not see. It writes ONE line
+# to its summary, what it did and why, and ends 0 on every path it controls;
+# a cancel or the job's timeout ends it otherwise.
+name: installer-smoke-rerun
+
+on:
+  workflow_run:
+    workflows: [installer-smoke]
+    types: [completed]
+
+permissions: {}
+
+# One run of this workflow at a time for one smoke run: a second delivery of
+# the same event waits, then runs the guards again; once the first re-run was
+# accepted and the run reads attempt 2, it refuses at G1.
+concurrency:
+  group: installer-smoke-rerun-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    name: Re-run the installer smoke's Windows job once when not every step of it reported an end, if no guard refuses (#3810)
+    if: ${{ github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # actions: write reads the run and re-runs its Windows job. contents: read
+    # is for the checkout of the default branch's two scripts.
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/job-steps-ended.sh
+            scripts/job-steps-ended-rerun.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Read the run, and ask GitHub to re-run its Windows job once if not every step of it reported an end and no guard refuses
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          # Matched by equality. scripts/job-steps-ended-test.sh holds both
+          # equal to the jobs' `name:` in installer-smoke.yml.
+          SMOKE_JOB: per-User MSI install + uninstall (windows-latest)
+          CHECK_JOB: "Did every step of the Windows job report an end? (#3810)"
+        run: bash scripts/job-steps-ended-rerun.sh

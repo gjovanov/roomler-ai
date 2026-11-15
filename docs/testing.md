@@ -324,7 +324,7 @@ and passes.
 | Lane | What it does |
 |---|---|
 | `ci.yml` | fmt + clippy (`--workspace -D warnings`, which compiles no test code, then `--all-targets` on the audited server crates and every `roomler-ai-mod-*` crate through [`scripts/clippy-audited-crates.sh`](../scripts/clippy-audited-crates.sh), whose module list is read from the workspace, #3594) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the thirteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1385`). A push to master always runs everything |
-| `installer-smoke.yml` | On a Windows runner: installs, audits and uninstalls the freshly built per-User MSI; upgrades, reinstalls, repairs and uninstalls the per-Machine MSI over its running service; upgrades the newest released MSIs of both flavours at or below the branch's version to the branch's, so a ref behind the newest release still upgrades (#3774). Every installer run goes through one runner ([`installer-smoke.yml:143`](../.github/workflows/installer-smoke.yml#L143), #3754) that waits for that process alone, fails the step past a 300 s deadline or on any exit but 0, prints the MSI log's `RESTART MANAGER` and held-in-use lines, and saves a process list with image paths and the service logs; a negative control proves the deadline on every run ([`:241`](../.github/workflows/installer-smoke.yml#L241)). Each per-Machine step has a timeout of its own (6 or 10 min, well under the job's 40; [`:1166`](../.github/workflows/installer-smoke.yml#L1166), #3810), so a step that never returns fails by itself and the evidence step runs, which adds the boot time, the System events 1074, 41 and 6008 since the job began and the service's state ([`:1740`](../.github/workflows/installer-smoke.yml#L1740)). A job that still sits to its 40 min with that step never run means the runner itself was gone. The per-Machine service is opted out of the live update channel from its first start: `ROOMLERD_AUTO_UPDATE=0` goes into the machine environment, from which each spawn builds the worker's environment ([`:1178`](../.github/workflows/installer-smoke.yml#L1178)), and the step fails if a log of the service says its updater was armed. On a macOS runner: installs the pkg with the live update channel shut by the product's own opt-out marker (`/etc/roomler/disable-auto-update`) until the job's last install, which asserts the update helper is installed by default; every step that runs the bundle's `roomlerd` first checks that its `--version` is the build's (#3774); `roomlerd caps` must report `has_input_permission` and `permissions` consistently, and the hosted image grants both Screen Recording and Accessibility |
+| `installer-smoke.yml` | On a Windows runner: installs, audits and uninstalls the freshly built per-User MSI; upgrades, reinstalls, repairs and uninstalls the per-Machine MSI over its running service; upgrades the newest released MSIs of both flavours at or below the branch's version to the branch's, so a ref behind the newest release still upgrades (#3774). Every installer run goes through one runner ([`installer-smoke.yml:143`](../.github/workflows/installer-smoke.yml#L143), #3754) that waits for that process alone, fails the step past a 300 s deadline or on any exit but 0, prints the MSI log's `RESTART MANAGER` and held-in-use lines, and saves a process list with image paths and the service logs; a negative control proves the deadline on every run ([`:241`](../.github/workflows/installer-smoke.yml#L241)). Each per-Machine step has a timeout of its own (6 or 10 min, well under the job's 40; [`:1166`](../.github/workflows/installer-smoke.yml#L1166), #3810), so a step that never returns fails by itself and the evidence step runs, which adds the boot time, the System events 1074, 41 and 6008 since the job began and the service's state ([`:1764`](../.github/workflows/installer-smoke.yml#L1764)). A runner that goes away mid-job leaves a step that never reports an end: GitHub closes the job `cancelled` 5 min past its 40 min timeout, with the evidence step still `pending`. When the Windows job does not succeed, a check job on a fresh Ubuntu runner reads it through the API ([`:2723`](../.github/workflows/installer-smoke.yml#L2723), #3810), writes which steps reported an end and which did not, as an error annotation and in its summary, and ends 1. When not every step of attempt 1 reported an end, the workflow `installer-smoke-rerun`, which GitHub runs from the default branch's copy when the smoke run completes, asks GitHub to re-run that one job once, as attempt 2 of the same run, unless one of its guards refuses. Attempt 2 is never re-run, and until a re-run replaces the lost job's check the run reads `cancelled` (the flow, the guards and the known limits: [below](#a-lost-windows-job-is-re-run-once-3810)). The per-Machine service is opted out of the live update channel from its first start: `ROOMLERD_AUTO_UPDATE=0` goes into the machine environment, from which each spawn builds the worker's environment ([`:1178`](../.github/workflows/installer-smoke.yml#L1178)), and the step fails if a log of the service says its updater was armed. On a macOS runner: installs the pkg with the live update channel shut by the product's own opt-out marker (`/etc/roomler/disable-auto-update`) until the job's last install, which asserts the update helper is installed by default; every step that runs the bundle's `roomlerd` first checks that its `--version` is the build's (#3774); `roomlerd caps` must report `has_input_permission` and `permissions` consistently, and the hosted image grants both Screen Recording and Accessibility |
 | `deb-bare-image.yml` | On a PR that changes what a `.deb` declares: packages the latest release's binaries with the checkout's control file through the lane's own `cargo deb`, installs them on five bare images on both arches, by apt and by the real `install.sh`, and starts them. A control proves the check still refuses agent-v0.4.190. The release lane runs the same script on what it is about to publish (`verify-linux-debs`) — [installation.md](installation.md#what-a-bare-host-needs-3204) |
 | `selfhost-coturn.yml` | On a PR or a master push that changes either compose file, `turnserver.conf`, `.env.selfhost.example` or the check: starts the file's own coturn, with the stack it needs, and runs `scripts/selfhost-coturn-check.sh`, which fails a crash loop, a coturn left outside the server's namespace, a refused CreatePermission to the public address, a relay that carries no bytes, and a hole in the deny list. It runs on `docker-compose.selfhost.yml` with a documentation address as the public one, three times in a row, because a run that costs too many relay ports fails on its own leftovers; then after a `kill -9` of the server's process, on the same file with the example's defaults, and on `docker-compose.yml`. It pulls the published server image and compiles no Rust, so a run takes minutes. `scripts/selfhost-smoke.sh` runs the same check after a full install — [self-hosting.md](self-hosting.md#the-turn-relay) |
 | `integration-tests.yml` | The integration suite against a real MongoDB and Redis, as **four shards** (FR-6 waves 24 and 27). Each shard lists the same test binaries, sorts the (test, binary) pairs and runs every fourth with `--exact`, so between them the shards run each test once. Each shard must report every test it was handed, and the whole listing must clear a floor. 2 threads per shard, each with its own mongod: at 4 threads against one mongod, the dropped test databases' files reached the 64,000-descriptor ceiling and mongod aborted. Dispatch inputs: `filter`, `threads`, `mongo_tmpfs`, `report_time` (per-test durations and the slowest tests, in the step summary) |
@@ -339,6 +339,83 @@ and passes.
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
 are tracked in `scripts/e2e-expected-failures.txt` rather than papered over.
+
+### A lost Windows job is re-run once (#3810)
+
+A hosted runner that goes away mid-job (Windows restarted, the network lost, the runner's
+process ended) cannot report the end of the step it was running. GitHub closes such a job
+`cancelled` 5 min past its 40 min timeout
+([`installer-smoke.yml:118`](../.github/workflows/installer-smoke.yml#L118)). In every loss
+read so far, the step it was running stayed `in_progress` and every later step `pending`, the
+evidence step among them although it runs on any failure or cancel, and the only annotation was
+"The job has exceeded the maximum execution time of 40m0s". The job's check then reads
+`cancelled`, and so does the run. Only a re-run of the same run, as attempt 2, replaces that
+check, and a job cannot re-run its own run while the run is in progress. So the smoke run only
+says what it read, and a second workflow asks for the re-run once the run has completed.
+
+```mermaid
+sequenceDiagram
+    participant W as Windows job
+    participant C as check job
+    participant G as GitHub
+    participant L as installer-smoke-rerun
+    Note over W,C: attempt 1 of an installer-smoke run
+    W--xG: a step never reports an end
+    G->>W: closed cancelled, 5 min past its 40 min timeout
+    G->>C: started, since the Windows job did not succeed
+    C->>G: reads the job's steps, prints what it read, exits 1
+    G->>L: the run completed, the default branch's file runs
+    L->>G: G1, G2, the decision, then G3 last
+    alt not every step reported an end, and every guard passes
+        L->>G: re-run that one job, by its job id
+        G->>W: attempt 2 of the same run, the check job after it
+    else every step reported an end, or a guard refuses
+        L->>L: one summary line that says why, exits 0
+    end
+```
+
+| Part | Where | What it does |
+|---|---|---|
+| The decision | [`scripts/job-steps-ended.sh:13-20`](../scripts/job-steps-ended.sh#L13-L20) | `complete` when GitHub lists at least one step of the job and every one of them reports `completed`, `incomplete` otherwise. Neither the job's conclusion nor its annotations decide. Its lines name no cause: the job's conclusion, the steps that reported an end other than success or skipped, the steps that reported none with the API's own status word, GitHub's annotations, and whether the job is re-run ([`:174-181`](../scripts/job-steps-ended.sh#L174-L181)). Each control character in a string from the API is printed as a space, so no step name can start a line of its own |
+| The check job | [`installer-smoke.yml:2720-2762`](../.github/workflows/installer-smoke.yml#L2720-L2762) | Runs in the smoke run when the Windows job neither succeeded nor was skipped, unless the run was cancelled first ([`:2723`](../.github/workflows/installer-smoke.yml#L2723)). It only reads (`actions`, `checks`, `contents`), prints the decision's lines as an error annotation and in its summary, and ends 1 whenever it runs. Its name, "Did every step of the Windows job report an end? (#3810)", is true on both attempts |
+| The listener | [`installer-smoke-rerun.yml:36-39`](../.github/workflows/installer-smoke-rerun.yml#L36-L39) | Starts when an `installer-smoke` run completes, always from the default branch's file, and acts only on attempt 1 of a run that did not succeed ([`:53`](../.github/workflows/installer-smoke-rerun.yml#L53)). Its one job holds `actions: write` and `contents: read` ([`:58-60`](../.github/workflows/installer-smoke-rerun.yml#L58-L60)) and checks out the default branch's two scripts with no credentials kept, never a pull request's code ([`:62-68`](../.github/workflows/installer-smoke-rerun.yml#L62-L68)). One concurrency group per smoke run ([`:46-48`](../.github/workflows/installer-smoke-rerun.yml#L46-L48)) makes a second delivery of the same event wait for the first, so that its G1 reads the run's attempt after any re-run the first one asked for |
+| The re-run | [`scripts/job-steps-ended-rerun.sh:88-149`](../scripts/job-steps-ended-rerun.sh#L88-L149) | G1: the run's live attempt is 1 ([`:88-92`](../scripts/job-steps-ended-rerun.sh#L88-L92)). G2: in attempt 1 the check job is listed and reads neither `skipped` nor `cancelled`, and the Windows job is listed ([`:94-108`](../scripts/job-steps-ended-rerun.sh#L94-L108)). The decision, on that same list ([`:110-119`](../scripts/job-steps-ended-rerun.sh#L110-L119)). G3, read last: no smoke run created after this one exists for the same branch, event and head repository ([`:121-141`](../scripts/job-steps-ended-rerun.sh#L121-L141)). Then ONE request, `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`, which re-runs the Windows job and the check job that needs it ([`:143-149`](../scripts/job-steps-ended-rerun.sh#L143-L149)). Whatever it prints of the run is plain log inside a `::stop-commands::` block whose token is random per run ([`:65-72`](../scripts/job-steps-ended-rerun.sh#L65-L72)). After it comes ONE line in the script's own words, with only numbers and GitHub's status words from the run, in the log and in its summary. It always ends 0 |
+| The tests | [`scripts/job-steps-ended-test.sh`](../scripts/job-steps-ended-test.sh), the `job-steps-ended` job of [`ci.yml`](../.github/workflows/ci.yml) | The decision on the API data of five real runs whose Windows job failed or was lost, and on made-up replies built from one of them; the re-run script against a stand-in `gh`, a test for each guard, each of them red on a deliberately broken copy; and the job names the listener matches by equality, held equal to `installer-smoke.yml`'s. On every pull request |
+
+Known limits:
+
+- Until a re-run replaces the lost job's check, the run reads `cancelled`, and a reader that
+  reads the checks by name stops on it.
+- Attempt 2 is never re-run. If it does not succeed either, lost again or out of time, its check
+  job prints what it read in attempt 2 and ends 1, and no third attempt follows.
+- A job whose every listed step reported an end is never re-run, whatever ended it: a step that
+  failed, the job's own timeout while its runner still answered, a failed "Set up job", a runner
+  shut down after its last step reported, or one lost after its last step but before "Complete
+  job". The check job still prints what it read and ends 1.
+- A push that lands between G3's read and the request is not seen. Whether a re-run enters the
+  smoke's concurrency group again, GitHub's documentation does not say; if it does, it could
+  cancel that newer push's run.
+- G3 does not see a run of the same branch created in the same second, and reads one page of
+  100 runs.
+- For a pull request from a fork, G3's branch filter on GitHub's side was not read; there G2 is
+  the guard (a superseded run's check job does not run).
+- A person's cancel that arrives after the check job has ended is still followed by one re-run:
+  the API does not say who cancelled.
+- Whether the run reads attempt 2 as soon as GitHub accepts the re-run is not read yet. If not,
+  a second delivery in that window passes G1 and asks again; GitHub's answer to that is not
+  documented, and the script then ends 0 with a warning.
+- When no attempt 2 follows, look at the `installer-smoke-rerun` runs in the Actions list: the
+  one for that smoke run says in one summary line, which names the run's id, what it did and
+  why. It never ends red,
+  because a red run would sit on the default branch's head, where nobody reading the smoke run
+  looks.
+- From a re-run run, the newest files carry the attempt in their names: what attempt 2 uploads
+  is named `installer-smoke-msis-attempt-2`, `installer-smoke-pm-msis-attempt-2` or
+  `msi-logs-attempt-2` ([`installer-smoke.yml:1730`](../.github/workflows/installer-smoke.yml#L1730),
+  [`:1747`](../.github/workflows/installer-smoke.yml#L1747),
+  [`:1788`](../.github/workflows/installer-smoke.yml#L1788)). Take the highest attempt's: the
+  plain name holds only what attempt 1 uploaded before it was lost.
+- A re-run runs the real test again, so a failure that comes and goes can pass on attempt 2.
 
 ## The agent-e2e lane (FR-114)
 
