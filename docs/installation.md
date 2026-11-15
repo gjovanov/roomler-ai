@@ -1530,7 +1530,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:5974`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:6002`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`

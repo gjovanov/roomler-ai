@@ -122,7 +122,7 @@ working two-row.
 | LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as today (`:1395-1407`) | the plist is removed by `convert` |
 | Root's file | `config::save` of `/etc/roomler/config.toml`, as today | nothing |
 | People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:265-277`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and those bytes are kept as the config's `.prev`, 0600, as a save keeps the outgoing file; it reads no file again by path. The files are born the person's |
-| Restart, verify, report | as today (`:731-739`, `:797-892`) | nothing |
+| Restart, verify, report | as today (`:728-736`, `:797-892`) | nothing |
 | Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then the bootstrap (D6) |
 | `--revert` | its file back from its kept copy; its records removed after the restart answers | `put-back`, or `put-back-legacy` on a Mac converted by 0.4.200 to 0.4.219 |
 
