@@ -8992,7 +8992,9 @@ mod smoke_ffmpeg_tests {
             .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"));
         assert_eq!(f.verdict, Verdict::None, "{e:#}");
         assert!(
-            f.tried.backends.contains(&(Backend::Ffmpeg, Reach::InBuild)),
+            f.tried
+                .backends
+                .contains(&(Backend::Ffmpeg, Reach::InBuild)),
             "{e:#}"
         );
         // The dispatch locks pin the names the vendored build carries, and

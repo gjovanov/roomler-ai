@@ -1939,10 +1939,7 @@ mod tests {
             NoMf::from_reach(Reach::NotCompiled),
             Some(NoMf::NotCompiled)
         );
-        assert_eq!(
-            NoMf::from_reach(Reach::WindowsOnly),
-            Some(NoMf::OffWindows)
-        );
+        assert_eq!(NoMf::from_reach(Reach::WindowsOnly), Some(NoMf::OffWindows));
         let here = if cfg!(all(target_os = "windows", feature = "mf-encoder")) {
             None
         } else if cfg!(target_os = "windows") {
