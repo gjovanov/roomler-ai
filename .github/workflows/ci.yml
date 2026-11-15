@@ -2986,6 +2986,14 @@ jobs:
         run: bash scripts/macos-postinstall-check.sh
       - name: Run the post-install script on both roads under bash 3.2, the version macOS ships
         run: bash scripts/macos-postinstall-check.sh --bash 3.2
+      # #3881 — the served install script's own output (the release it names,
+      # the installed daemon's --version), under the /bin/sh of both hosts.
+      - name: Run the install script's output cases under dash, Debian's /bin/sh
+        run: bash scripts/install-sh-output-check.sh --shell dash
+      - name: Run the install script's output cases under bash 5 in POSIX mode
+        run: bash scripts/install-sh-output-check.sh --shell bash
+      - name: Run the install script's output cases under bash 3.2 in POSIX mode, the version of macOS's /bin/sh
+        run: bash scripts/install-sh-output-check.sh --shell bash3.2
 
   vendored-sctp:
     # #3755 — the webrtc-sctp fork's own tests, which ran in no lane: the fork
