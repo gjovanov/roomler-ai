@@ -937,7 +937,7 @@ impl CellOpener for SessionOpener {
 }
 
 /// `VideoCodec::wire()` says `hevc` where `open_for_codec` says `h265`.
-fn codec_label(wire: &'static str) -> &'static str {
+pub(crate) fn codec_label(wire: &'static str) -> &'static str {
     if wire == "hevc" { "h265" } else { wire }
 }
 

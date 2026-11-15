@@ -728,7 +728,9 @@ mod tests {
                     fail_at: a.fail_at,
                     never_key: a.never_key,
                 }),
-                codec: a.codec,
+                // `a.codec` is spelt as its constructor returns it, and read
+                // as `SessionOpener` reads it.
+                codec: bench::codec_label(a.codec),
                 chroma444: false,
             })
         }
@@ -899,11 +901,23 @@ mod tests {
     }
 
     // RED on the seam: master warned "demoted" for `hevc` answered by HEVC.
+    // Each opener answers in its own spelling: the RTP track's
+    // `open_for_codec` says `h265`, and `open_named` says `hevc`
+    // (`VideoCodec::wire()`), which `bench::codec_label` reads as `h265`.
     #[tokio::test]
     async fn hevc_answered_by_hevc_is_no_demotion() {
         let mut o = Scripted::opens("mf-hevc", true, "h265");
         let (r, _) = smoke(WINDOWS_MSI, req(Hardware, "hevc"), &mut o).await;
         assert_eq!(r.expect("passes").verdict, Verdict::Ok);
+        let named = Request {
+            pref: Hardware,
+            codec: "h264",
+            name: Some("hevc_nvenc"),
+        };
+        let mut o = Scripted::opens("hevc_nvenc", true, "hevc");
+        let (r, out) = smoke(LINUX_FFMPEG, named, &mut o).await;
+        assert_eq!(r.expect("passes").verdict, Verdict::Ok, "{out}");
+        assert!(out.contains(" verdict=ok cell=named:h265 hw=true"), "{out}");
     }
 
     // RED on the seam: it passed with a warning.
@@ -974,6 +988,65 @@ mod tests {
         }
         let (r, _) = smoke(LINUX_FFMPEG, req(Hardware, "h264"), &mut o).await;
         assert_eq!(failed(&r).verdict, Verdict::Error);
+    }
+
+    // The FR-62 sweep's only judgement: it hands the encoder back on `ok`
+    // alone, and any other verdict comes back as a `Failed` that names it and
+    // what opened, as the plain smoke reports it.
+    #[test]
+    fn into_ok_hands_the_encoder_back_on_ok_alone() {
+        let r = req(Hardware, "h264");
+        let p = plan(&r, WIDTH, HEIGHT, LINUX_FFMPEG).expect("plans");
+        let id = OpenedId {
+            name: "h264_nvenc",
+            hw: true,
+            codec: "h264",
+            chroma444: false,
+        };
+        let judged = |verdict| Judged {
+            enc: Some(Box::new(FakeEncoder {
+                name: id.name,
+                hw: id.hw,
+                frames: 0,
+                key_next: false,
+                fail_at: None,
+                never_key: false,
+            })),
+            opened: Some(id),
+            verdict,
+            tried: Tried::default(),
+            why: None,
+        };
+        for verdict in [
+            Verdict::Ok,
+            Verdict::Fallback,
+            Verdict::SwOnly,
+            Verdict::Demoted,
+            Verdict::None,
+            Verdict::Error,
+            Verdict::Skipped,
+        ] {
+            match judged(verdict).into_ok(&p, &r) {
+                Ok((enc, opened)) => {
+                    assert_eq!(verdict, Verdict::Ok, "{} passed", verdict.label());
+                    assert_eq!((enc.name(), opened), (id.name, id));
+                }
+                Err(e) => {
+                    let f = e
+                        .downcast_ref::<Failed>()
+                        .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"));
+                    assert_ne!(verdict, Verdict::Ok, "ok did not pass: {e:#}");
+                    assert_eq!((f.verdict, f.opened, f.cell), (verdict, Some(id), p.cell));
+                    assert_eq!(f.request, r.describe());
+                }
+            }
+        }
+        // `ok` with no encoder in hand is no pass either.
+        let no_encoder = Judged {
+            enc: None,
+            ..judged(Verdict::Ok)
+        };
+        assert!(no_encoder.into_ok(&p, &r).is_err());
     }
 
     // CONTROL on the seam, the NEW lane request (D2 A): either MFT passes.
