@@ -232,6 +232,12 @@ case "$me" in
         fi ;;
     roomler)
         if [ "${1:-}" = --version ]; then
+            # A case can make its Nth --version (this one is logged above)
+            # read its stdin first.
+            if [ -f "$C/cli.reads-stdin" ] &&
+                [ "$(grep -cx 'roomler \[--version\]' "$C/roomler.log")" = "$(cat "$C/cli.reads-stdin")" ]; then
+                cat >/dev/null
+            fi
             if [ -f "$C/cli.out" ]; then cat "$C/cli.out"; else echo "roomler 0.4.215"; fi
         fi ;;
     systemctl)
@@ -242,7 +248,9 @@ case "$me" in
     exe)
         # That daemon's own image, reached as /proc/$pid/exe.
         case "${1:-}" in
-            --version) cat "$C/running.out" ;;
+            --version)
+                if [ -f "$C/running.reads-stdin" ]; then cat >/dev/null; fi
+                cat "$C/running.out" ;;
             update-helper) if [ -f "$C/running.caps" ]; then cat "$C/running.caps"; fi ;;
         esac ;;
     curl)
@@ -342,8 +350,10 @@ SH=""
 # prints and exits with, and READS_STDIN=1 before `run` makes it read its
 # stdin first. RUNNING=<answer> before `run` (empty counts) puts a per-user
 # daemon there, already running, whose own image prints that to --version and
-# RUNNING_CAPS to update-helper --capabilities; CLI=<answer> is what the
-# tunnel CLI prints to --version. The records land in $RUNS/$SH/CASE.
+# RUNNING_CAPS to update-helper --capabilities; RUNNING_READS_STDIN=1 makes
+# that --version read its stdin first. CLI=<answer> is what the tunnel CLI
+# prints to --version, and CLI_READS_STDIN=<n> makes its nth --version read
+# its stdin first. The records land in $RUNS/$SH/CASE.
 run() {
     CASE=$1 os=$2 arch=$3 debian=$4 feedname=$5 answer=$6 answer_rc=$7
     shift 7
@@ -359,8 +369,10 @@ run() {
         printf '%s\n' "$PID" >"$C/mainpid"
         printf '%s' "$RUNNING" >"$C/running.out"
         [ -z "${RUNNING_CAPS:-}" ] || printf '%s' "$RUNNING_CAPS" >"$C/running.caps"
+        [ "${RUNNING_READS_STDIN:-0}" = 0 ] || : >"$C/running.reads-stdin"
     fi
     [ -z "${CLI+set}" ] || printf '%s' "$CLI" >"$C/cli.out"
+    [ -z "${CLI_READS_STDIN:-}" ] || printf '%s\n' "$CLI_READS_STDIN" >"$C/cli.reads-stdin"
     : >"$C/calls.log"
     : >"$C/curl.log"
     : >"$C/roomlerd.log"
@@ -491,6 +503,13 @@ for SH in $SHELLS; do
     a="roomlerd $LONG"$'\n'
     RUNNING=$a run deb-user-same/long Linux x86_64 1 normal "$a" 0 "${usr[@]}"
     same "$VU"; lines "$LONG" 0; done_case
+    # #3923 — the installed binary's --version, then the running image's, reads
+    # its stdin, which in the one-liner is the rest of the script: the script
+    # gives it none, and still ends.
+    READS_STDIN=1 RUNNING=$new run deb-user-same/reads-stdin Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    same 0.4.221; says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
+    RUNNING_READS_STDIN=1 RUNNING=$new run deb-user-same/running-reads-stdin Linux x86_64 1 normal "$new" 0 "${usr[@]}"
+    same 0.4.221; says agent-v0.4.221 0.4.221 0; want "==> done."; done_case
     # Another answer, from a daemon that restarts onto a new version by
     # itself (it lists restart-on-replace): left to it.
     cap=$'restart-on-replace\n'
@@ -525,6 +544,12 @@ for SH in $SHELLS; do
     want "==> installed: $VU"; done_case
     CLI="roomler $LONG"$'\n' run tunnel/long Linux x86_64 1 normal '' 0 --role tunnel
     want "==> installed: $VU"; lines "$LONG" 0; done_case
+    # #3923 — the CLI's --version reads its stdin: the first one, which asks
+    # whether it runs (the second asks again), and the third, which names it.
+    CLI_READS_STDIN=1 run tunnel/reads-stdin-runs Linux x86_64 1 normal '' 0 --role tunnel
+    lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
+    CLI_READS_STDIN=3 run tunnel/reads-stdin-names Linux x86_64 1 normal '' 0 --role tunnel
+    lines "$R" 0; lines "$V" 0; want "==> installed: roomler 0.4.215"; want "==> done."; done_case
 
     # The same calls, byte for byte, in every case of a mode: neither the
     # feed's tag nor the daemon's answer changes what the script runs or how
