@@ -1007,27 +1007,19 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// report a TIMEOUT, and "nobody answered in 30 s" and "there is nobody to
 /// ask, and there never was" need different things done about them.
 pub async fn ensure_running() -> bool {
-    use std::sync::Mutex;
-    use std::time::Instant;
-    // Both halves of the rate limit: when we last tried, and what we concluded.
-    // A cooldown that returned an optimistic default would report a surface
-    // that does not exist — worse than not rate-limiting at all.
-    static LAST: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-
-    if let Some((at, verdict)) = *LAST.lock().unwrap()
-        && at.elapsed() < ENSURE_COOLDOWN
-    {
-        return verdict;
+    let verdicts = ensure_verdicts();
+    if let Some(up) = verdicts.standing() {
+        return up;
     }
 
-    let verdict = match ensure_running_inner().await {
+    let (up, stands) = match ensure_running_inner().await {
         Ok(EnsureOutcome::AlreadyRunning) => {
             tracing::debug!("desktop companion is already running");
-            true
+            (true, ENSURE_COOLDOWN)
         }
         Ok(EnsureOutcome::Started) => {
             tracing::info!("started the desktop companion for a prompt");
-            true
+            (true, ENSURE_COOLDOWN)
         }
         Ok(EnsureOutcome::Unsupported) => {
             tracing::info!(
@@ -1035,22 +1027,102 @@ pub async fn ensure_running() -> bool {
                  answer with `roomlerd consent --list` / `--approve`, or set this device to \
                  email/push consent"
             );
-            false
+            (false, ENSURE_COOLDOWN)
         }
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
                 "could not start the desktop companion — an on-screen prompt is not possible"
             );
-            false
+            (false, ENSURE_COOLDOWN)
         }
     };
-    *LAST.lock().unwrap() = Some((Instant::now(), verdict));
-    verdict
+    verdicts.keep(up, stands);
+    up
 }
 
 /// One attempt per this interval, process-wide.
 const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// #3884 — how long a start that failed, or ran out of its wait, stands.
+#[cfg_attr(not(test), allow(dead_code))]
+const ENSURE_RETRY_AFTER_ERROR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// #3884 — [`ensure_running`]'s last verdict, and how long it stands: both
+/// halves of the rate limit. A cooldown that returned an optimistic default
+/// would report a surface that does not exist — worse than not rate-limiting
+/// at all.
+struct EnsureVerdicts(std::sync::Mutex<Option<EnsureVerdict>>);
+
+/// A verdict of [`ensure_running`]: when it was reached, whether the companion
+/// is up, and how long that stands.
+#[derive(Debug, Clone, Copy)]
+struct EnsureVerdict {
+    at: std::time::Instant,
+    up: bool,
+    stands: std::time::Duration,
+}
+
+impl EnsureVerdicts {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// The last verdict, while it stands.
+    fn standing(&self) -> Option<bool> {
+        let last = *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        last.filter(|v| v.at.elapsed() < v.stands).map(|v| v.up)
+    }
+
+    /// `up`, standing `stands` from now.
+    fn keep(&self, up: bool, stands: std::time::Duration) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(EnsureVerdict {
+            at: std::time::Instant::now(),
+            up,
+            stands,
+        });
+    }
+}
+
+/// The verdicts [`ensure_running`] keeps: the daemon's, or under a test's
+/// stand-in ([`tray_stand_in`]) that test's own.
+fn ensure_verdicts() -> &'static EnsureVerdicts {
+    static VERDICTS: EnsureVerdicts = EnsureVerdicts::new();
+    #[cfg(all(test, any(target_os = "windows", unix)))]
+    if let Some(stood) = tray_stand_in::now() {
+        return stood.verdicts;
+    }
+    &VERDICTS
+}
+
+/// #3888 — the companion's start for a consent prompt, as the WS loop asks
+/// for it ([`ensure_running`], [`crate::signaling::COMPANION_START_BUDGET`]
+/// at most), and its verdict for the session's consent task
+/// ([`Starting::up`]).
+pub(crate) async fn start_for_prompt() -> Starting {
+    let up = tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running())
+        .await
+        .unwrap_or(false);
+    Starting(tokio::spawn(async move { up }))
+}
+
+/// #3888 — a companion's start for a prompt ([`start_for_prompt`]).
+pub(crate) struct Starting(tokio::task::JoinHandle<bool>);
+
+impl Starting {
+    /// Whether the companion is up to show the question: its start's
+    /// verdict. `false` for a start that failed, that did not answer within
+    /// its budget, or that ended with no answer.
+    pub(crate) async fn up(self) -> bool {
+        self.0.await.unwrap_or(false)
+    }
+}
 
 /// Whether the desktop companion can show a consent question, and a
 /// recording's banner. A remote recording asks through it, and so does an SSH
@@ -2017,12 +2089,14 @@ const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(25
 /// own starts, are never stood in.
 #[cfg(all(test, any(target_os = "windows", unix)))]
 mod tray_stand_in {
-    use super::{TrayStarts, TraySteps};
+    use super::{EnsureVerdicts, TrayStarts, TraySteps};
 
     #[derive(Clone)]
     pub(super) struct StandIn {
         pub(super) steps: TraySteps,
         pub(super) starts: &'static TrayStarts,
+        /// #3884 — [`super::ensure_running`]'s verdicts, of this test's own.
+        pub(super) verdicts: &'static EnsureVerdicts,
     }
 
     impl StandIn {
@@ -2030,6 +2104,7 @@ mod tray_stand_in {
             Self {
                 steps,
                 starts: Box::leak(Box::new(TrayStarts::new("tray-start"))),
+                verdicts: Box::leak(Box::new(EnsureVerdicts::new())),
             }
         }
     }
@@ -2064,12 +2139,18 @@ mod tray_start_tests {
     use super::tray_stand_in::{StandIn, asking};
     use super::*;
     #[cfg(all(unix, not(target_os = "macos")))]
+    use on_linux::host_steps;
+    #[cfg(all(unix, not(target_os = "macos")))]
     use on_linux::{COMPANION, HELD, steps};
+    #[cfg(target_os = "macos")]
+    use on_mac::host_steps;
     #[cfg(target_os = "macos")]
     use on_mac::{HELD, steps};
     #[cfg(target_os = "windows")]
+    use on_windows::host_steps;
+    #[cfg(target_os = "windows")]
     use on_windows::{DEST, HELD, steps};
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use std::sync::{Arc, Condvar, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
@@ -2329,6 +2410,389 @@ mod tray_start_tests {
             start_on_a_worker(&rt, &stood, RUNS_WITHIN).expect("the next ask is answered");
         assert_eq!(started, Ok(EnsureOutcome::Started), "a start of its own");
         assert_eq!(held.began(), 2, "the held start, and the next ask's own");
+    }
+
+    /// #3884, #3888 — a host the tray's start runs on, as each OS's
+    /// `host_steps` stands it in: whether the companion is installed, whether
+    /// someone is signed in at the screen, and whether the tray runs, which a
+    /// start that works brings about. The start itself (systemd-run, the
+    /// process start, launchctl) waits for `held` when there is one. Each
+    /// start is counted at its first step.
+    #[derive(Clone, Default)]
+    struct Host {
+        not_installed: Arc<AtomicBool>,
+        nobody: Arc<AtomicBool>,
+        up: Arc<AtomicBool>,
+        held: Option<Held>,
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl Host {
+        /// The starts that began.
+        fn starts(&self) -> usize {
+            self.starts.load(SeqCst)
+        }
+
+        /// Whether the tray runs.
+        fn up(&self) -> bool {
+            self.up.load(SeqCst)
+        }
+    }
+
+    /// What [`ensure_running`] answered a prompt, as a task on `rt` taking
+    /// `stood`'s steps, starts in flight and verdicts, and how long that
+    /// took: waited for `bound` at most from THIS thread.
+    fn ensure_on_a_worker(
+        rt: &tokio::runtime::Runtime,
+        stood: &StandIn,
+        bound: Duration,
+    ) -> std::result::Result<(bool, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(asking(stood.clone(), async move {
+            let up = ensure_running().await;
+            let _ = tx.send((up, asked.elapsed()));
+        }));
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("no answer within {bound:?}"))
+    }
+
+    /// #3884 — a start that ran out of its wait goes on on its thread, and
+    /// here brings the tray up just after. The prompt the refusal invites, a
+    /// few seconds later ([`ENSURE_RETRY_AFTER_ERROR`]), asks again and finds
+    /// the tray up, so its question shows.
+    ///
+    /// Red before #3884: the refusal stood [`ENSURE_COOLDOWN`], 20 s, and that
+    /// prompt was answered `false` from it, with no look.
+    #[test]
+    fn a_prompt_after_a_start_that_ran_out_of_time_finds_the_tray_it_brought_up() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let host = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let stood = StandIn::new(host_steps(&host));
+        let (up, waited) = ensure_on_a_worker(&rt, &stood, TRAY_START_WAIT + SLACK)
+            .expect("a start that runs out of time is answered within its wait");
+        assert!(!up, "a start that ran out of time shows no question");
+        assert!(
+            waited >= TRAY_START_WAIT,
+            "the start was waited for: {waited:?}"
+        );
+        // The start goes on, and brings the tray up.
+        held.open();
+        let opened = Instant::now();
+        while !host.up() {
+            assert!(
+                opened.elapsed() < RUNS_WITHIN,
+                "the late start never brought the tray up"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(ENSURE_RETRY_AFTER_ERROR);
+        let (up, _) =
+            ensure_on_a_worker(&rt, &stood, RUNS_WITHIN).expect("the next prompt is answered");
+        assert!(
+            up,
+            "a prompt a few seconds later finds the tray the late start brought up"
+        );
+        assert_eq!(
+            host.starts(),
+            2,
+            "it asked again: the start that ran out of time, then its own"
+        );
+    }
+
+    /// #3884 — with nobody at the screen the start fails. A prompt right
+    /// after it is answered from that verdict, with no start of its own: a
+    /// failure is still rate-limited. A few seconds on
+    /// ([`ENSURE_RETRY_AFTER_ERROR`]) a prompt asks again, finds the person
+    /// who signed in meanwhile, and the tray is started for them.
+    ///
+    /// Red before #3884: the failure stood 20 s.
+    #[test]
+    fn a_failed_start_is_tried_again_after_a_few_seconds_not_per_prompt() {
+        let rt = runtime();
+        let host = Host::default();
+        host.nobody.store(true, SeqCst);
+        let stood = StandIn::new(host_steps(&host));
+        let ask = || {
+            ensure_on_a_worker(&rt, &stood, RUNS_WITHIN)
+                .expect("a prompt is answered")
+                .0
+        };
+        assert!(!ask(), "nobody at the screen: no question shows");
+        assert_eq!(host.starts(), 1);
+        assert!(!ask(), "a prompt at once is answered from that start");
+        assert_eq!(host.starts(), 1, "with no start of its own");
+        host.nobody.store(false, SeqCst);
+        std::thread::sleep(ENSURE_RETRY_AFTER_ERROR);
+        assert!(
+            ask(),
+            "a prompt a few seconds later finds the person who signed in"
+        );
+        assert_eq!(host.starts(), 2, "it asked again");
+        assert!(host.up(), "and the tray was started for them");
+    }
+
+    /// #3884 — the control: what cannot change soon stands
+    /// [`ENSURE_COOLDOWN`], past a failure's few seconds, and no prompt in it
+    /// starts anything. On a host with no companion the answer stays `false`,
+    /// and with the tray up it stays `true`.
+    #[test]
+    fn no_companion_and_a_tray_that_is_up_stand_with_no_start_per_prompt() {
+        let rt = runtime();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let none_stood = StandIn::new(host_steps(&none));
+        let up = Host::default();
+        up.up.store(true, SeqCst);
+        let up_stood = StandIn::new(host_steps(&up));
+        let ask = |stood: &StandIn| {
+            ensure_on_a_worker(&rt, stood, RUNS_WITHIN)
+                .expect("a prompt is answered")
+                .0
+        };
+        assert!(!ask(&none_stood), "no companion: no question shows");
+        assert!(ask(&up_stood), "the tray is up: the question shows");
+        std::thread::sleep(ENSURE_RETRY_AFTER_ERROR + SLACK);
+        assert!(!ask(&none_stood), "still no companion");
+        assert!(ask(&up_stood), "still up");
+        assert_eq!(
+            none.starts(),
+            1,
+            "no companion is not looked for again per prompt"
+        );
+        assert_eq!(
+            up.starts(),
+            1,
+            "a tray that is up is not looked for again per prompt"
+        );
+    }
+
+    /// An RC prompt's question, open for 30 s.
+    fn rc_view(session_hex: &str) -> crate::indicator::PromptView {
+        crate::indicator::PromptView {
+            session_hex: session_hex.into(),
+            title: "Remote control request".into(),
+            lead: "Alice is requesting to control this device.".into(),
+            detail: String::new(),
+            permissions: "VIEW|INPUT".into(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    /// #3888 — while the tray's start is held, the WS loop handles its next
+    /// frame at once: it starts the companion's start ([`start_for_prompt`])
+    /// and hands it to the consent task, which hears within the start's wait
+    /// that no companion came up. The loop and the consent task are modelled
+    /// as they run, as #3857's tests model them: a frame is handled before the
+    /// next one is read.
+    ///
+    /// Red before #3888: the loop waited for the start, up to its 2.5 s wait,
+    /// and read no frame meanwhile.
+    #[test]
+    fn the_loop_handles_its_next_frame_while_the_tray_start_is_held() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let host = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let stood = StandIn::new(host_steps(&host));
+        let (frames, mut frames_rx) = tokio::sync::mpsc::channel::<Option<u32>>(4);
+        let (handled_tx, handled) = std::sync::mpsc::channel::<(u32, Instant)>();
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<(bool, Duration)>();
+        rt.spawn(asking(stood, async move {
+            // The WS loop, as far as it goes here. `None` is an RC request
+            // whose question no native panel shows.
+            while let Some(frame) = frames_rx.recv().await {
+                let Some(n) = frame else {
+                    let asked = Instant::now();
+                    let starting = start_for_prompt().await;
+                    // The consent task.
+                    let verdict_tx = verdict_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = verdict_tx.send((starting.up().await, asked.elapsed()));
+                    });
+                    continue;
+                };
+                let _ = handled_tx.send((n, Instant::now()));
+            }
+        }));
+        frames.blocking_send(None).expect("the loop reads frames");
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(
+                asked.elapsed() < RUNS_WITHIN,
+                "no start reached the held step"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sent = Instant::now();
+        frames
+            .blocking_send(Some(7))
+            .expect("the loop reads frames");
+        let (n, at) = handled
+            .recv_timeout(crate::signaling::COMPANION_START_BUDGET + SLACK)
+            .expect("a frame sent while the tray's start is held is handled");
+        assert_eq!(n, 7);
+        assert!(
+            at.duration_since(sent) < AT_ONCE,
+            "the frame waited {:?} behind the tray's start",
+            at.duration_since(sent)
+        );
+        let (up, waited) = verdict
+            .recv_timeout(crate::signaling::COMPANION_START_BUDGET + SLACK)
+            .expect("the consent task hears within the start's budget");
+        assert!(!up, "a start held past its wait is no companion");
+        assert!(
+            waited >= TRAY_START_WAIT,
+            "the verdict came in {waited:?}, before the start's wait"
+        );
+    }
+
+    /// #3888 — a start that fails, or runs out of its wait, is still
+    /// `no_prompt_surface` once the window is out, never a timeout: the
+    /// consent task waits for its verdict before the window starts
+    /// ([`crate::signaling::rc_surfaces_up`]). The control beside them: a
+    /// start that works is a surface, and the window's end is then the
+    /// person's timeout.
+    #[test]
+    fn a_start_that_fails_or_runs_out_of_time_is_still_no_prompt_surface() {
+        use crate::consent::Decision;
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let ran_out = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let failed = Host::default();
+        failed.nobody.store(true, SeqCst);
+        let works = Host::default();
+        // No notification: the companion's verdict alone decides.
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let reason_at_the_windows_end = |host: &Host| {
+            let ind = ind.clone();
+            rt.block_on(asking(StandIn::new(host_steps(host)), async move {
+                // The loop's side.
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("f6"))),
+                    mark_up: None,
+                };
+                // The consent task's.
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "f6", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }))
+        };
+        assert_eq!(
+            reason_at_the_windows_end(&ran_out),
+            Some(ConsentDenyReason::NoPromptSurface),
+            "a start that ran out of time: nobody could be asked"
+        );
+        assert_eq!(
+            reason_at_the_windows_end(&failed),
+            Some(ConsentDenyReason::NoPromptSurface),
+            "a start that failed: nobody could be asked"
+        );
+        assert_eq!(
+            reason_at_the_windows_end(&works),
+            Some(ConsentDenyReason::HostTimeout),
+            "a start that worked: nobody answered"
+        );
+    }
+
+    /// #3888 — a question withdrawn while the tray's start is held (a
+    /// `Terminate` the loop reads meanwhile, which finds nothing on the screen
+    /// to take down) gets no notification once the start runs out of time: no
+    /// show starts for it, so logind is not even asked, and nothing comes up.
+    ///
+    /// The loop used to read no frame while the start ran, so no question
+    /// could end then.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    #[test]
+    fn a_question_withdrawn_while_the_tray_start_is_held_gets_no_notification() {
+        use super::session_walk_stand_in as walk;
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let host = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let logind = walk::Held::default();
+        let _logind_opened = walk::OpenedAtTheEnd(logind.clone());
+        let (kill_tx, _disconnects) = tokio::sync::mpsc::channel(1);
+        let (consent_tx, _answers) = tokio::sync::mpsc::channel(4);
+        let ind = crate::indicator::ViewerIndicator::new(
+            kill_tx,
+            crate::rc_sessions::RcSessionRegistry::new(),
+            consent_tx,
+        )
+        .expect("an indicator");
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<bool>();
+        {
+            let (ind, withdrawn) = (ind.clone(), withdrawn.clone());
+            let walking = walk::StandIn::held(&logind, walk::ana());
+            rt.spawn(asking(
+                StandIn::new(host_steps(&host)),
+                walk::asking(walking, async move {
+                    let surfaces = crate::signaling::RcSurfaces {
+                        native: false,
+                        marker: true,
+                        behind: Some((start_for_prompt().await, rc_view("g7"))),
+                        mark_up: None,
+                    };
+                    let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                    let have_surface = crate::signaling::rc_surfaces_up(
+                        surfaces,
+                        &ind,
+                        move || !withdrawn.load(SeqCst),
+                        "g7",
+                        &outbound,
+                    )
+                    .await;
+                    let _ = verdict_tx.send(have_surface);
+                }),
+            ));
+        }
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(
+                asked.elapsed() < RUNS_WITHIN,
+                "no start reached the held step"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The `Terminate`: the question off the books, and its prompts taken
+        // down, of which none is up yet.
+        withdrawn.store(true, SeqCst);
+        ind.hide_prompt("g7");
+        let have_surface = verdict
+            .recv_timeout(TRAY_START_WAIT + SLACK)
+            .expect("the consent task hears once the start runs out of time");
+        assert!(!have_surface, "a question that is over has no surface");
+        logind.open();
+        std::thread::sleep(AT_ONCE);
+        assert_eq!(
+            logind.began(),
+            0,
+            "no notification was started for a question that is over"
+        );
+        assert!(!ind.notification_is_up("g7"), "nothing is up for it");
     }
 
     /// The control on Linux: a start whose steps answer in time does what it
@@ -2703,6 +3167,41 @@ mod tray_start_tests {
                 user_manager: false,
             }
         }
+
+        /// #3884, #3888 — a root daemon's start on `host`: its install path
+        /// (each start's first step, counted), logind's session, the tray
+        /// check and systemd-run, which waits for `host.held` and brings the
+        /// tray up.
+        pub(super) fn host_steps(host: &Host) -> TraySteps {
+            let (at_path, at_session, at_running, at_run) =
+                (host.clone(), host.clone(), host.clone(), host.clone());
+            TraySteps {
+                path: Arc::new(move || -> Option<std::path::PathBuf> {
+                    at_path.starts.fetch_add(1, SeqCst);
+                    (!at_path.not_installed.load(SeqCst)).then(|| COMPANION.into())
+                }),
+                session: Arc::new(move || -> Result<GraphicalSession> {
+                    if at_session.nobody.load(SeqCst) {
+                        anyhow::bail!(
+                            "no active graphical session — nobody is at this machine's screen"
+                        );
+                    }
+                    Ok(ana())
+                }),
+                running: Arc::new(move |_: u32| at_running.up()),
+                environment: Arc::new(|_: &GraphicalSession| -> Option<String> { None }),
+                systemd_run: Arc::new(
+                    move |_: std::process::Command| -> std::io::Result<std::process::Output> {
+                        if let Some(held) = &at_run.held {
+                            held.hold();
+                        }
+                        at_run.up.store(true, SeqCst);
+                        Ok(exited(0, ""))
+                    },
+                ),
+                user_manager: false,
+            }
+        }
     }
 
     /// Windows' steps, stood in.
@@ -2760,6 +3259,37 @@ mod tray_start_tests {
                         }
                     },
                 ),
+            }
+        }
+
+        /// #3884, #3888 — a SYSTEM service's start on `host`: the tray check
+        /// (each start's first step, counted), the install path, and the
+        /// start into the console session, which waits for `host.held`, finds
+        /// nobody signed in or brings the tray up.
+        pub(super) fn host_steps(host: &Host) -> TraySteps {
+            let (at_running, at_path, at_start) = (host.clone(), host.clone(), host.clone());
+            TraySteps {
+                running: Arc::new(move || {
+                    at_running.starts.fetch_add(1, SeqCst);
+                    at_running.up()
+                }),
+                path: Arc::new(move || -> Result<Option<std::path::PathBuf>> {
+                    Ok((!at_path.not_installed.load(SeqCst)).then(|| DEST.into()))
+                }),
+                context: Arc::new(|| RespawnContext::SystemService),
+                start: Arc::new(move |_: RespawnContext, _: &std::path::Path, _: &[&str]| {
+                    if let Some(held) = &at_start.held {
+                        held.hold();
+                    }
+                    if at_start.nobody.load(SeqCst) {
+                        return TrayStart::NobodySignedIn;
+                    }
+                    at_start.up.store(true, SeqCst);
+                    TrayStart::Started {
+                        pid: 4242,
+                        session: Some(1),
+                    }
+                }),
             }
         }
     }
@@ -2824,6 +3354,38 @@ mod tray_start_tests {
                     move |cmd: std::process::Command| -> std::io::Result<std::process::Output> {
                         holds(Step::Launchctl, &at_launchctl);
                         ran.record(&cmd);
+                        Ok(exited(0, ""))
+                    },
+                ),
+            }
+        }
+
+        /// #3884, #3888 — the start on a Mac that is `host`: the app (each
+        /// start's first step, counted), the tray check, the console's owner
+        /// (the login window while nobody is signed in), and launchctl, which
+        /// waits for `host.held` and brings the tray up.
+        pub(super) fn host_steps(host: &Host) -> TraySteps {
+            let (at_installed, at_running, at_console, at_launchctl) =
+                (host.clone(), host.clone(), host.clone(), host.clone());
+            TraySteps {
+                installed: Arc::new(move || {
+                    at_installed.starts.fetch_add(1, SeqCst);
+                    !at_installed.not_installed.load(SeqCst)
+                }),
+                running: Arc::new(move || at_running.up()),
+                console: Arc::new(move || -> Result<String> {
+                    if at_console.nobody.load(SeqCst) {
+                        return console_owner_person("root\n");
+                    }
+                    Ok("ana".into())
+                }),
+                uid: Arc::new(|_: &str| -> Result<u32> { Ok(501) }),
+                launchctl: Arc::new(
+                    move |_: std::process::Command| -> std::io::Result<std::process::Output> {
+                        if let Some(held) = &at_launchctl.held {
+                            held.hold();
+                        }
+                        at_launchctl.up.store(true, SeqCst);
                         Ok(exited(0, ""))
                     },
                 ),
