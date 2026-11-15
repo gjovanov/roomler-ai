@@ -479,7 +479,7 @@ mod parent {
     fn launch(
         req: &Request,
         what: &str,
-        mut on_said: impl FnMut(&Said) + Send + 'static,
+        on_said: impl FnMut(&Said) + Send + 'static,
         on_end: impl FnOnce() + Send + 'static,
         still_wanted: impl Fn() -> bool,
     ) -> Result<std::process::ChildStdin, String> {
@@ -495,11 +495,25 @@ mod parent {
             }
             spawn_child_in(&session, euid, &["--notify"], true)
         });
-        let mut child = match spawned {
+        let child = match spawned {
             Ok(c) => c,
             Err(SpawnError::NoSession) => return Err("no graphical session".into()),
             Err(SpawnError::Other(why)) => return Err(why),
         };
+        put_up(child, req, what, on_said, on_end, SHOW_BUDGET)
+    }
+
+    /// #3886 — [`launch`]'s helper, once started: `req` written to its stdin,
+    /// its lines read on a thread of their own, and its first line waited for
+    /// `budget` at most ([`SHOW_BUDGET`]). A test hands it a stand-in.
+    fn put_up(
+        mut child: std::process::Child,
+        req: &Request,
+        what: &str,
+        mut on_said: impl FnMut(&Said) + Send + 'static,
+        on_end: impl FnOnce() + Send + 'static,
+        budget: Duration,
+    ) -> Result<std::process::ChildStdin, String> {
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();
@@ -553,7 +567,7 @@ mod parent {
             // closing ends it.
             return Err("no thread to read the session helper".into());
         }
-        match shown_rx.recv_timeout(SHOW_BUDGET) {
+        match shown_rx.recv_timeout(budget) {
             Ok(Ok(())) => Ok(stdin),
             Ok(Err(why)) => Err(why),
             Err(_) => {
@@ -565,7 +579,7 @@ mod parent {
                 }
                 Err(format!(
                     "the session helper did not post it within {} s",
-                    SHOW_BUDGET.as_secs()
+                    budget.as_secs()
                 ))
             }
         }
@@ -706,6 +720,202 @@ mod parent {
     /// down. Idempotent.
     pub(crate) fn viewing_ended(session: &ObjectId) {
         with_viewings(|v| v.remove(session));
+    }
+
+    /// #3886 — a session helper the daemon gives up on, stood in by `sh` and
+    /// handed to [`put_up`] as `launch` hands it the real one. The stand-in's
+    /// notification is a file: it posts it by creating it, and takes it down
+    /// by removing it once its stdin closes, as the helper's
+    /// `CloseNotification` does. The give-up waits `BUDGET`, not
+    /// `SHOW_BUDGET`, to keep the suite quick.
+    #[cfg(test)]
+    mod given_up_tests {
+        use super::{Request, put_up};
+        use std::path::Path;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// The tests' give-up: how long [`put_up`] waits for the first line.
+        const BUDGET: Duration = Duration::from_secs(1);
+        /// How late the verdict may come past the give-up on a busy runner:
+        /// well under the helper's 1 s grace, which it never waits for.
+        const AT_ONCE: Duration = Duration::from_millis(600);
+        /// How soon after the give-up a helper is gone at the latest: its
+        /// grace (1 s), then the kill, and a busy runner's slack.
+        const GONE_WITHIN: Duration = Duration::from_secs(3);
+
+        /// A consent question, as the daemon writes it to the helper.
+        fn request() -> Request {
+            Request {
+                summary: "Remote control request".into(),
+                body: "Alice is requesting to control this device.".into(),
+                actions: vec![
+                    ("approve".into(), "Approve".into()),
+                    ("deny".into(), "Deny".into()),
+                ],
+                urgency: 2,
+                lifetime_ms: 30_000,
+            }
+        }
+
+        /// The stand-in: `script` run by `sh`, its notification the file
+        /// `$UP`, its pipes those `launch` gives the helper.
+        fn stand_in(script: &str, up: &Path) -> Child {
+            Command::new("sh")
+                .args(["-c", script])
+                .env("UP", up)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("sh starts")
+        }
+
+        /// Whether `done` holds within `wait`.
+        fn within(wait: Duration, done: impl Fn() -> bool) -> bool {
+            let until = Instant::now() + wait;
+            loop {
+                if done() {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Whether `pid` is still in the process table: only the reap takes
+        /// a process out, so a killed helper nobody waited on is still in it.
+        fn in_process_table(pid: u32) -> bool {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+
+        /// #3886 — a helper whose notification is up, and whose line saying
+        /// so comes only after the daemon gave up on it (the slow session
+        /// bus the budget exists for). The verdict is "not shown", at the
+        /// give-up. Then the notification comes down, and the helper is gone.
+        ///
+        /// Red before #3886: the helper was killed at the give-up, and its
+        /// notification stayed on the screen, with buttons that reached no
+        /// one.
+        #[test]
+        fn a_helper_given_up_on_takes_its_notification_down_and_is_gone() {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let up = dir.path().join("up");
+            // Posts at once; its `Notify` answers only after the daemon has
+            // given up on it. Then, as the helper does, it reads that its
+            // stdin closed, takes its notification down and exits.
+            let child = stand_in(
+                r#"IFS= read -r request || exit 1
+: > "$UP"
+while IFS= read -r line; do :; done
+sleep 0.2 </dev/null >/dev/null
+echo "ROOMLER_NOTIFY_SHOWN:7"
+rm -f "$UP"
+"#,
+                &up,
+            );
+            let pid = child.id();
+            let asked = Instant::now();
+            let shown = put_up(child, &request(), "test", |_| {}, || {}, BUDGET);
+            let answered = asked.elapsed();
+            assert!(
+                up.exists(),
+                "the stand-in's notification was up when the daemon gave up on it"
+            );
+            let why = shown.expect_err("a helper given up on is never reported up");
+            assert!(why.contains("did not post it"), "the reason: {why}");
+            assert!(
+                answered < BUDGET + AT_ONCE,
+                "the verdict came {answered:?} after the request, past the give-up"
+            );
+            assert!(
+                within(GONE_WITHIN, || !up.exists()),
+                "the notification of a helper given up on is still on the screen"
+            );
+            assert!(
+                within(GONE_WITHIN, || !in_process_table(pid)),
+                "the helper given up on is still in the process table"
+            );
+        }
+
+        /// #3886's control — a helper that never answers and ignores its
+        /// stdin's close is still killed, and is gone within the bound. The
+        /// verdict is "not shown", at the give-up.
+        #[test]
+        fn a_helper_that_ignores_its_stdin_is_still_killed_within_the_bound() {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let up = dir.path().join("up");
+            // Posts, never answers, and never reads its stdin again; its
+            // stdout stays open with it.
+            let child = stand_in(
+                r#"IFS= read -r request || exit 1
+: > "$UP"
+exec sleep 30
+"#,
+                &up,
+            );
+            let pid = child.id();
+            let asked = Instant::now();
+            let shown = put_up(child, &request(), "test", |_| {}, || {}, BUDGET);
+            let answered = asked.elapsed();
+            let why = shown.expect_err("a helper given up on is never reported up");
+            assert!(why.contains("did not post it"), "the reason: {why}");
+            assert!(
+                answered < BUDGET + AT_ONCE,
+                "the verdict came {answered:?} after the request, past the give-up"
+            );
+            assert!(
+                within(GONE_WITHIN, || !in_process_table(pid)),
+                "a helper that ignores its stdin was not killed within {GONE_WITHIN:?} of the \
+                 give-up"
+            );
+        }
+
+        /// The control — a helper that posts in time is reported up, and is
+        /// left alone past the give-up and its grace: the stdin it returns is
+        /// the notification's life, and dropping it takes the notification
+        /// down and ends the helper.
+        #[test]
+        fn a_helper_that_answers_in_time_is_up_until_its_stdin_closes() {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let up = dir.path().join("up");
+            let child = stand_in(
+                r#"IFS= read -r request || exit 1
+: > "$UP"
+echo "ROOMLER_NOTIFY_SHOWN:7"
+while IFS= read -r line; do :; done
+rm -f "$UP"
+"#,
+                &up,
+            );
+            let pid = child.id();
+            let ended = Arc::new(AtomicBool::new(false));
+            let on_end = {
+                let ended = ended.clone();
+                move || ended.store(true, Ordering::SeqCst)
+            };
+            let stdin = put_up(child, &request(), "test", |_| {}, on_end, BUDGET)
+                .expect("a helper that answers in time is up");
+            // Past the give-up and the grace a helper given up on would have.
+            std::thread::sleep(BUDGET + GONE_WITHIN);
+            assert!(up.exists(), "a notification that came up in time stays up");
+            assert!(in_process_table(pid), "its helper still runs");
+            assert!(!ended.load(Ordering::SeqCst), "its helper has not ended");
+            drop(stdin);
+            assert!(
+                within(GONE_WITHIN, || !up.exists()),
+                "dropping its stdin takes the notification down"
+            );
+            assert!(
+                within(GONE_WITHIN, || !in_process_table(pid)),
+                "and its helper exits"
+            );
+            assert!(ended.load(Ordering::SeqCst), "and its end is told");
+        }
     }
 }
 
