@@ -348,3 +348,430 @@ fn solid_frame(w: u32, h: u32, i: u32) -> Arc<Frame> {
         source: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::bench::Opened;
+    use crate::encode::{EncodedPacket, VideoEncoder};
+
+    /// The Linux release `.deb`: FFmpeg's cascades, OpenH264, libvpx.
+    const LINUX_FFMPEG: BuildCaps = BuildCaps {
+        mf: false,
+        openh264: true,
+        ffmpeg: true,
+        libvpx: true,
+        windows: false,
+        ffmpeg_compiled: true,
+    };
+    /// `--features openh264-encoder` alone (the AC1 build).
+    const LINUX_SW: BuildCaps = BuildCaps {
+        mf: false,
+        openh264: true,
+        ffmpeg: false,
+        libvpx: false,
+        windows: false,
+        ffmpeg_compiled: false,
+    };
+    /// The `.deb` with `ROOMLERD_USE_FFMPEG=0`.
+    const LINUX_FFMPEG_OFF: BuildCaps = BuildCaps {
+        ffmpeg: false,
+        ..LINUX_FFMPEG
+    };
+    /// The Windows MSI: everything.
+    const WINDOWS_MSI: BuildCaps = BuildCaps {
+        mf: true,
+        openh264: true,
+        ffmpeg: true,
+        libvpx: true,
+        windows: true,
+        ffmpeg_compiled: true,
+    };
+
+    /// A keyframe on its first frame and on request, unless `never_key`;
+    /// an encode error at frame `fail_at`.
+    struct FakeEncoder {
+        name: &'static str,
+        hw: bool,
+        frames: u32,
+        key_next: bool,
+        fail_at: Option<u32>,
+        never_key: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl VideoEncoder for FakeEncoder {
+        async fn encode(&mut self, _frame: Arc<Frame>) -> anyhow::Result<Vec<EncodedPacket>> {
+            if Some(self.frames) == self.fail_at {
+                anyhow::bail!("the device went away");
+            }
+            let key = !self.never_key && (self.frames == 0 || self.key_next);
+            self.key_next = false;
+            self.frames += 1;
+            Ok(vec![EncodedPacket {
+                data: vec![0; if key { 5_000 } else { 500 }],
+                is_keyframe: key,
+                duration_us: 33_333,
+                qp: None,
+            }])
+        }
+        fn request_keyframe(&mut self) {
+            self.key_next = true;
+        }
+        fn set_bitrate(&mut self, _bps: u32) {}
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn is_hardware(&self) -> bool {
+            self.hw
+        }
+    }
+
+    /// What the scripted opener answers with.
+    #[derive(Clone)]
+    struct Answer {
+        name: &'static str,
+        hw: bool,
+        codec: &'static str,
+        fail_at: Option<u32>,
+        never_key: bool,
+    }
+
+    /// Answers every open with `answer` (or `Err(refuse)`), records the plan
+    /// it got, and notes `cascade_failures` as a cascade would.
+    struct Scripted {
+        answer: Option<Answer>,
+        refuse: String,
+        cascade_failures: Vec<(&'static str, &'static str)>,
+        saw: Vec<CellPlan>,
+    }
+
+    impl Scripted {
+        fn opens(name: &'static str, hw: bool, codec: &'static str) -> Self {
+            Self {
+                answer: Some(Answer {
+                    name,
+                    hw,
+                    codec,
+                    fail_at: None,
+                    never_key: false,
+                }),
+                refuse: String::new(),
+                cascade_failures: Vec::new(),
+                saw: Vec::new(),
+            }
+        }
+        fn refuses(why: &str) -> Self {
+            Self {
+                answer: None,
+                refuse: why.into(),
+                cascade_failures: Vec::new(),
+                saw: Vec::new(),
+            }
+        }
+    }
+
+    impl CellOpener for Scripted {
+        fn open(&mut self, plan: &CellPlan) -> Result<Opened, String> {
+            self.saw.push(plan.clone());
+            for (name, why) in &self.cascade_failures {
+                crate::media_plan::note_candidate_failed(name, why);
+            }
+            let Some(a) = self.answer.clone() else {
+                return Err(self.refuse.clone());
+            };
+            Ok(Opened {
+                enc: Box::new(FakeEncoder {
+                    name: a.name,
+                    hw: a.hw,
+                    frames: 0,
+                    key_next: false,
+                    fail_at: a.fail_at,
+                    never_key: a.never_key,
+                }),
+                codec: a.codec,
+                chroma444: false,
+            })
+        }
+    }
+
+    fn req<'a>(pref: EncoderPreference, codec: &'a str) -> Request<'a> {
+        Request {
+            pref,
+            codec,
+            name: None,
+        }
+    }
+
+    /// The whole smoke through the seam: the result and what it printed.
+    async fn smoke(
+        build: BuildCaps,
+        req: Request<'_>,
+        opener: &mut Scripted,
+    ) -> (anyhow::Result<Passed>, String) {
+        let plan = plan(&req, WIDTH, HEIGHT, build).expect("the request plans");
+        let mut out = Vec::new();
+        let r = run(&plan, &req, build, opener, &mut out, None).await;
+        (r, String::from_utf8(out).expect("utf-8"))
+    }
+
+    /// `main` maps any `Err` to exit 1.
+    fn exit_code(r: &anyhow::Result<Passed>) -> i32 {
+        i32::from(r.is_err())
+    }
+
+    fn failed(r: &anyhow::Result<Passed>) -> &Failed {
+        r.as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<Failed>())
+            .expect("the smoke failed with a Failed")
+    }
+
+    fn cell_of(build: BuildCaps, req: Request<'_>) -> String {
+        let p = plan(&req, WIDTH, HEIGHT, build).expect("plans");
+        format!("{}:{}", p.cell.path.label(), p.cell.codec.label())
+    }
+
+    use EncoderPreference::{Auto, Hardware, Software};
+
+    // RED on the seam (D1 A: the DataChannel's FFmpeg cascade answers a
+    // hardware H.264 request where the RTP track has no hardware encoder).
+    #[test]
+    fn the_cell_per_request_and_build() {
+        assert_eq!(cell_of(LINUX_FFMPEG, req(Hardware, "h264")), "dc:h264");
+        assert_eq!(cell_of(LINUX_FFMPEG_OFF, req(Hardware, "h264")), "rtp:h264");
+        assert_eq!(cell_of(LINUX_SW, req(Hardware, "h264")), "rtp:h264");
+        assert_eq!(cell_of(WINDOWS_MSI, req(Hardware, "h264")), "rtp:h264");
+        assert_eq!(cell_of(LINUX_FFMPEG, req(Software, "h264")), "rtp:h264");
+        assert_eq!(cell_of(LINUX_FFMPEG, req(Auto, "h264")), "rtp:h264");
+        assert_eq!(cell_of(LINUX_FFMPEG, req(Hardware, "hevc")), "rtp:h265");
+        assert_eq!(cell_of(LINUX_FFMPEG, req(Hardware, "H265")), "rtp:h265");
+        assert_eq!(cell_of(WINDOWS_MSI, req(Auto, "av1")), "rtp:av1");
+        let p = plan(&req(Hardware, "h264"), WIDTH, HEIGHT, LINUX_SW).expect("plans");
+        assert!(p.requested_hw && !p.hardware_on_path);
+        let p = plan(&req(Software, "h264"), WIDTH, HEIGHT, WINDOWS_MSI).expect("plans");
+        assert!(!p.requested_hw);
+    }
+
+    // RED on the seam: it refuses nothing.
+    #[test]
+    fn a_request_no_build_can_serve_is_refused_before_anything_opens() {
+        let refused = |build, r: Request<'_>| plan(&r, WIDTH, HEIGHT, build).expect_err("refused");
+        assert!(matches!(
+            refused(WINDOWS_MSI, req(Software, "hevc")),
+            Refused::NoSoftwareEncoder(_)
+        ));
+        assert!(matches!(
+            refused(WINDOWS_MSI, req(Software, "av1")),
+            Refused::NoSoftwareEncoder(_)
+        ));
+        assert_eq!(
+            refused(LINUX_FFMPEG, req(Hardware, "vp9")),
+            Refused::Codec("vp9".into())
+        );
+        assert!(matches!(
+            refused(LINUX_FFMPEG, req(Hardware, "mpeg2")),
+            Refused::Codec(_)
+        ));
+        let bad_name = Request {
+            pref: Hardware,
+            codec: "h264",
+            name: Some("not_an_encoder"),
+        };
+        assert!(matches!(refused(LINUX_FFMPEG, bad_name), Refused::Name(_)));
+    }
+
+    // RED on the seam (guard 2: the release lane's OLD request now fails on a
+    // runner whose only H.264 MFT is Microsoft's software one).
+    #[tokio::test]
+    async fn hardware_h264_answered_by_the_software_mft_is_a_fallback() {
+        let mut o = Scripted::opens("mf-h264", false, "h264");
+        let (r, out) = smoke(WINDOWS_MSI, req(Hardware, "h264"), &mut o).await;
+        assert_eq!(failed(&r).verdict, Verdict::Fallback, "{out}");
+        assert_eq!(exit_code(&r), 1);
+        assert!(!out.contains("PASSED"), "{out}");
+    }
+
+    // RED on the seam.
+    #[tokio::test]
+    async fn hardware_h264_answered_by_openh264_on_windows_is_a_fallback() {
+        let mut o = Scripted::opens("openh264", false, "h264");
+        let (r, _) = smoke(WINDOWS_MSI, req(Hardware, "h264"), &mut o).await;
+        assert_eq!(failed(&r).verdict, Verdict::Fallback);
+    }
+
+    // RED on the seam: it passes, and says nothing of what it tried.
+    #[tokio::test]
+    async fn hardware_h264_on_a_software_only_build_is_sw_only_and_says_what_it_tried() {
+        let mut o = Scripted::opens("openh264", false, "h264");
+        let (r, _) = smoke(LINUX_SW, req(Hardware, "h264"), &mut o).await;
+        let f = failed(&r);
+        assert_eq!(f.verdict, Verdict::SwOnly);
+        assert_eq!(
+            f.tried.backends,
+            [
+                (Backend::MediaFoundation, Reach::WindowsOnly),
+                (Backend::Ffmpeg, Reach::NotCompiled),
+                (Backend::Openh264, Reach::InBuild),
+            ]
+        );
+        let text = format!("{f}");
+        assert!(text.contains("verdict=sw-only"), "{text}");
+        assert!(text.contains("media-foundation: Windows only"), "{text}");
+        assert!(
+            text.contains("ffmpeg: not compiled into this build"),
+            "{text}"
+        );
+        assert!(text.contains("--encoder software"), "the advice: {text}");
+    }
+
+    // RED on the seam.
+    #[tokio::test]
+    async fn ffmpeg_switched_off_is_named_as_switched_off() {
+        let mut o = Scripted::opens("openh264", false, "h264");
+        let (r, _) = smoke(LINUX_FFMPEG_OFF, req(Hardware, "h264"), &mut o).await;
+        let f = failed(&r);
+        assert_eq!(f.verdict, Verdict::SwOnly);
+        assert!(
+            f.tried
+                .backends
+                .contains(&(Backend::Ffmpeg, Reach::SwitchedOff)),
+            "{:?}",
+            f.tried
+        );
+    }
+
+    // RED on the seam: the PASSED line gains its appended fields.
+    #[tokio::test]
+    async fn hardware_h264_on_nvenc_passes_and_says_what_passed() {
+        let mut o = Scripted::opens("h264_nvenc", true, "h264");
+        let (r, out) = smoke(LINUX_FFMPEG, req(Hardware, "h264"), &mut o).await;
+        let p = r.expect("passes");
+        assert_eq!(p.verdict, Verdict::Ok);
+        assert!(
+            out.starts_with("encoder smoke PASSED: backend=h264_nvenc keyframes="),
+            "the old fields stay first: {out}"
+        );
+        assert!(out.contains(" verdict=ok cell=dc:h264 hw=true"), "{out}");
+        assert_eq!(
+            o.saw[0].cell,
+            CellSpec::new(CellPath::Dc, Codec::H264, false)
+        );
+    }
+
+    // RED on the seam: master warned "demoted" for `hevc` answered by HEVC.
+    #[tokio::test]
+    async fn hevc_answered_by_hevc_is_no_demotion() {
+        let mut o = Scripted::opens("mf-hevc", true, "h265");
+        let (r, _) = smoke(WINDOWS_MSI, req(Hardware, "hevc"), &mut o).await;
+        assert_eq!(r.expect("passes").verdict, Verdict::Ok);
+    }
+
+    // RED on the seam: it passed with a warning.
+    #[tokio::test]
+    async fn av1_answered_by_h264_is_demoted() {
+        let mut o = Scripted::opens("mf-h264", true, "h264");
+        let (r, _) = smoke(WINDOWS_MSI, req(Auto, "av1"), &mut o).await;
+        assert_eq!(failed(&r).verdict, Verdict::Demoted);
+        assert_eq!(exit_code(&r), 1);
+    }
+
+    // CONTROL: green on both.
+    #[tokio::test]
+    async fn auto_passes_on_the_software_mft_and_on_openh264() {
+        let mut o = Scripted::opens("mf-h264", false, "h264");
+        let (r, _) = smoke(WINDOWS_MSI, req(Auto, "h264"), &mut o).await;
+        assert_eq!(exit_code(&r), 0);
+        let mut o = Scripted::opens("openh264", false, "h264");
+        let (r, _) = smoke(LINUX_SW, req(Auto, "h264"), &mut o).await;
+        assert_eq!(exit_code(&r), 0);
+    }
+
+    // CONTROL: the `.deb` lanes' call.
+    #[tokio::test]
+    async fn software_h264_passes_on_openh264() {
+        let mut o = Scripted::opens("openh264", false, "h264");
+        let (r, _) = smoke(LINUX_FFMPEG, req(Software, "h264"), &mut o).await;
+        assert_eq!(exit_code(&r), 0);
+    }
+
+    // RED on the seam: `tried` is empty.
+    #[tokio::test]
+    async fn nothing_opening_is_none_with_what_failed() {
+        let mut o = Scripted::opens("noop", false, "h265");
+        o.cascade_failures = vec![
+            ("hevc_nvenc", "no device"),
+            ("hevc_vaapi", "no render node"),
+        ];
+        let (r, _) = smoke(LINUX_FFMPEG, req(Hardware, "hevc"), &mut o).await;
+        let f = failed(&r);
+        assert_eq!(f.verdict, Verdict::None);
+        assert_eq!(
+            f.tried.failed,
+            [
+                ("hevc_nvenc".to_string(), "no device".to_string()),
+                ("hevc_vaapi".to_string(), "no render node".to_string()),
+            ]
+        );
+    }
+
+    // RED on the seam: it propagated the raw encode error.
+    #[tokio::test]
+    async fn an_encode_error_is_the_error_verdict() {
+        let mut o = Scripted::opens("h264_nvenc", true, "h264");
+        if let Some(a) = o.answer.as_mut() {
+            a.fail_at = Some(2);
+        }
+        let (r, _) = smoke(LINUX_FFMPEG, req(Hardware, "h264"), &mut o).await;
+        assert_eq!(failed(&r).verdict, Verdict::Error);
+    }
+
+    // CONTROL.
+    #[tokio::test]
+    async fn no_keyframe_is_the_error_verdict() {
+        let mut o = Scripted::opens("h264_nvenc", true, "h264");
+        if let Some(a) = o.answer.as_mut() {
+            a.never_key = true;
+        }
+        let (r, _) = smoke(LINUX_FFMPEG, req(Hardware, "h264"), &mut o).await;
+        assert_eq!(failed(&r).verdict, Verdict::Error);
+    }
+
+    // CONTROL on the seam, the NEW lane request (D2 A): either MFT passes.
+    #[tokio::test]
+    async fn the_lanes_named_mf_request_passes_on_the_software_mft() {
+        let lane = Request {
+            pref: Hardware,
+            codec: "h264",
+            name: Some("h264_mf"),
+        };
+        let mut o = Scripted::opens("mf-h264", false, "h264");
+        let (r, _) = smoke(WINDOWS_MSI, lane, &mut o).await;
+        assert_eq!(exit_code(&r), 0);
+        let mut o = Scripted::refuses("no H.264 MFT on this host");
+        let (r, _) = smoke(WINDOWS_MSI, lane, &mut o).await;
+        assert_eq!(failed(&r).verdict, Verdict::None);
+        assert_eq!(exit_code(&r), 1);
+    }
+
+    // CONTROL: each backend's reach, per build.
+    #[test]
+    fn reach_per_build() {
+        assert_eq!(WINDOWS_MSI.reach(Backend::MediaFoundation), Reach::InBuild);
+        assert_eq!(
+            LINUX_FFMPEG.reach(Backend::MediaFoundation),
+            Reach::WindowsOnly
+        );
+        let windows_no_mf = BuildCaps {
+            mf: false,
+            ..WINDOWS_MSI
+        };
+        assert_eq!(
+            windows_no_mf.reach(Backend::MediaFoundation),
+            Reach::NotCompiled
+        );
+        assert_eq!(LINUX_FFMPEG_OFF.reach(Backend::Ffmpeg), Reach::SwitchedOff);
+        assert_eq!(LINUX_SW.reach(Backend::Ffmpeg), Reach::NotCompiled);
+        assert_eq!(LINUX_SW.reach(Backend::Openh264), Reach::InBuild);
+    }
+}
