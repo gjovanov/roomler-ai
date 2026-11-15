@@ -1846,11 +1846,11 @@ tag is read from the line its release object starts on, which begins with `"tag_
 writes it; any other shape reads as unreadable, never as another release's tag. The tunnel role prints
 neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1268`).
 
-`scripts/install-sh-output-check.sh` runs the real script, piped into the shell as the one-liner does,
-under dash and bash --posix, against stand-ins for the feed, the downloads, `sudo` and the daemon. It
-checks every line above, and that the cases of one mode record the same calls and exit code whatever
-the feed's tag or the daemon's answer. CI runs it in the "macOS post-install roads" job
-(`.github/workflows/ci.yml:2989-2994`).
+`scripts/install-sh-output-check.sh` pipes the real script into the shell as the one-liner does, under
+dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
+feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
+and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:2989-2996`).
 
 ### What a bare host needs (#3204)
 

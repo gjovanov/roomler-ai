@@ -2032,13 +2032,13 @@ say_unreadable() {
     say "$1: unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
 }
 
-# The release that holds the asset the download takes. asset_field_for takes
+# The release that holds the asset the download takes: asset_field_for takes
 # the first asset over the WHOLE feed whose name matches $2, so when the newest
-# release lacks this host's file, the download comes from an older release, and
-# that one is named. Its tag is read from the line its release object starts
-# on: the nearest line above the asset that is not an asset itself. Only a line
-# that starts with "tag_name" and closes its quote is read; any other shape is
-# unreadable, never another release's tag.
+# release lacks this host's file, an older release's is downloaded and named.
+# The asset is found in the caller's locale, as asset_field_for finds it; the
+# climb to its release's line runs in the C locale (where no byte hides a line)
+# and passes over asset lines (a name, then a URL) only. A line that does not
+# start with "tag_name" and close its quote is unreadable, never another's tag.
 name_release() {
     RELEASE_TAG=""
     nr_tag=""
@@ -2047,9 +2047,9 @@ name_release() {
         | grep '"browser_download_url":"[^"]*"' \
         | head -n 1 | cut -d: -f1)" || nr_line=""
     if [ -n "$nr_line" ] && [ "$nr_line" -gt 1 ]; then
-        nr_tag="$(tr '{' '\n' < "$1" \
+        nr_tag="$(LC_ALL=C; export LC_ALL; tr '{' '\n' < "$1" \
             | head -n "$((nr_line - 1))" \
-            | grep -v '^"name":"' \
+            | grep -v '^"name":"[^"]*","browser_download_url":"' \
             | tail -n 1 \
             | sed -n 's/^"tag_name":"\([^"]*\)".*/\1/p')" || nr_tag=""
     fi
@@ -2061,9 +2061,9 @@ name_release() {
     fi
 }
 
-# After an install, the installed daemon's own word for its version. A
-# download-only run installs nothing, and the tunnel role's CLI names itself
-# (require_tunnel_cli).
+# After an install, the installed daemon's own --version, with stdin from
+# /dev/null (in the one-liner, stdin is the rest of this script). Download-only
+# installs nothing; the tunnel role's CLI names itself (require_tunnel_cli).
 report_installed_version() {
     if [ "$ROLE" != daemon ]; then
         return 0
@@ -2077,13 +2077,13 @@ report_installed_version() {
         riv_bin="$MACOS_DAEMON_BIN"
     fi
     riv_rc=0
-    riv_out="$("$riv_bin" --version 2>/dev/null)" || riv_rc=$?
+    riv_out="$("$riv_bin" --version </dev/null 2>/dev/null)" || riv_rc=$?
     if [ "$riv_rc" != 0 ]; then
         say "installed daemon's own --version: no answer ($riv_bin --version exited $riv_rc)"
     elif [ -z "$riv_out" ]; then
         say "installed daemon's own --version: no answer ($riv_bin --version printed nothing)"
     else
-        riv_ver="$(printf '%s\n' "$riv_out" | head -n 1)"
+        riv_ver="$(printf '%s\n' "$riv_out" | head -n 1)" || riv_ver=""
         riv_ver="${riv_ver#roomlerd }"
         if fits_alphabet "$riv_ver"; then
             say "installed daemon's own --version: $riv_ver"
