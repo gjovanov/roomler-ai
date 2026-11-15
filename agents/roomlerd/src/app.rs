@@ -8976,14 +8976,20 @@ mod smoke_ffmpeg_tests {
     use super::*;
     use roomler_ai_remote_control::models::VideoCodec;
     use roomlerd::encode::bench::{Backend, Reach, Verdict};
-    use roomlerd::encode::ffmpeg::FfmpegEncoder;
+    use roomlerd::encode::ffmpeg::{FfmpegEncoder, USE_FFMPEG_LOCK};
     use roomlerd::encode::smoke::Failed;
 
+    // `encode::ffmpeg`'s own tests switch `ROOMLERD_USE_FFMPEG` off in this
+    // process, and this run needs FFmpeg on from its first read of the switch
+    // to its last open: it holds their lock across its awaits on purpose, and
+    // nothing it awaits takes that lock.
+    #[allow(clippy::await_holding_lock)]
     async fn fails_naming_what_it_tried(codec_raw: &str, codec: VideoCodec) {
         if std::env::var_os("GITHUB_ACTIONS").is_none() {
             eprintln!("skipped: a GPU-less CI runner only; here a GPU could answer");
             return;
         }
+        let _use_ffmpeg = USE_FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let e = encoder_smoke_cmd("hardware", codec_raw, None, None)
             .await
             .expect_err("a GPU-less runner has no hardware encoder to pass on");

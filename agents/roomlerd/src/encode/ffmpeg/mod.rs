@@ -120,18 +120,24 @@ pub fn available() -> bool {
     false
 }
 
+/// Serialises the tests that depend on `USE_FFMPEG`, which libtest runs on
+/// parallel threads of ONE `--lib` process. Both tests in `tests` write the
+/// var and then assert on it: unserialised, the first one's "unset → ON" can
+/// read the second one's `"0"`, the second's "`0` → OFF" can read the first
+/// one's clear, and any test that reads the switch meanwhile can see it off.
+/// Nothing outside `tests` writes the var. Of its readers, the smoke's FFmpeg
+/// tests (`app::smoke_ffmpeg_tests`) assert that FFmpeg is in this build and
+/// switched on (`bench::BuildCaps::this_build`), so they hold this lock for
+/// their whole run; the others (`caps`, `peer`, `encode::mod`) are pump or
+/// probe paths whose tests assert nothing that depends on it. A new test that
+/// writes the var, or asserts on what it switches, holds this lock too.
+#[cfg(test)]
+pub(crate) static USE_FFMPEG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tunnel_core::env::test_env::Saved;
-
-    /// Both tests below write `USE_FFMPEG` and then assert on it, and libtest
-    /// runs them on parallel threads of ONE process: unserialised, the first
-    /// one's "unset → ON" can read the second one's `"0"`, and the second's
-    /// "`0` → OFF" can read the first one's clear. Nothing outside this module
-    /// writes the var; its other readers (`caps`, `peer`, `encode::mod`) are
-    /// pump or probe paths whose tests assert nothing that depends on it.
-    static USE_FFMPEG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn available_default_on_when_env_unset() {
