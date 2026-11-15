@@ -484,6 +484,13 @@ impl HeldPath {
         self.folder
     }
 
+    /// The folder's own handle, borrowed: its owner and DACL, and a file
+    /// opened below it with its own ([`HeldFolder::security`],
+    /// [`HeldFolder::file`]), while the walk goes on acting in the folder.
+    pub fn folder(&self) -> &HeldFolder {
+        &self.folder
+    }
+
     /// Write `bytes` as the file `name`: a fresh temp file below this folder
     /// (`FILE_CREATE`, so nothing already there is ever written into), made
     /// with `seal`'s descriptor, written and flushed (#2955), then renamed

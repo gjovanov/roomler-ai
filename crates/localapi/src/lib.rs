@@ -1443,12 +1443,21 @@ pub enum Request {
     /// Remote-control sessions awaiting an operator consent decision.
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
+    /// Mutating, and the endpoint's ACL is NOT the whole boundary: an approval
+    /// lets someone see and control this screen, so it is the answer of the
+    /// person at that screen. On the daemon's own endpoint the dispatcher takes
+    /// it only from that person, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]); on the person socket only from
+    /// whoever is at the seat now (#3845). Anyone else is refused in words.
     ConsentDecide { session_id: String, allow: bool },
     /// FR-27 — remote-control sessions currently LIVE on this device.
     RcSessions,
     /// FR-27 — end a live remote-control session from the device side. This is
-    /// the Disconnect the "Being viewed by …" banner offers; mutating, and the
-    /// pipe/socket ACL is the trust boundary, like [`Self::ConsentDecide`].
+    /// the Disconnect the "Being viewed by …" banner offers. Mutating, and
+    /// gated like [`Self::ConsentDecide`] on the daemon's own endpoint: the
+    /// person at the screen, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]). The person socket serves it to
+    /// the person it was made for.
     RcDisconnect { session_id: String },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
@@ -1463,9 +1472,9 @@ pub enum Request {
     },
     /// Create a daemon-driven static forward: the daemon opens a tunnel to
     /// `node` (a hex agent id) over its own agent WS and listens on `local`,
-    /// dialing `remote` (`host:port`) from the target. Mutating — like
-    /// [`Request::ConsentDecide`], the pipe/socket ACL is the trust boundary
-    /// (P3b-2). Returns [`Response::FlowCreated`] with the assigned flow id.
+    /// dialing `remote` (`host:port`) from the target. Mutating — the
+    /// pipe/socket ACL is the trust boundary (P3b-2). Returns
+    /// [`Response::FlowCreated`] with the assigned flow id.
     CreateForward {
         node: String,
         local: u16,
@@ -2330,7 +2339,8 @@ pub struct RecordingsListing {
 /// reading status, and the wrong one for starting a screen recording: a guest
 /// in an RDP session must not be able to record the CONSOLE user's desktop.
 /// The recording verbs, and a `ConfigSet` of any `record_*` key, therefore
-/// require [`ClientPeer::is_console_user`].
+/// require [`ClientPeer::is_console_user`]; a consent answer and a Disconnect
+/// require [`ClientPeer::may_decide_for_the_screen`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientPeer {
     /// Windows: the client process's session id.
@@ -2394,6 +2404,12 @@ impl ClientPeer {
     /// `scope`'s endpoint? [`peer_may_record`].
     pub fn may_record(&self, scope: Scope) -> bool {
         peer_may_record(self, scope, console_session_id(), own_uid())
+    }
+
+    /// May this peer answer a consent prompt or end a live session over the
+    /// daemon's own endpoint? [`peer_may_decide_for_the_screen`].
+    pub fn may_decide_for_the_screen(&self) -> bool {
+        peer_may_decide_for_the_screen(self, console_session_id(), own_session_id(), own_uid())
     }
 }
 
@@ -2529,6 +2545,75 @@ pub fn peer_may_set_console_key(
     match scope {
         Scope::Full => peer_is_console_user(peer, console_session, own_uid),
         Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
+    }
+}
+
+/// The session whose screen this daemon shows, on Windows: the one whose
+/// person a consent prompt asks, and whose session a Disconnect ends.
+///
+/// - **Its own session**, when that is not session 0: a worker, which the
+///   service host starts in the active console session, or a per-user
+///   daemon, which runs where its person signed in, over RDP too. The person
+///   at the console is someone else then, and is not the one asked.
+/// - **The console session** (`WTSGetActiveConsoleSessionId`) for a daemon
+///   in session 0, the service host.
+/// - **None** when its own session cannot be read, or it runs in session 0
+///   and there is no console session: no person's screen, so only SYSTEM
+///   and an elevated administrator decide ([`peer_may_decide_for_the_screen`]).
+///
+/// Never session 0: no person sits there.
+pub fn screen_session(own_session: Option<u32>, console_session: Option<u32>) -> Option<u32> {
+    match own_session? {
+        0 => console_session.filter(|&s| s != 0),
+        own => Some(own),
+    }
+}
+
+/// Who may answer a consent prompt (approve or deny) or end a live session
+/// (a Disconnect) over the daemon's own endpoint ([`Scope::Full`]).
+///
+/// Both decide what happens to a screen, and an approval lets someone see
+/// and control it, so they are the answer of the person at that screen, as
+/// on the person socket, where the seat is asked (#3845). The Windows pipe
+/// admits every interactive user (its `IU` ace), so here the peer the OS
+/// read at accept decides, never anything the client says:
+/// - **SYSTEM** (`S-1-5-18`, read from the client's token; LocalService and
+///   NetworkService are not SYSTEM) and **an administrator who elevated**:
+///   either can change the daemon itself.
+/// - **Windows**: a peer in the session whose screen this daemon shows
+///   ([`screen_session`]).
+/// - **Unix**: this daemon's own account, or root: who its owner-only socket
+///   admits, so nothing changes there.
+/// - Anything unknown: no. A peer the endpoint could not read is refused.
+///
+/// [`ClientPeer::is_root`] reads a uid, which a pipe client never has: on
+/// Windows it is false for every peer, SYSTEM's included, so SYSTEM is
+/// named here by its SID.
+pub fn peer_may_decide_for_the_screen(
+    peer: &ClientPeer,
+    console_session: Option<u32>,
+    own_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    if peer.sid.as_deref() == Some(SYSTEM_SID) || peer.elevated == Some(true) {
+        return true;
+    }
+    if let Some(session) = peer.session_id {
+        return screen_session(own_session, console_session) == Some(session);
+    }
+    matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o || p == 0)
+}
+
+/// The session this process runs in (Windows), `None` when it cannot be read
+/// or on other platforms.
+fn own_session_id() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        process_session(std::process::id())
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 
@@ -3622,6 +3707,34 @@ fn not_at_the_seat_to_answer() -> Response {
     }
 }
 
+/// The answer to a consent answer (`ending` false) or a Disconnect (`ending`
+/// true) on the daemon's own endpoint from a peer
+/// [`peer_may_decide_for_the_screen`] does not admit. Nothing is decided,
+/// and the refusal is on the record.
+fn not_the_screens_person(peer: &ClientPeer, ending: bool) -> Response {
+    tracing::warn!(
+        peer_session = ?peer.session_id,
+        peer_uid = ?peer.uid,
+        peer_elevated = ?peer.elevated,
+        screen_session = ?screen_session(own_session_id(), console_session_id()),
+        verb = if ending { "rc_disconnect" } else { "consent_decide" },
+        "localapi: refused, from a caller that is not the person at this device's screen, \
+         SYSTEM or an elevated administrator"
+    );
+    let message = if ending {
+        "The session was not ended: only the person signed in at this device's screen ends a \
+         session on it from here, or SYSTEM, or an administrator from an elevated prompt. This \
+         caller is none of those."
+    } else {
+        "The answer was not taken: only the person signed in at this device's screen answers a \
+         request to see or control it, or SYSTEM, or an administrator from an elevated prompt. \
+         This caller is none of those."
+    };
+    Response::Error {
+        message: message.into(),
+    }
+}
+
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
 /// No I/O — the pipe listener (P1-cont) reads a JSON line, deserialises a
 /// [`Request`], calls this, and writes the [`Response`] back.
@@ -3703,7 +3816,8 @@ where
 
 /// [`serve_connection`] with the peer the listener identified at accept time.
 /// FR-85: the recording verbs and a `ConfigSet` of any `record_*` key require
-/// [`ClientPeer::is_console_user`]; an unknown peer fails that check.
+/// [`ClientPeer::is_console_user`]; a consent answer and a Disconnect require
+/// [`ClientPeer::may_decide_for_the_screen`]. An unknown peer fails both.
 pub async fn serve_connection_as<S>(
     stream: S,
     state: &dyn LocalApiState,
@@ -3832,6 +3946,22 @@ where
                             message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
                         },
                     }
+                }
+                // And on the daemon's own endpoint a consent answer and a
+                // Disconnect come from the person at the screen this daemon
+                // shows, SYSTEM or an elevated administrator, as the OS read
+                // the peer at accept: the Windows pipe admits every interactive
+                // user. A peer it could not read is refused. Any scope but the
+                // person socket's, so a new one starts refused.
+                Ok(Request::ConsentDecide { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, false)
+                }
+                Ok(Request::RcDisconnect { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, true)
                 }
                 Ok(Request::ExternalPasswordSet { .. } | Request::ExternalPasswordClear)
                     if !peer.is_console_user() =>
@@ -9503,9 +9633,376 @@ mod tests {
         };
         let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, approve).await;
         assert_eq!(r, Response::ConsentDecided { ok: true });
-        // The daemon's own endpoint never asks the seat.
-        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana, approve).await;
+        // The daemon's own endpoint never asks the seat. It takes a consent
+        // answer only from the person at the screen it shows, SYSTEM or an
+        // elevated administrator (`peer_may_decide_for_the_screen`), so `ana`
+        // asks there as an elevated administrator: a peer it identifies on
+        // every OS.
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana_elevated, approve).await;
         assert_eq!(r, Response::ConsentDecided { ok: true });
+    }
+
+    /// A daemon that counts the consent answers and the Disconnects that
+    /// reach it, and takes every one.
+    #[derive(Clone, Default)]
+    struct Counting {
+        decided: Arc<std::sync::atomic::AtomicUsize>,
+        ended: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LocalApiState for Counting {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            self.decided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        fn rc_disconnect(&self, _session_id: &str) -> bool {
+            self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    impl Counting {
+        fn decided(&self) -> usize {
+            self.decided.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn ended(&self) -> usize {
+            self.ended.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Who may answer a consent prompt or end a live session over the
+    /// daemon's own endpoint: the person at the screen the daemon shows,
+    /// SYSTEM, or an administrator who elevated. On Windows that screen is the
+    /// daemon's own session, and only a daemon in session 0 (the service host)
+    /// takes the console's; with neither known, only SYSTEM and an elevated
+    /// administrator. On Unix it is the daemon's own account or root, as its
+    /// owner-only socket admits.
+    #[test]
+    fn the_screen_decision_table() {
+        let decide = peer_may_decide_for_the_screen;
+        // A Windows person's process, read from its token.
+        let win = |s: u32| ClientPeer {
+            session_id: Some(s),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1001".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let elevated = |s: u32| ClientPeer {
+            sid: Some("S-1-5-21-1-2-3-500".into()),
+            elevated: Some(true),
+            ..win(s)
+        };
+        let system = |s: u32| ClientPeer {
+            system_account: Some(true),
+            sid: Some("S-1-5-18".into()),
+            elevated: Some(true),
+            ..win(s)
+        };
+        let unix = |u: u32| ClientPeer {
+            uid: Some(u),
+            gid: Some(u),
+            ..ClientPeer::UNKNOWN
+        };
+
+        // A machine-wide install: the worker runs in the console session (1).
+        assert!(
+            decide(&win(1), Some(1), Some(1), None),
+            "the console person"
+        );
+        assert!(
+            !decide(&win(2), Some(1), Some(1), None),
+            "another signed-in account: a switched-away user, an RDP session"
+        );
+        assert!(
+            decide(&elevated(2), Some(1), Some(1), None),
+            "an elevated administrator, from any session"
+        );
+        assert!(decide(&system(0), Some(1), Some(1), None), "SYSTEM");
+        assert!(
+            decide(&system(1), Some(1), Some(1), None),
+            "SYSTEM in the console session"
+        );
+
+        // A per-user install whose person works over RDP: the daemon runs in
+        // that RDP session (3), and its screen is the one it shows.
+        assert!(
+            decide(&win(3), Some(1), Some(3), None),
+            "the person in the RDP session the daemon shows"
+        );
+        assert!(
+            !decide(&win(1), Some(1), Some(3), None),
+            "the person at the console is someone else"
+        );
+        assert!(
+            decide(&elevated(1), Some(1), Some(3), None),
+            "an elevated administrator"
+        );
+        assert!(decide(&system(0), Some(1), Some(3), None), "SYSTEM");
+
+        // A daemon in session 0, the service host: the console session.
+        assert!(decide(&win(1), Some(1), Some(0), None));
+        assert!(
+            !decide(&win(0), Some(1), Some(0), None),
+            "session 0 is never a person's"
+        );
+        assert!(!decide(&win(2), Some(1), Some(0), None));
+
+        // No console session, or a daemon whose own session could not be
+        // read: nobody but SYSTEM and an elevated administrator.
+        for (console, own) in [(None, Some(0)), (Some(1), None), (None, None)] {
+            for s in [0, 1, 2] {
+                assert!(
+                    !decide(&win(s), console, own, None),
+                    "{console:?} {own:?} {s}"
+                );
+            }
+            assert!(
+                decide(&system(0), console, own, None),
+                "{console:?} {own:?}"
+            );
+            assert!(
+                decide(&elevated(1), console, own, None),
+                "{console:?} {own:?}"
+            );
+        }
+
+        // SYSTEM by its own account: LocalService and NetworkService are
+        // service accounts, not SYSTEM.
+        for sid in ["S-1-5-19", "S-1-5-20"] {
+            let service = ClientPeer {
+                sid: Some(sid.into()),
+                elevated: Some(false),
+                ..system(0)
+            };
+            assert!(!decide(&service, Some(1), Some(1), None), "{sid}");
+        }
+        // A Windows peer whose session or account could not be read.
+        let no_session = ClientPeer {
+            session_id: None,
+            ..win(1)
+        };
+        assert!(!decide(&no_session, Some(1), Some(1), None));
+        let no_account = ClientPeer {
+            session_id: Some(2),
+            ..ClientPeer::UNKNOWN
+        };
+        assert!(!decide(&no_account, Some(1), Some(1), None));
+
+        // Unix: the daemon's own account, or root.
+        assert!(decide(&unix(1000), None, None, Some(1000)));
+        assert!(decide(&unix(0), None, None, Some(1000)), "root");
+        assert!(!decide(&unix(1001), None, None, Some(1000)));
+        assert!(!decide(&unix(1000), None, None, None));
+
+        // Unknown: never.
+        for (console, own, uid) in [
+            (Some(1), Some(1), None),
+            (None, None, Some(1000)),
+            (None, None, None),
+        ] {
+            assert!(!decide(&ClientPeer::UNKNOWN, console, own, uid));
+        }
+
+        // The screen's session alone.
+        assert_eq!(screen_session(Some(3), Some(1)), Some(3), "its own");
+        assert_eq!(screen_session(Some(0), Some(1)), Some(1), "the console's");
+        assert_eq!(screen_session(Some(0), None), None);
+        assert_eq!(screen_session(Some(0), Some(0)), None);
+        assert_eq!(screen_session(None, Some(1)), None, "fails closed");
+    }
+
+    /// Over the daemon's own endpoint a consent answer, an approval or a
+    /// denial, and a Disconnect come from the person at the screen it shows,
+    /// SYSTEM or an elevated administrator. Another signed-in account, and a
+    /// peer the endpoint could not identify, are refused in words, and nothing
+    /// reaches the daemon. The person socket keeps its own rule (#3845).
+    #[tokio::test]
+    async fn a_consent_answer_or_a_disconnect_on_the_daemons_own_endpoint_comes_from_the_screens_person()
+     {
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":false}}"#;
+        let end = r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#;
+        // A session that is neither this process's nor the console's.
+        let other = [own_session_id(), console_session_id()]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let another_session = ClientPeer {
+            session_id: Some(other),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1002".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let stranger = if own_uid() == Some(4242) { 4243 } else { 4242 };
+        let another_account = ClientPeer {
+            uid: Some(stranger),
+            gid: Some(stranger),
+            ..ClientPeer::UNKNOWN
+        };
+        for (who, peer) in [
+            ("another session", another_session.clone()),
+            ("another account", another_account),
+            ("a peer nobody could identify", ClientPeer::UNKNOWN),
+        ] {
+            let state = Counting::default();
+            for line in [approve, deny] {
+                let r = ask_state_scoped_as(state.clone(), Scope::Full, peer.clone(), line).await;
+                assert!(
+                    matches!(&r, Response::Error { message } if message.starts_with("The answer was not taken")),
+                    "{who}: {line} → {r:?}"
+                );
+            }
+            let r = ask_state_scoped_as(state.clone(), Scope::Full, peer, end).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.starts_with("The session was not ended")),
+                "{who}: {r:?}"
+            );
+            assert_eq!(state.decided(), 0, "{who}: nothing was decided");
+            assert_eq!(state.ended(), 0, "{who}: nothing was ended");
+        }
+
+        let mut admitted = vec![
+            (
+                "SYSTEM",
+                ClientPeer {
+                    session_id: Some(0),
+                    system_account: Some(true),
+                    sid: Some(SYSTEM_SID.into()),
+                    elevated: Some(true),
+                    ..ClientPeer::UNKNOWN
+                },
+            ),
+            (
+                "an elevated administrator in another session",
+                ClientPeer {
+                    sid: Some("S-1-5-21-1-2-3-500".into()),
+                    elevated: Some(true),
+                    ..another_session
+                },
+            ),
+        ];
+        // The person at the screen this daemon shows, as the OS reads this
+        // process: on Windows the screen's session (its own, or the
+        // console's from session 0); on Unix this account.
+        let screen = screen_session(own_session_id(), console_session_id());
+        if cfg!(unix) || screen.is_some() {
+            admitted.push((
+                "the person at the screen",
+                ClientPeer {
+                    session_id: screen,
+                    uid: own_uid(),
+                    system_account: Some(false),
+                    elevated: Some(false),
+                    ..ClientPeer::UNKNOWN
+                },
+            ));
+        }
+        if cfg!(unix) {
+            admitted.push((
+                "root",
+                ClientPeer {
+                    uid: Some(0),
+                    gid: Some(0),
+                    ..ClientPeer::UNKNOWN
+                },
+            ));
+        }
+        for (who, peer) in admitted {
+            let state = Counting::default();
+            for line in [approve, deny] {
+                let r = ask_state_scoped_as(state.clone(), Scope::Full, peer.clone(), line).await;
+                assert_eq!(r, Response::ConsentDecided { ok: true }, "{who}: {line}");
+            }
+            let r = ask_state_scoped_as(state.clone(), Scope::Full, peer, end).await;
+            assert_eq!(r, Response::RcDisconnected { ok: true }, "{who}");
+            assert_eq!((state.decided(), state.ended()), (2, 1), "{who}");
+        }
+
+        // The person socket keeps #3845's rule: the person at the seat answers
+        // there and ends a session there, with no Windows identity at all.
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+        let state = Counting::default();
+        let r = ask_state_scoped_as(state.clone(), SEAT, ana, end).await;
+        assert_eq!(r, Response::RcDisconnected { ok: true });
+        assert_eq!(state.ended(), 1);
+    }
+
+    /// The tray and the CLI as the pipe reads them: a client of this process,
+    /// read from the OS at accept (its session, and its account from its
+    /// token), answers a consent prompt and ends a session over a real pipe.
+    /// It is admitted wherever this test runs as a person runs a tray or a
+    /// CLI: in an interactive session, which is this daemon's own screen
+    /// here, or elevated (a CI runner).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_client_at_the_screen_answers_and_ends_a_session_over_a_real_pipe() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let pipe = format!(r"\\.\pipe\roomler-test-screen-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let client = ClientOptions::new().open(&pipe).unwrap();
+        server.connect().await.unwrap();
+        let peer = pipe_client_peer(server.as_raw_handle());
+        let interactive = own_session_id().is_some_and(|s| s != 0);
+        if !interactive && peer.elevated != Some(true) {
+            eprintln!("skipped: this process runs in session 0, not elevated: {peer:?}");
+            return;
+        }
+        assert_eq!(peer.session_id, own_session_id(), "{peer:?}");
+        let state = Counting::default();
+        let st = state.clone();
+        let served = tokio::spawn(async move { serve_connection_as(server, &st, peer).await });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        for (line, want) in [
+            (
+                r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#,
+                Response::ConsentDecided { ok: true },
+            ),
+            (
+                r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
+                Response::RcDisconnected { ok: true },
+            ),
+        ] {
+            wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let got = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Response>(&got).unwrap(),
+                want,
+                "{line}"
+            );
+        }
+        drop(wr);
+        drop(lines);
+        served.await.unwrap().unwrap();
+        assert_eq!((state.decided(), state.ended()), (1, 1));
     }
 
     /// #2871 — the person's view of a configuration listing marks every key

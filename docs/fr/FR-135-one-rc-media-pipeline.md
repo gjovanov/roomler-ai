@@ -594,7 +594,7 @@ Hello counts are this window's live agents (Windows 16, Linux 12, macOS 2) [M]; 
 | GDI | CPU | n/a | S, ~85 ms a frame, ~12 fps [R doc]; 15 of 16 bad reopens landed here [M #3272] | S: the lock screen's arm | U | keep: it is how SYSTEM sees a lock | Viewer told it is on GDI |
 | synthetic | CPU | N in releases | N | N | N | keep for CI | None |
 
-Windows, RDP: the supervisor tracks only `WTSGetActiveConsoleSessionId` (`win_service/supervisor.rs:176-186`), so an RDP session gets no worker from it. Field behaviour U. Nobody signed in, swap off: no worker at all (`win_service/supervisor.rs:1727-1733`).
+Windows, RDP: the supervisor tracks only `WTSGetActiveConsoleSessionId` (`win_service/supervisor.rs:177-187`), so an RDP session gets no worker from it. Field behaviour U. Nobody signed in, swap off: no worker at all (`win_service/supervisor.rs:1749-1755`).
 
 **Linux.**
 
@@ -612,7 +612,7 @@ Locked: DRM sees it. Portal and mutter refuse while locked; mutter resumes 2.8 s
 
 ### 5.4 Fallback and selection facts this design binds to
 
-Cascade in `open_with` (`capture/mod.rs:2893`): synthetic, SystemContext, WGC, auto mutter then portal, DRM, `portal_capture` key, Xwayland refusal, scrap, Noop. Windows worker choice: `decide_spawn` (`win_service/supervisor.rs:768`). `planned_arm` and `arm_facts` only predict and are kept in step by hand (`capture/mod.rs:1345-1346`). The prediction cannot go: `pick` runs at session create (`signaling.rs:3499-3515`), before any capture opens (`peer.rs:6482`). So R10 puts both behind one function that returns a predicted `CaptureFacts`, and an open source's `facts()` reports any mismatch.
+Cascade in `open_with` (`capture/mod.rs:2893`): synthetic, SystemContext, WGC, auto mutter then portal, DRM, `portal_capture` key, Xwayland refusal, scrap, Noop. Windows worker choice: `decide_spawn` (`win_service/supervisor.rs:790`). `planned_arm` and `arm_facts` only predict and are kept in step by hand (`capture/mod.rs:1345-1346`). The prediction cannot go: `pick` runs at session create (`signaling.rs:3499-3515`), before any capture opens (`peer.rs:6482`). So R10 puts both behind one function that returns a predicted `CaptureFacts`, and an open source's `facts()` reports any mismatch.
 
 ### 5.5 Transport × codec × browser decode
 

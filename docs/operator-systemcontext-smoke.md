@@ -216,7 +216,7 @@ where it is read, to recover a config that does not parse; an old one another
 account owns stops nothing, and the next save replaces it. A machine config
 that fails is not run: the device runs as in step 2a, and the service log says
 once which entry fails and why (step 6). The service host and the worker read
-it through one function (`agents/roomlerd/src/win_service/supervisor.rs:976`),
+it through one function (`agents/roomlerd/src/win_service/supervisor.rs:998`),
 so they cannot disagree, and a SYSTEM worker never loads a config the check
 refused (`agents/roomlerd/src/app.rs:1850`). `keep-system-context` reads a
 record that fails as no record, so SystemContext off (`machine_tree.rs:1179`).

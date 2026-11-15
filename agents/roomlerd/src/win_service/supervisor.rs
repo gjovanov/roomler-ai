@@ -39,8 +39,9 @@ use std::time::{Duration, Instant};
 use super::stop_event::HostStopEvent;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_TOKEN, FALSE, GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_CTX_WINSTATION_NOT_FOUND, ERROR_NO_TOKEN, FALSE, GENERIC_READ, GetLastError,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SECURITY_ATTRIBUTES, SecurityImpersonation,
@@ -202,6 +203,27 @@ pub fn query_user_token(session_id: u32) -> Result<Option<OwnedHandle>> {
         // SAFETY: GetLastError is a thread-local read.
         let err = unsafe { GetLastError() };
         if err == ERROR_NO_TOKEN {
+            return Ok(None);
+        }
+        bail!("WTSQueryUserToken({session_id}) failed (err {err})");
+    }
+    Ok(OwnedHandle::new(token))
+}
+
+/// #3844 — [`query_user_token`] for a session named by a tray that ran in
+/// it, not by the console: `Ok(None)` also when the session is gone
+/// (`ERROR_CTX_WINSTATION_NOT_FOUND`), which is how a Remote Desktop session
+/// its person signed out of answers once it is torn down. Either way nobody
+/// is signed in there to start anything for.
+pub fn query_session_user_token(session_id: u32) -> Result<Option<OwnedHandle>> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: as in `query_user_token`: `token` is an out-pointer the API
+    // writes a HANDLE to, owned below.
+    let ok = unsafe { WTSQueryUserToken(session_id, &mut token) };
+    if ok == 0 {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_NO_TOKEN || err == ERROR_CTX_WINSTATION_NOT_FOUND {
             return Ok(None);
         }
         bail!("WTSQueryUserToken({session_id}) failed (err {err})");

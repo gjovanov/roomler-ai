@@ -1720,10 +1720,34 @@ jobs:
         if: ${{ !cancelled() && github.event_name != 'push' }}
         uses: actions/upload-artifact@v4
         with:
-          name: installer-smoke-msis
+          # #3810: from attempt 2 on (a re-run), the name carries the attempt.
+          # Documented, of `overwrite` (default false): "If false, the action will
+          # fail if an artifact for the given name already exists"
+          # (https://github.com/actions/upload-artifact/blob/v4/README.md). Observed
+          # in run 43272025014: attempt 2 uploaded attempt 1's name without failing,
+          # and the run then held it twice. The suffix is safe either way, and the
+          # two uploads below carry the same one.
+          name: installer-smoke-msis${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/fr133/branch-*.msi
           if-no-files-found: warn
           retention-days: 7
+
+      # #3810 — the six per-Machine MSIs of this run, pm-1.msi to pm-6.msi:
+      # the same binary at versions 0.0.1-smoke.1 to 0.0.6-smoke.1, built by
+      # the hand-run upgrade step above. CI builds, unsigned: never ship them.
+      # A lab replay of the per-Machine steps on a throwaway guest installs
+      # exactly these. No step after the build moves or deletes them. Only on
+      # a pull request from a `lab/` branch, the one that asks for them: at
+      # about 20 MB a file, every other run would only fill the account's
+      # Actions storage.
+      - name: Upload the per-Machine MSIs for a lab replay (#3810)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && startsWith(github.head_ref, 'lab/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-pm-msis${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
+          path: ${{ runner.temp }}/pm-msi/pm-*.msi
+          if-no-files-found: warn
+          retention-days: 3
 
       # #3754 — what a failure leaves for its reader, taken before the runner
       # cleans up: every process with its image path, and the service's and the
@@ -1761,7 +1785,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: msi-logs
+          name: msi-logs${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/msi-logs/
           retention-days: 7
 
@@ -2677,5 +2701,64 @@ jobs:
           family: macos-pkg-smoke
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
+
+  # #3810 — when the Windows job did not succeed, this job reads it through
+  # the API and prints what it read, as an error annotation and in the job
+  # summary: the job's conclusion, the steps that reported an end other than
+  # success or skipped, the steps that reported no end, and GitHub's
+  # annotations on the job. The decision is scripts/job-steps-ended.sh:
+  # `complete` when GitHub lists at least one step and every step reported an
+  # end, `incomplete` otherwise (scripts/job-steps-ended-test.sh holds its
+  # cases). On attempt 1, `incomplete` means that the workflow
+  # installer-smoke-rerun (.github/workflows/installer-smoke-rerun.yml, run
+  # from the default branch when this run completes) asks GitHub to re-run the
+  # Windows job once, as attempt 2, unless one of its guards refuses; that
+  # workflow never re-runs attempt 2. This job fails whenever it runs. A run
+  # whose Windows job was lost reads `cancelled` until a re-run replaces that
+  # job's check. This job is skipped when the Windows job passes or was
+  # skipped, and in a run cancelled first.
+  windows-steps-check:
+    name: "Did every step of the Windows job report an end? (#3810)"
+    needs: windows-msi-install-uninstall
+    if: ${{ !cancelled() && needs.windows-msi-install-uninstall.result != 'success' && needs.windows-msi-install-uninstall.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Reads only: the decision script (contents), the run's jobs and their
+    # steps (actions), the job's annotations (checks).
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/job-steps-ended.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Read every step of the Windows job through the API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SMOKE_JOB: per-User MSI install + uninstall (windows-latest)
+        run: |
+          set -uo pipefail
+          esc() { local s=${1//%/%25}; s=${s//$'\r'/%0D}; printf '%s' "${s//$'\n'/%0A}"; }
+          out=$(bash scripts/job-steps-ended.sh --repo "$GITHUB_REPOSITORY" --run "$GITHUB_RUN_ID" \
+            --attempt "$GITHUB_RUN_ATTEMPT" --job "$SMOKE_JOB")
+          rc=$?
+          case "$(head -n 1 <<<"$out")" in
+            verdict=complete) title='Every step of the Windows job reported an end (#3810)' ;;
+            verdict=incomplete) title='Not every step of the Windows job reported an end (#3810)' ;;
+            *) title='The Windows job could not be read (#3810)' ;;
+          esac
+          lines=$(grep -v '^verdict=' <<<"$out")
+          [ "$rc" -eq 0 ] || lines+=$'\n'"The decision script exited $rc with no verdict."
+          echo "::error title=$title::$(esc "$lines")"
+          {
+            printf '### %s\n\n' "$title"
+            while IFS= read -r l; do printf -- '- %s\n' "$l"; done <<<"$lines"
+          } >>"$GITHUB_STEP_SUMMARY"
+          # The Windows job did not succeed, so this check fails, whatever it read.
+          exit 1
 
 # RETIRED-NAME-ANCHOR-END
