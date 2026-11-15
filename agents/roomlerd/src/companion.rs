@@ -3035,13 +3035,11 @@ mod tray_start_tests {
         assert!(!ind.notification_is_up("g7"), "nothing is up for it");
     }
 
-    /// The control on Linux: a start whose steps answer in time does what it
-    /// always did. A root daemon starts the tray through the system manager
-    /// as the person, with the session's allowlisted environment; a per-user
-    /// daemon through its own manager, without reading it. A tray already
-    /// running, no companion installed, nobody at the screen and a failed
-    /// systemd-run answer as before, and only a systemd-run that exited 0 is
-    /// `Started`.
+    /// The control on Linux: a start in time does what it always did, and says it is for a
+    /// prompt (`--for-prompt`, #3887). A root daemon starts the tray through the system manager
+    /// as the person, with the session's allowlisted environment; a per-user daemon through its
+    /// own manager, without reading it. A running tray, no companion, nobody at the screen and a
+    /// failed systemd-run answer as before; only a systemd-run that exited 0 is `Started`.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_start_in_time_works_as_today() {
@@ -3069,6 +3067,7 @@ mod tray_start_tests {
                 "--setenv=DISPLAY=:0",
                 "--setenv=XDG_CURRENT_DESKTOP=GNOME",
                 COMPANION,
+                "--for-prompt",
             ])],
             "a root daemon: the system manager, as the person, with the allowlisted environment"
         );
@@ -3097,6 +3096,7 @@ mod tray_start_tests {
                 "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
                 "--setenv=DISPLAY=:0",
                 COMPANION,
+                "--for-prompt",
             ])],
             "a per-user daemon: its own manager"
         );
@@ -3160,7 +3160,7 @@ mod tray_start_tests {
     /// it always did. A SYSTEM service starts the tray into the console
     /// session as its person, and a daemon that runs as the person a plain
     /// start in its own session, each from the companion beside the daemon
-    /// with no arguments. A tray already running, no companion installed, a
+    /// with `--for-prompt` (#3887). A tray already running, no companion, a
     /// daemon that cannot find itself, nobody signed in and a refused start
     /// answer as before, and only a start that created the process is
     /// `Started` (#3824).
@@ -3180,8 +3180,8 @@ mod tray_start_tests {
         assert_eq!(ask(steps(None, &held, &ran)), Ok(EnsureOutcome::Started));
         assert_eq!(
             ran.argvs(),
-            vec![call(&["SystemService", DEST])],
-            "a SYSTEM service: into the console session, the companion beside it, no arguments"
+            vec![call(&["SystemService", DEST, "--for-prompt"])],
+            "a SYSTEM service: into the console session, the companion beside it, for a prompt"
         );
 
         let ran = Ran::default();
@@ -3190,8 +3190,8 @@ mod tray_start_tests {
         assert_eq!(ask(own), Ok(EnsureOutcome::Started));
         assert_eq!(
             ran.argvs(),
-            vec![call(&["UserSession", DEST])],
-            "the person's own daemon: a plain start in its own session"
+            vec![call(&["UserSession", DEST, "--for-prompt"])],
+            "the person's own daemon: a plain start in its own session, for a prompt"
         );
 
         let ran = Ran::default();

@@ -27,6 +27,9 @@ pub struct LaunchArgs {
     pub autostart: bool,
     /// `--first-run`: the daemon's one-shot post-install launch.
     pub first_run: bool,
+    /// `--for-prompt`: the daemon's start to show a consent question or a
+    /// banner (#3887).
+    pub for_prompt: bool,
 }
 
 /// Parse the companion's own arguments (`args[0]` is the program).
@@ -93,7 +96,11 @@ pub enum SecondLaunch {
 }
 
 /// Decide a forwarded launch.
-pub fn decide_second_instance(args: &LaunchArgs, first_run_done: bool) -> SecondLaunch {
+pub fn decide_second_instance(
+    args: &LaunchArgs,
+    first_run_done: bool,
+    _tour_held: bool,
+) -> SecondLaunch {
     if let Some(view) = &args.view {
         return SecondLaunch::ShowView(view.clone());
     }
@@ -109,6 +116,40 @@ pub fn decide_second_instance(args: &LaunchArgs, first_run_done: bool) -> Second
         return SecondLaunch::Ignore;
     }
     SecondLaunch::Show
+}
+
+/// RED stub (#3887).
+pub fn holds_the_tour(_action: &StartupAction, _first_run_done: bool) -> bool {
+    false
+}
+
+/// RED stub (#3887).
+pub fn hold_the_tour() {}
+
+/// RED stub (#3887).
+pub fn tour_held() -> bool {
+    false
+}
+
+/// RED stub (#3887).
+pub fn showing(_view: &str) {}
+
+/// RED stub (#3887).
+pub fn tray_open_view(_tour_held: bool, _first_run_done: bool) -> &'static str {
+    "overview"
+}
+
+/// RED stub (#3887).
+pub fn asks_the_daemon(_args: &LaunchArgs, _first_run_done: bool, _on_macos: bool) -> bool {
+    false
+}
+
+/// RED stub (#3887).
+pub fn something_to_show(
+    _pending: &[roomler_localapi::ConsentRequest],
+    _live: &[roomler_localapi::RcSessionInfo],
+) -> bool {
+    false
 }
 
 /// The first port in `start..start+span` that is not in `exclude` and that
@@ -577,11 +618,19 @@ mod tests {
         let welcome = || Show("welcome".to_string());
         // (args, first_run_done, opted_out) → action
         let table: Vec<(Vec<&str>, bool, bool, StartupAction)> = vec![
-            // A person who never finished the tour sees it, however launched.
+            // A person who never finished the tour sees it, however a person,
+            // a login or the installer launched it.
             (vec![], false, false, welcome()),
             (vec!["--autostart"], false, false, welcome()),
             (vec!["--autostart"], false, true, welcome()),
             (vec!["--first-run"], false, false, welcome()),
+            // #3887 — the daemon's start for a question or a banner stays in
+            // the tray, the tour done or not: the question has a deadline. It
+            // never leaves either, whatever the login-start switch says.
+            (vec!["--for-prompt"], false, false, Tray),
+            (vec!["--for-prompt"], false, true, Tray),
+            (vec!["--for-prompt"], true, false, Tray),
+            (vec!["--for-prompt"], true, true, Tray),
             // After the tour: login starts stay in the tray…
             (vec!["--autostart"], true, false, Tray),
             // …or leave at once for a person who switched login start off.
@@ -625,22 +674,208 @@ mod tests {
     fn a_forwarded_launch_never_pops_a_login_start() {
         use SecondLaunch::*;
         let a = |v: &[&str]| parse_launch_args(&args(v));
-        assert_eq!(decide_second_instance(&a(&["--autostart"]), true), Ignore);
-        assert_eq!(decide_second_instance(&a(&["--autostart"]), false), Ignore);
         assert_eq!(
-            decide_second_instance(&a(&["--view=devices"]), true),
+            decide_second_instance(&a(&["--autostart"]), true, false),
+            Ignore
+        );
+        assert_eq!(
+            decide_second_instance(&a(&["--autostart"]), false, false),
+            Ignore
+        );
+        assert_eq!(
+            decide_second_instance(&a(&["--view=devices"]), true, false),
             ShowView("devices".into())
         );
         assert_eq!(
-            decide_second_instance(&a(&["--first-run"]), false),
+            decide_second_instance(&a(&["--first-run"]), false, false),
             ShowView("welcome".into())
         );
         assert_eq!(
-            decide_second_instance(&a(&["--first-run"]), true),
+            decide_second_instance(&a(&["--first-run"]), true, false),
             ShowView("overview".into())
         );
         // A plain second launch (a double-click) shows the window where it is.
-        assert_eq!(decide_second_instance(&a(&[]), true), Show);
+        assert_eq!(decide_second_instance(&a(&[]), true, false), Show);
+        assert_eq!(decide_second_instance(&a(&[]), false, false), Show);
+    }
+
+    /// #3887 — `--for-prompt` is read by equality, as the other arguments
+    /// are: a longer or a different spelling is not it.
+    #[test]
+    fn a_start_for_a_prompt_is_read_by_equality() {
+        assert_eq!(
+            parse_launch_args(&args(&["--for-prompt"])),
+            LaunchArgs {
+                for_prompt: true,
+                ..LaunchArgs::default()
+            }
+        );
+        for near in [
+            "--for-prompt=1",
+            "--for-prompts",
+            "--for-promp",
+            "--FOR-PROMPT",
+            "-for-prompt",
+            "for-prompt",
+        ] {
+            assert_eq!(
+                parse_launch_args(&args(&[near])),
+                LaunchArgs::default(),
+                "{near}"
+            );
+        }
+        assert_eq!(
+            parse_launch_args(&["--for-prompt".to_string()]),
+            LaunchArgs::default(),
+            "the program name is never an argument"
+        );
+    }
+
+    /// #3887 — a start for a question holds the tour back, and the person's
+    /// own opening of the window shows it: a double-click (forwarded), the
+    /// tray's icon or its Device status. Once, and only while it is not done.
+    #[test]
+    fn a_persons_start_after_a_start_for_a_prompt_shows_the_tour() {
+        use SecondLaunch::*;
+        let a = |v: &[&str]| parse_launch_args(&args(v));
+        // The daemon starts the companion for a question; the tour is not done.
+        let first = decide_startup(&a(&["--for-prompt"]), false, false);
+        assert_eq!(first, StartupAction::Tray);
+        assert!(
+            holds_the_tour(&first, false),
+            "the tour waits for the person"
+        );
+        // The person double-clicks the app: the running companion gets it.
+        assert_eq!(
+            decide_second_instance(&a(&[]), false, true),
+            ShowView("welcome".into())
+        );
+        // …or clicks the tray icon, or Device status.
+        assert_eq!(tray_open_view(true, false), "welcome");
+        // The daemon's next start for a prompt, forwarded (it raced the
+        // running check): nothing pops. The question has its own window.
+        assert_eq!(
+            decide_second_instance(&a(&["--for-prompt"]), false, true),
+            Ignore
+        );
+        assert_eq!(
+            decide_second_instance(&a(&["--for-prompt"]), true, false),
+            Ignore
+        );
+        // A login start forwarded still pops nothing.
+        assert_eq!(
+            decide_second_instance(&a(&["--autostart"]), false, true),
+            Ignore
+        );
+        // Finished or skipped meanwhile: the window opens as it always did.
+        assert_eq!(decide_second_instance(&a(&[]), true, true), Show);
+        assert_eq!(tray_open_view(true, true), "overview");
+        // Nothing held: as before.
+        assert_eq!(tray_open_view(false, false), "overview");
+
+        // Only a start that kept a tour that is not done in the tray holds it:
+        // a person's start, a login start and the installer's show it at once.
+        for v in [vec![], vec!["--autostart"], vec!["--first-run"]] {
+            let action = decide_startup(&a(&v), false, true);
+            assert!(!holds_the_tour(&action, false), "{v:?} → {action:?}");
+        }
+        assert!(
+            !holds_the_tour(&decide_startup(&a(&["--for-prompt"]), true, false), true),
+            "a finished tour is not held"
+        );
+    }
+
+    /// #3887 — the tour held back is offered once: the opening that shows it
+    /// releases it, and another view leaves it held.
+    #[test]
+    fn the_held_tour_is_offered_once() {
+        hold_the_tour();
+        assert!(tour_held());
+        showing("overview");
+        assert!(tour_held(), "another view leaves it held");
+        showing("welcome");
+        assert!(!tour_held(), "shown once, held no more");
+    }
+
+    /// #3887 — on macOS, where the daemon's start (`launchctl kickstart`)
+    /// carries no argument, a start asks the daemon why it came: only a start
+    /// with no argument at all, for a person whose tour is not done. Never on
+    /// Windows or Linux, where the start says it.
+    #[test]
+    fn only_a_bare_start_on_a_mac_with_the_tour_not_done_asks_the_daemon() {
+        let a = |v: &[&str]| parse_launch_args(&args(v));
+        assert!(asks_the_daemon(&a(&[]), false, true));
+        assert!(
+            !asks_the_daemon(&a(&[]), true, true),
+            "a finished tour has nothing to hold back"
+        );
+        assert!(
+            !asks_the_daemon(&a(&[]), false, false),
+            "Windows and Linux never ask"
+        );
+        for v in [
+            ["--autostart"],
+            ["--first-run"],
+            ["--for-prompt"],
+            ["--view=devices"],
+        ] {
+            assert!(
+                !asks_the_daemon(&a(&v), false, true),
+                "{v:?}: an argument decides alone"
+            );
+        }
+        // An argument the companion does not know (an old Finder's `-psn_…`)
+        // is no argument.
+        assert!(asks_the_daemon(&a(&["-psn_0_12345"]), false, true));
+    }
+
+    /// #3887 — what the daemon answers on a Mac: a start for a prompt when
+    /// the companion has something to show right now, by the watcher's own
+    /// rules (a question the daemon does not show natively, a session the
+    /// banner is for).
+    #[test]
+    fn the_daemons_answer_is_what_the_companion_would_show() {
+        let asked = |surface: &str| roomler_localapi::ConsentRequest {
+            session_id: "0".repeat(24),
+            controller_name: "ana".into(),
+            permissions: "VIEW".into(),
+            timeout_secs: 30,
+            kind: "rc".into(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            surface: surface.into(),
+            org: String::new(),
+        };
+        let live = |asking| roomler_localapi::RcSessionInfo {
+            session_id: "1".repeat(24),
+            asking,
+            ..Default::default()
+        };
+        assert!(
+            !something_to_show(&[], &[]),
+            "nothing asked, nothing live: a person's or a login start"
+        );
+        assert!(something_to_show(&[asked("companion")], &[]));
+        assert!(
+            something_to_show(&[asked("")], &[]),
+            "an older daemon names no surface: the companion's question"
+        );
+        assert!(
+            !something_to_show(&[asked("native")], &[]),
+            "the daemon shows that one itself"
+        );
+        assert!(
+            something_to_show(&[asked("native"), asked("companion")], &[]),
+            "one question for the companion is enough"
+        );
+        assert!(
+            something_to_show(&[], &[live(false)]),
+            "a session that sees the screen: the banner"
+        );
+        assert!(
+            !something_to_show(&[], &[live(true)]),
+            "the desktop's own dialog still asks: no banner yet"
+        );
     }
 
     #[test]

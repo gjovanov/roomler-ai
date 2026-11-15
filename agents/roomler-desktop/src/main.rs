@@ -105,7 +105,7 @@ fn main() {
             // the Overview once it is done); `--view=<name>` routes there.
             let launch = first_run::parse_launch_args(&args);
             let done = roomler_node_core::desktop_state::load().first_run_done;
-            let view = match first_run::decide_second_instance(&launch, done) {
+            let view = match first_run::decide_second_instance(&launch, done, false) {
                 first_run::SecondLaunch::Ignore => return,
                 first_run::SecondLaunch::Show => None,
                 first_run::SecondLaunch::ShowView(view) => Some(view),
