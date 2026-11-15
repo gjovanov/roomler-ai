@@ -2810,8 +2810,8 @@ the job prints or checks a `sudo` line.
 The two halves are **two enrollments with two configuration files**, and that
 stays true with the FR-43 supervisor on (`macos_supervise_gui_worker = true`):
 the root daemon spawns the GUI worker as the console user, but the worker still
-runs on *that person's* enrollment and file (FR-43 keeps it through P2 as the
-fallback; P3, one enrollment, has not shipped). So a supervised Mac has:
+runs on *that person's* enrollment and file (FR-43's default; a one-row Mac, P3
+above, is the exception at the end of this section). So a supervised Mac has:
 
 | Half | Config file | Edited by | Owns |
 |---|---|---|---|
@@ -2832,6 +2832,29 @@ is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
 (`crates/localapi/src/lib.rs:5354`).
+
+On a **one-row Mac** (FR-43 P3a, above) there is no per-user half. What answers
+the console user's `roomler …` is the screen worker the root daemon starts for
+them, which holds no enrollment and runs on that person's own file, and since
+#3898 the note says so. After `roomler config set rc_clipboard on` it reads:
+
+```text
+note: this answer is from the screen worker of this one-row Mac.
+      Its root daemon (/var/run/roomler/roomler.sock) starts it for the person at the console.
+      What the worker lists and sets is your own file: your session settings.
+      The device's keys (the overlay, SSH, exec) are the root daemon's:
+      `sudo roomler config ls` / `sudo roomler config set <key> <value>`.
+```
+
+`config ls` ends the same way. `status` ends with "The device's own status is the
+root daemon's: `sudo roomler status`.", and `peers` and `why` with "The overlay is
+the root daemon's: `sudo roomler …` asks it directly." The worker cannot tell the
+CLI which layout this is, because its status is the device's. So the CLI asks the
+root daemon for its own status on the person socket above and reads
+`gui_worker.one_row` (`agents/roomler-cli/src/localclient.rs:80-93`; the words are
+in `agents/roomler-cli/src/other_daemon.rs`). When that daemon refuses, predates
+the field or takes 300 ms to answer, the note keeps the two-row words, and the
+command waits no longer than that. A two-row Mac prints them as before.
 
 The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
