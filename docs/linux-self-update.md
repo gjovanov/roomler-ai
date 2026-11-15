@@ -550,9 +550,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3445`) | after every check that installs nothing; at the start after an update (`:3333`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3384`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4013`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3262`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3450`) | after every check that installs nothing; at the start after an update (`:3338`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3389`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4018`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3267`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
