@@ -2559,20 +2559,28 @@ console user are skipped and every root row runs as on any install
   (`crates/agent-core/src/appdirs.rs:152`). The person's `live.roomler.roomler`
   is made by the person's own processes. On a Mac where an earlier root step made
   it, the screen worker's config write fails with an error that names the folder,
-  its owner and its mode (`agents/roomlerd/src/app.rs:3874`, `:3976`). No log
-  keeps that error. The macOS release build (`viewer-indicator-macos`,
+  its owner and its mode (`agents/roomlerd/src/app.rs:3874`, `:3976`). The
+  macOS release build (`viewer-indicator-macos`,
   `.github/workflows/release-agent.yml:2915`) runs the AppKit `main`
-  (`agents/roomlerd/src/app.rs:1293`), which logs the error through tracing
-  and exits 1 (`:1311-1313`). Nothing of it reaches the worker's stderr (the
-  supervisor sets only the worker's stdin,
-  `agents/roomlerd/src/macos_supervisor.rs:1376`), which is the root daemon's
-  `/var/log/roomler/daemon.log`
-  (`agents/roomlerd/packaging/macos/com.roomler.daemon.plist:74-75`). Tracing's
-  own file is in the folder the worker cannot write, and its console copy goes
-  to stdout, which that plist sends to `/dev/null` (`:72-73`). So the only
-  record of the cause is the supervisor's give-up line in the root daemon's own
-  log, in root's tree: `/var/root/Library/Application Support/live.roomler.roomler/logs`
-  (the table above).
+  (`agents/roomlerd/src/app.rs:1293`), which cannot return the error for std
+  to print: its daemon thread exits 1 itself (`:1321-1323`). That thread
+  writes the error on stderr as std prints it for the other `main`, `Error:`
+  and then every cause, before it logs it through tracing
+  (`agents/roomlerd/src/daemon_error.rs:20`, `:28`). A failed write is
+  ignored, so the exit always follows. Tracing's own file is in the folder the
+  worker cannot write, and its console copy goes to stdout, which the root
+  daemon's plist sends to `/dev/null`
+  (`agents/roomlerd/packaging/macos/com.roomler.daemon.plist:72-73`). The
+  supervisor sets only the worker's stdin
+  (`agents/roomlerd/src/macos_supervisor.rs:1376`), so the worker's stderr is
+  the one the root daemon hands to `launchctl asuser` and `sudo`, and that
+  plist sends the root daemon's stderr to `/var/log/roomler/daemon.log`
+  (`:74-75`). That the worker's line lands in that file is not established
+  yet: no Mac has been read with it, and the release lab's cell for #3802
+  reads it. The other record of the cause is the supervisor's give-up line in
+  the root daemon's own log, in root's tree:
+  `/var/root/Library/Application Support/live.roomler.roomler/logs` (the table
+  above).
   The give-up line names the same folder, owner and mode
   (`agents/roomlerd/src/macos_supervisor.rs:531`, read by `:1067` and `:1174`),
   and says in words that only an administrator of the Mac can move it aside:

@@ -1319,7 +1319,7 @@ pub fn main() -> Result<()> {
             shut_down_runtime(rt);
             purge_after_daemon();
             if let Err(e) = res {
-                tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
+                roomlerd::daemon_error::say(&e);
                 std::process::exit(1);
             }
             // FR-84 D3 — a requested restart leaves with its own code (launchd
@@ -3969,8 +3969,8 @@ async fn run_cmd(
     if unenrolled && !config_path.exists() {
         let name = roomlerd::machine::hostname().unwrap_or_default();
         let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
-        // #3802 — the reason names the folder and who owns it. On the macOS release build
-        // the AppKit `main` logs it through tracing and exits 1: nothing reaches stderr.
+        // #3802 — the reason names the folder and who owns it. The macOS release build's
+        // AppKit `main` writes it on stderr as std would (`daemon_error::say`), then exits 1.
         config::save(config_path, &blank).with_context(|| {
             format!(
                 "writing the person's config {}{}",
