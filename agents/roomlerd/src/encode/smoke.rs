@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomlerd encoder-smoke` (#3652): one cell, opened the way a session opens
 //! it, ten solid-colour frames encoded, and the run judged by the FR-16 L1
 //! bench's [`bench::verdict`]: what OPENED against what was ASKED. Only `ok`

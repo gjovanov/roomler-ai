@@ -855,7 +855,7 @@ the run too. Take the denominator from the server's device list, not from who an
 ### The plain smoke and the sweep judge by the same verdict
 
 `roomlerd encoder-smoke` without `--bench` is the bench's judgement on ONE cell (#3652). Its flags map
-to a cell (`encode::smoke::plan`, `agents/roomlerd/src/encode/smoke.rs:95`), the cell opens through the
+to a cell (`encode::smoke::plan`, `agents/roomlerd/src/encode/smoke.rs:97`), the cell opens through the
 same `SessionOpener`, and `verdict()` judges what opened. Only `ok` passes and every other verdict exits
 1. An encoder that opened and then failed to encode, or gave no keyframe, is `error`, and a request no
 build can serve is refused before anything opens. The FR-62 sweep (`--reconfigure-sweep`) opens through
@@ -886,7 +886,7 @@ encoder smoke FAILED: verdict=sw-only cell=rtp:h264 request="--encoder hardware 
 encoder smoke tried: media-foundation: Windows only; ffmpeg: not compiled into this build; openh264: in this build
 ```
 
-`tried` (`Tried`, `smoke.rs:215`) names each backend the request could reach and why one was not there
+`tried` (`Tried`, `smoke.rs:217`) names each backend the request could reach and why one was not there
 (`Reach`, `bench.rs:366`); each candidate that failed to open, with its error, as FFmpeg's cascade and
 the RTP track's Media Foundation note it (`media_plan::OpenTrail`, only names this build carries); and
 each FFmpeg cell the denylist kept out. Tests assert on that value, not on its prose. The PASSED line
