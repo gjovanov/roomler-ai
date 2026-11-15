@@ -1347,15 +1347,21 @@ mod sshd {
 
             // sftp-server writes diagnostics here. They belong in OUR log, not
             // on the client's channel: the SFTP stream is a binary protocol
-            // and injecting text into it corrupts the transfer.
+            // and injecting text into it corrupts the transfer. One escaped
+            // line when it closes its stderr, 4 KiB at most (#3890).
             if let Some(mut stderr) = stderr {
                 let peer = self.peer;
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
-                    let mut s = String::new();
-                    if stderr.read_to_string(&mut s).await.is_ok() && !s.trim().is_empty() {
-                        warn!(%peer, msg = %s.trim(), "ssh: sftp-server stderr");
+                    let mut said = SftpStderr::default();
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match stderr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => said.push(&buf[..n]),
+                        }
                     }
+                    said.log(peer);
                 });
             }
 
@@ -1371,7 +1377,8 @@ mod sshd {
         /// the client's bytes feed its stdin through a bounded queue, and the
         /// client's EOF (the queue's last sender dropping) ends its input. Its
         /// stdout reaches the channel raw, never redacted, because SFTP is a
-        /// binary protocol. Its stderr goes to this log, never the channel.
+        /// binary protocol. Its stderr goes to this log, never the channel, as
+        /// one escaped line when it ends ([`SftpStderr`], #3890).
         /// When it exits, the client gets the exit status (`scp`'s verdict on
         /// the whole transfer), then EOF, then close. A client that has gone
         /// kills the process tree: the channel closed or the session ended
@@ -1401,6 +1408,7 @@ mod sshd {
             let pump_handle = handle.clone();
             let pump_abort = abort.clone();
             let pump = tokio::spawn(async move {
+                let mut said = SftpStderr::default();
                 while let Some(chunk) = raw_rx.recv().await {
                     match chunk.stream {
                         crate::exec::OutStream::Stdout => {
@@ -1409,14 +1417,10 @@ mod sshd {
                                 break;
                             }
                         }
-                        crate::exec::OutStream::Stderr => {
-                            let s = String::from_utf8_lossy(&chunk.bytes);
-                            if !s.trim().is_empty() {
-                                warn!(%peer, msg = %s.trim(), "ssh: sftp-server stderr");
-                            }
-                        }
+                        crate::exec::OutStream::Stderr => said.push(&chunk.bytes),
                     }
                 }
+                said.log(peer);
             });
 
             let program = program.to_string_lossy().into_owned();
@@ -2154,6 +2158,45 @@ mod sshd {
         /// connection on its own thread, so no other test's server sees it.
         pub(super) static STAND_IN_SFTP_SERVER: std::cell::RefCell<Option<std::path::PathBuf>> =
             const { std::cell::RefCell::new(None) };
+    }
+
+    /// #3890 — the most of `sftp-server`'s stderr the daemon's log keeps.
+    const SFTP_STDERR_KEPT: usize = 4096;
+
+    /// #3890 — what `sftp-server` wrote to its stderr, kept for ONE log line:
+    /// its first [`SFTP_STDERR_KEPT`] bytes and a count of the bytes after
+    /// them, so a child that writes a lot grows neither the daemon's memory
+    /// nor one line of its log. Both spawns feed it: the `tokio::process` one
+    /// from the pipe, the Windows `console_user` one chunk by chunk.
+    #[derive(Default)]
+    struct SftpStderr {
+        kept: Vec<u8>,
+        cut: usize,
+    }
+
+    impl SftpStderr {
+        fn push(&mut self, bytes: &[u8]) {
+            let take = SFTP_STDERR_KEPT
+                .saturating_sub(self.kept.len())
+                .min(bytes.len());
+            self.kept.extend_from_slice(&bytes[..take]);
+            self.cut += bytes.len() - take;
+        }
+
+        /// One `WARN` line once the child has closed its stderr; none for a
+        /// stderr of whitespace alone. The text is ONE field, escaped (`?`),
+        /// like the text the server takes from the wire (#3815): a line
+        /// break or a control character the child wrote, or a path it quotes
+        /// from the client, stays inside this line.
+        fn log(&self, peer: std::net::SocketAddr) {
+            let text = String::from_utf8_lossy(&self.kept);
+            let msg = text.trim();
+            if self.cut > 0 {
+                warn!(%peer, ?msg, cut_bytes = self.cut, "ssh: sftp-server stderr");
+            } else if !msg.is_empty() {
+                warn!(%peer, ?msg, "ssh: sftp-server stderr");
+            }
+        }
     }
 
     /// FR-97 P4b's kill switch: `ROOMLERD_SFTP_AS_USER=0` puts back the

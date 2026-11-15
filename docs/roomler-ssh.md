@@ -1555,7 +1555,13 @@ the signed-in user, and still work.
 ⚠️ **No `sftp-server` binary ⇒ refuse**, naming what to install. The probe
 covers Debian/RHEL/Arch/macOS/Windows layouts; `ROOMLER_SFTP_SERVER` overrides
 for an unusual host. `sftp-server`'s stderr goes to the daemon log, never the
-channel — SFTP is binary and injected text corrupts a transfer.
+channel — SFTP is binary and injected text corrupts a transfer. It is one
+`ssh: sftp-server stderr` line a session, written when the child closes its
+stderr, with the text as ONE escaped field, `msg="…"`: its first 4 KiB, and
+`cut_bytes` counting the rest (#3890, `SftpStderr`,
+`agents/roomlerd/src/ssh.rs:2172`). A line break or a control character in
+it, or in a path it quotes from the client, stays inside that line. Up to 0.4.222
+the text was logged as it came, and on Windows one line per chunk.
 
 Field-proven 2026-08-22, buildhost → fleet-host-1: an `sftp put` landed
 `-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
