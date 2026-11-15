@@ -15,9 +15,12 @@
 //! restart it if it was running.
 //!
 //! Version tracking is a sidecar marker (`roomler-desktop.exe.version`)
-//! written on every successful swap — no PE version parsing. A
-//! wizard-placed EXE with no marker counts as stale and gets swapped
-//! once, after which the marker tracks.
+//! written on every successful swap. When it does not name the daemon's
+//! version (missing, unreadable, or one a swap could not write), the EXE's
+//! own version resource decides (#3850): an EXE already at the daemon's
+//! version is not swapped again, and its marker is written again. So a
+//! wizard-placed EXE with no marker is swapped only when it is another
+//! version.
 //!
 //! Ownership: ONE refresher per install (#1686). Under a running SCM service
 //! the service host refreshes at its own start, and the worker does not —
@@ -180,8 +183,11 @@ pub(crate) fn known_version(
     marker: Option<&str>,
     exe_version: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    let _ = (own, exe_version);
-    marker.and_then(sanitize_version)
+    let recorded = marker.and_then(sanitize_version);
+    if recorded.as_deref() == Some(own) {
+        return recorded;
+    }
+    exe_version().or(recorded)
 }
 
 /// #3850 — what a refresh pass finds beside the daemon, before any download.
@@ -214,15 +220,26 @@ pub(crate) fn installed_state(
     exe_version: impl FnOnce() -> Option<String>,
 ) -> Installed {
     let recorded = marker.and_then(sanitize_version);
-    if present && recorded.as_deref() == Some(own) {
+    if !present {
+        return Installed::Stale {
+            recorded,
+            its_version: None,
+        };
+    }
+    if recorded.as_deref() == Some(own) {
         return Installed::Current {
             by_its_version: false,
         };
     }
-    let _ = exe_version;
+    let its_version = exe_version();
+    if its_version.as_deref() == Some(own) {
+        return Installed::Current {
+            by_its_version: true,
+        };
+    }
     Installed::Stale {
         recorded,
-        its_version: None,
+        its_version,
     }
 }
 
@@ -259,9 +276,16 @@ impl MarkerWrites {
     /// The line for a write that came to `wrote`; `None` for one that worked,
     /// as the last one did.
     pub(crate) fn wrote(&self, wrote: std::result::Result<(), String>) -> Option<MarkerLine> {
+        use std::sync::atomic::Ordering::SeqCst;
         match wrote {
-            Ok(()) => None,
-            Err(error) => Some(MarkerLine::NotWritten { error, first: true }),
+            Ok(()) => self
+                .failing
+                .swap(false, SeqCst)
+                .then_some(MarkerLine::WrittenAgain),
+            Err(error) => Some(MarkerLine::NotWritten {
+                error,
+                first: !self.failing.swap(true, SeqCst),
+            }),
         }
     }
 }
@@ -269,6 +293,144 @@ impl MarkerWrites {
 /// This process's [`MarkerWrites`].
 #[cfg(target_os = "windows")]
 static MARKER_WRITES: MarkerWrites = MarkerWrites::new();
+
+/// #3850 — the version a `VS_VERSIONINFO` resource states: its
+/// `ProductVersion` string, else its `FileVersion`, from the first string
+/// table that has one, up to its first space and bounded as a marker is
+/// ([`sanitize_version`]). Every offset and length is checked against the
+/// block it sits in, and anything malformed is `None`: not known, which the
+/// refresh reads as it always did, stale, so it swaps. Never a guess: a
+/// version is read only from a resource whose every block it walks parsed.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn version_resource_version(res: &[u8]) -> Option<String> {
+    let root = ver_block(res, 0, res.len())?;
+    if root.key != "VS_VERSION_INFO" {
+        return None;
+    }
+    let (mut product, mut file) = (None, None);
+    for info in ver_children(res, &root)? {
+        if info.key != "StringFileInfo" {
+            continue;
+        }
+        for table in ver_children(res, &info)? {
+            for string in ver_children(res, &table)? {
+                let slot = match string.key.as_str() {
+                    "ProductVersion" => &mut product,
+                    "FileVersion" => &mut file,
+                    _ => continue,
+                };
+                if slot.is_none() {
+                    *slot = ver_text(res.get(string.value.clone())?);
+                }
+            }
+        }
+    }
+    product.or(file).as_deref().and_then(sanitize_version)
+}
+
+/// #3850 — one block of a version resource: its key, and the byte ranges of
+/// its value and of its children, each inside the block.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug)]
+struct VerBlock {
+    key: String,
+    value: std::ops::Range<usize>,
+    children: std::ops::Range<usize>,
+    /// Where the next block may start: past this one, on a 32-bit boundary.
+    next: usize,
+}
+
+/// #3850 — the block at `at`, which must end by `end`: its length, the
+/// length of its value (in words for text, in bytes for binary), its type,
+/// its key up to a terminator inside the block, then its value and its
+/// children, each on a 32-bit boundary. `None` for anything that does not
+/// fit where it must.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn ver_block(res: &[u8], at: usize, end: usize) -> Option<VerBlock> {
+    let word = |at: usize| -> Option<usize> {
+        let bytes = res.get(at..at.checked_add(2)?)?;
+        Some(usize::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+    };
+    let len = word(at)?;
+    let block_end = at.checked_add(len)?;
+    // Its three header words and a key's terminator, at least.
+    if len < 8 || block_end > end || block_end > res.len() {
+        return None;
+    }
+    let value_len = word(at.checked_add(2)?)?;
+    let text = match word(at.checked_add(4)?)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let mut units = Vec::new();
+    let mut p = at.checked_add(6)?;
+    loop {
+        if p.checked_add(2)? > block_end {
+            return None;
+        }
+        let unit = word(p)?;
+        p += 2;
+        if unit == 0 {
+            break;
+        }
+        units.push(u16::try_from(unit).ok()?);
+    }
+    let key = String::from_utf16(&units).ok()?;
+    let value_start = align4(p)?.min(block_end);
+    let value_bytes = if text {
+        value_len.checked_mul(2)?
+    } else {
+        value_len
+    };
+    let value_end = value_start.checked_add(value_bytes)?;
+    if value_end > block_end {
+        return None;
+    }
+    Some(VerBlock {
+        key,
+        value: value_start..value_end,
+        children: align4(value_end)?.min(block_end)..block_end,
+        next: align4(block_end)?,
+    })
+}
+
+/// #3850 — the blocks that make up `parent`'s children, every one of which
+/// must parse.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn ver_children(res: &[u8], parent: &VerBlock) -> Option<Vec<VerBlock>> {
+    let mut children = Vec::new();
+    let mut at = parent.children.start;
+    while at < parent.children.end {
+        let child = ver_block(res, at, parent.children.end)?;
+        at = child.next;
+        children.push(child);
+    }
+    Some(children)
+}
+
+/// The next 32-bit boundary at or after `at`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn align4(at: usize) -> Option<usize> {
+    Some(at.checked_add(3)? & !3)
+}
+
+/// #3850 — a string value: UTF-16 up to its terminator, up to its first
+/// space (`10.0.26100.1 (WinBuild…)` states `10.0.26100.1`); `None` when it
+/// is empty or not UTF-16.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn ver_text(value: &[u8]) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = value
+        .chunks_exact(2)
+        .map(|w| u16::from_le_bytes([w[0], w[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    let text = String::from_utf16(&units).ok()?;
+    text.split_whitespace().next().map(str::to_string)
+}
 
 /// #3781 — the retry loop's memory: how many refreshes it has made in a row
 /// while the companion read too old to connect, and (#3824) while a tray
@@ -567,11 +729,79 @@ async fn sibling_version() -> Option<String> {
     tokio::time::timeout(LOOK_WAIT, read).await.ok()?.ok()?
 }
 
-/// #3850 — the version the EXE at `exe` states in its own version resource.
+/// #3850 — the version the EXE at `exe` states in its own version resource
+/// ([`version_resource_version`]): the release's companion carries the
+/// workspace version there, as its marker does. The file is mapped as data
+/// and as an image resource only, so nothing in it runs and its imports are
+/// not resolved, and it is freed on every path out. Through kernel32 alone,
+/// which the daemon already imports: `GetFileVersionInfoW` would add
+/// `version.dll` to what the SYSTEM service loads. `None` when it states
+/// none or cannot be read.
 #[cfg(target_os = "windows")]
 fn exe_version(exe: &std::path::Path) -> Option<String> {
-    let _ = exe;
-    None
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+    use windows_sys::Win32::System::LibraryLoader::{
+        FindResourceW, LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE, LoadLibraryExW,
+        LoadResource, LockResource, SizeofResource,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::RT_VERSION;
+
+    /// The mapped file, freed when it goes out of scope, on every path.
+    struct AsData(HMODULE);
+    impl Drop for AsData {
+        fn drop(&mut self) {
+            // SAFETY: a module LoadLibraryExW returned, freed exactly once.
+            unsafe {
+                FreeLibrary(self.0);
+            }
+        }
+    }
+
+    let wide: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call. As data and as
+    // an image resource only: nothing in the file runs.
+    let module = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+        )
+    };
+    if module.is_null() {
+        return None;
+    }
+    let module = AsData(module);
+    // VS_VERSION_INFO is resource 1 of type RT_VERSION.
+    // SAFETY: `module` is live, and the name is an integer resource id.
+    let found = unsafe { FindResourceW(module.0, std::ptr::without_provenance(1), RT_VERSION) };
+    if found.is_null() {
+        return None;
+    }
+    // SAFETY: `found` is a resource of `module`, which is live.
+    let (size, loaded) = unsafe {
+        (
+            SizeofResource(module.0, found),
+            LoadResource(module.0, found),
+        )
+    };
+    if loaded.is_null() || size == 0 {
+        return None;
+    }
+    // SAFETY: a resource LoadResource returned; LockResource gives its address.
+    let data = unsafe { LockResource(loaded) }.cast::<u8>();
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the resource's `size` bytes at `data`, mapped while `module`
+    // lives; the slice is read, and what it states copied out, before
+    // `module` is freed at the end of this function.
+    let res = unsafe { std::slice::from_raw_parts(data, size as usize) };
+    version_resource_version(res)
 }
 
 /// #3850 — what a refresh pass finds beside the daemon ([`installed_state`]),
@@ -3483,7 +3713,7 @@ impl TrayRestart {
     /// Did it leave a tray where one was stopped, or nobody to leave one for?
     /// Anything else is a tray lost ([`TrayLost`]).
     fn settled(&self) -> bool {
-        matches!(self.start, TrayStart::Started { .. })
+        matches!(self.start, TrayStart::Started { .. } | TrayStart::SignedOut)
     }
 
     /// What came of it, for a log line, naming the session.
@@ -3650,11 +3880,19 @@ fn start_stopped<O: SwapOps>(
 /// starts one, in its own session, as before. None stopped, none started.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn restart_plan(respawn: RespawnContext, stopped: &[RunningTray]) -> Vec<Option<u32>> {
-    let _ = respawn;
     if stopped.is_empty() {
         return Vec::new();
     }
-    vec![None]
+    match respawn {
+        RespawnContext::UserSession => vec![None],
+        RespawnContext::SystemService => {
+            let mut at: Vec<Option<u32>> = stopped.iter().map(|tray| tray.session).collect();
+            // The sessions in order, then a session that could not be read.
+            at.sort_by_key(|session| (session.is_none(), *session));
+            at.dedup();
+            at
+        }
+    }
 }
 
 /// #3824 — what a start of the tray came to. The refresh's line and the
@@ -3873,7 +4111,7 @@ pub(crate) fn restore_lost_tray(
     }
     let mut lines = Vec::new();
     let mut down = Vec::new();
-    for at in [None] {
+    for at in lost.lost_at() {
         match start(at) {
             LostTrayStart::Running => {
                 lost.clear(at);
@@ -4030,8 +4268,7 @@ impl SwapOps for FsSwap {
         self.respawn
     }
     fn start(&mut self, at: Option<u32>) -> TrayStart {
-        let _ = at;
-        start_desktop(self.respawn, &self.dest, &[])
+        start_again(self.respawn, &self.dest, at, &[])
     }
     fn remove_old(&mut self) {
         // The tray just stopped may take a moment to release its image: a few
@@ -4151,6 +4388,103 @@ fn start_desktop(respawn: RespawnContext, dest: &std::path::Path, args: &[&str])
     }
 }
 
+/// #3844 — the tray's start in session `session`, with that session's own
+/// person's token: what a service starts for a tray it stopped there. Nobody
+/// signed in there any more (no token, or the session is gone) is
+/// `SignedOut`, and nothing is created.
+#[cfg(target_os = "windows")]
+fn start_desktop_in_session(session: u32, dest: &std::path::Path, args: &[&str]) -> TrayStart {
+    use crate::win_service::supervisor;
+    match supervisor::query_session_user_token(session) {
+        Ok(Some(token)) => {
+            // SAFETY: `token` is a live user token from WTSQueryUserToken,
+            // held for the duration of the call.
+            match unsafe { supervisor::spawn_in_session(token.raw(), dest, args) } {
+                Ok(child) => TrayStart::Started {
+                    pid: child.pid,
+                    session: Some(session),
+                },
+                Err(e) => TrayStart::Failed(format!("{e:#}")),
+            }
+        }
+        Ok(None) => TrayStart::SignedOut,
+        Err(e) => TrayStart::Failed(format!("{e:#}")),
+    }
+}
+
+/// #3844 — a start at `at` ([`TrayRestart::at`]): a service's in that
+/// session, else where the start has always gone ([`start_desktop`]).
+#[cfg(target_os = "windows")]
+fn start_tray_at(
+    respawn: RespawnContext,
+    dest: &std::path::Path,
+    at: Option<u32>,
+    args: &[&str],
+) -> TrayStart {
+    match (respawn, at) {
+        (RespawnContext::SystemService, Some(session)) => {
+            start_desktop_in_session(session, dest, args)
+        }
+        _ => start_desktop(respawn, dest, args),
+    }
+}
+
+/// #3844 — how long the refresh waits for one start of the tray. A start
+/// that works (`WTSQueryUserToken`, `CreateEnvironmentBlock`,
+/// `CreateProcessAsUserW`) takes tens to a few hundred milliseconds, more with
+/// endpoint protection looking at it; no caller waits on the refresh, so the
+/// wait is generous, and a start that hangs past it holds one thread for its
+/// session while the next session's start goes ahead.
+#[cfg(target_os = "windows")]
+const RESPAWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #3844 — the refresh's starts of the tray in flight, at most one per place
+/// ([`TrayRestart::at`]), each on a thread named `tray-respawn`
+/// (`one_in_flight`'s rules).
+#[cfg(target_os = "windows")]
+static RESPAWNS: crate::one_in_flight::OneInFlightPerKey<Option<u32>, TrayStart> =
+    crate::one_in_flight::OneInFlightPerKey::new("tray-respawn");
+
+/// #3844 — the tray's start at `at` ([`start_tray_at`]) for the refresh, on
+/// the start in flight's thread, [`RESPAWN_WAIT`] at most ([`start_within`]).
+#[cfg(target_os = "windows")]
+fn start_again(
+    respawn: RespawnContext,
+    dest: &std::path::Path,
+    at: Option<u32>,
+    args: &'static [&'static str],
+) -> TrayStart {
+    let dest = dest.to_path_buf();
+    start_within(&RESPAWNS, at, RESPAWN_WAIT, move || {
+        start_tray_at(respawn, &dest, at, args)
+    })
+}
+
+/// #3844 — `start`, on the thread of the one start in flight for `at` in
+/// `starts`, waited for `wait` at most: what came of it, or a failure saying
+/// it gave no answer in time. That start goes on on its own thread, and its
+/// late answer is nobody's; while it hangs, a later start for the same place
+/// waits on it and starts none of its own, so a hung start holds one thread,
+/// however many refreshes ask. Never on the async worker: the swap and the
+/// lost-tray retry call it from the blocking pool.
+#[cfg(any(target_os = "windows", test))]
+fn start_within(
+    starts: &'static crate::one_in_flight::OneInFlightPerKey<Option<u32>, TrayStart>,
+    at: Option<u32>,
+    wait: std::time::Duration,
+    start: impl FnOnce() -> TrayStart + Send + 'static,
+) -> TrayStart {
+    use crate::one_in_flight::Asked;
+    match starts.ask_blocking(at, wait, start) {
+        Asked::Answer(started) => started,
+        Asked::Failed(why) => TrayStart::Failed(format!("the start ended with no answer: {why}")),
+        Asked::OutOfTime => TrayStart::Failed(format!(
+            "the start gave no answer within {wait:?} (`WTSQueryUserToken`, \
+             `CreateEnvironmentBlock` or `CreateProcessAsUserW`); it goes on on its own thread"
+        )),
+    }
+}
+
 /// #3824 — start a tray this process's refresh stopped and could not start
 /// again: where someone is signed in, none runs, and the tray is set to start
 /// at sign-in. With `--autostart`, as the sign-in start does, so a person who
@@ -4162,9 +4496,20 @@ fn start_lost_tray(
     at: Option<u32>,
 ) -> LostTrayStart {
     use roomler_node_core::companion_autostart::AUTOSTART_ARG;
-    let _ = at;
-    let Some(session) = signed_in_session(respawn) else {
-        return LostTrayStart::Tried(TrayStart::NobodySignedIn);
+    let session = match (respawn, at) {
+        // #3844 — the session it was lost in, while its person is still
+        // signed in there; never the console's, whose person may be another.
+        (RespawnContext::SystemService, Some(session)) => {
+            match crate::win_service::supervisor::query_session_user_token(session) {
+                Ok(Some(_)) => session,
+                Ok(None) => return LostTrayStart::Tried(TrayStart::SignedOut),
+                Err(e) => return LostTrayStart::Tried(TrayStart::Failed(format!("{e:#}"))),
+            }
+        }
+        _ => match signed_in_session(respawn) {
+            Some(session) => session,
+            None => return LostTrayStart::Tried(TrayStart::NobodySignedIn),
+        },
     };
     if desktop_running_in_session(session) {
         return LostTrayStart::Running;
@@ -4172,7 +4517,7 @@ fn start_lost_tray(
     if !set_to_start_at_sign_in(dest) {
         return LostTrayStart::NotSetToStart;
     }
-    LostTrayStart::Tried(start_desktop(respawn, dest, &[AUTOSTART_ARG]))
+    LostTrayStart::Tried(start_again(respawn, dest, at, &[AUTOSTART_ARG]))
 }
 
 /// The session a start would go to, when someone is signed in there: the
@@ -5216,6 +5561,353 @@ mod swap_tests {
             ]
         );
         assert!(!lost.is_set());
+    }
+}
+
+/// #3850 — the companion EXE's own version, read from its `VS_VERSIONINFO`
+/// resource: what a good one states, and that a truncated, garbage or lying
+/// one states nothing, never a panic and never a guess. On every OS; the read
+/// of a real EXE on Windows.
+#[cfg(test)]
+mod version_resource_tests {
+    use super::version_resource_version;
+
+    enum Value<'a> {
+        Text(&'a str),
+        Bytes(&'a [u8]),
+        None,
+    }
+
+    /// A block as rc.exe lays one out: its three header words, its key, its
+    /// value and its children, each on a 32-bit boundary, its length counting
+    /// up to its last byte.
+    fn block(key: &str, value: Value, children: &[Vec<u8>]) -> Vec<u8> {
+        fn pad(b: &mut Vec<u8>) {
+            while !b.len().is_multiple_of(4) {
+                b.push(0);
+            }
+        }
+        let mut b = vec![0u8; 6];
+        for unit in key.encode_utf16().chain([0]) {
+            b.extend(unit.to_le_bytes());
+        }
+        pad(&mut b);
+        let (value_len, kind) = match value {
+            Value::Text(text) => {
+                let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                for unit in &units {
+                    b.extend(unit.to_le_bytes());
+                }
+                (units.len(), 1u16)
+            }
+            Value::Bytes(bytes) => {
+                b.extend_from_slice(bytes);
+                (bytes.len(), 0)
+            }
+            Value::None => (0, 1),
+        };
+        for child in children {
+            pad(&mut b);
+            b.extend(child);
+        }
+        let len = u16::try_from(b.len()).expect("a test block fits a word");
+        b[0..2].copy_from_slice(&len.to_le_bytes());
+        b[2..4].copy_from_slice(&(value_len as u16).to_le_bytes());
+        b[4..6].copy_from_slice(&kind.to_le_bytes());
+        b
+    }
+
+    /// A resource with `strings` in its one string table, as the release's
+    /// companion carries one: `VS_FIXEDFILEINFO`, then `StringFileInfo` and
+    /// `VarFileInfo`.
+    fn resource(strings: &[(&str, &str)]) -> Vec<u8> {
+        let mut fixed = 0xFEEF_04BDu32.to_le_bytes().to_vec();
+        fixed.resize(52, 0);
+        let strings: Vec<Vec<u8>> = strings
+            .iter()
+            .map(|(key, text)| block(key, Value::Text(text), &[]))
+            .collect();
+        block(
+            "VS_VERSION_INFO",
+            Value::Bytes(&fixed),
+            &[
+                block(
+                    "StringFileInfo",
+                    Value::None,
+                    &[block("040904b0", Value::None, &strings)],
+                ),
+                block(
+                    "VarFileInfo",
+                    Value::None,
+                    &[block(
+                        "Translation",
+                        Value::Bytes(&[0x09, 0x04, 0xb0, 0x04]),
+                        &[],
+                    )],
+                ),
+            ],
+        )
+    }
+
+    /// Where the block keyed `key` starts in `res`.
+    fn block_at(res: &[u8], key: &str) -> usize {
+        let wanted: Vec<u8> = key.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        res.windows(wanted.len())
+            .position(|w| w == wanted.as_slice())
+            .expect("the key is in the resource")
+            - 6
+    }
+
+    fn set_word(res: &mut [u8], at: usize, word: u16) {
+        res[at..at + 2].copy_from_slice(&word.to_le_bytes());
+    }
+
+    /// The release's companion states its version in both strings
+    /// (`0.4.221` on the installed 0.4.221 tray); `ProductVersion` is read
+    /// first, `FileVersion` when it is missing.
+    #[test]
+    fn a_resource_states_its_product_version_else_its_file_version() {
+        let good = resource(&[
+            ("CompanyName", "G ROX LTD"),
+            ("FileDescription", "Roomler"),
+            ("FileVersion", "0.4.223"),
+            ("ProductName", "Roomler"),
+            ("ProductVersion", "0.4.223"),
+        ]);
+        assert_eq!(version_resource_version(&good).as_deref(), Some("0.4.223"));
+        assert_eq!(
+            version_resource_version(&resource(&[("FileVersion", "0.4.223")])).as_deref(),
+            Some("0.4.223")
+        );
+        assert_eq!(
+            version_resource_version(&resource(&[
+                ("FileVersion", "0.4.222"),
+                ("ProductVersion", "0.4.223")
+            ]))
+            .as_deref(),
+            Some("0.4.223")
+        );
+        assert_eq!(
+            version_resource_version(&resource(&[(
+                "FileVersion",
+                "10.0.26100.1 (WinBuild.160101.0800)"
+            )]))
+            .as_deref(),
+            Some("10.0.26100.1")
+        );
+        assert_eq!(
+            version_resource_version(&resource(&[("ProductName", "Roomler")])),
+            None,
+            "no version stated"
+        );
+        assert_eq!(
+            version_resource_version(&resource(&[("ProductVersion", "  ")])),
+            None
+        );
+    }
+
+    /// Anything malformed is not known: a resource cut anywhere, garbage, a
+    /// length that overruns its parent or the resource, one too short for a
+    /// header, a key with no terminator inside its block, a value longer than
+    /// its block, an unknown type, a root that is not `VS_VERSION_INFO`.
+    /// None of it panics, and no byte flipped anywhere does.
+    #[test]
+    fn a_truncated_garbage_or_lying_resource_states_no_version() {
+        let good = resource(&[("FileVersion", "0.4.223"), ("ProductVersion", "0.4.223")]);
+        assert_eq!(
+            version_resource_version(&good).as_deref(),
+            Some("0.4.223"),
+            "the control"
+        );
+        for cut in 0..good.len() {
+            assert_eq!(version_resource_version(&good[..cut]), None, "cut at {cut}");
+        }
+
+        let mut seed = 0x2545_F491u32;
+        let noise: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect();
+        for junk in [&[][..], &[0u8; 64][..], &[0xFFu8; 64][..], &noise[..]] {
+            assert_eq!(version_resource_version(junk), None);
+        }
+
+        let lying = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut res = good.clone();
+            edit(&mut res);
+            version_resource_version(&res)
+        };
+        let info = block_at(&good, "StringFileInfo");
+        let product = block_at(&good, "ProductVersion");
+        assert_eq!(
+            lying(&|r| set_word(r, info, 0xFFF0)),
+            None,
+            "past its parent"
+        );
+        assert_eq!(
+            lying(&|r| set_word(r, 0, 0xFFF0)),
+            None,
+            "past the resource"
+        );
+        assert_eq!(
+            lying(&|r| set_word(r, info, 4)),
+            None,
+            "shorter than a header"
+        );
+        assert_eq!(
+            lying(&|r| set_word(r, product, 6 + 8)),
+            None,
+            "its key cut by its own length"
+        );
+        assert_eq!(
+            lying(&|r| set_word(r, product + 2, 0x7FFF)),
+            None,
+            "a value longer than its block"
+        );
+        assert_eq!(lying(&|r| set_word(r, product + 4, 7)), None, "a type of 7");
+        assert_eq!(
+            lying(&|r| r[6] = b'X'),
+            None,
+            "a root that is not VS_VERSION_INFO"
+        );
+
+        for at in 0..good.len() {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                let mut res = good.clone();
+                res[at] ^= flip;
+                if let Some(version) = version_resource_version(&res) {
+                    assert!(version.len() <= 32, "bounded: {version:?}");
+                }
+            }
+        }
+    }
+
+    /// The read of a real EXE: a system program states its version, a file
+    /// that is no program states none, and the file is not held afterwards
+    /// (a mapped image refuses a delete, so a delete that works proves the
+    /// read freed it).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_real_exe_states_its_version_and_is_not_held_after() {
+        let system32 = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()),
+        )
+        .join("System32");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let copy = dir.path().join("roomler-desktop.exe");
+        std::fs::copy(system32.join("cmd.exe"), &copy).expect("copy cmd.exe");
+        let stated = super::exe_version(&copy).expect("cmd.exe states its version");
+        assert!(stated.starts_with("10.0."), "{stated}");
+        std::fs::remove_file(&copy).expect("the read freed the file");
+
+        let text = dir.path().join("roomler-desktop.exe");
+        std::fs::write(&text, "not a program").expect("write");
+        assert_eq!(super::exe_version(&text), None);
+        assert_eq!(super::exe_version(&dir.path().join("missing.exe")), None);
+    }
+}
+
+/// #3844 — each start of the tray again is bounded: a start that hangs in
+/// one session fails within its wait, saying so, and holds that session
+/// alone. The next session's start goes ahead at once, and another ask for
+/// the held session starts none of its own until the held one ends.
+#[cfg(test)]
+mod start_within_tests {
+    use super::{TrayStart, start_within};
+    use crate::one_in_flight::OneInFlightPerKey;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_millis(300);
+    /// What a wait may take past itself on a busy runner.
+    const SLACK: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn a_start_that_hangs_holds_its_session_alone() {
+        let starts: &'static OneInFlightPerKey<Option<u32>, TrayStart> =
+            Box::leak(Box::new(OneInFlightPerKey::new("tray-respawn")));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let began = Arc::new(AtomicUsize::new(0));
+        let held = |gate: &Arc<(Mutex<bool>, Condvar)>, began: &Arc<AtomicUsize>| {
+            let (gate, began) = (gate.clone(), began.clone());
+            move || {
+                began.fetch_add(1, SeqCst);
+                let (open, opened) = &*gate;
+                let _open = opened
+                    .wait_while(open.lock().unwrap(), |open| !*open)
+                    .unwrap();
+                TrayStart::Started {
+                    pid: 1,
+                    session: Some(1),
+                }
+            }
+        };
+        /// Opens the gate however the test ends.
+        struct Open(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Open {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        let open = Open(gate.clone());
+
+        let asked = Instant::now();
+        let first = start_within(starts, Some(1), WAIT, held(&gate, &began));
+        let waited = asked.elapsed();
+        assert!(
+            matches!(&first, TrayStart::Failed(why) if why.contains("no answer within 300ms")),
+            "{first:?}"
+        );
+        assert!((WAIT..WAIT + SLACK).contains(&waited), "{waited:?}");
+
+        let asked = Instant::now();
+        let other = start_within(starts, Some(3), WAIT, || TrayStart::Started {
+            pid: 3,
+            session: Some(3),
+        });
+        assert_eq!(
+            other,
+            TrayStart::Started {
+                pid: 3,
+                session: Some(3)
+            }
+        );
+        assert!(
+            asked.elapsed() < WAIT,
+            "the next session goes ahead at once"
+        );
+
+        let again = start_within(starts, Some(1), WAIT, held(&gate, &began));
+        assert!(matches!(again, TrayStart::Failed(_)), "{again:?}");
+        assert_eq!(
+            began.load(SeqCst),
+            1,
+            "one start for session 1 while it hangs"
+        );
+
+        drop(open);
+        let deadline = Instant::now() + SLACK;
+        while starts.keys_in_flight() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = start_within(starts, Some(1), WAIT, || TrayStart::Started {
+            pid: 11,
+            session: Some(1),
+        });
+        assert_eq!(
+            after,
+            TrayStart::Started {
+                pid: 11,
+                session: Some(1)
+            },
+            "once it ends, the next start is its own"
+        );
     }
 }
 
