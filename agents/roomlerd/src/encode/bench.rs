@@ -473,6 +473,33 @@ pub(crate) fn requests_hardware(path: CellPath, pref: EncoderPreference) -> bool
     }
 }
 
+/// What a `--name` names: its codec, and whether it is a Media Foundation
+/// encoder, which `VideoBackend::from_ffmpeg_name` does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NamedEncoder {
+    pub codec: Codec,
+    pub media_foundation: bool,
+}
+
+pub(crate) fn named_encoder(name: &str) -> Option<NamedEncoder> {
+    let mf = [
+        (super::cells::MF_H264, Codec::H264),
+        (super::cells::MF_HEVC, Codec::H265),
+        (super::cells::MF_AV1, Codec::Av1),
+    ];
+    if let Some((_, codec)) = mf.iter().find(|(n, _)| *n == name) {
+        return Some(NamedEncoder {
+            codec: *codec,
+            media_foundation: true,
+        });
+    }
+    let (codec, _) = VideoBackend::from_ffmpeg_name(name)?;
+    Some(NamedEncoder {
+        codec: Codec::parse(codec.wire())?,
+        media_foundation: false,
+    })
+}
+
 /// One row to run: a cell at one size, rate and motion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellPlan {

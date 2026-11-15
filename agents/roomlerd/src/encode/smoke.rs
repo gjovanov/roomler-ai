@@ -18,7 +18,6 @@ use super::bench::{
 };
 use crate::capture::synthetic_scene::Scene;
 use crate::capture::{Damage, Frame, PixelFormat};
-use roomler_ai_remote_control::models::VideoBackend;
 
 pub const WIDTH: u32 = 640;
 pub const HEIGHT: u32 = 480;
@@ -91,30 +90,55 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The cell the request asks for, on this build.
-///
-/// SEAM (#3652 AC2): master's mapping, byte for byte. It never refuses: an
-/// unknown codec opens H.264, as master's `open_for_codec` did.
+/// The cell the request asks for on this build, or why no build serves it.
 pub fn plan(
     req: &Request<'_>,
     width: u32,
     height: u32,
     build: BuildCaps,
 ) -> Result<CellPlan, Refused> {
-    let cell = match req.name {
+    let (cell, requested_hw, hardware_on_path) = match req.name {
         Some(name) => {
-            let codec = VideoBackend::from_ffmpeg_name(name)
-                .and_then(|(codec, _)| Codec::parse(codec.wire()))
-                .unwrap_or(Codec::H264);
-            CellSpec::new(CellPath::Named, codec, false)
+            let named =
+                bench::named_encoder(name).ok_or_else(|| Refused::Name(name.to_string()))?;
+            let cell = CellSpec::new(CellPath::Named, named.codec, false);
+            if named.media_foundation {
+                // A named Media Foundation encoder asks for Media Foundation,
+                // either MFT (D2 A): Microsoft's software H.264 MFT is all a
+                // GPU-less runner has.
+                (cell, false, build.mf)
+            } else {
+                (cell, true, build.hardware_on_path(cell))
+            }
         }
         None => {
-            let codec = match req.codec.to_ascii_lowercase().as_str() {
+            let lower = req.codec.to_ascii_lowercase();
+            let codec = match lower.as_str() {
+                "h264" => Codec::H264,
                 "h265" | "hevc" => Codec::H265,
                 "av1" => Codec::Av1,
-                _ => Codec::H264,
+                _ => return Err(Refused::Codec(lower)),
             };
-            CellSpec::new(CellPath::Rtp, codec, false)
+            // D3 A: no build has a software HEVC or AV1 encoder.
+            if req.pref == EncoderPreference::Software && codec != Codec::H264 {
+                return Err(Refused::NoSoftwareEncoder(codec.label().to_string()));
+            }
+            let rtp = CellSpec::new(CellPath::Rtp, codec, false);
+            // D1 A: hardware asked for where the RTP track has none, and
+            // FFmpeg's cascade is here: the DataChannel's cell answers.
+            let cell = if req.pref == EncoderPreference::Hardware
+                && !build.hardware_on_path(rtp)
+                && build.ffmpeg
+            {
+                CellSpec::new(CellPath::Dc, codec, false)
+            } else {
+                rtp
+            };
+            (
+                cell,
+                bench::requests_hardware(cell.path, req.pref),
+                build.hardware_on_path(cell),
+            )
         }
     };
     Ok(CellPlan {
@@ -125,8 +149,8 @@ pub fn plan(
         fps: FPS,
         target_bps: super::initial_bitrate_for_fps(width, height, FPS),
         motion: Scene::Static,
-        requested_hw: bench::requests_hardware(cell.path, req.pref),
-        hardware_on_path: build.hardware_on_path(cell),
+        requested_hw,
+        hardware_on_path,
     })
 }
 
