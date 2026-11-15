@@ -504,9 +504,9 @@ The docs:
 - `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2310`, its flow at `:2322`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2529`): one-row's row, and
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2532`): one-row's row, and
   what D8 decides.
-- `docs/installation.md`, where the give-up's line is described (`:2592-2615`): what D8 decides, in its place.
+- `docs/installation.md`, where the give-up's line is described (`:2595-2618`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:1-27` (the step table) and the new `one_row_home.rs`.
 - `docs/README.md`: the `installation.md` row names the rule.
