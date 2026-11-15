@@ -1830,24 +1830,24 @@ jobs:
             Write-Host "  $($dll.Name) ($([math]::Round($dll.Length / 1KB, 0)) KB)"
           }
 
-      - name: Encoder smoke test (FFmpeg link check + MF cascade → openh264 fallback)
+      - name: Encoder smoke test (FFmpeg link check + Media Foundation H.264, either MFT)
         shell: pwsh
         env:
           RUST_LOG: roomlerd=debug,info
         run: |
-          # Probe the hardware encoder path. On windows-latest the runner
-          # exposes a WARP software D3D11 device; the MS H264 Encoder MFT
-          # falls back to its SW path there, which is enough for "it loads,
-          # negotiates types, produces an IDR, no SEH crash". Debug logging
-          # surfaces STREAM_CHANGE notifications and per-frame byte counts
-          # so regressions in the MF drain path are visible in CI output.
-          # P3d Slice B: daemon EXE is now roomlerd.exe.
+          # Assert Media Foundation's H.264 by name (#3652): `--name h264_mf`
+          # opens that cascade alone, with no openh264 behind it, and passes
+          # on either MFT. windows-latest has no GPU, only a WARP software
+          # D3D11 device, so the MS H264 Encoder MFT answers on its SW path:
+          # "it loads, negotiates types, produces an IDR, no SEH crash". An MF
+          # that fails to open fails the job. `--encoder hardware` would fail
+          # here: it passes only on a hardware encoder. Debug logging surfaces
+          # STREAM_CHANGE notifications and per-frame byte counts.
           # Under ffmpeg-encoder, encoder-smoke FIRST asserts the linked
-          # libavcodec is >= 61 (FFmpeg 7+) — the load-bearing replacement
-          # for the deleted 5m33s cargo-test link-verify step. On failure:
-          # re-pin ffmpeg-next in agents/roomlerd/Cargo.toml or
-          # re-vendor via vendor-ffmpeg-windows.yml.
-          & "target\release\roomlerd.exe" encoder-smoke --encoder hardware
+          # libavcodec is >= 61 (FFmpeg 7+), the load-bearing replacement for
+          # the deleted 5m33s cargo-test link-verify step. On failure: re-pin
+          # ffmpeg-next in agents/roomlerd/Cargo.toml or re-vendor (vendor-ffmpeg-windows.yml).
+          & "target\release\roomlerd.exe" encoder-smoke --name h264_mf
 
       # Sign the MSI PAYLOAD, before cargo-wix harvests it.
       #

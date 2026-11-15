@@ -40,7 +40,7 @@ therefore **increased**.
 ### The six mechanisms
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
-   (`agents/roomlerd/src/encode/mod.rs:227`); on a constrained path `area_min_bitrate_bps()`
+   (`agents/roomlerd/src/encode/mod.rs:229`); on a constrained path `area_min_bitrate_bps()`
    (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
@@ -208,7 +208,7 @@ The plumbing is one shape for all of them:
 ```mermaid
 flowchart LR
   cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3156–3161 → ROOMLERD_*"]
-  bridge --> rd["readers<br/>encode/mod.rs:317–448<br/>on unless the value is \"0\""]
+  bridge --> rd["readers<br/>encode/mod.rs:319–450<br/>on unless the value is \"0\""]
   rd --> gf["GovernorFlags::from_env<br/>governor.rs:171"]
   rd --> pk["PlanKnobs::from_env<br/>plan.rs:187 (P2)"]
   rd --> pump["pump, resolved once<br/>peer.rs:6362 (P5) · :6745 (P2)"]

@@ -60,18 +60,18 @@ from scratchpad to `scripts/`.
 
 ## FR-A — Encoder rate changes without an IDR (first)
 
-**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:437–489`, dispatch
+**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:440–499`, dispatch
 `encoder_smoke_cmd` :6273) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
 `4.5M 3M 2M 1.5M 1M 750k 550k 400k 300k 200k` down and back (20 changes via `set_bitrate`). Per
-rung: `applied_maxrate, set_bitrate_ms, key_packets` (`AV_PKT_FLAG_KEY`, encoder.rs:1613; size
+rung: `applied_maxrate, set_bitrate_ms, key_packets` (`AV_PKT_FLAG_KEY`, encoder.rs:1620; size
 heuristic as the second detector for vp9_qsv), `burst = first3_max/trailing_mean`, `ratio =
 mean_bytes/(rung/fps/8)`. **Pass** = 0 key packets after the opener, `set_bitrate_ms < 5`, ratio
 ±25 % by frame 10, burst ≤ 2×. Hosts: CORPLAP-1 (`hevc_qsv`, `low_power` 1 and 0), an
 Arc/Meteor-Lake host (`av1_qsv`), the RTX box (`hevc/av1_nvenc`), one Apple Silicon Mac
 (`hevc_videotoolbox`); AMD recorded as unmeasured. Add a defaulted trait method
-`VideoEncoder::rate_stats()` (`encode/mod.rs:1285`) so the sweep reads counters. The sweep bypasses
+`VideoEncoder::rate_stats()` (`encode/mod.rs:1287`) so the sweep reads counters. The sweep bypasses
 the coarsen gate (:1591–1594).
 
 **A1 — in-place applies, gated.** Replace `supports_dynamic_bitrate = name.contains("nvenc")`
@@ -111,8 +111,8 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 
 | PR | delete | anchors | precondition |
 |---|---|---|---|
-| A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5181, 5108–5115, 6469–6516, 6527–6563, 6633–6638`; `mod.rs:417–474` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7354–7373, 7696–7789`; `encoder.rs:2553–2763`; `aimd.rs:285–338`; `mod.rs:488–499` | VT measured or kept on the settle rule |
+| A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5181, 5108–5115, 6469–6516, 6527–6563, 6633–6638`; `mod.rs:419–476` | A0 pass on QSV, switch ON one release |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7354–7373, 7696–7789`; `encoder.rs:2560–2770`; `aimd.rs:285–338`; `mod.rs:490–501` | VT measured or kept on the settle rule |
 | A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:1003–1019`; `peer.rs:4901` | — |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
@@ -208,7 +208,7 @@ viewer_rate_clamp, queue_drain, relay_age_feedback`; B3b `constrained_queue_meas
 `reference_bps`), `slow_link_profile` (→ rung), `relay_ceiling_learn` + `relay_max_hi_kbps` (→
 prior bound), `area_min_bitrate` (→ `RateDomain` rule), and delete `aimd.rs`, `ceiling_learn.rs`,
 `LinkLoop`/`AgeLoop`, the P1/P3/P4/P6 governor arms. Retired keys join a `RETIRED_KEYS`
-accept-and-ignore list for one release (mirrors `mod.rs:136–145`). Tests: aimd (15) → ratectl
+accept-and-ignore list for one release (mirrors `mod.rs:138–147`). Tests: aimd (15) → ratectl
 invariants; governor (32) → ~15 retire, the rest re-anchor; viewer_rate (24) → 10 become sensor
 tests; ceiling_learn (12) → 4 prior tests; goodput/rate_profile/encode_pressure/kf_policy stay.
 
@@ -238,7 +238,7 @@ before B2).
 3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1296–1345`), after mDNS resolution:
    drop non-relay candidates whose address equals a LocalAPI `peers()` overlay IP or our own (same
    query as :1644–1651, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
-   `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:983–992`).
+   `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:985–994`).
 
 Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`peer.rs:2056`)
 and in the FR-35 memory key (`peer.rs:4860` → `"{ip}|{class}"`, which fixes "a fast day carried

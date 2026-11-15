@@ -1374,6 +1374,13 @@ impl FfmpegEncoder {
             .find(|n| *n == name)
     }
 
+    /// #3652 — does this FFmpeg build carry the encoder `name`? A cascade
+    /// name it does not carry never runs (the dispatch notes no failure for
+    /// it), so what a smoke says it tried leaves it out.
+    pub(crate) fn carried(name: &str) -> bool {
+        codec::encoder::find_by_name(name).is_some()
+    }
+
     /// FR-77 — open ONE named encoder at the probe's settings (30 fps, the
     /// standard ceiling, no CQ bias) in the requested chroma format. This is
     /// the capability probe's per-cell open; a session never calls it — it

@@ -74,10 +74,10 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
 
 1. **Parallel convert** (`par_convert`, default on). Frames ≥ 2 MPix run the
    BGRA→NV12/I444 conversion in row bands, since FR-119 P2b-11 on a pool that
-   stays up (`encoder.rs:3388` `convert_pool`) — byte-identical output (even-row
+   stays up (`encoder.rs:3395` `convert_pool`) — byte-identical output (even-row
    cuts, chroma pairs never straddle a band boundary). Band count is
-   `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2310`
-   `convert_bands`, `:2325` `band_cuts`; `mod.rs:639` `par_convert_enabled`).
+   `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2317`
+   `convert_bands`, `:2325` `band_cuts`; `mod.rs:641` `par_convert_enabled`).
 2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
