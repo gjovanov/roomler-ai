@@ -533,7 +533,7 @@ sequenceDiagram
 | `rc:terminate` for a held request | drops it | — |
 | A connection that drops | its held requests go with it, and the hub pushes a pending request again to the next one | — |
 | exec, SSH, tunnels, the overlay | work: the hello carries every verb | work |
-| The LocalAPI Overview | `not_probed` | the cells |
+| The companion's encoding card (LocalAPI `EncoderCaps`; on a Linux system install over the person socket, since #3831) | `not_probed` | the cells |
 
 Why a request waits rather than being served from the interim answer: no driver code runs in the
 daemon until a child has opened that cell, and a session opens Media Foundation in the daemon

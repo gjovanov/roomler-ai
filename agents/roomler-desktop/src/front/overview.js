@@ -372,6 +372,12 @@
       if (view.reason === 'old_daemon') {
         encChip('Unavailable', 'chip-muted');
         encNote('The device service predates this view — update the service to see this.');
+      } else if (view.reason === 'root_only') {
+        // #3831 — a Linux system install whose service predates #3831 refuses
+        // this over the person socket the app reaches it by: an answer, not a
+        // failure.
+        encChip('Unavailable', 'chip-muted');
+        encNote("The encoders are shown to this device's administrator.");
       } else if (view.reason === 'daemon_unreachable') {
         encChip('Offline', 'chip-muted');
         encNote('The device service is not running.');

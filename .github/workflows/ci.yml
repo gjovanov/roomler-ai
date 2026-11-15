@@ -1575,11 +1575,11 @@ jobs:
           grep -q "real-clipboard: the round trip ran and outlived a clone's drop" /tmp/clip-real.log
 
       # #3757 — a Mac's root daemon declines the `files` channel of a session
-      # no GUI worker serves; every other process serves it as before. In the
-      # step above's test build: the module (and the root half's hello still
-      # offering file transfer) as the runner's user, then the same binary
-      # under sudo, where the Mac's own euid 0 declines. The step fails unless
-      # the root test ran and passed (ROOMLERD_TEST_REQUIRE_ROOT: no skip).
+      # no GUI worker serves; every other process serves it. In the step above's
+      # build: the module (and the root half's hello still offering file
+      # transfer) as the runner's user, then under sudo, where euid 0 declines:
+      # the root test must run and pass (ROOMLERD_TEST_REQUIRE_ROOT: no skip).
+      # #3876 — one test at a time, or another test's output can split `... ok`.
       - name: cargo test the files channel on a Mac's root daemon (#3757)
         run: |
           set -eu
@@ -1588,7 +1588,7 @@ jobs:
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/files3757.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           RC=0
-          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture > /tmp/files3757-root.log 2>&1 || RC=$?
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture --test-threads=1 > /tmp/files3757-root.log 2>&1 || RC=$?
           cat /tmp/files3757-root.log
           if [ "$RC" != 0 ]; then echo "::error::the files channel tests failed under sudo (exit $RC)"; exit 1; fi
           grep -q 'as_root::a_root_process_on_a_mac_declines_the_files_channel \.\.\. ok' /tmp/files3757-root.log \
