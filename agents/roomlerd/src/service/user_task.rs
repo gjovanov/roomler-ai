@@ -106,6 +106,10 @@ pub(crate) trait Library {
     fn create(&mut self, name: &str, xml: &str) -> Result<()>;
     /// Delete `name`. A task this process cannot find is gone already.
     fn delete(&mut self, name: &str) -> Result<()>;
+    /// End the running instance of `name` (`schtasks /End`): the launcher the
+    /// task started, and through the launcher's kill-on-close job the daemon
+    /// (#3885, `agents/roomlerdw`).
+    fn end(&mut self, name: &str) -> Result<()>;
 }
 
 /// Is the task `name` the account `sid`'s, by its principal? A task this
@@ -375,7 +379,8 @@ pub(crate) mod fake {
         pub(crate) caller: String,
         pub(crate) elevated: bool,
         pub(crate) tasks: Vec<Task>,
-        /// Every create and delete asked of the library, refused ones too.
+        /// Every create, end and delete asked of the library, refused ones
+        /// too.
         pub(crate) asked: Vec<(&'static str, String)>,
         /// Names whose registration the library refuses.
         pub(crate) refuse: Vec<String>,
@@ -423,7 +428,7 @@ pub(crate) mod fake {
             self.find(name).map(|i| self.tasks[i].principal.clone())
         }
 
-        /// Was a create or a delete of `name` asked?
+        /// Was a create, an end or a delete of `name` asked?
         pub(crate) fn asked_for(&self, name: &str) -> bool {
             self.asked.iter().any(|(_, n)| n.eq_ignore_ascii_case(name))
         }
@@ -501,6 +506,15 @@ pub(crate) mod fake {
                 }
                 Some(i) if self.sees(&self.tasks[i]) => bail!("ERROR: Access is denied."),
                 _ => Ok(()),
+            }
+        }
+
+        fn end(&mut self, name: &str) -> Result<()> {
+            self.asked.push(("end", name.into()));
+            match self.find(name) {
+                Some(i) if self.may_change(&self.tasks[i]) => Ok(()),
+                Some(i) if self.sees(&self.tasks[i]) => bail!("ERROR: Access is denied."),
+                _ => bail!("ERROR: The system cannot find the file specified."),
             }
         }
     }

@@ -250,6 +250,68 @@ pub(crate) fn normalize(p: &Path) -> String {
     s.to_lowercase()
 }
 
+/// #3885 — a running process, as this process could read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub(crate) pid: u32,
+    /// The name it is listed under: its image's file name, or a bare file id
+    /// once the file behind its image is gone (#1686).
+    pub(crate) name: String,
+    /// The SID of the account it runs as, from its token. `None` when its
+    /// token cannot be read.
+    pub(crate) user: Option<String>,
+    /// The file it was started from, the first entry of its module list
+    /// ([`started_from`]), which a later rename of the file does not change.
+    /// `None` when the list cannot be read.
+    pub(crate) started_from: Option<PathBuf>,
+    /// The file its image is now, as Windows names it
+    /// (`QueryFullProcessImageNameW`), which follows a rename. `None` when it
+    /// cannot be read.
+    pub(crate) image: Option<PathBuf>,
+}
+
+impl Seen {
+    /// The file it runs: the one it was started from, else its image now.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.started_from.as_deref().or(self.image.as_deref())
+    }
+}
+
+/// #3885 — what became of a process [`terminate_checked`] was asked to stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// It had exited, or no process has its pid now.
+    Gone,
+    /// The process its pid names now does not check out: left alone.
+    NotIt,
+    /// It checked out, was terminated, and exited within the wait.
+    Stopped,
+    /// It checks out, and Windows refused this process the right to end it:
+    /// the Win32 error.
+    Refused(u32),
+    /// It checked out and was terminated, and still ran when the wait ended.
+    StillRunning,
+}
+
+/// RED stub (#3885).
+pub(crate) fn read_named(_names: &[&str]) -> Option<Vec<Seen>> {
+    Some(Vec::new())
+}
+
+/// RED stub (#3885).
+pub(crate) fn terminate_checked(
+    _pid: u32,
+    _wait: Duration,
+    _is_it: &dyn Fn(&Seen) -> bool,
+) -> Ended {
+    Ended::NotIt
+}
+
+/// RED stub (#3885).
+pub(crate) fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

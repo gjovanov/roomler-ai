@@ -101,6 +101,8 @@ use anyhow::Result;
 // Only the Windows cleanup paths name a path — gate the import behind cfg so
 // Linux/macOS clippy doesn't flag it as unused.
 #[cfg(target_os = "windows")]
+use crate::win_service::companion_procs::{Ended, Seen};
+#[cfg(target_os = "windows")]
 use std::path::Path;
 
 /// Which MSI flavour is being INSTALLED. The helper cleans the
@@ -272,13 +274,22 @@ fn cleanup_vacated_install_dir(target: TargetFlavour, report: &mut CleanupReport
     };
     let dir = match target {
         TargetFlavour::PerMachine => base.join(name),
-        TargetFlavour::PerUser => base
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join(name),
+        TargetFlavour::PerUser => per_user_install(&base, name),
     };
     sweep_vacated_dir(&base, &dir, report, dry_run);
+}
+
+/// The per-user install folder `folder` of the account whose profile is
+/// `profile`: `<profile>\AppData\Local\Programs\<folder>`, where the per-user
+/// MSI installs. The one place both the vacated-dir sweep and the per-user
+/// arm's daemon stop (#3885) name it.
+#[cfg(target_os = "windows")]
+fn per_user_install(profile: &Path, folder: &str) -> std::path::PathBuf {
+    profile
+        .join("AppData")
+        .join("Local")
+        .join("Programs")
+        .join(folder)
 }
 
 /// The sweep of one vacated install folder, `dir`, below `base`: what
@@ -395,7 +406,12 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
     let cleaned = account_cleaned();
     clean_up_user_tasks(
         &mut crate::service::Schtasks,
+        &mut Running,
         cleaned.as_deref().map_err(|why| *why),
+        Folders {
+            per_user: None,
+            per_machine: None,
+        },
         report,
         dry_run,
     );
@@ -458,11 +474,14 @@ fn account_cleaned() -> Result<String, &'static str> {
 #[cfg(target_os = "windows")]
 fn clean_up_user_tasks(
     lib: &mut impl crate::service::user_task::Library,
+    procs: &mut impl Processes,
     cleaned: Result<&str, &str>,
+    folders: Folders<'_>,
     report: &mut CleanupReport,
     dry_run: bool,
 ) {
     use crate::service::user_task::{Verdict, clean_up_choice};
+    let _ = (procs.this_step(), folders); // RED stub (#3885)
     for choice in clean_up_choice(lib, cleaned) {
         let shown = &choice.shown;
         match choice.verdict {
@@ -487,6 +506,164 @@ fn clean_up_user_tasks(
                 "Scheduled Task {shown} left in place: {why}, so this step removes no account's \
                  task"
             )),
+        }
+    }
+}
+
+/// #3885 — the image names of a per-user install's daemon: the daemon, and
+/// the launcher its task runs, which holds the daemon in a kill-on-close job
+/// (`agents/roomlerdw`).
+#[cfg(target_os = "windows")]
+const DAEMON_IMAGES: [&str; 2] = ["roomlerd.exe", "roomlerdw.exe"];
+
+/// #3885 — how long the per-user arm waits for a daemon it terminated to go.
+#[cfg(target_os = "windows")]
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #3885 — where the per-user arm looks for the daemon of the account it
+/// cleans.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+struct Folders<'a> {
+    /// That account's per-user install ([`per_user_install`]). `None` when
+    /// this step cannot name it: it then looks for no running daemon.
+    per_user: Option<&'a Path>,
+    /// The per-Machine install, whose daemon this step never stops or names,
+    /// whichever account it runs as.
+    per_machine: Option<&'a Path>,
+}
+
+/// #3885 — the running processes, as the per-user arm sees them: the seam
+/// between its choice and Windows (`win_service::companion_procs`). The
+/// tests' is a list.
+#[cfg(target_os = "windows")]
+trait Processes {
+    /// Every running process listed under a daemon image's name
+    /// ([`DAEMON_IMAGES`]), with what this step can read of it. `None` when
+    /// the process list cannot be read.
+    fn daemon_named(&mut self) -> Option<Vec<Seen>>;
+    /// Terminate `pid` when the process it names now still checks out
+    /// (`is_it`, on what is read through the handle that terminates it), and
+    /// wait for it to go.
+    fn stop(&mut self, pid: u32, is_it: &dyn Fn(&Seen) -> bool) -> Ended;
+    /// This step's own pid, and its parent's when the list names one.
+    fn this_step(&self) -> (u32, Option<u32>);
+}
+
+/// The processes of this machine.
+#[cfg(target_os = "windows")]
+struct Running;
+
+#[cfg(target_os = "windows")]
+impl Processes for Running {
+    fn daemon_named(&mut self) -> Option<Vec<Seen>> {
+        crate::win_service::companion_procs::read_named(&DAEMON_IMAGES)
+    }
+
+    fn stop(&mut self, pid: u32, is_it: &dyn Fn(&Seen) -> bool) -> Ended {
+        crate::win_service::companion_procs::terminate_checked(pid, STOP_WAIT, is_it)
+    }
+
+    fn this_step(&self) -> (u32, Option<u32>) {
+        let own = std::process::id();
+        (own, crate::win_service::companion_procs::parent_of(own))
+    }
+}
+
+/// #3885 — what the per-user arm does with one running process of a daemon's
+/// name.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// A daemon of the account it cleans, from that account's per-user
+    /// install: stopped.
+    Stop,
+    /// Left running, with a line that gives this reason.
+    Left(&'static str),
+    /// Left running, with no line: this step's own process, or the
+    /// per-Machine install's daemon.
+    Quiet,
+}
+
+/// #3885 — whose daemon the per-user arm stops.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy)]
+struct Pick<'a> {
+    /// The SID of the account it cleans ([`account_cleaned`]).
+    cleaned: &'a str,
+    /// That account's per-user install folder.
+    per_user: &'a Path,
+    /// The per-Machine install's folder.
+    per_machine: Option<&'a Path>,
+    /// This step's own pid: it runs as `roomlerd.exe` too.
+    own: u32,
+    /// The pid of the process that started this step.
+    parent: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+impl Pick<'_> {
+    /// RED stub (#3885).
+    fn fate(&self, _seen: &Seen) -> Fate {
+        Fate::Quiet
+    }
+}
+
+/// #3885 — what the report says of one running process of a daemon's name.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Said {
+    /// A daemon of the account, stopped: by its task's end, or here.
+    Stopped,
+    /// The dry run: one it would stop.
+    WouldStop,
+    /// Left running, for this reason.
+    Left(&'static str),
+    /// One it picked, still running: Windows refused to end it, or it did not
+    /// go within the wait.
+    StillRunning,
+}
+
+/// #3885 — the report's lines for the running processes of a daemon's name:
+/// one per pid, by pid and the name it is listed under, never an account or a
+/// path.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default)]
+struct DaemonLines(Vec<(u32, String, Said)>);
+
+#[cfg(target_os = "windows")]
+impl DaemonLines {
+    /// What is said of `seen`, in place of what was said before.
+    fn set(&mut self, seen: &Seen, said: Said) {
+        match self.0.iter_mut().find(|(pid, ..)| *pid == seen.pid) {
+            Some(line) => *line = (seen.pid, seen.name.clone(), said),
+            None => self.0.push((seen.pid, seen.name.clone(), said)),
+        }
+    }
+
+    /// What is said of `seen`, unless something is said of its pid already.
+    fn fill(&mut self, seen: &Seen, said: Said) {
+        if !self.0.iter().any(|(pid, ..)| *pid == seen.pid) {
+            self.0.push((seen.pid, seen.name.clone(), said));
+        }
+    }
+
+    fn write(self, report: &mut CleanupReport) {
+        for (pid, name, said) in self.0 {
+            match said {
+                Said::Stopped => report
+                    .removed
+                    .push(format!("daemon pid {pid} ({name}) stopped")),
+                Said::WouldStop => report
+                    .removed
+                    .push(format!("[dry-run] stop daemon pid {pid} ({name})")),
+                Said::Left(why) => report
+                    .skipped
+                    .push(format!("pid {pid} ({name}) left running: {why}")),
+                Said::StillRunning => report.errors.push(format!(
+                    "daemon pid {pid} ({name}) still running: stop it with taskkill /F /PID {pid}"
+                )),
+            }
         }
     }
 }
@@ -1446,7 +1623,14 @@ mod tests {
                     lib = lib.with(name, Some(*sid));
                 }
                 let mut report = CleanupReport::default();
-                clean_up_user_tasks(&mut lib, Ok(ACCOUNT_A), &mut report, dry_run);
+                clean_up_user_tasks(
+                    &mut lib,
+                    &mut nothing_running(),
+                    Ok(ACCOUNT_A),
+                    folders(),
+                    &mut report,
+                    dry_run,
+                );
                 let said = report.summary();
                 for (name, sid) in tasks {
                     let mine = *sid == ACCOUNT_A;
@@ -1460,7 +1644,13 @@ mod tests {
                     }
                 }
                 let own = tasks.iter().filter(|(_, sid)| *sid == ACCOUNT_A).count();
-                assert_eq!(report.removed.len(), own, "{state}: {said}");
+                // #3885: a dry run says it would end each task as well.
+                let deleted = report
+                    .removed
+                    .iter()
+                    .filter(|line| line.starts_with("Scheduled Task ") || line.contains("/Delete"))
+                    .count();
+                assert_eq!(deleted, own, "{state}: {said}");
                 assert_eq!(
                     report
                         .skipped
@@ -1495,7 +1685,14 @@ mod tests {
         ];
         for (case, mut lib) in cases {
             let mut report = CleanupReport::default();
-            clean_up_user_tasks(&mut lib, Ok(ACCOUNT_A), &mut report, false);
+            clean_up_user_tasks(
+                &mut lib,
+                &mut nothing_running(),
+                Ok(ACCOUNT_A),
+                folders(),
+                &mut report,
+                false,
+            );
             let said = report.summary();
             assert!(lib.owner(SHARED).is_some(), "{case}: {said}");
             assert!(!lib.asked_for(SHARED), "{case}: {:?}", lib.asked);
@@ -1522,7 +1719,14 @@ mod tests {
             .with(RETIRED, Some(ACCOUNT_B))
             .with(&a, Some(ACCOUNT_A));
         let mut report = CleanupReport::default();
-        clean_up_user_tasks(&mut lib, Err(why), &mut report, false);
+        clean_up_user_tasks(
+            &mut lib,
+            &mut nothing_running(),
+            Err(why),
+            folders(),
+            &mut report,
+            false,
+        );
         let said = report.summary();
         assert!(lib.asked.is_empty(), "{:?}", lib.asked);
         assert!(report.removed.is_empty(), "{said}");
@@ -1536,6 +1740,730 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains(ACCOUNT_A), "{said}");
+    }
+
+    // ── #3885 the per-user arm stops the account's daemon ────────
+
+    /// ACCOUNT_A's per-user install, and the machine's per-Machine one.
+    #[cfg(target_os = "windows")]
+    const PER_USER: &str = r"C:\Users\a\AppData\Local\Programs\Roomler";
+    #[cfg(target_os = "windows")]
+    const PER_MACHINE: &str = r"C:\Program Files\Roomler";
+    /// The service account's SID.
+    #[cfg(target_os = "windows")]
+    const SYSTEM_SID: &str = "S-1-5-18";
+    /// The pid of the step under test, and of the process that started it.
+    #[cfg(target_os = "windows")]
+    const OWN: u32 = 900;
+    #[cfg(target_os = "windows")]
+    const PARENT: u32 = 901;
+
+    /// A process as the step reads it.
+    #[cfg(target_os = "windows")]
+    fn seen(
+        pid: u32,
+        name: &str,
+        user: Option<&str>,
+        started_from: Option<&str>,
+        image: Option<&str>,
+    ) -> Seen {
+        Seen {
+            pid,
+            name: name.into(),
+            user: user.map(str::to_string),
+            started_from: started_from.map(std::path::PathBuf::from),
+            image: image.map(std::path::PathBuf::from),
+        }
+    }
+
+    /// A process of ACCOUNT_A started from `file`, readable in full, listed
+    /// under its file name.
+    #[cfg(target_os = "windows")]
+    fn of_a(pid: u32, file: &str) -> Seen {
+        let name = file.rsplit('\\').next().unwrap_or(file);
+        seen(pid, name, Some(ACCOUNT_A), Some(file), Some(file))
+    }
+
+    /// The folders of the tests: ACCOUNT_A's per-user install, and the
+    /// per-Machine one.
+    #[cfg(target_os = "windows")]
+    fn folders() -> Folders<'static> {
+        Folders {
+            per_user: Some(Path::new(PER_USER)),
+            per_machine: Some(Path::new(PER_MACHINE)),
+        }
+    }
+
+    /// A machine for the per-user arm's tests: its processes, and a journal
+    /// of what the arm did to them and to the task library, in order.
+    #[cfg(target_os = "windows")]
+    #[derive(Debug, Default)]
+    struct Machine {
+        journal: Vec<String>,
+        /// Each running process, with the task that started it, if one did.
+        running: Vec<(Seen, Option<String>)>,
+        /// What starts once a task is ended and before it is deleted, as a
+        /// one-shot trigger would start it: a launcher and its daemon.
+        on_end: Vec<(Seen, Option<String>)>,
+        /// The pids Windows will not let the step end.
+        refused: Vec<u32>,
+        /// The process list cannot be read.
+        unlisted: bool,
+    }
+
+    #[cfg(target_os = "windows")]
+    type Shared = std::rc::Rc<std::cell::RefCell<Machine>>;
+
+    /// The task library of a [`Machine`]: the fake, with each end and delete
+    /// in the journal. An end takes away what the task started (its launcher,
+    /// and through the launcher's job its daemon), and then starts what
+    /// `on_end` holds.
+    #[cfg(target_os = "windows")]
+    struct Tasks {
+        lib: crate::service::user_task::fake::Library,
+        machine: Shared,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl crate::service::user_task::Library for Tasks {
+        fn exists(&self, name: &str) -> bool {
+            self.lib.exists(name)
+        }
+        fn principal(&self, name: &str) -> Option<String> {
+            self.lib.principal(name)
+        }
+        fn names(&self) -> Option<Vec<String>> {
+            self.lib.names()
+        }
+        fn status(&self, name: &str) -> Result<crate::service::AutostartStatus> {
+            self.lib.status(name)
+        }
+        fn create(&mut self, name: &str, xml: &str) -> Result<()> {
+            self.lib.create(name, xml)
+        }
+        fn delete(&mut self, name: &str) -> Result<()> {
+            self.machine
+                .borrow_mut()
+                .journal
+                .push(format!("delete {name}"));
+            self.lib.delete(name)
+        }
+        fn end(&mut self, name: &str) -> Result<()> {
+            let mut machine = self.machine.borrow_mut();
+            machine.journal.push(format!("end {name}"));
+            self.lib.end(name)?;
+            machine
+                .running
+                .retain(|(_, task)| task.as_deref() != Some(name));
+            let started = std::mem::take(&mut machine.on_end);
+            machine.running.extend(started);
+            Ok(())
+        }
+    }
+
+    /// The processes of a [`Machine`]: a stop takes away a process that
+    /// checks out, unless Windows refuses it.
+    #[cfg(target_os = "windows")]
+    struct Procs(Shared);
+
+    #[cfg(target_os = "windows")]
+    impl Processes for Procs {
+        fn daemon_named(&mut self) -> Option<Vec<Seen>> {
+            let mut machine = self.0.borrow_mut();
+            machine.journal.push("list".into());
+            (!machine.unlisted).then(|| machine.running.iter().map(|(s, _)| s.clone()).collect())
+        }
+
+        fn stop(&mut self, pid: u32, is_it: &dyn Fn(&Seen) -> bool) -> Ended {
+            let mut machine = self.0.borrow_mut();
+            let Some(i) = machine.running.iter().position(|(s, _)| s.pid == pid) else {
+                return Ended::Gone;
+            };
+            if !is_it(&machine.running[i].0) {
+                return Ended::NotIt;
+            }
+            if machine.refused.contains(&pid) {
+                machine.journal.push(format!("refused {pid}"));
+                return Ended::Refused(5);
+            }
+            machine.journal.push(format!("terminate {pid}"));
+            machine.running.remove(i);
+            Ended::Stopped
+        }
+
+        fn this_step(&self) -> (u32, Option<u32>) {
+            (OWN, Some(PARENT))
+        }
+    }
+
+    /// A machine that runs no daemon.
+    #[cfg(target_os = "windows")]
+    fn nothing_running() -> Procs {
+        Procs(Shared::default())
+    }
+
+    /// The per-user arm on `machine`, through the task library `lib`.
+    #[cfg(target_os = "windows")]
+    fn run_arm(
+        machine: &Shared,
+        lib: crate::service::user_task::fake::Library,
+        cleaned: Result<&str, &str>,
+        per_user: Option<&Path>,
+        dry_run: bool,
+    ) -> CleanupReport {
+        let mut tasks = Tasks {
+            lib,
+            machine: machine.clone(),
+        };
+        let mut report = CleanupReport::default();
+        let folders = Folders {
+            per_user,
+            ..folders()
+        };
+        clean_up_user_tasks(
+            &mut tasks,
+            &mut Procs(machine.clone()),
+            cleaned,
+            folders,
+            &mut report,
+            dry_run,
+        );
+        report
+    }
+
+    /// The machine of the order's and the dry run's tests. ACCOUNT_A's task
+    /// started its launcher (100) and daemon (101); A started one more daemon
+    /// by hand (102), and one Windows will not let the step end (103). B's
+    /// daemon (104) runs from B's install, the per-Machine daemon (105) as the
+    /// service account, the step itself (OWN) from A's install, started by A's
+    /// launcher (PARENT), and A has a daemon in another folder (108). Ending
+    /// A's task starts a launcher (110) and its daemon (111), as a one-shot
+    /// trigger would before the delete.
+    #[cfg(target_os = "windows")]
+    fn a_machine() -> (Shared, crate::service::user_task::fake::Library) {
+        let a_task = format!("Roomler-{ACCOUNT_A}");
+        let b_task = format!("Roomler-{ACCOUNT_B}");
+        let daemon = format!(r"{PER_USER}\roomlerd.exe");
+        let launcher = format!(r"{PER_USER}\roomlerdw.exe");
+        let b_daemon = r"C:\Users\b\AppData\Local\Programs\Roomler\roomlerd.exe";
+        let machine_daemon = format!(r"{PER_MACHINE}\roomlerd.exe");
+        let machine = Machine {
+            running: vec![
+                (of_a(100, &launcher), Some(a_task.clone())),
+                (of_a(101, &daemon), Some(a_task.clone())),
+                (of_a(102, &daemon), None),
+                (of_a(103, &daemon), None),
+                (
+                    seen(
+                        104,
+                        "roomlerd.exe",
+                        Some(ACCOUNT_B),
+                        Some(b_daemon),
+                        Some(b_daemon),
+                    ),
+                    Some(b_task.clone()),
+                ),
+                (
+                    seen(
+                        105,
+                        "roomlerd.exe",
+                        Some(SYSTEM_SID),
+                        Some(&machine_daemon),
+                        Some(&machine_daemon),
+                    ),
+                    None,
+                ),
+                (of_a(OWN, &daemon), None),
+                (of_a(PARENT, &launcher), None),
+                (of_a(108, r"C:\tools\roomlerd.exe"), None),
+            ],
+            on_end: vec![
+                (of_a(110, &launcher), Some(a_task.clone())),
+                (of_a(111, &daemon), Some(a_task.clone())),
+            ],
+            refused: vec![103],
+            ..Machine::default()
+        };
+        let lib = crate::service::user_task::fake::Library::new(ACCOUNT_A, true)
+            .with(&a_task, Some(ACCOUNT_A))
+            .with(&b_task, Some(ACCOUNT_B));
+        (std::rc::Rc::new(std::cell::RefCell::new(machine)), lib)
+    }
+
+    /// The lines every run on [`a_machine`] gives the processes it leaves.
+    #[cfg(target_os = "windows")]
+    const LEFT_ON_A_MACHINE: [&str; 3] = [
+        "pid 104 (roomlerd.exe) left running: it runs as another account",
+        "pid 901 (roomlerdw.exe) left running: it started this step",
+        "pid 108 (roomlerd.exe) left running: it runs from another folder",
+    ];
+
+    /// #3885 — which running processes of a daemon's name the per-user arm
+    /// stops: those of the account it cleans, started from a daemon image in
+    /// that account's per-user install, and no other. Each one it leaves has
+    /// its line, by pid and listed name, except this step's own process and
+    /// the per-Machine install's daemon, which it neither touches nor names.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_user_clean_up_picks_only_its_accounts_daemon_from_its_install() {
+        let daemon = format!(r"{PER_USER}\roomlerd.exe");
+        let launcher = format!(r"{PER_USER}\roomlerdw.exe");
+        let machine_daemon = format!(r"{PER_MACHINE}\roomlerd.exe");
+        let (lower_a, upper_daemon) = (ACCOUNT_A.to_lowercase(), daemon.to_uppercase());
+        let (verbatim, aside) = (format!(r"\\?\{daemon}"), format!("{daemon}.old"));
+        let legacy = r"C:\Users\a\AppData\Local\Programs\roomler-agent\roomlerd.exe";
+        let a = Some(ACCOUNT_A);
+        let left = |why: &'static str| Fate::Left(why);
+        let cases: Vec<(&str, Seen, Fate, Option<&str>)> = vec![
+            (
+                "its daemon",
+                of_a(10, &daemon),
+                Fate::Stop,
+                Some("[dry-run] stop daemon pid 10 (roomlerd.exe)"),
+            ),
+            (
+                "its launcher",
+                of_a(11, &launcher),
+                Fate::Stop,
+                Some("[dry-run] stop daemon pid 11 (roomlerdw.exe)"),
+            ),
+            (
+                "its account and file in other case",
+                seen(
+                    12,
+                    "ROOMLERD.EXE",
+                    Some(&lower_a),
+                    Some(&upper_daemon),
+                    None,
+                ),
+                Fate::Stop,
+                Some("[dry-run] stop daemon pid 12 (ROOMLERD.EXE)"),
+            ),
+            (
+                "its file as a verbatim path",
+                seen(13, "roomlerd.exe", a, Some(&verbatim), None),
+                Fate::Stop,
+                Some("[dry-run] stop daemon pid 13 (roomlerd.exe)"),
+            ),
+            (
+                "renamed aside: the file it was started from counts",
+                seen(14, "roomlerd.exe.old", a, Some(&daemon), Some(&aside)),
+                Fate::Stop,
+                Some("[dry-run] stop daemon pid 14 (roomlerd.exe.old)"),
+            ),
+            (
+                "its module list unread: its image counts",
+                seen(15, "roomlerd.exe", a, None, Some(&daemon)),
+                Fate::Stop,
+                Some("[dry-run] stop daemon pid 15 (roomlerd.exe)"),
+            ),
+            (
+                "started elsewhere, its image renamed into the install",
+                seen(
+                    16,
+                    "roomlerd.exe",
+                    a,
+                    Some(r"C:\tools\roomlerd.exe"),
+                    Some(&daemon),
+                ),
+                left("it runs from another folder"),
+                Some("pid 16 (roomlerd.exe) left running: it runs from another folder"),
+            ),
+            (
+                "another account's, from the same folder",
+                seen(20, "roomlerd.exe", Some(ACCOUNT_B), Some(&daemon), None),
+                left("it runs as another account"),
+                Some("pid 20 (roomlerd.exe) left running: it runs as another account"),
+            ),
+            (
+                "the per-Machine daemon, as the service account",
+                seen(
+                    21,
+                    "roomlerd.exe",
+                    Some(SYSTEM_SID),
+                    Some(&machine_daemon),
+                    None,
+                ),
+                Fate::Quiet,
+                None,
+            ),
+            (
+                "the per-Machine daemon, as the account (an attended install)",
+                of_a(22, &machine_daemon),
+                Fate::Quiet,
+                None,
+            ),
+            (
+                "the per-Machine daemon, its account unread",
+                seen(23, "roomlerd.exe", None, None, Some(&machine_daemon)),
+                Fate::Quiet,
+                None,
+            ),
+            ("this step", of_a(OWN, &daemon), Fate::Quiet, None),
+            (
+                "this step's parent",
+                of_a(PARENT, &launcher),
+                left("it started this step"),
+                Some("pid 901 (roomlerdw.exe) left running: it started this step"),
+            ),
+            (
+                "its account unread",
+                seen(30, "roomlerd.exe", None, Some(&daemon), Some(&daemon)),
+                left("this step cannot read which account it runs as"),
+                Some(
+                    "pid 30 (roomlerd.exe) left running: this step cannot read which account it runs as",
+                ),
+            ),
+            (
+                "its file unread",
+                seen(31, "roomlerd.exe", a, None, None),
+                left("this step cannot read the file it was started from"),
+                Some(
+                    "pid 31 (roomlerd.exe) left running: this step cannot read the file it was started from",
+                ),
+            ),
+            (
+                "nothing of it read",
+                seen(32, "roomlerd.exe", None, None, None),
+                left("this step cannot read which account it runs as"),
+                Some(
+                    "pid 32 (roomlerd.exe) left running: this step cannot read which account it runs as",
+                ),
+            ),
+            (
+                "the account's, from another folder",
+                of_a(33, legacy),
+                left("it runs from another folder"),
+                Some("pid 33 (roomlerd.exe) left running: it runs from another folder"),
+            ),
+        ];
+        let pick = Pick {
+            cleaned: ACCOUNT_A,
+            per_user: Path::new(PER_USER),
+            per_machine: Some(Path::new(PER_MACHINE)),
+            own: OWN,
+            parent: Some(PARENT),
+        };
+        for (case, seen, fate, _) in &cases {
+            assert_eq!(pick.fate(seen), *fate, "{case}: {seen:?}");
+        }
+        // The lines a dry run gives them, and none for a quiet one.
+        let machine = Shared::default();
+        machine.borrow_mut().running = cases.iter().map(|(_, s, ..)| (s.clone(), None)).collect();
+        let report = run_arm(
+            &machine,
+            crate::service::user_task::fake::Library::new(ACCOUNT_A, false),
+            Ok(ACCOUNT_A),
+            Some(Path::new(PER_USER)),
+            true,
+        );
+        let lines: Vec<&String> = report
+            .removed
+            .iter()
+            .chain(&report.skipped)
+            .chain(&report.errors)
+            .filter(|line| line.contains("pid "))
+            .collect();
+        for (case, _, _, line) in &cases {
+            if let Some(line) = line {
+                assert_eq!(
+                    lines.iter().filter(|l| *l == line).count(),
+                    1,
+                    "{case}: {line}: {lines:#?}"
+                );
+            }
+        }
+        let expected = cases.iter().filter(|(.., line)| line.is_some()).count();
+        assert_eq!(lines.len(), expected, "{lines:#?}");
+    }
+
+    /// #3885 — the order: the account's task is ended, then deleted, and only
+    /// then is what still runs terminated, each through the check (the data
+    /// dirs come after, `cleanup_per_user_artifacts`). Every daemon of the
+    /// account gets one line, whether its task's end or the terminate stopped
+    /// it, and the one Windows will not let the step end gets the command that
+    /// does. Another account's daemon and task, the per-Machine daemon, this
+    /// step and its parent are left, and the report names no account and no
+    /// folder.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_user_clean_up_ends_then_deletes_the_task_then_stops_what_is_left() {
+        let a_task = format!("Roomler-{ACCOUNT_A}");
+        let b_task = format!("Roomler-{ACCOUNT_B}");
+        let (machine, lib) = a_machine();
+        let report = run_arm(
+            &machine,
+            lib,
+            Ok(ACCOUNT_A),
+            Some(Path::new(PER_USER)),
+            false,
+        );
+        let said = report.summary();
+        let machine = machine.borrow();
+        let journal = &machine.journal;
+        let at = |entry: &str| {
+            journal
+                .iter()
+                .position(|e| e == entry)
+                .unwrap_or_else(|| panic!("no {entry}: {journal:?}"))
+        };
+        let (end, delete) = (
+            at(&format!("end {a_task}")),
+            at(&format!("delete {a_task}")),
+        );
+        assert!(journal[..end].iter().any(|e| e == "list"), "{journal:?}");
+        assert!(end < delete, "{journal:?}");
+        let mut terminated = Vec::new();
+        for (i, entry) in journal.iter().enumerate() {
+            if let Some(pid) = entry.strip_prefix("terminate ") {
+                assert!(i > delete, "terminated before the delete: {journal:?}");
+                terminated.push(pid.parse::<u32>().unwrap());
+            }
+        }
+        terminated.sort_unstable();
+        assert_eq!(terminated, [102, 110, 111], "{journal:?}");
+        assert!(!journal.iter().any(|e| e.contains(&b_task)), "{journal:?}");
+        let mut running: Vec<u32> = machine.running.iter().map(|(s, _)| s.pid).collect();
+        running.sort_unstable();
+        assert_eq!(running, [103, 104, 105, 108, OWN, PARENT], "{journal:?}");
+
+        for pid in [100, 101, 102, 110, 111] {
+            let name = if pid % 10 == 0 {
+                "roomlerdw.exe"
+            } else {
+                "roomlerd.exe"
+            };
+            let line = format!("daemon pid {pid} ({name}) stopped");
+            assert_eq!(
+                report.removed.iter().filter(|l| **l == line).count(),
+                1,
+                "{line}: {said}"
+            );
+        }
+        assert_eq!(
+            report.errors,
+            ["daemon pid 103 (roomlerd.exe) still running: stop it with taskkill /F /PID 103"],
+            "{said}"
+        );
+        for line in LEFT_ON_A_MACHINE {
+            assert_eq!(
+                report.skipped.iter().filter(|l| *l == line).count(),
+                1,
+                "{line}: {said}"
+            );
+        }
+        assert!(
+            report
+                .removed
+                .contains(&"Scheduled Task Roomler-<this account's SID>".to_string()),
+            "{said}"
+        );
+        assert_eq!(report.removed.len(), 6, "{said}");
+        for pid in [105, OWN] {
+            assert!(!said.contains(&format!("pid {pid} ")), "{said}");
+        }
+        for word in [ACCOUNT_A, ACCOUNT_B, "AppData", "Program Files", r"C:\"] {
+            assert!(!said.contains(word), "the report names {word}: {said}");
+        }
+    }
+
+    /// #3885 — `--dry-run` ends, deletes and terminates nothing. It reads the
+    /// process list, and says what it would end, delete and stop.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_dry_run_stops_nothing_and_says_what_it_would_stop() {
+        let (machine, lib) = a_machine();
+        let report = run_arm(
+            &machine,
+            lib,
+            Ok(ACCOUNT_A),
+            Some(Path::new(PER_USER)),
+            true,
+        );
+        let said = report.summary();
+        let machine = machine.borrow();
+        assert!(
+            !machine.journal.is_empty() && machine.journal.iter().all(|e| e == "list"),
+            "{:?}",
+            machine.journal
+        );
+        assert_eq!(machine.running.len(), 9, "{said}");
+        let mut removed = report.removed.clone();
+        removed.sort();
+        let mut expected = vec![
+            "[dry-run] schtasks /End /TN Roomler-<this account's SID>".to_string(),
+            "[dry-run] schtasks /Delete /TN Roomler-<this account's SID> /F".to_string(),
+        ];
+        expected.extend((100..=103).map(|pid| {
+            let name = if pid == 100 {
+                "roomlerdw.exe"
+            } else {
+                "roomlerd.exe"
+            };
+            format!("[dry-run] stop daemon pid {pid} ({name})")
+        }));
+        expected.sort();
+        assert_eq!(removed, expected, "{said}");
+        for line in LEFT_ON_A_MACHINE {
+            assert!(report.skipped.iter().any(|l| l == line), "{line}: {said}");
+        }
+        assert!(report.errors.is_empty(), "{said}");
+    }
+
+    /// #3885 — with no account to clean, the arm looks at no process. With no
+    /// per-user install folder it can name, it still ends and then deletes
+    /// the account's task, and looks for no daemon left running. A process
+    /// list it cannot read is an error line, and the task is still ended and
+    /// deleted, in that order.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_user_clean_up_says_why_it_looks_for_no_daemon() {
+        let a_task = format!("Roomler-{ACCOUNT_A}");
+        let why = "nobody is signed in to this step's session";
+        let (machine, lib) = a_machine();
+        let report = run_arm(&machine, lib, Err(why), Some(Path::new(PER_USER)), false);
+        assert!(
+            machine.borrow().journal.is_empty(),
+            "{:?}",
+            machine.borrow().journal
+        );
+        assert!(
+            report
+                .skipped
+                .contains(&format!("no running daemon stopped: {why}")),
+            "{}",
+            report.summary()
+        );
+
+        let (machine, lib) = a_machine();
+        let report = run_arm(&machine, lib, Ok(ACCOUNT_A), None, false);
+        assert_eq!(
+            machine.borrow().journal,
+            [format!("end {a_task}"), format!("delete {a_task}")]
+        );
+        assert!(
+            report.skipped.contains(
+                &"no running daemon looked for: this step cannot name the account's per-user \
+                  install folder"
+                    .to_string()
+            ),
+            "{}",
+            report.summary()
+        );
+
+        let (machine, lib) = a_machine();
+        machine.borrow_mut().unlisted = true;
+        let report = run_arm(
+            &machine,
+            lib,
+            Ok(ACCOUNT_A),
+            Some(Path::new(PER_USER)),
+            false,
+        );
+        let journal = machine.borrow().journal.clone();
+        let end = journal.iter().position(|e| *e == format!("end {a_task}"));
+        let delete = journal
+            .iter()
+            .position(|e| *e == format!("delete {a_task}"));
+        assert!(end.is_some() && end < delete, "{journal:?}");
+        assert!(
+            !journal.iter().any(|e| e.starts_with("terminate")),
+            "{journal:?}"
+        );
+        assert_eq!(
+            report.errors,
+            [
+                "the process list could not be read, so this step cannot tell whether the \
+              account's daemon still runs"
+            ],
+            "{}",
+            report.summary()
+        );
+    }
+
+    /// #3885 — the walk over this machine's real processes. A child this test
+    /// starts from a copy of its own executable, named `roomlerd.exe` in a
+    /// per-user install folder of its own, is listed with this account and
+    /// that file, is the one process on this machine the pick would stop, and
+    /// is stopped through the check. The test ends nothing but its own child,
+    /// and only once the pick has named it alone; whatever else runs here,
+    /// the developer's own daemon included, is only read. In the child, this
+    /// test waits a minute at most.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_running_daemon_is_picked_by_its_account_and_file_and_stopped_alone() {
+        use crate::win_service::companion_procs::{
+            normalize, parent_of, read_named, terminate_checked,
+        };
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "ROOMLERD_TEST_3885_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let per_user = per_user_install(root.path(), crate::updater::INSTALL_FOLDER_NAME);
+        std::fs::create_dir_all(&per_user).unwrap();
+        let exe = per_user.join("roomlerd.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let test = "install_cleanup::tests::a_running_daemon_is_picked_by_its_account_and_file_and_stopped_alone";
+        let mut child = std::process::Command::new(&exe)
+            .args([test, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the child");
+        let own_sid = crate::win_token::own_user_sid().expect("this process's account");
+        let per_machine = crate::updater::install_dir_with_name(
+            crate::updater::WindowsInstallFlavour::PerMachine,
+            crate::updater::INSTALL_FOLDER_NAME,
+        );
+        let pick = Pick {
+            cleaned: &own_sid,
+            per_user: &per_user,
+            per_machine: per_machine.as_deref(),
+            own: std::process::id(),
+            parent: parent_of(std::process::id()),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (listed, picked) = loop {
+            let listed = read_named(&DAEMON_IMAGES).unwrap_or_default();
+            let picked: Vec<u32> = listed
+                .iter()
+                .filter(|s| pick.fate(s) == Fate::Stop)
+                .map(|s| s.pid)
+                .collect();
+            if picked.contains(&child.id()) || Instant::now() >= deadline {
+                break (listed, picked);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let ended = (picked == [child.id()]).then(|| {
+            terminate_checked(child.id(), Duration::from_secs(10), &|s| {
+                pick.fate(s) == Fate::Stop
+            })
+        });
+        let gone = child.try_wait().ok().flatten().is_some();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(picked, [child.id()], "{listed:#?}");
+        let seen = listed.iter().find(|s| s.pid == child.id()).unwrap();
+        assert!(
+            seen.user
+                .as_deref()
+                .is_some_and(|user| user.eq_ignore_ascii_case(&own_sid)),
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen.path().map(normalize),
+            Some(normalize(&exe)),
+            "{seen:?}"
+        );
+        assert_eq!(ended, Some(Ended::Stopped), "{seen:?}");
+        assert!(gone, "the child is gone once stopped");
     }
 }
 // RETIRED-NAME-ANCHOR-END

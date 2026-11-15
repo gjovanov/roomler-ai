@@ -758,6 +758,10 @@ mod windows {
         fn delete(&mut self, name: &str) -> Result<()> {
             delete_task(name)
         }
+
+        fn end(&mut self, name: &str) -> Result<()> {
+            end_named(name)
+        }
     }
 
     /// `enrolled`: a config exists, so a started daemon has something to do. A
@@ -950,8 +954,16 @@ mod windows {
                  --as-service`, elevated"
             );
         };
+        end_named(&name)
+    }
+
+    /// `schtasks /End /TN <name>`: Task Scheduler ends the launcher the task
+    /// started, and the launcher's kill-on-close job ends the daemon
+    /// (`agents/roomlerdw`). The hard stop's, and the per-user clean-up's
+    /// before it deletes the task (#3885).
+    fn end_named(name: &str) -> Result<()> {
         let output = schtasks()
-            .args(["/End", "/TN", name.as_str()])
+            .args(["/End", "/TN", name])
             .output()
             .context("running schtasks /End")?;
         if !output.status.success() {
