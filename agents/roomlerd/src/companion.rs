@@ -688,7 +688,8 @@ pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
 
 /// #3908 — [`too_old_to_connect`] for the companion in `dir`, by the version
 /// [`known_beside`] knows for it now. `None` for `dir`: no folder of its own
-/// to look in, so a tray of unknown version.
+/// to look in, so a tray of unknown version. With no EXE there is no tray to
+/// refuse, and nothing is read.
 #[cfg(target_os = "windows")]
 fn too_old_beside(
     dir: Option<&std::path::Path>,
@@ -697,10 +698,13 @@ fn too_old_beside(
     versions: &'static ExeVersions,
 ) -> Option<tunnel_core::localapi::CompanionTooOld> {
     let (exe_present, version) = match dir {
-        Some(dir) => (
-            dir.join(DESKTOP_EXE).try_exists().unwrap_or(true),
-            known_beside(dir, own, versions).version,
-        ),
+        Some(dir) => {
+            let present = dir.join(DESKTOP_EXE).try_exists().unwrap_or(true);
+            let version = present
+                .then(|| known_beside(dir, own, versions).version)
+                .flatten();
+            (present, version)
+        }
         None => (true, None),
     };
     too_old_to_connect(exe_present, true, version.as_deref(), by_service)
@@ -763,7 +767,7 @@ static EXE_VERSIONS: ExeVersions = ExeVersions::new("companion-ver", exe_version
 /// hangs (a filter driver holding the EXE) holds that one thread however
 /// often the readers ask, and they answer from the marker meanwhile.
 #[cfg(target_os = "windows")]
-pub(crate) struct ExeVersions {
+struct ExeVersions {
     read: fn(&std::path::Path) -> Option<String>,
     /// The last read's answer and the files it was made for. Locked only to
     /// look at it or to replace it, never across a read.
@@ -771,14 +775,9 @@ pub(crate) struct ExeVersions {
     reads: crate::one_in_flight::OneInFlight<()>,
 }
 
-// RED (#3908): the readers take `now` in the next commit.
-#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 impl ExeVersions {
-    pub(crate) const fn new(
-        thread_name: &'static str,
-        read: fn(&std::path::Path) -> Option<String>,
-    ) -> Self {
+    const fn new(thread_name: &'static str, read: fn(&std::path::Path) -> Option<String>) -> Self {
         Self {
             read,
             last: std::sync::Mutex::new(None),
@@ -833,8 +832,6 @@ struct Stamp {
     exe: Option<(std::time::SystemTime, u64)>,
 }
 
-// RED (#3908): read through `ExeVersions::now` from the next commit.
-#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 impl Stamp {
     fn of(dir: &std::path::Path) -> Self {
@@ -854,21 +851,27 @@ impl Stamp {
 /// still being read: the answer is then the marker's.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BesideNow {
-    pub(crate) version: Option<String>,
-    pub(crate) settled: bool,
+struct BesideNow {
+    version: Option<String>,
+    settled: bool,
 }
 
-/// #3908 — the companion's version in `dir`, for the readers that may not
-/// wait. RED: the marker alone, as before #3908.
+/// #3908 — the companion's version in `dir` by the refresh's rule
+/// ([`known_version`], #3850), for the readers that may not wait: the marker
+/// when it names `own` (one small file read, the common case); else what the
+/// EXE states, as `versions` read it for the files there now; else the
+/// marker's own words. With no answer for those files yet, the marker's
+/// words, not settled, and the read starts.
 #[cfg(target_os = "windows")]
 fn known_beside(dir: &std::path::Path, own: &str, versions: &'static ExeVersions) -> BesideNow {
-    let _ = (own, versions);
     let marker = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok();
-    BesideNow {
-        version: marker.as_deref().and_then(sanitize_version),
-        settled: true,
-    }
+    let mut settled = true;
+    let version = known_version(own, marker.as_deref(), || {
+        let stated = versions.now(dir);
+        settled = stated.is_some();
+        stated.flatten()
+    });
+    BesideNow { version, settled }
 }
 
 /// #3850 — the version the EXE at `exe` states in its own version resource
@@ -1357,7 +1360,8 @@ impl Companion {
 /// thread of its own, never run.
 ///
 /// Cached for [`VERSION_TTL`]: the answer only changes when a package manager
-/// runs, and the heartbeat is every 30 s.
+/// runs, and the heartbeat is every 30 s. #3908: an answer that is not
+/// settled is not kept ([`kept_version`]).
 pub fn installed_version() -> Option<String> {
     kept_version(&VERSION_CACHE, || {
         #[cfg(target_os = "windows")]
@@ -1373,8 +1377,11 @@ pub fn installed_version() -> Option<String> {
 }
 
 /// [`installed_version`] over `cache`: the answer it holds while that is
-/// younger than [`VERSION_TTL`], else `read`'s. RED (#3908): kept whether
-/// `read` says it is settled or not, as before.
+/// younger than [`VERSION_TTL`], else `read`'s. #3908: `read`'s is kept only
+/// when it says the answer is settled. A Windows answer from the marker while
+/// the EXE's version is still being read goes out once, and the next
+/// heartbeat reads again, instead of sending the marker's version for ten
+/// minutes after each start.
 fn kept_version(
     cache: &std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
     read: impl FnOnce() -> (Option<String>, bool),
@@ -1384,8 +1391,10 @@ fn kept_version(
     {
         return v.clone();
     }
-    let (v, _settled) = read();
-    *cache.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+    let (v, settled) = read();
+    if settled {
+        *cache.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+    }
     v
 }
 
@@ -6814,7 +6823,8 @@ mod beside_version_tests {
     }
 
     /// #3908, the control: a marker naming this daemon's version reads as
-    /// today, and the EXE is not read at all, whatever it states.
+    /// today, and the EXE is not read at all, whatever it states. With no EXE,
+    /// as today too: no tray to refuse, no version to report, nothing read.
     #[test]
     fn a_marker_naming_this_version_reads_as_today() {
         static READS: AtomicUsize = AtomicUsize::new(0);
@@ -6823,12 +6833,24 @@ mod beside_version_tests {
             super::exe_version(exe)
         }
         let beside = Beside::new(counted);
-        beside.exe(&resource(&[("ProductVersion", OLD)]));
+        let exe = beside.exe(&resource(&[("ProductVersion", OLD)]));
         for marker in [format!("{OWN}\n"), format!("{OWN}\r\n"), OWN.to_string()] {
             beside.read_only_marker(&marker);
             assert_eq!(beside.installed(), settled(OWN), "{marker:?}");
             assert_eq!(beside.too_old(), None, "{marker:?}");
         }
+
+        std::fs::remove_file(exe).expect("remove the EXE");
+        beside.read_only_marker(&format!("{OLD}\n"));
+        assert_eq!(
+            beside.installed(),
+            BesideNow {
+                version: None,
+                settled: true
+            },
+            "no EXE"
+        );
+        assert_eq!(beside.too_old(), None, "no EXE");
         assert_eq!(READS.load(SeqCst), 0, "the EXE is not read");
     }
 
