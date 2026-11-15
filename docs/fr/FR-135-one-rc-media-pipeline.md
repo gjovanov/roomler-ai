@@ -175,7 +175,7 @@ The send task holds the `video_bytes_dc` mutex for a frame's whole chunked send 
 
 ### 2.6 Eight readers of "which encoder" [R]
 
-Probe (`encode/caps.rs`), pick (`signaling.rs:3500`), RTP track bind (`peer.rs:13344`), RTP open (`encode/mod.rs:1613`), DC dispatcher (`peer.rs:2420-2638`), DC open (`peer.rs:5247`), GPU plan (`encode/ffmpeg/gpu_input.rs:130`), viewer (`ui/src/composables/videoCells.ts`, `ui/src/composables/useRemoteControl.ts:3471`), and the bench's mirror (`encode/bench.rs:808`). Twenty named divergences between them are listed in §5.7. The three that cost the most:
+Probe (`encode/caps.rs`), pick (`signaling.rs:3500`), RTP track bind (`peer.rs:13344`), RTP open (`encode/mod.rs:1617`), DC dispatcher (`peer.rs:2420-2638`), DC open (`peer.rs:5247`), GPU plan (`encode/ffmpeg/gpu_input.rs:130`), viewer (`ui/src/composables/videoCells.ts`, `ui/src/composables/useRemoteControl.ts:3471`), and the bench's mirror (`encode/bench.rs:906`). Twenty named divergences between them are listed in §5.7. The three that cost the most:
 
 - `chosen_codec` is bound before the transport and without it (`signaling.rs:3499-3515`), so a session can bind a codec no opener on that transport has: #3245, 7 sessions on one laptop in 7 days, connected and black, the watchdog looping [M].
 - `codecs` is a union of what MF and FFmpeg opened on RTP or DC, read by one consumer that means RTP (`encode/caps.rs:1860`, `:1917`, `:1939`, `:2186`, `:2209`).
@@ -192,7 +192,7 @@ Probe (`encode/caps.rs`), pick (`signaling.rs:3500`), RTP track bind (`peer.rs:1
 
 ### 2.8 Rate and recovery [R, M]
 
-- **The 25 M ceiling.** The ladder tops at 25 M (`encode/aimd.rs:299`). Replacements open at `coarsen_bitrate` ≤ 25 M (`encode/ffmpeg/encoder.rs:2576`), FR-119's fps swaps included, while the heartbeat prints above 100 M. After a first rung crossing an in-place backend caps at 25 M for the session. There is no maxrate in the heartbeat. Whether viewers see this is unknown; 28 % of FFmpeg DC sessions ask above 60 fps, 3.3 h, where the ceiling matters.
+- **The 25 M ceiling.** The ladder tops at 25 M (`encode/aimd.rs:299`). Replacements open at `coarsen_bitrate` ≤ 25 M (`encode/ffmpeg/encoder.rs:2583`), FR-119's fps swaps included, while the heartbeat prints above 100 M. After a first rung crossing an in-place backend caps at 25 M for the session. There is no maxrate in the heartbeat. Whether viewers see this is unknown; 28 % of FFmpeg DC sessions ask above 60 fps, 3.3 h, where the ceiling matters.
 - No pacer on the wire. Keyframes are unbounded except by HRD (8.6 MB is legal at AV1 34.56 M), and ~625 KB blocks the wire about 72 ms [M FR-119 §4.12].
 - SCTP: `RTO_MIN` 1 s, initial 3 s (`crates/vendored/webrtc-sctp/src/timer/rtx_timer.rs:9-11`), T3 drops cwnd to one MTU, a 128 KiB pending semaphore shared by control, cursor and clipboard per ordering class (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:20`), initial cwnd 4,380 B. `peer.rs` never sets the receive buffer. Measured DC throughput is loopback only, 275-376 Mbit/s; a real path at high rates is unknown.
 - Every repair is a full IDR or a new session. Time to recover from a lost frame has no number anywhere.
@@ -342,7 +342,7 @@ So a 2 s window where the host framed under 5 real frames a second should read 0
 | N2 | `rc.l4` needs a join; logs age out in 7 d | `target_fps`, dims, codec, chroma, carrier, render path, decoder hw on the record | `ui/src/composables/rcBench.ts:371-431` | 0.5 | R0 |
 | N3 | arm and keepalive share unseen | `capture_backend`, `frames_keepalive`, `keepalive_bytes` on both DC pumps | `peer.rs:9745-9760`, `:5133` | 0.5 | R0 |
 | N7 | age starts at hand-off | capture → hand-off p50/p95 on the heartbeat, one epoch | `peer.rs:9365`, `:9553` | 1 | R0 |
-| N8 | VideoToolbox's encode is on no timer | pts → submit map, `enc_latency_ms` at packet out, every backend | `encode/ffmpeg/encoder.rs:2363`, `:2813`, `:2971` | 1 | R0 |
+| N8 | VideoToolbox's encode is on no timer | pts → submit map, `enc_latency_ms` at packet out, every backend | `encode/ffmpeg/encoder.rs:2370`, `:2820`, `:2978` | 1 | R0 |
 | N9 | decode and paint are HUD-only | `dec_ms`, `paint_ms`, `fwd_ms`, `backlog_ms`, `chunk_gaps`, `decoder_hw` on `rc:decodestat`; shared with FR-63's v2 fields | `useRemoteControl.ts:2366-2428`, `peer.rs:10684-10757` | 1 | R0 |
 | N10 | jitter is a console paste | arrival and hand-off interval histograms, log buckets, per 2 s window | workers, heartbeat | 1.5 | R0 |
 | N11 | no freeze counter | worker counts paint gaps > 200 ms, cumulative; since #3875 only the part the host's own framing does not explain: a gap more than 200 ms longer than the host's longest pause between the two painted frames, every header the worker saw counted as framed (§3.5); `freezeCount` from `getStats` on `<video>` | workers (`ui/src/workers/rc-freeze.ts`), `session_telemetry.rs`, `crates/remote_control/src/signaling.rs:737` | 1.5 | R0; qualified in Wave B (#3875) |
@@ -429,22 +429,22 @@ Bare paths are relative to `agents/roomlerd/src/`; `:N` continues the file just 
 | cap:SPC-31 | `capture/scrap_backend.rs:389-392`, `capture/drm_backend.rs:1176-1178` | Pointer rides capture asks; hidden after 2 s of none | stage's bounded wait keeps asking on those arms | stays as a contract line, then a pointer thread if a later FR wants one |
 | cap:NOP-19 | `peer.rs:2847`, `:4400` | RTP never caps output; RTP and VP9 never set the rate | `apply` from the `Plan`, for every path | R8, R11 |
 | — | `system_context/capture_pump.rs:285`, `system_context/dxgi_direct.rs:1174` | `set_target_fps` empty on DXGI; `AcquireNextFrame(0)` | cadence on the stage; a real wait with two devices | R4b, R5 |
-| — | `encode/ffmpeg/encoder.rs:2836`, `:2853` | Encoder reopens when the capture device changes, 0.6-0.9 s on Iris Xe | encoder device by LUID; the capture device is free to churn | R5 |
+| — | `encode/ffmpeg/encoder.rs:2843`, `:2860` | Encoder reopens when the capture device changes, 0.6-0.9 s on Iris Xe | encoder device by LUID; the capture device is free to churn | R5 |
 | — | `encode/ffmpeg/gpu_input.rs:111`, `:130` | GPU form by name; proof on the wrong adapter | `CellSpec.input_forms` + `CellProof` keyed by arm | R10 |
 | — | `signaling.rs:3499-3515` | `chosen_codec` before transport | `pick(path, …)` | W-1 PR 2 starts it, R10 finishes |
 | — | `encode/caps.rs:1860`, `:1917`, `:1939`, `:2186`, `:2209` | `codecs` is a union | derived RTP column | R9 |
-| enc:I005 | `encode/ffmpeg/encoder.rs:3141-3142` | `is_hardware` always true | `CellSpec.hw`, per backend | R10 |
+| enc:I005 | `encode/ffmpeg/encoder.rs:3148-3149` | `is_hardware` always true | `CellSpec.hw`, per backend | R10 |
 | enc:I185 | `encode/caps.rs:2044` | A `vp9_vaapi` cell takes `hw` from a QSV check | same | R9 |
 | enc:I177 | `encode/ffmpeg/encoder.rs:411` | Every QSV name's `low_power` comes from the `vp9_qsv` verdict | per-row verdict | R10 |
 | — | `encode/caps.rs:1883-1894` | `mf-h264-hw` says hardware for the software MFT | labels generated from the row | R9 |
-| enc:I172 | `encode/mod.rs:305`, `:343`, `:372`, `:545` | Knob values have nine spellings | one parser | R0 |
+| enc:I172 | `encode/mod.rs:307`, `:345`, `:374`, `:547` | Knob values have nine spellings | one parser | R0 |
 | enc:I253 | `encode/plan.rs:90-94` | "Every knob": it is not every knob | the producer holds them | R6 |
-| — | `encode/mod.rs:1641` | RTP AV1 is MF-only, so it Noops | no RTP AV1 row | W-1 PR 2, R10 |
-| enc:I010 | `encode/mod.rs:1354-1368` | `NoopEncoder`: looks alive, ships nothing | a typed open failure | R11 |
-| — | `encode/mod.rs:1277`, `encode/thread.rs:58` | Two encoder front doors, three "encoder on a thread" copies. `recording/`, `app.rs:6335`, `:6456` and `encode/bench.rs:829` use them too | `EncoderBackend` | R8, R11, then R11b |
-| — | `encode/mod.rs:1299`, `:1320` | `request_reference_invalidation` is a keyframe; `set_roi_hints` is nothing | deleted until a backend does either | R8 |
+| — | `encode/mod.rs:1740` | RTP AV1 is MF-only, so it Noops | no RTP AV1 row | W-1 PR 2, R10 |
+| enc:I010 | `encode/mod.rs:1356-1370` | `NoopEncoder`: looks alive, ships nothing | a typed open failure | R11 |
+| — | `encode/mod.rs:1279`, `encode/thread.rs:58` | Two encoder front doors, three "encoder on a thread" copies. `recording/`, `app.rs:6345`, `:6466` and `encode/bench.rs:923` use them too | `EncoderBackend` | R8, R11, then R11b |
+| — | `encode/mod.rs:1301`, `:1322` | `request_reference_invalidation` is a keyframe; `set_roi_hints` is nothing | deleted until a backend does either | R8 |
 | — | `peer.rs:2336`, `:2667`, `:2676`, `:3033` | `encoder_preference` binds RTP only | a filter in `pick`, both paths | R10 |
-| — | `encode/aimd.rs:299`, `encode/ffmpeg/encoder.rs:2576` | Ladder tops at 25 M and replacements honour it | rungs to 160 M; ceiling from the `Plan` | R12 |
+| — | `encode/aimd.rs:299`, `encode/ffmpeg/encoder.rs:2583` | Ladder tops at 25 M and replacements honour it | rungs to 160 M; ceiling from the `Plan` | R12 |
 | — | `encode/frame_rate.rs:94-108` | Fps verdict cache key has no chroma or input path | column on the row | R10 |
 | — | `ui/src/composables/useRemoteControl.ts:3471` | Rank in one function, five readings of it | one rank over cells | R13 |
 | view:M21 | `useRemoteControl.ts:3481`, `:3485` | `enc.includes('ffmpeg-vp9_qsv')` | a cell field | R13 |
@@ -767,7 +767,7 @@ flowchart LR
 
 **One pipeline, 1..N sinks.** `media_share.rs` today makes the first session's pump the owner and later same-profile sessions followers. That stays, as a pipeline with several sinks. Per-viewer inputs still merge as floors in the controller, a congested follower still gates production, and joiner gating and spill keep their behaviour. No frame is dropped per viewer after encode, for the reason the module gives (`media_share.rs:1-48`). R7 and R8 carry this, each with a two-viewer read. FR-132's P1d reads absent on a follower, so N16 names followers rather than leaving an absence.
 
-**Teardown leaves the runtime.** The controller signals stop and awaits a oneshot with a timeout. If a stage does not answer (a driver hung inside `avcodec_close`), it emits `stage_stuck`, the session ends with a reason, and the thread is leaked and counted. The process stays up, because a stuck driver thread cannot be killed, and that has a bound. A leaked capture stage keeps the DXGI seat, so later sessions would meet `E_INVALIDARG` and fall to GDI (§2.4). So with three leaked stages [reasoned] and no live session, the daemon takes the existing watchdog exit: `app.rs:4475-4476` registers `encoder` and `capture` pumps that nothing gates (`watchdog.rs:314`). It does so only where a supervisor will relaunch it. An orphan never exits, by `docs/remote-config.md` §7b's rule, and stays up, counted, until someone restarts it. A per-session media process would isolate all this, and it is not in this plan (§6.14).
+**Teardown leaves the runtime.** The controller signals stop and awaits a oneshot with a timeout. If a stage does not answer (a driver hung inside `avcodec_close`), it emits `stage_stuck`, the session ends with a reason, and the thread is leaked and counted. The process stays up, because a stuck driver thread cannot be killed, and that has a bound. A leaked capture stage keeps the DXGI seat, so later sessions would meet `E_INVALIDARG` and fall to GDI (§2.4). So with three leaked stages [reasoned] and no live session, the daemon takes the existing watchdog exit: `app.rs:4485-4486` registers `encoder` and `capture` pumps that nothing gates (`watchdog.rs:314`). It does so only where a supervisor will relaunch it. An orphan never exits, by `docs/remote-config.md` §7b's rule, and stays up, counted, until someone restarts it. A per-session media process would isolate all this, and it is not in this plan (§6.14).
 
 **FR-70's words, refined.** FR-70 says one media thread per session owning capturer, scaler and encoder. That loses pipelining: on a pull arm throughput stays 1 / (capture + encode). Two threads with a latest-wins slot give 1 / max(stage). Its invariant stands unchanged: *the media thread never makes a rate or geometry decision; it reads a plan.*
 
@@ -848,7 +848,7 @@ impl<T> LatestSlot<T> {
 
 FR-118's contract stands: `FrameData`, the proof child, `zero_copy_deny`, and FR-132's default per cell. This FR amends one line of it: FR-118 §4.3 "one device, shared".
 
-**The problem.** On one D3D11 device, a thread waiting in `AcquireNextFrame` holds the device's multithread lock. Every encoder call behind it waits [M #3272 S1, S8 control: lock p50 4-19 ms, p99 ≈ 1 s]. So a zero-copy host cannot wait, and stays on a 2 ms poll floor: about 15,500 calls per 30 s (W-1's decision, #3272). There are costs beyond the polling: lock tails, and an encoder that reopens when the capture device churns, 0.6-0.9 s on Iris Xe at a lock edge (`encode/ffmpeg/encoder.rs:2836`, `:2853`).
+**The problem.** On one D3D11 device, a thread waiting in `AcquireNextFrame` holds the device's multithread lock. Every encoder call behind it waits [M #3272 S1, S8 control: lock p50 4-19 ms, p99 ≈ 1 s]. So a zero-copy host cannot wait, and stays on a 2 ms poll floor: about 15,500 calls per 30 s (W-1's decision, #3272). There are costs beyond the polling: lock tails, and an encoder that reopens when the capture device churns, 0.6-0.9 s on Iris Xe at a lock edge (`encode/ffmpeg/encoder.rs:2843`, `:2860`).
 
 **The change: two D3D11 devices on one adapter, sharing a pool.** Sunshine does this (`Sunshine@c31fa9a src/platform/windows/display_vram.cpp:875-886`, `:1001-1005`, `:1975-1979`, `:2004-2008`, `:2139-2153`).
 
@@ -869,7 +869,7 @@ A superseded slot's key is 1, not 0, so capture acquires with the slot's real ke
 
 - **Measured [S8, one machine].** With a thread waiting on A, a sampler on B reads lock p50 1 µs, p99 3 µs, against 4-19 ms and ~1 s on one device. Readback p50 4.6 ms against 14.4 ms, p99 5.7-7.8 ms against up to 1 s. The hand-off costs **+0.28 ms (RTX 5090) and +0.49 ms (Radeon 610M) p50 per frame at 2560×1600**, of which +0.1 ms on the capture thread. Not measured: Intel (QSV's population, spike S13), an NVIDIA-driven panel, FFmpeg's real encoder surfaces, a SYSTEM token. Sunshine runs this in a service session by its source.
 - **Gives.** A real wait on zero-copy hosts, so W-1's floor arm retires. No lock tails. The encoder no longer reopens when the capture device churns: device B is created by LUID with `D3D_DRIVER_TYPE_UNKNOWN` (the trap Sunshine documents) and outlives A while that LUID holds.
-- **A changed LUID.** A dock, a MUX switch or a driver reset can move the adapter, and a shared handle cannot cross adapters. So the pool is torn down, and device B is rebuilt make-before-break on the new LUID, as `follow_capture_device`'s `moved` does today (`encode/ffmpeg/encoder.rs:2842-2858`). Frames use the CPU form meanwhile, and the step is a ladder entry.
+- **A changed LUID.** A dock, a MUX switch or a driver reset can move the adapter, and a shared handle cannot cross adapters. So the pool is torn down, and device B is rebuilt make-before-break on the new LUID, as `follow_capture_device`'s `moved` does today (`encode/ffmpeg/encoder.rs:2849-2865`). Frames use the CPU form meanwhile, and the step is a ladder entry.
 - **Costs.** +0.3-0.5 ms a frame against a 2.5 ms-class poll saving, and 400 lines. If Intel measures worse, R5 stays on one device there, by cell.
 - **A new input form gets its own proof.** A keyed-mutex shared texture opened on a second device and fed into QSV or NVENC surfaces is not what FR-118's `gpu` child proves: that child opens on the capture adapter's device and feeds `probe_gpu_frame(device, pool, i)`, one device (`encode/caps.rs:874`, `:929`). A fault there would land in the daemon, under SYSTEM, the 0xc0000005 class the rule exists for (`.claude/skills/encoder-cells/SKILL.md:61`, `:80-83`). So R5's first PR is a `gpu-shared` child phase: two devices on the adapter, a keyed-mutex shared texture, real frames through device B into the encoder's own surfaces. Its proof is keyed on that form and read at every open, and a host whose `gpu-shared` child has not passed stays on one device. R5's second PR is the hand-off.
 - **Fallback.** The kill switch `zero_copy_shared` restores today's one device and floor. Both stay until a fleet week reads clean.
@@ -892,7 +892,7 @@ A superseded slot's key is 1, not 0, so capture acquires with the slot's real ke
 
 ### 6.4 Encoder surface
 
-Today there are two front doors and three copies of "an encoder on its own thread" (`encode/mod.rs:1277`, `encode/thread.rs:58`). After:
+Today there are two front doors and three copies of "an encoder on its own thread" (`encode/mod.rs:1279`, `encode/thread.rs:58`). After:
 
 ```rust
 pub trait EncoderBackend: Send {
@@ -980,7 +980,7 @@ pub fn pick(path: MediaPath, browser: &BrowserCaps, pref: EncoderPreference,
 | RTP bind (`peer.rs:13344`) | Derives from the row; a DC row gets its placeholder by rule, no row in common is the refusal |
 | RTP open, DC dispatcher, DC open | One `open(binding, dims, fps, bps, input)` walking the rows `pick` chose, reporting each attempt |
 | GPU plan (`gpu_input.rs:130`) | `input_forms` + `CellProof.gpu`, keyed by arm |
-| Bench mirror (`encode/bench.rs:808`) | Calls the same `open`, so the "needs the same change" warning in `docs/testing.md` retires |
+| Bench mirror (`encode/bench.rs:906`) | Calls the same `open`, so the "needs the same change" warning in `docs/testing.md` retires |
 | Viewer (`videoCells.ts`, the rank) | Reads cells only; one rank (R13) |
 | Denylists: `encoder_cells_deny`, `zero_copy_deny`, `fps_deny` | One predicate over `(name, chroma, input, fps)` every open calls. The keys and wire stay |
 
@@ -995,7 +995,7 @@ The table also records what S7 found. H.264 `max_num_reorder_frames=0` is presen
 This FR does not redesign the law. FR-63's controller publishes the `Plan` once its flip criterion is fixed. FR-79's gate, FR-71's classifier and FR-62's per-backend `RateReconfig` stand. What this adds, each small:
 
 - `rate_move` per cell. QSV's rationing survives, as a cost the controller reads.
-- **The ladder extends above 25 M** (32, 40, 50, 65, 80, 100, 130, 160 M) and a replacement honours the `Plan`'s ceiling (`encode/aimd.rs:299`, `encode/ffmpeg/encoder.rs:2576`). This is cheap, and high value for the 28 % of sessions asking above 60, 2.8 moving hours. FR-63's B3 deletes that ladder, so the rungs land on the `Plan`'s ceiling if B3 has landed; otherwise on one table in `aimd.rs`, and FR-63's law carries the same ceiling.
+- **The ladder extends above 25 M** (32, 40, 50, 65, 80, 100, 130, 160 M) and a replacement honours the `Plan`'s ceiling (`encode/aimd.rs:299`, `encode/ffmpeg/encoder.rs:2583`). This is cheap, and high value for the 28 % of sessions asking above 60, 2.8 moving hours. FR-63's B3 deletes that ladder, so the rungs land on the `Plan`'s ceiling if B3 has landed; otherwise on one table in `aimd.rs`, and FR-63's law carries the same ceiling.
 - Maxrate in the heartbeat, and a cause-tagged IDR counter (R0).
 - `keepalive`, `chroma` and a monotonic `idr_epoch` join FR-70's `Plan` (`encode/plan.rs:105`), so a keyframe ask cannot be lost in a republish. The plan stays `Copy`, with an epoch.
 - `PlanKnobs` takes the `rate_plan` inputs it omits, so the frame path reads no knob at all.
@@ -1369,7 +1369,7 @@ Sizes are changed lines in a PR, S ≤ 300, M 300-1,000, L 1,000-2,500 (§7.6). 
 | **R8** `EncodeStage`: FFmpeg + libvpx, one loop, `media_share` as a fan-out sink | 2 + a flip, L + L | 15 | 3 weeks, then the delete gate | every DC hour structurally; VP9 0.9 as behaviour | −4,040 lines net. VP9's inline rebuild stall gone. A stage exit reaches the viewer | 164 |
 | **R10** Eight readers flip to the table; the hybrid pick rule; MF out if D3 | 2, L + M | 10 | 1 week | all, 23.3 | The #3245 class is unreachable. −2,618 lines with D3, −500 without | 190 |
 | **R11** `RtpSink`, REMB into the controller, `media_pump` deleted | 2, L + S | 8 | 1 week, forced sessions, then the delete gate | RTP 0.7 | −978 lines net. The contract has no exception left | 32 |
-| **R11b** `recording/`, `app.rs:6335`, `:6456` and `encode/bench.rs:829` move to `EncoderBackend`; on the delete gate the two front doors go, in R15 | 1, M | 4 | FR-85's recording read | recordings: no live-session hours | §4.2's "two front doors" row closes. Without this phase it stays | 2 |
+| **R11b** `recording/`, `app.rs:6345`, `:6466` and `encode/bench.rs:923` move to `EncoderBackend`; on the delete gate the two front doors go, in R15 | 1, M | 4 | FR-85's recording read | recordings: no live-session hours | §4.2's "two front doors" row closes. Without this phase it stays | 2 |
 | **R12** High refresh | 2, M + M | 24 incl. N4, N5, N14, N15, N17, N18 | 2 weeks | above 60: 3.3, 2.8 | §3.5's delivered-rate SLO at 120 and 144 on the cells that fit. Today 0.9-42.1 % of windows reach 90 % of target, idle windows mixed in. Its ladder rungs land on the `Plan`'s ceiling if B3 has landed; otherwise on one table in `aimd.rs`, and FR-63's law carries the same ceiling | 12 |
 | **R13** One rank, transform worker retired | 1, M | 5 | 1 week, every browser class | all, 23.3 | −1,559 lines. Picker and decoder cannot disagree | 93 |
 | **R15** Remaining deletions, on counters | S each | 3 | per release | none | −500 lines, and the knobs at §4.3's end state | 63 |
@@ -1401,7 +1401,7 @@ Rollback for an agent row is the switch, then a forward release with the default
 | R13 | `roomler-rc-rank-legacy` | A truth-table test of `decodes(codec, chroma, profile)` against today's rank fails on at least one row. If none fails, the phase's value is deletion only, and the PR says so | One rank. One field session per browser class in §12, including phones. `rc-webcodecs-worker.ts`'s reach reads zero before its delete |
 | R15 | None: runs only on a zero | Each deletion cites a counter reading zero across a release | The ledger's `delete outright` rows closed. Both keys empty and removed |
 
-| R11b | `recording_door` | `recording/` opens encoders through both retired doors (`recording/recorder.rs:37-38`, `:369`, `:512`, `recording/child.rs:330`, `recording/fit.rs:45`, `recording/export.rs:245`), and so do `app.rs:6335`, `:6456` and `encode/bench.rs:829` | One door in use. FR-85's recording read within its spread: an HQ recording and an export on each OS. `encode/mod.rs:1277` and `encode/thread.rs:58` go on the gate |
+| R11b | `recording_door` | `recording/` opens encoders through both retired doors (`recording/recorder.rs:37-38`, `:369`, `:512`, `recording/child.rs:330`, `recording/fit.rs:45`, `recording/export.rs:245`), and so do `app.rs:6345`, `:6466` and `encode/bench.rs:923` | One door in use. FR-85's recording read within its spread: an HQ recording and an export on each OS. `encode/mod.rs:1279` and `encode/thread.rs:58` go on the gate |
 
 R6, B2, B3 and A4 carry the switch and proof their own specs give them: FR-70's byte-identical acceptance and `plan_divergences` at fleet zero, FR-63's `ratectl`, FR-62's per-row preconditions. R16 changes only docs.
 

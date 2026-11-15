@@ -766,11 +766,12 @@ escaping, on every line that holds it:
 |---|---|---|
 | `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
 | `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
-| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2165`) |
-| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2083`) | the four `ssh: forward …` lines |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2221`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2087`) | the four `ssh: forward …` lines |
 | `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:901`, `:924`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
 | `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
 | `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
+| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2172`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
 
 Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
 question's id), which the SYSTEM service checks with `valid_object_id` before it
@@ -781,8 +782,10 @@ service, which `clean_reason` has stripped of control characters. The exec
 engine's lines serve fleet RPC too, so a fleet RPC command's `caller` is escaped
 there as well. Pinned by `ssh::tests::wire_text_log_tests`: a client's login
 name, terminal, subsystem and forward hosts; a grant's caller, through the
-question to the person at the device and on the SYSTEM service's port; and a
-named account. Each holds a line break and a control character.
+question to the person at the device and on the SYSTEM service's port; a
+named account; and a stand-in `sftp-server`'s stderr, exactly one line for it
+(#3890). Each holds a line break and a control character; one more stand-in
+writes 6000 bytes and its line keeps 4 KiB.
 
 ### A received file's folders are its writer's own (#3688)
 
@@ -1130,6 +1133,8 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
   (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
   elevation passes none of them, and the person socket keeps its own rules. A machine-wide
   install's worker runs in the console session, so there they decide as they always did.
+  Their refusals name the person they take, "only the person at this device's screen …"
+  (#3907), never the console, whose person a per-user install over Remote Desktop refuses.
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go

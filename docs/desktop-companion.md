@@ -432,7 +432,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2243`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2253`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -1806,7 +1806,7 @@ Who calls them, and how each is read:
 | Caller | Runs | Taken as |
 |---|---|---|
 | the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2545`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2615`) | as the person, in their session | the screen's session |
-| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2489`; `rc_cmd`, `:2386`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
+| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2499`; `rc_cmd`, `:2396`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
 The tests, in `crates/localapi`: `the_screen_decision_table` (every row above, a per-user daemon
@@ -1841,8 +1841,15 @@ is. Each gate's other conditions are as they were:
 | its own session unreadable, or session 0 with no console session | no Windows peer |
 
 Unlike a consent answer, these gates take no SYSTEM or elevated caller from outside the screen's
-session, as before. The refusals keep their words ("only the person at this device's
-console …"), and Unix reads no session, so there each gate decides by the uid.
+session, as before, and Unix reads no session, so there each gate decides by the uid.
+
+Each refusal names the person these gates take (#3907): "only the person at this device's screen
+can …", in its gate's own words (`not_the_console_user`, `not_the_console_user_for_external_access`
+and `not_the_person_for_keep_busy`, `crates/localapi/src/lib.rs:3237-3265`, and each
+`CONSOLE_PERSON_KEYS` entry's `refusal`). On a machine-wide install the screen is the console's,
+so they read as before. On a per-user install used over Remote Desktop the person at the console
+is the one refused, whom the words of 0.4.222 and earlier ("only the person at this device's
+console …") named.
 
 The tests, in `crates/localapi`, run on every OS:
 `the_console_persons_gates_follow_the_screens_session` (a table per gate: a per-user daemon in
@@ -1854,7 +1861,13 @@ both scopes) and `the_console_persons_verbs_follow_the_screen_the_daemon_shows` 
 with the two session reads pinned for the test's thread: every verb from the screen's person
 reaches the daemon, from any other session none does, and stopping keep busy stays open). On
 Windows, `a_client_at_the_screen_sets_a_console_persons_key_over_a_real_pipe` reads a client from
-the OS over a real pipe, as the tray is read.
+the OS over a real pipe, as the tray is read. One test a gate pins its refusal's words, asked as
+the person at the console of a per-user daemon in an RDP session:
+`a_recording_verbs_refusal_names_the_person_at_the_screen`,
+`a_keep_busy_starts_refusal_names_the_person_at_the_screen`,
+`the_external_access_passwords_refusal_names_the_person_at_the_screen` and
+`a_console_persons_keys_refusal_names_the_person_at_the_screen` (every `CONSOLE_PERSON_KEYS`
+entry).
 
 ## 13. One version: the companion follows the daemon (FR-117)
 

@@ -282,7 +282,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:780-917`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:868-873`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:960`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3480`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:195`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3551`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:195`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:948`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:279-326`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:85-109`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`) | P0c, D5 |
@@ -294,7 +294,7 @@ and the consent chain's fallbacks.
 |---|---|---|---|---|---|---|
 | X1 | `exec` and SSH `daemon` mode run as the machine | 🟡 the console worker: the signed-in user on attended installs (#2021) | ✅ root | 🟡 root on the `-daemon` row, the user on the other | Two identities, one per row | FR-94; FR-43 P3 |
 | X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:819`), for SSH and exec's `run_as` | P5a |
-| X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1382`) | P4b |
+| X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1389`) | P4b |
 
 ### 2.6 Install, update, ops, architectures
 
@@ -309,7 +309,7 @@ and the consent chain's fallbacks.
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:271-295`, `:1534-1541`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1013-1022` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3720`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3730`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2617-2623`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:86-87`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
@@ -357,7 +357,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
 | code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:85-86`, `caps.rs:4923`, `tun.rs:3364-3369` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-86`, `agents/roomlerd/src/encode/caps.rs:4954`, `crates/tunnel-core/src/overlay/tun.rs:4157-4158`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:316`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:4010`, `:4106`, `:4513`, `agents/roomlerd/src/app.rs:5474` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:316`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:4010`, `:4106`, `:4513`, `agents/roomlerd/src/app.rs:5484` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -1010,7 +1010,7 @@ test of the SIGKILL property itself.
   - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`** (built). `sftp-server` runs through the `CreateProcessAsUserW` + three-pipe path
   the exec code already uses (`exec::run_console_user_program`, `exec.rs:1184`), instead of `tokio::process`
-  (`ssh.rs:1382`).
+  (`ssh.rs:1389`).
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
@@ -1039,7 +1039,7 @@ test of the SIGKILL property itself.
     through Unix tools.
   - Kill switch: `hive_adopt`, the device's own key, default off. `docs/hive.md` §8 (*On Windows*).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`app.rs:5681`):
+  reaches (`app.rs:5691`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:872`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,

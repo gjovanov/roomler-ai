@@ -4295,7 +4295,7 @@ mod tests {
         ] {
             assert!(is_daemon_owned_key(key), "{key}");
         }
-        let refusal = "only the person at this device's console can open it to people outside \
+        let refusal = "only the person at this device's screen can open it to people outside \
                        the organization, or change how";
         assert_eq!(
             explain_daemon_owned_error("external_access_enabled", refusal),
@@ -4659,10 +4659,10 @@ mod tests {
             explain_daemon_owned_error("files_dir", refused),
             "the service runs as SYSTEM/root, so files_dir must be inside the active user's profile (C:\\Users\\alice); D:\\Drops is outside it"
         );
-        let console = "localapi error: only the person at this device's console can change where incoming files land";
+        let not_the_screens = "localapi error: only the person at this device's screen can change where incoming files land";
         assert_eq!(
-            explain_daemon_owned_error("files_dir", console),
-            "only the person at this device's console can change where incoming files land"
+            explain_daemon_owned_error("files_dir", not_the_screens),
+            "only the person at this device's screen can change where incoming files land"
         );
         // An older daemon (key or verb unknown): a plain "update", not the
         // raw parse error — and still no direct write.

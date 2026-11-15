@@ -10,7 +10,8 @@
 #                         when ENROLL_EPHEMERAL=1, the default): stop the configless service, write the drop-in,
 #                         enroll, ONE clean start. Never restart an ephemeral daemon: on SIGTERM it unenrolls
 #   caps                  the daemon's probe verdict, the probe's own matrix, the cache
-#   smoke                 encoder-smoke --encoder hardware (an offline NVENC/VAAPI open, no session)
+#   smoke [ARGS]          encoder-smoke ARGS (default --encoder hardware): an offline open, no session, that passes
+#                         only on what it asked for and names what it tried (#3652); prints its exit code
 #   record [hardware|auto|software]
 #                         a ~10 s recording of a private Xvfb with --system-audio; prints the recorder's events and
 #                         the file's sample entries (avc1 = H.264; mp4a + esds = AAC, Opus + dOps = Opus), then
@@ -122,7 +123,11 @@ caps)
   ;;
 
 smoke)
-  sudo roomlerd encoder-smoke --encoder hardware 2>&1 | strip | tail -n 15 | cut -c1-300
+  [ "$#" -gt 0 ] || set -- --encoder hardware
+  sudo roomlerd encoder-smoke "$@" 2>&1 | strip | tail -n 15 | cut -c1-300
+  RC=${PIPESTATUS[0]}
+  say "encoder-smoke exit=$RC"
+  exit "$RC"
   ;;
 
 record)
@@ -173,5 +178,5 @@ stop)
   ;;
 
 *)
-  sed -n '2,22p' "$0"; exit 2 ;;
+  sed -n '2,23p' "$0"; exit 2 ;;
 esac
