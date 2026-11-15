@@ -105,7 +105,7 @@ pub struct BenchArgs {
 }
 
 /// What `encoder-smoke` runs. The plain smoke is what the release lane
-/// invokes (`encoder-smoke --encoder hardware`); the FR-62 sweep and this
+/// invokes (`encoder-smoke --name h264_mf`); the FR-62 sweep and this
 /// bench are opt-in modes beside it, and `--bench` conflicts with the sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmokeMode {

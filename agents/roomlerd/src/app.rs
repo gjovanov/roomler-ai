@@ -7973,16 +7973,20 @@ mod tests {
         assert!(service_env_var_lifetime("X_ROOMLERD_ENABLE_SYSTEM_SWAP").contains("stays"));
     }
 
-    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --encoder hardware` on
-    /// every freshly built EXE. The bench is opt-in: that line, and the bare
-    /// command, still parse to the plain 10-frame smoke with every flag where
-    /// it was before the bench existed.
+    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --name h264_mf` on
+    /// every freshly built EXE (#3652): Media Foundation's H.264 on either MFT,
+    /// since the runner has no GPU. The bench is opt-in: that line, and the
+    /// bare command (`--encoder hardware`), still parse to the plain 10-frame
+    /// smoke with every other flag where it was before the bench existed.
     #[test]
     fn the_release_lanes_encoder_smoke_is_still_the_plain_smoke() {
         use roomlerd::encode::bench::{SmokeMode, smoke_mode};
-        for argv in [
-            &["roomlerd", "encoder-smoke", "--encoder", "hardware"][..],
-            &["roomlerd", "encoder-smoke"][..],
+        for (argv, lane_name) in [
+            (
+                &["roomlerd", "encoder-smoke", "--name", "h264_mf"][..],
+                Some("h264_mf"),
+            ),
+            (&["roomlerd", "encoder-smoke"][..], None),
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             match cli.command {
@@ -8001,7 +8005,7 @@ mod tests {
                 }) => {
                     assert_eq!((encoder.as_str(), codec.as_str()), ("hardware", "h264"));
                     assert!(!reconfigure_sweep && !constrained && !json);
-                    assert_eq!((name, dump), (None, None));
+                    assert_eq!((name.as_deref(), dump), (lane_name, None));
                     assert_eq!((width, height, frames_per_rung), (1280, 800, 30));
                     assert!(!bench.bench && !bench.bench_full && !bench.bench_paced);
                     assert!(bench.bench_cells.is_empty() && bench.bench_sizes.is_empty());
