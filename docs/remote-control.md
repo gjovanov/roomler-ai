@@ -2694,7 +2694,7 @@ sequenceDiagram
   ([`peerAuthCanVerify`, `peerAuth.ts:138`](../ui/src/utils/peerAuth.ts#L138)), or every answer would read
   as a bad signature.
 - **What the device signs** ([`peer_auth_transcript`, `signaling.rs:240`](../crates/remote_control/src/signaling.rs#L240);
-  [`sign_answer`, `peer_auth.rs:265`](../agents/roomlerd/src/peer_auth.rs#L265)): the transcript above,
+  [`sign_answer`, `peer_auth.rs:276`](../agents/roomlerd/src/peer_auth.rs#L276)): the transcript above,
   ECDSA P-256 over SHA-256 as WebCrypto verifies it. The daemon signs at both places an answer leaves it, so a
   GUI worker that built the answer never holds the key.
 - **What the page does with the answer** ([`judgePeerAuth`, `peerAuth.ts:267`](../ui/src/utils/peerAuth.ts#L267),
@@ -2738,7 +2738,7 @@ changed** in every browser that pinned the old one, even when the server revives
 machine is a new identity until a person says otherwise.
 
 **The other direction: the device judges the browser (P1c).** The daemon judges the browser behind every in-org
-offer as it notes it ([`judge_offer`, `peer_auth.rs:220`](../agents/roomlerd/src/peer_auth.rs#L220)),
+offer as it notes it ([`judge_offer`, `peer_auth.rs:231`](../agents/roomlerd/src/peer_auth.rs#L231)),
 and the hub records the verdict on the session's `session_started` audit row
 ([`forward_answer`, `hub.rs:2455`](../crates/modules/fleet/src/hub.rs#L2455)). Nothing is refused
 before FR-100 P3; the record is what the fleet's audit week is counted over.
@@ -2757,7 +2757,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   nothing else ([`pick_config_path`, `app.rs:1111`](../agents/roomlerd/src/app.rs#L1111)), so no daemon copies a
   person's config, or its `peer-auth/`, to the machine-global path any more: the copy after a healthy run and the
   key adoption #3096 added to it are gone. A key is read from its file or made there
-  ([`load_or_make`, `peer_auth.rs:681`](../agents/roomlerd/src/peer_auth.rs#L681)). An administrator who moves an
+  ([`load_or_make`, `peer_auth.rs:740`](../agents/roomlerd/src/peer_auth.rs#L740)). An administrator who moves an
   enrollment to the machine-global path by hand moves its `peer-auth/` folder with it
   ([the SystemContext checklist](operator-systemcontext-smoke.md), step 2c): an enrollment that arrives without its
   key mints a new one, and every browser that pinned the device reads it as `key-changed`, though the device's
@@ -2770,6 +2770,24 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   outside a save the repair seals the keys folder and a key file only when that entry gave no account other than
   an administrator a right to change it as found; one another account could have written stays refused until an
   elevated Setup or `roomlerd enroll --machine-global` seals it.
+- **Any other config an elevated or SYSTEM daemon runs, it seals itself.** On Windows, a daemon that runs
+  elevated or as SYSTEM with a config outside the machine folder keeps `peer-auth\` sealed to SYSTEM and
+  Administrators: owner Administrators, protected, nothing inherited, and every file read and written by handle
+  ([`seal`, `peer_auth.rs:1343`](../agents/roomlerd/src/peer_auth.rs#L1343)).
+
+  | Who decides | Rule |
+  |---|---|
+  | [`keeping`, `peer_auth.rs:924`](../agents/roomlerd/src/peer_auth.rs#L924) | sealed only on Windows, elevated or SYSTEM, outside the machine folder, switch on. Unix keeps 0700/0600; the machine folder stays `machine_tree`'s |
+  | the first seal, per run | reads the folder as found, then seals it: a folder and key file Administrators or SYSTEM own are sealed in place, the key kept byte for byte, so no browser warns |
+  | | a folder or key file another account owns is never used: moved aside by handle (the folder as `peer-auth.moved-<unix>`, a file as `peer-auth.<name>.not-sealed-<UTC>` in the config folder), nothing deleted, and a new key made, which each browser that knew the old one warns about once. Where a policy gives an elevated process's files to its person (the "object creator" default owner), the first seal makes a new key |
+  | | a browser-key file is kept only when its folder and the file were closed to every other account as found; otherwise it is moved aside, and each browser reads `unknown` once more |
+  | every read after it | judged with [`verdict`, `machine_tree.rs:201`](../crates/agent-core/src/machine_tree.rs#L201) on the handle it reads through: a key file another account can change is not offered (the hello carries none, so the viewer shows **Unverified**), and a browser-key file another account can change is not read |
+  | a config folder that cannot be held as itself | redirected to a share, or reached through a link: the key is kept as before, no browser key is read or kept, and that is said once |
+  | a run neither elevated nor SYSTEM | a per-user install: nothing is sealed or changed. At a folder an elevated run sealed it offers no key, deletes nothing, and says once why and what to do: start it elevated again, or an administrator moves the folder away (a new key, one warning per browser) |
+  | `ROOMLERD_PEER_AUTH_SEAL=0` | read from the service's `Environment` value only ([`seal_enabled_in`, `peer_auth.rs:953`](../agents/roomlerd/src/peer_auth.rs#L953)), never the process's environment or the config: the switch is the service's, set where only an administrator sets it. Off keeps the behaviour from before, said once |
+
+  A later change that runs this worker with standard rights must first hand the sealed folder back to the person's
+  account (the SYSTEM host can), or each such device makes a new key once.
 - **The policy is the device owner's**: `roomler config set peer_auth off|audit` (default `audit`), live, and only
   from the person at the console. It is never pushable by the server, and `enforce` is refused by name until P3.
   `off` stops the judging, the remembering and the record; the device still signs its answers.

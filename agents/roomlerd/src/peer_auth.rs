@@ -947,8 +947,8 @@ const SEAL_SWITCH: &str = "PEER_AUTH_SEAL";
 /// companion switch is: under the first of `tunnel_core::env::PREFIXES` it is
 /// named with, in any case, as `flag` reads it. A value that could not be read
 /// (`None`), or one that does not name it, leaves the seal on. Never the
-/// process's own environment or the config: on an attended install both are
-/// the signed-in person's to write.
+/// process's own environment or the config: the switch is the service's, set
+/// where only an administrator sets it.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn seal_enabled_in(service_env: Option<&[(String, String)]>) -> bool {
     let value = service_env.and_then(|env| {
