@@ -674,6 +674,7 @@ install_daemon_linux() {
         digest="$(asset_field_for "$releases" "$pattern" digest)"
     fi
     [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest roomlerd release" >&2; exit 1; }
+    name_release "$releases" "$pattern"
     deb="$STAGE/roomlerd.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
@@ -843,6 +844,7 @@ install_daemon_macos() {
     url="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' browser_download_url)"
     digest="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' digest)"
     [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest roomlerd release" >&2; exit 1; }
+    name_release "$releases" 'aarch64-apple-darwin[^"]*\.pkg'
     pkg="$STAGE/roomlerd.pkg"
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
@@ -2013,6 +2015,87 @@ uninstall_finish() {
     exit 0
 }
 
+# #3881 — the release the download came from, as the server's feed names it,
+# and the installed daemon's own --version: information for the person and for
+# the labs that read this output. The feed's tag and the binary's answer are
+# printed only when they fit a small alphabet and 64 characters, and in fixed
+# words otherwise, so neither can write terminal control. Nothing here changes
+# a command the script runs or its exit code.
+fits_alphabet() {
+    case "$1" in
+        '' | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+say_unreadable() {
+    say "$1: unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
+}
+
+# The release that holds the asset the download takes. asset_field_for takes
+# the first asset over the WHOLE feed whose name matches $2, so when the newest
+# release lacks this host's file, the download comes from an older release, and
+# that one is named. Its tag is read from the line its release object starts
+# on: the nearest line above the asset that is not an asset itself. Only a line
+# that starts with "tag_name" and closes its quote is read; any other shape is
+# unreadable, never another release's tag.
+name_release() {
+    RELEASE_TAG=""
+    nr_tag=""
+    nr_line="$(tr '{' '\n' < "$1" \
+        | grep -n '"name":"[^"]*'"$2"'"' \
+        | grep '"browser_download_url":"[^"]*"' \
+        | head -n 1 | cut -d: -f1)" || nr_line=""
+    if [ -n "$nr_line" ] && [ "$nr_line" -gt 1 ]; then
+        nr_tag="$(tr '{' '\n' < "$1" \
+            | head -n "$((nr_line - 1))" \
+            | grep -v '^"name":"' \
+            | tail -n 1 \
+            | sed -n 's/^"tag_name":"\([^"]*\)".*/\1/p')" || nr_tag=""
+    fi
+    if fits_alphabet "$nr_tag"; then
+        RELEASE_TAG="$nr_tag"
+        say "release named by the server's feed: $nr_tag"
+    else
+        say_unreadable "release named by the server's feed"
+    fi
+}
+
+# After an install, the installed daemon's own word for its version. A
+# download-only run installs nothing, and the tunnel role's CLI names itself
+# (require_tunnel_cli).
+report_installed_version() {
+    if [ "$ROLE" != daemon ]; then
+        return 0
+    fi
+    if [ "$DOWNLOAD_ONLY" = 1 ]; then
+        say "installed daemon's own --version: none (download-only installs nothing)"
+        return 0
+    fi
+    riv_bin=/usr/bin/roomlerd
+    if [ "$OS" = Darwin ]; then
+        riv_bin="$MACOS_DAEMON_BIN"
+    fi
+    riv_rc=0
+    riv_out="$("$riv_bin" --version 2>/dev/null)" || riv_rc=$?
+    if [ "$riv_rc" != 0 ]; then
+        say "installed daemon's own --version: no answer ($riv_bin --version exited $riv_rc)"
+    elif [ -z "$riv_out" ]; then
+        say "installed daemon's own --version: no answer ($riv_bin --version printed nothing)"
+    else
+        riv_ver="$(printf '%s\n' "$riv_out" | head -n 1)"
+        riv_ver="${riv_ver#roomlerd }"
+        if fits_alphabet "$riv_ver"; then
+            say "installed daemon's own --version: $riv_ver"
+            if [ -n "${RELEASE_TAG:-}" ] && [ "${RELEASE_TAG#agent-v}" != "$riv_ver" ]; then
+                say "NOTE: the installed daemon's $riv_ver differs from the release this script resolved, $RELEASE_TAG"
+            fi
+        else
+            say_unreadable "installed daemon's own --version"
+        fi
+    fi
+}
+
 # ─── main ───────────────────────────────────────────────────────────────────
 
 if [ "$UNINSTALL" = 1 ]; then
@@ -2059,4 +2142,5 @@ if [ "$PRIV_STEPS" = 1 ]; then
     fi
 fi
 
+report_installed_version
 say "done."

@@ -1816,6 +1816,42 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
 
+### What the script says it installed (#3881)
+
+A daemon install, on Linux and on a Mac, names the release its download came from and, at the end,
+what the installed daemon reports. Both lines are information for the person and for the labs that
+read this output. Neither is a verification, and neither changes a command the script runs or its
+exit code (`scripts/install.sh:2018-2097`):
+
+```text
+==> resolving the latest roomlerd release from https://roomler.ai
+==> host: linux/x86_64, installing the .deb
+==> release named by the server's feed: agent-v0.4.221
+==> downloading roomlerd.deb
+==> sha256 verified: roomlerd.deb
+…
+==> installed daemon's own --version: 0.4.221
+==> done.
+```
+
+| Line | What it says | When its source cannot be read |
+|---|---|---|
+| `release named by the server's feed: <tag>` (`name_release`, called at `:677` on Linux and `:847` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
+| `installed daemon's own --version: <v>` (`report_installed_version`, `:2067`, called at `:2145`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
+| `NOTE: the installed daemon's <v> differs from the release this script resolved, <tag>` | printed only when both are readable and the tag without `agent-v` is not `<v>` | not printed |
+
+What the feed or the binary says is printed only when it fits the alphabet `A-Z a-z 0-9 . _ + -` and
+64 characters (`fits_alphabet`, `:2024`), so a tag cannot carry terminal control onto the screen. The
+tag is read from the line its release object starts on, which begins with `"tag_name"` as the server
+writes it; any other shape reads as unreadable, never as another release's tag. The tunnel role prints
+neither line: its CLI names itself after an install (`installed: roomler <v>`, `:1268`).
+
+`scripts/install-sh-output-check.sh` runs the real script, piped into the shell as the one-liner does,
+under dash and bash --posix, against stand-ins for the feed, the downloads, `sudo` and the daemon. It
+checks every line above, and that the cases of one mode record the same calls and exit code whatever
+the feed's tag or the daemon's answer. CI runs it in the "macOS post-install roads" job
+(`.github/workflows/ci.yml:2980-2985`).
+
 ### What a bare host needs (#3204)
 
 The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
@@ -1857,7 +1893,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1486`), and the wizard's root half is the same code:
+`scripts/install.sh:1488`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -1883,7 +1919,7 @@ left half-configured.
 The companion takes the same two steps and comes off again if they fail, because a
 half-configured companion blocks apt for the whole host. The CLI's arm keeps
 `apt-get -f install` on purpose: it checks the result and falls back to the tarball
-(`scripts/install.sh:1220`, #2472).
+(`scripts/install.sh:1222`, #2472).
 
 **What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
 on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
@@ -3114,9 +3150,9 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:2970-2971`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:2978-2979`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
-`:1360-1365`).
+`:1428-1433`).
 
 **An install started over a session that the root daemon serves ends that
 session.** `roomler ssh` and `roomler exec` reach such a Mac through the root
@@ -3236,8 +3272,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1428` (the section) — `uninstall_linux` at `:1872`,
-`uninstall_macos` at `:1494`.
+`scripts/install.sh:1430` (the section) — `uninstall_linux` at `:1874`,
+`uninstall_macos` at `:1939`.
 
 ```mermaid
 flowchart TD
