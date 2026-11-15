@@ -8893,7 +8893,7 @@ mod one_row_enroll_tests {
     fn install_sh_asks_for_the_flag_this_binary_prints() {
         use clap::CommandFactory;
         let script = include_str!("../../../scripts/install.sh");
-        assert!(script.contains("enroll --help 2>/dev/null | grep -q -- '--one-row'"));
+        assert!(script.contains("enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'"));
         assert!(script.contains("enroll \"$@\" --overlay --one-row"));
         let mut cli = Cli::command();
         let help = cli

@@ -562,7 +562,7 @@ repair_tarball_owners() {
 # ⚠️ Every branch here ends in a construct that returns 0: under `set -e` a
 # function whose last command fails would abort the whole install.
 enable_update_helper() {
-    if ! /usr/bin/roomlerd update-helper --capabilities 2>/dev/null | grep -qx 'step-aside'; then
+    if ! /usr/bin/roomlerd update-helper --capabilities </dev/null 2>/dev/null | grep -qx 'step-aside'; then
         say "NOTE: this release's daemon cannot hand its updates to the root helper yet, and a per-user daemon cannot install them itself (writing /usr needs root). Re-run this script after the next release, or use --system."
         return 0
     fi
@@ -628,7 +628,7 @@ restart_old_user_daemon() {
             return 0
         fi
         why="the root update helper was just turned on, and the daemon decides at its start who installs its updates"
-    elif "/proc/$pid/exe" update-helper --capabilities 2>/dev/null | grep -qx 'restart-on-replace'; then
+    elif "/proc/$pid/exe" update-helper --capabilities </dev/null 2>/dev/null | grep -qx 'restart-on-replace'; then
         say "the running daemon (pid $pid) restarts onto $(printable_version "${installed#roomlerd }") by itself, once nothing it serves would be cut"
         return 0
     else
@@ -814,14 +814,14 @@ user_steps_linux() {
 place_system_config() {
     target="$1"; daemon_bin="$2"
     grp=root; [ "$OS" = Darwin ] && grp=wheel
-    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help >/dev/null 2>&1; then
+    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help </dev/null >/dev/null 2>&1; then
         say "a config already exists at $target — folding the new enrollment into it (operator settings kept)"
         take_args=""
         if [ -n "$CONFIG_TAKE" ]; then
             for k in $(printf '%s' "$CONFIG_TAKE" | tr ',' ' '); do take_args="$take_args --take $k"; done
         fi
         # shellcheck disable=SC2086
-        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args; then
+        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args </dev/null; then
             return 0
         fi
         warn "the daemon could not fold the enrollment in — placing the new config instead, the old one kept as $target.prev"
@@ -976,7 +976,7 @@ install_macos_privileged_half() {
         # root LaunchDaemon is the `system` scope.
         # shellcheck disable=SC2046
         as_root $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
-            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay
+            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay </dev/null
     fi
 
     say "starting the privileged half"
@@ -1044,7 +1044,7 @@ install_macos_one_row() {
 
     # A release from before P3d refuses the flag. Asked before the marker and
     # before the token is spent, so the Mac keeps only the package.
-    if ! "$daemon_bin" enroll --help 2>/dev/null | grep -q -- '--one-row'; then
+    if ! "$daemon_bin" enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'; then
         echo "error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
         exit 1
     fi
@@ -1184,7 +1184,7 @@ enroll_daemon() {
     # env + two VAR=value words, binary + --config + path), none of which
     # contain whitespace.
     # shellcheck disable=SC2086
-    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME" </dev/null
 }
 
 # ─── tunnel role ────────────────────────────────────────────────────────────
@@ -1300,7 +1300,7 @@ enroll_tunnel() {
         return 0
     fi
     say "enrolling this tunnel client as '$NAME' against $SERVER (token is single-use, never echoed)"
-    "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME" </dev/null
 }
 
 # FR-93 P6d — the tool that installs a local .rpm and resolves its
