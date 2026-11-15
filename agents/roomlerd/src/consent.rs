@@ -710,6 +710,19 @@ impl ConsentBroker {
         }
     }
 
+    /// #3888 — whether a question for `session_hex` is on the books: asked,
+    /// and not withdrawn ([`Self::cancel`]) or ended at a look of its own.
+    /// The RC consent task reads it once the companion's start has answered,
+    /// which a `Terminate` may have come in before, and puts nothing up for a
+    /// question that is over.
+    pub fn is_asking(&self, session_hex: &str) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(session_hex)
+    }
+
     /// Drop a sentinel file for the given session. Used by the CLI
     /// subcommand. Returns the path written so the caller can surface
     /// it to the operator.
