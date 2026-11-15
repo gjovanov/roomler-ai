@@ -75,13 +75,23 @@ fn main() {
     // whether this person has been through the Welcome tour. A login start
     // for someone who switched it off ends here, before any window or tray.
     let argv: Vec<String> = std::env::args().collect();
-    let launch = first_run::parse_launch_args(&argv);
+    let mut launch = first_run::parse_launch_args(&argv);
     let state = roomler_node_core::desktop_state::load();
+    // #3887 — the daemon's start for a question or a banner keeps the tour
+    // for the person's own start. On macOS that start is launchd's, with no
+    // argument, so a bare start there asks the daemon why it came.
+    if first_run::asks_the_daemon(&launch, state.first_run_done, cfg!(target_os = "macos")) {
+        launch.for_prompt = first_run::daemon_has_something_to_show();
+    }
     let action = first_run::decide_startup(&launch, state.first_run_done, state.autostart_opt_out);
+    if first_run::holds_the_tour(&action, state.first_run_done) {
+        first_run::hold_the_tour();
+    }
     tracing::info!(
         ?launch,
         ?action,
         first_run_done = state.first_run_done,
+        tour_held = first_run::tour_held(),
         "startup"
     );
     if action == first_run::StartupAction::Exit {
@@ -103,9 +113,14 @@ fn main() {
             // login start (`--autostart`) never pops the window of a
             // companion that is already up; `--first-run` opens the tour (or
             // the Overview once it is done); `--view=<name>` routes there.
+            // #3887 — nor does the daemon's start for a prompt, and a
+            // person's start shows the tour such a start held back.
             let launch = first_run::parse_launch_args(&args);
             let done = roomler_node_core::desktop_state::load().first_run_done;
-            let view = match first_run::decide_second_instance(&launch, done, false) {
+            let held = first_run::tour_held();
+            let decision = first_run::decide_second_instance(&launch, done, held);
+            tracing::info!(?launch, tour_held = held, ?decision, "a second launch");
+            let view = match decision {
                 first_run::SecondLaunch::Ignore => return,
                 first_run::SecondLaunch::Show => None,
                 first_run::SecondLaunch::ShowView(view) => Some(view),
@@ -115,6 +130,7 @@ fn main() {
                 // before it goes near eval; the router maps anything unknown
                 // to Overview.
                 if let Some(view) = view {
+                    first_run::showing(&view);
                     let _ = window.eval(format!("window.location.hash = '#/{view}'"));
                 }
                 let _ = window.show();
@@ -322,6 +338,8 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
 /// capture still waits on the desktop's own dialog (`asking`) shares nothing
 /// yet: saying "Being viewed" then is untrue, and on a desktop that centres
 /// new windows the banner lands on the dialog the person has to answer.
+/// A bare start on macOS asks by the same rule (#3887,
+/// `first_run::something_to_show`).
 fn wants_banner(live: &[roomler_localapi::RcSessionInfo]) -> bool {
     live.iter().any(|s| !s.asking)
 }

@@ -8,14 +8,18 @@
 //! callback in `main.rs`): the first process ignored `--view=` entirely, and
 //! nothing could tell a login start from a person opening the app.
 //!
+//! #3887 — nor a start the daemon made to show a consent question or a
+//! banner: such a start keeps the tour for the person's own start.
+//!
 //! Also the Tauri commands behind the Welcome view and the "Start at login"
 //! card: the launch intent, the per-user state, the login start itself, and
 //! a free loopback port for userspace mode.
 
-use roomler_node_core::companion_autostart::{AUTOSTART_ARG, FIRST_RUN_ARG};
+use roomler_node_core::companion_autostart::{AUTOSTART_ARG, FIRST_RUN_ARG, FOR_PROMPT_ARG};
 use roomler_node_core::desktop_state;
 use serde::Serialize;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the command line asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,11 +32,14 @@ pub struct LaunchArgs {
     /// `--first-run`: the daemon's one-shot post-install launch.
     pub first_run: bool,
     /// `--for-prompt`: the daemon's start to show a consent question or a
-    /// banner (#3887).
+    /// banner (#3887). On macOS, where launchd's start carries no argument,
+    /// set from the daemon's answer instead ([`asks_the_daemon`]).
     pub for_prompt: bool,
 }
 
-/// Parse the companion's own arguments (`args[0]` is the program).
+/// Parse the companion's own arguments (`args[0]` is the program). Each flag
+/// is read by equality; anything else is ignored, so an older companion
+/// starts on a newer daemon's argument as it always did.
 pub fn parse_launch_args<S: AsRef<str>>(args: &[S]) -> LaunchArgs {
     let mut out = LaunchArgs::default();
     for arg in args.iter().skip(1).map(AsRef::as_ref) {
@@ -40,6 +47,8 @@ pub fn parse_launch_args<S: AsRef<str>>(args: &[S]) -> LaunchArgs {
             out.autostart = true;
         } else if arg == FIRST_RUN_ARG {
             out.first_run = true;
+        } else if arg == FOR_PROMPT_ARG {
+            out.for_prompt = true;
         } else if let Some(view) = arg.strip_prefix("--view=")
             && !view.is_empty()
             && view.chars().all(|c| c.is_ascii_alphanumeric())
@@ -68,9 +77,17 @@ pub fn decide_startup(args: &LaunchArgs, first_run_done: bool, opted_out: bool) 
     if let Some(view) = &args.view {
         return StartupAction::Show(view.clone());
     }
-    // The tour shows until it is finished or skipped, however this started —
-    // a login start included: an install done over RMM with nobody logged on
-    // meets its person at their first login.
+    // #3887 — the daemon's start for a consent question or a banner stays in
+    // the tray: each has a window of its own, and the question has a
+    // deadline. A tour that is not done waits for the person's own start
+    // ([`holds_the_tour`]). Never `Exit` either: this is no login start.
+    if args.for_prompt {
+        return StartupAction::Tray;
+    }
+    // The tour shows until it is finished or skipped, however a person, a
+    // login or the installer started this — a login start included: an
+    // install done over RMM with nobody logged on meets its person at their
+    // first login.
     if !first_run_done {
         return StartupAction::Show("welcome".to_string());
     }
@@ -95,11 +112,13 @@ pub enum SecondLaunch {
     ShowView(String),
 }
 
-/// Decide a forwarded launch.
+/// Decide a forwarded launch. `tour_held`: this companion was started for a
+/// prompt while the tour was not done, and has not shown it yet
+/// ([`tour_held`]).
 pub fn decide_second_instance(
     args: &LaunchArgs,
     first_run_done: bool,
-    _tour_held: bool,
+    tour_held: bool,
 ) -> SecondLaunch {
     if let Some(view) = &args.view {
         return SecondLaunch::ShowView(view.clone());
@@ -112,44 +131,124 @@ pub fn decide_second_instance(
         };
         return SecondLaunch::ShowView(view.to_string());
     }
-    if args.autostart {
+    // Neither a login start nor the daemon's start for a prompt pops the
+    // window; the question and the banner have their own (#3887).
+    if args.autostart || args.for_prompt {
         return SecondLaunch::Ignore;
+    }
+    // A person's start: the tour a start for a prompt held back (#3887).
+    if tour_held && !first_run_done {
+        return SecondLaunch::ShowView("welcome".to_string());
     }
     SecondLaunch::Show
 }
 
-/// RED stub (#3887).
-pub fn holds_the_tour(_action: &StartupAction, _first_run_done: bool) -> bool {
-    false
+// ─── the tour a start for a prompt held back (#3887) ──────────────────────
+
+/// Set at a start for a prompt while the tour was not done: the person's own
+/// first opening of the window shows the tour, once.
+static TOUR_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Whether this start holds the tour back: it stays in the tray with the
+/// tour not done, which only a start for a prompt does ([`decide_startup`]).
+pub fn holds_the_tour(action: &StartupAction, first_run_done: bool) -> bool {
+    !first_run_done && *action == StartupAction::Tray
 }
 
-/// RED stub (#3887).
-pub fn hold_the_tour() {}
+/// Hold the tour back for the person's own opening of the window.
+pub fn hold_the_tour() {
+    TOUR_HELD.store(true, Ordering::SeqCst);
+}
 
-/// RED stub (#3887).
+/// The tour is held back and has not been shown yet.
 pub fn tour_held() -> bool {
-    false
+    TOUR_HELD.load(Ordering::SeqCst)
 }
 
-/// RED stub (#3887).
-pub fn showing(_view: &str) {}
-
-/// RED stub (#3887).
-pub fn tray_open_view(_tour_held: bool, _first_run_done: bool) -> &'static str {
-    "overview"
+/// The window is being shown on `view`: once that is the tour, it is held no
+/// more, and the window opens as it always did.
+pub fn showing(view: &str) {
+    if view == "welcome" {
+        TOUR_HELD.store(false, Ordering::SeqCst);
+    }
 }
 
-/// RED stub (#3887).
-pub fn asks_the_daemon(_args: &LaunchArgs, _first_run_done: bool, _on_macos: bool) -> bool {
-    false
+/// The view the tray's icon and its Device status open: the tour a start for
+/// a prompt held back while it is not done, else the Overview.
+pub fn tray_open_view(tour_held: bool, first_run_done: bool) -> &'static str {
+    if tour_held && !first_run_done {
+        "welcome"
+    } else {
+        "overview"
+    }
 }
 
-/// RED stub (#3887).
+/// [`tray_open_view`] now, as the window's path. The per-user state is read
+/// only while the tour is held: a tray click reads no file otherwise.
+pub fn tray_path() -> String {
+    let held = tour_held();
+    let view = tray_open_view(held, held && desktop_state::load().first_run_done);
+    format!("/{view}")
+}
+
+/// #3887 — whether this start asks the daemon why it came. Only on macOS,
+/// where the daemon's start for a prompt is launchd's (`launchctl
+/// kickstart`), which carries no argument and so looks like a login start or
+/// a person's. Only a start with no argument at all, for a person whose tour
+/// is not done: the tour is all the answer can change. Windows and Linux are
+/// told (`--for-prompt`).
+pub fn asks_the_daemon(args: &LaunchArgs, first_run_done: bool, on_macos: bool) -> bool {
+    on_macos && !first_run_done && *args == LaunchArgs::default()
+}
+
+/// #3887 — the daemon's answer: whether the companion has something to show
+/// right now, by the watch's own rules (`consent_watch_loop` in `main.rs`): a
+/// question the daemon does not show natively, or a session the banner is
+/// for.
 pub fn something_to_show(
-    _pending: &[roomler_localapi::ConsentRequest],
-    _live: &[roomler_localapi::RcSessionInfo],
+    pending: &[roomler_localapi::ConsentRequest],
+    live: &[roomler_localapi::RcSessionInfo],
 ) -> bool {
-    false
+    pending.iter().any(|p| p.surface != "native") || crate::wants_banner(live)
+}
+
+/// How long a start waits for the daemon's answer, all of it: the connection
+/// and both lists.
+const DAEMON_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// #3887 — ask the daemon over the LocalAPI ([`DAEMON_ANSWER_WAIT`] at most)
+/// whether it has something for this companion to show ([`something_to_show`]).
+/// No answer is no reason: the start shows the tour as it always did.
+pub fn daemon_has_something_to_show() -> bool {
+    let ask = async {
+        let mut client = roomler_localapi::connect().await.ok()?;
+        // Read as the watch reads them: a list that fails is an empty one.
+        let pending = client.consent_pending().await.unwrap_or_default();
+        let live = client.rc_sessions().await.unwrap_or_default();
+        Some((pending, live))
+    };
+    let answer = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(DAEMON_ANSWER_WAIT, ask)
+            .await
+            .ok()
+            .flatten()
+    });
+    let Some((pending, live)) = answer else {
+        tracing::info!(
+            wait = ?DAEMON_ANSWER_WAIT,
+            "a start with no argument asked the daemon why it came, and had no answer: \
+             the tour shows as before (#3887)"
+        );
+        return false;
+    };
+    let for_prompt = something_to_show(&pending, &live);
+    tracing::info!(
+        pending = pending.len(),
+        live = live.len(),
+        for_prompt,
+        "a start with no argument asked the daemon why it came (#3887)"
+    );
+    for_prompt
 }
 
 /// The first port in `start..start+span` that is not in `exclude` and that

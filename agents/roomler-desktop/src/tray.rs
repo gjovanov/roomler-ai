@@ -5,7 +5,9 @@
 //! layer).
 //!
 //! Menu items:
-//!   - Open Roomler       — show the main window (Overview view)
+//!   - Device status      — show the main window on the Overview, or on the
+//!                           Welcome tour a start for a prompt held back (#3887)
+//!   - Open Roomler…      — S7: the Roomler web app in a window of its own
 //!   - Start/Stop recording — FR-85: record this screen through the device
 //!                           service; the label and the tray tooltip follow
 //!                           the recorder (a light poll, every 3 s), and
@@ -78,7 +80,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     )?;
 
     let on_menu = |app: &AppHandle<R>, event: tauri::menu::MenuEvent| match event.id.as_ref() {
-        "open_status" => show_window(app, "/overview"),
+        "open_status" => show_window(app, &crate::first_run::tray_path()),
         "open_web" => open_roomler_web(app),
         RECORD_ITEM_ID => toggle_recording(app),
         KEEP_BUSY_ITEM_ID => toggle_keep_busy(app),
@@ -106,7 +108,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             ..
         } = event
         {
-            show_window(tray.app_handle(), "/overview");
+            show_window(tray.app_handle(), &crate::first_run::tray_path());
         }
     };
 
@@ -539,6 +541,7 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
 /// so a stale path can't strand the window on a blank page.
 fn show_window<R: Runtime>(app: &AppHandle<R>, path: &str) {
     if let Some(window) = app.get_webview_window("main") {
+        crate::first_run::showing(path.trim_start_matches('/')); // #3887: a held tour, once
         // Navigate (no-op when already on the same path).
         let _ = window.eval(format!("window.location.hash = '#{path}'"));
         let _ = window.show();

@@ -1843,7 +1843,7 @@ impl TraySteps {
 /// The Windows tray's start, blocking, on the start in flight's thread: its
 /// steps in the order the start has always taken them, each recorded in `at`
 /// as it begins. `Started` only when the process was created
-/// ([`started_outcome`]).
+/// ([`started_outcome`]). The companion is told it is for a prompt (#3887).
 #[cfg(target_os = "windows")]
 fn start_tray(
     steps: &TraySteps,
@@ -1862,16 +1862,16 @@ fn start_tray(
         // about which of the two happened.
         return Ok(EnsureOutcome::Unsupported);
     };
-    // A SYSTEM daemon has no desktop of its own — the companion has to be
-    // launched INTO the interactive session, which is exactly what the
-    // update-respawn path already does.
+    // A SYSTEM daemon has no desktop of its own: the companion is launched INTO the interactive
+    // session, as the update respawn does. #3887: for a prompt, so the tour waits for the person.
+    let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG];
     step(TrayStep::Context);
     let ctx = (steps.context)();
     step(match ctx {
         RespawnContext::SystemService => TrayStep::StartInSession,
         RespawnContext::UserSession => TrayStep::StartHere,
     });
-    started_outcome((steps.start)(ctx, &dest, &[])).map_err(|e| format!("{e:#}"))
+    started_outcome((steps.start)(ctx, &dest, &args)).map_err(|e| format!("{e:#}"))
 }
 
 /// The tray beside this daemon, when it is installed there.
@@ -2259,7 +2259,7 @@ impl TraySteps {
 
 /// The Linux tray's start, blocking, on the start in flight's thread: its
 /// steps in the order the start has always taken them, each recorded in `at`
-/// as it begins. `Started` only when systemd-run exited 0.
+/// as it begins. `Started` only when systemd-run exited 0. For a prompt (#3887).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn start_tray(
     steps: &TraySteps,
@@ -2288,9 +2288,9 @@ fn start_tray(
     if (steps.running)(sess.uid) {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
-    // #2713 — a root daemon's system unit carries the desktop session's own
-    // environment ([`systemd_run_command`]); a per-user daemon's `--user`
-    // unit inherits its manager's.
+    let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG]; // #3887: for a prompt
+    // #2713 — a root daemon's system unit carries the desktop session's own environment
+    // ([`systemd_run_command`]); a per-user daemon's `--user` unit inherits its manager's.
     let session_env = if steps.user_manager {
         Vec::new()
     } else {
@@ -2299,7 +2299,7 @@ fn start_tray(
             .map(|text| session_env_pairs(&text))
             .unwrap_or_default()
     };
-    let cmd = systemd_run_command_with(&sess, &path, &[], steps.user_manager, &session_env);
+    let cmd = systemd_run_command_with(&sess, &path, &args, steps.user_manager, &session_env);
     step(TrayStep::SystemdRun);
     let out = (steps.systemd_run)(cmd).map_err(|e| format!("spawning systemd-run: {e}"))?;
     if !out.status.success() {
