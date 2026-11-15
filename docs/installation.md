@@ -1837,7 +1837,7 @@ exit code (`scripts/install.sh:2018-2097`):
 | Line | What it says | When its source cannot be read |
 |---|---|---|
 | `release named by the server's feed: <tag>` (`name_release`, called at `:677` on Linux and `:847` on a Mac) | the tag of the release that holds the file the script downloads. The script takes the first matching file over the whole feed, so when the newest release lacks this host's file, the download comes from an older release, and that one is named | `unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)` |
-| `installed daemon's own --version: <v>` (`report_installed_version`, `:2067`, called at `:2145`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
+| `installed daemon's own --version: <v>` (`report_installed_version`, `:2067`, called at `:2157`) | the first line of the daemon's `--version`, without its `roomlerd ` prefix; `none (download-only installs nothing)` on a `--download-only` run | `no answer (<binary> --version exited <rc>)`, `no answer (<binary> --version printed nothing)`, or the `unreadable (…)` words above |
 | `NOTE: the installed daemon's <v> differs from the release this script resolved, <tag>` | printed only when both are readable and the tag without `agent-v` is not `<v>` | not printed |
 
 What the feed or the binary says is printed only when it fits the alphabet `A-Z a-z 0-9 . _ + -` and
