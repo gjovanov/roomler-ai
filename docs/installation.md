@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3952`, `crates/agent-core/src/config.rs:4310`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3952`, `crates/agent-core/src/config.rs:4374`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,8 +576,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3485`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3529`) |
-| `config::read_if_present` (`:3554`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3487`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3531`) |
+| `config::read_if_present` (`:3556`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -614,7 +614,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2583`, `:2605`), at the clean-run promotion
 (`record_clean_run_at`, `:2555`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4406`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4326`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -858,7 +858,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4597`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4661`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -1567,7 +1567,7 @@ folder they name from the system, never from the environment they were started w
 | The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:230`, `crates/agent-core/src/appdirs.rs:241` |
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1121`, `agents/roomlerd/src/win_service/supervisor.rs:974` |
-| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:999`, `crates/agent-core/src/appdirs.rs:779` |
+| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:1054`, `crates/agent-core/src/appdirs.rs:779` |
 | The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:257`, `agents/roomlerd/src/install_cleanup.rs:289` |
 | The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:679`, `agents/roomlerd/src/install_cleanup.rs:727` |
 | The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the Scheduled Tasks of the account signed in to its session, and no other account's ([#3801](#what-the-per-user-arm-of-the-clean-up-removes-3801)): that account's `Roomler-<SID>`, and `Roomler` or the one under the retired name when their principal is that account. Then it removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session, or an account it cannot tell, it removes no tree and no task; when the system records no profile for that account, it removes no tree. Its lines say which. | `agents/roomlerd/src/install_cleanup.rs:182`, `agents/roomlerd/src/install_cleanup.rs:386`, `agents/roomlerd/src/service/user_task.rs:219`, `agents/roomlerd/src/install_cleanup.rs:557`, `agents/roomlerd/src/install_cleanup.rs:609`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
@@ -1602,7 +1602,7 @@ profile, or the machine's data folder) or is reached through a link below it
 `crates/agent-core/src/appdirs.rs:856`):
 
 - A pair whose NEW folder is already there is left in place, and the move goes on
-  (`crates/agent-core/src/appdirs.rs:910`).
+  (`crates/agent-core/src/appdirs.rs:965`).
 - The first pair, which holds `config.toml`, moves by one rename or not at all. When that move
   fails, there is no NEW config folder, nothing after it moves, the daemon reads its config from
   the OLD tree, and the next start tries again. The empty `%APPDATA%\roomler\roomler` made for
@@ -1610,7 +1610,7 @@ profile, or the machine's data folder) or is reached through a link below it
   data folders only where neither tree holds a config folder
   (`crates/agent-core/src/appdirs.rs:60`).
 - A later pair whose folder rename the system refuses moves child by child (`migrate_children`,
-  `crates/agent-core/src/appdirs.rs:1114`); when that fails, it renames the moved entries back
+  `crates/agent-core/src/appdirs.rs:1169`); when that fails, it renames the moved entries back
   and its note says whether every one went back. A later pair whose move fails stops the move:
   the pairs before it stay in the NEW tree, the pairs after it in the OLD one.
 
@@ -2916,8 +2916,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1619`, `:1568`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:1359` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1619`, `:1568`; `crates/tunnel-core/src/child.rs:86` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:367`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:1359` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own

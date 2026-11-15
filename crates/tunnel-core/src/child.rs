@@ -20,13 +20,15 @@
 //! One answer for each side of the race:
 //! - [`output_bounded`] reads a short command's output until the command
 //!   EXITS rather than until EOF, within a deadline, and always reaps it.
+//!   [`output_bounded_fed`] does the same for a command that reads bytes on
+//!   its stdin, with a cap of the caller's on stdout.
 //! - [`inherit_only_stdio`] (and [`inherit_only_stdio_async`]) has a
 //!   long-lived child mark every descriptor above stderr close-on-exec just
 //!   before it execs, so it keeps no pipe but its own stdio.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long a read whose pipes have gone quiet waits before it checks again
@@ -44,6 +46,15 @@ const DRAIN_CHUNKS: usize = 64;
 /// commands print kilobytes. A child that writes more is stopped like one past
 /// its deadline, so no command can balloon the daemon's memory.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
+/// The bytes of stderr [`output_bounded_fed`] keeps. What follows them is
+/// read and dropped, so a child that says a lot is never stopped for it and
+/// never stalls on a full pipe.
+pub const FED_STDERR_KEPT: usize = 16 * 1024;
+
+/// How long [`output_bounded_fed`] waits, once the child is reaped, for the
+/// thread that wrote its stdin to say how the write ended.
+const FEED_GRACE: Duration = Duration::from_secs(2);
 
 /// The highest descriptor [`inherit_only_stdio`] sweeps, whatever
 /// `RLIMIT_NOFILE` says. An unlimited soft limit must not cost a child
@@ -78,7 +89,12 @@ pub fn output_bounded(cmd: &mut Command, deadline: Duration) -> io::Result<Outpu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let collected = collect(&mut child, deadline);
+    let collected = collect(
+        &mut child,
+        deadline,
+        Limit::Fail(MAX_OUTPUT),
+        Limit::Fail(MAX_OUTPUT),
+    );
     if collected.is_err() {
         // Ignored: the child may have exited by itself in the meantime.
         let _ = child.kill();
@@ -94,9 +110,136 @@ pub fn output_bounded(cmd: &mut Command, deadline: Duration) -> io::Result<Outpu
     })
 }
 
-fn collect(child: &mut Child, deadline: Duration) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let mut out = Stream::new(child.stdout.take());
-    let mut err = Stream::new(child.stderr.take());
+/// [`output_bounded`] for a command that reads `stdin`: the bytes are written
+/// to its stdin from a thread of their own, and the pipe is then closed, so
+/// the child reads them and an EOF while its own output is read here. Neither
+/// side can stall the other on a full pipe.
+///
+/// - The child exits within `deadline`, or it is killed and reaped, and the
+///   error is [`io::ErrorKind::TimedOut`].
+/// - More than `cap` bytes on stdout stops it the same way, with an error of
+///   its own. Of stderr the first [`FED_STDERR_KEPT`] bytes are kept and the
+///   rest is read and dropped.
+/// - A child that does not take all of `stdin` (it exits first, or closes its
+///   end) fails the call, with [`io::ErrorKind::BrokenPipe`] and an
+///   [`InputNotTaken`] that carries the child's own exit and stderr.
+///
+/// The child is always reaped before this returns. Once it has exited, the
+/// call waits up to `FEED_GRACE` (2 s) for the thread that wrote its stdin to
+/// say how the write ended, so a call can last `deadline` and 2 s more. The
+/// reap after a kill waits as [`output_bounded`]'s does: a child in an
+/// uninterruptible wait, on a hung network home for instance, holds the call
+/// until the kernel lets it go. It blocks the calling thread: call it from a
+/// blocking context, never on an async runtime's worker.
+pub fn output_bounded_fed(
+    cmd: &mut Command,
+    stdin: &[u8],
+    deadline: Duration,
+    cap: usize,
+) -> io::Result<Output> {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pipe = child.stdin.take();
+    let input = stdin.to_vec();
+    let (said, how) = std::sync::mpsc::channel();
+    let feeder = std::thread::Builder::new()
+        .name("child-stdin".into())
+        .spawn(move || {
+            let written = match pipe {
+                Some(mut pipe) => pipe.write_all(&input),
+                None => Ok(()),
+            };
+            // `pipe` is dropped by now: the child reads an EOF after the bytes.
+            let _ = said.send(written);
+        });
+    if let Err(e) = feeder {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    let collected = collect(
+        &mut child,
+        deadline,
+        Limit::Fail(cap),
+        Limit::Keep(FED_STDERR_KEPT),
+    );
+    if collected.is_err() {
+        // Ignored: the child may have exited by itself in the meantime.
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let (stdout, stderr) = collected?;
+    // The child is gone, so a write still blocked on its pipe fails now with
+    // EPIPE, unless some other process holds a copy of the read end.
+    match how.recv_timeout(FEED_GRACE) {
+        Ok(Ok(())) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(Err(e)) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            InputNotTaken {
+                status,
+                stderr,
+                error: e.to_string(),
+            },
+        )),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            InputNotTaken {
+                status,
+                stderr,
+                error: format!("the write was still blocked {FEED_GRACE:?} after the child exited"),
+            },
+        )),
+    }
+}
+
+/// Why [`output_bounded_fed`] failed when the child did not take all of its
+/// stdin: how the child ended, and what it said on stderr (at most
+/// [`FED_STDERR_KEPT`] bytes, as it wrote them). Reached through
+/// [`io::Error::get_ref`].
+#[derive(Debug)]
+pub struct InputNotTaken {
+    pub status: ExitStatus,
+    pub stderr: Vec<u8>,
+    /// The write's own error.
+    pub error: String,
+}
+
+impl std::fmt::Display for InputNotTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the child ended ({}) before it took all of its input: {}",
+            self.status, self.error
+        )
+    }
+}
+
+impl std::error::Error for InputNotTaken {}
+
+/// What one captured stream may hold.
+#[derive(Debug, Clone, Copy)]
+enum Limit {
+    /// More bytes than this is an error, and the child is stopped.
+    Fail(usize),
+    /// The first this many bytes are kept, and the rest is read and dropped.
+    Keep(usize),
+}
+
+fn collect(
+    child: &mut Child,
+    deadline: Duration,
+    out_limit: Limit,
+    err_limit: Limit,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut out = Stream::new(child.stdout.take(), out_limit);
+    let mut err = Stream::new(child.stderr.take(), err_limit);
     let started = Instant::now();
     loop {
         // The exit first, then the read: a read that follows an observed exit
@@ -123,13 +266,15 @@ fn collect(child: &mut Child, deadline: Duration) -> io::Result<(Vec<u8>, Vec<u8
 struct Stream<R> {
     pipe: Option<R>,
     buf: Vec<u8>,
+    limit: Limit,
 }
 
 impl<R: Read + AsRawFd> Stream<R> {
-    fn new(pipe: Option<R>) -> Self {
+    fn new(pipe: Option<R>, limit: Limit) -> Self {
         Self {
             pipe,
             buf: Vec::new(),
+            limit,
         }
     }
 
@@ -153,14 +298,20 @@ impl<R: Read + AsRawFd> Stream<R> {
             }
             match pipe.read(&mut chunk) {
                 Ok(0) => self.pipe = None,
-                Ok(n) => {
-                    self.buf.extend_from_slice(&chunk[..n]);
-                    if self.buf.len() > MAX_OUTPUT {
-                        return Err(io::Error::other(format!(
-                            "the child wrote more than {MAX_OUTPUT} bytes to one stream"
-                        )));
+                Ok(n) => match self.limit {
+                    Limit::Fail(max) => {
+                        self.buf.extend_from_slice(&chunk[..n]);
+                        if self.buf.len() > max {
+                            return Err(io::Error::other(format!(
+                                "the child wrote more than {max} bytes to one stream"
+                            )));
+                        }
                     }
-                }
+                    Limit::Keep(max) => {
+                        let room = max.saturating_sub(self.buf.len());
+                        self.buf.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                },
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -538,5 +689,131 @@ mod tests {
     fn the_sweep_ceiling_stays_within_its_bounds() {
         let c = sweep_ceiling();
         assert!((SWEEP_FLOOR..=SWEEP_CAP).contains(&c), "{c}");
+    }
+
+    /// Bytes that are not all one value, so a reordered or cut copy shows.
+    fn input(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg(script);
+        c
+    }
+
+    /// More than a pipe holds each way: the child gets every byte and then an
+    /// EOF, and what it writes back is read while it is still being fed.
+    #[test]
+    fn a_fed_child_gets_its_input_and_then_an_eof() {
+        let bytes = input(300_000);
+        let out = output_bounded_fed(&mut sh("cat"), &bytes, Duration::from_secs(10), 1 << 20)
+            .expect("ran");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, bytes);
+    }
+
+    /// The child writes more to stderr than a pipe holds before it reads a
+    /// byte of its input. Its stderr is drained while its stdin is written,
+    /// so neither side waits on the other; the first 16 KiB are kept.
+    #[test]
+    fn a_fed_child_with_a_chatty_stderr_does_not_deadlock() {
+        let bytes = input(200_000);
+        let started = Instant::now();
+        let out = output_bounded_fed(
+            &mut sh("head -c 300000 /dev/zero >&2; cat"),
+            &bytes,
+            Duration::from_secs(10),
+            1 << 20,
+        )
+        .expect("ran");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, bytes);
+        assert_eq!(out.stderr.len(), FED_STDERR_KEPT);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Its own exit code and what it said come back as they were.
+    #[test]
+    fn a_fed_child_keeps_its_own_exit_and_stderr() {
+        let out = output_bounded_fed(
+            &mut sh("cat >/dev/null; echo said >&2; exit 3"),
+            b"bytes",
+            Duration::from_secs(10),
+            1 << 20,
+        )
+        .expect("ran");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stderr, b"said\n");
+        assert!(out.stdout.is_empty());
+    }
+
+    /// A child that exits without reading its input (more than a pipe holds,
+    /// so the write cannot finish into the pipe's buffer) fails the call,
+    /// and the error still says how the child ended and what it said.
+    #[test]
+    fn a_fed_child_that_does_not_take_its_input_fails_the_step() {
+        let e = output_bounded_fed(
+            &mut sh("echo refused >&2; exit 2"),
+            &input(1 << 20),
+            Duration::from_secs(10),
+            1 << 20,
+        )
+        .expect_err("the input was not taken");
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+        let why = e
+            .get_ref()
+            .and_then(|r| r.downcast_ref::<InputNotTaken>())
+            .expect("an InputNotTaken");
+        assert_eq!(why.status.code(), Some(2));
+        assert_eq!(why.stderr, b"refused\n");
+    }
+
+    /// More than `cap` on stdout is refused, not truncated, and the child is
+    /// stopped for it, long before its deadline. This child stops writing
+    /// once it is over the cap and stays alive, so only the call's kill ends
+    /// it inside the bound: one that kept writing would die of the closed
+    /// pipe by itself.
+    #[test]
+    fn an_oversize_reply_is_refused() {
+        let started = Instant::now();
+        let e = output_bounded_fed(
+            &mut sh("head -c 2000000 /dev/zero; exec sleep 30"),
+            b"",
+            Duration::from_secs(10),
+            1 << 20,
+        )
+        .expect_err("over the cap");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_ne!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(e.to_string().contains("more than 1048576"), "{e}");
+    }
+
+    /// A child that neither reads its input nor exits is killed at the
+    /// deadline and reaped: its pid is gone, not a zombie.
+    #[test]
+    fn a_child_that_hangs_is_killed_and_the_step_fails() {
+        let pid_file = pid_file("fed-hang");
+        let mut cmd = sh("echo $$ > \"$PIDFILE\"; exec sleep 30");
+        cmd.env("PIDFILE", &pid_file);
+        let started = Instant::now();
+        let e = output_bounded_fed(&mut cmd, &input(1 << 20), Duration::from_secs(1), 1 << 20)
+            .expect_err("timed out");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("the child wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let _ = std::fs::remove_file(&pid_file);
+        // SAFETY: signal 0 only asks whether the pid exists. A zombie would
+        // still answer; a reaped child is gone.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "pid {pid} is still there after the call returned");
     }
 }
