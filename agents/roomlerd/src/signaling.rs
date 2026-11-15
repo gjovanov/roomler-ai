@@ -7553,8 +7553,9 @@ pub(crate) struct RcSurfaces {
 ///
 /// `still_asked` is whether the question is still on the consent broker's
 /// books. A `Terminate` the loop read while the start ran withdrew it, and
-/// found no notification to take down: none is started for it, and one
-/// started as it was withdrawn is taken down here.
+/// found no notification to take down: none is started for it, nor for a
+/// question whose control socket closed meanwhile (#2416), and one started as
+/// it was withdrawn is taken down here.
 pub(crate) async fn rc_surfaces_up(
     surfaces: RcSurfaces,
     indicator: &ViewerIndicator,
@@ -7573,7 +7574,7 @@ pub(crate) async fn rc_surfaces_up(
     if let Some((starting, view)) = behind {
         let up = starting.up().await;
         companion = Some(up);
-        let notifying = if still_asked() {
+        let notifying = if still_asked() && !outbound.is_closed() {
             notification_for_rc(indicator, up, marker, view).await
         } else {
             None

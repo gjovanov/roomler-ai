@@ -997,9 +997,13 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// is the difference between a diagnosable refusal and a mystery.
 ///
 /// ⚠️ Rate-limited process-wide. A burst of session requests must not turn into
-/// a burst of `launchctl kickstart` / `CreateProcessAsUserW` calls; one attempt
-/// per [`ENSURE_COOLDOWN`] is plenty, since a launch that works is visible
-/// within a second and one that doesn't will not work any better on retry.
+/// a burst of `launchctl kickstart` / `CreateProcessAsUserW` calls. A verdict
+/// that cannot change soon stands [`ENSURE_COOLDOWN`]: a tray that is up (a
+/// launch that works is visible within a second), or no companion on this
+/// host. #3884 — a start that failed or ran out of its wait stands
+/// [`ENSURE_RETRY_AFTER_ERROR`] only: it goes on on its thread and may bring
+/// the tray up just after, and the person may sign in meanwhile, so the prompt
+/// that refusal invites looks again.
 /// Returns whether a human can now, in fact, be shown a prompt on this host.
 ///
 /// The caller reports `no_prompt_surface` on `false`, which is why this is a
@@ -1032,20 +1036,29 @@ pub async fn ensure_running() -> bool {
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
+                asks_again_in = ?ENSURE_RETRY_AFTER_ERROR,
                 "could not start the desktop companion — an on-screen prompt is not possible"
             );
-            (false, ENSURE_COOLDOWN)
+            (false, ENSURE_RETRY_AFTER_ERROR)
         }
     };
     verdicts.keep(up, stands);
     up
 }
 
-/// One attempt per this interval, process-wide.
+/// One attempt per this interval, process-wide, after a verdict that cannot
+/// change soon: the tray is up, or there is no companion on this host.
 const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// #3884 — how long a start that failed, or ran out of its wait, stands.
-#[cfg_attr(not(test), allow(dead_code))]
+/// #3884 — how long a start that failed, or ran out of its wait, stands: a few
+/// seconds, not [`ENSURE_COOLDOWN`]. Such a start goes on on its thread and may
+/// bring the tray up just after, and the person may sign in meanwhile, so the
+/// prompt the refusal invites asks again. Under the 2.5 s the start waits
+/// (`TRAY_START_WAIT`): a start that ran out of time answers 2.5 s after its
+/// prompt and stands until 4.5 s, so a prompt 5 s after that one asks afresh.
+/// Still a rate limit: the prompts in a burst after a failure are answered
+/// from it, with no start of their own, and one that asks while a start still
+/// hangs joins that start (`TRAY_STARTS`, one in flight).
 const ENSURE_RETRY_AFTER_ERROR: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// #3884 — [`ensure_running`]'s last verdict, and how long it stands: both
@@ -1103,13 +1116,27 @@ fn ensure_verdicts() -> &'static EnsureVerdicts {
 
 /// #3888 — the companion's start for a consent prompt, as the WS loop asks
 /// for it ([`ensure_running`], [`crate::signaling::COMPANION_START_BUDGET`]
-/// at most), and its verdict for the session's consent task
-/// ([`Starting::up`]).
+/// at most): STARTED, on a task of its own, and never waited for here. The
+/// start asks other processes (logind, the process list, launchd), and the
+/// loop reads its next frame meanwhile. Its verdict is the session's consent
+/// task's to wait for ([`Starting::up`]), before the question's window
+/// starts, so a start that failed or ran out of time is still
+/// `no_prompt_surface`, as when the loop waited for it.
 pub(crate) async fn start_for_prompt() -> Starting {
-    let up = tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running())
-        .await
-        .unwrap_or(false);
-    Starting(tokio::spawn(async move { up }))
+    let start = tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running());
+    // A test stands the tray's start in for its own task; the start runs on a
+    // task of its own, so the stand-in goes with it.
+    #[cfg(all(test, any(target_os = "windows", unix)))]
+    let start = {
+        let stood = tray_stand_in::now();
+        async move {
+            match stood {
+                Some(stood) => tray_stand_in::asking(stood, start).await,
+                None => start.await,
+            }
+        }
+    };
+    Starting(tokio::spawn(async move { start.await.unwrap_or(false) }))
 }
 
 /// #3888 — a companion's start for a prompt ([`start_for_prompt`]).
