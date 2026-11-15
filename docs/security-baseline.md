@@ -664,7 +664,7 @@ The sites on it since P1:
 | The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:727` |
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:609`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:289` |
-| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1435` |
+| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1449` |
 
 P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
 machine folder, with a test that fails on a new path-based one; until then those sites
@@ -1411,7 +1411,7 @@ its Redis, or a TLS-inspecting box on a signalling leg could otherwise stand in 
 
 | Who signs | With what | Checked by | Shipped |
 |---|---|---|---|
-| The device, its answer | a P-256 key per enrollment, made on the device; the private half in `<config dir>/peer-auth/<tenant>.json` with the config's protection (0600 on Unix), never sent | the browser, **before** it applies the answer; the key is pinned per (user, device) on first use | key + signature 0.4.145 (P1a, P1b); the browser's check P2a |
+| The device, its answer | a P-256 key per enrollment, made on the device; the private half in `<config dir>/peer-auth/<tenant>.json`, never sent: 0600 on Unix, and on Windows sealed to SYSTEM and Administrators wherever the daemon runs elevated or as SYSTEM, where a key file another account can change is not offered ([`docs/remote-control.md` §11.4a](remote-control.md#114a-the-device-and-the-browser-prove-who-they-are-fr-100-p1p2b)). A per-user install's stays in its person's profile | the browser, **before** it applies the answer; the key is pinned per (user, device) on first use | key + signature 0.4.145 (P1a, P1b); the browser's check P2a |
 | The browser, its offer | a P-256 key per user, made in the browser, non-extractable, kept in IndexedDB | the device, which remembers each browser key per user in `<tenant>.controllers.json` | the signature P2b; the device's check 0.4.146 (P1c) |
 
 - **The browser fails closed.** A different key, or a signature that does not verify, ends the attempt
