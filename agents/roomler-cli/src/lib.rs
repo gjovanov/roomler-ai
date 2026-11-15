@@ -27,6 +27,9 @@ pub mod mesh;
 /// Display names on the CLI: the peers↔devices join and the device-selector
 /// rule for `ping` / `exec` / `ssh` (pure; `docs/device-naming.md`).
 pub mod names;
+/// #3898 — the note the read and config verbs add when a second daemon runs:
+/// its words, and which of them (a one-row Mac's screen worker is no half).
+mod other_daemon;
 pub mod sshcmd;
 pub mod update;
 

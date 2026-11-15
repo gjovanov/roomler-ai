@@ -46,7 +46,7 @@ pub async fn status(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         print_status(&status);
-        print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
+        print_other_daemon_hint(crate::other_daemon::Hint::Status).await;
     }
     Ok(())
 }
@@ -62,35 +62,35 @@ pub async fn status(json: bool) -> Result<()> {
 /// Only printed in human mode: `--json` output is parsed, and a stray line
 /// would be a breaking change for anything consuming it.
 ///
-/// `what` says what the per-user half's answer leaves out, per command: the
-/// overlay for `status` / `peers` / `why`, the root half's configuration for
-/// `config ls` / `config set` (#2871).
-async fn print_other_daemon_hint(what: &str) {
-    if let Some(other) = localapi::other_daemon_socket().await {
-        eprintln!();
-        eprintln!(
-            "note: a second roomler daemon is running on this host ({}).",
-            other.display()
-        );
-        eprintln!("      This is the per-user half; {what}");
-        eprintln!("      Use `sudo roomler …` to ask that one instead.");
+/// `hint` says what the answer leaves out, per command (#2871 added `config`);
+/// the words, and a one-row Mac's (#3898), are `crate::other_daemon`'s.
+async fn print_other_daemon_hint(hint: crate::other_daemon::Hint) {
+    let other = localapi::other_daemon_socket().await;
+    let one_row = root_runs_one_row(other.as_deref()).await;
+    for line in crate::other_daemon::note(hint, other.as_deref(), one_row) {
+        eprintln!("{line}");
     }
 }
 
-/// The hint's second line for the network commands.
-const OVERLAY_IS_THE_ROOT_HALFS: &str = "the overlay runs in the privileged one.";
-
-/// #2871 — the hint's second line for `config ls` / `config set`. On a
-/// supervised Mac (FR-43) the per-user half the unprivileged CLI reaches has a
-/// configuration of its own, and the device-owned gates that matter to an
-/// administrator — the overlay, Roomler SSH, remote commands — are read from
-/// the ROOT half's `/etc/roomler/config.toml`. Before this line the command
-/// listed, and changed, the per-user half's file with no word that another
-/// existed; the Mac in #2871 showed `ssh_enabled = false` here while the root
-/// half served SSH.
-const CONFIG_IS_THE_PER_USER_HALFS: &str = "this is ITS configuration. The root daemon's keys \
-     (the overlay, SSH, exec) live in its own file: `sudo roomler config ls` / `sudo roomler \
-     config set <key> <value>`.";
+/// #3898 — does this Mac's root daemon run one row (FR-43 P3a)? Its own word
+/// (`gui_worker.one_row`) in the status it serves this account on the person
+/// socket; the screen worker that answered has the device's status, not that.
+/// `None` with no second daemon, off macOS, and when the root daemon refuses,
+/// predates the field or takes 300 ms: the note then keeps its words.
+async fn root_runs_one_row(other: Option<&std::path::Path>) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if let (Some(_), Some(path)) = (other, localapi::own_person_socket_path()) {
+        let ask = async {
+            let mut root = localapi::connect_unix_served_by_root(path).await.ok()?;
+            root.status().await.ok()
+        };
+        let status = tokio::time::timeout(std::time::Duration::from_millis(300), ask).await;
+        return status.ok().flatten()?.gui_worker.map(|w| w.one_row);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = other;
+    None
+}
 
 /// `roomler logs` — surface the S2 `TailLog` verb on the CLI.
 ///
@@ -294,7 +294,7 @@ pub async fn peers(args: PeersArgs) -> Result<()> {
     if names.is_empty() {
         print_dark_orgs(&orgs, &peers);
     }
-    print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Network).await;
     Ok(())
 }
 
@@ -648,7 +648,7 @@ pub async fn why(peer: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     print_why(p);
-    print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Network).await;
     Ok(())
 }
 
@@ -1581,7 +1581,7 @@ pub async fn config_ls(json: bool) -> Result<()> {
              `sudo roomler config set <key> <value>`"
         );
     }
-    print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Config).await;
     Ok(())
 }
 
@@ -1618,7 +1618,7 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
         println!("{note}");
     }
     // #2871 — and WHICH daemon's file just changed, when this host runs two.
-    print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Config).await;
     Ok(())
 }
 
