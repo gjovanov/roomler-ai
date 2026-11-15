@@ -2187,26 +2187,10 @@ pub fn spawn_installer_as_flavour(
 /// against synthetic env-var values without an SCM dependency.
 #[cfg(target_os = "windows")]
 fn preserve_system_context_property(flavour: WindowsInstallFlavour) -> Vec<(String, String)> {
-    let env_value =
+    preserve_system_context_property_for(flavour, || {
         crate::win_service::environment::read_service_env_var("ROOMLERD_ENABLE_SYSTEM_SWAP")
-            .map_err(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
-                     not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
-                     but may strip SystemContext if it was enabled)"
-                );
-                format!("{e}")
-            });
-    let result = preserve_system_context_property_for(flavour, env_value);
-    if !result.is_empty() {
-        tracing::info!(
-            "updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env; \
-             passing ENABLE_SYSTEM_CONTEXT=1 to msiexec to preserve SystemContext mode \
-             across auto-update (rc.56 hotfix)"
-        );
-    }
-    result
+            .map_err(|e| format!("{e}"))
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2246,13 +2230,29 @@ fn preserve_system_context_property(_flavour: WindowsInstallFlavour) -> Vec<(Str
 #[cfg(any(target_os = "windows", test))]
 fn preserve_system_context_property_for(
     flavour: WindowsInstallFlavour,
-    env_value: Result<Option<String>, String>,
+    read_service_env: impl FnOnce() -> Result<Option<String>, String>,
 ) -> Vec<(String, String)> {
+    let env_value = read_service_env().map_err(|e| {
+        tracing::warn!(
+            error = %e,
+            "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
+             not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
+             but may strip SystemContext if it was enabled)"
+        );
+        e
+    });
     if flavour != WindowsInstallFlavour::PerMachine {
         return Vec::new();
     }
     match env_value {
-        Ok(Some(v)) if v == "1" => vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())],
+        Ok(Some(v)) if v == "1" => {
+            tracing::info!(
+                "updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env; \
+                 passing ENABLE_SYSTEM_CONTEXT=1 to msiexec to preserve SystemContext mode \
+                 across auto-update (rc.56 hotfix)"
+            );
+            vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
+        }
         _ => Vec::new(),
     }
 }
@@ -6598,21 +6598,19 @@ mod tests {
         // property because perUser MSIs don't define the WiX
         // `EnableSystemContext` CA at all.
         assert_eq!(
-            preserve_system_context_property_for(
-                WindowsInstallFlavour::PerUser,
-                Ok(Some("1".into())),
-            ),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || Ok(Some(
+                "1".into()
+            )),),
             Vec::<(String, String)>::new()
         );
         assert_eq!(
-            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, Ok(None),),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || Ok(None)),
             Vec::<(String, String)>::new()
         );
         assert_eq!(
-            preserve_system_context_property_for(
-                WindowsInstallFlavour::PerUser,
-                Err("nope".into()),
-            ),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || Err(
+                "nope".into()
+            ),),
             Vec::<(String, String)>::new()
         );
     }
@@ -6623,10 +6621,10 @@ mod tests {
         // pass `ENABLE_SYSTEM_CONTEXT=1`. Without this assertion the
         // WiX DisableSystemContext CA would strip the env var on every
         // auto-update (field-repro WINHOST-A 2026-05-24, rc.55 self-update).
-        let result = preserve_system_context_property_for(
-            WindowsInstallFlavour::PerMachine,
-            Ok(Some("1".into())),
-        );
+        let result =
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || {
+                Ok(Some("1".into()))
+            });
         assert_eq!(
             result,
             vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
@@ -6640,7 +6638,7 @@ mod tests {
         // runs DisableSystemContext which is an idempotent no-op when
         // there's nothing to disable.
         assert_eq!(
-            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, Ok(None),),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || Ok(None)),
             Vec::<(String, String)>::new()
         );
     }
@@ -6656,10 +6654,9 @@ mod tests {
         // `system_swap_enabled` to also be strict.
         for v in ["0", "true", "yes", "on", "TRUE", "", "anything"] {
             assert_eq!(
-                preserve_system_context_property_for(
-                    WindowsInstallFlavour::PerMachine,
-                    Ok(Some(v.into())),
-                ),
+                preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || Ok(
+                    Some(v.into())
+                ),),
                 Vec::<(String, String)>::new(),
                 "non-\"1\" env value {v:?} must NOT pass ENABLE_SYSTEM_CONTEXT"
             );
@@ -6673,11 +6670,80 @@ mod tests {
         // Operator can re-enable SystemContext manually via
         // `roomlerd enable-system-context` if needed.
         assert_eq!(
-            preserve_system_context_property_for(
-                WindowsInstallFlavour::PerMachine,
-                Err("SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into()),
-            ),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || Err(
+                "SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into()
+            ),),
             Vec::<(String, String)>::new()
+        );
+    }
+
+    /// #3889 — a per-user install registers no service, so its self-update
+    /// never asks for the service's environment and logs nothing about the
+    /// SystemContext switch: the flavour is checked first. Whatever the read
+    /// would have answered, it is never made.
+    #[test]
+    fn a_per_user_update_never_reads_the_service_environment() {
+        /// What the service's environment would have answered.
+        type Answer = fn() -> Result<Option<String>, String>;
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+        let answers: [Answer; 3] = [
+            || Ok(Some("1".into())),
+            || Ok(None),
+            || Err("the service is not installed".into()),
+        ];
+        for answer in answers {
+            let asked = std::cell::Cell::new(false);
+            let props =
+                preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || {
+                    asked.set(true);
+                    answer()
+                });
+            assert!(props.is_empty(), "{props:?}");
+            assert!(
+                !asked.get(),
+                "a per-user update asked for the service environment ({:?})",
+                answer()
+            );
+        }
+        let text = log.text();
+        assert!(
+            !text.contains("ROOMLERD_ENABLE_SYSTEM_SWAP"),
+            "a per-user update logged about the SystemContext switch:\n{text}"
+        );
+    }
+
+    /// #3889 — a per-Machine update keeps its read, one per update, its INFO
+    /// when the switch is on and its WARN when the read fails.
+    #[test]
+    fn a_per_machine_update_reads_the_service_environment_and_says_what_it_found() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+        let reads = std::cell::Cell::new(0);
+        let on = preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || {
+            reads.set(reads.get() + 1);
+            Ok(Some("1".into()))
+        });
+        assert_eq!(
+            on,
+            vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
+        );
+        let failed =
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || {
+                reads.set(reads.get() + 1);
+                Err("SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into())
+            });
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(reads.get(), 2, "one read per update");
+        let text = log.text();
+        assert!(
+            text.lines().any(|l| l.contains("INFO")
+                && l.contains("updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env")),
+            "no INFO for the switch that was on:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l.contains("WARN")
+                && l.contains("updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP")
+                && l.contains("ERROR_ACCESS_DENIED")),
+            "no WARN for the read that failed:\n{text}"
         );
     }
 

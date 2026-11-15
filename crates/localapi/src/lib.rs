@@ -8982,6 +8982,148 @@ mod tests {
         );
     }
 
+    /// #3907 — `line` from the person at the CONSOLE of a per-user daemon in
+    /// RDP session 3: since #3903 the console person's gates take the person
+    /// at the screen the daemon shows, session 3's, and refuse this one. The
+    /// refusal, which must not reach the daemon.
+    async fn refused_at_the_console_of_an_rdp_daemon(line: &str) -> String {
+        let _pinned = PinnedSessions::own_and_console(Some(3), Some(1));
+        let state = TakesTheVerbs::default();
+        let r = ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(1), line).await;
+        assert_eq!(state.reached(), 0, "{line} reached the daemon: {r:?}");
+        match r {
+            Response::Error { message } => message,
+            other => panic!("{line} was not refused: {other:?}"),
+        }
+    }
+
+    /// #3907 — the recording verbs' refusal names the person at this device's
+    /// screen, whom the gate takes, and never the console, whose person it
+    /// refuses here.
+    #[tokio::test]
+    async fn a_recording_verbs_refusal_names_the_person_at_the_screen() {
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"a.mp4"}}"#,
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can start, stop or delete a recording, \
+                 or change where recordings are saved",
+                "{line}"
+            );
+        }
+    }
+
+    /// #3907 — keep busy on: its refusal names the person at this device's
+    /// screen.
+    #[tokio::test]
+    async fn a_keep_busy_starts_refusal_names_the_person_at_the_screen() {
+        assert_eq!(
+            refused_at_the_console_of_an_rdp_daemon(r#"{"t":"keep_busy_on","d":{}}"#).await,
+            "only the person at this device's screen can turn keep busy on here — not root or \
+             SYSTEM, not a background service, not another session (anyone may stop it)"
+        );
+    }
+
+    /// #3907 — the external-access password, set and clear: its refusal names
+    /// the person at this device's screen.
+    #[tokio::test]
+    async fn the_external_access_passwords_refusal_names_the_person_at_the_screen() {
+        // Built, never a literal: a scanner cannot tell a test password from a leak.
+        let set = format!(
+            r#"{{"t":"external_password_set","d":{{"password":"{}"}}}}"#,
+            "p".repeat(16)
+        );
+        for (verb, line) in [
+            ("external_password_set", set.as_str()),
+            (
+                "external_password_clear",
+                r#"{"t":"external_password_clear"}"#,
+            ),
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can open it to people outside the \
+                 organization, or change how",
+                "{verb}"
+            );
+        }
+    }
+
+    /// #3907 — a console person's `ConfigSet` key: every entry of
+    /// [`CONSOLE_PERSON_KEYS`] refuses in its own words, which name the person
+    /// at this device's screen.
+    #[tokio::test]
+    async fn a_console_persons_keys_refusal_names_the_person_at_the_screen() {
+        const RECORDING: &str = "only the person at this device's screen can start, stop or \
+                                 delete a recording, or change where recordings are saved";
+        const OUTSIDERS: &str = "only the person at this device's screen can open it to people \
+                                 outside the organization, or change how";
+        const SESSION_USE: &str = "only the person at this device's screen can change what a \
+                                   remote session may use here (clipboard, files, audio)";
+        let expected = [
+            ("record_dir", RECORDING),
+            ("record_remote_enabled", RECORDING),
+            ("record_remote_audio", RECORDING),
+            (
+                "files_dir",
+                "only the person at this device's screen can change where incoming files land",
+            ),
+            (
+                "keep_busy_enabled",
+                "only the person at this device's screen can change whether keep busy is \
+                 allowed here",
+            ),
+            (
+                "privacy_mode_allowed",
+                "only the person at this device's screen can change whether privacy mode is \
+                 allowed here",
+            ),
+            (
+                "lock_on_end",
+                "only the person at this device's screen can change whether this computer locks \
+                 when a remote session ends",
+            ),
+            (
+                "display_match",
+                "only the person at this device's screen can change whether a remote session \
+                 may switch this display",
+            ),
+            (
+                "peer_auth",
+                "only the person at this device's screen can change whether this device checks \
+                 the browsers that connect to it",
+            ),
+            ("rc_clipboard", SESSION_USE),
+            ("rc_files", SESSION_USE),
+            ("rc_audio", SESSION_USE),
+            (
+                "allow_plaintext_server",
+                "only the person at this device's screen can let it reach its server without TLS",
+            ),
+            ("external_access_enabled", OUTSIDERS),
+            ("external_consent_mode", OUTSIDERS),
+            ("external_max_permissions", OUTSIDERS),
+        ];
+        // Every entry of the table is asked, a new one included.
+        for k in CONSOLE_PERSON_KEYS {
+            assert!(
+                expected.iter().any(|(key, _)| k.keys.matches(key)),
+                "{k:?}: no key of it is asked here"
+            );
+        }
+        for (key, words) in expected {
+            let line = format!(r#"{{"t":"config_set","d":{{"key":"{key}","value":"false"}}}}"#);
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(&line).await,
+                words,
+                "{key}"
+            );
+        }
+    }
+
     /// The tray and the CLI as the pipe reads them: a client of this process,
     /// read from the OS at accept (its session, its account from its token),
     /// sets a console person's key, turns keep busy on and starts a recording

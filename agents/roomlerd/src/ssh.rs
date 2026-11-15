@@ -2117,6 +2117,10 @@ mod sshd {
     /// `None` is a normal answer (no OpenSSH server installed) and the caller
     /// turns it into a refusal that says what to install.
     fn sftp_server_path() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(p) = STAND_IN_SFTP_SERVER.with(|s| s.borrow().clone()) {
+            return Some(p);
+        }
         // `ROOMLER_SFTP_SERVER` first, for a host that keeps it somewhere
         // unusual — an escape hatch beats a support ticket.
         if let Ok(p) = std::env::var("ROOMLER_SFTP_SERVER") {
@@ -2141,6 +2145,15 @@ mod sshd {
             .iter()
             .map(std::path::PathBuf::from)
             .find(|p| p.is_file())
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Tests only: the `sftp-server` a server on this thread starts in
+        /// place of OpenSSH's (#3890). A `#[tokio::test]` serves its
+        /// connection on its own thread, so no other test's server sees it.
+        pub(super) static STAND_IN_SFTP_SERVER: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// FR-97 P4b's kill switch: `ROOMLERD_SFTP_AS_USER=0` puts back the
@@ -5758,6 +5771,146 @@ mod tests {
             ] {
                 let at = line_with(&text, message);
                 assert!(at.contains(&run_as), "{run_as} on {at:?}");
+            }
+        }
+
+        /// The line `sftp-server`'s stderr is logged on.
+        const SFTP_STDERR: &str = "ssh: sftp-server stderr";
+
+        /// #3890 — a stand-in `sftp-server` for the server on this thread,
+        /// gone with this guard: it writes its lines to its stderr and exits
+        /// 0. Unix: `/bin/sh`, running the script the client sends it on the
+        /// channel, so no file is written and then run. Windows: a `.cmd`
+        /// that echoes them, and the client sends nothing.
+        struct StandInSftpServer {
+            script: String,
+            dir: Option<std::path::PathBuf>,
+        }
+
+        impl StandInSftpServer {
+            fn writing(lines: &[&str]) -> Self {
+                let (program, script, dir) = if cfg!(windows) {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos();
+                    let dir = std::env::temp_dir().join(format!("roomler-sftp-stand-in-{nanos}"));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let mut cmd = String::from("@echo off\r\n");
+                    for line in lines {
+                        cmd.push_str(&format!(">&2 echo {line}\r\n"));
+                    }
+                    cmd.push_str("exit /b 0\r\n");
+                    let program = dir.join("sftp-server.cmd");
+                    std::fs::write(&program, cmd).unwrap();
+                    (program, String::new(), Some(dir))
+                } else {
+                    let script = lines
+                        .iter()
+                        .map(|line| format!("printf '%s\\n' '{line}' >&2\n"))
+                        .collect();
+                    (std::path::PathBuf::from("/bin/sh"), script, None)
+                };
+                super::super::sshd::STAND_IN_SFTP_SERVER.with(|s| *s.borrow_mut() = Some(program));
+                Self { script, dir }
+            }
+
+            /// What it writes, as the server reads it trimmed: its lines,
+            /// each ended as this OS's `echo` or `printf` ends one.
+            fn wrote(lines: &[&str]) -> String {
+                lines.join(if cfg!(windows) { "\r\n" } else { "\n" })
+            }
+
+            /// SFTP on a key-list session that runs as the daemon: the
+            /// stand-in gets its script and EOF, and the channel closes
+            /// with its exit status. Then the log, once its stderr line is
+            /// in, which its own task writes: 10 s at most.
+            async fn run(&self, seed: u8, log: &Logged) -> String {
+                let (key, line) = client_key(seed);
+                let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+                let session = connect(addr, key).await;
+                let mut channel = session.channel_open_session().await.unwrap();
+                channel.request_subsystem(true, "sftp").await.unwrap();
+                if !self.script.is_empty() {
+                    channel.data(self.script.as_bytes()).await.unwrap();
+                }
+                channel.eof().await.unwrap();
+                let mut exit = None;
+                while let Some(msg) = channel.wait().await {
+                    match msg {
+                        russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                        russh::ChannelMsg::Failure => panic!("sftp refused:\n{}", log.text()),
+                        _ => {}
+                    }
+                }
+                assert_eq!(exit, Some(0), "the stand-in's exit:\n{}", log.text());
+                for _ in 0..500 {
+                    if log.text().contains(SFTP_STDERR) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                log.text()
+            }
+        }
+
+        impl Drop for StandInSftpServer {
+            fn drop(&mut self) {
+                super::super::sshd::STAND_IN_SFTP_SERVER.with(|s| s.borrow_mut().take());
+                if let Some(dir) = &self.dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        /// The lines of `log` that hold `sftp-server`'s stderr.
+        fn sftp_stderr_lines(log: &str) -> Vec<&str> {
+            log.lines().filter(|l| l.contains(SFTP_STDERR)).collect()
+        }
+
+        /// #3890 — `sftp-server`'s stderr goes to the daemon's log, never
+        /// the client's channel, as ONE escaped field of one line, like the
+        /// text the server takes from the wire: two lines and a control
+        /// character from the child stay inside it.
+        #[tokio::test]
+        async fn sftp_servers_stderr_never_starts_a_log_line_of_its_own() {
+            const LINES: [&str; 2] = [
+                "sftp-server: first line",
+                "SECOND LINE from sftp-server\u{1b}[2J",
+            ];
+            let log = Logged::start(tracing::Level::INFO);
+            let stand_in = StandInSftpServer::writing(&LINES);
+            let text = stand_in.run(155, &log).await;
+
+            assert_one_line_each(&text, '\u{1b}');
+            let lines = sftp_stderr_lines(&text);
+            assert_eq!(lines.len(), 1, "one line for its stderr:\n{text}");
+            let msg = format!("msg={}", escaped(&StandInSftpServer::wrote(&LINES)));
+            assert!(lines[0].contains(&msg), "{msg} on {:?}", lines[0]);
+        }
+
+        /// #3890 — and at most its first 4 KiB, with a count of the bytes
+        /// after them: a child that writes a lot to its stderr cannot grow
+        /// the daemon's memory, or one line of its log, past that.
+        #[tokio::test]
+        async fn sftp_servers_stderr_is_logged_4_kib_at_most() {
+            let long = "x".repeat(6000);
+            let log = Logged::start(tracing::Level::INFO);
+            let stand_in = StandInSftpServer::writing(&[long.as_str()]);
+            let text = stand_in.run(156, &log).await;
+
+            let lines = sftp_stderr_lines(&text);
+            assert_eq!(lines.len(), 1, "one line for its stderr:\n{text}");
+            let written = StandInSftpServer::wrote(&[long.as_str()]).len()
+                + if cfg!(windows) { 2 } else { 1 };
+            let kept = format!("msg={}", escaped(&"x".repeat(4096)));
+            let cut = format!("cut_bytes={}", written - 4096);
+            for field in [&kept, &cut] {
+                assert!(
+                    lines[0].contains(field.as_str()),
+                    "{field} on {:?}",
+                    lines[0]
+                );
             }
         }
     }
