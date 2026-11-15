@@ -25,7 +25,7 @@
 //! | `service start` (the wizard, a restart by the tray or `roomler restart`, the updater's watcher after a failed install, the Start menu entry) and the hard stop's `schtasks /End` | its own task, else a legacy one that is its own ([`own_autostart`]) |
 //! | `service status` | the same, read without acting ([`status`]) |
 //! | `service uninstall` (the MSI's `UnregisterAutostart`) | its own tasks, and the legacy ones that are its own ([`unregister`]) |
-//! | the per-user arm of `cleanup-legacy-install` | the tasks of the account signed in to the step's session (`install_cleanup.rs`) |
+//! | the per-user arm of `cleanup-legacy-install` | the tasks of the account signed in to the step's session, each ended and then deleted, and then that account's daemon still running (`install_cleanup.rs`, #3885) |
 //!
 //! An install from before #3801 keeps its `Roomler` until its own account's
 //! update: the old product's `UnregisterAutostart` deletes it, as every update

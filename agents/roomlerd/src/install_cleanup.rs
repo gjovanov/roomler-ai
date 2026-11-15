@@ -34,6 +34,8 @@
 //!   `RoomlerAgent` when their principal is that account
 //!   (`service::user_task::clean_up_choice`). Another account's task, or one
 //!   whose account it cannot read, stays, with a line that says so.
+//! - #3885: the daemon those tasks started, which still runs once they are
+//!   deleted (below, "Stopping the account's daemon").
 //! - The session user's data dirs at `AppData\Local\roomler\
 //!   roomler-agent\` and `AppData\Roaming\roomler\roomler-agent\` (and the
 //!   `roomler` segment; `needs-attention.txt` goes with the Roaming one),
@@ -43,6 +45,53 @@
 //! - FR-145: each tree is removed by handle, through the walk that checked
 //!   it (`HeldPath::remove_tree`); a tree with a link on the way or in it is
 //!   left in place, with a line that names the link.
+//!
+//! ## Stopping the account's daemon (#3885)
+//!
+//! Deleting a Scheduled Task does not end the process it started, so before
+//! #3885 the account's daemon ran on beside the per-Machine service's: one
+//! machine, two daemons, on one TUN name and GUID, one LocalAPI pipe, and one
+//! host-wide exit, DNS and WFP state. The arm stops it, in this order:
+//!
+//! 1. It reads the processes listed under a daemon image's name
+//!    (`roomlerd.exe`, `roomlerdw.exe`) and picks the account's (`Pick::fate`):
+//!    its token's user is the account it cleans, and the file it was started
+//!    from is one of those images in that account's per-user install, below
+//!    the profile the data dirs' plan names (`per_user_install`). Never this
+//!    step's own process (it is `roomlerd.exe` too), the per-Machine
+//!    install's daemon, another account's process, or one whose account or
+//!    file it cannot read; never the process that started this step either,
+//!    as ending a launcher ends what its job holds.
+//! 2. `schtasks /End` on each task it removes: Task Scheduler ends the
+//!    task's process, the launcher `roomlerdw.exe`, and the launcher's
+//!    kill-on-close job ends the daemon (`agents/roomlerdw`).
+//! 3. `schtasks /Delete` on each.
+//! 4. Each daemon it picked is stopped, or found gone; then it reads the list
+//!    again and stops each daemon of the account still running. Every stop
+//!    checks the process through the handle that ends it, so a pid another
+//!    process has taken since the list is never ended.
+//! 5. The data dirs, last.
+//!
+//! Why the order holds: until a task is deleted, something can start it
+//! again. Its one-shot triggers fire 60, 180 and 600 s after each
+//! registration, its logon and boot triggers at a sign-in and a start, and
+//! `service start` (the tray's restart, `roomler restart`, the updater's
+//! watcher, the Start menu entry) runs it. `<RestartOnFailure>` restarts
+//! nothing (#3292), and an ended task has not failed. A process ended while
+//! its task is still there can come back, and the delete cannot come first,
+//! as `/End` needs the task. Once the task is deleted, nothing of the product
+//! starts the daemon, so the list read then holds what is left, and its stop
+//! holds. A launcher started just before the delete is in that list too
+//! (`roomlerdw.exe` is a daemon image), and its job ends its daemon with it.
+//! The data dirs go once nothing of the account runs from them.
+//!
+//! The report gives each daemon it picked one line, by pid and listed name,
+//! never an account or a path: `daemon pid N (roomlerd.exe) stopped`, whether
+//! the task's end or the stop ended it, or `daemon pid N (roomlerd.exe) still
+//! running: stop it with taskkill /F /PID N`. Every other process of a
+//! daemon's name gets `pid N (name) left running: <why>`, except this step's
+//! own and the per-Machine install's daemon. `--dry-run` reads the list, ends
+//! and stops nothing, and says what it would end, delete and stop.
 //!
 //! ## Vacated-dir sweep (P4b)
 //!
@@ -395,34 +444,15 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 // ──────────────────────────────────────────────────────────────────
 #[cfg(target_os = "windows")]
 fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
-    // 1. Scheduled Tasks — registered by the perUser MSI's
-    //    `RegisterAutostart` custom action: `RoomlerAgent` pre-P3d,
-    //    `Roomler` since the P3d rename, `Roomler-<SID>` since #3801. Only
-    //    those of the account this arm cleans: every account's install
-    //    held the shared names, so one is removed only when its principal
-    //    is that account. NB reachable via operator CLI only — the MSI CA
-    //    always exits through the same-flavour fast path (module docs) — so
-    //    this can never race the SAME install's freshly-registered task.
-    let cleaned = account_cleaned();
-    clean_up_user_tasks(
-        &mut crate::service::Schtasks,
-        &mut Running,
-        cleaned.as_deref().map_err(|why| *why),
-        Folders {
-            per_user: None,
-            per_machine: None,
-        },
-        report,
-        dry_run,
-    );
-
-    // 2. The data dirs below the profile the system records for the
-    //    session's account (FR-145: by its SID, never by its user name), as
-    //    `plan_per_user_removal` decides (#3702).
+    // 0. The data dirs' plan first, which only reads: the profile the system
+    //    records for the session's account (FR-145: by its SID, never by its
+    //    user name), as `plan_per_user_removal` decides (#3702). That account's
+    //    per-user install, the folder its daemon runs from, is below it
+    //    (#3885).
     #[cfg(feature = "system-context")]
-    {
+    let plan = {
         use crate::system_context::user_profile;
-        let plan = plan_per_user_removal(
+        plan_per_user_removal(
             crate::win_token::own_user_sid().as_deref(),
             || match user_profile::session_user_name() {
                 Some(name) => SessionAccount::User {
@@ -432,9 +462,46 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
                 None => SessionAccount::Nobody,
             },
             crate::appdirs::profile_of_account,
-        );
-        remove_per_user_trees(plan, report, dry_run);
-    }
+        )
+    };
+    #[cfg(feature = "system-context")]
+    let per_user = plan
+        .profile
+        .as_deref()
+        .map(|profile| per_user_install(profile, crate::updater::INSTALL_FOLDER_NAME));
+    #[cfg(not(feature = "system-context"))]
+    let per_user: Option<std::path::PathBuf> = None;
+    let per_machine = crate::updater::install_dir_with_name(
+        crate::updater::WindowsInstallFlavour::PerMachine,
+        crate::updater::INSTALL_FOLDER_NAME,
+    );
+
+    // 1. Scheduled Tasks — registered by the perUser MSI's
+    //    `RegisterAutostart` custom action: `RoomlerAgent` pre-P3d,
+    //    `Roomler` since the P3d rename, `Roomler-<SID>` since #3801. Only
+    //    those of the account this arm cleans: every account's install
+    //    held the shared names, so one is removed only when its principal
+    //    is that account. NB reachable via operator CLI only — the MSI CA
+    //    always exits through the same-flavour fast path (module docs) — so
+    //    this can never race the SAME install's freshly-registered task.
+    //    #3885: each is ended before it is deleted, and then the account's
+    //    daemon still running is stopped (module docs).
+    let cleaned = account_cleaned();
+    clean_up_user_tasks(
+        &mut crate::service::Schtasks,
+        &mut Running,
+        cleaned.as_deref().map_err(|why| *why),
+        Folders {
+            per_user: per_user.as_deref(),
+            per_machine: per_machine.as_deref(),
+        },
+        report,
+        dry_run,
+    );
+
+    // 2. The data dirs, once nothing of the account runs from them.
+    #[cfg(feature = "system-context")]
+    remove_per_user_trees(plan, report, dry_run);
 
     // Without the system-context feature compiled in, the session's
     // account cannot be read; the cleanup becomes a
@@ -467,10 +534,18 @@ fn account_cleaned() -> Result<String, &'static str> {
     Err("this build cannot read the account signed in to the step's session")
 }
 
-/// #3801 — the per-user arm's Scheduled Tasks: those of `cleaned`, the account
-/// it cleans ([`account_cleaned`]; `Err`: why it cannot tell that account),
-/// and no other account's. The choice is `user_task::clean_up_choice`; every
-/// task it finds has its line in `report`, and no line names an account.
+/// #3801, #3885 — the per-user arm's Scheduled Tasks, and the daemon they
+/// started. The tasks are those of `cleaned`, the account it cleans
+/// ([`account_cleaned`]; `Err`: why it cannot tell that account), and no other
+/// account's: the choice is `user_task::clean_up_choice`. The daemon is that
+/// account's, from its per-user install in `folders` ([`Pick::fate`]).
+///
+/// In this order (module docs): the processes are listed; each task it removes
+/// is ended (`schtasks /End`), then deleted; then each daemon it picked is
+/// stopped or found gone, and what still runs is stopped
+/// ([`stop_what_is_left`]). Every task and every process of a daemon's name it
+/// finds has one line in `report`, and no line names an account or a folder.
+/// `dry_run`: it reads the tasks and the processes and acts on none.
 #[cfg(target_os = "windows")]
 fn clean_up_user_tasks(
     lib: &mut impl crate::service::user_task::Library,
@@ -481,13 +556,51 @@ fn clean_up_user_tasks(
     dry_run: bool,
 ) {
     use crate::service::user_task::{Verdict, clean_up_choice};
-    let _ = (procs.this_step(), folders); // RED stub (#3885)
-    for choice in clean_up_choice(lib, cleaned) {
+    let choice = clean_up_choice(lib, cleaned);
+    let (own, parent) = procs.this_step();
+    let pick = match (cleaned, folders.per_user) {
+        (Ok(cleaned), Some(per_user)) => Some(Pick {
+            cleaned,
+            per_user,
+            per_machine: folders.per_machine,
+            own,
+            parent,
+        }),
+        _ => None,
+    };
+    // The account's daemons as they run before anything is ended: the ones
+    // its tasks started among them, which their end stops.
+    let first = pick.as_ref().and_then(|_| procs.daemon_named());
+    if pick.is_some() && first.is_none() {
+        tracing::warn!(
+            "cleanup-legacy-install: the process list could not be read before the account's \
+             tasks are ended"
+        );
+    }
+    if !dry_run {
+        for choice in choice.iter().filter(|c| c.verdict == Verdict::Remove) {
+            // A failure is no reason to keep the task: what still runs once it
+            // is deleted is stopped below.
+            if let Err(e) = lib.end(&choice.name) {
+                tracing::info!(
+                    task = %choice.shown,
+                    error = %format!("{e:#}"),
+                    "cleanup-legacy-install: schtasks /End did not end the task"
+                );
+            }
+        }
+    }
+    for choice in choice {
         let shown = &choice.shown;
         match choice.verdict {
-            Verdict::Remove if dry_run => report
-                .removed
-                .push(format!("[dry-run] schtasks /Delete /TN {shown} /F")),
+            Verdict::Remove if dry_run => {
+                report
+                    .removed
+                    .push(format!("[dry-run] schtasks /End /TN {shown}"));
+                report
+                    .removed
+                    .push(format!("[dry-run] schtasks /Delete /TN {shown} /F"));
+            }
             Verdict::Remove => match lib.delete(&choice.name) {
                 Ok(()) => report.removed.push(format!("Scheduled Task {shown}")),
                 Err(e) => report.errors.push(format!("schtasks /Delete {shown}: {e}")),
@@ -507,6 +620,105 @@ fn clean_up_user_tasks(
                  task"
             )),
         }
+    }
+    match (cleaned, pick) {
+        (Err(why), _) => report
+            .skipped
+            .push(format!("no running daemon stopped: {why}")),
+        (Ok(_), None) => report.skipped.push(
+            "no running daemon looked for: this step cannot name the account's per-user install \
+             folder"
+                .to_string(),
+        ),
+        (Ok(_), Some(pick)) if dry_run => would_stop(&pick, first, report),
+        (Ok(_), Some(pick)) => stop_what_is_left(procs, &pick, first, report),
+    }
+}
+
+/// #3885 — the error line when the process list cannot be read.
+#[cfg(target_os = "windows")]
+const LIST_UNREAD: &str = "the process list could not be read, so this step cannot tell whether the account's daemon \
+     still runs";
+
+/// #3885 — the dry run's lines for the processes of a daemon's name in
+/// `first`: what it would stop, and what it would leave.
+#[cfg(target_os = "windows")]
+fn would_stop(pick: &Pick<'_>, first: Option<Vec<Seen>>, report: &mut CleanupReport) {
+    let Some(first) = first else {
+        return report.errors.push(LIST_UNREAD.to_string());
+    };
+    let mut lines = DaemonLines::default();
+    for seen in &first {
+        match pick.fate(seen) {
+            Fate::Stop => lines.set(seen, Said::WouldStop),
+            Fate::Left(why) => lines.fill(seen, Said::Left(why)),
+            Fate::Quiet => {}
+        }
+    }
+    lines.write(report);
+}
+
+/// #3885 — once the account's tasks are ended and deleted: each daemon picked
+/// in `first`, the list read before the end, is stopped here or found gone,
+/// the task's end having stopped it. Then the list is read again, and a daemon
+/// of the account it still holds (one started before the delete, one started
+/// by hand, one the first stop did not end) is stopped, and what is said of it
+/// replaces what was said before. Every other process of a daemon's name in
+/// that list gets its line, unless its pid has one. Each stop is checked
+/// through the handle that ends the process ([`Processes::stop`]).
+#[cfg(target_os = "windows")]
+fn stop_what_is_left(
+    procs: &mut impl Processes,
+    pick: &Pick<'_>,
+    first: Option<Vec<Seen>>,
+    report: &mut CleanupReport,
+) {
+    let is_it = |seen: &Seen| pick.fate(seen) == Fate::Stop;
+    let mut lines = DaemonLines::default();
+    for seen in first.iter().flatten() {
+        if pick.fate(seen) == Fate::Stop {
+            lines.set(seen, said_of(seen, procs.stop(seen.pid, &is_it)));
+        }
+    }
+    match procs.daemon_named() {
+        Some(again) => {
+            for seen in &again {
+                match pick.fate(seen) {
+                    Fate::Stop => lines.set(seen, said_of(seen, procs.stop(seen.pid, &is_it))),
+                    Fate::Left(why) => lines.fill(seen, Said::Left(why)),
+                    Fate::Quiet => {}
+                }
+            }
+        }
+        None => {
+            for seen in first.iter().flatten() {
+                if let Fate::Left(why) = pick.fate(seen) {
+                    lines.fill(seen, Said::Left(why));
+                }
+            }
+            report.errors.push(LIST_UNREAD.to_string());
+        }
+    }
+    lines.write(report);
+}
+
+/// #3885 — what the report says of a daemon it picked, from what became of
+/// it: stopped when it is gone, or the pid now names another process (its
+/// own is gone then), whoever stopped it; still running when Windows refused
+/// to end it or it did not go within the wait.
+#[cfg(target_os = "windows")]
+fn said_of(seen: &Seen, ended: Ended) -> Said {
+    match ended {
+        Ended::Gone | Ended::NotIt | Ended::Stopped => Said::Stopped,
+        Ended::Refused(code) => {
+            tracing::warn!(
+                pid = seen.pid,
+                error = code,
+                "cleanup-legacy-install: Windows refused to end a daemon of the account"
+            );
+            Said::StillRunning
+        }
+        Ended::StillRunning => Said::StillRunning,
     }
 }
 
@@ -603,10 +815,54 @@ struct Pick<'a> {
 
 #[cfg(target_os = "windows")]
 impl Pick<'_> {
-    /// RED stub (#3885).
-    fn fate(&self, _seen: &Seen) -> Fate {
-        Fate::Quiet
+    /// What the per-user arm does with `seen`, in this order. This step's own
+    /// process is never touched or named, and neither is the per-Machine
+    /// install's daemon, whichever account it runs as (an attended install
+    /// runs it as the person). The process that started this step is left:
+    /// ending a launcher would end this step through its job. Then a process
+    /// whose account cannot be read, one of another account, one whose file
+    /// cannot be read, and one started from anything but a daemon image in
+    /// the per-user install are left, each with its reason. What is left is
+    /// the account's daemon, and is stopped.
+    fn fate(&self, seen: &Seen) -> Fate {
+        if seen.pid == self.own {
+            return Fate::Quiet;
+        }
+        let path = seen.path();
+        if let (Some(dir), Some(path)) = (self.per_machine, path)
+            && is_daemon_in(dir, path)
+        {
+            return Fate::Quiet;
+        }
+        if Some(seen.pid) == self.parent {
+            return Fate::Left("it started this step");
+        }
+        let Some(user) = seen.user.as_deref() else {
+            return Fate::Left("this step cannot read which account it runs as");
+        };
+        if !user.eq_ignore_ascii_case(self.cleaned) {
+            return Fate::Left("it runs as another account");
+        }
+        let Some(path) = path else {
+            return Fate::Left("this step cannot read the file it was started from");
+        };
+        if is_daemon_in(self.per_user, path) {
+            Fate::Stop
+        } else {
+            Fate::Left("it runs from another folder")
+        }
     }
+}
+
+/// #3885 — is `path` one of the daemon's images ([`DAEMON_IMAGES`]) directly
+/// in `dir`, compared the way Windows compares paths?
+#[cfg(target_os = "windows")]
+fn is_daemon_in(dir: &Path, path: &Path) -> bool {
+    use crate::win_service::companion_procs::normalize;
+    let path = normalize(path);
+    DAEMON_IMAGES
+        .iter()
+        .any(|image| normalize(&dir.join(image)) == path)
 }
 
 /// #3885 — what the report says of one running process of a daemon's name.
