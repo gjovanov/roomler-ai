@@ -1305,7 +1305,7 @@ sequenceDiagram
 | the start | `notification_for_rc`, [`signaling.rs:7612`](../agents/roomlerd/src/signaling.rs#L7612); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:287`](../agents/roomlerd/src/indicator/mod.rs#L287) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
 | the consent task | `rc_surfaces_up`, [`signaling.rs:7559`](../agents/roomlerd/src/signaling.rs#L7559); `notification_shown`, [`:7627`](../agents/roomlerd/src/signaling.rs#L7627) | waits for the show's verdict before it first looks at the prompt, so the window still starts after the show. Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
 | the session walk | `graphical_session_within`, [`companion.rs:7319`](../agents/roomlerd/src/companion.rs#L7319); `SESSION_WALKS`, [`:7347`](../agents/roomlerd/src/companion.rs#L7347) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:7303`](../agents/roomlerd/src/companion.rs#L7303)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:7360`](../agents/roomlerd/src/companion.rs#L7360)), never "nobody at the screen" |
-| a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:338`](../agents/roomlerd/src/indicator/notify.rs#L338); `launch`, [`:479`](../agents/roomlerd/src/indicator/notify.rs#L479) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
+| a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:351`](../agents/roomlerd/src/indicator/notify.rs#L351); `launch`, [`:492`](../agents/roomlerd/src/indicator/notify.rs#L492) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
 
 Every caller of the portal's session helper takes the walk through `helper_session`
 ([`capture/portal/mod.rs:1330`](../agents/roomlerd/src/capture/portal/mod.rs#L1330)), all on
@@ -1322,10 +1322,12 @@ naming the uid for the recorder. logind's own answer keeps its words and its kin
   (§10.2) and the walk at 1.5 s, so the consent task hears "not up" about 4 s after the request.
   The window starts then, and the agent's `no_prompt_surface` reaches the controller about a
   second ahead of the hub's own timer. With logind answering and the session bus wedged, the
-  helper's own 5 s (`SHOW_BUDGET`) still applies, and the helper is killed then, as before.
+  helper's own 5 s (`SHOW_BUDGET`) still applies: the verdict comes then, as before, and the
+  helper is let go, its stdin closed, and killed 1 s later if it is still there (#3886, below).
 - **A late prompt: nothing comes up late.** A walk out of time starts no helper (its late
   answer reaches no one, and the next ask waits for it or walks afresh); a helper that has not
-  posted within 5 s is killed; a question that ended on the way gets none. The viewer waits out
+  posted within 5 s is let go and then killed, and takes down a notification it did post
+  (#3886); a question that ended on the way gets none. The viewer waits out
   the window and is told `no_prompt_surface`, unless someone answers on another surface (the
   CLI). The log has `no notification prompt (FR-93 P6f)` with the session and the reason, then
   `consent prompt surface … notified=false have_surface=false`.
@@ -1346,6 +1348,70 @@ naming the uid for the recorder. logind's own answer keeps its words and its kin
   (FR-85)": `recording::launch::unix::tests` (a held walk refuses the recorder's session within
   its wait, naming the uid; the control). Field cells: a paused logind while a viewer asks, the
   next prompt after it resumes, and the control.
+
+#### 10.3.1 A helper given up on takes its notification down (#3886)
+
+The helper says its notification is up with one marked line, the reply to its `Notify` turned
+into words. On a slow session bus, the case `SHOW_BUDGET` exists for, the notification can be
+up on screen while that line is still on its way. Until #3886 the daemon killed the helper at
+5 s with `SIGKILL`. A helper killed that way never closes its notification, so it stayed up,
+and its Approve and Deny reached no one: the person saw a question while the viewer was told
+nobody could be asked.
+
+A helper given up on is now let go the way the daemon takes any notification down. Its stdin
+closes, and it takes down a notification it did post, then exits. It is killed only if it is
+still there 1 s later. The verdict, "not up", still comes at 5 s.
+
+```mermaid
+sequenceDiagram
+    participant T as consent task
+    participant S as the show, on the blocking pool
+    participant H as session helper
+    participant N as notification server
+    participant G as notify-let-go
+    T->>S: start the notification
+    S->>H: start it, and write the question to its stdin
+    H->>N: Notify, on a slow session bus
+    Note over S: no up line within 5 s
+    S->>H: close its stdin, the daemon's take-it-down
+    S->>G: kill it if it is still there 1 s later
+    S-->>T: not up, at 5 s as before
+    N-->>H: the late reply, the notification is up
+    H->>N: CloseNotification, as its stdin closed
+    H->>H: exits, and its reader marks it ended, then reaps it
+    G->>G: marked within 1 s, so nothing is killed
+    Note over G: still unmarked at 1 s - SIGKILL, under the lock
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the give-up | `put_up`, [`indicator/notify.rs:528`](../agents/roomlerd/src/indicator/notify.rs#L528); the stdin's drop, [`:599`](../agents/roomlerd/src/indicator/notify.rs#L599) | no "up" line within `SHOW_BUDGET`: the helper's stdin is dropped, which is what takes any of its notifications down, and the verdict is returned at once, as before: `the session helper did not post it within 5 s` |
+| the kill, 1 s later | `let_go`, [`:648`](../agents/roomlerd/src/indicator/notify.rs#L648); `Ended`, [`:615`](../agents/roomlerd/src/indicator/notify.rs#L615); `GIVE_UP_GRACE`, [`:312`](../agents/roomlerd/src/indicator/notify.rs#L312) | a thread named `notify-let-go` waits up to 1 s for the helper's stdout to close, and sends `SIGKILL` only if it has not. The reader marks that close under a lock before it reaps the helper ([`:581`](../agents/roomlerd/src/indicator/notify.rs#L581)), and the kill is sent under the same lock only while unmarked: it reaches our own unreaped child, never a process that took its pid. With no thread for the wait, the kill comes at once, as before |
+| the helper's side | `helper::run`, [`:1085`](../agents/roomlerd/src/indicator/notify.rs#L1085), [`:1153`](../agents/roomlerd/src/indicator/notify.rs#L1153) | the helper listens for its stdin's close from its start. A close that comes while it is still reaching the session bus posts nothing, and its stderr says `the daemon took it down before it was posted; nothing posted`. After its `Notify` has answered, the close takes the notification down, as for any question that ends |
+| the expiry | `expire_timeout`, [`:1252`](../agents/roomlerd/src/indicator/notify.rs#L1252); the question's end, [`:1078`](../agents/roomlerd/src/indicator/notify.rs#L1078) | the question is posted to expire at its end: what is left of `lifetime_ms`, counted from the request's arrival, and never 0, which is "never expires". A server that keeps the spec's `expire_timeout` then takes down a notification whose helper was killed with its `Notify` still in flight |
+
+- **The bounds:** the verdict comes at 5 s, as before, so the viewer's `no_prompt_surface` keeps
+  its timing against the hub's timer (5 s past the window). The 1 s runs on its own thread, after
+  the verdict: no async worker and no caller waits for it. A helper given up on is gone 6 s after
+  its start at the latest, and reaped by its reader.
+- **What is left:** a `Notify` the server has still not answered 1 s after the give-up. The
+  helper is killed with it in flight, and the server may still put the question up. It expires
+  at the question's end on a server that keeps `expire_timeout`. A server that ignores it keeps
+  the question until the person closes it, and a press on it reaches no one.
+- **The being-viewed notice** (FR-93 P6g) has the same helper and the same give-up. It expires
+  after its day (`lifetime_ms`, 24 h), when its helper closes it anyway.
+- **Tested** in rust-agent's "Test agent under vp9-444" (`portal-capture`), with `sh` standing in
+  for the helper and a file for its notification: `indicator::notify::parent::given_up_tests`
+  ([`:803`](../agents/roomlerd/src/indicator/notify.rs#L803)). A helper that posts and answers
+  only after the give-up gets the verdict "not up" at the give-up, then takes its notification
+  down and is gone. It was red before #3886: killed at the give-up, with its notification left
+  up. The controls: a helper that ignores its stdin is still killed within the bound, and one
+  that answers in time stays up past the grace until its stdin is dropped.
+  `indicator::notify::helper::tests::the_notification_expires_with_its_question` pins the
+  expiry: never 0, and capped at `i32::MAX`, never wrapped.
+- **Field cells:** a Linux system install with no companion and a session bus slowed so that the
+  helper answers after 5 s: after the viewer is told `no_prompt_surface`, no consent
+  notification stays on screen. The control is the same cell on 0.4.222.
 
 ### 10.4 The tray's start for a prompt on Windows and macOS (#3858)
 
