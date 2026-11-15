@@ -35,7 +35,7 @@ flowchart TB
 | Soft-keyboard harness | `cd ui && bun run test:harness` | nothing — one harness page on the Vite dev server, in a real Chromium (`ui/e2e-harness/`, #2888) |
 | Data-channel worker harness | the same run (`e2e-harness/dcworker.spec.ts`, FR-135 R3) | nothing — two peer connections looped in one page, `VideoEncoder` on one side and the real decode worker on the other, on both arms of `roomler-rc-dc-worker` ([below](#the-data-channel-worker-harness-fr-135-r3)) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
-| Encoder smoke | `roomlerd encoder-smoke --encoder hardware [--codec hevc]` | the host's GPU — 10 synthetic frames, prints the cascade's decisions |
+| Encoder smoke | `roomlerd encoder-smoke [--encoder hardware] [--codec h264/hevc/av1]`, or `--name <encoder>` | the host's encoders: one cell opened as a session opens it, 10 synthetic frames, judged by [the L1 verdict](#the-plain-smoke-and-the-sweep-judge-by-the-same-verdict): only `ok` passes, and a failure says what it tried. The default asks for hardware; `--encoder software` is the software smoke |
 
 ## Rust integration tests (`crates/tests/`)
 
@@ -674,11 +674,13 @@ the smoke that every build already carries, so the fleet profiles itself through
 ```mermaid
 flowchart LR
     A["encoder-smoke --bench<br/>flags → plan()"] --> B["rows: cell × size × rate × motion<br/>(the cells this build can open)"]
+    S["encoder-smoke, no --bench<br/>flags → smoke::plan(): one cell"] --> C
     B --> C["SessionOpener<br/>the constructor a session calls"]
     C -- "the opened encoder: name(),<br/>is_hardware(), codec, chroma" --> D["verdict()<br/>asked for vs opened"]
     C --> E["the bench's own thread:<br/>Scene::render → encode(),<br/>a keyframe each second of content"]
     D --> F["one L1 row,<br/>printed when its cell ends"]
     E --> F
+    D --> G["the plain smoke: PASSED only on ok,<br/>else FAILED + what it tried, exit 1"]
 ```
 
 **Run it.** The default profile fits `roomler exec`'s 30 s default timeout, so it needs no flag
@@ -696,7 +698,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8049`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8049`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -707,7 +709,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 | `--bench-paced` | off | Feed frames at `--bench-fps` instead of back to back |
 | `--bench-budget-secs` | 25, or 280 with `--bench-full` | Start no cell after this; the rest print `skipped` |
 | `--encoder` | `hardware` | The smoke's own flag: what the RTP rows ask for |
-| `--name` | — | One FFmpeg encoder by name (FR-78 P2), as path `named` |
+| `--name` | — | One FFmpeg encoder by name (FR-78 P2), as path `named`. A Media Foundation cell's name (`h264_mf`, `hevc_mf`, `av1_mf`) opens that MF cascade alone and asks for MF on either MFT |
 
 **What each cell opens.** The bench opens every cell through the constructor a session calls for
 it (`SessionOpener`, `agents/roomlerd/src/encode/bench.rs:808`), so the encoder that answers is the
@@ -721,7 +723,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:av1` | MF's AV1 | MF |
 | `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5511`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
-| `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
+| `named` | `encode::open_named`: an FFmpeg name past every cascade and the denylist; an MF cell's name, that MF cascade alone (MF still refuses a denied MF cell) | FFmpeg; an MF name asks for MF, not hardware |
 
 ⚠️ The DataChannel rows **mirror** the pump's open; they do not call it, because `FfmpegDcCodec`
 is private to `peer.rs`. A change to how a session opens its encoder needs the same change in
@@ -849,6 +851,47 @@ skip and run nothing. Send plain text: an encoded payload is the shape endpoint 
 
 Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
 the run too. Take the denominator from the server's device list, not from who answered exec.
+
+### The plain smoke and the sweep judge by the same verdict
+
+`roomlerd encoder-smoke` without `--bench` is the bench's judgement on ONE cell (#3652). Its flags map
+to a cell (`encode::smoke::plan`, `agents/roomlerd/src/encode/smoke.rs:95`), the cell opens through the
+same `SessionOpener`, and `verdict()` judges what opened. Only `ok` passes and every other verdict exits
+1. An encoder that opened and then failed to encode, or gave no keyframe, is `error`, and a request no
+build can serve is refused before anything opens. The FR-62 sweep (`--reconfigure-sweep`) opens through
+the same plan and verdict (`smoke::open`), so it measures only a cell the smoke would pass. Before this,
+the smoke failed only when nothing opened: `--encoder hardware` passed on OpenH264 on every Linux host
+whatever its GPU, and the release lane's Windows smoke passed on Microsoft's software MFT, or on
+OpenH264 after Media Foundation failed.
+
+| Request | Cell | Passes on | Otherwise |
+|---|---|---|---|
+| `--encoder hardware` (the default), H.264, a build with Media Foundation (the MSI) | `rtp:h264` | a hardware MFT | `fallback` on Microsoft's software MFT or on OpenH264 |
+| the same, no Media Foundation, FFmpeg on (the `.deb`, the `.pkg`) | `dc:h264`: FFmpeg's H.264 cascade, under the denylist | a hardware FFmpeg encoder | `none`, naming each candidate that failed |
+| the same, no Media Foundation and no FFmpeg (or `ROOMLERD_USE_FFMPEG=0`) | `rtp:h264` | nothing: the build has no hardware H.264 | `sw-only` on OpenH264 |
+| `--encoder hardware --codec hevc` (or `h265`) | `rtp:h265`: FFmpeg's cascade, then MF's | a hardware encoder | `none` |
+| `--encoder hardware --codec av1`, Media Foundation | `rtp:av1` | MF's AV1 | `none` |
+| `--encoder hardware --codec av1`, no MF, FFmpeg on | `dc:av1` | a hardware FFmpeg AV1 encoder | `none` |
+| `--encoder auto` | `rtp:<codec>` | whatever opens there, as a session's RTP track takes it | `none`, or `demoted` if another codec answers |
+| `--encoder software`, H.264 (the `.deb` lanes' call) | `rtp:h264` | OpenH264 | `none` |
+| `--encoder software`, HEVC or AV1 | — | refused before anything opens: no build has a software encoder for either | |
+| `--codec` anything else, `vp9` included | — | refused: VP9 is the DataChannel's (`--bench --bench-cells dc:vp9:444`) | |
+| `--name <FFmpeg encoder>` | `named:<codec>`, past every cascade and the denylist | that encoder | `none` |
+| `--name h264_mf` (`hevc_mf`, `av1_mf`) | `named:<codec>`: that MF cascade alone | MF on either MFT, which is what the release lane's Windows smoke asks (`release-agent.yml:1850`) | `none`, with MF's own error |
+
+A failure prints two lines on stdout, then the error:
+
+```text
+encoder smoke FAILED: verdict=sw-only cell=rtp:h264 request="--encoder hardware --codec h264" backend=openh264 hw=false
+encoder smoke tried: media-foundation: Windows only; ffmpeg: not compiled into this build; openh264: in this build
+```
+
+`tried` (`Tried`, `smoke.rs:214`) names each backend the request could reach and why one was not there
+(`Reach`, `bench.rs:366`); each candidate that failed to open, with its error, as FFmpeg's cascade and
+the RTP track's Media Foundation note it (`media_plan::OpenTrail`, only names this build carries); and
+each FFmpeg cell the denylist kept out. Tests assert on that value, not on its prose. The PASSED line
+keeps its three fields first and appends the rest, so a script that reads it keeps working:
+`encoder smoke PASSED: backend=… keyframes=… total_bytes=… verdict=ok cell=dc:h264 hw=true`.
 
 ## The overlay stress lane (FR-81)
 

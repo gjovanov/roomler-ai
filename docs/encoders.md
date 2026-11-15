@@ -948,6 +948,16 @@ Key properties:
   (`encode::open`). An MF cascade that ends with nothing goes to OpenH264, not to
   the codec table, so a hardware cell the probe found through FFmpeg does not
   serve this track. FFmpeg's H.264 serves the data channel.
+- **`encoder-smoke` asserts what was asked; a session settles for what opens**
+  (#3652). A session's track takes whatever its cascade ends on: OpenH264 under
+  `hardware` off Windows, the software MFT on a Windows host with no GPU. The
+  smoke maps its flags to one cell and passes only when what opened is what was
+  asked, by the L1 bench's verdict
+  ([testing.md](testing.md#the-plain-smoke-and-the-sweep-judge-by-the-same-verdict)).
+  `--encoder hardware` passes only on a hardware encoder; where the track has
+  no Media Foundation and FFmpeg is on, it opens the data channel's H.264
+  cascade, the hardware H.264 a session gets there. `--name h264_mf` asserts
+  Media Foundation on either MFT, as the release lane's Windows smoke does.
 - **Probe, don't trust**: every candidate encoder must actually open (and, for
   the MF path, encode a frame) before it is selected — the same trial the
   startup probe runs at 480×270, so the browser is never offered a codec the
