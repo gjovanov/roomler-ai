@@ -1458,7 +1458,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 
 | Family | Where it is written | What the bitstream carries (read on neo16 in P1, and in the field in P3) |
 |---|---|---|
-| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1922`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
+| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1929`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
 | Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:619`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
 | libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:454`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
@@ -1590,7 +1590,7 @@ What a rate move costs decided the shape of the rate-control code: nine of its
 heuristics exist only to ration that cost
 ([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
 AIMD target to `FfmpegEncoder::set_bitrate`
-(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3011`), which snaps it to the
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3018`), which snaps it to the
 ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
 and returns when the rung is the one already running. Only a rung crossing reaches
 the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
@@ -1650,7 +1650,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:850`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6604`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6564`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1664,11 +1664,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6865`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6797`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6894`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6826`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
@@ -1690,7 +1690,7 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 
 | Switch | Default | What it does | Retires when |
 |---|---|---|---|
-| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:350`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:363`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:352`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:365`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
 | `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
 | `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
 
@@ -1745,11 +1745,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:853`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:855`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:837`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:839`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until the operator decides it per OS on P3's numbers
     ([below](#what-the-numbers-recommend)). `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
@@ -1761,7 +1761,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:822`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:824`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### The clock on macOS and Windows (FR-112 P3)

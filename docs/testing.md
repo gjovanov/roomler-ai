@@ -698,7 +698,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:8049`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7982`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -712,7 +712,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 | `--name` | — | One FFmpeg encoder by name (FR-78 P2), as path `named`. A Media Foundation cell's name (`h264_mf`, `hevc_mf`, `av1_mf`) opens that MF cascade alone and asks for MF on either MFT |
 
 **What each cell opens.** The bench opens every cell through the constructor a session calls for
-it (`SessionOpener`, `agents/roomlerd/src/encode/bench.rs:808`), so the encoder that answers is the
+it (`SessionOpener`, `agents/roomlerd/src/encode/bench.rs:906`), so the encoder that answers is the
 one a session would get. The quick profile is the seven cells a session opens by default (the
 VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCaps`, `bench.rs:329`).
 
@@ -734,7 +734,7 @@ the table. An `L1 #` preamble (version, OS, build, encoder, fps, frames, pace, b
 clock) comes first, then the header, then one row per cell as each one finishes, so a run that
 `roomler exec` cuts off keeps the rows it finished. An `L1 # done` line counts the verdicts.
 
-The columns (`COLUMNS`, `bench.rs:694`) are a contract: a fleet run splits rows on whitespace and
+The columns (`COLUMNS`, `bench.rs:792`) are a contract: a fleet run splits rows on whitespace and
 reads them by position, so a column is only ever appended, never renamed, moved or dropped
 (pinned by `the_header_is_the_contract`). An empty field is `-`.
 
@@ -752,7 +752,7 @@ reads them by position, so a column is only ever appended, never renamed, moved 
 | `idr_n` `idr_p50_B` `idr_max_B` | Keyframes: the first frame, and one requested every `fps` frames after it. A frame is everything one `encode()` returned: OpenH264 returns an IDR as two packets (the parameter sets, then the slice), and counted by packet every IDR would count twice |
 | `delta_p50_B` `delta_p95_B` `delta_max_B` | Every other frame |
 
-The verdict (`verdict()`, `bench.rs:601`) is always read from the encoder that opened, never
+The verdict (`verdict()`, `bench.rs:699`) is always read from the encoder that opened, never
 from what was requested or advertised:
 
 | Verdict | When |
@@ -886,7 +886,7 @@ encoder smoke FAILED: verdict=sw-only cell=rtp:h264 request="--encoder hardware 
 encoder smoke tried: media-foundation: Windows only; ffmpeg: not compiled into this build; openh264: in this build
 ```
 
-`tried` (`Tried`, `smoke.rs:214`) names each backend the request could reach and why one was not there
+`tried` (`Tried`, `smoke.rs:215`) names each backend the request could reach and why one was not there
 (`Reach`, `bench.rs:366`); each candidate that failed to open, with its error, as FFmpeg's cascade and
 the RTP track's Media Foundation note it (`media_plan::OpenTrail`, only names this build carries); and
 each FFmpeg cell the denylist kept out. Tests assert on that value, not on its prose. The PASSED line
