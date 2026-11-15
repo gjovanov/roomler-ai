@@ -1411,66 +1411,25 @@ mod sealed {
             let Some(kind) = kind_of(&entry.name) else {
                 continue;
             };
-            let path = dir.join(&entry.name);
-            if entry.is_dir || entry.is_link {
-                if first_time(format!("not a plain file {}", path.display())) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "peer-auth: not a plain file, so it is not used, and it is left as it is"
-                    );
+            let done = if entry.is_dir || entry.is_link {
+                Err("it is not a plain file".to_string())
+            } else {
+                seal_file(&held, &base, &entry.name, kind, folder_closed, &stamp)
+            };
+            match done {
+                Ok(now) => sealed |= now,
+                // One file's trouble is that file's: the rest are sealed, and
+                // a later read refuses this one, so nothing in it is used.
+                Err(why) => {
+                    let path = dir.join(&entry.name);
+                    if first_time(format!("left {} {why}", path.display())) {
+                        tracing::warn!(
+                            path = %path.display(), reason = %why,
+                            "peer-auth: this file could be neither sealed nor moved aside, so it \
+                             is not used, and it is left as it is"
+                        );
+                    }
                 }
-                continue;
-            }
-            let file = match held.folder().file(&entry.name, OpenFor::Read) {
-                Ok(Some(file)) => file,
-                Ok(None) => continue,
-                Err(why) => return Err(Failure::Failed(why)),
-            };
-            let sd = file.security().map_err(Failure::Failed)?;
-            let keep = match kind {
-                Kind::Key if trusted(&sd.owner) => Ok(()),
-                Kind::Key => Err(format!(
-                    "it was owned by {}, an account other than SYSTEM or Administrators",
-                    sd.owner
-                )),
-                Kind::Pins if folder_closed => verdict(&sd, WRITE_LIKE, "it"),
-                Kind::Pins => Err(
-                    "its folder let an account other than SYSTEM or Administrators change \
-                     what it held"
-                        .to_string(),
-                ),
-            };
-            if keep.is_ok() && exactly_sealed(&sd) {
-                continue;
-            }
-            let max_len = if kind == Kind::Key { KEY_MAX } else { PINS_MAX };
-            let bytes = match keep {
-                Ok(()) => file.read_bytes(max_len).map_err(Failure::Failed)?,
-                Err(_) => None,
-            };
-            drop(file);
-            if let Some(bytes) = bytes {
-                held.write_file(&entry.name, &bytes, Seal::Private)
-                    .map_err(|r| Failure::Failed(r.to_string()))?;
-                sealed = true;
-                continue;
-            }
-            let why = keep
-                .err()
-                .unwrap_or_else(|| "it is too large to be one".to_string());
-            let aside = move_aside(&held, &base, &entry.name, &stamp)?;
-            match kind {
-                Kind::Key => tracing::warn!(
-                    path = %path.display(), moved_to = %aside.display(), reason = %why,
-                    "peer-auth: the device key in this file is not kept: it is moved aside, and \
-                     nothing is deleted. A new device key is made, and each browser that knew \
-                     this device's old key warns once"
-                ),
-                Kind::Pins => tracing::warn!(
-                    path = %path.display(), moved_to = %aside.display(), reason = %why,
-                    "peer-auth: the browser-key file is not kept: it is moved aside, and \
-                     nothing is deleted. Each browser reads `unknown` once more"
-                ),
             }
         }
         if sealed {
@@ -1483,6 +1442,69 @@ mod sealed {
         Ok(held)
     }
 
+    /// One key or browser-key file of a folder [`seal`] holds: kept and
+    /// sealed, or moved aside, by the rules there. `Ok(true)`: it was sealed
+    /// now.
+    fn seal_file(
+        held: &HeldPath,
+        base: &HeldPath,
+        name: &str,
+        kind: Kind,
+        folder_closed: bool,
+        stamp: &str,
+    ) -> Result<bool, String> {
+        let Some(file) = held.folder().file(name, OpenFor::Read)? else {
+            return Ok(false);
+        };
+        let sd = file.security()?;
+        let keep = match kind {
+            Kind::Key if trusted(&sd.owner) => Ok(()),
+            Kind::Key => Err(format!(
+                "it was owned by {}, an account other than SYSTEM or Administrators",
+                sd.owner
+            )),
+            Kind::Pins if folder_closed => verdict(&sd, WRITE_LIKE, "it"),
+            Kind::Pins => Err(
+                "its folder let an account other than SYSTEM or Administrators change what it \
+                 held"
+                    .to_string(),
+            ),
+        };
+        if keep.is_ok() && exactly_sealed(&sd) {
+            return Ok(false);
+        }
+        let max_len = if kind == Kind::Key { KEY_MAX } else { PINS_MAX };
+        let bytes = match keep {
+            Ok(()) => file.read_bytes(max_len)?,
+            Err(_) => None,
+        };
+        drop(file);
+        if let Some(bytes) = bytes {
+            held.write_file(name, &bytes, Seal::Private)
+                .map_err(|r| r.to_string())?;
+            return Ok(true);
+        }
+        let why = keep
+            .err()
+            .unwrap_or_else(|| "it is too large to be one".to_string());
+        let path = held.path().join(name);
+        let aside = move_aside(held, base, name, stamp)?;
+        match kind {
+            Kind::Key => tracing::warn!(
+                path = %path.display(), moved_to = %aside.display(), reason = %why,
+                "peer-auth: the device key in this file is not kept: it is moved aside, and \
+                 nothing is deleted. A new device key is made, and each browser that knew this \
+                 device's old key warns once"
+            ),
+            Kind::Pins => tracing::warn!(
+                path = %path.display(), moved_to = %aside.display(), reason = %why,
+                "peer-auth: the browser-key file is not kept: it is moved aside, and nothing is \
+                 deleted. Each browser reads `unknown` once more"
+            ),
+        }
+        Ok(false)
+    }
+
     /// Move the file `name` of `held` to `base` as `peer-auth.<name>.not-sealed-
     /// <stamp>`, by its handle: never through a link, and nothing replaced.
     fn move_aside(
@@ -1490,7 +1512,7 @@ mod sealed {
         base: &HeldPath,
         name: &str,
         stamp: &str,
-    ) -> Result<PathBuf, Failure> {
+    ) -> Result<PathBuf, String> {
         let mut last = String::new();
         for n in 0..10 {
             let aside = if n == 0 {
@@ -1504,11 +1526,11 @@ mod sealed {
                     Why::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         last = refusal.to_string();
                     }
-                    _ => return Err(Failure::Failed(refusal.to_string())),
+                    _ => return Err(refusal.to_string()),
                 },
             }
         }
-        Err(Failure::Failed(last))
+        Err(last)
     }
 }
 
@@ -2788,6 +2810,46 @@ mod tests {
             assert_eq!(said.matches("is closed to this run").count(), 1, "{said}");
             assert!(said.contains("Start roomlerd elevated again"), "{said}");
             assert_eq!(std::fs::read(&key_file).unwrap(), bytes, "nothing deleted");
+        }
+
+        /// One file the seal can neither read nor move (here it shuts out
+        /// Administrators) is that file's trouble alone: it is left as it is
+        /// and not used, said once, and the other enrollment's key is kept.
+        #[test]
+        fn a_file_the_seal_cannot_open_leaves_the_rest_sealed() {
+            if !ts::elevated_or_skip("a_file_the_seal_cannot_open_leaves_the_rest_sealed") {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let before = made_plain(&cfg, TENANT_A);
+            made_plain(&cfg, TENANT_B);
+            let folder = dir.path().join(DIR_NAME);
+            let (a, b) = (
+                key_path(&cfg, TENANT_A).unwrap(),
+                key_path(&cfg, TENANT_B).unwrap(),
+            );
+            for path in [&folder, &a] {
+                assert!(ts::icacls(path, &["/setowner", "*S-1-5-32-544"]));
+            }
+            assert!(ts::icacls(&b, &["/setowner", GUESTS]));
+            ts::set_dacl(&b, "D:P(A;;FA;;;BG)");
+            let (keys, said) = logged(|| {
+                kept_as(Keeping::Sealed, || {
+                    (hello_key(&cfg, TENANT_A), hello_key(&cfg, TENANT_B))
+                })
+            });
+            assert_eq!(keys.0, before, "the other enrollment's key is kept");
+            assert_eq!(keys.1, "", "not used");
+            assert_sealed(&folder, true);
+            assert_sealed(&a, false);
+            assert_eq!(
+                said.matches("could be neither sealed nor moved aside")
+                    .count(),
+                1,
+                "{said}"
+            );
+            assert!(b.exists(), "left as it is");
         }
 
         /// A junction at `peer-auth` is never followed: moved aside, and what
