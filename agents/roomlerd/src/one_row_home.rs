@@ -9,8 +9,8 @@
 //! Root starts one per person, with the person's uid, their primary group and
 //! no other group, an empty environment, `/` as its folder and its three pipes
 //! only. It is not in `--help`. It answers from the raw argv as the first
-//! statement of both `main`s ([`answer_if_asked`]), before any runtime, log
-//! file, window or folder move: it starts no daemon, and its stderr is its log.
+//! statement of the binary's `main` ([`answer_if_asked`]), before any runtime,
+//! log file, window or folder move: it starts no daemon; its stderr is its log.
 //!
 //! | Verb | stdin | The reply's answer | Exit |
 //! |---|---|---|---|
@@ -1191,7 +1191,7 @@ fn put_back_legacy(at: &Places, fs: &mut impl Fs) -> Result<Legacy, Fail> {
 
 /// Answer `roomlerd one-row-home …` and exit; return at once, having read
 /// nothing but the argv, for any other command line. The first statement of
-/// both `main`s.
+/// the binary's `main` (`src/bin/roomlerd.rs`), before `app::main`.
 #[cfg(target_os = "macos")]
 pub fn answer_if_asked() {
     use std::io::Write as _;

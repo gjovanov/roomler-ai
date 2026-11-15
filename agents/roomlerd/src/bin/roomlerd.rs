@@ -13,5 +13,9 @@
 //! pairs the rename and carries an edit in flight on the old file onto
 //! `app.rs` when its branch rebases.
 fn main() -> anyhow::Result<()> {
+    // FR-147 P1: `roomlerd one-row-home …` is answered here, from the raw
+    // argv, before the daemon's `main` starts anything (an empty function off
+    // macOS).
+    roomlerd::one_row_home::answer_if_asked();
     roomlerd::app::main()
 }
