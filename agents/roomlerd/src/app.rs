@@ -8965,3 +8965,60 @@ mod smoke_openh264_tests {
         );
     }
 }
+
+/// #3652 — on a host with no hardware encoder, a hardware smoke fails and
+/// names each FFmpeg candidate it tried and why, and nothing this build does
+/// not carry. CI's `ffmpeg-encoder` job runs it (its plain `--lib` step), on a
+/// GPU-less runner with the vendored FFmpeg. Anywhere else a GPU could
+/// answer, and a local run would open it, so outside GitHub Actions it skips.
+#[cfg(all(test, target_os = "linux", feature = "ffmpeg-encoder"))]
+mod smoke_ffmpeg_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::VideoCodec;
+    use roomlerd::encode::bench::{Backend, Reach, Verdict};
+    use roomlerd::encode::ffmpeg::FfmpegEncoder;
+    use roomlerd::encode::smoke::Failed;
+
+    async fn fails_naming_what_it_tried(codec_raw: &str, codec: VideoCodec) {
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            eprintln!("skipped: a GPU-less CI runner only; here a GPU could answer");
+            return;
+        }
+        let e = encoder_smoke_cmd("hardware", codec_raw, None, None)
+            .await
+            .expect_err("a GPU-less runner has no hardware encoder to pass on");
+        let f = e
+            .downcast_ref::<Failed>()
+            .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"));
+        assert_eq!(f.verdict, Verdict::None, "{e:#}");
+        assert!(
+            f.tried.backends.contains(&(Backend::Ffmpeg, Reach::InBuild)),
+            "{e:#}"
+        );
+        // The dispatch locks pin the names the vendored build carries, and
+        // every one of them fails here: the value names them, with a reason.
+        assert!(!f.tried.failed.is_empty(), "{e:#}");
+        for (name, why) in &f.tried.failed {
+            assert!(
+                FfmpegEncoder::cascade_names(codec).contains(&name.as_str()),
+                "{name} is not in the {codec_raw} cascade: {e:#}"
+            );
+            assert!(FfmpegEncoder::carried(name), "{name} is not carried: {e:#}");
+            assert!(!why.is_empty(), "{name} failed without a reason: {e:#}");
+        }
+        assert!(!format!("{e:#}").contains("HW and SW"), "{e:#}");
+    }
+
+    /// The RTP track's HEVC: FFmpeg's cascade, then Media Foundation.
+    #[tokio::test]
+    async fn hardware_hevc_names_each_candidate_it_tried() {
+        fails_naming_what_it_tried("hevc", VideoCodec::Hevc).await;
+    }
+
+    /// D1 A: no Media Foundation in this build, so hardware H.264 is the
+    /// DataChannel's FFmpeg cascade, and OpenH264 never answers it.
+    #[tokio::test]
+    async fn hardware_h264_names_each_candidate_it_tried() {
+        fails_naming_what_it_tried("h264", VideoCodec::H264).await;
+    }
+}
