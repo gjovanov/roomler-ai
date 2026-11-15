@@ -504,6 +504,9 @@ pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
     true
 }
 
+// Here, not in the list above, so that no line the docs anchor in this file moves.
+pub mod daemon_error;
+
 #[cfg(test)]
 mod tests {
     /// #1690 — a running daemon keeps its routes: `roomlerd self-update`, a
