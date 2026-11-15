@@ -1,6 +1,6 @@
 # FR-147: On a Mac, a root step of ours does nothing inside a person's home — what changes there is done by a process of that person
 
-**Issue:** [#3834](https://github.com/gjovanov/roomler-ai/issues/3834) · **Status:** claimed 2026-11-13. P1's first half, the person's child `roomlerd one-row-home <verb>`, is written and in review as #3838: inert, nothing calls it until root's side does. Root's side is not started and waits for the operator's decisions D1–D8. P2 cannot work as designed (a person cannot rename a folder root owns), so P2, C16 and AC6 are blocked on D8
+**Issue:** [#3834](https://github.com/gjovanov/roomler-ai/issues/3834) · **Status:** claimed 2026-11-13. P1's first half, the person's child `roomlerd one-row-home <verb>`, landed as #3838 (`0a6fd3f95`, 2026-11-15): inert, nothing calls it until root's side does. Root's side is not started and waits for the operator's decisions D1–D8. P2 cannot work as designed (a person cannot rename a folder root owns), so P2, C16 and AC6 are blocked on D8
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) P3c (`sudo roomlerd one-row`, released in 0.4.200), #3825 (a root command's folders come from its own account), #3846 (the screen worker's give-up names an administrator's `sudo` command, where #3825's line had the person run `mv`)
 **Related:** #3802 (its first criterion), #3763, #3702
 
@@ -228,7 +228,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:2532`; P1 adds one-row's row to it.
+That section is `docs/installation.md:2570`; P1 adds one-row's row to it.
 
 ### Root's records
 
@@ -483,7 +483,7 @@ where macOS does not. Cell C8 reads it.
 
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
-| P1 | the conversion, its undo and its revert through the person's child: `one_row_home.rs` (the verbs, the identity checks, the dispatch as the first statement of the binary's `main`, `agents/roomlerd/src/bin/roomlerd.rs:20`), `output_bounded_fed`, `config::parse_text`, `appdirs::account_entry`, then `spawn_person` with its hook, root's records, the new `Host` types, the refusals and their lines, `put-back-legacy`, and the tests above. Two pull requests (the child, inert until called; then root's side), shipped in ONE release | none: `one-row` is a one-shot command an administrator runs. A conversion that fails undoes itself, and a converted Mac goes back with `--revert`. A back-out is a later release whose `one-row` refuses to convert and keeps P1's `--revert`, never an older binary, which does not read root's records | the child: written, in review as #3838, inert until root's side calls it. Root's side: not started, waits for D1–D8 |
+| P1 | the conversion, its undo and its revert through the person's child: `one_row_home.rs` (the verbs, the identity checks, the dispatch as the first statement of the binary's `main`, `agents/roomlerd/src/bin/roomlerd.rs:20`), `output_bounded_fed`, `config::parse_text`, `appdirs::account_entry`, then `spawn_person` with its hook, root's records, the new `Host` types, the refusals and their lines, `put-back-legacy`, and the tests above. Two pull requests (the child, inert until called; then root's side), shipped in ONE release | none: `one-row` is a one-shot command an administrator runs. A conversion that fails undoes itself, and a converted Mac goes back with `--revert`. A back-out is a later release whose `one-row` refuses to convert and keeps P1's `--revert`, never an older binary, which does not read root's records | the child: landed as #3838 (`0a6fd3f95`, 2026-11-15), inert until root's side calls it. Root's side: not started, waits for D1–D8 |
 | P2 | `reclaim-folder`, run by the root daemon before the screen worker, in place of the printed line. As designed it cannot work: the person's child cannot rename a folder root owns | a switch whose off state is today's give-up with #3846's administrator's command, named in its pull request | blocked on D8 |
 | P3 | the other root writes and removals under a home (P3's table), one issue and pull request each; the rows not determined are read first | each pull request names its own. The uninstall is a one-shot script with no switch: its change is backed out by reverting it | not started |
 | P4 | the field read: C1 to C15 with P1's candidate (C13 decides D6), C16 with P2's, each P3 change's own read, then AC8 on a released build | read only | not started |
@@ -501,12 +501,12 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2313`, its flow at `:2325`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2351`, its flow at `:2363`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2532`): one-row's row, and
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2570`): one-row's row, and
   what D8 decides.
-- `docs/installation.md`, where the give-up's line is described (`:2595-2618`): what D8 decides, in its place.
+- `docs/installation.md`, where the give-up's line is described (`:2641-2664`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:1-27` (the step table) and the new `one_row_home.rs`.
 - `docs/README.md`: the `installation.md` row names the rule.
