@@ -254,7 +254,7 @@ rebuild.
 | **VAAPI** | Takes **hardware frames**; `encode/ffmpeg/vaapi.rs` holds the raw `ffmpeg_sys_next` calls. Device opens ONCE per process; each encoder gets a frame pool whose ref goes onto `hw_frames_ctx` **before** `open`. libva + libdrm are **bundled**, with **no `Depends`** — a `Depends: libva2` only holds where apt reaches a mirror, and the updater's offline `dpkg --install` replaces the binary *before* the dependency failure |
 | **D3D12 / Vulkan** | `dlopen`'d by FFmpeg itself — the vendor jobs assert **no link directive / DT_NEEDED**, so a host without them loses cells, never the daemon. Set `bf=0` (both default to `bf=2`). `rc_mode` constants are **UPPERCASE** for d3d12va (`VBR`), lowercase for Vulkan (`vbr`) |
 | **Media Foundation** | `ActivateObject`'s caller must end what it made, and a release does not: `HwMftCandidate`'s `Drop` calls `ShutdownObject`, or each open leaves 72 threads behind on a host with an AMD GPU. ⚠️ Candidates end when the cascade ends, **never between adapters**: until then `ActivateObject` returns the same instance, and a new one would change what wins (`docs/encoders.md`) |
-| **VideoToolbox** | macOS ships **no FFmpeg at all**. Wiring it needs BOTH the `*_videotoolbox` names in the tables **and** a re-run of `vendor-ffmpeg-macos.yml` — restoring the feature alone re-ships a dyld crash on every end-user Mac |
+| **VideoToolbox** | macOS ships the vendored FFmpeg built with `--enable-videotoolbox` (`vendor-ffmpeg-macos.yml`), and the release builds `ffmpeg-encoder`, so the `*_videotoolbox` names in the tables run there. A new one needs BOTH its name in the tables **and** a re-run of that recipe, whose `--disable-autodetect` keeps the runner's Homebrew libraries out of the dylibs: with them, dyld kills the agent at launch on every end-user Mac |
 
 ⚠️ **The OPEN decides the device** (`open_on_some_device`: preferred first, then
 the rest, winner remembered). Vulkan device 0 may be an iGPU with no
@@ -271,9 +271,13 @@ truth.
 
 **CLI `--encoder` > env `ROOMLERD_ENCODER` > `encoder_preference` in config TOML >
 `Auto`.** Values: `auto` | `hardware` (`hw`/`mf`) | `software` (`sw`/`openh264`).
-`Auto` on Windows runs the MF H.264 probe-and-rollback cascade then falls back to
-openh264; everywhere else it is openh264 only. `ROOMLERD_HW_AUTO=0` reverts to
-openh264-first without a rebuild.
+The preference binds the RTP track's encoder (FR-135 Dv14). There `Auto` on
+Windows runs the MF H.264 probe-and-rollback cascade then falls back to openh264,
+and everywhere else that track's H.264 is openh264 whatever the preference; off
+Windows, hardware H.264 is the DataChannel's FFmpeg cascade. `ROOMLERD_HW_AUTO=0`
+reverts to openh264-first without a rebuild. `encoder-smoke --encoder hardware`
+passes only on a hardware encoder (#3652), so off Windows, with FFmpeg on, it
+opens that cascade for H.264.
 
 Legacy caps fields keep their exact pre-FR-77 meaning (first backend that opens),
 and **`data-channel-vp9-444` stays on the wire forever**. Unknown cell names are

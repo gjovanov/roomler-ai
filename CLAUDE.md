@@ -153,7 +153,7 @@ cargo build -p roomlerd --release --features full-hw   # + Windows MF encoder, W
 cargo build -p roomlerd --release                      # signalling-only (no media, no input)
 ./target/release/roomlerd enroll --server <url> --token <enrollment-jwt> --name <label>
 ./target/release/roomlerd run [--encoder software|hardware]
-./target/release/roomlerd encoder-smoke --encoder hardware   # offline MFT/FFmpeg init diagnosis
+./target/release/roomlerd encoder-smoke --encoder hardware   # offline open; passes only on a hardware encoder
 ./scripts/dev-xvfb.sh                  # capture smoke test via a virtual framebuffer
 
 # Testing

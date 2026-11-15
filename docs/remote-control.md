@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:4010`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:676`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1743`, `delegate.rs:1787`; the worker side is `delegate_worker.rs:510`, wired at `app.rs:4882`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1743`, `delegate.rs:1787`; the worker side is `delegate_worker.rs:510`, wired at `app.rs:4892`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -2754,7 +2754,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   with its protections: public keys only, 16 per user (the oldest goes first), 256 users. They are why a later
   `enforce` can ask only about a browser the device has never met.
 - **A config does not move by itself** (#3387). A SystemContext worker runs the machine's own enrollment and
-  nothing else ([`pick_config_path`, `app.rs:1111`](../agents/roomlerd/src/app.rs#L1111)), so no daemon copies a
+  nothing else ([`pick_config_path`, `app.rs:1121`](../agents/roomlerd/src/app.rs#L1121)), so no daemon copies a
   person's config, or its `peer-auth/`, to the machine-global path any more: the copy after a healthy run and the
   key adoption #3096 added to it are gone. A key is read from its file or made there
   ([`load_or_make`, `peer_auth.rs:740`](../agents/roomlerd/src/peer_auth.rs#L740)). An administrator who moves an
@@ -6611,7 +6611,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4307`](../agents/roomlerd/src/app.rs#L4307),
+([`agents/roomlerd/src/app.rs:4317`](../agents/roomlerd/src/app.rs#L4317),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
