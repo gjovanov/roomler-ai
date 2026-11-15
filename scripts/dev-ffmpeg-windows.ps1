@@ -189,4 +189,4 @@ Write-Host ""
 Write-Host "Then (the MSI's exact feature set; never vp9-444-bindgen on Windows):"
 Write-Host '  cargo build -p roomlerd --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"'
 Write-Host '  .\target\release\roomlerd.exe encoder-smoke --encoder hardware --codec hevc'
-Write-Host '  .\target\release\roomlerd.exe encoder-smoke --encoder hardware --codec av1'
+Write-Host '  .\target\release\roomlerd.exe encoder-smoke --name av1_nvenc   # FFmpeg AV1 by name (or av1_qsv, av1_amf); --codec av1 opens MF only'

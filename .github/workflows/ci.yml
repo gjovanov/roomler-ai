@@ -903,10 +903,10 @@ jobs:
         # carries the colour description (and nothing with the switch off), the
         # recording profile's keeps its own. #3245 — `peer::codec_cap_tests::`: the
         # RTP pump holds that encoder's ceiling. No other lane builds the feature
-        # without a `recording::` filter, and this one built the test binary above.
+        # without a `recording::` filter, and this one built the test binary above. #3652 — `app::smoke_openh264_tests::`: the plain smoke, judged on a build whose only encoder is OpenH264.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests:: app::smoke_openh264_tests::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export

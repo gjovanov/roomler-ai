@@ -163,7 +163,7 @@ going back from 13.1 to 12.1, because what FFmpeg 9.0.1 gates on the newer SDKs 
 | 13.0 | H.264 10-bit, 4:2:2, AV1 UHQ tuning, H.264/AV1 temporal filter, mastering metadata, MV-HEVC, a **4-strip** split | 8-bit 4:2:0 and 4:4:4 only; the split is `forced` (the driver's count) unless `nvenc_split` is set |
 | 12.2 | the new bit-depth fields, temporal filter, lookahead level, UHQ tuning, unidirectional B, timecodes | `rc-lookahead=0`, `tune=ll`, 8-bit (the old bit-depth field describes the same 8 bits) |
 
-No B-frames anywhere ([`encoder.rs:1900`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L1900), and `bf=0` in
+No B-frames anywhere ([`encoder.rs:1907`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L1907), and `bf=0` in
 NVENC's options, [`encoder.rs:367`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L367)). Two opt-in knobs can
 name what 12.1 does not. `nvenc_split=4` ([`encoder.rs:605`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L605))
 is for a GPU with four or more engines: on the Linux trees it reaches the driver as a number, which either takes it or

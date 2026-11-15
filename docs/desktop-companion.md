@@ -432,7 +432,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2243`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2253`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -1718,7 +1718,7 @@ Who calls them, and how each is read:
 | Caller | Runs | Taken as |
 |---|---|---|
 | the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2545`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2615`) | as the person, in their session | the screen's session |
-| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2489`; `rc_cmd`, `:2386`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
+| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2499`; `rc_cmd`, `:2396`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
 The tests, in `crates/localapi`: `the_screen_decision_table` (every row above, a per-user daemon
