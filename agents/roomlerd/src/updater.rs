@@ -2182,9 +2182,9 @@ pub fn spawn_installer_as_flavour(
 /// invocation re-asserts the env var via the WiX `EnableSystemContext`
 /// CA instead of stripping it via `DisableSystemContext`.
 ///
-/// Thin wrapper around [`preserve_system_context_property_for`] that
-/// reads the SCM env block; the inner pure helper is unit-tested
-/// against synthetic env-var values without an SCM dependency.
+/// Thin wrapper around [`preserve_system_context_property_for`], which
+/// makes the SCM read only for a perMachine install (#3889); the helper
+/// is unit-tested against synthetic reads without an SCM dependency.
 #[cfg(target_os = "windows")]
 fn preserve_system_context_property(flavour: WindowsInstallFlavour) -> Vec<(String, String)> {
     preserve_system_context_property_for(flavour, || {
@@ -2202,27 +2202,32 @@ fn preserve_system_context_property(_flavour: WindowsInstallFlavour) -> Vec<(Str
 /// rc.56 pure decision logic. Split from the SCM read so the rules
 /// are unit-testable without mocking the registry.
 ///
+/// #3889 — the flavour comes FIRST: `read_service_env` is called only for
+/// a PerMachine install. A perUser install registers no service, so the
+/// read could only fail, and its WARN named a SystemContext that install
+/// cannot have, on every perUser self-update.
+///
 /// Returns `vec![("ENABLE_SYSTEM_CONTEXT", "1")]` iff:
 ///   * flavour is PerMachine (perUser installs have no SCM service)
-///   * env_value == Ok(Some("1")) — the SCM block has the swap on
+///   * the read answers Ok(Some("1")) — the SCM block has the swap on
 ///
 /// All other paths return an empty vec (pass nothing to msiexec):
-///   * PerUser flavour
+///   * PerUser flavour: no read, and no log line
 ///   * env var absent (plain perMachine install — DisableSystemContext
 ///     is a harmless idempotent no-op)
 ///   * env var present but != "1" (operator may have set a non-"1"
 ///     truthy variant the agent's `system_swap_enabled` accepts, but
 ///     the WiX CA condition compares strictly against the string
 ///     `"1"`; we follow WiX's strictness here)
-///   * SCM read error (best-effort; falling back matches pre-rc.56
+///   * SCM read error (best-effort, WARNed; falling back matches pre-rc.56
 ///     behaviour — `enable-system-context` CLI remains the manual
 ///     escape hatch)
 //
 // cfg-gate so the function is only compiled where it's actually
-// reachable: on Windows (the SCM wrapper at line 869 calls it) and
-// under `cfg(test)` (the unit tests at lines 1959+ exercise it
-// directly without going through the Windows wrapper). Without the
-// gate, the Linux clippy job fails with `-D dead_code` because the
+// reachable: on Windows (`preserve_system_context_property` calls it) and
+// under `cfg(test)` (the `preserve_system_context_*` and #3889 tests
+// exercise it directly without going through the Windows wrapper). Without
+// the gate, the Linux clippy job fails with `-D dead_code` because the
 // non-Windows `preserve_system_context_property` stub returns early
 // and never reaches this helper. Pre-existing master regression
 // repro'd in CI run 26375071253; fix landed alongside the
@@ -2232,19 +2237,10 @@ fn preserve_system_context_property_for(
     flavour: WindowsInstallFlavour,
     read_service_env: impl FnOnce() -> Result<Option<String>, String>,
 ) -> Vec<(String, String)> {
-    let env_value = read_service_env().map_err(|e| {
-        tracing::warn!(
-            error = %e,
-            "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
-             not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
-             but may strip SystemContext if it was enabled)"
-        );
-        e
-    });
     if flavour != WindowsInstallFlavour::PerMachine {
         return Vec::new();
     }
-    match env_value {
+    match read_service_env() {
         Ok(Some(v)) if v == "1" => {
             tracing::info!(
                 "updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env; \
@@ -2253,7 +2249,16 @@ fn preserve_system_context_property_for(
             );
             vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
         }
-        _ => Vec::new(),
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
+                 not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
+                 but may strip SystemContext if it was enabled)"
+            );
+            Vec::new()
+        }
     }
 }
 
