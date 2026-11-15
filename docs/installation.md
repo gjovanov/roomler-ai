@@ -594,7 +594,7 @@ flowchart TD
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:1120`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1142`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -1199,7 +1199,7 @@ apart (`lifecycle.rs:81`, pinned by the test
 
 | Bound | Value | What it covers |
 |---|---|---|
-| `HOST_STOP_BOUND` | 14.5 s | the supervisor's whole shutdown (`agents/roomlerd/src/win_service/supervisor.rs:671`: a 0.5 s poll tick, the worker's 8 s graceful budget at `:659`, the terminate and netd's reap at 1.5 s each), then the 3 s the host process gives its runtime after it reports STOPPED (`agents/roomlerd/src/runtime_exit.rs:30`) |
+| `HOST_STOP_BOUND` | 14.5 s | the supervisor's whole shutdown (`agents/roomlerd/src/win_service/supervisor.rs:693`: a 0.5 s poll tick, the worker's 8 s graceful budget at `:681`, the terminate and netd's reap at 1.5 s each), then the 3 s the host process gives its runtime after it reports STOPPED (`agents/roomlerd/src/runtime_exit.rs:30`) |
 | `STOP_WAIT_BOUND` | 29 s | twice that, for a loaded box. A retire waits this long for STOPPED **and** for the host process to exit (`lifecycle.rs:275`), and only then deletes |
 | `GONE_WAIT_BOUND` | 10 s | after the delete, for the SCM to answer 1060. A handle held elsewhere (services.msc on the service's properties) outlasts it, and the retire says so |
 | `MARKED_WAIT_BOUND` | 39 s | how long an install waits for an entry that an earlier delete marked (1072) before it creates the service |
@@ -1409,7 +1409,7 @@ flowchart LR
 ```
 
 The service host starts the SystemContext worker with `CREATE_NO_WINDOW` and passes it
-no standard handles (`agents/roomlerd/src/win_service/supervisor.rs:331`). So the
+no standard handles (`agents/roomlerd/src/win_service/supervisor.rs:353`). So the
 worker's stdout and stderr are a console with no window, served by a `conhost.exe` of its
 own at Normal priority, and nobody reads it. Until #3438 every log line went there first.
 The console layer sat ahead of the file layer, so the file got a line only once the
@@ -1564,7 +1564,7 @@ folder they name from the system, never from the environment they were started w
 | The folder variables of a process on the service account | Set first thing in `main`, before the process has a second thread: the machine's (`ProgramData`, `ProgramFiles` and the rest) from the kernel and the machine's registry, and `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` of the service account's own profile. A process on any other account keeps the environment the system gave it. | `crates/agent-core/src/appdirs.rs:336`, `agents/roomlerd/src/app.rs:1369` |
 | The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:230`, `crates/agent-core/src/appdirs.rs:241` |
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
-| The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:952` |
+| The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:974` |
 | The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:999`, `crates/agent-core/src/appdirs.rs:779` |
 | The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:257`, `agents/roomlerd/src/install_cleanup.rs:289` |
 | The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:679`, `agents/roomlerd/src/install_cleanup.rs:727` |
