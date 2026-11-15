@@ -1,6 +1,9 @@
 //! `roomlerd encoder-smoke` (#3652): one cell, opened the way a session opens
 //! it, ten solid-colour frames encoded, and the run judged by the FR-16 L1
-//! bench's [`bench::verdict`]: what OPENED against what was ASKED.
+//! bench's [`bench::verdict`]: what OPENED against what was ASKED. Only `ok`
+//! passes, so hardware answered by software, a codec answered by another
+//! codec, or nothing opening fails, and the failure says what was tried on
+//! this OS and build.
 //!
 //! The opener is the bench's [`CellOpener`] seam, so the judgement is tested
 //! with a fake opener and no encoder hardware.
@@ -11,11 +14,11 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 
-use super::EncoderPreference;
 use super::bench::{
     self, Backend, BuildCaps, CellOpener, CellPath, CellPlan, CellSpec, Codec, OpenedId, Reach,
     Verdict,
 };
+use super::{EncoderPreference, VideoEncoder};
 use crate::capture::synthetic_scene::Scene;
 use crate::capture::{Damage, Frame, PixelFormat};
 
@@ -41,19 +44,17 @@ impl Request<'_> {
             Some(name) => format!("--name {name}"),
             None => format!(
                 "--encoder {} --codec {}",
-                pref_label(self.pref),
+                self.pref.wire(),
                 self.codec.to_ascii_lowercase()
             ),
         }
     }
 }
 
-fn pref_label(pref: EncoderPreference) -> &'static str {
-    match pref {
-        EncoderPreference::Auto => "auto",
-        EncoderPreference::Hardware => "hardware",
-        EncoderPreference::Software => "software",
-    }
+/// `rtp:h264`, `named:h265`: a cell as the bench's rows name it (the smoke
+/// opens 4:2:0 only).
+fn cell_label(cell: CellSpec) -> String {
+    format!("{}:{}", cell.path.label(), cell.codec.label())
 }
 
 /// A request this build cannot serve, refused before anything opens.
@@ -154,6 +155,61 @@ pub fn plan(
     })
 }
 
+/// The backends `plan`'s open can reach, in the order its opener tries them.
+fn backends_for(plan: &CellPlan, pref: EncoderPreference, build: BuildCaps) -> Vec<Backend> {
+    use Backend::{Ffmpeg, MediaFoundation as Mf, Openh264};
+    match (plan.cell.path, plan.cell.codec) {
+        // [`plan`] asks hardware of a named FFmpeg encoder, and not of a
+        // named Media Foundation one.
+        (CellPath::Named, _) if !plan.requested_hw => vec![Mf],
+        (CellPath::Named, _) => vec![Ffmpeg],
+        // D1 A: the RTP track's Media Foundation is not in this build, so the
+        // DataChannel's FFmpeg cascade answered for hardware.
+        (CellPath::Dc, _) => vec![Mf, Ffmpeg],
+        (CellPath::Rtp, Codec::H264) => match pref {
+            EncoderPreference::Software => vec![Openh264],
+            EncoderPreference::Hardware if !build.mf => vec![Mf, Ffmpeg, Openh264],
+            _ => vec![Mf, Openh264],
+        },
+        (CellPath::Rtp, Codec::H265) => vec![Ffmpeg, Mf],
+        (CellPath::Rtp, _) => vec![Mf],
+    }
+}
+
+/// The candidates of `plan`'s FFmpeg cascade that the cell denylist
+/// (`encoder_cells_deny`) keeps out: the cascade skips them without a word.
+/// Media Foundation's refusal of a denied cell comes back as its open's
+/// failure, and `--name` passes the list by design.
+fn denied_for(plan: &CellPlan, backends: &[(Backend, Reach)]) -> Vec<String> {
+    let ffmpeg_tried = backends.contains(&(Backend::Ffmpeg, Reach::InBuild));
+    if plan.cell.path == CellPath::Named || !ffmpeg_tried {
+        return Vec::new();
+    }
+    #[cfg(feature = "ffmpeg-encoder")]
+    {
+        use roomler_ai_remote_control::models::{ChromaFormat, VideoCodec};
+        let codec = match plan.cell.codec {
+            Codec::H264 => VideoCodec::H264,
+            Codec::H265 => VideoCodec::Hevc,
+            Codec::Av1 => VideoCodec::Av1,
+            Codec::Vp9 => VideoCodec::Vp9,
+        };
+        let deny = super::cells::denied_cells();
+        super::ffmpeg::FfmpegEncoder::cascade_names(codec)
+            .iter()
+            .filter(|name| {
+                super::ffmpeg::FfmpegEncoder::carried(name)
+                    && super::cells::cell_denied(&deny, name, ChromaFormat::Yuv420)
+            })
+            .map(|name| name.to_string())
+            .collect()
+    }
+    #[cfg(not(feature = "ffmpeg-encoder"))]
+    {
+        Vec::new()
+    }
+}
+
 /// What the smoke tried on this OS and build.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tried {
@@ -201,30 +257,157 @@ pub struct Passed {
 pub struct Failed {
     pub verdict: Verdict,
     pub cell: CellSpec,
+    /// The flags that asked ([`Request::describe`]).
     pub request: String,
+    /// What opened, when something did (a `noop` included).
     pub opened: Option<OpenedId>,
     pub tried: Tried,
-    /// The reason in words, when the verdict alone does not say it.
+    /// The opener's answer when nothing opened, or how the encode failed.
     pub why: Option<String>,
+}
+
+impl Failed {
+    /// The first line a failing smoke prints: the verdict, and what opened.
+    /// Like the PASSED line, its fields are only ever appended.
+    pub fn headline(&self) -> String {
+        let (backend, hw) = self.opened.map_or(("none", false), |o| (o.name, o.hw));
+        format!(
+            "encoder smoke FAILED: verdict={} cell={} request={:?} backend={backend} hw={hw}",
+            self.verdict.label(),
+            cell_label(self.cell),
+            self.request,
+        )
+    }
+
+    /// The verdict, in words.
+    fn reason(&self) -> String {
+        let answered = self.opened.map_or("nothing", |o| o.name);
+        match (self.verdict, self.opened) {
+            (Verdict::Fallback, _) => format!(
+                "hardware was asked for, and software answered ({answered}), although this \
+                 build has a hardware encoder on that path"
+            ),
+            (Verdict::SwOnly, _) => format!(
+                "hardware was asked for, and this build has no hardware encoder on that path, \
+                 so software answered ({answered})"
+            ),
+            (Verdict::Demoted, Some(o)) => format!(
+                "{} was asked for, and {} answered with {}{}",
+                self.cell.codec.label(),
+                o.name,
+                o.codec,
+                if o.chroma444 { " 4:4:4" } else { "" }
+            ),
+            (Verdict::None, _) => "nothing opened".into(),
+            (Verdict::Error, _) => format!("{answered} opened, and its encode failed"),
+            _ => "the run did not complete".into(),
+        }
+    }
 }
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.headline(), self.reason())?;
         if let Some(why) = &self.why {
-            return write!(f, "{why}");
+            write!(f, ": {why}")?;
         }
-        write!(
-            f,
-            "encoder smoke FAILED: verdict={} cell={}:{} request={}",
-            self.verdict.label(),
-            self.cell.path.label(),
-            self.cell.codec.label(),
-            self.request
-        )
+        write!(f, "; tried: {}", self.tried)?;
+        if matches!(self.verdict, Verdict::Fallback | Verdict::SwOnly) {
+            write!(
+                f,
+                ". With no flags, encoder-smoke asks for hardware; \
+                 the software smoke is `encoder-smoke --encoder software`"
+            )?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for Failed {}
+
+/// One open, judged by [`bench::verdict`]: what opened, and what was tried on
+/// the way. The smoke and the FR-62 sweep both open through [`open`].
+pub struct Judged {
+    /// The encoder, when one opened (a `NoopEncoder` included).
+    pub enc: Option<Box<dyn VideoEncoder>>,
+    pub opened: Option<OpenedId>,
+    pub verdict: Verdict,
+    pub tried: Tried,
+    /// The opener's answer when nothing opened.
+    pub why: Option<String>,
+}
+
+impl Judged {
+    /// The encoder, when what opened is what was asked for; else why not. An
+    /// encoder that did not pass is dropped unused, and it is never an FFmpeg
+    /// one: an FFmpeg encoder always produces what its cell asks for.
+    pub fn into_ok(
+        self,
+        plan: &CellPlan,
+        req: &Request<'_>,
+    ) -> Result<(Box<dyn VideoEncoder>, OpenedId), Failed> {
+        match (self.verdict, self.enc, self.opened) {
+            (Verdict::Ok, Some(enc), Some(id)) => Ok((enc, id)),
+            (verdict, _, opened) => Err(Failed {
+                verdict,
+                cell: plan.cell,
+                request: req.describe(),
+                opened,
+                tried: self.tried,
+                why: self.why,
+            }),
+        }
+    }
+}
+
+/// Open `plan`'s cell through `opener`, recording each candidate that failed
+/// (`media_plan::OpenTrail`, as a DataChannel pump does), and judge what
+/// opened against what was asked.
+pub fn open(
+    plan: &CellPlan,
+    pref: EncoderPreference,
+    build: BuildCaps,
+    opener: &mut (dyn CellOpener + Send),
+) -> Judged {
+    let trail = crate::media_plan::OpenTrail::default();
+    let opened = {
+        let _recording = trail.recording();
+        opener.open(plan)
+    };
+    let backends: Vec<(Backend, Reach)> = backends_for(plan, pref, build)
+        .into_iter()
+        .map(|b| (b, build.reach(b)))
+        .collect();
+    let tried = Tried {
+        denied: denied_for(plan, &backends),
+        backends,
+        failed: trail.take(),
+    };
+    match opened {
+        Err(why) => Judged {
+            enc: None,
+            opened: None,
+            verdict: Verdict::None,
+            tried,
+            why: Some(why),
+        },
+        Ok(o) => {
+            let id = OpenedId {
+                name: o.enc.name(),
+                hw: o.enc.is_hardware(),
+                codec: o.codec,
+                chroma444: o.chroma444,
+            };
+            Judged {
+                enc: Some(o.enc),
+                opened: Some(id),
+                verdict: bench::verdict(plan, Some(&id)),
+                tried,
+                why: None,
+            }
+        }
+    }
+}
 
 /// Where `--dump` writes the raw bitstream.
 pub struct Dump<'a> {
@@ -232,70 +415,81 @@ pub struct Dump<'a> {
     pub file: &'a mut (dyn Write + Send),
 }
 
-/// Open the planned cell, encode [`FRAMES`] frames, and judge the run.
-///
-/// SEAM (#3652 AC2): master's judgement, byte for byte. A pass is anything
-/// but the NoopEncoder that produced a keyframe; `verdict` only records
-/// whether master would have warned of a demotion.
+/// Print a failure's two lines and hand it back.
+fn fail(out: &mut (dyn Write + Send), failed: Failed) -> anyhow::Result<Passed> {
+    writeln!(out, "{}", failed.headline())?;
+    writeln!(out, "encoder smoke tried: {}", failed.tried)?;
+    Err(failed.into())
+}
+
+/// Open the planned cell, encode [`FRAMES`] frames, and judge the run by the
+/// bench's verdict: only `ok` passes. An encoder that opened and then fails
+/// to encode, or produces no keyframe, is the `error` verdict. A failure
+/// prints its verdict and what was tried, and comes back as a [`Failed`], so
+/// `main` exits 1.
 pub async fn run(
     plan: &CellPlan,
     req: &Request<'_>,
-    _build: BuildCaps,
+    build: BuildCaps,
     opener: &mut (dyn CellOpener + Send),
     out: &mut (dyn Write + Send),
     mut dump: Option<Dump<'_>>,
 ) -> anyhow::Result<Passed> {
     let (w, h) = (plan.width, plan.height);
-    let codec = req.codec.to_ascii_lowercase();
-    tracing::info!(width = w, height = h, pref = ?req.pref, codec = %codec, "encoder smoke: opening encoder");
-
-    let failed = |verdict: Verdict, why: String| Failed {
-        verdict,
-        cell: plan.cell,
-        request: req.describe(),
-        opened: None,
-        tried: Tried::default(),
-        why: Some(why),
-    };
-    let opened = match opener.open(plan) {
-        Ok(o) => o,
-        Err(e) => {
-            let why = match req.name {
-                Some(name) => format!(
-                    "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-                ),
-                None => e,
-            };
-            return Err(failed(Verdict::None, why).into());
+    tracing::info!(
+        width = w,
+        height = h,
+        pref = ?req.pref,
+        request = %req.describe(),
+        cell = %cell_label(plan.cell),
+        "encoder smoke: opening encoder"
+    );
+    let Judged {
+        enc,
+        opened,
+        mut verdict,
+        tried,
+        why: open_why,
+    } = open(plan, req.pref, build, opener);
+    let (mut enc, id) = match (enc, opened) {
+        (Some(enc), Some(id)) if verdict != Verdict::None => (enc, id),
+        (_, opened) => {
+            return fail(
+                out,
+                Failed {
+                    verdict: Verdict::None,
+                    cell: plan.cell,
+                    request: req.describe(),
+                    opened,
+                    tried,
+                    why: open_why,
+                },
+            );
         }
     };
-    let mut enc = opened.enc;
-    // Master named the codec a named encoder produces by its wire name.
-    let actual_codec = if plan.cell.path == CellPath::Named && opened.codec == "h265" {
-        "hevc"
-    } else {
-        opened.codec
-    };
-    let backend = enc.name();
-    tracing::info!(backend, actual_codec = %actual_codec, "encoder smoke: backend selected");
-    let mut verdict = Verdict::Ok;
-    if codec != "h264" && actual_codec != codec {
-        verdict = Verdict::Demoted;
-        tracing::warn!(
-            requested = %codec,
-            actual = %actual_codec,
-            "encoder smoke: demoted from requested codec"
-        );
-    }
+    tracing::info!(
+        backend = id.name,
+        hw = id.hw,
+        codec = id.codec,
+        verdict = verdict.label(),
+        "encoder smoke: backend selected"
+    );
 
     let mut keyframes = 0usize;
     let mut total_bytes = 0usize;
+    let mut encode_failed = None;
     for i in 0..FRAMES {
         let frame = solid_frame(w, h, i);
         if i == 5 {
             enc.request_keyframe();
         }
-        let packets = enc.encode(frame).await?;
+        let packets = match enc.encode(frame).await {
+            Ok(packets) => packets,
+            Err(e) => {
+                encode_failed = Some(format!("frame {i}: {e:#}"));
+                break;
+            }
+        };
         for p in &packets {
             total_bytes += p.data.len();
             if p.is_keyframe {
@@ -318,27 +512,44 @@ pub async fn run(
             "encoder smoke: bitstream dumped"
         );
     }
-    tracing::info!(backend, keyframes, total_bytes, "encoder smoke: done");
-    if backend == "noop" {
-        return Err(failed(
-            Verdict::None,
-            "encoder smoke: fell through to NoopEncoder — HW and SW backends both failed".into(),
-        )
-        .into());
+    tracing::info!(
+        backend = id.name,
+        keyframes,
+        total_bytes,
+        "encoder smoke: done"
+    );
+
+    let why = match encode_failed {
+        Some(e) => Some(format!("the encode failed at {e}")),
+        None if keyframes == 0 => Some(format!("no keyframe in {FRAMES} frames")),
+        None => None,
+    };
+    if why.is_some() {
+        verdict = Verdict::Error;
     }
-    if keyframes == 0 {
-        return Err(failed(
-            Verdict::Error,
-            format!("encoder smoke: no keyframes produced (backend={backend})"),
-        )
-        .into());
+    if verdict != Verdict::Ok {
+        return fail(
+            out,
+            Failed {
+                verdict,
+                cell: plan.cell,
+                request: req.describe(),
+                opened: Some(id),
+                tried,
+                why,
+            },
+        );
     }
     writeln!(
         out,
-        "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
+        "encoder smoke PASSED: backend={} keyframes={keyframes} total_bytes={total_bytes} \
+         verdict=ok cell={} hw={}",
+        id.name,
+        cell_label(plan.cell),
+        id.hw
     )?;
     Ok(Passed {
-        backend,
+        backend: id.name,
         verdict,
         keyframes,
         total_bytes,

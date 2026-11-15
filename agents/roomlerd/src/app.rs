@@ -429,19 +429,26 @@ enum Command {
     /// parser runs: see `daemon_main`.
     #[command(hide = true, name = "update-helper")]
     UpdateHelper,
-    /// Smoke-test the encoder cascade: open the preferred encoder at
-    /// a small resolution, feed 10 synthetic frames, assert at least
-    /// one IDR output. Exits non-zero if no encoder could be opened or
-    /// no keyframe was produced. Used in the release CI smoke check
-    /// to catch regressions in the MF init path before shipping.
+    /// Smoke-test one encoder cell: open it as a session would, encode 10
+    /// synthetic frames, and pass only if what opened is what was asked for.
+    ///
+    /// Judged by the FR-16 L1 bench's verdict (#3652): it exits non-zero
+    /// when hardware was asked for and software answered, when another codec
+    /// answered, when nothing opened, or when no keyframe came out, and then
+    /// says what it tried on this OS and build. The release lane's Windows
+    /// smoke runs it as `--name h264_mf`.
     EncoderSmoke {
-        /// Encoder preference for the test. Defaults to `hardware` so
-        /// the CI exercise actually verifies the MF path.
+        /// Encoder preference: `hardware` (the default), `auto` or
+        /// `software`. `hardware` passes only on a hardware encoder, so on a
+        /// host with none the software smoke is `--encoder software`.
         #[arg(long, default_value = "hardware")]
         encoder: String,
-        /// Codec to smoke-test. `h264` (default) or `h265` — HEVC
-        /// goes through `open_for_codec` and the MF HEVC cascade.
-        /// Accepts `hevc` as an alias.
+        /// Codec to smoke-test: `h264` (default), `h265` (alias `hevc`) or
+        /// `av1`, through the RTP track's opener (`open_for_codec`: FFmpeg's
+        /// HEVC cascade, then Media Foundation's). `--encoder hardware` on a
+        /// build without the track's Media Foundation opens the DataChannel's
+        /// FFmpeg cascade instead. Anything else is refused: VP9 is the
+        /// DataChannel's (`--bench --bench-cells dc:vp9:444`).
         #[arg(long, default_value = "h264")]
         codec: String,
         /// FR-62 A0 — instead of the 10-frame smoke, open once and sweep the
@@ -450,13 +457,16 @@ enum Command {
         /// and how closely the encoder tracked the target. Measures, on real
         /// silicon, the cost the whole rate-control patch-work exists to
         /// ration. Best with `--codec hevc`/`av1` and `--encoder hardware`.
+        /// It measures only a cell the plain smoke would pass.
         #[arg(long)]
         reconfigure_sweep: bool,
         /// FR-78 P2 — open exactly this FFmpeg encoder name (`hevc_d3d12va`,
         /// `av1_vulkan`, `h264_vaapi`, …) instead of the cascade, so a
         /// backend the vendor SDK outranks on this host can be driven with
-        /// real bytes (and swept, with `--reconfigure-sweep`). `--encoder`
-        /// and `--codec` are ignored when set.
+        /// real bytes (and swept, with `--reconfigure-sweep`). A Media
+        /// Foundation cell's name (`h264_mf`, `hevc_mf`, `av1_mf`) opens that
+        /// MF cascade alone, on either MFT. `--encoder` and `--codec` are
+        /// ignored when set.
         #[arg(long)]
         name: Option<String>,
         /// FR-78 P3 — write every packet's bytes, back to back, to this file:
@@ -6478,10 +6488,10 @@ async fn restart_daemon_beside_self_update(exe: Option<&std::path::Path>, latest
     }
 }
 
-/// Open the preferred encoder, feed it 10 synthetic BGRA frames, and
-/// assert at least one keyframe comes out. Used in CI to catch MF init
-/// regressions before shipping an MSI. Exits with a non-zero code on
-/// any failure so a failed smoke check fails the release build.
+/// Open the cell the flags ask for, feed it 10 synthetic BGRA frames, and
+/// pass only when what opened is what was asked for and a keyframe came out
+/// (`encode::smoke`). Any failure is an `Err`, so the process exits non-zero
+/// and a failed smoke check fails the release build.
 async fn encoder_smoke_cmd(
     pref_raw: &str,
     codec_raw: &str,
@@ -6561,32 +6571,35 @@ async fn encoder_reconfigure_sweep_cmd(
     constrained: bool,
     json: bool,
 ) -> Result<()> {
-    use roomlerd::encode::{open_default, open_for_codec};
+    use roomlerd::encode::bench::{BuildCaps, CellPath, SessionOpener};
+    use roomlerd::encode::smoke;
     use std::time::Instant;
 
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
-    let codec = codec_raw.to_ascii_lowercase();
     if constrained {
         tracing::info!(
             "reconfigure-sweep: --constrained noted; A0 opens the encoder's default HRD window \
              (the IDR-on-reconfigure question is independent of HRD %; burst sizes may differ)"
         );
     }
-    let (mut enc, actual_codec) = if let Some(name) = name {
-        // FR-78 P2 — a named backend, past every cascade: the same open the
-        // capability probe runs, so what the probe advertised opens here.
-        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-            )
-        })?;
-        (e, actual.to_string())
-    } else if codec == "h264" {
-        (open_default(w, h, pref), "h264".to_string())
+    // #3652 — the plain smoke's request → cell → verdict, so a fallback, a
+    // demotion or nothing opening measures nothing. `--name` (FR-78 P2) is a
+    // named backend past every cascade: the open the capability probe runs.
+    let req = smoke::Request {
+        pref,
+        codec: codec_raw,
+        name,
+    };
+    let build = BuildCaps::this_build();
+    let plan = smoke::plan(&req, w, h, build)?;
+    let (mut enc, opened) =
+        smoke::open(&plan, pref, build, &mut SessionOpener { pref }).into_ok(&plan, &req)?;
+    // The A0 JSON's `codec` stays a named encoder's wire name.
+    let actual_codec = if plan.cell.path == CellPath::Named && opened.codec == "h265" {
+        "hevc"
     } else {
-        let (e, actual) = open_for_codec(&codec, w, h, pref);
-        (e, actual.to_string())
+        opened.codec
     };
     let backend = enc.name();
     tracing::info!(
@@ -6595,9 +6608,6 @@ async fn encoder_reconfigure_sweep_cmd(
         width = w, height = h, frames_per_rung,
         "reconfigure-sweep: backend selected"
     );
-    if backend == "noop" {
-        bail!("reconfigure-sweep: fell through to NoopEncoder — no HW/SW backend on this host");
-    }
 
     // Deterministic moving-block-over-stripes frame. `n` advances the block.
     let make_frame = |n: u32| -> std::sync::Arc<roomlerd::capture::Frame> {
@@ -8897,6 +8907,13 @@ mod one_row_enroll_tests {
 ))]
 mod smoke_openh264_tests {
     use super::*;
+    use roomlerd::encode::bench::{Backend, Reach, Verdict};
+    use roomlerd::encode::smoke::Failed;
+
+    fn failed(e: &anyhow::Error) -> &Failed {
+        e.downcast_ref::<Failed>()
+            .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"))
+    }
 
     #[tokio::test]
     async fn hardware_answered_by_openh264_is_not_a_pass() {
@@ -8905,6 +8922,10 @@ mod smoke_openh264_tests {
             smoke.is_err(),
             "hardware was asked for, OpenH264 answered, and the smoke passed"
         );
+        let e = smoke.unwrap_err();
+        let f = failed(&e);
+        assert_eq!(f.verdict, Verdict::SwOnly, "{e:#}");
+        assert_eq!(f.opened.map(|o| o.name), Some("openh264"), "{e:#}");
     }
 
     /// The `.deb` lanes' call (`scripts/deb-bare-check.sh`).
@@ -8919,9 +8940,24 @@ mod smoke_openh264_tests {
     /// not that a hardware and a software backend both failed.
     #[tokio::test]
     async fn hevc_fails_and_names_what_this_build_has() {
-        let failed = encoder_smoke_cmd("hardware", "hevc", None, None)
+        let e = encoder_smoke_cmd("hardware", "hevc", None, None)
             .await
             .expect_err("no HEVC encoder in this build");
-        assert!(!format!("{failed:#}").contains("HW and SW"), "{failed:#}");
+        assert!(!format!("{e:#}").contains("HW and SW"), "{e:#}");
+        let f = failed(&e);
+        assert_eq!(f.verdict, Verdict::None, "{e:#}");
+        let media_foundation = if cfg!(target_os = "windows") {
+            Reach::NotCompiled
+        } else {
+            Reach::WindowsOnly
+        };
+        assert_eq!(
+            f.tried.backends,
+            [
+                (Backend::Ffmpeg, Reach::NotCompiled),
+                (Backend::MediaFoundation, media_foundation),
+            ],
+            "{e:#}"
+        );
     }
 }

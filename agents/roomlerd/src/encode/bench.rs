@@ -535,12 +535,11 @@ pub fn plan(
 ) -> Result<BenchPlan, String> {
     let fps = args.bench_fps;
     let cells: Vec<(CellSpec, Option<String>)> = if let Some(name) = name {
-        let (codec, _) = VideoBackend::from_ffmpeg_name(name)
-            .ok_or_else(|| format!("--name {name:?} is not an FFmpeg encoder name"))?;
-        let codec = Codec::parse(codec.wire())
-            .ok_or_else(|| format!("--name {name:?}: no bench codec for it"))?;
+        let named = named_encoder(name).ok_or_else(|| {
+            format!("--name {name:?} is not an FFmpeg or Media Foundation encoder name")
+        })?;
         vec![(
-            CellSpec::new(CellPath::Named, codec, false),
+            CellSpec::new(CellPath::Named, named.codec, false),
             Some(name.to_string()),
         )]
     } else if !args.bench_cells.is_empty() {
@@ -608,6 +607,15 @@ pub fn plan(
     for &(width, height) in &sizes {
         for (cell, name) in &cells {
             let cell = *cell;
+            let (requested_hw, hardware_on_path) = match name.as_deref().and_then(named_encoder) {
+                // #3652 — a named Media Foundation encoder asks for Media
+                // Foundation, either MFT.
+                Some(n) if n.media_foundation => (false, build.mf),
+                _ => (
+                    requests_hardware(cell.path, pref),
+                    build.hardware_on_path(cell),
+                ),
+            };
             for &rate in &rates {
                 for &motion in &motions {
                     plans.push(CellPlan {
@@ -618,8 +626,8 @@ pub fn plan(
                         fps,
                         target_bps: rate.resolve(width, height, fps),
                         motion,
-                        requested_hw: requests_hardware(cell.path, pref),
-                        hardware_on_path: build.hardware_on_path(cell),
+                        requested_hw,
+                        hardware_on_path,
                     });
                 }
             }
@@ -901,11 +909,7 @@ impl CellOpener for SessionOpener {
         match plan.cell.path {
             CellPath::Named => {
                 let name = plan.name.as_deref().unwrap_or_default();
-                let (mut enc, codec) = super::open_named(name, w, h).ok_or_else(|| {
-                    format!(
-                        "{name} did not open (not a cascade name, no FFmpeg, or no device takes it)"
-                    )
-                })?;
+                let (mut enc, codec) = super::open_named(name, w, h)?;
                 enc.set_bitrate(plan.target_bps);
                 Ok(Opened {
                     enc,
