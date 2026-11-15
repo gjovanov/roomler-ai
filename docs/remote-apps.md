@@ -63,7 +63,7 @@ Three properties of the wire are load-bearing:
   decimal on Windows, `tmux:<name>` for a detached session. The viewer only
   ever round-trips it, and the Linux backend re-validates the shape before
   handing it to `wmctrl -i -a` so a crafted id cannot become a flag
-  (`agents/roomlerd/src/apps/linux.rs:461`).
+  (`agents/roomlerd/src/apps/linux.rs:463`).
 - 🔑 **Launch takes a key, never a command.** `resolve_app`
   (`agents/roomlerd/src/apps/mod.rs:631`) is the security gate: the key must be
   in the device's own allowlist and the entry's `command` is run as argv with
@@ -80,7 +80,7 @@ Until FR-56 P1 the gate was literally `env::var_os("DISPLAY").is_some()` on
 the **daemon**, which is true only when the daemon started its own Xvfb
 (`ROOMLERD_VIRTUAL_DESKTOP=1`). On every real login session the daemon has no
 `DISPLAY`, so the feature never failed — it never engaged. `discover()`
-(`agents/roomlerd/src/apps/linux.rs:502`) replaces that with the walk below.
+(`agents/roomlerd/src/apps/linux.rs:504`) replaces that with the walk below.
 
 ```mermaid
 flowchart TD
@@ -100,13 +100,13 @@ flowchart TD
 
 | Arm | Runs as | Needs | Why it is the way it is |
 |---|---|---|---|
-| **Daemon** (`Target::Daemon`, `linux.rs:56`) | the daemon (root) | `DISPLAY` only | The daemon started that Xvfb and owns it — the only case where root on the display is the right answer. It is also the only population that used the feature before FR-56, and AC3 keeps it **unchanged, first, and unprobed** |
-| **Session** (`Target::Session`) | the session's owner, by **name** | `DISPLAY` **and** `XAUTHORITY` | ⚠️ Measured before any code: with `DISPLAY` alone — what the pre-FR-56 code passed — every call on a compositor-started Xwayland dies `Authorization required, but no authorization protocol specified`. The cookie's file name is a glob (`.mutter-Xwaylandauth.XXXXXX`), so the runtime dir is scanned newest-first (a compositor restart leaves a stale one behind that authorises nothing; `linux.rs:682`) |
+| **Daemon** (`Target::Daemon`, `linux.rs:58`) | the daemon (root) | `DISPLAY` only | The daemon started that Xvfb and owns it — the only case where root on the display is the right answer. It is also the only population that used the feature before FR-56, and AC3 keeps it **unchanged, first, and unprobed** |
+| **Session** (`Target::Session`) | the session's owner, by **name** | `DISPLAY` **and** `XAUTHORITY` | ⚠️ Measured before any code: with `DISPLAY` alone — what the pre-FR-56 code passed — every call on a compositor-started Xwayland dies `Authorization required, but no authorization protocol specified`. The cookie's file name is a glob (`.mutter-Xwaylandauth.XXXXXX`), so the runtime dir is scanned newest-first (a compositor restart leaves a stale one behind that authorises nothing; `linux.rs:684`) |
 
 Four rules the session arm enforces, each paid for somewhere:
 
 - ⚠️ **The desktop is a person's, never the login screen's.** `desktop_session`
-  (`agents/roomlerd/src/apps/linux.rs:520`) asks logind for `Class=user` only.
+  (`agents/roomlerd/src/apps/linux.rs:522`) asks logind for `Class=user` only.
   GDM's greeter IS an active graphical session, owned by the service account
   `gdm`: FR-27's consent path wants that answer, and this backend must not take
   it. Until P7 it did. On a Wayland greeter, whose Xwayland runs at `:1024`,
@@ -118,7 +118,7 @@ Four rules the session arm enforces, each paid for somewhere:
 - ⚠️ **The privilege drop is not politeness, and it is fallible on purpose.**
   `launch` spawns a terminal and a tmux server; doing that as root on
   somebody's own desktop puts a root shell on their screen and root-owned
-  state in their runtime dir. So `LinuxWm::cmd` (`linux.rs:102`) returns an
+  state in their runtime dir. So `LinuxWm::cmd` (`linux.rs:104`) returns an
   error when the drop cannot be installed, and the only outcome is to run
   *nothing* — an infallible constructor could not express that. Since P6 that
   failure is also a *named* refusal (`cannot_run_as`) rather than being retried
@@ -127,13 +127,13 @@ Four rules the session arm enforces, each paid for somewhere:
   for X11 sessions and often not for Wayland ones, so `:0` is an unavoidable
   guess — but an *unverified* guess would surface later as a reassuring
   "no windows" instead of an honest "no desktop". Each pair is tried with
-  `wmctrl -m` and the first that answers wins (`linux.rs:639`).
+  `wmctrl -m` and the first that answers wins (`linux.rs:641`).
 - ⚠️ **`wmctrl -l`'s exit status is checked.** It was not, before P1: against a
   display it cannot open the tool writes nothing to stdout and exits non-zero,
   and parsing stdout regardless turned *"I could not reach the desktop"* into
   `Ok(vec![])` — *no windows*, a different and calmer claim. Discovery makes it
   matter: a found display can go stale (the cookie dies with the compositor)
-  where an Xvfb the daemon owns could not (`linux.rs:312`).
+  where an Xvfb the daemon owns could not (`linux.rs:314`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
 helper (`agents/roomlerd/src/companion.rs:3760`) — one copy on purpose, because
@@ -259,11 +259,11 @@ not a field set at construction, so the compiler forces every backend to answer
 - ⚠️ **`wmctrl` is deliberately not a `MissingTool`.** Without it there is no
   backend — `list` and `focus` *are* `wmctrl` — so its absence must surface as a
   refusal of the whole feature (`tool_missing`, below), never as a footnote on
-  a reply that otherwise reads like success (`linux.rs:230`).
+  a reply that otherwise reads like success (`linux.rs:232`).
 - ⚠️ **The probe resolves against the daemon's `PATH`**, because that is what
   the spawn inherits: the privilege drop changes the child's uid from a
   `pre_exec` hook long after the environment was copied, so the target user's
-  login `PATH` never enters into it (`linux.rs:211`). Asking any other way
+  login `PATH` never enters into it (`linux.rs:213`). Asking any other way
   answers about an environment the child never gets.
 - **`coverage` rides the error arm too** (`mod.rs:561`). A failed listing is
   exactly where an empty list is most likely to be read as calm.
@@ -342,23 +342,28 @@ restart changes it. That is why P6 added a fourth value:
 
 On Linux the flagship entry is a **bash session that is a tmux session**,
 shown as an xterm attached to it. That buys three things a bare terminal
-cannot: it survives the agent restarting and the viewer disconnecting (the tmux
-server outlives both), it is `ssh`-attachable from a real login
-(`tmux attach -t s2`), and it is one X window per session, so focus works.
+cannot: it survives the viewer disconnecting (the tmux server outlives the
+xterm), it is `ssh`-attachable from a real login (`tmux attach -t s2`), and it
+is one X window per session, so focus works. It does **not** survive a stop or
+a restart of the daemon under the shipped systemd units: the unit's whole
+control group ends with the daemon, the tmux server in it. Only a daemon that
+no service manager owns leaves it running. These sessions are the daemon's
+own children, not the desktop's keeper's
+([`linux-capture.md` §2.3](linux-capture.md#23-the-desktops-keeper-3665)).
 
 | Entry kind | What `launch` does | How the list finds it again |
 |---|---|---|
-| `tmux = true` | `tmux new-session -d -s s<N> <command>`, then `xterm -T roomler:tmux:s<N> -e tmux attach -t s<N>`; at most **32** live sessions (`linux.rs:43`) — a bound on what a misbehaving viewer can spawn | title convention `roomler:tmux:<s>` → `session` |
+| `tmux = true` | `tmux new-session -d -s s<N> <command>`, then `xterm -T roomler:tmux:s<N> -e tmux attach -t s<N>`; at most **32** live sessions (`linux.rs:45`) — a bound on what a misbehaving viewer can spawn | title convention `roomler:tmux:<s>` → `session` |
 | `terminal = true` | `xterm -T roomler:app:<key> -e <command>` — for TUIs | `roomler:app:<key>` → `app_key` |
 | neither | `<command>` as argv, detached, stdio to `/dev/null`; the app sets its own title | unmanaged — reported as-is |
-| **detached session** (no live xterm after a restart or a detach) | listed anyway, as `Terminal (s2) — detached` with the synthetic id `tmux:s2` (`linux.rs:39`); `focus` on it spawns a fresh attached xterm — "attach" fits the three-verb protocol with no fourth verb | `tmux list-sessions` minus the attached ones |
+| **detached session** (no live xterm after a restart or a detach) | listed anyway, as `Terminal (s2) — detached` with the synthetic id `tmux:s2` (`linux.rs:41`); `focus` on it spawns a fresh attached xterm — "attach" fits the three-verb protocol with no fourth verb | `tmux list-sessions` minus the attached ones |
 
 - 🔑 **Our own windows carry a known title**, so a window maps back to its
   session or allowlist key without pid/`xprop` correlation
   (`classify_title`, `mod.rs:745`). Anything else is an unmanaged window and is
   reported with its real title.
 - ⚠️ **A re-attach target is validated as a plain session token**
-  (`is_safe_session`, `linux.rs:470`) — defence in depth against a crafted
+  (`is_safe_session`, `linux.rs:472`) — defence in depth against a crafted
   `window_id` reaching `tmux attach -t`.
 - ⚠️ **Launching stays X11-only, on purpose, on a Wayland host.** P5 was
   written as *prefer a Wayland-native terminal where there is no Xwayland*,
@@ -493,7 +498,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1211`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6858`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6866`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
