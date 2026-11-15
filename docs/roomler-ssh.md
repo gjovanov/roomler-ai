@@ -659,7 +659,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:3848`](../agents/roomlerd/src/companion.rs#L3848)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:1857`](../agents/roomlerd/src/companion.rs#L1857)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:4061`](../agents/roomlerd/src/companion.rs#L4061)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:2070`](../agents/roomlerd/src/companion.rs#L2070)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -746,7 +746,7 @@ worker and every socket and timer on it: the shape #3830 measured for a hung log
 
 The lookup now runs on a thread of its own, named `account-lookup`, through one
 lookup in flight **per account name** (`one_in_flight::OneInFlightPerKey`,
-[`one_in_flight.rs:401`](../agents/roomlerd/src/one_in_flight.rs#L401); the
+[`one_in_flight.rs:407`](../agents/roomlerd/src/one_in_flight.rs#L407); the
 daemon's `ACCOUNTS`, [`exec.rs:1550`](../agents/roomlerd/src/exec.rs#L1550)). The
 session's own task awaits it `ACCOUNT_LOOKUP_WAIT` (1.5 s) at most
 (`unix_priv::session_account`,
@@ -810,7 +810,7 @@ hung, every ask held its blocking thread for as long as the hang lasted. They no
 the same lookup in flight (`unix_priv::account_blocking`,
 [`exec.rs:1311`](../agents/roomlerd/src/exec.rs#L1311), through
 `OneInFlightPerKey::ask_blocking`,
-[`one_in_flight.rs:446`](../agents/roomlerd/src/one_in_flight.rs#L446)), 1.5 s at most
+[`one_in_flight.rs:452`](../agents/roomlerd/src/one_in_flight.rs#L452)), 1.5 s at most
 from the caller's own thread. The recorder's uid is looked up through one lookup in
 flight per uid (`account_name`, [`exec.rs:1476`](../agents/roomlerd/src/exec.rs#L1476)).
 An ask from the recorder's launch and an exec as the same account share one lookup.
