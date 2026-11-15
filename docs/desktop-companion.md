@@ -1759,8 +1759,15 @@ is. Each gate's other conditions are as they were:
 | its own session unreadable, or session 0 with no console session | no Windows peer |
 
 Unlike a consent answer, these gates take no SYSTEM or elevated caller from outside the screen's
-session, as before. The refusals keep their words ("only the person at this device's
-console …"), and Unix reads no session, so there each gate decides by the uid.
+session, as before, and Unix reads no session, so there each gate decides by the uid.
+
+Each refusal names the person these gates take (#3907): "only the person at this device's screen
+can …", in its gate's own words (`not_the_console_user`, `not_the_console_user_for_external_access`
+and `not_the_person_for_keep_busy`, `crates/localapi/src/lib.rs:3237-3265`, and each
+`CONSOLE_PERSON_KEYS` entry's `refusal`). On a machine-wide install the screen is the console's,
+so they read as before. On a per-user install used over Remote Desktop the person at the console
+is the one refused, whom the words of 0.4.222 and earlier ("only the person at this device's
+console …") named.
 
 The tests, in `crates/localapi`, run on every OS:
 `the_console_persons_gates_follow_the_screens_session` (a table per gate: a per-user daemon in
@@ -1772,7 +1779,13 @@ both scopes) and `the_console_persons_verbs_follow_the_screen_the_daemon_shows` 
 with the two session reads pinned for the test's thread: every verb from the screen's person
 reaches the daemon, from any other session none does, and stopping keep busy stays open). On
 Windows, `a_client_at_the_screen_sets_a_console_persons_key_over_a_real_pipe` reads a client from
-the OS over a real pipe, as the tray is read.
+the OS over a real pipe, as the tray is read. One test a gate pins its refusal's words, asked as
+the person at the console of a per-user daemon in an RDP session:
+`a_recording_verbs_refusal_names_the_person_at_the_screen`,
+`a_keep_busy_starts_refusal_names_the_person_at_the_screen`,
+`the_external_access_passwords_refusal_names_the_person_at_the_screen` and
+`a_console_persons_keys_refusal_names_the_person_at_the_screen` (every `CONSOLE_PERSON_KEYS`
+entry).
 
 ## 13. One version: the companion follows the daemon (FR-117)
 

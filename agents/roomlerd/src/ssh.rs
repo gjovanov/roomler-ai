@@ -1347,15 +1347,21 @@ mod sshd {
 
             // sftp-server writes diagnostics here. They belong in OUR log, not
             // on the client's channel: the SFTP stream is a binary protocol
-            // and injecting text into it corrupts the transfer.
+            // and injecting text into it corrupts the transfer. One escaped
+            // line when it closes its stderr, 4 KiB at most (#3890).
             if let Some(mut stderr) = stderr {
                 let peer = self.peer;
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
-                    let mut s = String::new();
-                    if stderr.read_to_string(&mut s).await.is_ok() && !s.trim().is_empty() {
-                        warn!(%peer, msg = %s.trim(), "ssh: sftp-server stderr");
+                    let mut said = SftpStderr::default();
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match stderr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => said.push(&buf[..n]),
+                        }
                     }
+                    said.log(peer);
                 });
             }
 
@@ -1371,7 +1377,8 @@ mod sshd {
         /// the client's bytes feed its stdin through a bounded queue, and the
         /// client's EOF (the queue's last sender dropping) ends its input. Its
         /// stdout reaches the channel raw, never redacted, because SFTP is a
-        /// binary protocol. Its stderr goes to this log, never the channel.
+        /// binary protocol. Its stderr goes to this log, never the channel, as
+        /// one escaped line when it ends ([`SftpStderr`], #3890).
         /// When it exits, the client gets the exit status (`scp`'s verdict on
         /// the whole transfer), then EOF, then close. A client that has gone
         /// kills the process tree: the channel closed or the session ended
@@ -1401,6 +1408,7 @@ mod sshd {
             let pump_handle = handle.clone();
             let pump_abort = abort.clone();
             let pump = tokio::spawn(async move {
+                let mut said = SftpStderr::default();
                 while let Some(chunk) = raw_rx.recv().await {
                     match chunk.stream {
                         crate::exec::OutStream::Stdout => {
@@ -1409,14 +1417,10 @@ mod sshd {
                                 break;
                             }
                         }
-                        crate::exec::OutStream::Stderr => {
-                            let s = String::from_utf8_lossy(&chunk.bytes);
-                            if !s.trim().is_empty() {
-                                warn!(%peer, msg = %s.trim(), "ssh: sftp-server stderr");
-                            }
-                        }
+                        crate::exec::OutStream::Stderr => said.push(&chunk.bytes),
                     }
                 }
+                said.log(peer);
             });
 
             let program = program.to_string_lossy().into_owned();
@@ -2117,6 +2121,10 @@ mod sshd {
     /// `None` is a normal answer (no OpenSSH server installed) and the caller
     /// turns it into a refusal that says what to install.
     fn sftp_server_path() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(p) = STAND_IN_SFTP_SERVER.with(|s| s.borrow().clone()) {
+            return Some(p);
+        }
         // `ROOMLER_SFTP_SERVER` first, for a host that keeps it somewhere
         // unusual — an escape hatch beats a support ticket.
         if let Ok(p) = std::env::var("ROOMLER_SFTP_SERVER") {
@@ -2141,6 +2149,54 @@ mod sshd {
             .iter()
             .map(std::path::PathBuf::from)
             .find(|p| p.is_file())
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Tests only: the `sftp-server` a server on this thread starts in
+        /// place of OpenSSH's (#3890). A `#[tokio::test]` serves its
+        /// connection on its own thread, so no other test's server sees it.
+        pub(super) static STAND_IN_SFTP_SERVER: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// #3890 — the most of `sftp-server`'s stderr the daemon's log keeps.
+    const SFTP_STDERR_KEPT: usize = 4096;
+
+    /// #3890 — what `sftp-server` wrote to its stderr, kept for ONE log line:
+    /// its first [`SFTP_STDERR_KEPT`] bytes and a count of the bytes after
+    /// them, so a child that writes a lot grows neither the daemon's memory
+    /// nor one line of its log. Both spawns feed it: the `tokio::process` one
+    /// from the pipe, the Windows `console_user` one chunk by chunk.
+    #[derive(Default)]
+    struct SftpStderr {
+        kept: Vec<u8>,
+        cut: usize,
+    }
+
+    impl SftpStderr {
+        fn push(&mut self, bytes: &[u8]) {
+            let take = SFTP_STDERR_KEPT
+                .saturating_sub(self.kept.len())
+                .min(bytes.len());
+            self.kept.extend_from_slice(&bytes[..take]);
+            self.cut += bytes.len() - take;
+        }
+
+        /// One `WARN` line once the child has closed its stderr; none for a
+        /// stderr of whitespace alone. The text is ONE field, escaped (`?`),
+        /// like the text the server takes from the wire (#3815): a line
+        /// break or a control character the child wrote, or a path it quotes
+        /// from the client, stays inside this line.
+        fn log(&self, peer: std::net::SocketAddr) {
+            let text = String::from_utf8_lossy(&self.kept);
+            let msg = text.trim();
+            if self.cut > 0 {
+                warn!(%peer, ?msg, cut_bytes = self.cut, "ssh: sftp-server stderr");
+            } else if !msg.is_empty() {
+                warn!(%peer, ?msg, "ssh: sftp-server stderr");
+            }
+        }
     }
 
     /// FR-97 P4b's kill switch: `ROOMLERD_SFTP_AS_USER=0` puts back the
@@ -5758,6 +5814,146 @@ mod tests {
             ] {
                 let at = line_with(&text, message);
                 assert!(at.contains(&run_as), "{run_as} on {at:?}");
+            }
+        }
+
+        /// The line `sftp-server`'s stderr is logged on.
+        const SFTP_STDERR: &str = "ssh: sftp-server stderr";
+
+        /// #3890 — a stand-in `sftp-server` for the server on this thread,
+        /// gone with this guard: it writes its lines to its stderr and exits
+        /// 0. Unix: `/bin/sh`, running the script the client sends it on the
+        /// channel, so no file is written and then run. Windows: a `.cmd`
+        /// that echoes them, and the client sends nothing.
+        struct StandInSftpServer {
+            script: String,
+            dir: Option<std::path::PathBuf>,
+        }
+
+        impl StandInSftpServer {
+            fn writing(lines: &[&str]) -> Self {
+                let (program, script, dir) = if cfg!(windows) {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos();
+                    let dir = std::env::temp_dir().join(format!("roomler-sftp-stand-in-{nanos}"));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let mut cmd = String::from("@echo off\r\n");
+                    for line in lines {
+                        cmd.push_str(&format!(">&2 echo {line}\r\n"));
+                    }
+                    cmd.push_str("exit /b 0\r\n");
+                    let program = dir.join("sftp-server.cmd");
+                    std::fs::write(&program, cmd).unwrap();
+                    (program, String::new(), Some(dir))
+                } else {
+                    let script = lines
+                        .iter()
+                        .map(|line| format!("printf '%s\\n' '{line}' >&2\n"))
+                        .collect();
+                    (std::path::PathBuf::from("/bin/sh"), script, None)
+                };
+                super::super::sshd::STAND_IN_SFTP_SERVER.with(|s| *s.borrow_mut() = Some(program));
+                Self { script, dir }
+            }
+
+            /// What it writes, as the server reads it trimmed: its lines,
+            /// each ended as this OS's `echo` or `printf` ends one.
+            fn wrote(lines: &[&str]) -> String {
+                lines.join(if cfg!(windows) { "\r\n" } else { "\n" })
+            }
+
+            /// SFTP on a key-list session that runs as the daemon: the
+            /// stand-in gets its script and EOF, and the channel closes
+            /// with its exit status. Then the log, once its stderr line is
+            /// in, which its own task writes: 10 s at most.
+            async fn run(&self, seed: u8, log: &Logged) -> String {
+                let (key, line) = client_key(seed);
+                let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+                let session = connect(addr, key).await;
+                let mut channel = session.channel_open_session().await.unwrap();
+                channel.request_subsystem(true, "sftp").await.unwrap();
+                if !self.script.is_empty() {
+                    channel.data(self.script.as_bytes()).await.unwrap();
+                }
+                channel.eof().await.unwrap();
+                let mut exit = None;
+                while let Some(msg) = channel.wait().await {
+                    match msg {
+                        russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                        russh::ChannelMsg::Failure => panic!("sftp refused:\n{}", log.text()),
+                        _ => {}
+                    }
+                }
+                assert_eq!(exit, Some(0), "the stand-in's exit:\n{}", log.text());
+                for _ in 0..500 {
+                    if log.text().contains(SFTP_STDERR) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                log.text()
+            }
+        }
+
+        impl Drop for StandInSftpServer {
+            fn drop(&mut self) {
+                super::super::sshd::STAND_IN_SFTP_SERVER.with(|s| s.borrow_mut().take());
+                if let Some(dir) = &self.dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        /// The lines of `log` that hold `sftp-server`'s stderr.
+        fn sftp_stderr_lines(log: &str) -> Vec<&str> {
+            log.lines().filter(|l| l.contains(SFTP_STDERR)).collect()
+        }
+
+        /// #3890 — `sftp-server`'s stderr goes to the daemon's log, never
+        /// the client's channel, as ONE escaped field of one line, like the
+        /// text the server takes from the wire: two lines and a control
+        /// character from the child stay inside it.
+        #[tokio::test]
+        async fn sftp_servers_stderr_never_starts_a_log_line_of_its_own() {
+            const LINES: [&str; 2] = [
+                "sftp-server: first line",
+                "SECOND LINE from sftp-server\u{1b}[2J",
+            ];
+            let log = Logged::start(tracing::Level::INFO);
+            let stand_in = StandInSftpServer::writing(&LINES);
+            let text = stand_in.run(155, &log).await;
+
+            assert_one_line_each(&text, '\u{1b}');
+            let lines = sftp_stderr_lines(&text);
+            assert_eq!(lines.len(), 1, "one line for its stderr:\n{text}");
+            let msg = format!("msg={}", escaped(&StandInSftpServer::wrote(&LINES)));
+            assert!(lines[0].contains(&msg), "{msg} on {:?}", lines[0]);
+        }
+
+        /// #3890 — and at most its first 4 KiB, with a count of the bytes
+        /// after them: a child that writes a lot to its stderr cannot grow
+        /// the daemon's memory, or one line of its log, past that.
+        #[tokio::test]
+        async fn sftp_servers_stderr_is_logged_4_kib_at_most() {
+            let long = "x".repeat(6000);
+            let log = Logged::start(tracing::Level::INFO);
+            let stand_in = StandInSftpServer::writing(&[long.as_str()]);
+            let text = stand_in.run(156, &log).await;
+
+            let lines = sftp_stderr_lines(&text);
+            assert_eq!(lines.len(), 1, "one line for its stderr:\n{text}");
+            let written = StandInSftpServer::wrote(&[long.as_str()]).len()
+                + if cfg!(windows) { 2 } else { 1 };
+            let kept = format!("msg={}", escaped(&"x".repeat(4096)));
+            let cut = format!("cut_bytes={}", written - 4096);
+            for field in [&kept, &cut] {
+                assert!(
+                    lines[0].contains(field.as_str()),
+                    "{field} on {:?}",
+                    lines[0]
+                );
             }
         }
     }
