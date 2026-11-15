@@ -1135,12 +1135,13 @@ opens". The rules that matter here:
   cannot bind its port for two minutes now logs who holds it.
 - **Per-machine Windows launches from the service host, with the console user's own,
   non-elevated token** — never from a worker that may run elevated.
-- **The companion decides what to show** (`agents/roomler-desktop/src/first_run.rs:63`):
+- **The companion decides what to show** (`agents/roomler-desktop/src/first_run.rs:75`):
   it reads its own arguments on the first launch too (`--first-run`, `--autostart`,
-  `--view=<name>`) and a per-user `desktop-state.json` (`first_run_done`, the start-at-login
-  opt-out; `crates/agent-core/src/desktop_state.rs`). A missing or unreadable file is a
-  first run. Until the tour is finished or skipped it shows at every start; afterwards a
-  login start stays in the tray.
+  `--for-prompt`, `--view=<name>`) and a per-user `desktop-state.json` (`first_run_done`, the
+  start-at-login opt-out; `crates/agent-core/src/desktop_state.rs`). A missing or unreadable
+  file is a first run. Until the tour is finished or skipped it shows at every start but the
+  daemon's start for a consent question or a banner, which keeps it for the person's own
+  start (#3887, §10.6); afterwards a login start stays in the tray.
 
 **The Welcome** (`front/welcome.js`) is six steps — this device · the private network ·
 who may view this screen · files you receive · start at login · done:
@@ -1241,7 +1242,7 @@ flowchart TD
 |---|---|---|
 | the start, off the worker | `ensure_running_inner`, [`companion.rs:1750`](../agents/roomlerd/src/companion.rs#L1750) (one for Linux, Windows and macOS since #3858, §10.4); `TrayStarts::start`, [`:2131`](../agents/roomlerd/src/companion.rs#L2131) | the prompt's task awaits the start; it never runs a step itself |
 | one start in flight | `TRAY_STARTS`, [`companion.rs:2105`](../agents/roomlerd/src/companion.rs#L2105), a `one_in_flight::OneInFlight` on a thread named `tray-start` | while a step hangs, every prompt that asks waits on that one start and starts none of its own, so a hang holds one thread however often a viewer asks. A start that began before an ask is waited out, and the ask then starts afresh: the person at the screen may have changed meanwhile |
-| the steps | `TraySteps`, [`companion.rs:2216`](../agents/roomlerd/src/companion.rs#L2216); `start_tray`, [`:2264`](../agents/roomlerd/src/companion.rs#L2264) | in the order the start always took them, each recorded as it begins (`TrayStep`, [`:2150`](../agents/roomlerd/src/companion.rs#L2150)). Who the tray is for (logind's active graphical session, `pgrep -u` per uid), the user manager for a per-user daemon and the system manager as the person for a root one, #2713's environment and #2729's `KillMode=process` are as before |
+| the steps | `TraySteps`, [`companion.rs:2216`](../agents/roomlerd/src/companion.rs#L2216); `start_tray`, [`:2264`](../agents/roomlerd/src/companion.rs#L2264) | in the order the start always took them, each recorded as it begins (`TrayStep`, [`:2150`](../agents/roomlerd/src/companion.rs#L2150)). Who the tray is for (logind's active graphical session, `pgrep -u` per uid), the user manager for a per-user daemon and the system manager as the person for a root one, #2713's environment and #2729's `KillMode=process` are as before. Since #3887 the companion's argv carries `--for-prompt` (§10.6) |
 | the bound | `TRAY_START_WAIT`, [`companion.rs:2324`](../agents/roomlerd/src/companion.rs#L2324): 2.5 s | under the callers' 3 s, so the start's own reason lands before their fallback fires (with equal timers the hub's fallback fired first, FR-27). A start that works takes tens to a few hundred milliseconds, under half the wait, which one start in flight needs to answer an ask that comes just after another began |
 | the failure | `started_in_time`, [`companion.rs:2188`](../agents/roomlerd/src/companion.rs#L2188) | a start's own failure keeps its words (`finding a graphical login session: …`, `systemd-run failed: …`); no answer in time is `the tray's start did not finish within 2.5s: it was still waiting on logind (…)`, naming the step. `ensure_running` logs either as `could not start the desktop companion` and the prompt has no surface, as for any failed start. The start goes on on its thread: if it later brings the tray up, the tray reads the `.pending` marker and shows the question. Since #3884 that verdict stands 2 s, not 20 s, so the next prompt asks again (§10.5) |
 
@@ -1440,12 +1441,12 @@ flowchart LR
 | Windows: `start_tray`, [`companion.rs:1848`](../agents/roomlerd/src/companion.rs#L1848); `TrayStep`, [`:1765`](../agents/roomlerd/src/companion.rs#L1765) | the tray check | `desktop_running`: `win_service::companion_procs::find`, a process snapshot, then each candidate's loaded image (#1686) | `the process list (…)` |
 | | the install path | `installed_desktop`: the companion beside the daemon | `the companion's install path` |
 | | the daemon's own token | `respawn_context_for_self`: is this the SYSTEM service? | `the daemon's own token (…)` |
-| | the start | `start_desktop`, #3848's, with its session choice: the SYSTEM service starts the tray in the console session as its person (`WTSQueryUserToken`, `CreateEnvironmentBlock`, `CreateProcessAsUserW`), the person's own daemon a plain `CreateProcessW` in its session | `the start in the console session (…)`, or `the start in the daemon's own session (…)` |
+| | the start | `start_desktop`, #3848's, with its session choice: the SYSTEM service starts the tray in the console session as its person (`WTSQueryUserToken`, `CreateEnvironmentBlock`, `CreateProcessAsUserW`), the person's own daemon a plain `CreateProcessW` in its session; since #3887 with `--for-prompt` (§10.6) | `the start in the console session (…)`, or `the start in the daemon's own session (…)` |
 | macOS: `start_tray`, [`companion.rs:2005`](../agents/roomlerd/src/companion.rs#L2005); `TrayStep`, [`:1922`](../agents/roomlerd/src/companion.rs#L1922) | the app | `/Applications/Roomler.app` exists | `the companion's app bundle (…)` |
 | | the tray check | `pgrep -x roomler-desktop` | `the process list (pgrep)` |
 | | the console's owner | `console_user_name`: `stat -f %Su /dev/console`, the way the pkg's postinstall reads it | `the console's owner (stat /dev/console)` |
 | | the uid | `account_uid`: `id -u <user>`, from the account database | `the account database (id -u, …)` |
-| | the start | `launchctl kickstart -k gui/<uid>/com.roomler.desktop`: launchd starts the LaunchAgent in the console user's GUI domain | `launchd (launchctl kickstart)` |
+| | the start | `launchctl kickstart -k gui/<uid>/com.roomler.desktop`: launchd starts the LaunchAgent in the console user's GUI domain, with no argument (the companion asks why it came, §10.6) | `launchd (launchctl kickstart)` |
 
 - **`Started` only when the process was created.** On Windows `started_outcome` (#3824) reads
   `start_desktop`'s answer: nobody signed in, or a refused `CreateProcessAsUserW`, is an error in its
@@ -1557,6 +1558,72 @@ sequenceDiagram
   once while the start is held, the second request handled at once; and both on the release
   before, as the control.
 
+### 10.6 A start for a prompt keeps the Welcome tour for the person (#3887)
+
+The daemon starts the companion to show a consent question or a being-viewed banner (§10.2,
+§10.4, §10.5). Until #3887 the companion could not tell that start from any other, and for a
+person who had not finished or skipped the Welcome tour it opened the tour too: `decide_startup`
+showed it "however this started". On a person's first remote session, the usual case, the tour
+came up together with the question, and the question is the one with a deadline.
+
+Now the start says what it is for, and the tour waits for the person's own start:
+
+| The start | Made by | Its argument | The tour, while it is not done |
+|---|---|---|---|
+| for a question or a banner, Windows and Linux | the daemon's `start_tray`: Windows [`companion.rs:1867`](../agents/roomlerd/src/companion.rs#L1867), Linux [`:2291`](../agents/roomlerd/src/companion.rs#L2291) | `--for-prompt` (`FOR_PROMPT_ARG`, `crates/agent-core/src/companion_autostart.rs:36`) | held back: the companion stays in the tray, and the question's or the banner's own window shows as before |
+| for a question, macOS | the daemon's `launchctl kickstart` ([`companion.rs:2005`](../agents/roomlerd/src/companion.rs#L2005)) | none: launchd's start carries none | the companion asks the daemon why it came (below), and holds the tour back when there is a question |
+| at login | the `Run` value, the XDG entry, the LaunchAgent | `--autostart` (macOS: none) | shows |
+| after install | `launch_once` | `--first-run` | shows |
+| a person's own | a double-click, the Start or applications menu, Finder | none | shows |
+| after an update; a tray the refresh lost (§13.3) | the daemon's update swap; its restart | none; `--autostart` | shows, as before |
+
+```mermaid
+flowchart TD
+    S([the companion starts]) --> V{"--view=…?"}
+    V -->|yes| SV[that view]
+    V -->|no| P{"--for-prompt?<br/>(macOS: a bare start whose<br/>tour is not done asks the daemon)"}
+    P -->|yes| T["the tray; the tour, not done,<br/>is held for the person"]
+    P -->|no| D{tour done?}
+    D -->|no| W[the Welcome tour]
+    D -->|yes| R["as before: the tray, the Overview<br/>after install, or leave (login start, opted out)"]
+    T --> O{"the person opens the window:<br/>a double-click, the tray icon,<br/>Device status"}
+    O --> W2[the Welcome tour, once]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the decision | `decide_startup`, `agents/roomler-desktop/src/first_run.rs:75` | an explicit `--view=` first, then a start for a prompt stays in the tray, the tour done or not. It never leaves either: `Exit` stays for `--autostart` with the login-start switch off |
+| the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:87` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called at `tray.rs:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
+| macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:83`; `daemon_has_something_to_show`, `:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, read as the consent watch reads them, 300 ms for all of it: a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac |
+
+- **Old and new together.** An older companion started with `--for-prompt` ignores it, as it
+  ignores any argument it does not know, and shows the tour as before. A newer companion that
+  an older daemon starts on Windows or Linux gets no argument and behaves as before. On macOS a
+  newer companion asks an older daemon with verbs that daemon has, so its question keeps the
+  tour back too.
+- **Unchanged:** the start's 2.5 s and the callers' 3 s, the verdicts (§10.5), who the tray is
+  started for, the post-install `--first-run`, the login starts, the update swap's restart and
+  the `--autostart` restart of a tray the refresh lost, and the restart of a companion a Linux
+  package update stopped (`companion/package_sync.rs`).
+- **Every caller of the start is a question or a banner:** the remote-control prompt
+  (`start_for_prompt`, `companion.rs:1270`, from `signaling.rs:4550`), the exec prompt
+  (`signaling.rs:6098`), a recording's and an SSH session's question (`Companion::up`,
+  `companion.rs:1332`), and Linux's being-viewed banner (`indicator/notify.rs:710`). The other
+  callers are `tray_start_tests`' own.
+- **Tested:** the companion's `first_run::tests` (`startup_table`, the forwarded launches, the
+  held tour offered once, `--for-prompt` read by equality, which starts ask on a Mac and what
+  the answer means) in "Rust unit tests (server + crates)", step "Test the desktop companion
+  (roomler-desktop)"; the three start arguments distinct, none a prefix of another
+  (`companion_autostart::tests`), in its "Run the remaining crates' unit tests"; and the
+  daemon's argv in `a_start_in_time_works_as_today` (Linux's systemd-run argv, the Windows
+  start's arguments), in rust-agent's "Test agent under vp9-444" and in "Agent unit tests on
+  Windows (the whole --lib suite)".
+- **Field cells:** a Windows per-machine install, a Linux system install, a one-row and a
+  two-row Mac: a fresh install whose person has not seen the tour, with the companion not
+  running. A remote session's consent start shows the question and no Welcome window; the
+  person's own start, the tray icon and the next sign-in then show the tour. The control is the
+  release before, where the tour opens together with the question.
+
 ## 11. Testing it
 
 - **Unit:** `cargo test -p roomler-desktop` (the Rust side), `cargo test -p roomler-localapi
@@ -1639,7 +1706,7 @@ dialog's **Approve**. Now the capture open's wait hook marks its session `asking
 dialog is the wait (`agents/roomlerd/src/peer.rs:5879`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1370`), and the banner comes up only for a session that sees the
-screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
+screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:343`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
 
@@ -1657,7 +1724,7 @@ also keeps a system install's Wayland capture opt-in.
 | Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:127`, `:416` |
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
-| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:380` |
+| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:382` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
 | Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:513` |
 
@@ -2040,8 +2107,8 @@ sequenceDiagram
 
 | Piece | Where | Why |
 |---|---|---|
-| the tray's half | `check_updates`, `src/tray.rs:588` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
-| the event and the flag | `tray_check_update_js`, `src/tray.rs:574` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
+| the tray's half | `check_updates`, `src/tray.rs:591` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
+| the event and the flag | `tray_check_update_js`, `src/tray.rs:577` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
 | one check | `runUpdateCheck`, `src/front/overview.js:184` | the card's button and the tray share it: a stale "Install update" is hidden first, the button is disabled while it runs, and a failure lands in the card |
 | a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:173` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
 | into view | `scrollToUpdates`, `src/front/overview.js:214`; `revealUpdates`, `:234` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |

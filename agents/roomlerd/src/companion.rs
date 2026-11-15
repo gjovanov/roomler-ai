@@ -1843,7 +1843,7 @@ impl TraySteps {
 /// The Windows tray's start, blocking, on the start in flight's thread: its
 /// steps in the order the start has always taken them, each recorded in `at`
 /// as it begins. `Started` only when the process was created
-/// ([`started_outcome`]).
+/// ([`started_outcome`]). The companion is told it is for a prompt (#3887).
 #[cfg(target_os = "windows")]
 fn start_tray(
     steps: &TraySteps,
@@ -1862,16 +1862,16 @@ fn start_tray(
         // about which of the two happened.
         return Ok(EnsureOutcome::Unsupported);
     };
-    // A SYSTEM daemon has no desktop of its own — the companion has to be
-    // launched INTO the interactive session, which is exactly what the
-    // update-respawn path already does.
+    // A SYSTEM daemon has no desktop of its own: the companion is launched INTO the interactive
+    // session, as the update respawn does. #3887: for a prompt, so the tour waits for the person.
+    let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG];
     step(TrayStep::Context);
     let ctx = (steps.context)();
     step(match ctx {
         RespawnContext::SystemService => TrayStep::StartInSession,
         RespawnContext::UserSession => TrayStep::StartHere,
     });
-    started_outcome((steps.start)(ctx, &dest, &[])).map_err(|e| format!("{e:#}"))
+    started_outcome((steps.start)(ctx, &dest, &args)).map_err(|e| format!("{e:#}"))
 }
 
 /// The tray beside this daemon, when it is installed there.
@@ -2259,7 +2259,7 @@ impl TraySteps {
 
 /// The Linux tray's start, blocking, on the start in flight's thread: its
 /// steps in the order the start has always taken them, each recorded in `at`
-/// as it begins. `Started` only when systemd-run exited 0.
+/// as it begins. `Started` only when systemd-run exited 0. For a prompt (#3887).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn start_tray(
     steps: &TraySteps,
@@ -2288,9 +2288,9 @@ fn start_tray(
     if (steps.running)(sess.uid) {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
-    // #2713 — a root daemon's system unit carries the desktop session's own
-    // environment ([`systemd_run_command`]); a per-user daemon's `--user`
-    // unit inherits its manager's.
+    let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG]; // #3887: for a prompt
+    // #2713 — a root daemon's system unit carries the desktop session's own environment
+    // ([`systemd_run_command`]); a per-user daemon's `--user` unit inherits its manager's.
     let session_env = if steps.user_manager {
         Vec::new()
     } else {
@@ -2299,7 +2299,7 @@ fn start_tray(
             .map(|text| session_env_pairs(&text))
             .unwrap_or_default()
     };
-    let cmd = systemd_run_command_with(&sess, &path, &[], steps.user_manager, &session_env);
+    let cmd = systemd_run_command_with(&sess, &path, &args, steps.user_manager, &session_env);
     step(TrayStep::SystemdRun);
     let out = (steps.systemd_run)(cmd).map_err(|e| format!("spawning systemd-run: {e}"))?;
     if !out.status.success() {
@@ -3035,13 +3035,11 @@ mod tray_start_tests {
         assert!(!ind.notification_is_up("g7"), "nothing is up for it");
     }
 
-    /// The control on Linux: a start whose steps answer in time does what it
-    /// always did. A root daemon starts the tray through the system manager
-    /// as the person, with the session's allowlisted environment; a per-user
-    /// daemon through its own manager, without reading it. A tray already
-    /// running, no companion installed, nobody at the screen and a failed
-    /// systemd-run answer as before, and only a systemd-run that exited 0 is
-    /// `Started`.
+    /// The control on Linux: a start in time does what it always did, and says it is for a
+    /// prompt (`--for-prompt`, #3887). A root daemon starts the tray through the system manager
+    /// as the person, with the session's allowlisted environment; a per-user daemon through its
+    /// own manager, without reading it. A running tray, no companion, nobody at the screen and a
+    /// failed systemd-run answer as before; only a systemd-run that exited 0 is `Started`.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_start_in_time_works_as_today() {
@@ -3069,6 +3067,7 @@ mod tray_start_tests {
                 "--setenv=DISPLAY=:0",
                 "--setenv=XDG_CURRENT_DESKTOP=GNOME",
                 COMPANION,
+                "--for-prompt",
             ])],
             "a root daemon: the system manager, as the person, with the allowlisted environment"
         );
@@ -3097,6 +3096,7 @@ mod tray_start_tests {
                 "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
                 "--setenv=DISPLAY=:0",
                 COMPANION,
+                "--for-prompt",
             ])],
             "a per-user daemon: its own manager"
         );
@@ -3160,7 +3160,7 @@ mod tray_start_tests {
     /// it always did. A SYSTEM service starts the tray into the console
     /// session as its person, and a daemon that runs as the person a plain
     /// start in its own session, each from the companion beside the daemon
-    /// with no arguments. A tray already running, no companion installed, a
+    /// with `--for-prompt` (#3887). A tray already running, no companion, a
     /// daemon that cannot find itself, nobody signed in and a refused start
     /// answer as before, and only a start that created the process is
     /// `Started` (#3824).
@@ -3180,8 +3180,8 @@ mod tray_start_tests {
         assert_eq!(ask(steps(None, &held, &ran)), Ok(EnsureOutcome::Started));
         assert_eq!(
             ran.argvs(),
-            vec![call(&["SystemService", DEST])],
-            "a SYSTEM service: into the console session, the companion beside it, no arguments"
+            vec![call(&["SystemService", DEST, "--for-prompt"])],
+            "a SYSTEM service: into the console session, the companion beside it, for a prompt"
         );
 
         let ran = Ran::default();
@@ -3190,8 +3190,8 @@ mod tray_start_tests {
         assert_eq!(ask(own), Ok(EnsureOutcome::Started));
         assert_eq!(
             ran.argvs(),
-            vec![call(&["UserSession", DEST])],
-            "the person's own daemon: a plain start in its own session"
+            vec![call(&["UserSession", DEST, "--for-prompt"])],
+            "the person's own daemon: a plain start in its own session, for a prompt"
         );
 
         let ran = Ran::default();
