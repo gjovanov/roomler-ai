@@ -1531,10 +1531,13 @@ pub fn open_default(
         #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
         {
             if preference == EncoderPreference::Hardware {
+                // #3652 — what this OS and build lack, with rebuild advice
+                // only where a rebuild could add Media Foundation.
+                let why = NoMf::here().map_or("", NoMf::why);
                 tracing::warn!(
-                    "Hardware encoder requested but this build has no HW backend \
-                     compiled in (rebuild with --features mf-encoder on Windows); \
-                     falling back to software"
+                    "Hardware encoder requested, and the RTP track's H.264 has no hardware \
+                     encoder here ({why}): falling back to software. Hardware H.264 is the \
+                     DataChannel's, through FFmpeg"
                 );
             }
             // On Auto with no mf-encoder feature, fall through silently —
@@ -1676,6 +1679,44 @@ fn open_named_mf(
     }
 }
 
+/// #3652 — why Media Foundation was not there to try, for an opener's
+/// warning, by what this OS and build lack: only a Windows build can be
+/// rebuilt with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(all(target_os = "windows", feature = "mf-encoder"), allow(dead_code))]
+enum NoMf {
+    /// A Windows build without `mf-encoder`.
+    NotCompiled,
+    /// Linux or macOS.
+    OffWindows,
+}
+
+#[cfg_attr(all(target_os = "windows", feature = "mf-encoder"), allow(dead_code))]
+impl NoMf {
+    fn from_reach(reach: bench::Reach) -> Option<Self> {
+        match reach {
+            bench::Reach::InBuild => None,
+            bench::Reach::NotCompiled => Some(Self::NotCompiled),
+            // `WindowsOnly`: nothing switches Media Foundation off.
+            _ => Some(Self::OffWindows),
+        }
+    }
+
+    /// This OS and build's, or `None` with Media Foundation compiled in.
+    fn here() -> Option<Self> {
+        Self::from_reach(bench::BuildCaps::this_build().reach(bench::Backend::MediaFoundation))
+    }
+
+    fn why(self) -> &'static str {
+        match self {
+            Self::NotCompiled => {
+                "this Windows build has no Media Foundation (rebuild with --features mf-encoder)"
+            }
+            Self::OffWindows => "Media Foundation is Windows only",
+        }
+    }
+}
+
 /// #3245 — could [`open_for_codec`] open `codec` on this host, by the cells the
 /// probe opened? Beside the opener because it states what the opener knows, and
 /// `AgentCaps.codecs` cannot say that: it lists AV1 for an FFmpeg cell the opener
@@ -1783,8 +1824,10 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
     #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
     {
         let _ = (width, height);
+        let why = NoMf::here().map_or("", NoMf::why);
         tracing::warn!(
-            "AV1 requested but this build has no MF AV1 backend — session will have no video until reconnect with a lower Quality preference."
+            "AV1 requested on the RTP track, whose only AV1 encoder is Media Foundation's, and \
+             {why}: the session will have no video until reconnect with a lower Quality preference"
         );
         (Box::new(NoopEncoder), "av1")
     }
@@ -1792,11 +1835,10 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
 
 /// HEVC opener — same fail-closed semantics as `open_for_codec_av1`.
 ///
-/// rc.72: when `ROOMLERD_USE_FFMPEG=1` is set AND the
-/// `ffmpeg-encoder` feature is compiled in, try the FFmpeg backend first
-/// (`hevc_nvenc` → `hevc_qsv` → `hevc_amf`). Falls through to MF on
-/// FFmpeg construction failure so a misconfigured opt-in doesn't break
-/// existing sessions. Unset = MF default (preserves rc.71 behaviour).
+/// FFmpeg's HEVC cascade first wherever it is compiled in and on
+/// (`ffmpeg::available()`: on unless `ROOMLERD_USE_FFMPEG=0`, since rc.107),
+/// then Media Foundation's on Windows. No build has a software HEVC encoder,
+/// so with neither it fails closed to a `NoopEncoder`.
 fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'static str) {
     #[cfg(feature = "ffmpeg-encoder")]
     {
@@ -1811,12 +1853,13 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
                     );
                     return (Box::new(e), "h265");
                 }
-                Err(err) => {
-                    tracing::warn!(
+                Err(err) => match NoMf::here() {
+                    None => tracing::warn!(
                         %err,
-                        "ROOMLERD_USE_FFMPEG=1 but ffmpeg HEVC construction failed; falling back to MF cascade"
-                    );
-                }
+                        "ffmpeg HEVC cascade did not open; trying Media Foundation's HEVC"
+                    ),
+                    Some(_) => tracing::warn!(%err, "ffmpeg HEVC cascade did not open"),
+                },
             }
         }
     }
@@ -1840,8 +1883,15 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
     #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
     {
         let _ = (width, height);
+        let ffmpeg_state = match bench::BuildCaps::this_build().reach(bench::Backend::Ffmpeg) {
+            bench::Reach::InBuild => "FFmpeg's HEVC cascade did not open",
+            bench::Reach::SwitchedOff => "FFmpeg is switched off (ROOMLERD_USE_FFMPEG=0)",
+            _ => "this build has no FFmpeg",
+        };
+        let why = NoMf::here().map_or("", NoMf::why);
         tracing::warn!(
-            "HEVC requested but this build has no MF HEVC backend — session will have no video until reconnect with a lower Quality preference."
+            "HEVC requested, and no HEVC encoder opened: {ffmpeg_state}, and {why}. The \
+             session will have no video until reconnect with a lower Quality preference"
         );
         (Box::new(NoopEncoder), "h265")
     }
@@ -1877,6 +1927,31 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3652 — an opener's warning names what this OS and build lack, and
+    /// advises a rebuild only on Windows, the one OS a rebuild can add Media
+    /// Foundation to.
+    #[test]
+    fn the_no_media_foundation_warning_follows_the_os_and_build() {
+        use bench::Reach;
+        assert_eq!(NoMf::from_reach(Reach::InBuild), None);
+        assert_eq!(
+            NoMf::from_reach(Reach::NotCompiled),
+            Some(NoMf::NotCompiled)
+        );
+        assert_eq!(
+            NoMf::from_reach(Reach::WindowsOnly),
+            Some(NoMf::OffWindows)
+        );
+        let here = if cfg!(all(target_os = "windows", feature = "mf-encoder")) {
+            None
+        } else if cfg!(target_os = "windows") {
+            Some(NoMf::NotCompiled)
+        } else {
+            Some(NoMf::OffWindows)
+        };
+        assert_eq!(NoMf::here(), here);
+    }
 
     /// FR-62 AC5 — with `encoder_inplace_rate` OFF an in-place move writes
     /// the pre-A1 1× window, whatever the session opened with; ON writes the
