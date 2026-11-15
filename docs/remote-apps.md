@@ -136,7 +136,7 @@ Four rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:314`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:3171`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:3760`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -513,7 +513,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3559`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3561`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.
