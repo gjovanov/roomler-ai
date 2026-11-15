@@ -2594,7 +2594,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3294`](../crates/localapi/src/lib.rs#L3294), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3379`](../crates/localapi/src/lib.rs#L3379), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -2796,7 +2796,11 @@ same arm of the agent's signalling loop (`kill_rx`, `agents/roomlerd/src/signali
 and that arm's job is to make the ending **final and attributed**: the viewer
 is told who ended it and does not come back on its own. Since FR-101 P4b-2 the
 same arm also ends a session that sat idle past its limit (`idle_rx`, §11.6),
-the same way and under its own reason (`DeviceEnd`).
+the same way and under its own reason (`DeviceEnd`). The banner's Disconnect
+reaches it over the LocalAPI (`RcDisconnect`), which takes it, as it takes a
+consent answer, only from the person at the screen the daemon shows, SYSTEM
+or an elevated administrator (`docs/desktop-companion.md` §12.4). The badge's
+is the daemon's own and never crosses the pipe.
 
 ```mermaid
 sequenceDiagram
