@@ -5990,9 +5990,9 @@ pub struct SessionVideo {
     /// what the encoder made against what reached the screen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frames_painted: Option<u64>,
-    /// FR-135 R0 (N11) — the viewer's freezes: two painted frames more than
-    /// 200 ms apart, counted by its decode worker, which restarts its clock at
-    /// a capture hold the agent announces (`rc:media-waiting`).
+    /// FR-135 R0 (N11) — the viewer's freezes, counted by its decode worker: paint
+    /// gaps more than 200 ms longer than the host's own longest framing pause in
+    /// them (#3875, `ui/src/workers/rc-freeze.ts`); before #3875, every gap over 200 ms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freezes: Option<u32>,
 }

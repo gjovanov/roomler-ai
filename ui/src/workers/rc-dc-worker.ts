@@ -999,6 +999,9 @@ function consumeBytes(bytes: Uint8Array): void {
           assembler.headerHave = 0
           continue
         }
+        // FR-135 N11 (#3875) — the host framed this frame at `ts_us`, whether
+        // the gate, the backlog shed or the decoder then takes it.
+        mediaWindow.onFramed(Number(ts_us))
         assembler.payloadBuf = new Uint8Array(size)
         assembler.payloadHave = 0
         assembler.pendingPayloadSize = size

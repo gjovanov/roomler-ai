@@ -1745,7 +1745,9 @@ pub enum Request {
     /// processes at the first server hello, and a control-surface poll must
     /// not be what launches vendor driver code. Before that first hello the
     /// answer is `not_probed`; a build without encoders answers
-    /// `unsupported`. Returns [`Response::EncoderCaps`].
+    /// `unsupported`. Returns [`Response::EncoderCaps`]. The person-at-the-device
+    /// socket serves it too (#3831, [`person_may`]); a daemon older than that
+    /// refuses it there.
     EncoderCaps,
 }
 
@@ -3115,8 +3117,9 @@ pub enum Scope {
     /// The person-at-the-device socket of a Linux system install, and of a
     /// Mac's root half ([`serve_person_socket`]): only what that person needs
     /// to see who is viewing their screen, end it, answer a consent prompt,
-    /// record it, see the devices the machine's private network lets it see,
-    /// and set the keys that are that person's own call (#2871).
+    /// record it, see the devices the machine's private network lets it see
+    /// and what the device can encode (#3831), and set the keys that are that
+    /// person's own call (#2871).
     ///
     /// `owner_uid` is the person it was made for (#2871's review): the
     /// listener drops any connection whose kernel-read uid is neither theirs
@@ -3387,7 +3390,8 @@ fn console_key_refusal(key: &str) -> Response {
 /// adds recording that person's own screen, and #2871 (design A) the
 /// configuration: the listing, read-only but for the keys that are the
 /// console person's call, and `ConfigSet` of exactly those
-/// ([`person_socket_admits_key`]).
+/// ([`person_socket_admits_key`]). #3831 adds what this device can encode,
+/// the Overview's card, from the probe's cached summary.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -3436,7 +3440,19 @@ pub fn person_may(req: &Request) -> bool {
         // administrator's command — instead of another daemon's file. Every
         // key the person socket does not serve a `ConfigSet` of is marked
         // `read_only` on the way out (`person_view`).
-        | Request::ConfigGet => true,
+        | Request::ConfigGet
+        // #3831 — what this device can encode: the Overview's "Hardware video
+        // encoding" card, which read Error on every Linux system install
+        // while this socket refused it. It can go here because the answer is
+        // read-only and cached: `handle` asks `LocalApiState::encoder_caps`,
+        // which the daemon answers with `caps::summarize_cached`, a
+        // `OnceLock::get` and lock reads of what the probe already found plus
+        // the denylist from its env and config. That never starts a probe or
+        // runs vendor driver code (`not_probed_never_triggers_a_probe` pins
+        // it), and it changes nothing on the host. The denylist and the
+        // preference it reports are on the configuration listing above
+        // already, and Windows serves the verb to every interactive user.
+        | Request::EncoderCaps => true,
         // #2871 (design A) — and `ConfigSet` of exactly the keys that are the
         // console person's call (`CONSOLE_PERSON_KEYS`): where their incoming
         // files land, whether a controller may record their screen, what a
@@ -3471,8 +3487,7 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::RestartDaemon { .. }
-        | Request::EncoderCaps => false,
+        | Request::RestartDaemon { .. } => false,
     }
 }
 
@@ -3520,10 +3535,10 @@ fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
                   viewing this screen, ends it, answers consent prompts, records this screen, \
-                  lists the devices this machine's private network reaches and its links to \
-                  them, and shows this device's settings, changing only the ones that are the \
-                  person at the device's own call. Everything else goes to the daemon's own \
-                  socket — run `sudo roomler …`"
+                  lists the devices this machine's private network reaches, its links to them \
+                  and what this device can encode, and shows this device's settings, changing \
+                  only the ones that are the person at the device's own call. Everything else \
+                  goes to the daemon's own socket — run `sudo roomler …`"
             .into(),
     }
 }
@@ -8692,6 +8707,9 @@ mod tests {
             r#"{"t":"config_set","d":{"key":"rc_audio","value":"false"}}"#,
             r#"{"t":"config_set","d":{"key":"external_access_enabled","value":"false"}}"#,
             r#"{"t":"config_set","d":{"key":"external_consent_mode","value":"ask"}}"#,
+            // #3831 — what this device can encode, the Overview's card: the
+            // probe's cached summary, read-only, never a probe.
+            r#"{"t":"encoder_caps"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -8755,7 +8773,6 @@ mod tests {
                 value: None,
             },
             Request::ConfigCleanupStale,
-            Request::EncoderCaps,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
@@ -8862,6 +8879,82 @@ mod tests {
             }
             other => panic!("expected Peers on the full socket, got {other:?}"),
         }
+    }
+
+    /// #3831 — a daemon whose probe has answered: [`Mock`]'s answers, with the
+    /// summary its cache holds.
+    struct Encodes;
+    #[async_trait]
+    impl LocalApiState for Encodes {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn encoder_caps(&self) -> Option<EncoderCapsSummary> {
+            Some(EncoderCapsSummary {
+                state: "ready".into(),
+                cells: vec![EncoderCell {
+                    codec: "h264".into(),
+                    backend: "vaapi".into(),
+                    chroma: vec!["yuv420".into()],
+                    hardware: true,
+                }],
+                hw_encoders: vec!["ffmpeg-h264_vaapi".into()],
+                codecs: vec!["h264".into()],
+                probe_ms: Some(640),
+                probe_cached: true,
+                denied: vec!["hevc_vaapi:yuv444".into()],
+                encoder_preference: Some("auto".into()),
+            })
+        }
+    }
+
+    /// #3831 — on a Linux system install the companion runs as the person and
+    /// reaches the root daemon over its person socket, where its encoding card
+    /// read `Error`: the socket refused `encoder_caps`. The answer is the
+    /// probe's cached summary and nothing else, so the person socket now
+    /// serves it whole, to its person and to root, exactly as the daemon's own
+    /// socket does; a verb outside the list is still refused with the `sudo`
+    /// text.
+    #[tokio::test]
+    async fn the_person_socket_serves_the_cached_encoder_summary() {
+        let want = Response::EncoderCaps(Encodes.encoder_caps().unwrap());
+        let person = ClientPeer {
+            uid: Some(501),
+            ..ClientPeer::UNKNOWN
+        };
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ClientPeer::UNKNOWN
+        };
+        for peer in [person.clone(), root] {
+            let r =
+                ask_state_scoped_as(Encodes, SEAT, peer.clone(), r#"{"t":"encoder_caps"}"#).await;
+            assert!(
+                !is_person_refusal(&r),
+                "refused on the person socket: {r:?}"
+            );
+            assert_eq!(r, want, "the cached summary, whole, as {peer:?}");
+        }
+        let full = ask_state_scoped_as(
+            Encodes,
+            Scope::Full,
+            ClientPeer::UNKNOWN,
+            r#"{"t":"encoder_caps"}"#,
+        )
+        .await;
+        assert_eq!(full, want, "the daemon's own socket answers the same");
+        let r = ask_state_scoped_as(Encodes, SEAT, person, r#"{"t":"route_list"}"#).await;
+        assert!(is_person_refusal(&r), "{r:?}");
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("sudo roomler")),
+            "{r:?}"
+        );
     }
 
     /// #2871 — the console person's keys are ONE table, and that table is the

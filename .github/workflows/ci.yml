@@ -1549,13 +1549,15 @@ jobs:
       #      outlives a clone's drop. Until #3813 the gate's test had its own
       #      variable, ROOMLERD_TEST_MAC_PASTEBOARD, and the round trip ran in
       #      no Mac step.
+      # #3876 — one test at a time. A skip line is written in pieces; on several
+      # threads another test's line can land between them, and grep misses it.
       - name: The real clipboard on a Mac — untouched without the opt-in, its tests run with it (#3813)
         run: |
           set -euo pipefail
           SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           printf %s "$SENTINEL" | pbcopy
           [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::the pasteboard did not take the sentinel"; exit 1; }
-          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture 2>&1 | tee /tmp/clip-plain.log
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture --test-threads=1 2>&1 | tee /tmp/clip-plain.log
           [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::a test replaced the pasteboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping mac_real_the_gate_counts_a_copy" /tmp/clip-plain.log
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
@@ -1564,11 +1566,11 @@ jobs:
           grep -q "real-clipboard: the round trip ran and outlived a clone's drop" /tmp/clip-real.log
 
       # #3757 — a Mac's root daemon declines the `files` channel of a session
-      # no GUI worker serves; every other process serves it as before. In the
-      # step above's test build: the module (and the root half's hello still
-      # offering file transfer) as the runner's user, then the same binary
-      # under sudo, where the Mac's own euid 0 declines. The step fails unless
-      # the root test ran and passed (ROOMLERD_TEST_REQUIRE_ROOT: no skip).
+      # no GUI worker serves; every other process serves it. In the step above's
+      # build: the module (and the root half's hello still offering file
+      # transfer) as the runner's user, then under sudo, where euid 0 declines:
+      # the root test must run and pass (ROOMLERD_TEST_REQUIRE_ROOT: no skip).
+      # #3876 — one test at a time, or another test's output can split `... ok`.
       - name: cargo test the files channel on a Mac's root daemon (#3757)
         run: |
           set -eu
@@ -1577,7 +1579,7 @@ jobs:
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/files3757.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           RC=0
-          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture > /tmp/files3757-root.log 2>&1 || RC=$?
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture --test-threads=1 > /tmp/files3757-root.log 2>&1 || RC=$?
           cat /tmp/files3757-root.log
           if [ "$RC" != 0 ]; then echo "::error::the files channel tests failed under sudo (exit $RC)"; exit 1; fi
           grep -q 'as_root::a_root_process_on_a_mac_declines_the_files_channel \.\.\. ok' /tmp/files3757-root.log \
@@ -1983,6 +1985,8 @@ jobs:
       #      skipping. A clipboard that does not open is then a failure.
       # Before #3813 no Windows step built `clipboard`, so the round trip ran
       # on Windows only on developers' own machines.
+      # #3876 — one test at a time. A skip line is written in pieces; on several
+      # threads another test's line can land between them, and grep misses it.
       - name: The real clipboard on Windows — untouched without the opt-in, its test runs with it (#3813)
         timeout-minutes: 20
         run: |
@@ -1991,7 +1995,7 @@ jobs:
           holds() { [ "$(pwsh -NoProfile -Command Get-Clipboard | tr -d '\r')" = "$SENTINEL" ]; }
           pwsh -NoProfile -Command "Set-Clipboard -Value '$SENTINEL'"
           holds || { echo "::error::this runner's clipboard did not take the sentinel"; exit 1; }
-          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features "$F" -- clipboard:: --nocapture 2>&1 | tee "$RUNNER_TEMP/clip-plain.log"
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features "$F" -- clipboard:: --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-plain.log"
           holds || { echo "::error::a test replaced the clipboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" "$RUNNER_TEMP/clip-plain.log"
           ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --lib --features "$F" -- clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-real.log"
