@@ -1088,7 +1088,7 @@ impl Folder {
         match self.keeping {
             Keeping::Plain(why) => Ok(Mode::Plain(why)),
             #[cfg(windows)]
-            Keeping::Sealed => Ok(Mode::Plain(Plain::MachineFolder)), // RED: not wired yet
+            Keeping::Sealed => sealed::ensure(&self.base),
             #[cfg(not(windows))]
             Keeping::Sealed => Ok(Mode::Plain(Plain::NotWindows)),
         }
@@ -1341,7 +1341,20 @@ mod sealed {
     /// time>`. Nothing is deleted. Nothing changes, and nothing is said, when
     /// everything already has the seal.
     pub(super) fn seal(base_path: &Path) -> Result<HeldPath, Failure> {
-        let base = HeldPath::base(base_path).map_err(|r| Failure::Unsealable(r.to_string()))?;
+        // The config's folder, made as before when it is not there yet: the
+        // plain writer made it the same way.
+        if !base_path.exists() {
+            std::fs::create_dir_all(base_path)
+                .map_err(|e| Failure::Failed(format!("making {}: {e}", base_path.display())))?;
+        }
+        let base = HeldPath::base(base_path).map_err(|r| match r.why {
+            // Reached through a link, on a share, or not a folder: no seal
+            // made here could hold.
+            Why::Elsewhere { .. } | Why::Link | Why::NotFolder => {
+                Failure::Unsealable(r.to_string())
+            }
+            _ => Failure::Failed(r.to_string()),
+        })?;
         let dir = base_path.join(DIR_NAME);
         let found = match base.open_dir(DIR_NAME) {
             Ok(None) => AsFound::Absent,
@@ -2587,6 +2600,7 @@ mod tests {
                 let (browser, user) = (browser(), ObjectId::new());
                 let pins_file = pins_path(&cfg, TENANT_A).unwrap();
                 std::fs::write(&pins_file, pins_listing(&browser, user)).unwrap();
+                assert!(ts::icacls(&pins_file, &["/setowner", "*S-1-5-32-544"]));
                 assert!(ts::icacls(
                     &pins_file,
                     &["/grant", &format!("{GUESTS}:(M)")]
@@ -2638,6 +2652,7 @@ mod tests {
                 let bytes = std::fs::read(key_path(&config_in(&other), TENANT_B).unwrap()).unwrap();
                 let key_file = key_path(&cfg, TENANT_B).unwrap();
                 std::fs::write(&key_file, &bytes).unwrap();
+                assert!(ts::icacls(&key_file, &["/setowner", "*S-1-5-32-544"]));
                 assert!(ts::icacls(&key_file, &["/grant", &format!("{GUESTS}:(M)")]));
                 let (keys, said) =
                     logged(|| (hello_key(&cfg, TENANT_B), hello_key(&cfg, TENANT_B)));
