@@ -34,8 +34,8 @@ timeout; the command lives exactly as long as the channel does. Everything that 
 
 | What | Where | Why it blocks streaming |
 |---|---|---|
-| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:2016` `run_exec` → `:2062-2063` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:2069-2071` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
-| The whole output is sent after the run, then the ceiling notice | `ssh.rs:1979-1986`, `:1990-2002` | nothing reaches the channel while the command runs |
+| The SSH exec handler hands the command to the Fleet-RPC engine with the engine's maxima | `agents/roomlerd/src/ssh.rs:2020` `run_exec` → `:2066-2067` (`timeout_ms: MAX_TIMEOUT_MS`, `max_output_bytes: MAX_OUTPUT_BYTES`) → `:2073-2075` `run_fed` | the engine returns ONE `ExecOutcome` when the process is gone |
+| The whole output is sent after the run, then the ceiling notice | `ssh.rs:1983-1990`, `:1994-2006` | nothing reaches the channel while the command runs |
 | The engine re-clamps timeout and ceiling, takes the permit, registers cancel | `agents/roomlerd/src/exec.rs:1135` `run_fed`, `:1148-1149` | the clamps are for a wire the server bounded; SSH never needed them |
 | Both pipes are drained into a `Vec` against ONE shared budget | `exec.rs:1272-1276`, `read_capped` `:1367` | the reader stops at the budget; past it the child dies of SIGPIPE / `ERROR_NO_DATA` |
 | The process waits in a `select!` over `wait` / `sleep(timeout)` / `cancel` | `exec.rs:1281-1294` | a fixed wall clock kills a long transfer |

@@ -3234,30 +3234,30 @@ pub trait LocalApiState: Send + Sync {
     }
 }
 
-/// FR-85 — the refusal a non-console caller gets for a recording verb.
+/// FR-85 — a recording verb's refusal, which names the screen's person (#3907).
 fn not_the_console_user() -> Response {
     Response::Error {
-        message: "only the person at this device's console can start, stop or delete a \
+        message: "only the person at this device's screen can start, stop or delete a \
                   recording, or change where recordings are saved"
             .into(),
     }
 }
 
-/// FR-52 — the answer to anyone but the person at the console who tries to
-/// open this device to people outside its organization, or change how.
+/// FR-52 — the answer to anyone but the person at this device's screen who
+/// tries to open it to people outside its organization, or change how.
 fn not_the_console_user_for_external_access() -> Response {
     Response::Error {
-        message: "only the person at this device's console can open it to people outside \
+        message: "only the person at this device's screen can open it to people outside \
                   the organization, or change how"
             .into(),
     }
 }
 
 /// FR-92 P10 — the answer to a keep-busy start from anyone but the person at
-/// the console.
+/// this device's screen.
 fn not_the_person_for_keep_busy() -> Response {
     Response::Error {
-        message: "only the person at this device's console can turn keep busy on here — \
+        message: "only the person at this device's screen can turn keep busy on here — \
                   not root or SYSTEM, not a background service, not another session \
                   (anyone may stop it)"
             .into(),
@@ -3372,7 +3372,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Prefix("record_"),
         fr: "FR-85",
-        refusal: "only the person at this device's console can start, stop or delete a \
+        refusal: "only the person at this device's screen can start, stop or delete a \
                   recording, or change where recordings are saved",
         person_socket: &["record_remote_enabled", "record_remote_audio"],
         why_not_person_socket: "`record_dir` is where every recording on the device is saved: on \
@@ -3387,7 +3387,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("files_dir"),
         fr: "FR-84 D4",
-        refusal: "only the person at this device's console can change where incoming files \
+        refusal: "only the person at this device's screen can change where incoming files \
                   land",
         person_socket: &["files_dir"],
         why_not_person_socket: "",
@@ -3397,7 +3397,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("keep_busy_enabled"),
         fr: "FR-92",
-        refusal: "only the person at this device's console can change whether keep busy is \
+        refusal: "only the person at this device's screen can change whether keep busy is \
                   allowed here",
         person_socket: &["keep_busy_enabled"],
         why_not_person_socket: "",
@@ -3407,7 +3407,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("privacy_mode_allowed"),
         fr: "FR-99",
-        refusal: "only the person at this device's console can change whether privacy mode \
+        refusal: "only the person at this device's screen can change whether privacy mode \
                   is allowed here",
         person_socket: &["privacy_mode_allowed"],
         why_not_person_socket: "",
@@ -3417,7 +3417,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("lock_on_end"),
         fr: "FR-99 P3",
-        refusal: "only the person at this device's console can change whether this computer \
+        refusal: "only the person at this device's screen can change whether this computer \
                   locks when a remote session ends",
         person_socket: &["lock_on_end"],
         why_not_person_socket: "",
@@ -3428,7 +3428,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("display_match"),
         fr: "FR-108",
-        refusal: "only the person at this device's console can change whether a remote \
+        refusal: "only the person at this device's screen can change whether a remote \
                   session may switch this display",
         person_socket: &["display_match"],
         why_not_person_socket: "",
@@ -3439,7 +3439,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("peer_auth"),
         fr: "FR-100 P1c",
-        refusal: "only the person at this device's console can change whether this device \
+        refusal: "only the person at this device's screen can change whether this device \
                   checks the browsers that connect to it",
         person_socket: &["peer_auth"],
         why_not_person_socket: "",
@@ -3449,7 +3449,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("rc_clipboard"),
         fr: "FR-101 P2b",
-        refusal: "only the person at this device's console can change what a remote session \
+        refusal: "only the person at this device's screen can change what a remote session \
                   may use here (clipboard, files, audio)",
         person_socket: &["rc_clipboard"],
         why_not_person_socket: "",
@@ -3457,7 +3457,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("rc_files"),
         fr: "FR-101 P2b",
-        refusal: "only the person at this device's console can change what a remote session \
+        refusal: "only the person at this device's screen can change what a remote session \
                   may use here (clipboard, files, audio)",
         person_socket: &["rc_files"],
         why_not_person_socket: "",
@@ -3465,7 +3465,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("rc_audio"),
         fr: "FR-101 P2b",
-        refusal: "only the person at this device's console can change what a remote session \
+        refusal: "only the person at this device's screen can change what a remote session \
                   may use here (clipboard, files, audio)",
         person_socket: &["rc_audio"],
         why_not_person_socket: "",
@@ -3479,7 +3479,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("allow_plaintext_server"),
         fr: "FR-101 P1b",
-        refusal: "only the person at this device's console can let it reach its server \
+        refusal: "only the person at this device's screen can let it reach its server \
                   without TLS",
         person_socket: &[],
         why_not_person_socket: "the device's server link, not the person's screen or session: \
@@ -3494,7 +3494,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Prefix("external_"),
         fr: "FR-52",
-        refusal: "only the person at this device's console can open it to people outside \
+        refusal: "only the person at this device's screen can open it to people outside \
                   the organization, or change how",
         person_socket: &[
             "external_access_enabled",
@@ -8982,6 +8982,148 @@ mod tests {
         );
     }
 
+    /// #3907 — `line` from the person at the CONSOLE of a per-user daemon in
+    /// RDP session 3: since #3903 the console person's gates take the person
+    /// at the screen the daemon shows, session 3's, and refuse this one. The
+    /// refusal, which must not reach the daemon.
+    async fn refused_at_the_console_of_an_rdp_daemon(line: &str) -> String {
+        let _pinned = PinnedSessions::own_and_console(Some(3), Some(1));
+        let state = TakesTheVerbs::default();
+        let r = ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(1), line).await;
+        assert_eq!(state.reached(), 0, "{line} reached the daemon: {r:?}");
+        match r {
+            Response::Error { message } => message,
+            other => panic!("{line} was not refused: {other:?}"),
+        }
+    }
+
+    /// #3907 — the recording verbs' refusal names the person at this device's
+    /// screen, whom the gate takes, and never the console, whose person it
+    /// refuses here.
+    #[tokio::test]
+    async fn a_recording_verbs_refusal_names_the_person_at_the_screen() {
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"a.mp4"}}"#,
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can start, stop or delete a recording, \
+                 or change where recordings are saved",
+                "{line}"
+            );
+        }
+    }
+
+    /// #3907 — keep busy on: its refusal names the person at this device's
+    /// screen.
+    #[tokio::test]
+    async fn a_keep_busy_starts_refusal_names_the_person_at_the_screen() {
+        assert_eq!(
+            refused_at_the_console_of_an_rdp_daemon(r#"{"t":"keep_busy_on","d":{}}"#).await,
+            "only the person at this device's screen can turn keep busy on here — not root or \
+             SYSTEM, not a background service, not another session (anyone may stop it)"
+        );
+    }
+
+    /// #3907 — the external-access password, set and clear: its refusal names
+    /// the person at this device's screen.
+    #[tokio::test]
+    async fn the_external_access_passwords_refusal_names_the_person_at_the_screen() {
+        // Built, never a literal: a scanner cannot tell a test password from a leak.
+        let set = format!(
+            r#"{{"t":"external_password_set","d":{{"password":"{}"}}}}"#,
+            "p".repeat(16)
+        );
+        for (verb, line) in [
+            ("external_password_set", set.as_str()),
+            (
+                "external_password_clear",
+                r#"{"t":"external_password_clear"}"#,
+            ),
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can open it to people outside the \
+                 organization, or change how",
+                "{verb}"
+            );
+        }
+    }
+
+    /// #3907 — a console person's `ConfigSet` key: every entry of
+    /// [`CONSOLE_PERSON_KEYS`] refuses in its own words, which name the person
+    /// at this device's screen.
+    #[tokio::test]
+    async fn a_console_persons_keys_refusal_names_the_person_at_the_screen() {
+        const RECORDING: &str = "only the person at this device's screen can start, stop or \
+                                 delete a recording, or change where recordings are saved";
+        const OUTSIDERS: &str = "only the person at this device's screen can open it to people \
+                                 outside the organization, or change how";
+        const SESSION_USE: &str = "only the person at this device's screen can change what a \
+                                   remote session may use here (clipboard, files, audio)";
+        let expected = [
+            ("record_dir", RECORDING),
+            ("record_remote_enabled", RECORDING),
+            ("record_remote_audio", RECORDING),
+            (
+                "files_dir",
+                "only the person at this device's screen can change where incoming files land",
+            ),
+            (
+                "keep_busy_enabled",
+                "only the person at this device's screen can change whether keep busy is \
+                 allowed here",
+            ),
+            (
+                "privacy_mode_allowed",
+                "only the person at this device's screen can change whether privacy mode is \
+                 allowed here",
+            ),
+            (
+                "lock_on_end",
+                "only the person at this device's screen can change whether this computer locks \
+                 when a remote session ends",
+            ),
+            (
+                "display_match",
+                "only the person at this device's screen can change whether a remote session \
+                 may switch this display",
+            ),
+            (
+                "peer_auth",
+                "only the person at this device's screen can change whether this device checks \
+                 the browsers that connect to it",
+            ),
+            ("rc_clipboard", SESSION_USE),
+            ("rc_files", SESSION_USE),
+            ("rc_audio", SESSION_USE),
+            (
+                "allow_plaintext_server",
+                "only the person at this device's screen can let it reach its server without TLS",
+            ),
+            ("external_access_enabled", OUTSIDERS),
+            ("external_consent_mode", OUTSIDERS),
+            ("external_max_permissions", OUTSIDERS),
+        ];
+        // Every entry of the table is asked, a new one included.
+        for k in CONSOLE_PERSON_KEYS {
+            assert!(
+                expected.iter().any(|(key, _)| k.keys.matches(key)),
+                "{k:?}: no key of it is asked here"
+            );
+        }
+        for (key, words) in expected {
+            let line = format!(r#"{{"t":"config_set","d":{{"key":"{key}","value":"false"}}}}"#);
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(&line).await,
+                words,
+                "{key}"
+            );
+        }
+    }
+
     /// The tray and the CLI as the pipe reads them: a client of this process,
     /// read from the OS at accept (its session, its account from its token),
     /// sets a console person's key, turns keep busy on and starts a recording
@@ -9362,8 +9504,12 @@ mod tests {
         serde_json::from_str(&r).unwrap()
     }
 
+    /// How every console person's gate refuses: it names the person at this
+    /// device's screen, whom the gate takes (#3907).
+    const AT_THE_SCREEN: &str = "only the person at this device's screen can ";
+
     fn is_console_refusal(r: &Response) -> bool {
-        matches!(r, Response::Error { message } if message.contains("console"))
+        matches!(r, Response::Error { message } if message.starts_with(AT_THE_SCREEN))
     }
 
     fn is_person_refusal(r: &Response) -> bool {
@@ -9737,8 +9883,8 @@ mod tests {
             assert_eq!(k.person_socket.contains(key), *on_person_socket, "{key}");
             assert_eq!(person_socket_admits_key(key), *on_person_socket, "{key}");
             assert!(
-                k.refusal.contains("console"),
-                "{key}'s refusal names the console person: {}",
+                k.refusal.starts_with(AT_THE_SCREEN),
+                "{key}'s refusal names the person at this device's screen: {}",
                 k.refusal
             );
             // A key kept off the person socket has its entry say why.
@@ -11225,7 +11371,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("incoming files")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("incoming files")),
                 "{line} → {r:?}"
             );
         }
@@ -11264,7 +11410,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("without TLS")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("without TLS")),
                 "{line} → {r:?}"
             );
         }
@@ -11301,7 +11447,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("locks")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("locks")),
                 "{line} → {r:?}"
             );
         }
@@ -11338,7 +11484,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("display")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("display")),
                 "{line} → {r:?}"
             );
         }
@@ -11375,7 +11521,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("browsers")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("browsers")),
                 "{line} → {r:?}"
             );
         }
@@ -11422,7 +11568,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("outside")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("outside")),
                 "{line} → {r:?}"
             );
         }
