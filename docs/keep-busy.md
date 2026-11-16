@@ -67,7 +67,7 @@ flowchart LR
 The engine is one std thread, `keep-busy`. It never touches the OS injector
 itself. It asks the input arbiter to read or move the pointer: the one injector,
 created lazily and cached, and opened again while it has no permission
-(`agents/roomlerd/src/input/arbiter.rs:1254` `keep_busy_op`; #2066).
+(`agents/roomlerd/src/input/arbiter.rs:1594` `keep_busy_op`; #2066).
 
 | Rule | Where |
 |---|---|
@@ -76,6 +76,25 @@ created lazily and cached, and opened again while it has no permission
 | Every injected controller event bumps a counter the engine reads, so remote activity is known exactly. A heartbeat or a denied event is not counted | `input/arbiter.rs` L805, `keep_busy::note_remote_input` |
 | Only a session holding **INPUT** may set it, and in exclusive mode only the floor holder | `input/arbiter.rs` `keep_busy_may_set`, L523 |
 | An injector with **no pixel space** (uinput, below the compositor) is moved by a **fraction of the desktop** instead (`KbOp::MoveNorm`), under the same held-button rule | `input/arbiter.rs` `keep_busy_op`; `uinput_backend.rs` `move_norm` |
+
+**On the daemon's virtual desktop, keep busy follows its X server** (#3918).
+Its moves go through the arbiter's one injector, so when the desktop's X
+server exits and comes back
+([`linux-capture.md` §2.4](linux-capture.md#24-what-an-x-server-exit-does-to-everything-that-was-open-3671-3918))
+they follow that injector to the new server with no daemon restart
+([`remote-control.md` §6.1c](remote-control.md#61c-the-injector-follows-the-virtual-desktop-3918)).
+While the desktop is down a tick fails quietly: keep busy's own X connection
+drops and is tried again every 5 s (`X11Host::conn`,
+`agents/roomlerd/src/keep_busy/host_x11.rs:323`; `RECONNECT_EVERY`, `:45`),
+both at `DEBUG`; the engine finds no session, so its state reads locked or no
+session, which is what the viewer and the tray show, and it asks the arbiter
+nothing. A move that reaches the arbiter before keep busy's connection noticed
+fails as a host error, which logs nothing. Once the new server answers, keep
+busy says `keep-busy: X display opened` once, at `INFO`, and the arbiter's own
+`INFO` for the reopened injector comes with the next move. Nothing above
+`DEBUG` repeats while the desktop is down. Keep busy is not a session, so the
+marks of §6.1c do not concern it; a session the restart left behind cannot
+switch it, and a button that session had down no longer holds its moves off.
 
 The state machine (`keep_busy/engine.rs`) is pure. A `Host` trait (L308)
 carries every OS fact, and the tests drive the engine with a scripted fake host

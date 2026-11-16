@@ -27,6 +27,10 @@ use tunnel_core::env::node_env;
 pub struct EnigoInjector {
     tx: std_mpsc::Sender<Job>,
     has_perm: bool,
+    /// #3918 — the virtual desktop generation whose X server this injector
+    /// connected to, when it is that desktop's (`x_follow::opened_under`).
+    #[cfg(target_os = "linux")]
+    x_generation: Option<u64>,
 }
 
 impl EnigoInjector {
@@ -52,6 +56,12 @@ impl EnigoInjector {
                 return Err(super::no_display::NoDisplayToOpen { kind, read }.into());
             }
         }
+        // #3918 — read BEFORE the connection: a server that comes back in
+        // between is then a newer generation than the one recorded, and the
+        // arbiter opens again for nothing, where the other order would keep
+        // a connection to a dead server as if it were the new one.
+        #[cfg(target_os = "linux")]
+        let x_generation = super::x_follow::opened_under();
         let (tx, rx) = std_mpsc::channel::<Job>();
         // Construct Enigo on the worker thread — we never want to move it
         // between threads. Use a ready-ack channel to surface init errors.
@@ -100,7 +110,12 @@ impl EnigoInjector {
         #[cfg(not(target_os = "macos"))]
         let has_perm = true;
 
-        Ok(Self { tx, has_perm })
+        Ok(Self {
+            tx,
+            has_perm,
+            #[cfg(target_os = "linux")]
+            x_generation,
+        })
     }
 }
 
@@ -113,6 +128,17 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
                 }
             }
             Job::Px(job) => run_px_job(&mut enigo, job),
+            #[cfg(target_os = "linux")]
+            Job::Gone => {
+                // #3918 — enigo's `Drop` releases every key it holds and
+                // unmaps every keycode it mapped, and on a dead connection
+                // each one fails with an ERROR of its own. They all went with
+                // the server: drop it with nothing listening on this thread.
+                // The arbiter has said why, once.
+                let quiet = tracing::Dispatch::none();
+                tracing::dispatcher::with_default(&quiet, move || drop(enigo));
+                return;
+            }
         }
     }
 }
@@ -718,6 +744,18 @@ impl InputInjector for EnigoInjector {
     fn buttons_held(&mut self) -> Result<bool> {
         super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Buttons(reply)))
     }
+
+    #[cfg(target_os = "linux")]
+    fn x_generation(&self) -> Option<u64> {
+        self.x_generation
+    }
+
+    #[cfg(target_os = "linux")]
+    fn server_gone(&mut self) {
+        // After every event queued before it; the arbiter drops this value
+        // next, and the thread ends on this job.
+        let _ = self.tx.send(Job::Gone);
+    }
 }
 
 /// What the input thread runs: a controller's event, or (FR-92) a
@@ -726,6 +764,9 @@ impl InputInjector for EnigoInjector {
 pub(super) enum Job {
     Input(InputMsg),
     Px(PxJob),
+    /// #3918 — the X server is gone: end the thread, asking it nothing.
+    #[cfg(target_os = "linux")]
+    Gone,
 }
 
 /// FR-92 — run one pixel-space job on the input thread. Shared with the

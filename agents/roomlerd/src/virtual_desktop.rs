@@ -304,6 +304,53 @@ pub fn down() -> Option<String> {
     }
 }
 
+/// #3671 — how many times this daemon's own virtual desktop came back on a new
+/// X server since it started: the X connection a part of the daemon made
+/// under one generation is dead in the next, although `DISPLAY` names the
+/// same display. The clipboard worker follows it (`clipboard::x11_follow`).
+/// `0` in a process that started no desktop, and off Linux.
+pub fn generation() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        desktop().map_or(0, |d| {
+            d.generation.load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// #3918 — this daemon's own virtual desktop as an X client of it must see it,
+/// in one read: the generation of the X server answering now ([`generation`])
+/// and, while it is down, which down period it is in. Read under the lock that
+/// publishes the desktop up, where a restart counts its generation
+/// (`Desktop::bring_up_again`): a desktop seen up is seen with its new
+/// server's generation. `None` in a process that started no desktop, and off
+/// Linux.
+pub fn x_server_now() -> Option<XServerNow> {
+    #[cfg(target_os = "linux")]
+    {
+        desktop().map(|desk| desk.x_server_now())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// What [`x_server_now`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XServerNow {
+    /// [`generation`].
+    pub generation: u64,
+    /// `Some(n)` while the desktop is down: the n-th time it went down since
+    /// the daemon started, `0` before its first server came up. `None` while
+    /// its X server answers.
+    pub down: Option<u64>,
+}
+
 /// [`down`] as the `detail` of a session opened meanwhile: what happened to
 /// the desktop, and that the agent is already starting it again, so the
 /// person reconnects instead of reporting a fault.
@@ -316,6 +363,134 @@ fn down_detail_of(why: &str) -> String {
         "this device's virtual desktop is down: {why}. The agent starts it again by itself; \
          reconnect in a moment"
     )
+}
+
+/// #3671 — the sessions told that the desktop went down: every one of
+/// `registered` (the live ones) when a session on this device captures the
+/// desktop (`plans`, [`crate::capture::plans_the_virtual_desktop`]), and none
+/// otherwise, since the viewer keeps the notice up until the person connects
+/// again. #3918 — who is MARKED reads no plan: every registered session, told
+/// or not ([`sessions_told`]).
+#[cfg(target_os = "linux")]
+fn sessions_to_tell(
+    plans: bool,
+    registered: Vec<(bson::oid::ObjectId, crate::sleep_notice::ControlDc)>,
+) -> Vec<(bson::oid::ObjectId, crate::sleep_notice::ControlDc)> {
+    if plans { registered } else { Vec::new() }
+}
+
+/// #3671 kill switch `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0`: an open
+/// session is not told that the desktop went down, as before #3671. It then
+/// shows its last picture until the person reconnects, and it has no input of
+/// the desktop either (#3918: the supervisor marks every session open at the
+/// exit before it reads this switch), as on master, where its injector was
+/// dead. This switch turns off the notice only; `ROOMLERD_INPUT_X11_FOLLOW=0`
+/// turns off what reads the marks (`input::x_follow::enabled`).
+#[cfg(target_os = "linux")]
+fn tell_sessions_enabled() -> bool {
+    tunnel_core::env::flag("VIRTUAL_DESKTOP_TELL_SESSIONS", true)
+}
+
+/// #3671 — what the supervisor calls when the desktop goes down: the open
+/// sessions that capture it get `rc:media-unavailable` with `backend_error`
+/// and the sentence a session opened meanwhile gets ([`down_detail_of`]),
+/// each through FR-80's notice. Who is told is read on the supervisor's own
+/// thread (cheap on a desktop host: both automatic plans answer at once), and
+/// the notices go out on the daemon's runtime, so the supervisor never waits.
+///
+/// #3918 — the rule: a session that has no picture of this desktop has no
+/// input of it either while its input would reach the desktop's X server.
+/// Every session registered at the exit was open at the exit, and any of them
+/// may have been reading the X server that is gone, so every one is marked
+/// (`input::mark_no_picture`) first, on this thread, before the device's plan
+/// and the kill switch are read and before anything is spawned: the marks
+/// stand before the restart can publish the desktop up. Where the plan is the
+/// desktop's, they are also told. Where an explicit `drm_capture` or
+/// `portal_capture` arm plans another capture, whose open may have fallen
+/// through to the desktop's X server (the tell's known miss,
+/// `capture::plans_the_virtual_desktop`), and with the switch, they are
+/// marked in silence. What a mark costs is decided where the session's input
+/// goes (`input::x_follow::Sessions`: nothing while a route or another
+/// injector carries it) and what its shared pipeline reads (`media_share`:
+/// a joiner is refused only while its capture may read an X server).
+#[cfg(target_os = "linux")]
+fn sessions_told(rt: tokio::runtime::Handle) -> DownTell {
+    sessions_told_via(
+        rt,
+        crate::capture::sessions_capture_the_virtual_desktop,
+        crate::peer::spawn_capture_unavailable_notice,
+    )
+}
+
+/// #3671 — how [`sessions_told`] tells one session: FR-80's notice
+/// (`peer::spawn_capture_unavailable_notice`), which spawns a task of its own
+/// on the runtime it runs in. A test passes a stand-in.
+#[cfg(target_os = "linux")]
+type Notice =
+    fn(bson::oid::ObjectId, crate::sleep_notice::ControlDc, crate::capture::CaptureUnavailable);
+
+/// [`sessions_told`] with the device rule (`plans`) and the notice given, so
+/// that a test drives the daemon's own hook from a thread in no runtime, as
+/// the supervisor's thread is.
+#[cfg(target_os = "linux")]
+fn sessions_told_via(rt: tokio::runtime::Handle, plans: fn() -> bool, notice: Notice) -> DownTell {
+    Box::new(move |why: &str| {
+        let registered = crate::sleep_notice::sessions();
+        for (session, _) in &registered {
+            crate::input::mark_no_picture(*session);
+        }
+        if !tell_sessions_enabled() {
+            return;
+        }
+        let sessions = sessions_to_tell(plans(), registered);
+        if sessions.is_empty() {
+            return;
+        }
+        let reason = crate::capture::CaptureUnavailable::virtual_desktop_down(down_detail_of(why));
+        // The notice runs inside the daemon's runtime: called on the
+        // supervisor's thread it would panic there, and that thread would
+        // never start the desktop again. A runtime that has shut down drops
+        // the task: nobody is told, and the daemon is leaving anyway.
+        rt.spawn(async move {
+            for (session, control_dc) in sessions {
+                notice(session, control_dc, reason.clone());
+            }
+        });
+    })
+}
+
+/// #3671 — the shared encoder pipelines (`media_share`) retired with the
+/// desktop's X server when a session on this device captures the desktop
+/// (`plans`, the rule [`sessions_to_tell`] reads), and none otherwise: a
+/// session that does not capture the desktop keeps sharing its pipeline. How
+/// many were retired.
+#[cfg(target_os = "linux")]
+fn retire_if(plans: bool) -> usize {
+    if plans {
+        crate::media_share::retire_all()
+    } else {
+        0
+    }
+}
+
+/// #3671 — the daemon's [`Retire`]. The rule is read on the supervisor's
+/// thread as the tell reads it (it asks no bus with the desktop requested),
+/// and the retire takes a few short locks of `media_share`'s, never one of
+/// the desktop's. It is not the tell, so the tell's kill switch leaves it on:
+/// a session opened after the exit, or a reconnect, still gets a pump of its
+/// own. With `ROOMLERD_SHARED_ENCODER=0` nothing is registered to retire.
+#[cfg(target_os = "linux")]
+fn pipelines_retired() -> Retire {
+    pipelines_retired_via(crate::capture::sessions_capture_the_virtual_desktop)
+}
+
+/// [`pipelines_retired`] with the device rule given, so that a test drives
+/// the daemon's own hook from a thread in no runtime.
+#[cfg(target_os = "linux")]
+fn pipelines_retired_via(plans: fn() -> bool) -> Retire {
+    Box::new(move || {
+        retire_if(plans());
+    })
 }
 
 /// The handle [`start`] returns. Its `Drop` tears the whole process tree down
@@ -820,6 +995,28 @@ const RESTART_DELAY_CEIL: Duration = Duration::from_secs(300);
 #[cfg(target_os = "linux")]
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 
+/// #3671 — after an exit, the first part of the restart delay waits for the
+/// daemon's own stop before anything is said, told or killed. A service
+/// manager's stop (and restart, and a package upgrade's restart) signals every
+/// process of the unit at once, so the desktop's X server, or its keeper, can
+/// exit before the daemon's teardown reaches [`Desktop::stop`]: about 200 ms
+/// after the signal, since the run loop's arm for it sleeps 200 ms and then
+/// calls [`teardown`]. A stop inside the grace finds the whole tree recorded
+/// and takes it down itself (#1684); the supervisor says one line at INFO and
+/// leaves. Carved out of the delay and never longer than it, so the desktop
+/// comes back no later than it did before the grace: with a plan whose delay
+/// is shorter (the tests' 20 ms), the grace is that delay.
+///
+/// ⚠️ Not a SIGTERM listener, on purpose. Tokio installs the process's SIGTERM
+/// handler for good at the first `signal(SignalKind::terminate())`, and a
+/// listener made later hears only the signals after it. One made here, when
+/// the desktop starts, would come before the run loop's own (`app.rs`,
+/// `terminate_signal`, the agent's only SIGTERM listener): a SIGTERM landing
+/// between the two, which ends the daemon by the default action today, would
+/// be swallowed, and the daemon would run on.
+#[cfg(target_os = "linux")]
+const STOP_GRACE: Duration = Duration::from_secs(1);
+
 /// How a desktop is started and how patiently it is started again. A struct
 /// so the tests can put a stand-in where Xvfb is and count in milliseconds;
 /// [`Plan::of`] is what the daemon runs.
@@ -998,6 +1195,10 @@ struct State {
     up: Option<Server>,
     /// Why it is down, for [`down`].
     why_down: String,
+    /// #3918 — how many times the desktop went from up to down: the number of
+    /// the down period it is in while `up` is `None` (`0` until its first
+    /// server came up), for [`x_server_now`].
+    downs: u64,
     /// Children a kill could not collect in its bound (SIGKILLed, and still
     /// stuck in the kernel). Asked for again at the next kill; never
     /// signalled again.
@@ -1007,6 +1208,17 @@ struct State {
     /// tree, and closed by the kernel when the daemon dies however it dies.
     /// Created close-on-exec, so no other program holds it.
     lifeline: Option<std::process::ChildStdin>,
+}
+
+#[cfg(target_os = "linux")]
+impl State {
+    /// The desktop is down from here on; a desktop that was up starts a new
+    /// down period ([`State::downs`]).
+    fn went_down(&mut self) {
+        if self.up.take().is_some() {
+            self.downs += 1;
+        }
+    }
 }
 
 /// One virtual desktop: a display that is its own for the daemon's life, and
@@ -1035,7 +1247,30 @@ struct Desktop {
     keeper_off: std::sync::atomic::AtomicBool,
     /// Starts in a row whose keeper did not say `ready` in time.
     keeper_slow: std::sync::atomic::AtomicU32,
+    /// #3671 — what the open sessions are told when the desktop goes down,
+    /// with why ([`sessions_told`]). Set once: by [`start`] on the daemon's
+    /// runtime, by a test with a recorder. Unset, nobody is told.
+    tell_down: std::sync::OnceLock<DownTell>,
+    /// #3671 — what retires the shared encoder pipelines with the desktop's X
+    /// server ([`pipelines_retired`]). Set once: by [`start`], by a test with a
+    /// recorder. Unset, nothing is retired.
+    retire: std::sync::OnceLock<Retire>,
+    /// #3671 — how many times the desktop came back on a new X server
+    /// ([`generation`]).
+    generation: std::sync::atomic::AtomicU64,
 }
+
+/// #3671 — what [`supervise`] calls, on its own thread, once an exit's
+/// [`STOP_GRACE`] has passed without a stop, with why. It must not block: the
+/// daemon's spawns its work on the runtime ([`sessions_told`]).
+#[cfg(target_os = "linux")]
+type DownTell = Box<dyn Fn(&str) + Send + Sync>;
+
+/// #3671 — what [`supervise`] calls, on its own thread, to retire the shared
+/// encoder pipelines: where it tells the open sessions, and again once a
+/// restarted desktop is up. It must not block ([`pipelines_retired`]).
+#[cfg(target_os = "linux")]
+type Retire = Box<dyn Fn() + Send + Sync>;
 
 /// An X server this daemon started, while it answers.
 #[cfg(target_os = "linux")]
@@ -1064,6 +1299,9 @@ impl Desktop {
             xorg_dir_made: std::sync::atomic::AtomicBool::new(false),
             keeper_off: std::sync::atomic::AtomicBool::new(false),
             keeper_slow: std::sync::atomic::AtomicU32::new(0),
+            tell_down: std::sync::OnceLock::new(),
+            retire: std::sync::OnceLock::new(),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1075,6 +1313,20 @@ impl Desktop {
         self.state().stopping
     }
 
+    /// [`x_server_now`] for this desktop, in one read under `st`: the lock
+    /// that publishes the desktop up, and under which a restart counts its
+    /// generation ([`Desktop::bring_up_again`]). `st` is held across at most
+    /// one `Command::spawn` (`spawn_server`, `spawn_client`, `spawn_keeper`),
+    /// never across a kill, a reap or a wait for a server, so a reader waits
+    /// no longer than that.
+    fn x_server_now(&self) -> XServerNow {
+        let st = self.state();
+        XServerNow {
+            generation: self.generation.load(std::sync::atomic::Ordering::Acquire),
+            down: st.up.is_none().then_some(st.downs),
+        }
+    }
+
     /// Record that the desktop is down, and why. `false` when the daemon is
     /// stopping instead: then the tree is `stop`'s, and the caller leaves.
     fn set_down(&self, why: String) -> bool {
@@ -1082,7 +1334,7 @@ impl Desktop {
         if st.stopping {
             return false;
         }
-        st.up = None;
+        st.went_down();
         st.why_down = why;
         true
     }
@@ -1243,7 +1495,7 @@ impl Desktop {
         {
             let mut st = self.state();
             st.stopping = true;
-            st.up = None;
+            st.went_down();
             st.why_down = "the daemon is stopping".into();
         }
         self.wake.notify_all();
@@ -1254,6 +1506,22 @@ impl Desktop {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             let _ = std::fs::remove_dir_all(xorg_dir(&self.display));
+        }
+    }
+
+    /// #3671 — tell the open sessions why the desktop went down, through the
+    /// hook [`start`] set (a test's recorder); nobody when none is set.
+    fn tell(&self, why: &str) {
+        if let Some(tell) = self.tell_down.get() {
+            tell(why);
+        }
+    }
+
+    /// #3671 — retire the shared encoder pipelines through the hook [`start`]
+    /// set (a test's recorder); nothing when none is set.
+    fn retire_pipelines(&self) {
+        if let Some(retire) = self.retire.get() {
+            retire();
         }
     }
 
@@ -1281,6 +1549,19 @@ impl Desktop {
     /// window manager and the startup apps. `Err` carries why not, and leaves
     /// nothing running.
     fn bring_up(&self) -> std::result::Result<XServer, NoDesktop> {
+        self.bring_up_as(false)
+    }
+
+    /// [`Desktop::bring_up`] after an exit: its server is a new generation
+    /// ([`generation`], #3671), counted under the lock that publishes the
+    /// desktop up and before it (#3918). So whoever finds the desktop up finds
+    /// the new server's generation, and an X client of the old server never
+    /// passes for one of the new.
+    fn bring_up_again(&self) -> std::result::Result<XServer, NoDesktop> {
+        self.bring_up_as(true)
+    }
+
+    fn bring_up_as(&self, again: bool) -> std::result::Result<XServer, NoDesktop> {
         let cfg = &self.plan.cfg;
         // An Xorg that hung once is no longer the server that will serve.
         let try_xorg =
@@ -1295,6 +1576,10 @@ impl Desktop {
             let mut st = self.state();
             if st.stopping {
                 return Err(NoDesktop::because("the daemon is stopping"));
+            }
+            if again {
+                self.generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
             st.up = Some(x.kind);
             st.why_down.clear();
@@ -1681,6 +1966,19 @@ pub fn start(cfg: &Config) -> VirtualDesktop {
             None
         }
     };
+    // #3671 — the shared pipelines are retired with the desktop's X server
+    // (no runtime needed: a few locks on the supervisor's thread).
+    let _ = desk.retire.set(pipelines_retired());
+    // #3671 — the open sessions are told when the desktop goes down. `start`
+    // runs on the daemon's runtime; without one, nobody is told.
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            let _ = desk.tell_down.set(sessions_told(rt));
+        }
+        Err(_) => info!(
+            "virtual-desktop: no runtime here — an open session is not told when the desktop goes down"
+        ),
+    }
     let display = desk.display.clone();
     let spawned = std::thread::Builder::new()
         .name("vd-supervisor".into())
@@ -1707,6 +2005,8 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
     let mut delays = Backoff::new(desk.plan.delay_floor, desk.plan.delay_ceil);
     let mut strikes = KeeperStrikes::default();
     loop {
+        // What is left of the delay after an exit's grace; `None`: a whole one.
+        let mut rest = None;
         if let Some(x) = running.take() {
             let gone = wait_desktop_exit(&x);
             let up_for = x.since.elapsed();
@@ -1714,11 +2014,43 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
                 Gone::Server(exit) => format!("its X server ({}) exited: {exit}", x.kind.name()),
                 Gone::Keeper(exit) => format!("its keeper process (vd-keeper) exited: {exit}"),
             };
-            if !desk.set_down(why) {
+            if !desk.set_down(why.clone()) {
                 // A deliberate stop killed it; the tree is `stop`'s.
                 return;
             }
             crate::desktop_brief::refresh_soon();
+            if up_for >= desk.plan.stable_after {
+                delays.reset();
+            }
+            let delay = delays.next();
+            let grace = STOP_GRACE.min(delay);
+            // #3671 — an exit the daemon's own stop caused. Nothing of the tree
+            // is touched while this waits, and the keeper's input stays open,
+            // so the stop finds everything recorded. The wait is the one
+            // `stop` wakes: it never adds to a stop.
+            if desk.wait_unless_stopping(grace) {
+                let (what, exit) = match &gone {
+                    Gone::Server(exit) => ("the X server", exit),
+                    Gone::Keeper(exit) => ("the desktop's keeper (vd-keeper)", exit),
+                };
+                info!(
+                    display = desk.display.as_str(),
+                    server = x.kind.name(),
+                    %exit,
+                    "virtual-desktop: {what} exited as the daemon stops"
+                );
+                return;
+            }
+            rest = Some(delay.saturating_sub(grace));
+            // #3671 — from here on, a session opened while the desktop is down
+            // runs a pump of its own, and its open is refused with the sentence
+            // below, instead of following a capture of the server that went,
+            // untold. Before the tell, so a session opened between the two is
+            // refused by its own open.
+            desk.retire_pipelines();
+            // #3671 — the open sessions that capture this desktop, told why,
+            // with the sentence a session opened now gets.
+            desk.tell(&why);
             // The window manager and the apps lost their display. Bring them
             // down so the next start is clean and none of them stays a zombie;
             // this is also what reaps the server.
@@ -1756,16 +2088,22 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
                 }
             }
             if up_for >= desk.plan.stable_after {
-                delays.reset();
                 strikes.reset();
             }
         }
-        let delay = delays.next();
+        let delay = rest.unwrap_or_else(|| delays.next());
         if desk.wait_unless_stopping(delay) {
             return;
         }
-        match desk.bring_up() {
+        // #3671 — the new server's generation is counted as it is published up
+        // (`bring_up_again`), so whoever reads it after this line finds it.
+        match desk.bring_up_again() {
             Ok(x) => {
+                // #3671 — whatever is registered now was registered before the
+                // new server answered, the refused pumps of the down period
+                // included: the next session of each profile opens a capture of
+                // its own on the new server.
+                desk.retire_pipelines();
                 info!(
                     display = desk.display.as_str(),
                     server = x.kind.name(),
@@ -3503,6 +3841,121 @@ mod tests {
     }
 }
 
+/// #3671 — an X server of a test's own, for the tests of other modules whose
+/// X connection must outlive its server: an Xvfb on the first display from
+/// `:99` up with neither a socket nor a lock ([`pick_display`]), so never one
+/// a server already runs on, started as the daemon starts its desktop
+/// (with `true` for a window manager and no keeper), killed as a server dies,
+/// started again on the same display, and stopped with the value.
+#[cfg(all(test, target_os = "linux"))]
+#[cfg_attr(
+    not(any(feature = "scrap-capture", feature = "clipboard")),
+    allow(dead_code)
+)]
+pub(crate) struct TestX(std::sync::Arc<Desktop>);
+
+#[cfg(all(test, target_os = "linux"))]
+#[cfg_attr(
+    not(any(feature = "scrap-capture", feature = "clipboard")),
+    allow(dead_code)
+)]
+impl TestX {
+    /// The lane that runs these tests asked for them: `ROOMLERD_TEST_X11=1`,
+    /// which CI's X11 step sets, with an Xvfb installed, one test at a time.
+    /// Read here, not in the capture's files, whose environment reads the
+    /// FR-135 ratchet counts.
+    pub(crate) fn opted_in() -> bool {
+        std::env::var("ROOMLERD_TEST_X11").as_deref() == Ok("1")
+    }
+
+    /// `None` when no Xvfb comes up (none installed).
+    pub(crate) fn start() -> Option<Self> {
+        let mut plan = Plan::of(&Config {
+            resolution: "640x480".into(),
+            wm: "true".into(),
+            startup: vec![],
+        });
+        plan.xorg = false;
+        plan.clients = Clients::Direct;
+        let desk = std::sync::Arc::new(Desktop::new(pick_display(X11_UNIX_DIR), plan));
+        let x = Self(desk);
+        x.0.bring_up().ok()?;
+        Some(x)
+    }
+
+    pub(crate) fn display(&self) -> &str {
+        &self.0.display
+    }
+
+    /// The server's SIGKILL, as a server dies, and its tree taken down and
+    /// collected, as the supervisor does after an exit.
+    pub(crate) fn kill(&self) {
+        let pid = self
+            .0
+            .state()
+            .tree
+            .as_ref()
+            .and_then(|t| t.roots.first().copied());
+        if let Some(pid) = pid {
+            // A child of this test that nobody has collected yet.
+            RealProcs.signal(pid, libc::SIGKILL);
+            self.0.set_down("its X server was killed by a test".into());
+            self.0.kill_recorded_tree();
+            self.0.clear_lock_of(pid);
+        }
+    }
+
+    /// A new server on the same display, as the supervisor starts one. Only
+    /// the clipboard's and the input's tests restart a server.
+    #[cfg_attr(
+        not(any(feature = "clipboard", feature = "enigo-input")),
+        allow(dead_code)
+    )]
+    pub(crate) fn restart(&self) -> bool {
+        self.0.bring_up().is_ok()
+    }
+
+    /// `DISPLAY` names this server until the value is dropped, for what
+    /// connects to `$DISPLAY` with no way to be told another display: the
+    /// capture's worker, arboard.
+    pub(crate) fn point_display(&self) -> TestDisplay {
+        let was = std::env::var_os("DISPLAY");
+        // SAFETY: only under `ROOMLERD_TEST_X11=1` (`Self::opted_in`), which
+        // CI's X11 steps run with `--test-threads=1`: no other test reads
+        // the environment while it changes.
+        unsafe { std::env::set_var("DISPLAY", self.display()) };
+        TestDisplay(was)
+    }
+}
+
+/// `DISPLAY` as it was before [`TestX::point_display`], put back on drop.
+#[cfg(all(test, target_os = "linux"))]
+#[cfg_attr(
+    not(any(feature = "scrap-capture", feature = "clipboard")),
+    allow(dead_code)
+)]
+pub(crate) struct TestDisplay(Option<std::ffi::OsString>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestDisplay {
+    fn drop(&mut self) {
+        // SAFETY: as in `TestX::point_display`.
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var("DISPLAY", v),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestX {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// #3643 — the supervised desktop against real processes and real sockets.
 /// No X server is needed for these: the stand-ins are shell scripts, and the
 /// "server that answers" is a listener in the test.
@@ -3512,6 +3965,38 @@ mod supervise_tests {
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
+
+    /// #3918 — what input reads of the desktop, both ways. A
+    /// desktop not up yet is down in period 0 under generation 0; up, it is
+    /// not down; gone, it is in down period 1; a restart's count and its
+    /// publish are one read apart from nothing (the same lock), so it is seen
+    /// up with generation 1 or down with 0; a stop is a new down period. And
+    /// a process that started no desktop reads `None`, never "down".
+    #[test]
+    fn input_reads_the_desktops_generation_and_down_period_both_ways() {
+        assert_eq!(x_server_now(), None, "no desktop started in this process");
+        assert_eq!(down(), None);
+        let desk = Desktop::new(":0".into(), plan(String::new()));
+        let at = |generation, down| XServerNow { generation, down };
+        assert_eq!(desk.x_server_now(), at(0, Some(0)), "not up yet");
+        desk.state().up = Some(Server::Xvfb);
+        assert_eq!(desk.x_server_now(), at(0, None), "up");
+        assert!(desk.set_down("the X server exited".into()));
+        assert_eq!(desk.x_server_now(), at(0, Some(1)), "gone");
+        assert!(desk.set_down("still down".into()));
+        assert_eq!(desk.x_server_now(), at(0, Some(1)), "the same period");
+        {
+            // What `bring_up_as(true)` does under the lock once the new
+            // server answers.
+            let mut st = desk.state();
+            desk.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            st.up = Some(Server::Xvfb);
+        }
+        assert_eq!(desk.x_server_now(), at(1, None), "back, a new generation");
+        desk.stop();
+        assert_eq!(desk.x_server_now(), at(1, Some(2)), "stopped");
+    }
 
     /// A directory of this test's own.
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -3981,6 +4466,8 @@ mod supervise_tests {
             },
         ));
         let _stop = StopAtTheEnd(desk.clone());
+        let told = tell_recorded(&desk);
+        retire_recorded(&desk, &told);
 
         let first = desk.bring_up().expect("the X server comes up");
         let first_pid = first.pid;
@@ -4024,13 +4511,29 @@ mod supervise_tests {
             "the lock on {display} does not name the new server"
         );
         assert!(collected(first_pid), "the killed server was left a zombie");
+        // #3671 — the shared pipelines were retired at the exit, before the
+        // sessions were told, and again once the new server was published up.
+        wait_for("the shared pipelines to be retired once it is back", || {
+            told.lock().unwrap_or_else(|e| e.into_inner()).len() >= 3
+        });
+        let events: Vec<String> = told
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(e, _)| e.clone())
+            .collect();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0], "retired: down on generation 0", "{events:?}");
+        assert!(events[1].starts_with("its X server ("), "{events:?}");
+        assert_eq!(events[2], "retired: up on generation 1", "{events:?}");
 
         desk.stop();
         supervisor.join().expect("the supervisor left cleanly");
         assert!(collected(second_pid), "the stop left the server running");
         assert!(!x_answers(&sock, Duration::from_millis(200)));
         println!(
-            "x11-real: a killed X server came back on {display} ({})",
+            "x11-real: a killed X server came back on {display} ({}); the shared pipelines were \
+             retired at its exit and once it was back",
             kind.name()
         );
     }
@@ -5249,6 +5752,827 @@ mod supervise_tests {
         assert!(keeper_ran, "the keeper left with the window manager");
         assert_eq!(up, Some(Server::Xvfb), "the desktop went down");
         assert_eq!(starts, 0, "the desktop was started again");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3671: what an X server's exit tells the open sessions, and the exit a
+    // stop of the daemon asked for. Stand-ins only: no X server, never `:99`.
+    // -----------------------------------------------------------------------
+
+    /// A log, as the daemon's log file writes it.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuf {
+        /// The lines that say `text`, at any level.
+        fn lines_with(&self, text: &str) -> Vec<String> {
+            let all = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            String::from_utf8_lossy(&all)
+                .lines()
+                .filter(|l| l.contains(text))
+                .map(|l| l.trim_start().to_string())
+                .collect()
+        }
+
+        /// The lines logged at WARN or above.
+        fn warnings(&self) -> Vec<String> {
+            let text = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            String::from_utf8_lossy(&text)
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| l.starts_with("WARN") || l.starts_with("ERROR"))
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    /// [`supervise`] on a thread of its own, whose log is kept: a
+    /// subscriber set for one thread hears that thread only.
+    fn supervise_logged(
+        desk: &Arc<Desktop>,
+        first: XServer,
+    ) -> (std::thread::JoinHandle<()>, LogBuf) {
+        let log = LogBuf::default();
+        let writer = log.clone();
+        let desk = desk.clone();
+        let supervisor = std::thread::spawn(move || {
+            // Two dispatchers, never one: with one, a callsite's interest is
+            // taken once for every thread.
+            let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_target(false)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || supervise(&desk, Some(first)));
+        });
+        (supervisor, log)
+    }
+
+    /// What [`Desktop::tell_down`] was called with, and when.
+    type Told = Arc<std::sync::Mutex<Vec<(String, Instant)>>>;
+
+    fn tell_recorded(desk: &Desktop) -> Told {
+        let told = Told::default();
+        let seen = told.clone();
+        let set = desk.tell_down.set(Box::new(move |why: &str| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((why.to_string(), Instant::now()));
+        }));
+        assert!(set.is_ok(), "the desktop already had a tell");
+        told
+    }
+
+    /// #3671 — each retire of the shared pipelines recorded into `told`, in
+    /// call order with the tell: whether the desktop was down or up at that
+    /// moment, and its generation.
+    fn retire_recorded(desk: &Arc<Desktop>, told: &Told) {
+        let seen = told.clone();
+        let desktop = Arc::downgrade(desk);
+        let set = desk.retire.set(Box::new(move || {
+            let what = match desktop.upgrade().map(|d| d.x_server_now()) {
+                Some(n) => format!(
+                    "retired: {} on generation {}",
+                    if n.down.is_some() { "down" } else { "up" },
+                    n.generation
+                ),
+                None => "retired: no desktop".to_string(),
+            };
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((what, Instant::now()));
+        }));
+        assert!(set.is_ok(), "the desktop already had a retire");
+    }
+
+    /// [`plan`] with a restart delay of `d`, so the supervisor's grace is
+    /// [`STOP_GRACE`] as the daemon's is, when `d` is at least that.
+    fn plan_delayed(xvfb: String, d: Duration) -> Plan {
+        Plan {
+            delay_floor: d,
+            delay_ceil: d,
+            ..plan(xvfb)
+        }
+    }
+
+    /// #3671, part 4 — a service manager's stop (and a restart, and a package
+    /// upgrade's restart) signals the daemon and its X server at once, and
+    /// the daemon's teardown reaches [`Desktop::stop`] about 200 ms later.
+    /// The server's exit comes first, inside the supervisor's
+    /// [`STOP_GRACE`]: one line at INFO, with the server's kind and its exit;
+    /// no warning, nobody told, nothing started, and nothing of the tree
+    /// touched, so the stop finds it all recorded and takes it down within its
+    /// usual bound (#1684). Before #3671 the supervisor warned "the X server
+    /// exited" and killed the tree itself.
+    #[test]
+    fn a_stop_the_daemon_asked_for_adds_no_warning() {
+        let dir = scratch("asked-stop");
+        let (desk, x_pid) =
+            desktop_planned(":481", plan_delayed(stand_in(&dir, "exit 1"), STOP_GRACE));
+        let _stop = StopAtTheEnd(desk.clone());
+        let told = tell_recorded(&desk);
+        retire_recorded(&desk, &told);
+        let (supervisor, log) = supervise_logged(&desk, running(&desk, x_pid, None));
+        // The server's SIGTERM, our child, unreaped while the tree lists it.
+        RealProcs.signal(x_pid, libc::SIGTERM);
+        // The run loop's 200 ms between the signal and its teardown.
+        std::thread::sleep(Duration::from_millis(200));
+        let recorded = roots_of(&desk);
+        let asked = Instant::now();
+        desk.stop();
+        let took = asked.elapsed();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let starts = runs(&dir).len();
+        let st = desk.state();
+        let (left, unreaped) = (st.tree.is_some(), st.unreaped.clone());
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let warned = log.warnings();
+        assert!(
+            warned.is_empty(),
+            "a stop the daemon asked for warned: {warned:?}"
+        );
+        let said = log.lines_with("exited as the daemon stops");
+        assert_eq!(said.len(), 1, "one line for the stop's exit: {said:?}");
+        assert!(
+            said[0].starts_with("INFO")
+                && said[0].contains("the X server exited")
+                && said[0].contains("server=\"Xvfb\"")
+                && said[0].contains("signal 15 (terminated)"),
+            "{said:?}"
+        );
+        assert_eq!(starts, 0, "the desktop was started again in a stop");
+        assert!(
+            told.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "in a stop, the sessions were told the desktop went down, or the shared pipelines \
+             were retired"
+        );
+        assert_eq!(recorded, vec![x_pid], "the grace touched the tree");
+        assert!(
+            !left && unreaped.is_empty(),
+            "the stop left {unreaped:?} recorded"
+        );
+        assert!(collected(x_pid), "the stop left the server {x_pid}");
+        assert!(
+            took < TEARDOWN_GRACE + Duration::from_secs(1),
+            "the stop took {took:?}"
+        );
+    }
+
+    /// #3671, part 4 — the same grace for the keeper's exit (#3665): the X
+    /// server still runs during it, so an open session keeps a live picture
+    /// for that second; a stop inside it is one INFO line and no warning, and
+    /// takes the server, the keeper and what the keeper started down.
+    #[test]
+    fn a_keepers_exit_in_a_stop_adds_no_warning() {
+        let dir = scratch("keeper-stop");
+        let d = dir.display();
+        let (desk, x_pid) = desktop_planned(
+            ":485",
+            Plan {
+                cfg: Config {
+                    resolution: "640x480".into(),
+                    wm: script(
+                        &dir,
+                        "wm",
+                        &format!("echo $$ > \"{d}/wm.pid\"\nexec sleep 300"),
+                    ),
+                    startup: vec![],
+                },
+                ..plan_delayed(stand_in(&dir, "exit 1"), STOP_GRACE)
+            },
+        );
+        let _stop = StopAtTheEnd(desk.clone());
+        let told = tell_recorded(&desk);
+        let keeper = desk.start_clients().expect("the keeper said it was ready");
+        let wm = recorded(&dir, "wm.pid");
+        let (supervisor, log) = supervise_logged(&desk, running(&desk, x_pid, Some(keeper)));
+        // Our child, unreaped while the tree lists it.
+        RealProcs.signal(keeper, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(200));
+        let server_ran = is_running(x_pid);
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let starts = runs(&dir).len();
+        let (x_gone, keeper_gone, wm_running) =
+            (collected(x_pid), collected(keeper), still_running(&wm));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let warned = log.warnings();
+        assert!(
+            warned.is_empty(),
+            "the keeper's exit in a stop warned: {warned:?}"
+        );
+        let said = log.lines_with("exited as the daemon stops");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("INFO")
+                && said[0].contains("the desktop's keeper (vd-keeper) exited")
+                && said[0].contains("signal 9 (killed)"),
+            "{said:?}"
+        );
+        assert!(server_ran, "the grace took the server down");
+        assert_eq!(starts, 0, "the desktop was started again in a stop");
+        assert!(told.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(x_gone, "the server {x_pid} was not collected");
+        assert!(keeper_gone, "the keeper {keeper} was not collected");
+        assert!(
+            !wm_running,
+            "the window manager {} outlived the stop",
+            wm.pid
+        );
+    }
+
+    /// #3671, part 4 — a SIGTERM that is not the daemon's stop (an operator's
+    /// `kill`) is an exit nobody asked for: warned once, after the grace, and
+    /// the desktop is started again.
+    #[test]
+    fn an_x_server_terminated_by_someone_else_warns_once() {
+        let dir = scratch("term-alone");
+        let (desk, x_pid) = desktop_planned(":486", plan(stand_in(&dir, "exit 1")));
+        let _stop = StopAtTheEnd(desk.clone());
+        let _told = tell_recorded(&desk);
+        let (supervisor, log) = supervise_logged(&desk, running(&desk, x_pid, None));
+        RealProcs.signal(x_pid, libc::SIGTERM);
+        wait_for("the server to be collected", || collected(x_pid));
+        wait_for("the next start", || !runs(&dir).is_empty());
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let exits: Vec<String> = log
+            .warnings()
+            .into_iter()
+            .filter(|l| l.contains("the X server exited"))
+            .collect();
+        assert_eq!(exits.len(), 1, "one exit, warned {exits:?}");
+        assert!(exits[0].contains("signal 15 (terminated)"), "{exits:?}");
+    }
+
+    /// #3671, part 4 — the grace is carved out of the
+    /// restart delay: from the exit to the next start takes the delay, as
+    /// before, not the delay and the grace.
+    #[test]
+    fn the_grace_does_not_delay_the_next_start() {
+        let dir = scratch("grace-start");
+        let at = dir.join("at");
+        let body = format!("date +%s%N >> \"{}\"\nexit 1", at.display());
+        let (desk, x_pid) =
+            desktop_planned(":487", plan_delayed(stand_in(&dir, &body), STOP_GRACE));
+        let _stop = StopAtTheEnd(desk.clone());
+        let (supervisor, _log) = supervise_logged(&desk, running(&desk, x_pid, None));
+        let killed = std::time::SystemTime::now();
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        // The stand-in records its run before its body writes the time: wait
+        // for the time itself.
+        let started = || {
+            std::fs::read_to_string(&at)
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<u128>().ok())
+        };
+        wait_for("the next start to write its time", || started().is_some());
+        let ns = started().expect("the stand-in wrote when it started");
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let killed_ns = killed
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let after = Duration::from_nanos(ns.saturating_sub(killed_ns) as u64);
+        assert!(
+            after >= STOP_GRACE.saturating_sub(Duration::from_millis(50)),
+            "started again {after:?} after the exit, within the delay"
+        );
+        assert!(
+            after < STOP_GRACE + Duration::from_millis(700),
+            "started again {after:?} after the exit: the grace was added to the delay"
+        );
+        println!("vd-grace: the next start came {after:?} after the exit (delay {STOP_GRACE:?})");
+    }
+
+    /// #3671, part 4 — and an exit nobody asked for still warns, exactly once.
+    #[test]
+    fn an_x_server_that_dies_by_itself_warns_once() {
+        let dir = scratch("dies-alone");
+        let (desk, x_pid) = desktop_planned(":483", plan(stand_in(&dir, "exit 1")));
+        let _stop = StopAtTheEnd(desk.clone());
+        let _told = tell_recorded(&desk);
+        let (supervisor, log) = supervise_logged(&desk, running(&desk, x_pid, None));
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the server to be collected", || collected(x_pid));
+        // The stand-in's restarts fail and say so (`did not start`); those
+        // are not this exit's.
+        std::thread::sleep(Duration::from_millis(300));
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let exits: Vec<String> = log
+            .warnings()
+            .into_iter()
+            .filter(|l| l.contains("the X server exited"))
+            .collect();
+        assert_eq!(exits.len(), 1, "one exit, warned {exits:?}");
+        assert!(exits[0].contains("signal 9 (killed)"), "{exits:?}");
+    }
+
+    /// #3671, part 2 — an X server's exit tells the open sessions once the
+    /// stop grace has passed without a stop, with the sentence a session
+    /// opened meanwhile gets: `backend_error`, "this device's virtual desktop
+    /// is down: … reconnect in a moment" ([`down_detail_of`]). The viewer
+    /// receives it as `rc:media-unavailable` (`peer::capture_unavailable_payload`,
+    /// locked by FR-80's test) and shows it over the last picture until the
+    /// person reconnects. Told once per exit: the failed starts after it tell
+    /// nobody again. The bound is the daemon's grace, [`STOP_GRACE`].
+    #[test]
+    fn an_x_server_exit_tells_the_sessions_after_the_grace() {
+        let dir = scratch("tell");
+        let (desk, x_pid) =
+            desktop_planned(":484", plan_delayed(stand_in(&dir, "exit 1"), STOP_GRACE));
+        let _stop = StopAtTheEnd(desk.clone());
+        let told = tell_recorded(&desk);
+        let (supervisor, _log) = supervise_logged(&desk, running(&desk, x_pid, None));
+        let killed = Instant::now();
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the sessions to be told", || {
+            !told.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        });
+        // Past a failed start or two of the stand-in.
+        std::thread::sleep(Duration::from_millis(2500));
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let told = told.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(told.len(), 1, "one exit, told {told:?}");
+        let (why, at) = &told[0];
+        let after = at.duration_since(killed);
+        let reason = crate::capture::CaptureUnavailable::new(
+            crate::capture::CaptureUnavailableCode::BackendError,
+            down_detail_of(why),
+        );
+        assert_eq!(reason.code.wire(), "backend_error");
+        assert_eq!(
+            reason.detail,
+            "this device's virtual desktop is down: its X server (Xvfb) exited: signal 9 \
+             (killed). The agent starts it again by itself; reconnect in a moment"
+        );
+        // Not before the grace: a stop that comes within it is the daemon's
+        // own, and its sessions are told nothing.
+        assert!(
+            after >= STOP_GRACE.saturating_sub(Duration::from_millis(50))
+                && after < STOP_GRACE + Duration::from_secs(1),
+            "told {after:?} after the server's exit (grace {STOP_GRACE:?})"
+        );
+        println!(
+            "vd-tell: the sessions were told {after:?} after the X server's exit (grace {STOP_GRACE:?})"
+        );
+    }
+
+    /// #3671 — an X server's exit retires the shared encoder pipelines once
+    /// the stop grace has passed without a stop, just before the open
+    /// sessions are told; the failed starts after it retire nothing more.
+    /// From the retire on, a session opened while the desktop is down runs a
+    /// pump of its own, and its open is refused with the tell's sentence,
+    /// instead of following a capture of the server that went. The retire
+    /// once a restarted desktop is up is read against a real X server
+    /// (`a_killed_server_comes_back`); a stop retires nothing
+    /// (`a_stop_the_daemon_asked_for_adds_no_warning`).
+    #[test]
+    fn an_x_server_exit_retires_the_shared_pipelines_after_the_grace_before_the_tell() {
+        let dir = scratch("retire");
+        let (desk, x_pid) =
+            desktop_planned(":488", plan_delayed(stand_in(&dir, "exit 1"), STOP_GRACE));
+        let _stop = StopAtTheEnd(desk.clone());
+        let told = tell_recorded(&desk);
+        retire_recorded(&desk, &told);
+        let (supervisor, _log) = supervise_logged(&desk, running(&desk, x_pid, None));
+        let killed = Instant::now();
+        RealProcs.signal(x_pid, libc::SIGKILL);
+        wait_for("the sessions to be told", || {
+            told.lock().unwrap_or_else(|e| e.into_inner()).len() >= 2
+        });
+        // Past a failed start or two of the stand-in.
+        std::thread::sleep(Duration::from_millis(2500));
+        desk.stop();
+        wait_for("the supervisor to leave", || supervisor.is_finished());
+        supervisor.join().expect("the supervisor left cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let told = told.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let events: Vec<&str> = told.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            events,
+            [
+                "retired: down on generation 0",
+                "its X server (Xvfb) exited: signal 9 (killed)"
+            ],
+            "retired once, with the desktop down, before the tell"
+        );
+        let after = told[0].1.duration_since(killed);
+        assert!(
+            after >= STOP_GRACE.saturating_sub(Duration::from_millis(50))
+                && after < STOP_GRACE + Duration::from_secs(1),
+            "retired {after:?} after the server's exit (grace {STOP_GRACE:?})"
+        );
+    }
+
+    /// #3671 — the shared pipelines are retired by the tell's rule: only when
+    /// a session on this device captures the desktop. A session that does not
+    /// keeps sharing its pipeline.
+    #[test]
+    fn the_shared_pipelines_are_retired_only_when_the_plan_is_the_virtual_desktop() {
+        let _serial = crate::media_share::test_serial();
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-3671-VD-RULE");
+        let owner = crate::media_share::Pipeline::register(key, bson::oid::ObjectId::new());
+        assert_eq!(
+            retire_if(false),
+            0,
+            "retired though no session captures the desktop"
+        );
+        assert!(
+            retire_if(true) >= 1,
+            "the pipeline of a session that captures the desktop was left joinable"
+        );
+        drop(owner);
+    }
+
+    /// The tell's kill switch, `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS`, which
+    /// the daemon reads at each tell.
+    const TELL_SWITCH: &str = "VIRTUAL_DESKTOP_TELL_SESSIONS";
+
+    /// #3671 — the tell's kill switch, held for one test with every spelling
+    /// cleared, and put back as it was when the test ends (the fields drop in
+    /// order: the variable first, then the lock).
+    struct TellSwitch {
+        _saved: tunnel_core::env::test_env::Saved,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TellSwitch {
+        fn hold() -> Self {
+            static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+            TellSwitch {
+                _saved: tunnel_core::env::test_env::Saved::cleared(TELL_SWITCH),
+                _env: env,
+            }
+        }
+
+        /// The switch at `value`; `None` clears it.
+        fn set(&self, value: Option<&str>) {
+            // SAFETY: only the tests that hold `ENV` read or write the
+            // variable: it is read by the daemon's tell, which they drive.
+            match value {
+                Some(v) => unsafe { tunnel_core::env::test_env::set(TELL_SWITCH, v) },
+                None => unsafe { tunnel_core::env::test_env::clear(TELL_SWITCH) },
+            }
+        }
+    }
+
+    /// What the stand-in for FR-80's notice was handed: the session, the
+    /// reason's code and detail, and whether it ran inside a runtime (the
+    /// daemon's notice spawns a task, so outside one it panics).
+    type Noticed = (bson::oid::ObjectId, &'static str, String, bool);
+
+    static NOTICED: std::sync::Mutex<Vec<Noticed>> = std::sync::Mutex::new(Vec::new());
+
+    fn stand_in_notice(
+        session: bson::oid::ObjectId,
+        _control_dc: crate::sleep_notice::ControlDc,
+        reason: crate::capture::CaptureUnavailable,
+    ) {
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+        NOTICED.lock().unwrap_or_else(|e| e.into_inner()).push((
+            session,
+            reason.code.wire(),
+            reason.detail,
+            in_runtime,
+        ));
+    }
+
+    /// What the stand-in was handed for `ours` (other tests register sessions
+    /// of their own).
+    fn noticed(ours: &[bson::oid::ObjectId]) -> Vec<Noticed> {
+        NOTICED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|n| ours.contains(&n.0))
+            .cloned()
+            .collect()
+    }
+
+    /// A runtime of the test's own, standing for the daemon's.
+    fn daemon_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime for the notices")
+    }
+
+    /// Run `f` as the supervisor runs its hooks: on a thread in no runtime.
+    /// `false` when it panicked.
+    fn on_a_thread_in_no_runtime(f: impl FnOnce() + Send + 'static) -> bool {
+        std::thread::spawn(move || {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "the test's thread is in a runtime"
+            );
+            f();
+        })
+        .join()
+        .is_ok()
+    }
+
+    /// #3918 — whether the tell marked each of `ours` as having no picture of
+    /// the desktop. Where the desktop's X11 injector is not built nothing is
+    /// marked, and there is no input of the desktop to drop.
+    fn marked(ours: &[bson::oid::ObjectId]) -> Vec<bool> {
+        ours.iter()
+            .map(|s| crate::input::has_no_picture(*s))
+            .collect()
+    }
+
+    /// #3671 — the daemon's own tell, not a recorder: called on a thread in
+    /// no runtime, as the supervisor calls it, it does not panic, and every
+    /// registered session gets FR-80's notice once, with `backend_error` and
+    /// the down sentence, from inside the daemon's runtime. A tell that ran
+    /// the notice on the calling thread would panic the supervisor's, which
+    /// would then never start the desktop again. #3918 — each is marked as
+    /// having no picture of the desktop by the time the tell returns, on the
+    /// supervisor's thread: the stand-in notice marks nothing, so the marks
+    /// are the tell's own, set before the restart can publish the desktop.
+    #[test]
+    fn the_daemons_tell_reaches_each_session_from_a_thread_in_no_runtime() {
+        let _switch = TellSwitch::hold();
+        let rt = daemon_runtime();
+        let ours = [bson::oid::ObjectId::new(), bson::oid::ObjectId::new()];
+        let _registered: Vec<_> = ours
+            .iter()
+            .map(|s| crate::sleep_notice::register(*s, Arc::new(tokio::sync::Mutex::new(None))))
+            .collect();
+        let tell = sessions_told_via(rt.handle().clone(), || true, stand_in_notice);
+        let why = "its X server (Xvfb) exited: signal 9 (killed)";
+        assert!(
+            on_a_thread_in_no_runtime(move || tell(why)),
+            "the tell panicked on a thread in no runtime"
+        );
+        let on_return = marked(&ours);
+        let x11_input = cfg!(feature = "enigo-input");
+        assert_eq!(
+            on_return,
+            vec![x11_input; 2],
+            "marked as having no picture when the tell returned"
+        );
+        wait_for("both sessions to be told", || noticed(&ours).len() >= 2);
+        // Room for a second notice to a session that was told twice.
+        std::thread::sleep(Duration::from_millis(200));
+        let got = noticed(&ours);
+        assert_eq!(got.len(), 2, "each session told once: {got:?}");
+        for (session, code, detail, in_runtime) in &got {
+            assert_eq!(*code, "backend_error", "{session}");
+            assert_eq!(*detail, down_detail_of(why), "{session}");
+            assert!(
+                *in_runtime,
+                "{session} was told outside the daemon's runtime"
+            );
+        }
+    }
+
+    /// #3671 — `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0` leaves every
+    /// session untold, as before #3671. The switch is read at each tell: the
+    /// same hook tells the session once the variable is gone. #3918 — and
+    /// with the switch the session is marked all the same: it is left behind
+    /// in silence, with no input of the desktop, as on master, where its
+    /// injector was dead.
+    #[test]
+    fn the_kill_switch_leaves_every_session_untold() {
+        let switch = TellSwitch::hold();
+        let rt = daemon_runtime();
+        let ours = [bson::oid::ObjectId::new()];
+        let _registered =
+            crate::sleep_notice::register(ours[0], Arc::new(tokio::sync::Mutex::new(None)));
+        let tell = Arc::new(sessions_told_via(
+            rt.handle().clone(),
+            || true,
+            stand_in_notice,
+        ));
+        let why = "its X server (Xvfb) exited: signal 9 (killed)";
+        switch.set(Some("0"));
+        let off = tell.clone();
+        assert!(
+            on_a_thread_in_no_runtime(move || off(why)),
+            "the tell panicked"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            noticed(&ours).is_empty(),
+            "told with ROOMLERD_{TELL_SWITCH}=0: {:?}",
+            noticed(&ours)
+        );
+        assert_eq!(
+            marked(&ours),
+            vec![cfg!(feature = "enigo-input")],
+            "with ROOMLERD_{TELL_SWITCH}=0 the session was not left behind"
+        );
+        switch.set(None);
+        assert!(
+            on_a_thread_in_no_runtime(move || tell(why)),
+            "the tell panicked"
+        );
+        wait_for("the session to be told with the switch gone", || {
+            noticed(&ours).len() == 1
+        });
+    }
+
+    /// #3918 — on a device whose plan is another arm
+    /// (an explicit `drm_capture` or `portal_capture`, whose open can fall
+    /// through to the desktop's X server), the tell tells nobody and still
+    /// marks every registered session by the time it returns: each was open
+    /// at the exit, and one whose capture fell through to the X server that
+    /// is gone has no picture of the new desktop. Before, the marks followed
+    /// the plan, and such a session typed into the new desktop blind.
+    #[test]
+    fn with_another_arm_every_session_is_marked_and_none_is_told() {
+        let _switch = TellSwitch::hold();
+        let rt = daemon_runtime();
+        let ours = [bson::oid::ObjectId::new(), bson::oid::ObjectId::new()];
+        let _registered: Vec<_> = ours
+            .iter()
+            .map(|s| crate::sleep_notice::register(*s, Arc::new(tokio::sync::Mutex::new(None))))
+            .collect();
+        let tell = sessions_told_via(rt.handle().clone(), || false, stand_in_notice);
+        let why = "its X server (Xvfb) exited: signal 9 (killed)";
+        assert!(
+            on_a_thread_in_no_runtime(move || tell(why)),
+            "the tell panicked on a thread in no runtime"
+        );
+        let on_return = marked(&ours);
+        // Room for a notice that must not come.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            on_return,
+            vec![cfg!(feature = "enigo-input"); 2],
+            "with another arm planned a session was not marked"
+        );
+        assert!(
+            noticed(&ours).is_empty(),
+            "told with another arm planned: {:?}",
+            noticed(&ours)
+        );
+    }
+
+    /// #3918 — on a device whose plan is another arm,
+    /// the supervisor's retire retires nothing (it reads the plan), and the
+    /// owner's mark is what keeps a new session from following a capture of
+    /// the X server that is gone: once the tell has run, the pipeline of a
+    /// session that was open at the exit takes no joiner, because nothing was
+    /// published of its capture (its arm unknown, which fails closed), not
+    /// because of the plan: a pipeline that published an arm off X takes
+    /// joiners under a mark (`media_share`'s own tests). Without
+    /// `enigo-input` nothing is marked, and it still takes joiners: such a
+    /// build has no input of the desktop to protect (`input::mark_no_picture`).
+    #[test]
+    fn with_another_arm_a_marked_owners_pipeline_takes_no_joiner() {
+        let _serial = crate::media_share::test_serial();
+        let _switch = TellSwitch::hold();
+        let rt = daemon_runtime();
+        let owner_session = bson::oid::ObjectId::new();
+        let _registered =
+            crate::sleep_notice::register(owner_session, Arc::new(tokio::sync::Mutex::new(None)));
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-3918-ANOTHER-ARM");
+        let owner = crate::media_share::Pipeline::register(key, owner_session);
+        let before = crate::media_share::takes_joiners(key);
+        // The supervisor's two hooks at the exit, in its order, with the
+        // plan another arm.
+        assert!(
+            on_a_thread_in_no_runtime(pipelines_retired_via(|| false)),
+            "the retire panicked on a thread in no runtime"
+        );
+        let after_the_retire = crate::media_share::takes_joiners(key);
+        let tell = sessions_told_via(rt.handle().clone(), || false, stand_in_notice);
+        assert!(
+            on_a_thread_in_no_runtime(move || tell(
+                "its X server (Xvfb) exited: signal 9 (killed)"
+            )),
+            "the tell panicked on a thread in no runtime"
+        );
+        let after_the_tell = crate::media_share::takes_joiners(key);
+        drop(owner);
+        assert!(before, "a registered pipeline takes no joiner");
+        assert!(after_the_retire, "the retire ran with another arm planned");
+        assert_eq!(
+            after_the_tell,
+            !cfg!(feature = "enigo-input"),
+            "a joiner would follow a capture of the X server that is gone"
+        );
+    }
+
+    /// #3671 — the daemon's own retire, not a recorder: called on a thread
+    /// in no runtime, as the supervisor calls it, it does not panic and
+    /// leaves no pipeline of the old X server joinable.
+    #[test]
+    fn the_daemons_retire_runs_on_a_thread_in_no_runtime() {
+        let _serial = crate::media_share::test_serial();
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-3671-VD-HOOK");
+        let owner = crate::media_share::Pipeline::register(key, bson::oid::ObjectId::new());
+        assert!(
+            crate::media_share::takes_joiners(key),
+            "a registered pipeline takes no joiner"
+        );
+        assert!(
+            on_a_thread_in_no_runtime(pipelines_retired_via(|| true)),
+            "the retire panicked on a thread in no runtime"
+        );
+        assert!(
+            !crate::media_share::takes_joiners(key),
+            "a joiner would follow a capture of the old X server"
+        );
+        drop(owner);
+    }
+
+    /// #3671, part 2 — who is told is one decision for the device: every
+    /// registered session when its plan is the virtual desktop's X11, and
+    /// nobody when an explicit console (`drm_capture`) or portal
+    /// (`portal_capture`) key plans another arm, since that session never
+    /// captured the desktop. The plan is read with the desktop counted as up:
+    /// it is asked as the desktop goes down. #3918 — who is marked reads no
+    /// plan (`with_another_arm_every_session_is_marked_and_none_is_told`).
+    #[test]
+    fn the_sessions_are_told_only_when_the_plan_is_the_virtual_desktop() {
+        use crate::capture::{ArmFacts, plans_the_virtual_desktop};
+        let ours = [bson::oid::ObjectId::new(), bson::oid::ObjectId::new()];
+        let _registered: Vec<_> = ours
+            .iter()
+            .map(|s| crate::sleep_notice::register(*s, Arc::new(tokio::sync::Mutex::new(None))))
+            .collect();
+        let told = |facts: ArmFacts| -> Vec<bson::oid::ObjectId> {
+            sessions_to_tell(
+                plans_the_virtual_desktop(facts),
+                crate::sleep_notice::sessions(),
+            )
+            .into_iter()
+            .map(|(s, _)| s)
+            .filter(|s| ours.contains(s))
+            .collect()
+        };
+        let vd = ArmFacts {
+            x11_built: true,
+            // As `arm_facts` reads it while the desktop is down.
+            virtual_desktop: false,
+            ..ArmFacts::default()
+        };
+        assert_eq!(
+            told(vd).len(),
+            2,
+            "the plan is the desktop's: every session"
+        );
+        let drm = ArmFacts { drm: true, ..vd };
+        assert!(told(drm).is_empty(), "drm_capture plans the console");
+        let portal = ArmFacts { portal: true, ..vd };
+        assert!(told(portal).is_empty(), "portal_capture plans the portal");
+        let mutter = ArmFacts {
+            portal: true,
+            portal_via_mutter: true,
+            ..vd
+        };
+        assert!(told(mutter).is_empty(), "mutter_capture plans mutter");
+        let no_x11 = ArmFacts {
+            x11_built: false,
+            ..vd
+        };
+        assert!(
+            told(no_x11).is_empty(),
+            "a build without X11 captures nothing"
+        );
     }
 
     /// Review R2-5 — how the daemon logs a keeper's line after its first

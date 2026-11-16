@@ -38,6 +38,14 @@ impl Server {
     }
 
     pub fn raw(&self) -> *mut xcb_connection_t { self.raw }
+
+    /// ROOMLER PATCH: the connection has failed: the server closed it (it
+    /// exited) or a protocol error shut it. XCB sets this on the first read
+    /// or write that fails and never clears it, so asking costs no round
+    /// trip. Upstream binds `xcb_connection_has_error` for `connect` only.
+    pub fn has_error(&self) -> bool {
+        unsafe { xcb_connection_has_error(self.raw) != 0 }
+    }
     pub fn screenp(&self) -> i32 { self.screenp }
     pub fn setup(&self) -> *const xcb_setup_t { self.setup }
 }
