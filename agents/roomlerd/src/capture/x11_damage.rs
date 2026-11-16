@@ -72,6 +72,13 @@ pub struct DamageTracker {
     /// failure. Distinct from `overflowed`: there we still have a truthful
     /// bounding box, here we have nothing and must say `Unknown`.
     blind: bool,
+    /// #3671 — the connection failed: said once, never polled again, and
+    /// blind for good. If only this connection broke and the server lives,
+    /// capturing every tick is right; if the server went away, the capture's
+    /// own check stops the frames (`scrap_backend`, `connection_lost`).
+    /// Before, the next poll read the same dead connection and warned again:
+    /// a warning per tick, 56 a second in the field.
+    dead: bool,
 }
 
 impl DamageTracker {
@@ -155,6 +162,7 @@ impl DamageTracker {
             rects: Vec::new(),
             overflowed: false,
             blind: false,
+            dead: false,
         })
     }
 
@@ -191,6 +199,9 @@ impl DamageTracker {
     /// no longer tell what changed, the safe answer is "assume it did, and
     /// admit we cannot say where".
     fn drain_events(&mut self) {
+        if self.dead {
+            return;
+        }
         loop {
             match self.conn.poll_for_event() {
                 Ok(Some(Event::DamageNotify(ev))) => {
@@ -218,6 +229,7 @@ impl DamageTracker {
                         "capture: X11 damage connection failed — assuming the screen changed from here on"
                     );
                     self.blind = true;
+                    self.dead = true;
                     return;
                 }
             }
@@ -235,8 +247,12 @@ impl DamageTracker {
     fn consume(&mut self) {
         self.rects.clear();
         self.overflowed = false;
-        self.blind = false;
+        // #3671 — a dead connection stays blind: nothing will ever say where.
+        self.blind = self.dead;
         self.last_capture = Instant::now();
+        if self.dead {
+            return;
+        }
         if let Ok(cookie) = self
             .conn
             .damage_subtract(self.damage, x11rb::NONE, x11rb::NONE)
@@ -358,5 +374,85 @@ mod tests {
         // the connect this test is here to exercise.
         unsafe { tunnel_core::env::test_env::clear("X11_DAMAGE") };
         let _ = DamageTracker::open_on(Some(":-1-not-a-display"));
+    }
+
+    /// What `f` logs on this thread, as the daemon's log file writes it, with
+    /// what it returned.
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = buf.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (out, String::from_utf8_lossy(&text).into_owned())
+    }
+
+    /// #3671 — a tracker whose X server went away says so once and never
+    /// polls the dead connection again. Every tick after it captures, with
+    /// its damage `Unknown`: the capture's own check stops the frames
+    /// (`scrap_backend`). Before, each tick polled the same dead connection
+    /// and warned again, 56 warnings a second in the field. Against an Xvfb
+    /// of the test's own, SIGKILLed (`ROOMLERD_TEST_X11=1`, CI's X11 step).
+    #[test]
+    fn a_tracker_whose_server_went_away_says_so_once() {
+        if !crate::virtual_desktop::TestX::opted_in() {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        let _serial = KILL_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised with the other writers by KILL_SWITCH, and only
+        // `DamageTracker::open` reads this variable.
+        unsafe { tunnel_core::env::test_env::clear("X11_DAMAGE") };
+        let x = crate::virtual_desktop::TestX::start()
+            .expect("ROOMLERD_TEST_X11=1 but no Xvfb came up");
+        let mut tracker = DamageTracker::open_on(Some(x.display())).expect("Xvfb has DAMAGE");
+        assert!(
+            matches!(tracker.tick(), Tick::Capture(_)),
+            "the first tick captures"
+        );
+        x.kill();
+        // As a session's capture asks, tick after tick: 200 ticks, about four
+        // seconds of a session at 50 a second, here 2 ms apart.
+        let (blind, log) = logged(|| {
+            (0..200)
+                .filter(|_| {
+                    let tick = tracker.tick();
+                    std::thread::sleep(Duration::from_millis(2));
+                    matches!(tick, Tick::Capture(Damage::Unknown))
+                })
+                .count()
+        });
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|l| l.trim_start().starts_with("WARN"))
+            .collect();
+        assert_eq!(warned.len(), 1, "one exit, warned: {warned:#?}");
+        assert_eq!(blind, 200, "a tick after the exit did not capture blind");
+        println!(
+            "x11-real: a killed X server cost the damage watcher {} warning in 200 ticks",
+            warned.len()
+        );
     }
 }

@@ -20,6 +20,15 @@ impl Capturer {
     pub fn frame<'a>(&'a mut self) -> io::Result<Frame<'a>> {
         Ok(Frame(self.0.frame()))
     }
+
+    /// ROOMLER PATCH: this capturer's X connection has failed. From then on
+    /// `frame` hands back whatever its shared memory last held, for ever,
+    /// because the reply it waits for never comes and its result is not
+    /// read: a server that went away reads as a screen that stopped
+    /// changing. Ask after a `frame`, whose wait is what finds the failure.
+    pub fn connection_lost(&self) -> bool {
+        self.0.display().server().has_error()
+    }
 }
 
 pub struct Frame<'a>(&'a [u8]);
