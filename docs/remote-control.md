@@ -548,6 +548,78 @@ into one the pipeline reads stale (rc.443), and a viewer that joins after that
 evicts it and opens a capture of its own
 ([`linux-capture.md` §4.6](linux-capture.md#46-one-request-per-host-and-an-open-that-holds-no-worker-fr-93-p2d)).
 
+⚠️ **A session open when the virtual desktop's X server exits is told too**
+(#3671). The daemon starts its own virtual desktop again after an exit
+([`linux-capture.md` §2.4](linux-capture.md#24-what-an-x-server-exit-does-to-everything-that-was-open-3671-3918)),
+and every session registered at that moment gets, one stop grace (1 s) after
+the exit, the reason a session opened while the desktop is down gets:
+`backend_error`, with *this device's virtual desktop is down: its X server
+(Xvfb) exited: … The agent starts it again by itself; reconnect in a moment.*
+(`down_detail_of`, `agents/roomlerd/src/virtual_desktop.rs:361`). The
+supervisor reads who to tell on its own thread and sends one
+`spawn_capture_unavailable_notice` per session on the daemon's runtime
+(`sessions_told_via`, `virtual_desktop.rs:436`), so it never waits on a
+channel. Only where the device's plan is the virtual desktop
+(`capture::sessions_capture_the_virtual_desktop`,
+`agents/roomlerd/src/capture/mod.rs:1535`); under an explicit `drm_capture` or
+`portal_capture` arm, and with `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0`,
+nobody is told. **The viewer keeps that notice until the person connects
+again, even if frames reach the session later** (a follower promoted, a
+transport flip that reopens its capture): `mediaUnavailable` is cleared only
+by a new connect (`ui/src/composables/useRemoteControl.ts:10058`), never by a
+frame, so the overlay (`ui/src/views/remote/RemoteControl.vue:1394`) stays.
+That is the point: such a session has no input of the new desktop until it
+reconnects (§6.1c).
+
+⚠️ **A shared pipeline is retired with the X server it read** (#3671). A
+pipeline whose capture read the dead server would hand its last picture to
+every new viewer of its profile. Where the device's plan is the virtual
+desktop, the supervisor retires every registered pipeline
+(`media_share::retire_all`, `agents/roomlerd/src/media_share.rs:1006`) after
+the stop grace, before the sessions are told, and again once the restarted
+desktop is up, which catches what registered while it was down (`retire_if`,
+`virtual_desktop.rs:468`). A retired pipeline takes no joiner and its key is
+free, so the next viewer of the profile runs a capture and an encoder of its
+own on the new server. Its owner and its followers keep what they share and
+are told with the rest; detaching a follower would send it back into an open
+that is refused while the desktop is down. At most one `INFO` line a retire,
+and only when it retired something. ⚠️ **The lock order is a pipeline's lock,
+then the registry, never the other way round**: the spill gate counts the
+registry while it holds a pipeline, so `retire_all` takes the entries out
+under the registry's lock and closes each pipeline only after that lock is
+released (`media_share.rs:997-1000`), and `try_join`'s refusal below lets the
+pipeline's lock go before it takes the registry.
+
+⚠️ **A pipeline whose owner is marked takes a joiner only when its capture
+reads no X server** (#3918). A session open at an X server exit is marked
+(§6.1c), and so is a session told that it has no picture of the virtual
+desktop. A marked owner's capture may be reading the X server that went
+away, so `try_join` refuses a new viewer of its pipeline, after the stale
+owner's eviction (an owner silent for 10 s is evicted first, as before), unless
+the capture is known not to read one (`media_share.rs:898`). The pipeline
+knows that from what its owner published: `publish_video_info` reads the arm
+that `rc:video-info` names (`names_a_capture_off_x`, `media_share.rs:823`)
+before it takes the pipeline's lock and stores the payload and the fact under
+one hold. It fails closed: `x11`, an arm this build does not know, a payload
+without the field and one that is not JSON all read as an X client, and so
+does a pipeline whose owner published nothing yet. Whether an arm reads an X
+server is decided in one place with no wildcard
+(`CaptureArm::reads_an_x_server`, `agents/roomlerd/src/capture/mod.rs:665`), and
+the test `media_share::tests::every_capture_arm_is_decided_on_or_off_x_and_what_is_unknown_fails_closed`
+walks every arm: a new `CaptureArm` does not compile until it is decided
+there and beside the tests' list (`media_share.rs:2179-2188`). A refused
+viewer runs a capture and an encoder of its own: one more of each, and on a
+portal host without a restore token one more consent dialog. While the
+owner's portal request is still pending, that viewer's open takes the request
+over and the owner's open falls through to the virtual desktop
+([#3945](https://github.com/gjovanov/roomler-ai/issues/3945)). After an FFmpeg
+error reopen nothing publishes the capture again, so the refusal can last for
+the pipeline's life. With `ROOMLERD_INPUT_X11_FOLLOW=0` nothing reads a mark,
+and every pipeline takes joiners as before #3918. A Linux build without
+`enigo-input` marks nothing and relies on the two retires. Pinned by
+`media_share::tests::a_pipeline_whose_owner_has_no_picture_takes_no_joiner` and
+`virtual_desktop::supervise_tests::with_another_arm_a_marked_owners_pipeline_takes_no_joiner`.
+
 ⚠️ **macOS fails this two different ways** and both are handled. Without the
 grant, older macOS opened `CGDisplayStream` fine and delivered wallpaper-only
 frames (`scrap_backend::primary` preflights and warns for that shape);
@@ -1704,6 +1776,138 @@ sequenceDiagram
 With `DISPLAY` set the open runs as before, and a failed one still prints enigo's ERROR lines and warns. The doubling still bounds the regrant tries: about nine in a session's first minute, then one a minute while events arrive.
 
 Off macOS only a Noop reports no permission, because enigo, SystemContext and uinput all report it once they open. So this can never drop an injector that works.
+
+### 6.1c The injector follows the virtual desktop (#3918)
+
+On a Linux host whose desktop is the daemon's own virtual desktop, the
+arbiter's one injector is the X11 one (enigo over XTest), an X client of that
+desktop's X server. When the server exits, the supervisor starts it again on
+the same display
+([`linux-capture.md` §2.4](linux-capture.md#24-what-an-x-server-exit-does-to-everything-that-was-open-3671-3918)),
+but the cached injector keeps the dead connection. Before #3918 every key,
+click and pointer move failed from then on, with an `ERROR` from enigo for
+each (one a key, two a click or a move), in every session, until the daemon
+restarted.
+
+**The injector records the X server it opened on.** At its open it reads the
+desktop's generation (`x_follow::opened_under`,
+`agents/roomlerd/src/input/x_follow.rs:85`, kept by the injector as
+`x_generation`); an injector that is no X client of the desktop records none.
+Before each of the arbiter's three lazy opens (the warm-up, an event's
+injection and a keep-busy move), and as the last step before it,
+`follow_the_desktop` (`agents/roomlerd/src/input/arbiter.rs:1432`) asks the
+gate (`x_follow::gate_at`, `x_follow.rs:130`):
+
+| The desktop | The cached injector | What happens |
+|---|---|---|
+| down | the desktop's X11 one, or none where the open would be the X11 one | the event is dropped and nothing is opened; said once a down period, at `INFO` |
+| up, on the generation the injector opened on | the desktop's X11 one | it is used |
+| up, on a newer generation | the desktop's X11 one | it is told its server is gone, dropped as a stale one is, and the lazy open after the gate connects to the new server (`let_go`, `x_follow.rs:162`); one `INFO` |
+| any | not an X client of the desktop (uinput, or any injector off Linux) | not concerned: the desktop is not even read, so no lock is taken |
+
+The gate is last because the regrant can drop an injector and open it again
+inside one command: a gate ahead of that would let an open reach a display
+with no server behind it, and warn at every regrant. The generation and the
+down period come in one read under the lock that publishes the desktop up
+(`virtual_desktop::x_server_now`), so an injector never records the new
+generation for the old server. That lock is held across one process spawn at
+most, never across a kill, a reap or the wait for a new server, so an event
+waits at most one fork and exec, on the arbiter's own thread.
+
+The arbiter's record of what each session holds is left alone: a release for
+a press made on the old server goes to the new one, where an XTest release of
+a key or button that is not down changes nothing, and nothing stays held.
+
+**The session rule.** A session that has no picture of the virtual desktop has
+no input of it either, for as long as its input would reach the desktop's X
+server.
+
+- **Who is marked.** At an X server exit the supervisor marks every session
+  registered at that moment, on its own thread, before it reads the device's
+  plan or the tell's switch and before the restart can publish the desktop up
+  (`sessions_told_via`, `agents/roomlerd/src/virtual_desktop.rs:436`). FR-80's
+  notice also marks the session it tells, when its reason is this daemon's
+  virtual desktop being down (`input::told_no_picture`,
+  `agents/roomlerd/src/input/mod.rs:93`): a session whose open was refused
+  while the desktop was down, the followers of a shared pipeline when its owner
+  tells them, and a later joiner told the same. A session opened while the
+  desktop was down whose capture opens only once it is back was told nothing,
+  is not marked, and sees and types into the new desktop. A mark goes when its
+  session closes, and nowhere else.
+- **Where a mark is read.** At the start of every command
+  (`Sessions::forget_left_behind`, `x_follow.rs:309`): a marked session whose
+  input would reach the desktop's X server is left behind, and any other marked
+  session is taken back. Again at the injection point, on the OS injector's
+  branch and only for an injector that is an X client of the desktop
+  (`arbiter.rs:1514`), because the regrant can swap the injector and a route
+  can come or go inside one command. And at a shared pipeline's join (§5.1a).
+- **What a mark never touches.** Input that goes elsewhere: a portal or
+  compositor route into a person's real desktop, and uinput. That is decided
+  again before every command.
+- **A session left behind** is a session without input (`leave_behind`,
+  `arbiter.rs:388`): its events are dropped before any injector, and said once
+  for the session at `INFO` until it closes. Its floor requests and grants,
+  its mode, keep busy and layout switches are refused as for a session without
+  an INPUT grant. What it holds is forgotten, releasing nothing: its presses
+  went with their X server, so no release of them reaches the new one, through
+  its close, the modifier fence or a floor takeover. The floor it holds, and a
+  request it made, are given up, so the person who reconnects does not wait
+  out an idle takeover from their own dead session, and the viewers are told;
+  taken back, it does not get them back. A session reconnecting is a new
+  session, with input.
+- **The switches.** `ROOMLERD_VIRTUAL_DESKTOP_TELL_SESSIONS=0` silences the
+  notice and not the marks: such a session keeps its last picture and has no
+  input of the desktop until it reconnects. `ROOMLERD_INPUT_X11_FOLLOW=0` turns
+  off the follow and every reader of a mark, the arbiter's and a shared
+  pipeline's join, so input and joins are as before #3918; the marks are still
+  written. Marks exist only on Linux builds with `enigo-input` (`full` and
+  `full-hw` carry it).
+
+**What a mark costs, by where the picture comes from and which injector
+carries the input.** "Master" is the behaviour before #3918; "told" is #3671's
+notice.
+
+| Picture | Input | Left behind | Its input, against master | A new viewer of its pipeline, against master | Told |
+|---|---|---|---|---|---|
+| the virtual desktop, by plan | the X11 injector | yes, at every command | nothing (on master that input was dead for the daemon's life). In exclusive mode the floor it gives up goes to the next session that acts, whose command tells the viewers | nothing it can see: the dead server's pipelines are retired at the exit and once the desktop is back. A pipeline the marked session registers later is refused although live: one more capture and encoder | yes |
+| the virtual desktop, by plan | uinput | no | nothing | as above | yes |
+| the virtual desktop, after an explicit `drm_capture` or `portal_capture` arm fell through to it | the X11 injector (or uinput that failed and fell back to it) | yes | nothing; exclusive mode as above | nothing, and better than master: nothing is retired (the plan is another arm), but the owner published `x11` or nothing, so the pipeline is refused (on master new viewers followed the frozen picture) | no |
+| the same fall-through | uinput | no | nothing | as the row above | no |
+| an explicit `drm_capture` that opens | uinput | no | nothing | `drm` published: joins as on master. While a marked owner reopens its capture, refused: one more capture and encoder, and with no end after an FFmpeg error reopen | no |
+| an explicit `drm_capture` that opens | the X11 injector | yes | nothing it can see; exclusive mode as above | as the row above | no |
+| an explicit `portal_capture` or `mutter_capture` that opens, with `portal_input` | the portal or mutter route | only in a moment with no route (a capture's reopen, the route owner's close) | events: nothing, since the route is read before the mark. In exclusive mode the floor and a pending request given up in such a moment are not given back | `portal` or `mutter` published: joins as on master. While a marked owner reopens and still beats: refused, one more capture and encoder, one more consent dialog without a restore token, #3945's takeover while the owner's portal open is pending, and with no end after an FFmpeg error reopen. An owner silent past 10 s is evicted first, as on master | no |
+| this session fell through, another session's route is live | the other session's route | no | nothing | the fall-through owner's pipeline is refused, as above; the route owners' as in the row above | no |
+| an explicit portal or mutter capture that opens, without `portal_input` | the X11 injector | yes | nothing it can see; exclusive mode as above | as the portal row; in #3945's takeover the owner's viewers lose the real desktop's picture, while their input already went to the virtual desktop | no |
+| a person's real desktop, no virtual desktop | any | never marked | nothing | nothing | — |
+| the per-user delegate worker | its own arbiter | never marked | nothing | nothing | — |
+| Windows, macOS, and Linux without `enigo-input` | — | no marks | nothing | nothing; on Linux without `enigo-input` a fall-through device's later viewers still join the frozen picture, as on master | — |
+
+**Log lines for one X server exit**: at most one `INFO` a down period when
+input arrives while the desktop is down, one `INFO` at the reopen when an X11
+injector was open, one `INFO` per session left behind that sends input, and an
+enigo `ERROR` only for an event in the moment between the server's death and
+the supervisor marking the desktop down.
+
+**Proven** by `input::x_follow::tests` (the gate, the marks, the switch:
+`nothing_but_the_desktops_x11_injector_follows_it`,
+`a_session_told_it_has_no_picture_stays_marked_until_its_close`,
+`with_the_kill_switch_nothing_reads_a_mark`), `input::arbiter::tests`
+(`input_while_the_desktop_is_down_reaches_nothing_and_is_said_once`,
+`a_noop_the_regrant_drops_while_the_desktop_is_down_opens_nothing`,
+`a_told_session_is_refused_as_one_without_input_and_gives_up_the_floor`,
+`another_sessions_event_or_takeover_releases_nothing_of_a_told_session`,
+`a_session_opened_while_down_and_never_told_types_once_the_desktop_is_back`),
+`input::tests::x11_would_open_names_every_route_open_default_tries_ahead_of_enigo`
+(the open's routes and the gate's reading of them stay one list), and, against
+a real X server that is killed and started again,
+`input::arbiter::x11_follow_tests` in CI's step "#3918 — remote input follows
+the virtual desktop to a new X server, on a real X server".
+
+**Not covered.** Two `rc:control.state` broadcasts for one viewer can arrive
+in the other order, and the viewer then keeps the older state
+([#3946](https://github.com/gjovanov/roomler-ai/issues/3946)). A portal
+capture beside the virtual desktop, where a session can see one desktop and
+type into the other ([#3945](https://github.com/gjovanov/roomler-ai/issues/3945)).
 
 ### 6.2 Remote cursor
 
@@ -5388,6 +5592,30 @@ to-activate, so the browser never sees a bait-and-switch.
   of it is unmeasured. A broken gate connection drops back to text
   polling with images unwatched. Kill switch
   `ROOMLERD_CLIPBOARD_X11_WATCH=0`.
+- **The worker follows the virtual desktop (#3671)**: on a host whose desktop
+  is the daemon's own, an X server exit used to leave the one worker on the
+  dead server for the daemon's life: copy and paste failed, and the X11 gate
+  stayed shut. Once the desktop is up on a newer X server than its handle's,
+  the worker takes arboard's process-wide connection down through a second
+  handle, opens a fresh one on the new server on a helper thread and proves it
+  with a read, under a 6 s bound, and the gate opens again (`x11_follow`,
+  `agents/roomlerd/src/clipboard.rs:1035`; `Follow::check`, `:1138`). A
+  follow that failed, and a first start (`Clipboard::shared`, `:459`) or a
+  gate check (`available`, `:1410`) that failed while the desktop was down,
+  are tried again at most every 10 s once its server answers (`Retry`,
+  `:700`). A session the desktop's restart left behind keeps the daemon's
+  clipboard: until it reconnects it receives the new desktop's copies, and its
+  pastes set the new desktop's clipboard, under the same grant as before. The
+  hello still announces copied images as its first probe found them
+  ([#3927](https://github.com/gjovanov/roomler-ai/issues/3927)). The follow
+  rests on how arboard 3.6.1's `Drop` counts its handles before it closes the
+  connection, so the workspace pins `arboard` to `=3.6.1` (`Cargo.toml:326`).
+  An upgrade has to read that `Drop` again; the CI control
+  `x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server`
+  turns red when its rule changes. Kill switch
+  `ROOMLERD_CLIPBOARD_X11_REBUILD=0` (the first connection is kept); the retry
+  of a failed first start has none. Bounds and log lines:
+  [`linux-capture.md` §2.4](linux-capture.md#24-what-an-x-server-exit-does-to-everything-that-was-open-3671-3918).
 - **The watcher on a Mac (FR-97 P2e-1)**: the same gate, from
   `NSPasteboard`'s change count, which the pasteboard server moves on every
   write by any app (`agents/roomlerd/src/clipboard.rs:756` `mac_gate`). The
