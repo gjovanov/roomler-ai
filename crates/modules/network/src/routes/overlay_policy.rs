@@ -136,6 +136,17 @@ fn validate(body: &UpsertOverlayPolicyRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The role ids a rule's `RoleId` sources name.
+fn source_role_ids(sources: &[OverlaySelector]) -> Vec<ObjectId> {
+    sources
+        .iter()
+        .filter_map(|s| match s {
+            OverlaySelector::RoleId { role_id } => Some(*role_id),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn gate(
     state: &NetworkState,
     tenant_id: &str,
@@ -180,6 +191,9 @@ pub async fn create(
 ) -> Result<Json<OverlayPolicyResponse>, ApiError> {
     let tid = gate(&state, &tenant_id, &auth).await?;
     validate(&body)?;
+    // A role source names a role of this org, or the body is a 400.
+    roomler_core::guards::require_org_roles(&state, tid, &source_role_ids(&body.sources), &[])
+        .await?;
     let created = state
         .overlay_policies
         .create(
@@ -230,8 +244,17 @@ pub async fn update(
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     // Resolve the target LIVE before touching it — a removed policy is a 404
     // whatever the body says, like a bogus or foreign id.
-    state.overlay_policies.find_live_in_tenant(tid, pid).await?;
+    let stored = state.overlay_policies.find_live_in_tenant(tid, pid).await?;
     validate(&body)?;
+    // A role source names a role of this org; one the stored rule already
+    // names is accepted back (`require_org_roles`).
+    roomler_core::guards::require_org_roles(
+        &state,
+        tid,
+        &source_role_ids(&body.sources),
+        &source_role_ids(&stored.sources),
+    )
+    .await?;
     let changed = state
         .overlay_policies
         .update(
@@ -299,6 +322,30 @@ pub async fn set_mode(
     state.overlay_networks.set_acl_mode(tid, body.mode).await?;
     refan_tenant(&state, tid).await;
     Ok(Json(AclModeResponse { mode: body.mode }))
+}
+
+/// Re-fan the org after a change of who holds which role
+/// (`MembershipHooks::org_roles_changed`): role-scoped rules are compiled into
+/// each node's netmap, the DERP allow table and the relay grants, so a role
+/// given, taken or deleted takes effect on the nodes only when they are
+/// recompiled. Only for an org that has an overlay network whose ACL is not
+/// `off`, the only postures in which a role-scoped rule shapes anything; the
+/// lookup never creates a network row.
+pub(crate) async fn refan_for_role_change(state: &NetworkState, tenant_id: ObjectId) {
+    let network = match state.overlay_networks.find_for_tenant(tenant_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(%tenant_id, %e,
+                "overlay acl: roles changed, but the network could not be read; nodes keep their \
+                 netmaps until the next re-fan");
+            return;
+        }
+    };
+    if matches!(network.acl_mode, OverlayAclMode::Off) {
+        return;
+    }
+    refan_tenant(state, tenant_id).await;
 }
 
 /// Re-fan every node in the tenant so a policy edit takes effect immediately,

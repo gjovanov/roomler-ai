@@ -46,7 +46,7 @@ pub async fn status(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         print_status(&status);
-        print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
+        print_other_daemon_hint(crate::other_daemon::Hint::Status).await;
     }
     Ok(())
 }
@@ -62,35 +62,35 @@ pub async fn status(json: bool) -> Result<()> {
 /// Only printed in human mode: `--json` output is parsed, and a stray line
 /// would be a breaking change for anything consuming it.
 ///
-/// `what` says what the per-user half's answer leaves out, per command: the
-/// overlay for `status` / `peers` / `why`, the root half's configuration for
-/// `config ls` / `config set` (#2871).
-async fn print_other_daemon_hint(what: &str) {
-    if let Some(other) = localapi::other_daemon_socket().await {
-        eprintln!();
-        eprintln!(
-            "note: a second roomler daemon is running on this host ({}).",
-            other.display()
-        );
-        eprintln!("      This is the per-user half; {what}");
-        eprintln!("      Use `sudo roomler …` to ask that one instead.");
+/// `hint` says what the answer leaves out, per command (#2871 added `config`);
+/// the words, and a one-row Mac's (#3898), are `crate::other_daemon`'s.
+async fn print_other_daemon_hint(hint: crate::other_daemon::Hint) {
+    let other = localapi::other_daemon_socket().await;
+    let one_row = root_runs_one_row(other.as_deref()).await;
+    for line in crate::other_daemon::note(hint, other.as_deref(), one_row) {
+        eprintln!("{line}");
     }
 }
 
-/// The hint's second line for the network commands.
-const OVERLAY_IS_THE_ROOT_HALFS: &str = "the overlay runs in the privileged one.";
-
-/// #2871 — the hint's second line for `config ls` / `config set`. On a
-/// supervised Mac (FR-43) the per-user half the unprivileged CLI reaches has a
-/// configuration of its own, and the device-owned gates that matter to an
-/// administrator — the overlay, Roomler SSH, remote commands — are read from
-/// the ROOT half's `/etc/roomler/config.toml`. Before this line the command
-/// listed, and changed, the per-user half's file with no word that another
-/// existed; the Mac in #2871 showed `ssh_enabled = false` here while the root
-/// half served SSH.
-const CONFIG_IS_THE_PER_USER_HALFS: &str = "this is ITS configuration. The root daemon's keys \
-     (the overlay, SSH, exec) live in its own file: `sudo roomler config ls` / `sudo roomler \
-     config set <key> <value>`.";
+/// #3898 — does this Mac's root daemon run one row (FR-43 P3a)? Its own word
+/// (`gui_worker.one_row`) in the status it serves this account on the person
+/// socket; the screen worker that answered has the device's status, not that.
+/// `None` with no second daemon, off macOS, and when the root daemon refuses,
+/// predates the field or takes 300 ms: the note then keeps its words.
+async fn root_runs_one_row(other: Option<&std::path::Path>) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if let (Some(_), Some(path)) = (other, localapi::own_person_socket_path()) {
+        let ask = async {
+            let mut root = localapi::connect_unix_served_by_root(path).await.ok()?;
+            root.status().await.ok()
+        };
+        let status = tokio::time::timeout(std::time::Duration::from_millis(300), ask).await;
+        return status.ok().flatten()?.gui_worker.map(|w| w.one_row);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = other;
+    None
+}
 
 /// `roomler logs` — surface the S2 `TailLog` verb on the CLI.
 ///
@@ -294,7 +294,7 @@ pub async fn peers(args: PeersArgs) -> Result<()> {
     if names.is_empty() {
         print_dark_orgs(&orgs, &peers);
     }
-    print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Network).await;
     Ok(())
 }
 
@@ -648,7 +648,7 @@ pub async fn why(peer: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     print_why(p);
-    print_other_daemon_hint(OVERLAY_IS_THE_ROOT_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Network).await;
     Ok(())
 }
 
@@ -1557,13 +1557,31 @@ pub async fn config_ls(json: bool) -> Result<()> {
         } else {
             "live"
         };
-        println!("{:key_w$}  {:9}  {:8}  {value}", e.key, e.kind, applies);
+        // #2871 — a key this connection cannot set: the daemon's own word
+        // (`read_only`), on the person-at-the-device socket of a system
+        // install, where only the keys that are the person's own call change.
+        let note = if e.read_only.is_some() {
+            "  (an administrator's)"
+        } else {
+            ""
+        };
+        println!(
+            "{:key_w$}  {:9}  {:8}  {value}{note}",
+            e.key, e.kind, applies
+        );
     }
     println!(
         "\n`restart` keys take effect on the next daemon restart, `live` keys at once — \
          `roomler config set <key> <value>`"
     );
-    print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
+    if entries.iter().any(|e| e.read_only.is_some()) {
+        println!(
+            "keys marked `(an administrator's)` are the root daemon's to change: this is its \
+             person-at-the-device socket, which serves them read-only — \
+             `sudo roomler config set <key> <value>`"
+        );
+    }
+    print_other_daemon_hint(crate::other_daemon::Hint::Config).await;
     Ok(())
 }
 
@@ -1600,7 +1618,7 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
         println!("{note}");
     }
     // #2871 — and WHICH daemon's file just changed, when this host runs two.
-    print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
+    print_other_daemon_hint(crate::other_daemon::Hint::Config).await;
     Ok(())
 }
 
@@ -2154,11 +2172,23 @@ fn print_password_next_steps(state: &localapi::ExternalPasswordState) {
 /// ENOENT must never surface, and `main` prints just this one line). Everything
 /// else keeps its context. Both branches are returned BEFORE any stdout write,
 /// so `--json | jq` on a dead daemon fails cleanly with empty stdout.
+///
+/// #3736 — when this account had no per-user socket to try at all (no private
+/// runtime directory: cron, `su`, a shell without a login session), the line
+/// says so, since a per-user daemon could not be reached from here either.
 pub(crate) fn daemon_err(e: io::Error) -> anyhow::Error {
     if e.kind() == io::ErrorKind::NotFound {
-        anyhow!("roomler daemon not running (is the service started?)")
+        not_running(localapi::no_per_user_socket_note())
     } else {
         anyhow!("talking to the roomler daemon: {e}")
+    }
+}
+
+/// The "not running" line, with why there was no per-user socket to try.
+fn not_running(note: Option<String>) -> anyhow::Error {
+    match note {
+        Some(note) => anyhow!("roomler daemon not running (is the service started?); {note}"),
+        None => anyhow!("roomler daemon not running (is the service started?)"),
     }
 }
 
@@ -2459,12 +2489,89 @@ pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
     format!("policy {}{source} — {state}{lid}", p.policy)
 }
 
+/// #3781 — `roomler status`'s `tray` lines for
+/// [`NodeStatus::companion_too_old`]: the tray beside this Windows daemon is
+/// too old to connect to it, Roomler replaces it by itself and when, the one
+/// command that retries now and the one that says why it failed. Those are
+/// the service's when the machine-wide service refreshes the tray, and this
+/// daemon's own when it does that itself. #3814: with the switch set where
+/// the refresh runs, that the tray is replaced only at a start.
+fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
+    let first = match &c.installed {
+        Some(v) => format!(
+            "OUT OF DATE: {v} cannot connect to this daemon, which needs {} or later",
+            c.minimum
+        ),
+        None => format!(
+            "version UNKNOWN (no version marker): one older than {} cannot connect to this \
+             daemon",
+            c.minimum
+        ),
+    };
+    let (retry, why) = if c.by_service {
+        (
+            "Restart-Service Roomler (as an administrator)",
+            "roomler logs --source service --grep \"desktop companion\"",
+        )
+    } else {
+        (
+            "restart roomlerd",
+            "roomler logs --grep \"desktop companion\"",
+        )
+    };
+    // #3814 — `ROOMLERD_COMPANION_SYNC=0` turns the retry off. The refresh at
+    // a start stays, so a restart still retries now.
+    let replaced = if c.retry_off {
+        "Roomler replaces it only at a start: its automatic retry is off \
+         (ROOMLERD_COMPANION_SYNC=0)"
+    } else {
+        "Roomler replaces it by itself, retrying every few minutes for an hour after a start, \
+         then every 4 h"
+    };
+    vec![
+        first,
+        replaced.to_string(),
+        format!("To retry now: {retry}"),
+        format!("Why it failed: {why}"),
+    ]
+}
+
+/// #3387 — `roomler status`'s line for [`NodeStatus::waiting_for_machine_enrollment`].
+const WAITING_FOR_MACHINE_ENROLLMENT: &str = "no machine enrollment yet: the Roomler service \
+     runs this person's own enrollment as them, so the lock and sign-in screens cannot be \
+     controlled. Run Roomler Setup, or `roomlerd enroll --machine-global` from an elevated prompt";
+
 fn print_status(s: &NodeStatus) {
     let mode = mode_label(s.mode, s.privileged);
     println!("{} {}", up_glyph(s.connected), s.name);
     println!("  node id     {}", short_id(&s.node_id));
     println!("  version     {}", s.version);
+    // FR-67 P3 — what the last install came to, right under the version it
+    // produced. Printed whenever the daemon reports it: an older daemon
+    // sends nothing and the line is absent, which must never be read as
+    // "never updated" — a daemon that was never updated SAYS `none recorded`.
+    if let Some(li) = &s.last_install {
+        println!(
+            "  last update {}",
+            last_install_line(li, &s.version, unix_now())
+        );
+    }
+    // #3781 — a Windows tray too old to connect to this daemon. Printed only
+    // when the daemon reports one, so every other device's output is
+    // byte-stable.
+    if let Some(c) = &s.companion_too_old {
+        for (i, line) in tray_lines(c).iter().enumerate() {
+            let label = if i == 0 { "tray" } else { "" };
+            println!("  {label:<11} {line}");
+        }
+    }
     println!("  mode        {mode}");
+    // #3387 — only from the person's own worker that a machine-wide service
+    // runs while the machine has no enrollment of its own: every other
+    // daemon's output stays byte-stable.
+    if s.waiting_for_machine_enrollment {
+        println!("  machine     {WAITING_FOR_MACHINE_ENROLLMENT}");
+    }
     // FR-51 — only when true: a permanent device's output stays byte-stable.
     if s.ephemeral {
         println!("  ephemeral   yes — removes itself after inactivity, or on clean stop");
@@ -2839,6 +2946,235 @@ fn credential_expiry(expires_at: i64, now_unix: i64) -> String {
             "re-enroll this device".to_string()
         };
         format!("EXPIRED {days} day{} ago ({next})", plural(days))
+    }
+}
+
+/// FR-67 P3 — the `last update` line of `roomler status`: one sentence per
+/// word of [`tunnel_core::localapi::LastInstallStatus`], the verdict first and
+/// in capitals when it wants a look.
+///
+/// ⚠️ `none recorded` (no record at all) and `NEVER REPORTED` (a record whose
+/// verdict never came) are two different sentences on purpose — the second
+/// is the state FR-67 was opened on, and one sentence for both would hide it
+/// again. A fresh `InProgress` is neither: on Windows the new service starts
+/// while the watcher still waits on msiexec, so for a while after an update
+/// the honest answer is "still at work".
+///
+/// `running` is the daemon's own version: a verified install of a release
+/// other than the one running is worth a word, because it means either a
+/// later install left no record or this daemon never restarted onto it.
+fn last_install_line(
+    li: &tunnel_core::localapi::LastInstallStatus,
+    running: &str,
+    now_unix: i64,
+) -> String {
+    use tunnel_core::localapi::LastInstallStatus as L;
+    let expected = li.expected_version.as_deref().unwrap_or("?");
+    let since = li
+        .started_unix
+        .map(|s| ago(now_unix.saturating_sub(s as i64)))
+        .unwrap_or_else(|| "at an unknown time".to_string());
+    let note = li.note.as_deref().unwrap_or("");
+    let path = li.path.as_deref().unwrap_or("the log dir");
+    match li.status.as_str() {
+        s if s == L::ABSENT => {
+            "none recorded — this daemon's updater has not installed anything yet".to_string()
+        }
+        s if s == L::IN_PROGRESS && li.never_reported(now_unix.max(0) as u64) => format!(
+            "NEVER REPORTED — {expected} started {since} and no verdict followed: the watcher \
+             was killed before it could write one ({path})"
+        ),
+        s if s == L::IN_PROGRESS => format!(
+            "in progress — {expected} started {since}; the post-install watcher has not \
+             reported yet"
+        ),
+        s if s == L::SUCCEEDED_VERIFIED => {
+            let probe = li
+                .new_binary_version
+                .as_deref()
+                .map(|v| format!(", verified: {v}"))
+                .unwrap_or_default();
+            let mismatch = if expected_is_running(expected, running) {
+                String::new()
+            } else {
+                format!(" — but this daemon runs {running}")
+            };
+            format!("ok — {expected} installed {since}{probe}{mismatch}")
+        }
+        s if s == L::SUCCEEDED_UNVERIFIED => format!(
+            "UNVERIFIED — {expected} {since}: the installer exited 0 but the version probe \
+             did not confirm it ({note})"
+        ),
+        s if s == L::INSTALLER_FAILED => format!(
+            "FAILED — {expected} {since}: the installer exited {} ({note})",
+            li.installer_exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "with no code".to_string())
+        ),
+        s if s == L::TIMEOUT => format!("TIMED OUT — {expected} {since}: {note}"),
+        s if s == L::WATCHER_STOPPED => format!("WATCHER STOPPED — {expected} {since}: {note}"),
+        s if s == L::UNREADABLE => format!("record UNREADABLE — {note} ({path})"),
+        // A newer daemon's word: shown as it is, never an error.
+        other => format!("{other} — {expected} {since} ({note})"),
+    }
+}
+
+/// `agent-v0.4.172` names the running `0.4.172`. Prefix-tolerant, so a tag
+/// spelled `v0.4.172` or bare matches too; never a semver compare — the line
+/// says "other than", not "older than".
+fn expected_is_running(expected: &str, running: &str) -> bool {
+    let tag = expected
+        .trim_start_matches("agent-")
+        .trim_start_matches('v');
+    !tag.is_empty() && tag == running.trim_start_matches('v')
+}
+
+/// A duration as `roomler status` says it: `12s ago`, `3m ago`, `2h ago`,
+/// `5d ago`. The coarse step is on purpose — an operator reads "days ago"
+/// against "the fleet updated last night", never a clock.
+fn ago(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 90 {
+        format!("{secs}s ago")
+    } else if secs < 5_400 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod last_install_tests {
+    use super::*;
+    use tunnel_core::localapi::LastInstallStatus as L;
+
+    fn record(status: &str) -> L {
+        L {
+            status: status.into(),
+            expected_version: Some("agent-v0.4.172".into()),
+            new_binary_version: Some("roomlerd 0.4.172".into()),
+            started_unix: Some(1_792_967_966),
+            finished_unix: Some(1_792_967_966),
+            installer_exit_code: Some(0),
+            note: Some("new binary at /usr/bin/roomlerd reports roomlerd 0.4.172".into()),
+            path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+        }
+    }
+
+    /// FR-67 — the three states that must never read as one: no record,
+    /// a record whose verdict never came, and a watcher still at work.
+    #[test]
+    fn absent_never_reported_and_in_progress_are_three_sentences() {
+        let now = 1_792_967_966 + 3 * 86_400;
+        let absent = last_install_line(&record(L::ABSENT), "0.4.172", now);
+        assert!(absent.starts_with("none recorded"), "{absent}");
+
+        let frozen = last_install_line(&record(L::IN_PROGRESS), "0.4.172", now);
+        assert!(frozen.starts_with("NEVER REPORTED"), "{frozen}");
+        assert!(frozen.contains("agent-v0.4.172 started 3d ago"), "{frozen}");
+        assert!(
+            frozen.contains("last-install.json"),
+            "says where to look: {frozen}"
+        );
+
+        let fresh = last_install_line(&record(L::IN_PROGRESS), "0.4.172", 1_792_967_966 + 17);
+        assert!(fresh.starts_with("in progress"), "{fresh}");
+        assert!(fresh.contains("started 17s ago"), "{fresh}");
+
+        assert_ne!(absent, frozen);
+        assert_ne!(frozen, fresh);
+    }
+
+    /// #3302 — a stopped watcher is its own sentence, never the "NEVER REPORTED" of
+    /// a record nobody has settled, and the note says what the daemon saw.
+    #[test]
+    fn a_stopped_watcher_says_so() {
+        let now = 1_792_967_966 + 3_600;
+        let line = last_install_line(&record(L::WATCHER_STOPPED), "0.4.171", now);
+        assert!(
+            line.starts_with("WATCHER STOPPED — agent-v0.4.172"),
+            "{line}"
+        );
+        assert!(line.contains("reports roomlerd 0.4.172"), "{line}");
+    }
+
+    /// The quiet line, and the one case it speaks up: a verified install of
+    /// a release other than the one this daemon runs.
+    #[test]
+    fn a_verified_install_is_ok_unless_it_is_not_what_runs() {
+        let now = 1_792_967_966 + 2 * 3_600;
+        let ok = last_install_line(&record(L::SUCCEEDED_VERIFIED), "0.4.172", now);
+        assert_eq!(
+            ok,
+            "ok — agent-v0.4.172 installed 2h ago, verified: roomlerd 0.4.172"
+        );
+        let other = last_install_line(&record(L::SUCCEEDED_VERIFIED), "0.4.175", now);
+        assert!(other.ends_with("— but this daemon runs 0.4.175"), "{other}");
+        assert!(expected_is_running("agent-v0.4.172", "0.4.172"));
+        assert!(expected_is_running("v0.4.172", "0.4.172"));
+        assert!(!expected_is_running("agent-v0.4.17", "0.4.172"));
+        assert!(
+            !expected_is_running("agent-v", "0.4.172"),
+            "an empty tag matches nothing"
+        );
+    }
+
+    /// Every verdict that is not a verified success leads with its word in
+    /// capitals and carries the watcher's note; a word this CLI has never
+    /// heard of is shown, not refused.
+    #[test]
+    fn the_other_verdicts_lead_with_their_word() {
+        let now = 1_792_967_966 + 600;
+        let mut failed = record(L::INSTALLER_FAILED);
+        failed.installer_exit_code = Some(1603);
+        failed.note = Some("installer exited with 1603".into());
+        let line = last_install_line(&failed, "0.4.172", now);
+        assert!(
+            line.starts_with("FAILED — agent-v0.4.172 10m ago: the installer exited 1603"),
+            "{line}"
+        );
+
+        let mut unverified = record(L::SUCCEEDED_UNVERIFIED);
+        unverified.note = Some("could not exec new binary --version: ENOENT".into());
+        let line = last_install_line(&unverified, "0.4.172", now);
+        assert!(line.starts_with("UNVERIFIED"), "{line}");
+        assert!(line.contains("ENOENT"), "{line}");
+
+        let mut timed_out = record(L::TIMEOUT);
+        timed_out.note = Some("installer did not exit within 600s".into());
+        let line = last_install_line(&timed_out, "0.4.172", now);
+        assert_eq!(
+            line,
+            "TIMED OUT — agent-v0.4.172 10m ago: installer did not exit within 600s"
+        );
+
+        let mut unreadable = record(L::UNREADABLE);
+        unreadable.note = Some("parsing /x/last-install.json: expected value".into());
+        let line = last_install_line(&unreadable, "0.4.172", now);
+        assert!(
+            line.starts_with("record UNREADABLE — parsing /x/last-install.json"),
+            "{line}"
+        );
+
+        let line = last_install_line(&record("RolledBack"), "0.4.172", now);
+        assert!(
+            line.starts_with("RolledBack — agent-v0.4.172 10m ago"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn ago_steps_coarsely_and_never_goes_negative() {
+        assert_eq!(ago(0), "0s ago");
+        assert_eq!(ago(-5), "0s ago");
+        assert_eq!(ago(89), "89s ago");
+        assert_eq!(ago(90), "1m ago");
+        assert_eq!(ago(5_399), "89m ago");
+        assert_eq!(ago(5_400), "1h ago");
+        assert_eq!(ago(172_799), "47h ago");
+        assert_eq!(ago(172_800), "2d ago");
     }
 }
 
@@ -3332,6 +3668,21 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3736 — "not running" says why there was no per-user socket to try,
+    /// when there was none, and is the one plain line otherwise.
+    #[test]
+    fn not_running_says_why_there_was_no_per_user_socket() {
+        assert_eq!(
+            not_running(None).to_string(),
+            "roomler daemon not running (is the service started?)"
+        );
+        let with = not_running(Some("XDG_RUNTIME_DIR is not set".into())).to_string();
+        assert_eq!(
+            with,
+            "roomler daemon not running (is the service started?); XDG_RUNTIME_DIR is not set"
+        );
+    }
 
     fn tier_row(tier: &str, eligible: bool, available: Option<bool>) -> TierWhy {
         TierWhy {
@@ -4413,6 +4764,77 @@ mod devices_tests {
         p.on_ac = Some(false);
         p.held = false;
         assert!(power_line(&p, true).starts_with("policy on-ac, on battery — free to sleep"));
+    }
+
+    /// #3781 — `roomler status` on a device whose tray is too old to connect
+    /// says so, says that Roomler retries by itself and when, and gives the
+    /// one command that retries now and the one that says why it failed: the
+    /// service's, or this daemon's own when it refreshes the tray itself. A
+    /// tray of unknown version says that, not a version it does not know.
+    #[test]
+    fn the_tray_lines_say_it_cannot_connect_and_what_to_do() {
+        let mut c = localapi::CompanionTooOld {
+            installed: Some("0.4.212".into()),
+            minimum: "0.4.216".into(),
+            by_service: true,
+            retry_off: false,
+        };
+        assert_eq!(
+            tray_lines(&c),
+            [
+                "OUT OF DATE: 0.4.212 cannot connect to this daemon, which needs 0.4.216 or later",
+                "Roomler replaces it by itself, retrying every few minutes for an hour after a \
+                 start, then every 4 h",
+                "To retry now: Restart-Service Roomler (as an administrator)",
+                "Why it failed: roomler logs --source service --grep \"desktop companion\"",
+            ]
+        );
+
+        c.by_service = false;
+        let own = tray_lines(&c);
+        assert_eq!(own[2], "To retry now: restart roomlerd");
+        assert_eq!(
+            own[3],
+            "Why it failed: roomler logs --grep \"desktop companion\""
+        );
+
+        c.installed = None;
+        assert_eq!(
+            tray_lines(&c)[0],
+            "version UNKNOWN (no version marker): one older than 0.4.216 cannot connect to this \
+             daemon"
+        );
+    }
+
+    /// #3814 — with `ROOMLERD_COMPANION_SYNC=0` set where the refresh runs,
+    /// the second line says the retry is off and names the switch. The
+    /// refresh at a start stays on, so the other three lines do not change.
+    #[test]
+    fn the_tray_lines_say_when_the_retry_is_off() {
+        let mut c = localapi::CompanionTooOld {
+            installed: Some("0.4.212".into()),
+            minimum: "0.4.216".into(),
+            by_service: true,
+            retry_off: false,
+        };
+        let retried = tray_lines(&c);
+        c.retry_off = true;
+        let off = tray_lines(&c);
+        assert_eq!(
+            off[1],
+            "Roomler replaces it only at a start: its automatic retry is off \
+             (ROOMLERD_COMPANION_SYNC=0)"
+        );
+        assert!(!off[1].contains("retrying"), "{}", off[1]);
+        assert_eq!(
+            [&off[0], &off[2], &off[3]],
+            [&retried[0], &retried[2], &retried[3]]
+        );
+
+        c.by_service = false;
+        let own = tray_lines(&c);
+        assert_eq!(own[1], off[1]);
+        assert_eq!(own[2], "To retry now: restart roomlerd");
     }
 
     /// FR-55 AC6 — `config set power_policy` on a Mac prints the daemon's own

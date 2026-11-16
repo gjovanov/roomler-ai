@@ -23,6 +23,7 @@
 pub mod acl;
 pub mod appdirs;
 pub mod apps_config;
+pub mod boot_id;
 /// FR-84 D6 — the companion's login-start registration (Run value, XDG
 /// entry), shared so the daemon and the companion spell it identically.
 pub mod companion_autostart;
@@ -36,9 +37,18 @@ pub mod enrollment;
 /// surface), placement (the SYSTEM/root-inside-the-active-profile rule) and
 /// writability, run by the daemon at set time and at every drop.
 pub mod files_dir;
+/// #3702 — `appdirs` is the one module that reads a folder variable.
+#[cfg(test)]
+mod folder_gate;
 pub mod logging;
 pub mod logs_upload;
 pub mod machine;
+/// #3737 — a machine registry key only SYSTEM and Administrators may change or
+/// read: where the Windows SYSTEM service keeps its anchor and SSH host key.
+pub mod machine_key;
+/// #3609 — the chain a Windows background service loads its machine
+/// enrollment from: repaired, then checked, and written only through new files.
+pub mod machine_tree;
 pub mod notify;
 /// FR-129 — the device-pairing client (`/api/pair/start`, `/api/pair/poll`):
 /// the wizard's half in A3, the daemon's `enroll --pair` in A4.
@@ -47,9 +57,6 @@ pub mod pairing;
 /// the `Join …? [y/N]` guard on `/dev/tty` or the Windows console, and
 /// `--pair-org` for a terminal that has none.
 pub mod pairing_terminal;
-/// FR-90 P4-5-1b — `knowhow_probe_reach`, where this device's knowhow
-/// probes may go: its syntax, shared by the config surface and the prober.
-pub mod probe_reach;
 pub mod recording_dir;
 /// macOS privacy-permission probes. Here rather than in `roomlerd`
 /// because the desktop companion needs them too and deliberately does NOT

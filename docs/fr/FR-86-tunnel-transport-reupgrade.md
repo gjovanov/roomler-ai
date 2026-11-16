@@ -25,7 +25,7 @@ The operator's decision (2026-09-28, on #1768): *"they should switch to the bett
 
 The ladder runs **only when a session opens**, and nothing ever re-opens a healthy session, so a route keeps the
 transport it happened to land on. The flow supervisor even remembers that QUIC-over-TURN failed
-(`quic_over_turn_failing`, `agents/roomlerd/src/tunnel/client_mgr.rs:839`) — but only uses it to choose the
+(`quic_over_turn_failing`, `agents/roomlerd/src/tunnel/client_mgr.rs:747`) — but only uses it to choose the
 NEXT session's first rung, and a healthy fallen-back session never ends on its own.
 
 ## The mechanism, in the code (master `f089d9992`)
@@ -62,7 +62,7 @@ the exit side are untouched. Its visible effect is that a route no longer refuse
 ### P2 — make-before-break re-upgrade
 
 The flow supervisor gains a **re-upgrade probe**. The order is `quic-v1` > `quic-derp-v1` > `webrtc-dc-v1`
-(`quic-derp-v1` only where `TUNNEL_DERP_FALLBACK` is on, `client_mgr.rs:957`), restricted to what the route's
+(`quic-derp-v1` only where `TUNNEL_DERP_FALLBACK` is on, `client_mgr.rs:865`), restricted to what the route's
 `--transport` preference allows (`auto` only; a pinned transport never re-upgrades).
 
 ```mermaid

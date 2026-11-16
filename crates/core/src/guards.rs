@@ -54,6 +54,44 @@ pub fn parse_tid(tenant_id: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(tenant_id).map_err(|_| ApiError::BadRequest("Invalid tenant_id".into()))
 }
 
+/// A rule or policy write names only roles of its own org: every id in
+/// `requested` that `stored` does not already hold must be a role of
+/// `tenant_id`, whoever writes it (ADMINISTRATOR included). 400 `bad_request`
+/// `Unknown role id: <hex>` otherwise, the same answer for another org's role
+/// and for no role at all.
+///
+/// ⚠️ An id the stored rule ALREADY names is accepted back as it is. The
+/// editors send the stored lists back on every save, so a stored id of a role
+/// deleted since must not make the rest of the rule unsaveable; it never
+/// matches anyone, because every gate reads a member's roles live
+/// (`TenantDao::member_live_role_ids`). ⚠️ Never DROP such an id either: an
+/// empty role allow-list means "no restriction by role" on the device
+/// policies, so removing the last id would widen a rule that matches nobody
+/// into one that matches everybody.
+pub async fn require_org_roles(
+    state: &Core,
+    tenant_id: ObjectId,
+    requested: &[ObjectId],
+    stored: &[ObjectId],
+) -> Result<(), ApiError> {
+    let new: Vec<ObjectId> = requested
+        .iter()
+        .copied()
+        .filter(|r| !stored.contains(r))
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let org = state.tenants.org_role_ids_among(tenant_id, &new).await?;
+    match new.iter().find(|r| !org.contains(r)) {
+        Some(unknown) => Err(ApiError::BadRequest(format!(
+            "Unknown role id: {}",
+            unknown.to_hex()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Tenant-permission gate: the caller must hold `flag` in `tenant_id`.
 ///
 /// FR-69 P3 — moved from the api crate's `routes/remote_control.rs`, where

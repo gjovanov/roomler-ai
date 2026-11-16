@@ -111,8 +111,8 @@ blake2 = { version = "0.10", optional = true }
 # WireGuard mac1, which its own doc calls "a ROUTER's pre-filter, not an
 # authenticator"), so its comparison must be constant-time. Already in the
 # lock transitively; this makes it a real dependency rather than an accident.
-# Unconditional since FR-90 P3-7-3b: a session's SOCKS5 listener compares its
-# RFC 1929 password, the listener's capability, in constant time too.
+# Unconditional, not behind `overlay` (FR-90 made it so, and FR-137 keeps it:
+# moving a dependency back under a feature buys nothing).
 subtle = { version = "2.6", default-features = false }
 # Unconditional since FR-97 P6b: `pgp_verify` de-armors the release `.asc`
 # sidecars for the agent's updater AND the CLI's `self-update`, and the CLI
@@ -191,6 +191,7 @@ features = [
     "Win32_NetworkManagement_Ndis",                     # NET_LUID_LH (fallback)
     "Win32_Networking_WinSock",                         # setsockopt IP_UNICAST_IF (rc.144 direct egress pin)
     "Win32_System_Registry",                            # RegOpenKeyExW/RegEnumValueW — read the firewall rule store (winfw, #1698)
+    "Win32_System_Threading",                           # OpenProcess/GetProcessTimes/WaitForSingleObject — the exit-DNS purge handoff (#3440)
 ]
 
 # FR-97 P1c — macOS DNS steering through the SCDynamicStore

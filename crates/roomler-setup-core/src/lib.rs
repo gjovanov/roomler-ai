@@ -20,9 +20,17 @@ pub mod asset_resolver;
 /// for the limited copy to be gone.
 pub mod elevation;
 pub mod extract;
+/// #3246 — a staged artifact, held open from the check to the run.
+pub mod held_file;
+/// #3432 — the wizard's HTTP client: names resolved with a failure of our own
+/// type, and a server's refusal as a type too.
+pub mod http;
 pub mod integration;
 pub mod msi_runner;
 pub mod progress;
+/// #3609 — the pipe between a limited wizard and its administrator step, which
+/// writes the machine enrollment of a background-service install.
+pub mod step_channel;
 pub mod token_peek;
 pub mod tunnel_enroll;
 pub mod wizard_state;

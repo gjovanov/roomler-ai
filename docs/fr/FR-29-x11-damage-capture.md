@@ -44,9 +44,9 @@ unchanged. Two consequences in
   **On Linux it is unreachable**: XShm always yields a full buffer.
 - `scrap_backend.rs:398` — every delivered frame is stamped
   `damage: Damage::Unknown`, so the encoder must treat all pixels as dirty and
-  `peer.rs:2513`'s `set_roi_hints` receives an empty rect list.
+  `peer.rs:2549`'s `set_roi_hints` receives an empty rect list.
 
-The pump already has the fast path this needs. `peer.rs:2191` logs
+The pump already has the fast path this needs. `peer.rs:2209` logs
 `"capture produced no frame (idle screen)"` on a `None` from `next_frame` and
 counts `frames_empty`. **That path exists, is named, and is simply
 unreachable on Linux.** P1 is about making it reachable, not about inventing it.
@@ -175,7 +175,7 @@ was unchanged (41.5–45 % across runs, within noise of the P1 numbers).
 ⚠️⚠️ **Both production consumers of `Damage` are inert**, which was not obvious
 until it was checked:
 
-- `encode/mod.rs:777` — `set_roi_hints` is a **default no-op that discards its
+- `encode/mod.rs:779` — `set_roi_hints` is a **default no-op that discards its
   arguments**, and no encoder overrides it.
 - `rate_profile::note_real_frame_area` and `Damage::area_permille` have **no
   production callers** — every call site is `#[cfg(test)]`.

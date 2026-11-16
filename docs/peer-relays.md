@@ -74,7 +74,7 @@ actor can turn one device into the org's traffic chokepoint.
 
 | # | gate | owner | default | where |
 |---|---|---|---|---|
-| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2893`](../crates/remote_control/src/models.rs#L2893) |
+| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2707`](../crates/remote_control/src/models.rs#L2707) |
 | 2 | overlay ACL grants **each** member the relay node | the policy author | no grant | [`org_relay.rs:377`](../crates/modules/network/src/org_relay.rs#L377) |
 | 3 | per-device approval `peer_relay_policy.serve` | the fleet admin (`MANAGE_AGENTS` **and** `EXEC_DEVICE`) | `false` | [`routes/peer_relay.rs:53`](../crates/modules/network/src/routes/peer_relay.rs#L53) |
 | 4 | the relay device's own `relay_server_enabled` | the relay host's owner, **locally** | off | [`orgrelay/mod.rs:36`](../crates/tunnel-core/src/overlay/orgrelay/mod.rs#L36) |
@@ -88,7 +88,7 @@ the relay node for the member.
 
 ⚠️ **An unreadable policy set is a refusal, never a grant.** The mint reads policies
 through `try_load_acl`
-([`overlay.rs:2152`](../crates/modules/network/src/overlay.rs#L2152)), which returns
+([`overlay.rs:2417`](../crates/modules/network/src/overlay.rs#L2417)), which returns
 `Result`. The older `load_acl` fails open, byte-identical to "no ACL configured", and a
 gate written against it would have granted on a Mongo blip. `PolicyUnreadable` is its
 own deny reason, so a blip is never mistaken for a policy decision.
@@ -108,11 +108,11 @@ survives a compromised server. Someone with local access sets it.
 secondary org's admin must not be able to mint sessions onto the device owner's
 listener. The server refuses (`SecondaryOrg`), and the device independently drops all
 three relay frames when they arrive on a secondary org's socket
-([`agents/roomlerd/src/overlay.rs:1104`](../agents/roomlerd/src/overlay.rs#L1104)).
+([`agents/roomlerd/src/overlay.rs:1063`](../agents/roomlerd/src/overlay.rs#L1063)).
 
 ## The mint — what the server decides
 
-`maybe_mint` ([`org_relay.rs:544`](../crates/modules/network/src/org_relay.rs#L544))
+`maybe_mint` ([`org_relay.rs:547`](../crates/modules/network/src/org_relay.rs#L547))
 runs on every `rc:overlay.relay_request` and never delays the TURN grant that frame
 also asks for.
 
@@ -279,7 +279,7 @@ the relay and both members, and each one writes a `revoke` row:
 | trigger | reason | code |
 |---|---|---|
 | the org switched peer relays off | `mode_off` | `revoke_tenant` |
-| a policy edit no longer grants a member the relay | `acl_revoked` | `reconcile_acl` ([`org_relay.rs:815`](../crates/modules/network/src/org_relay.rs#L815)) |
+| a policy edit no longer grants a member the relay | `acl_revoked` | `reconcile_acl` ([`org_relay.rs:818`](../crates/modules/network/src/org_relay.rs#L818)) |
 | the relay's approval was cleared | `policy_revoked` | `revoke_relay_agent` |
 | a party was removed from the overlay | `device_removed` / `device_left` | `revoke_node` |
 
@@ -386,16 +386,16 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 
 | piece | where |
 |---|---|
-| the mint: gates, ranking, session, push | [`crates/modules/network/src/org_relay.rs`](../crates/modules/network/src/org_relay.rs) — `plan_mint` `:377`, `maybe_mint` `:544`, revoke `:742`–`:815` |
+| the mint: gates, ranking, session, push | [`crates/modules/network/src/org_relay.rs`](../crates/modules/network/src/org_relay.rs) — `plan_mint` `:377`, `maybe_mint` `:547`, revoke `:745`–`:818` |
 | admin routes + approval policy | [`crates/modules/network/src/routes/peer_relay.rs`](../crates/modules/network/src/routes/peer_relay.rs) |
-| modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2303`–`:2489` |
+| modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2110`–`:2284` |
 | wire framing and shape rules | [`orgrelay/wire.rs`](../crates/tunnel-core/src/overlay/orgrelay/wire.rs) |
 | the authenticated bind | [`orgrelay/bind.rs`](../crates/tunnel-core/src/overlay/orgrelay/bind.rs) |
 | the relay's session table (pure) | [`orgrelay/session.rs`](../crates/tunnel-core/src/overlay/orgrelay/session.rs) |
 | the relay server + counters | [`orgrelay/server.rs`](../crates/tunnel-core/src/overlay/orgrelay/server.rs), [`agents/roomlerd/src/relay_server.rs`](../agents/roomlerd/src/relay_server.rs) |
 | the member: bind + `OrgRelayConn` | [`orgrelay/client.rs`](../crates/tunnel-core/src/overlay/orgrelay/client.rs) |
 | the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1161`, `org_request_bind` `:2055`, `commit_org_bind` `:2081` |
-| pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:62`](../crates/api/src/cluster/metrics.rs#L62) |
+| pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:65`](../crates/api/src/cluster/metrics.rs#L65) |
 
 ## Not built
 

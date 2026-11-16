@@ -50,9 +50,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 bson = { workspace = true }
 tokio = { workspace = true }
-# FR-90 P4-5-1b — `knowhow_probe_reach`'s address ranges, read into the
-# `forward_acl` rule shape (already in the lockfile, through remote_control).
-ipnet = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -66,9 +63,28 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    # #3609 — the machine tree reads the computer's account domain
+    # (LsaQueryInformationPolicy) to tell its own accounts apart.
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    # #3609 — the machine tree opens each entry by handle, never through a link
+    # (FILE_FLAG_OPEN_REPARSE_POINT).
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    # #3609 — netapi32 from System32 at run time (LoadLibraryExW), never a
+    # static import into the setup wizard's EXE.
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    # #3737 — a file of the SYSTEM service's former anchor folder is opened
+    # below the folder's own handle (NtOpenFile with a root directory), and a
+    # registry key is deleted through its handle (NtDeleteKey): ntdll, which
+    # the loader maps into every process before anything else.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_Registry",
+    "Win32_System_IO",
 ] }
 
 [features]
@@ -95,6 +111,12 @@ optional = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# #3702 — `folder_gate` parses the daemon's sources: `appdirs` is the one
+# module that reads a folder variable.
+syn = { version = "2", features = ["full", "visit"] }
+# #3778 — and reads the tokens of a macro's arguments, which `syn` leaves
+# unparsed.
+proc-macro2 = "1"
 
 # #3073's elevated test hardens from the daemon's position: it disables the
 # privileges that let icacls rewrite a DACL it has no access to, which a shell

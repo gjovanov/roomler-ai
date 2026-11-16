@@ -97,8 +97,8 @@ export const useCapabilitiesStore = defineStore('capabilities', () => {
    * Is a module usable from this bundle against this server? Both gates:
    * the bundle must carry it (`VITE_MODULES`) AND the server must mount it —
    * or the server has not answered yet, in which case the bundle's word
-   * stands (fail-open). A DEFAULT-OFF module (FR-90 `hive`) is the exception:
-   * it is present only once the server has said so.
+   * stands (fail-open). A DEFAULT-OFF module (`DEFAULT_OFF`, empty since
+   * FR-137) is the exception: it is present only once the server has said so.
    */
   function has(module: ModuleId): boolean {
     if (!BUILT_MODULES.includes(module)) return false

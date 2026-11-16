@@ -57,7 +57,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use roomler_core::ws::upgrade::WsParams;
+use roomler_ai_remote_control::models::{OverlayNode, RetiredKey, RetiredKeyMode};
+use roomler_core::ws::upgrade::{WsParams, native_credential, with_challenge};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -99,7 +100,7 @@ static FULL_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap:
 /// QUIC over this relay, and unlike the WG floor traffic the plane was
 /// sized for, a tunnel can be an elephant flow (a git clone). Per
 /// (network, src) token bucket, applied ONLY to tunnel-class payloads
-/// (non-WG/non-disco first bytes — the same classifier both mux ends use);
+/// (neither a whole WG header nor a disco frame — the same classifier both mux ends use);
 /// WG + disco frames are never shaped. ~3 Mbit/s sustained with a 1 MiB
 /// burst: the leg is a last resort whose job is "usable", not "fast", and
 /// a modest cap keeps the floor honest for every other tenant on the pod.
@@ -317,18 +318,18 @@ pub fn spawn_registry_census(state: &NetworkState) {
         }
     });
 }
-/// `GET /derp?token=<agent-jwt>` — upgrade to the DERP relay WS. Agent-only,
-/// same audience as `/ws?role=agent`.
-pub async fn derp_upgrade(
-    State(state): State<NetworkState>,
-    Query(params): Query<WsParams>,
+/// The `/derp` upgrade, judged on the credential [`derp_upgrade`] found: every
+/// check is the same whichever carrier brought it (#3656).
+async fn admit(
+    state: NetworkState,
+    token: Option<String>,
+    tid: Option<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // `WsParams::token` became optional when `/ws` learned to accept a browser
-    // session cookie. DERP is agent-only — no cookie jar on this side, and a
-    // browser must never be able to register as a relay node — so the token
-    // stays REQUIRED here.
-    let Some(token) = params.token.as_deref() else {
+    // DERP is agent-only: no cookie jar on this side, and a browser must never
+    // be able to register as a relay node, so a credential (header or query)
+    // stays REQUIRED here, though `WsParams::token` is optional for `/ws`.
+    let Some(token) = token.as_deref() else {
         return Response::builder()
             .status(401)
             .body("Unauthorized (derp)".into())
@@ -346,7 +347,7 @@ pub async fn derp_upgrade(
     // S6 — DERP relays are pod-local: two mesh peers only meet if their
     // /derp sockets land on the SAME pod, so the LB hashes on `tid` and
     // the server rejects a present-but-wrong claim.
-    if let Some(t) = &params.tid
+    if let Some(t) = &tid
         && t != &claims.tenant_id
     {
         return Response::builder()
@@ -431,6 +432,44 @@ pub async fn derp_upgrade(
         .max_frame_size(roomler_core::ws::upgrade::MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
 }
+/// FR-40 P2 — the org's retired-key mode and, unless it is `off`, the ledger
+/// entry for the key a registration presents. Fails OPEN to the pre-P2 path:
+/// an unreadable network row reads as `off`, an unreadable ledger as "not
+/// retired". The join already enforced the check on the key the row holds,
+/// and DERP is the floor that connects a node when nothing else does.
+async fn retired_key_at_derp(
+    state: &NetworkState,
+    node: &OverlayNode,
+    presented: &str,
+) -> (RetiredKeyMode, Option<RetiredKey>) {
+    let mode = match state
+        .overlay_networks
+        .base
+        .find_by_id(node.network_id)
+        .await
+    {
+        Ok(network) => network.retired_key_mode,
+        Err(e) => {
+            info!(network = %node.network_id, %e, "derp: network row unreadable — retired-key check skipped");
+            return (RetiredKeyMode::Off, None);
+        }
+    };
+    if mode == RetiredKeyMode::Off {
+        return (mode, None);
+    }
+    match state
+        .overlay_nodes
+        .retired_key_in_network(node.network_id, presented)
+        .await
+    {
+        Ok(retired) => (mode, retired),
+        Err(e) => {
+            warn!(network = %node.network_id, %e, "derp: retired-key ledger unreadable — check skipped");
+            (mode, None)
+        }
+    }
+}
+
 /// Drive one DERP connection: resolve the agent's node, validate its
 /// registration pubkey, add it to the registry, then pump frames until the
 /// socket closes.
@@ -466,7 +505,23 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             return;
         }
     };
-    if BASE64.encode(self_pubkey) != node.wg_public_key {
+    // FR-40 P2 — whether the presented key is a RETIRED one, read only when
+    // the org switched the check on (`off` reads nothing: the pre-P2 path).
+    let presented = BASE64.encode(self_pubkey);
+    let (retired_mode, retired) = retired_key_at_derp(&state, &node, &presented).await;
+    if presented != node.wg_public_key {
+        if retired.is_some() {
+            // The same refusal as below, under its real name: a device whose
+            // join was refused `key_retired` dials DERP with the same key, and
+            // "stale row or rotation race" would send its operator after the
+            // wrong thing.
+            warn!(
+                %agent_id, %network_id, node = %node_hex, got = %pk8(&self_pubkey),
+                "derp: registration REFUSED — pubkey != node's wg_public_key, and it is a \
+                 key retired on this network (key_retired)"
+            );
+            return;
+        }
         warn!(
             %agent_id, %network_id, node = %node_hex,
             got = %pk8(&self_pubkey),
@@ -474,6 +529,22 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             "derp: registration REFUSED — pubkey != node's wg_public_key (stale node row or key rotation race)"
         );
         return;
+    }
+    // The row's OWN key is retired: it was admitted while the switch was off
+    // or `warn`, and the node has not re-joined since. Under `enforce` its
+    // next join is refused and healed; refuse its relay now too.
+    if retired.is_some() {
+        if retired_mode == RetiredKeyMode::Enforce {
+            warn!(
+                %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
+                "derp: registration REFUSED — key_retired (the node's own key was retired on this network)"
+            );
+            return;
+        }
+        warn!(
+            %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
+            "derp: would refuse registration — key_retired (retired_key_mode=warn; admitted)"
+        );
     }
     let key: DerpKey = (network_id, self_pubkey);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(DERP_SEND_QUEUE);
@@ -706,6 +777,23 @@ fn forward_frame(
         // (`spawn_derp_usage_flush`) does the I/O on its own timer.
         add_network_bytes(network_id, out_len);
     }
+}
+
+/// `GET /derp` — upgrade to the DERP relay WS. Agent-only, same audience as
+/// `/ws?role=agent`. The agent JWT arrives as `Authorization: Bearer`, or as
+/// `?token=` from a daemon older than 0.4.210; a Bearer header decides when
+/// both come, and a refusal carries the Bearer challenge a newer daemon reads
+/// (#3656, `native_credential`, `with_challenge`). `?tid=` stays in the query,
+/// because the LB hashes on it. Every check is [`admit`]'s.
+pub async fn derp_upgrade(
+    State(state): State<NetworkState>,
+    Query(params): Query<WsParams>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = native_credential(&headers, params.token);
+    let presented = token.is_some();
+    with_challenge(admit(state, token, params.tid, ws).await, presented)
 }
 #[cfg(test)]
 mod tests {

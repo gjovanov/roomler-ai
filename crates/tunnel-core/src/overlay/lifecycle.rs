@@ -232,6 +232,20 @@ pub(crate) const POKE_SILENCE_AFTER: Duration = Duration::from_secs(30);
 /// organically and the poke only fires for idle or responder-role carriers —
 /// one 2-packet handshake per peer per ~2 min at worst.
 pub(crate) const POKE_PROOF_AFTER: Duration = Duration::from_secs(120);
+/// FR-65 P3 — how often a signal burst that moved NOTHING the snapshot models
+/// may force a revalidation, against the 3 s floor of the wave it rides. On a
+/// Wi-Fi host the adapter's parameter notifications alone are that burst,
+/// about 20 times a minute with no network change at all, and each one
+/// force-rekeyed every direct peer (peak 150 pokes/min on the field host,
+/// #1237's ~100/min storm by another road). Worse, each one re-arms a poke
+/// still in flight, and re-arming restarts its deadline, so the chatter
+/// postponed the verdict on exactly the carriers that had died: field
+/// 2026-10-30, 11 carriers behind a full-tunnel capture convicted at +31 s
+/// instead of +15 s. Must stay ABOVE [`POKE_SILENCE_AFTER`]: inside this
+/// window a no-delta burst falls back to the silence trigger, so anything
+/// longer than that leaves the worst case where it is and only sheds pokes. A
+/// real network move never waits on this, see [`netchange_action`].
+pub(crate) const NETCHANGE_POKE_QUIET: Duration = Duration::from_secs(60);
 /// #26 — the conviction window for a poke armed BY a netstate **Major** (a VPN
 /// connect / default-route move), instead of the tier's handshake deadline.
 ///
@@ -545,6 +559,47 @@ pub(crate) fn should_poke(
 /// re-send may already be ~5 s old.
 pub(crate) fn should_poke_on_netchange(handshake_done: bool) -> bool {
     handshake_done
+}
+
+/// What one addr/iface-classed delta may do. [`netchange_action`]'s verdict.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct NetChangeAction {
+    /// Regather and compare the LAN-IP set.
+    pub(crate) check: bool,
+    /// Arm the forced revalidation of every direct carrier
+    /// ([`should_poke_on_netchange`]).
+    pub(crate) poke: bool,
+}
+
+/// FR-65 P3 — the net-change arm's decision, pure and clock-free like
+/// [`should_poke`]. `material` is [`netstate::diff`](super::netstate::diff)
+/// having found a real move; `since_check` and `since_poke` are how long ago
+/// the last check and the last forced poke ran; `floor` is the check's 3 s
+/// debounce and `quiet` is [`NETCHANGE_POKE_QUIET`].
+///
+/// * A **material** delta checks and pokes at once, whatever ran a moment ago.
+///   Chatter must never spend a real move's turn: when one 3 s stamp covered
+///   both, a Minor delta (a VPN adapter gaining its address) landing just
+///   after a no-delta burst got no regather, no poke and no LAN-set check.
+/// * A **no-delta** burst checks on the floor, as it always did, and pokes at
+///   most once per `quiet`. The first burst after a quiet spell still pokes at
+///   once, so a filter-only VPN connect on a calm host loses nothing; what the
+///   bursts behind it would have caught is the silence trigger's to catch.
+/// * `quiet` zero is the kill switch: exactly the shared 3 s stamp from before.
+///
+/// Route-only bursts never get here, and the route wave rides every delta
+/// without consulting this: an erased peer `/32` is repaired as fast as ever.
+pub(crate) fn netchange_action(
+    material: bool,
+    since_check: Option<Duration>,
+    since_poke: Option<Duration>,
+    floor: Duration,
+    quiet: Duration,
+) -> NetChangeAction {
+    let gated = !quiet.is_zero();
+    let check = (gated && material) || since_check.is_none_or(|d| d >= floor);
+    let poke = check && (!gated || material || since_poke.is_none_or(|d| d >= quiet));
+    NetChangeAction { check, poke }
 }
 
 /// A make-before-break shadow probe's verdict (pre-P2: the two branch
@@ -1132,6 +1187,110 @@ mod tests {
     fn should_poke_on_netchange_matrix() {
         assert!(should_poke_on_netchange(true));
         assert!(!should_poke_on_netchange(false), "pre-handshake");
+    }
+
+    const FLOOR: Duration = Duration::from_secs(3);
+
+    fn action(
+        material: bool,
+        since_check: Option<u64>,
+        since_poke: Option<u64>,
+        quiet: Duration,
+    ) -> NetChangeAction {
+        netchange_action(
+            material,
+            since_check.map(Duration::from_secs),
+            since_poke.map(Duration::from_secs),
+            FLOOR,
+            quiet,
+        )
+    }
+
+    /// FR-65 P3 — the storm itself: 20 no-delta bursts a minute, the field
+    /// shape on a Wi-Fi host, walked through the decision with the stamps the
+    /// event arm keeps. One poke a window, where every due burst used to poke.
+    #[test]
+    fn a_no_delta_burst_pokes_once_per_quiet_window() {
+        let (mut last_check, mut last_poke) = (None::<u64>, None::<u64>);
+        let (mut checks, mut pokes) = (0, 0);
+        for now in (0..600u64).step_by(3) {
+            let a = action(
+                false,
+                last_check.map(|t| now - t),
+                last_poke.map(|t| now - t),
+                NETCHANGE_POKE_QUIET,
+            );
+            if a.check {
+                last_check = Some(now);
+                checks += 1;
+            }
+            if a.poke {
+                last_poke = Some(now);
+                pokes += 1;
+            }
+        }
+        assert_eq!(checks, 200, "the check keeps its 3 s floor");
+        assert_eq!(pokes, 10, "ten minutes, ten pokes");
+    }
+
+    /// Condition 1 of the gate: a real move is never debounced, neither by
+    /// the quiet window nor by the check's 3 s floor a no-delta burst just
+    /// stamped. Before P3 the second of those swallowed it.
+    #[test]
+    fn a_material_delta_acts_at_once_inside_both_windows() {
+        let a = action(true, Some(0), Some(0), NETCHANGE_POKE_QUIET);
+        assert_eq!(
+            a,
+            NetChangeAction {
+                check: true,
+                poke: true
+            }
+        );
+    }
+
+    /// The first no-delta burst after a calm spell keeps today's reaction: a
+    /// filter-only VPN connect on a quiet host is poked at once.
+    #[test]
+    fn the_first_no_delta_burst_after_a_quiet_spell_pokes_at_once() {
+        let q = NETCHANGE_POKE_QUIET.as_secs();
+        assert!(action(false, None, None, NETCHANGE_POKE_QUIET).poke);
+        assert!(action(false, Some(q), Some(q), NETCHANGE_POKE_QUIET).poke);
+        assert!(!action(false, Some(q), Some(q - 1), NETCHANGE_POKE_QUIET).poke);
+    }
+
+    /// A no-delta burst inside the window still regathers and checks the
+    /// LAN-IP set: W5(c)'s unconditional regather is not the gate's to drop.
+    #[test]
+    fn a_gated_burst_still_checks() {
+        let a = action(false, Some(3), Some(3), NETCHANGE_POKE_QUIET);
+        assert!(a.check && !a.poke);
+    }
+
+    /// The floor still holds for a no-delta burst.
+    #[test]
+    fn a_no_delta_burst_inside_the_floor_does_nothing() {
+        let a = action(false, Some(2), None, NETCHANGE_POKE_QUIET);
+        assert!(!a.check && !a.poke);
+    }
+
+    /// `0` is the whole pre-P3 arm, the shared 3 s stamp included: a material
+    /// delta inside the floor is swallowed again, and a due burst always pokes.
+    #[test]
+    fn quiet_zero_restores_the_shared_stamp() {
+        let off = Duration::ZERO;
+        for material in [false, true] {
+            let a = action(material, Some(2), Some(0), off);
+            assert!(!a.check && !a.poke, "material={material}");
+            let a = action(material, Some(3), Some(0), off);
+            assert!(a.check && a.poke, "material={material}");
+        }
+    }
+
+    /// The window has to clear the silence trigger, or a dropped burst could
+    /// be slower than a poke it replaced would have been. Its doc says why.
+    #[test]
+    fn the_quiet_window_clears_the_silence_trigger() {
+        assert!(NETCHANGE_POKE_QUIET > POKE_SILENCE_AFTER);
     }
 
     #[test]

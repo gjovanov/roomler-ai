@@ -46,8 +46,11 @@ pub enum ProgressEvent {
 
     /// Pre-flight probe (registry and/or config-file) began.
     PreflightStarted,
-    /// Pre-flight finished. `existing` is a human-readable detection
-    /// summary, e.g. `"clean"` / `"Detected: perUser 0.3.0-rc.194"`.
+    /// Pre-flight finished. `existing` says what is installed here already
+    /// and what this install does to it, in a person's words (never a
+    /// flavour's name): the preflight row shows it, e.g. `"Roomler is
+    /// installed for the whole computer (version 0.4.207): this install
+    /// replaces it"`.
     #[serde(rename_all = "camelCase")]
     PreflightOk { existing: String },
     /// Non-fatal warning surfaced during pre-flight (cross-flavour
@@ -79,10 +82,14 @@ pub enum ProgressEvent {
     /// into the replay log.
     #[serde(rename_all = "camelCase")]
     DownloadProgress { received_bytes: u64 },
-    /// Download complete; SHA256 verified (or `digest=None` and
-    /// verification was skipped with `sha256_match=true`).
+    /// Download complete, and compared with the digest the release
+    /// published. Not sent when the release published none.
     #[serde(rename_all = "camelCase")]
     DownloadVerified { sha256_match: bool },
+    /// #3246 — the download carries a valid signature from Roomler's
+    /// publisher, and `signer` is the name on it.
+    #[serde(rename_all = "camelCase")]
+    PublisherVerified { signer: String },
 
     /// msiexec launched (daemon roles, Windows). `pid` is the OS PID
     /// for operator diagnostics. SPA relabels Cancel to "Force-kill
@@ -139,19 +146,31 @@ pub enum ProgressEvent {
     #[serde(rename_all = "camelCase")]
     AnchorSkipped { reason: String },
 
+    /// #3174 — a limited wizard on a machine-wide install leaves the companion
+    /// to the service, and the EXE is not there yet.
+    CompanionWaiting,
+    /// #3174 — `roomler-desktop.exe` is there after the step, whoever placed it.
+    CompanionPresent,
+    /// #3174 — it is not. Never fatal: `message` says what happens next.
+    #[serde(rename_all = "camelCase")]
+    CompanionAbsent { message: String },
+
     /// #3116 — a Windows reinstall: the daemon the installer restarted loaded
     /// the config from before it, so it is asked to restart onto the one this
     /// install just wrote, as `install.sh` restarts the Linux unit. A remote
     /// session to the device drops for a few seconds.
     DaemonRestartStarted,
     /// #3116 — the daemon runs on the new enrollment; `pid` is the process
-    /// that answered, when it said.
+    /// that answered, when it said. #3387: also a fresh machine-wide install's
+    /// confirmation, which restarts nothing (the service swaps to the SYSTEM
+    /// worker on its own once the machine enrollment is written).
     #[serde(rename_all = "camelCase")]
     DaemonRestartOk { pid: Option<u32> },
     /// #3116 — the daemon was not restarted onto the new enrollment. Never
     /// fatal: the config is written, and no startup save of the running daemon
     /// writes over it (`config::StartupWrites`), so the enrollment takes effect
-    /// at its next start. `reason` says why, and what to do.
+    /// at its next start. `reason` says why, and what to do. #3387: also a
+    /// fresh machine-wide install whose service was not seen running it.
     #[serde(rename_all = "camelCase")]
     DaemonRestartSkipped { reason: String },
 
@@ -184,10 +203,28 @@ pub enum ProgressEvent {
     /// Whole install finished. SPA transitions to the Done step.
     Done,
 
-    /// Fatal error at some step. SPA surfaces the recovery panel
-    /// scoped to `step` (`"preflight"` / `"resolve"` / `"download"` /
-    /// `"msi"` / `"extract"` / `"integration"` / `"enroll"`).
-    Error { step: String, message: String },
+    /// #3432 — the install stopped. `step` is the step that was running
+    /// (`"preflight"`, `"resolve"`, `"download"`, `"verify"`, `"package"`,
+    /// `"extract"`, `"integrate"`, `"root_half"`, `"enroll"`, `"restart"`,
+    /// `"user_steps"`, `"companion"`, `"anchor"`), `kind` what kind of
+    /// failure it was (decided on the error's types: `"connection_refused"`,
+    /// `"name_not_resolved"`, `"secure_connection_failed"`, `"timed_out"`,
+    /// `"status"` with its `status`, …), `words` what failed, why and what to
+    /// try, and `chain` every cause, outermost first. The wizard's own
+    /// `failure::Failure` fills it; this crate keeps plain fields so it stays
+    /// free of the app's types.
+    Error {
+        step: String,
+        kind: String,
+        status: Option<u16>,
+        words: String,
+        chain: Vec<String>,
+    },
+
+    /// #3590 — the install's checklist as it now is: every row, in order. The
+    /// wizard's step tracker sends it whenever a row changes, and the page
+    /// draws this and nothing else.
+    Steps { rows: Vec<StepRow> },
 
     /// Daemon SystemContext role only: a WiX `EnableSystemContext` /
     /// `DisableSystemContext` custom action failed inside msiexec.
@@ -201,6 +238,22 @@ pub enum ProgressEvent {
         message: String,
         hint: String,
     },
+}
+
+/// #3590 — one row of the install's checklist: a step, or a warning the run
+/// raised, which keeps a row of its own in the order it came.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StepRow {
+    /// The step's name (`"resolve"`, …, as in `Error`), or `"warning"`.
+    pub step: String,
+    /// `"pending"`, `"running"`, `"done"`, `"failed"` or `"not_reached"`, and
+    /// `"warning"` for a warning's row.
+    pub state: String,
+    /// What the person reads: what the step does, or the warning's words.
+    pub label: String,
+    /// What the step's last progress event said, if anything.
+    pub detail: Option<String>,
 }
 
 /// Process-wide replay log. Every emit lands here (minus per-chunk
@@ -424,5 +477,34 @@ mod tests {
         let a = replay_log();
         let b = replay_log();
         assert!(std::ptr::eq(a, b));
+    }
+
+    /// #3432 — the terminal event carries the step, the kind, the status, the
+    /// words and the chain, and no `message`.
+    #[test]
+    fn error_carries_step_kind_words_and_chain() {
+        let event = ProgressEvent::Error {
+            step: "resolve".into(),
+            kind: "status".into(),
+            status: Some(503),
+            words: "Roomler Setup could not find the installer.".into(),
+            chain: vec!["GET https://roomler.ai/x answered 503 Service Unavailable".into()],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "Error",
+                "data": {
+                    "step": "resolve",
+                    "kind": "status",
+                    "status": 503,
+                    "words": "Roomler Setup could not find the installer.",
+                    "chain": ["GET https://roomler.ai/x answered 503 Service Unavailable"],
+                },
+            })
+        );
+        let back: ProgressEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, event);
     }
 }

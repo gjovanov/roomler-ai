@@ -15,7 +15,7 @@
 </head>
 <body>
 <h3>Phase Y.3 VP9 4:4:4 DataChannel pipeline harness</h3>
-<p>Self-contained: spins up two RTCPeerConnections in this page, encodes synthetic VP9 profile 1 frames on one side, sends them over a DataChannel labelled <code>video-bytes</code>, decodes them on the other side via the production <code>rc-vp9-444-worker.ts</code> worker. No real agent required. Used by the Playwright e2e suite — see <code>e2e/rc-vp9-444.spec.ts</code>.</p>
+<p>Self-contained: spins up two RTCPeerConnections in this page, encodes synthetic VP9 profile 1 frames on one side, sends them over a DataChannel labelled <code>video-bytes</code>, decodes them on the other side via the production data-channel worker, <code>rc-dc-worker.ts</code> (FR-135 R3: one worker for every codec). No real agent required. Used by the Playwright e2e suite — see <code>e2e/rc-vp9-444.spec.ts</code>.</p>
 <div id="status">idle</div>
 <canvas id="paint" width="64" height="36"></canvas>
 <pre id="log"></pre>

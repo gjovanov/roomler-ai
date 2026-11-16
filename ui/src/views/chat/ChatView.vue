@@ -52,16 +52,6 @@
               inline
             />
           </v-btn>
-          <v-btn
-            v-if="hiveSessionId"
-            icon="mdi-robot-outline"
-            size="small"
-            :color="showTranscript ? 'primary' : undefined"
-            :title="$t('hive.viewer.toggle')"
-            :aria-label="$t('hive.viewer.toggle')"
-            data-testid="hive-transcript-toggle"
-            @click="showTranscript = !showTranscript"
-          />
           <!-- (The pin button that stood here toggled a flag nothing read.) -->
           <template v-if="!xs">
             <v-btn icon="mdi-folder" size="small" data-testid="files-btn" aria-label="Files" @click="showFiles = !showFiles" />
@@ -95,7 +85,6 @@
             <div v-for="msg in messageStore.messages" :key="msg.id" :id="`msg-${msg.id}`" class="mb-3">
               <message-bubble
                 :message="msg"
-                :tenant-id="tenantId"
                 :editable="msg.author_id === currentUserId"
                 :unread="!readMessageIds.has(msg.id) && msg.author_id !== currentUserId"
                 @reply="openThread(msg)"
@@ -141,29 +130,6 @@
         </div>
       </div>
 
-      <!-- FR-90 — an agent session's room: its transcript, streamed from the
-           device over a viewer peer (the server holds only the stubs above). -->
-      <div v-if="hiveSessionId && showTranscript" class="chat-side-panel hive-panel border-s d-flex flex-column">
-        <!-- Closes like the thread, members and files panels. Below 960 px the
-             panel covers the room — toolbar and composer included — and this
-             is the one way back to the room's own chat. -->
-        <v-toolbar density="compact" flat>
-          <v-toolbar-title class="text-body-1">
-            <v-icon class="mr-1" size="small">mdi-robot-outline</v-icon>Agent session
-          </v-toolbar-title>
-          <v-spacer />
-          <v-btn
-            icon="mdi-close"
-            size="small"
-            aria-label="Close the transcript"
-            data-testid="hive-transcript-close"
-            @click="showTranscript = false"
-          />
-        </v-toolbar>
-        <v-divider />
-        <hive-transcript :tenant-id="tenantId" :session-id="hiveSessionId" :adopted="hiveAdopted" />
-      </div>
-
       <!-- Thread panel -->
       <div v-if="activeThread" class="chat-side-panel border-s d-flex flex-column">
         <v-toolbar density="compact" flat>
@@ -176,7 +142,6 @@
           <div v-for="msg in messageStore.threadMessages" :key="msg.id" class="mb-2">
             <message-bubble
               :message="msg"
-              :tenant-id="tenantId"
               :editable="msg.author_id === currentUserId"
               compact
               @react="(emoji) => handleReact(msg.id, emoji)"
@@ -250,8 +215,6 @@ import MessageEditor from '@/components/chat/MessageEditor.vue'
 import type { MentionData } from '@/components/chat/MessageEditor.vue'
 import type { MentionItem } from '@/components/chat/MentionList.vue'
 import MemberPanel from '@/components/chat/MemberPanel.vue'
-import HiveTranscript from '@/components/hive/HiveTranscript.vue'
-import { isAdopted, useHiveStore } from '@/stores/hive'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import GiphyPicker from '@/components/chat/GiphyPicker.vue'
@@ -277,28 +240,7 @@ function goToCall() {
 const activeThread = ref<{ id: string } | null>(null)
 const showMembers = ref(false)
 const showFiles = ref(false)
-// FR-90 — the room is an agent session's: show its transcript by default.
-const hiveSessionId = computed(() => {
-  const b = roomStore.current?.binding
-  return b?.module === 'hive' ? b.ref : null
-})
-// Open beside the chat where there is room for both; on a phone or a portrait
-// tablet the panel would cover the room, so the room opens on its chat and the
-// robot button opens the transcript.
-const { xs, smAndDown } = useDisplay()
-const showTranscript = ref(!smAndDown.value)
-// FR-90 P1j — an adopted session (a terminal's) is read-only: the panel says
-// so, and its People dialog takes readers only. Read from the record; a
-// failed read leaves it a started session, which the server enforces anyway.
-const hive = useHiveStore()
-const hiveAdopted = computed(() => isAdopted(hive.sessions.find((s) => s.id === hiveSessionId.value)))
-watch(
-  hiveSessionId,
-  (sid) => {
-    if (sid && tenantId.value) hive.fetchSession(tenantId.value, sid).catch(() => {})
-  },
-  { immediate: true },
-)
+const { xs } = useDisplay()
 const showEmojiPicker = ref(false)
 const showGiphyPicker = ref(false)
 const emojiTarget = ref<'editor' | 'thread'>('editor')
@@ -566,11 +508,6 @@ onMounted(async () => {
   min-width: 280px;
   min-height: 0;
   overflow: hidden;
-}
-/* FR-90 — a transcript (tool output, diffs) wants more room than a thread. */
-.hive-panel {
-  width: 50%;
-  min-width: 360px;
 }
 .message-highlight {
   animation: highlight-fade 3s ease-out;

@@ -98,11 +98,11 @@ sudo installer -pkg /tmp/roomlerd.pkg -target /
 
 ## 2. Enroll the agent
 
-In the Roomler admin UI:
+In the Roomler web app:
 
-1. **Admin → Tenant → Agents**.
-2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomlerd enroll …` command.
-3. Run that command on `AGENT-CORP` (the enrollment token is single-use, embedded in the command):
+1. **Devices → Enroll → Device (remote desktop + mesh)**.
+2. A 10-minute, single-use enrollment token appears, with a command per platform (the recommended one installs and enrolls in one step).
+3. To enroll an installed `roomlerd` by hand, run this on `AGENT-CORP` with that token:
 
 ```powershell
 roomlerd enroll `
@@ -125,7 +125,7 @@ roomlerd service install               # perUser scheduled task
 roomlerd service install --as-service  # SCM service, runs as LocalSystem (requires the perMachine MSI)
 ```
 
-Verify in **Admin → Tenant → Agents** that the row turned green (`status: online`).
+Verify on the **Devices** page that the row turned green (`status: online`).
 
 ---
 
@@ -163,7 +163,7 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
 > aarch64 CLI, and the proxy answers 404 for it rather than hand over the
 > x86_64 one. `install.sh --role tunnel` picks the arch by itself
-> (`scripts/install.sh:1037-1041`), and the aarch64 wizard asks for
+> (`scripts/install.sh:1197-1201`), and the aarch64 wizard asks for
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
@@ -211,10 +211,10 @@ roomler --version   # → roomler 0.4.16
 
 ## 4. Enroll the tunnel-client
 
-In the admin UI:
+In the web app:
 
-1. **Admin → Tenant → Tunnels**.
-2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomler enroll …` command.
+1. **Devices → Enroll → Tunnel client (CLI-only)**.
+2. A 10-minute, single-use enrollment token appears, with a command per platform.
 3. Paste-and-run on `OPERATOR-LAPTOP`:
 
 ```powershell
@@ -234,7 +234,7 @@ This writes the long-lived `TunnelClient` JWT to:
 - Linux: `~/.config/roomler-tunnel/config.toml`
 - macOS: `~/Library/Application Support/roomler-tunnel/config.toml`
 
-Verify in **Admin → Tenant → Tunnels** that the row appears.
+Verify on the **Devices** page, with the kind filter on **Tunnels**, that the row appears.
 
 ---
 
@@ -242,7 +242,9 @@ Verify in **Admin → Tenant → Tunnels** that the row appears.
 
 Server-side ACL is **default-deny** — without a matching policy, every `TcpForwardRequest` is rejected with `acl_denied`. Define what each subject (user / role / specific tunnel-client) is allowed to reach via which agents.
 
-**Admin → Tenant → Tunnel ACL → New policy.**
+**Network → ACL → Tunnel ACL → New policy.**
+
+Tunnel policies are read and written by people with the **Manage devices** permission (`MANAGE_AGENTS`): the organization's owner and admins. Anyone else sees a note saying so instead of the editor, and the server refuses them on every tunnel-policy route, the list included ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)). A policy is what lets a person reach a destination; nobody needs a permission of their own to use one.
 
 For an "ops team reaches the prod Postgres" policy:
 
@@ -250,10 +252,12 @@ For an "ops team reaches the prod Postgres" policy:
 |---|---|
 | Name | `ops-prod-postgres` |
 | Subjects | `Role ID` → `<your ops role hex>`, plus optionally `User ID` for specific users |
-| Targets | `Agent ID` → `<AGENT-CORP hex from Admin → Agents>` |
+| Targets | `Agent ID` → `<AGENT-CORP hex from Devices>` |
 | Allowlist | `Exact` `db.intranet.corp` ports `5432–5432`<br>(or `Wildcard` `*.intranet.corp` ports `5432–5432`<br>or `CIDR` `10.0.0.0/24` ports `1–65535`) |
 | Max concurrent flows | leave blank, or `64` for tight JDBC-pool bounds |
 | Max bytes / session | leave blank, or e.g. `10737418240` for 10 GiB cap |
+
+A `Role ID` subject matches whoever holds that role in this organization when they open a forward. Give someone the role and their next forward is allowed; take it back, or remove them from the organization, and their next forward is refused with `acl_denied`, on a tunnel that is already open too. A forward from `roomler` matches the roles of its owner, the person whose enrollment token enrolled it; a device that opens forwards itself (§6's `forward --daemon` and declared routes) acts for its owner, so it matches the roles its owner holds. Details: [tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635).
 
 Click **Create policy**. The row appears in the table and goes live immediately — there's no policy cache in front of MongoDB; every `TcpForwardRequest` reads the live set.
 
@@ -275,7 +279,7 @@ In a regular (non-elevated) PowerShell on `OPERATOR-LAPTOP`:
 
 ```powershell
 roomler forward `
-  --agent <AGENT-CORP-hex from Admin → Agents> `
+  --agent <AGENT-CORP-hex from Devices> `
   --local 5432 `
   --remote db.intranet.corp:5432
 ```
@@ -389,7 +393,7 @@ longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
 
 ## 7. Audit + diagnostics
 
-**Admin → Tenant → Tunnels → click a tunnel-client → Audit** lists every `PeerOpen` / `TcpAccept` / `TcpReject` / `TcpDialFailed` / `TcpClosed` with timestamps, bytes-in/out, destination, and reject reason.
+Every decision is recorded in the `tunnel_audit` collection (kept 90 days): each `PeerOpen` / `TcpAccept` / `TcpReject` / `TcpDialFailed` / `TcpClosed`, with timestamps, bytes in/out, the destination and the reject reason. The web app has no page that lists them yet.
 
 **Per-flow debug logs on the tunnel-client:**
 
@@ -407,7 +411,7 @@ roomler forward --agent … --local 5432 --remote db.intranet:5432
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `forward request timed out` after 10 s | agent offline, or no matching ACL policy | Check `Admin → Agents` shows agent online; check `Admin → Tunnel ACL` has a matching policy |
+| `forward request timed out` after 10 s | agent offline, or no matching ACL policy | Check **Devices** shows the device online; check **Network → ACL** has a matching policy |
 | `acl_denied` from the server | policy gate rejected the (subject × target × destination) tuple | Edit the policy to include the destination, or add subject/target |
 | `dial_failed` from the agent | destination unreachable from inside corp | Check from the agent host directly: `Test-NetConnection db.intranet -Port 5432` |
 | `cross_tenant` | tunnel-client and agent belong to different tenants | Re-enroll one of them in the correct tenant |
@@ -438,11 +442,11 @@ The HTTP listing from python's server should appear via the tunnel. Bytes flow: 
 
 **Stop the forward**: Ctrl-C on `roomler forward`. The agent's side closes automatically; audit row recorded.
 
-**Revoke a tunnel-client** (operator left the team, laptop lost, etc.): **Admin → Tenant → Tunnels → click client → Revoke**. The next WS read on that client gets a `rc:tunnel.revoked` message and the WS closes; further enrollment attempts with the same `machine_id` are rejected.
+**Revoke a tunnel-client** (laptop lost, etc.): **Devices** (kind filter **Tunnels**) **→ the client's ⋮ menu → Delete tunnel client** (Manage devices permission). Its live connection is told `rc:tunnel.revoked` by the 60 s revocation sweep and closes, and its overlay node is released. A person removed from the org, or leaving it, loses the tunnel clients they own there the same way, with no one deleting them ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)). Enrolling the same `machine_id` again brings it back only with a token minted by someone with the Manage devices permission, and as theirs ([tunnels.md](tunnels.md#cli)).
 
-**Revoke an agent**: **Admin → Tenant → Agents → click agent → Revoke**. Same mechanism.
+**Revoke an agent**: **Devices → the device's ⋮ menu → Delete device**. A connected device is told on its socket at once, and stops.
 
-**Soft-delete a policy**: **Admin → Tenant → Tunnel ACL → click delete on the row**. Live tunnel sessions keep working until they close naturally; new `TcpForwardRequest`s that relied on that policy alone start being rejected with `acl_denied` from the next request onward.
+**Soft-delete a policy**: **Network → ACL → Tunnel ACL → delete on the row** (Manage devices permission). Live tunnel sessions keep working until they close naturally; new `TcpForwardRequest`s that relied on that policy alone start being rejected with `acl_denied` from the next request onward.
 
 ---
 

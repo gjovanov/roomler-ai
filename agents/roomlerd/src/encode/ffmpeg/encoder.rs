@@ -920,6 +920,10 @@ pub struct RateStats {
     pub stage: StageTimes,
     /// FR-118 P2-2 — GPU frames or CPU frames, and why.
     pub input: super::gpu_hint::InputForm,
+    /// FR-135 R0 — the bitrate ceiling at this read (`rc_max_rate`). 0 from a
+    /// failed read (`RateStats::default()`), so the heartbeat reads the handle's
+    /// own copy, `current_maxrate_bps`, which no failed read can zero.
+    pub maxrate_bps: u32,
 }
 
 /// FR-118 P0 — where `encode_sync`'s time goes, cumulative for one encoder.
@@ -1368,6 +1372,13 @@ impl FfmpegEncoder {
             .chain(H264_ENCODER_NAMES.iter())
             .copied()
             .find(|n| *n == name)
+    }
+
+    /// #3652 — does this FFmpeg build carry the encoder `name`? A cascade
+    /// name it does not carry never runs (the dispatch notes no failure for
+    /// it), so what a smoke says it tried leaves it out.
+    pub(crate) fn carried(name: &str) -> bool {
+        codec::encoder::find_by_name(name).is_some()
     }
 
     /// FR-77 — open ONE named encoder at the probe's settings (30 fps, the
@@ -2532,6 +2543,7 @@ impl FfmpegEncoder {
             idr_count: self.idr_count,
             stage: self.stage,
             input: self.input,
+            maxrate_bps: self.current_maxrate_bps(),
         }
     }
 

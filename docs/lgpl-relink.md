@@ -155,9 +155,13 @@ you do not need VP9-4:4:4, drop the `vp9-444` features.
 ./roomlerd encoder-smoke --codec hevc     # exercises the FFmpeg encoder path
 ```
 
-`encoder-smoke` feeds synthetic frames through the hardware cascade and reports
-which encoder opened. That is the quickest confirmation that your FFmpeg is the
-one actually being used.
+`encoder-smoke` first checks the libavcodec it is linked against (it refuses one
+older than FFmpeg 7), then feeds synthetic frames through the hardware cascade and
+reports which encoder opened. It passes only on a hardware encoder: on a host with
+none for the codec it fails, and its `encoder smoke tried:` line names each FFmpeg
+encoder it tried and why it did not open. Either way, that is the quickest
+confirmation that your FFmpeg is the one actually being used. To drive one
+encoder by name: `./roomlerd encoder-smoke --name hevc_vaapi`.
 
 ---
 

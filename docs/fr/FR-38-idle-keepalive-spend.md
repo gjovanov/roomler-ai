@@ -65,7 +65,9 @@ on top of it. It also inflates the baseline FR-35's "carried" gate measures agai
       measured on CORPLAP-2 and CORPLAP-3 with the same harness as the table above
 - [ ] idle spend ≤ 0.2 Mbps on both
 - [ ] time-to-crisp after motion not worse than the FR-31 baseline (the refinement job still gets done)
-- [ ] `avg_qp` populated for HW encoders in the heartbeat
+- [~] `avg_qp` populated for HW encoders in the heartbeat. **Partial (2026-11-02):** set on
+      every NVENC cell and on `h264_qsv`, on no window of `hevc_qsv`, `av1_qsv`, VideoToolbox
+      or VAAPI (field log)
 
 ## Open decisions
 
@@ -81,3 +83,4 @@ The opening keyframe budget (FR-31), the relay ceiling (FR-35), Wayland (FR-36).
 | date | build | note |
 |---|---|---|
 | 2026-08-29 | 0.4.17–0.4.21 vs the same host's rc.474 logs | The table above; harness and method in `project_corplap3_relay_regression_2026_08_29` (operator memory) and the #922 field-run comment. |
+| 2026-11-02 | 0.4.177 to 0.4.197, a week of `agent_logs` | **AC4 `[~]`.** Windows of the DC pump heartbeat with `avg_qp` set, by encoder. Set on all of them: `av1_nvenc` (10 838, median 14), `hevc_nvenc` (1 279, median 15), `h264_qsv` (510, median 12), `h264_nvenc` (83, median 14). Set on none of them: `hevc_qsv` (83 334), `av1_qsv` (8 948), `hevc_videotoolbox` (19 887), `h264_videotoolbox` (44), `h264_vaapi` (398), `hevc_vaapi` (241), `vp9_qsv` (36). `av1_qsv`, one of the two encoders this FR is about, reports nothing, and neither does the fleet's busiest cell. The reader takes `AV_PKT_DATA_QUALITY_STATS` side data (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:2395`) and treats a missing or zero value as `None` (`agents/roomlerd/src/encode/mod.rs:1269`). This read can't tell which of the two those cells do. The comment at `agents/roomlerd/src/encode/mod.rs:1265` says QSV fills it, which holds for `h264_qsv` only. The harness above hasn't been rerun since 08-29, so the first three criteria stay open. FR-135's fleet read gives the size of the second: sparse windows at 0.20 Mbit/s on `av1_nvenc`, at the goal, and 8.93 on `av1_qsv`, about 45 times over it (`docs/fr/FR-135-one-rc-media-pipeline.md:307`). |

@@ -105,7 +105,7 @@ pub struct BenchArgs {
 }
 
 /// What `encoder-smoke` runs. The plain smoke is what the release lane
-/// invokes (`encoder-smoke --encoder hardware`); the FR-62 sweep and this
+/// invokes (`encoder-smoke --name h264_mf`); the FR-62 sweep and this
 /// bench are opt-in modes beside it, and `--bench` conflicts with the sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmokeMode {
@@ -136,7 +136,7 @@ pub enum CellPath {
 }
 
 impl CellPath {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Rtp => "rtp",
             Self::Dc => "dc",
@@ -154,7 +154,7 @@ pub enum Codec {
 }
 
 impl Codec {
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "h264" => Some(Self::H264),
             "h265" | "hevc" => Some(Self::H265),
@@ -184,7 +184,7 @@ pub struct CellSpec {
 }
 
 impl CellSpec {
-    const fn new(path: CellPath, codec: Codec, chroma444: bool) -> Self {
+    pub(crate) const fn new(path: CellPath, codec: Codec, chroma444: bool) -> Self {
         Self {
             path,
             codec,
@@ -336,6 +336,53 @@ pub struct BuildCaps {
     pub ffmpeg: bool,
     /// libvpx: the DataChannel's software VP9.
     pub libvpx: bool,
+    /// A Windows build: where Media Foundation could be, had it been compiled.
+    pub windows: bool,
+    /// FFmpeg is linked into this build, whether or not `ROOMLERD_USE_FFMPEG=0`
+    /// switched it off (`ffmpeg`).
+    pub ffmpeg_compiled: bool,
+}
+
+/// An encoder backend a request can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    MediaFoundation,
+    Ffmpeg,
+    Openh264,
+}
+
+impl Backend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MediaFoundation => "media-foundation",
+            Self::Ffmpeg => "ffmpeg",
+            Self::Openh264 => "openh264",
+        }
+    }
+}
+
+/// Whether a backend was there to try on this OS and build, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Compiled in and switched on.
+    InBuild,
+    /// Media Foundation, off Windows.
+    WindowsOnly,
+    /// This OS could run it; this build does not have it.
+    NotCompiled,
+    /// FFmpeg linked, and `ROOMLERD_USE_FFMPEG=0` switched it off.
+    SwitchedOff,
+}
+
+impl Reach {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InBuild => "in this build",
+            Self::WindowsOnly => "Windows only",
+            Self::NotCompiled => "not compiled into this build",
+            Self::SwitchedOff => "switched off (ROOMLERD_USE_FFMPEG=0)",
+        }
+    }
 }
 
 impl BuildCaps {
@@ -345,6 +392,22 @@ impl BuildCaps {
             openh264: cfg!(feature = "openh264-encoder"),
             ffmpeg: ffmpeg_on(),
             libvpx: cfg!(feature = "vp9-444"),
+            windows: cfg!(target_os = "windows"),
+            ffmpeg_compiled: cfg!(feature = "ffmpeg-encoder"),
+        }
+    }
+
+    /// Could `backend` be tried on this OS and build, and if not, why not.
+    pub fn reach(self, backend: Backend) -> Reach {
+        match backend {
+            Backend::MediaFoundation if self.mf => Reach::InBuild,
+            Backend::MediaFoundation if self.windows => Reach::NotCompiled,
+            Backend::MediaFoundation => Reach::WindowsOnly,
+            Backend::Ffmpeg if self.ffmpeg => Reach::InBuild,
+            Backend::Ffmpeg if self.ffmpeg_compiled => Reach::SwitchedOff,
+            Backend::Ffmpeg => Reach::NotCompiled,
+            Backend::Openh264 if self.openh264 => Reach::InBuild,
+            Backend::Openh264 => Reach::NotCompiled,
         }
     }
 
@@ -362,7 +425,7 @@ impl BuildCaps {
 
     /// Does `cell`'s path have a hardware encoder in this build? Without one,
     /// software answering a request for hardware is the build, not a fallback.
-    fn hardware_on_path(self, cell: CellSpec) -> bool {
+    pub(crate) fn hardware_on_path(self, cell: CellSpec) -> bool {
         match (cell.path, cell.codec) {
             (CellPath::Rtp, Codec::H265) => self.mf || self.ffmpeg,
             (CellPath::Rtp, _) => self.mf,
@@ -403,11 +466,38 @@ fn ffmpeg_on() -> bool {
 /// Does the session ask this path for hardware? The RTP pump asks for what
 /// the preference says; the DataChannel cascades and a named encoder are
 /// hardware by construction, whatever the preference.
-fn requests_hardware(path: CellPath, pref: EncoderPreference) -> bool {
+pub(crate) fn requests_hardware(path: CellPath, pref: EncoderPreference) -> bool {
     match path {
         CellPath::Rtp => pref == EncoderPreference::Hardware,
         CellPath::Dc | CellPath::Named => true,
     }
+}
+
+/// What a `--name` names: its codec, and whether it is a Media Foundation
+/// encoder, which `VideoBackend::from_ffmpeg_name` does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NamedEncoder {
+    pub codec: Codec,
+    pub media_foundation: bool,
+}
+
+pub(crate) fn named_encoder(name: &str) -> Option<NamedEncoder> {
+    let mf = [
+        (super::cells::MF_H264, Codec::H264),
+        (super::cells::MF_HEVC, Codec::H265),
+        (super::cells::MF_AV1, Codec::Av1),
+    ];
+    if let Some((_, codec)) = mf.iter().find(|(n, _)| *n == name) {
+        return Some(NamedEncoder {
+            codec: *codec,
+            media_foundation: true,
+        });
+    }
+    let (codec, _) = VideoBackend::from_ffmpeg_name(name)?;
+    Some(NamedEncoder {
+        codec: Codec::parse(codec.wire())?,
+        media_foundation: false,
+    })
 }
 
 /// One row to run: a cell at one size, rate and motion.
@@ -445,12 +535,11 @@ pub fn plan(
 ) -> Result<BenchPlan, String> {
     let fps = args.bench_fps;
     let cells: Vec<(CellSpec, Option<String>)> = if let Some(name) = name {
-        let (codec, _) = VideoBackend::from_ffmpeg_name(name)
-            .ok_or_else(|| format!("--name {name:?} is not an FFmpeg encoder name"))?;
-        let codec = Codec::parse(codec.wire())
-            .ok_or_else(|| format!("--name {name:?}: no bench codec for it"))?;
+        let named = named_encoder(name).ok_or_else(|| {
+            format!("--name {name:?} is not an FFmpeg or Media Foundation encoder name")
+        })?;
         vec![(
-            CellSpec::new(CellPath::Named, codec, false),
+            CellSpec::new(CellPath::Named, named.codec, false),
             Some(name.to_string()),
         )]
     } else if !args.bench_cells.is_empty() {
@@ -518,6 +607,15 @@ pub fn plan(
     for &(width, height) in &sizes {
         for (cell, name) in &cells {
             let cell = *cell;
+            let (requested_hw, hardware_on_path) = match name.as_deref().and_then(named_encoder) {
+                // #3652 — a named Media Foundation encoder asks for Media
+                // Foundation, either MFT.
+                Some(n) if n.media_foundation => (false, build.mf),
+                _ => (
+                    requests_hardware(cell.path, pref),
+                    build.hardware_on_path(cell),
+                ),
+            };
             for &rate in &rates {
                 for &motion in &motions {
                     plans.push(CellPlan {
@@ -528,8 +626,8 @@ pub fn plan(
                         fps,
                         target_bps: rate.resolve(width, height, fps),
                         motion,
-                        requested_hw: requests_hardware(cell.path, pref),
-                        hardware_on_path: build.hardware_on_path(cell),
+                        requested_hw,
+                        hardware_on_path,
                     });
                 }
             }
@@ -811,11 +909,7 @@ impl CellOpener for SessionOpener {
         match plan.cell.path {
             CellPath::Named => {
                 let name = plan.name.as_deref().unwrap_or_default();
-                let (mut enc, codec) = super::open_named(name, w, h).ok_or_else(|| {
-                    format!(
-                        "{name} did not open (not a cascade name, no FFmpeg, or no device takes it)"
-                    )
-                })?;
+                let (mut enc, codec) = super::open_named(name, w, h)?;
                 enc.set_bitrate(plan.target_bps);
                 Ok(Opened {
                     enc,
@@ -843,7 +937,7 @@ impl CellOpener for SessionOpener {
 }
 
 /// `VideoCodec::wire()` says `hevc` where `open_for_codec` says `h265`.
-fn codec_label(wire: &'static str) -> &'static str {
+pub(crate) fn codec_label(wire: &'static str) -> &'static str {
     if wire == "hevc" { "h265" } else { wire }
 }
 
@@ -1193,13 +1287,29 @@ mod tests {
         openh264: true,
         ffmpeg: true,
         libvpx: true,
+        windows: true,
+        ffmpeg_compiled: true,
     };
+
+    /// FR-135 R9 (ledger enc:I284) — the build line names the encoder families
+    /// as the cell table's family column does, in its order, until the bench
+    /// opens through the table (R10).
+    #[test]
+    fn the_build_line_names_the_cell_tables_families() {
+        let families: Vec<&str> = crate::encode::cell_table::Family::ALL
+            .iter()
+            .map(|f| f.wire())
+            .collect();
+        assert_eq!(ALL.label(), families.join(","));
+    }
     /// A Linux or macOS release build: no Media Foundation.
     const RELEASE_LINUX: BuildCaps = BuildCaps {
         mf: false,
         openh264: true,
         ffmpeg: true,
         libvpx: true,
+        windows: false,
+        ffmpeg_compiled: true,
     };
     /// The software build this PR's container run used.
     const SOFTWARE: BuildCaps = BuildCaps {
@@ -1207,6 +1317,8 @@ mod tests {
         openh264: true,
         ffmpeg: false,
         libvpx: true,
+        windows: false,
+        ffmpeg_compiled: false,
     };
 
     fn cells(p: &BenchPlan) -> Vec<String> {
@@ -1460,6 +1572,8 @@ mod tests {
             openh264: false,
             ffmpeg: false,
             libvpx: false,
+            windows: false,
+            ffmpeg_compiled: false,
         };
         assert!(plan(&args(), hw, None, none).is_err());
     }

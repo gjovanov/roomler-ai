@@ -1,6 +1,6 @@
 # FR-31: The opening keyframe of an NVENC session gets one frame's budget — ffmpeg discards the HRD in `cq` mode
 
-Status: **P0 measured; P1 (post-open VBV) and P1b (`ldkfs`) BOTH REFUTED by the A/B — the opening keyframe is ~1.1–1.3 × `maxrate/fps` and nothing ffmpeg exposes changes that; decision pending on the remaining levers** (2026-08-29). Tracking issue: `FR-31` (#897). Implementation PR #900 is a draft (inert knobs + the `open_vbv_bits` log field).
+Status: **closed not planned 2026-11-08** (triage): superseded by [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), which took the one lever left. **P0 measured; P1 (post-open VBV) and P1b (`ldkfs`) BOTH REFUTED by the A/B — the opening keyframe is ~1.1–1.3 × `maxrate/fps` and nothing ffmpeg exposes changes that** (2026-08-29). Tracking issue: `FR-31` (#897). Implementation PR #900, a draft (inert knobs + the `open_vbv_bits` log field), closed unmerged on 2026-11-08.
 Child of the RC-quality program; sibling of FR-10 (relay IDR thrift), FR-17 (relay transport),
 FR-22 (time-to-first-frame). Spec ships with the implementation PR (the default is decided by
 an A/B, see "Open decisions").
@@ -16,7 +16,7 @@ rc=vbr cq=22 preset=p4 tune=ll rc-lookahead=0 bf=0 forced-idr=1 maxrate=2550000 
 ```
 
 Per-frame sizes read off the `video-bytes` DataChannel in the browser (FR-17 framing header,
-then the pump's own header — `peer.rs:10252`, `byte[4]` flags, bit 0 = keyframe). Identical in
+then the pump's own header — `peer.rs:10254`, `byte[4]` flags, bit 0 = keyframe). Identical in
 every run:
 
 | frame | bytes | arrival | flags |
@@ -60,7 +60,7 @@ Two things this is NOT, both refuted by data rather than assumed:
    driver. That is what the A/B has to establish.
 
 The runtime side already works: the agent's `set_bitrate`
-(`encoder.rs:1736-1779`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
+(`encoder.rs:1747-1790`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
 ffmpeg's reconfigure path (`nvenc.c:2985-3001`) applies both via `NvEncReconfigureEncoder`
 before the next frame — the `if (avctx->rc_buffer_size > 0 && vbvBufferSize != rc_buffer_size)`
 branch is unconditional on `cq`. Consequence worth writing down: **from the first AIMD step
@@ -75,7 +75,7 @@ faster, so the same starvation is over in ~0.3 s.
 
 **P1 — make the intended reservoir reach the driver before frame 0 (NVENC).** Right after
 `build_encoder` returns an opened NVENC context (the constructor funnel at
-`encoder.rs:1085-1131`, the `Ok(encoder)` arm), write `rc_buffer_size = open_vbv_bits` on the
+`encoder.rs:1089-1135`, the `Ok(encoder)` arm), write `rc_buffer_size = open_vbv_bits` on the
 context, exactly as `set_bitrate` does; ffmpeg's reconfigure applies it on the first
 `send_frame`, before the opening IDR is encoded. `open_vbv_bits = buf × pct / 100`, where `buf`
 is the same HRD window `encoder_options` already computes (`maxrate × hrd_pct / 100`; AV1 is

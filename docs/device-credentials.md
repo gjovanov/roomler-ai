@@ -2,20 +2,22 @@
 
 Every enrolled device and every `roomler` tunnel client holds a long-lived credential the server issued. This page is what each one is, how it stays alive without hands on the machine (FR-103), and how it ends.
 
-> **The short version.** A device's agent token lives a year. The device renews it itself, 180 days early. A device that was off across its expiry renews within a 90-day grace when it comes back. Removing a device ends every token it was ever given, even if the same machine enrolls again and revives the row. A device connected at its removal is told at once and stops (#2267).
+> **The short version.** A device's agent token lives a year. The device renews it itself, 180 days early. A device that was off across its expiry renews within a 90-day grace when it comes back. Removing a device ends every token it was ever given, even if the same machine enrolls again and revives the row, and the revived row starts from a new device's settings (#3627). A device connected at its removal is told at once and stops (#2267).
 
 ## 1. The credentials
 
 | Credential | Issued by | Lives | Renewed by | Ends when | Where it is kept |
 |---|---|---|---|---|---|
-| **Enrollment token** | an admin (`POST /api/tenant/{tid}/agent/enroll-token`) | 10 min, **single use** | — | used, or 10 min pass | pasted once; never stored |
+| **Enrollment token** | an admin (`POST /api/tenant/{tid}/agent/enroll-token`) | 10 min, **single use** | — | used, or 10 min pass; refused, unspent, while its admin may not enroll devices in the org | pasted once; never stored |
+| **Ephemeral enrollment key** (FR-51) | an admin (`POST /api/tenant/{tid}/agent/enroll-key`) | 30 days by default, at most 90; 100 uses by default, at most 10 000 | — | revoked, expired or used up, or its admin leaves the org; refused while they may not enroll devices there | a CI secret store; shown once, never stored by the server ([`ephemeral-nodes.md`](ephemeral-nodes.md#ephemeral-enrollment-keys)) |
+| **Tunnel enrollment token** | a member (`POST /api/tenant/{tid}/tunnel-client/enroll-token`) | 10 min, **single use** (#3328) | — | used, or 10 min pass; refused, unspent, once its member has left the org | pasted once into `roomler enroll`; never stored |
 | **Agent token** (`aud = agent`) | `POST /api/agent/enroll` | 365 days (`rc.agent_token_ttl_secs`) | **the device** (`POST /api/agent/self/renew`) | the device is removed (generation), or it lapses past the grace | the daemon's `config.toml` (`agent_token`, or `[[orgs]].agent_token`) |
 | **Tunnel-client token** (`aud = tunnel-client`) | `POST /api/tunnel-client/enroll` | 365 days | **the `roomler` CLI** (`POST /api/tunnel-client/renew`) | the client is removed (generation), or it lapses past the grace | the CLI's `config.toml`, `0600` |
-| **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | `%ProgramData%\roomler\roomler\exec-service\anchor.json`, SYSTEM + Administrators only |
-| **Egress grant** (`net_grant`, FR-90 P3-7-1b) | the vault, answering `rc:vault.net` for one agent session | at most 900 s, with no leeway past its end | never: a session asks again for each tool call | its end; the network module believes it only on its origin device's own connection, toward the exit it names, in its organization, and holds every flow to it (P3-7-2a, [`tunnels.md`](tunnels.md#an-agent-sessions-grant-fr-90-p3-7-2a)) | the daemon that asked, once one does (P3-7-3) ([`vault.md`](vault.md) §21) |
-| **SSH ticket** (`ssh_ticket`, FR-90 P3-8-1a) | the vault, answering `rc:vault.ssh` for one agent session's command on another device | at most 900 s, with no leeway past its end | never: a session asks again for each command | its end; it never names the device the session runs on, and the network module will believe it only on that device's own connection, toward the target it names, while the target maps the account it names (P3-8-1b) | the daemon that asked, once one does (P3-8-2b) ([`vault.md`](vault.md) §22) |
+| **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | the registry key `HKLM\SOFTWARE\Roomler\ExecService`, value `Anchor`: SYSTEM + Administrators only, nobody else may read it (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)) |
 
 FR-104 adds one variation on the first row: an enrollment token minted with `anchor: true` may also anchor the device it enrolled, once ([`fleet-rpc.md`](fleet-rpc.md) § Anchoring).
+
+Both enrollment tokens are spent on the `used_tokens` ledger by the route that redeems them, and the mints that turn one into the long-lived credential take only the spent token ([`security-baseline.md`](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328), #3328). An enrollment token and an ephemeral key act for the admin who minted them: once that person has left the org or no longer manages its devices, `POST /api/agent/enroll` refuses either one, and `POST /api/agent/anchor` a token, with 403 before anything is spent, and a removal revokes the person's live keys ([`security-baseline.md`](security-baseline.md#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)). A tunnel enrollment token acts for the member who minted it: it enrolls nothing once that member has left the org, and it re-enrolls a known machine id only for that client's owner while the client is live, or for a holder of `MANAGE_AGENTS`.
 
 ## 2. The lifecycle of an agent token
 
@@ -68,7 +70,7 @@ sequenceDiagram
   - never before the first connect, so a device that cannot reach its server asks it nothing;
   - a random 0–60 s delay spreads a fleet that reconnected at once;
   - after a failure that may pass, it waits a full hour, and reconnects meanwhile do not trigger another try.
-- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:445`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
+- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:705`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
   - A file holding a *different* token was re-enrolled meanwhile, and that token wins.
   - A file naming another device for the enrollment is refused, with nothing written.
   - A save that fails still puts the renewed token in use: the file's token stays valid, so nothing is lost.
@@ -76,7 +78,7 @@ sequenceDiagram
 
 ### On a 401: recover before backing off
 
-When the server refuses the token at the socket (`signaling.rs:905`), the loop tries two things before its back-off ladder:
+When the server refuses the token at the socket (`agents/roomlerd/src/signaling.rs:1311`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
 2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:116`). On the renew routes only; every other route enforces `exp` as before.
@@ -87,27 +89,64 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 ## 4. A removal ends every earlier token
 
-Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape).
+Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1146`; tunnel clients `crates/services/src/dao/tunnel_client.rs:297`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1309`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
 |---|---|
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:96` |
-| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1512` |
-| DERP | `crates/modules/network/src/derp.rs:400` |
-| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2305` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:249` |
+| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1425` |
+| DERP | `crates/modules/network/src/derp.rs:401` |
+| the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2168` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:412` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.
 
 > ⚠️ Rows removed before FR-103 P1 reached the server keep generation 0, so their old tokens can still revive. That is accepted (the spec's decision 3): such rows are few, and only an old removal is affected.
 
+### A revived device starts from a new device's settings (#3627)
+
+The row comes back, but not what the removed device was allowed. Before #3627 a revive cleared `deleted_at` and nothing else, so the row came back with its SSH, exec and access policies, the org-relay and External access approvals, its connect code, approved routes, owner and labels, a pending config (pushed to the machine again on its first connect) and a standing key-rotation order, and the org's tunnel policies that named it applied to it again.
+
+`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:496`):
+
+| The row for `(tenant_id, machine_id)` | What the enrollment does |
+|---|---|
+| none | a new device (`AgentDao::create`), after the plan cap |
+| live: a device nobody removed (a lost token, a reinstall, `roomlerd re-enroll`) | refreshes it (`AgentDao::rehydrate`): os, version, the name unless an admin renamed it, the install method if the request says. **Everything it was allowed stays** |
+| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:326`) |
+
+What a revive keeps, and nothing else:
+
+| Kept | Why |
+|---|---|
+| `_id`, `tenant_id`, `machine_id` | the row's identity: sessions, audits, logs, crash reports and External access history hang off the id |
+| `created_at`, `enrolled_by` | when and by whom the row was first enrolled |
+| `token_gen` | the removal advanced it, so every token from before the removal stays refused ([above](#4-a-removal-ends-every-earlier-token)) |
+| `desired_config.revision` | a counter, so the next config saved for the device is one above every revision the row has used. The config itself is gone: nothing is requested |
+| a `Quarantined` status | a restriction, not a grant: enrolling the machine again must not be the way to lift a quarantine (nothing in the product sets one on a device; an operator does, in the database) |
+
+Everything else is what a new enrollment writes: every policy and approval at its closed default, no connect code, no approved routes, no key-rotation order, the machine's own name with no admin label or tag, and as owner the person whose enrollment token revived it. The device's own reports (capabilities, host key, device key, power, keep busy) wait for its first hello, as a new device's do. This holds by construction: the revive **replaces** the document with the one `AgentDao::new_row` builds for a new enrollment, so a field added later resets too.
+
+Before the row comes back, `HookRegistry::agent_revived` asks each holder to drop what it holds about the removed device (`network`, `crates/modules/network/src/hooks.rs:74`):
+
+- **its place in the org's tunnel policies**: its id leaves every live policy's subjects and targets (`TunnelPolicyDao::forget_agent`). A policy that named only this device is left naming nobody and grants nothing; it stays in the list to edit or delete;
+- **a lease its removal left behind**, normally none. A removal releases the device's overlay lease before the row goes; if that release did not happen, the leftover node goes through the same release (tombstone, then the pool, then the peers' `removes`). The device's first join then takes a fresh lease, as any device does ([overlay-communication.md](overlay-communication.md#address-leases--allocation-and-release)).
+
+A holder that cannot do its part stops the enrollment with a 503 and the row stays removed. The token is spent by then, so the retry needs a new one.
+
+**The races.** The revive is a compare-and-swap on the removal it read: the filter names the row's exact `deleted_at`, so a concurrent revive (the row is live) or a revive and a second removal (a new removal time, a higher `token_gen`) make it match nothing, and the route reads the row again. A stale read can never write an older generation back. The live refresh matches only a live row (`deleted_at: null`), so a removal that lands between the route's read and its write becomes a revive instead of being undone. After three rounds of such changes the enrollment answers 409.
+
+> ⚠️ A device removed by mistake therefore comes back blank: its policies, approvals, owner, name and tags are set again by hand. Removing a device is the way to end what it was allowed, and enrolling its machine again does not undo that. A device that was never removed keeps all of it.
+
+The server logs each revive: `enroll: a removed device enrolled again and starts from a new device's settings`, with the previous owner and the names (never the values) of the grants the removed device still held.
+
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1238`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1202`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1275`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1439`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 
@@ -118,7 +157,7 @@ sequenceDiagram
     participant Q as pod that holds the socket
     participant D as device
     A->>P: DELETE …/agent/{id}
-    P->>P: the holders (Hive's purge, the overlay lease), then the row
+    P->>P: the holders (the overlay lease), then the row
     P->>P: kick: out of this pod's hub
     P->>Q: control channel: kick {agent_id, goodbye}
     Q->>D: rc:goodbye AgentDeleted, behind what was queued before
@@ -132,16 +171,12 @@ sequenceDiagram
 | the ephemeral reaper | yes | |
 | an organization's archive | yes | before #2267 the archive did not even take the device out of the hub (`crates/modules/fleet/src/tenant_hooks.rs:50`) |
 | an ephemeral device's own unenroll | **no** | it is already shutting down, and a goodbye racing that clean stop would turn it into exit 7 (`tells_the_device`, `crates/modules/fleet/src/removal.rs:111`) |
-| a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a), on a build that drains (`hive-purge-drain`, #2294) | yes, after the purge's frame | its daemon finishes that purge before the goodbye's exit, bounded at 5 min (`finish_removal_purge`, `agents/roomlerd/src/hive/supervisor.rs:1384`) |
-| the same on `agent-v0.4.137` or `0.4.138` (`hive-purge-all` without `hive-purge-drain`) | **no**, and its socket stays open as before | that build exits at once on the goodbye, and its purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:1247`) |
-
-> ⚠️ `hive.replicaset` is server-wide, and the removal's purge goes to every connected device that advertises `hive-purge-all`, in any org. Every release since 0.4.137 does, as a property of the build. Before #2294 that meant no removed device on those builds was told once the replicaset was turned on. A build that drains is told whatever the setting. The same drain also covers a pod roll mid-purge, whose reconnect is refused with the same goodbye.
 
 What happens after exit 7 depends on how the daemon is installed. The device stays down until it is re-enrolled, and on some installs it needs a hand to start again. `roomlerd re-enroll` ends by naming the right step for the install it runs on, and so does the removal's needs-attention sentinel (`Install`, `agents/roomlerd/src/service.rs`; #2293):
 
 | Install | After exit 7 | After `roomlerd re-enroll` |
 |---|---|---|
-| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:937`) | the next start connects with the new token, with no hand |
+| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:1102`) | the next start connects with the new token, with no hand |
 | Windows, the per-user Scheduled Task | stays down until the next sign-in: `<RestartOnFailure>` restarts no exit, measured (#3292) | `roomlerd service start` |
 | macOS (launchd, `KeepAlive` on a failed exit) | relaunched at most every 10 s | the next relaunch, with no hand |
 | Linux, the system unit `roomlerd` | stays stopped: `RestartPreventExitStatus=7 8`, because restarting only hammers a server that already said no (`agents/roomlerd/packaging/linux/roomlerd.service:72`) | `sudo systemctl start roomlerd` |
@@ -190,6 +225,7 @@ A first `roomlerd enroll` ends the same way, by naming the step that connects th
 ## 7. Related
 
 - [`fleet-rpc.md`](fleet-rpc.md) — the anchor and the service credential.
+- [`ephemeral-nodes.md`](ephemeral-nodes.md) — the FR-51 ephemeral enrollment key.
 - [`security-baseline.md`](security-baseline.md) — the device plane.
 - [`multi-org.md`](multi-org.md) — one token per enrollment.
 - `docs/fr/FR-103-device-credentials-renew-themselves.md` — the spec, decisions and field log.

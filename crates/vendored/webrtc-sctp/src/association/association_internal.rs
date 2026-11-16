@@ -259,6 +259,10 @@ impl AssociationInternal {
             // awake read/write_loop to exit
             self.close_loop_ch_tx.take();
 
+            // roomler (#3716): and every writer parked in flow control. Nothing
+            // else ever lets one go once the peer stops acknowledging.
+            self.pending_queue.close();
+
             for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
                 self.unregister_stream(si);
             }
@@ -2435,5 +2439,19 @@ impl RtxTimerObserver for AssociationInternal {
             }
             _ => {}
         }
+    }
+}
+
+/// roomler (#3755): for the tests that need the pending queue full.
+#[cfg(test)]
+impl AssociationInternal {
+    /// Gives this association a pending queue of `bytes`. Before any stream is
+    /// opened: a stream writes to the queue it was opened with.
+    pub(crate) fn use_pending_queue_of(&mut self, bytes: usize) {
+        assert!(
+            self.streams.is_empty(),
+            "the pending queue is swapped before any stream is opened"
+        );
+        self.pending_queue = Arc::new(PendingQueue::with_limit(bytes));
     }
 }

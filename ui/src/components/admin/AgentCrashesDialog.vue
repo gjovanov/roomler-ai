@@ -28,8 +28,21 @@
       </v-card-title>
 
       <v-card-text style="max-height: 70vh">
+        <!-- A refusal is an answer, not an error (FR-82): reading a device's
+             crash reports needs MANAGE_AGENTS, and the dialog says so. -->
         <v-alert
-          v-if="error"
+          v-if="refused"
+          type="info"
+          variant="tonal"
+          density="compact"
+          data-testid="agent-crashes-refused"
+        >
+          Crash reports are shown to people who can manage this organization's
+          devices (the Manage devices permission).
+        </v-alert>
+
+        <v-alert
+          v-else-if="error"
           type="error"
           variant="tonal"
           density="compact"
@@ -43,14 +56,14 @@
         </div>
 
         <div
-          v-else-if="!loading && crashes.length === 0 && !error"
+          v-else-if="!loading && crashes.length === 0 && !error && !refused"
           class="text-center pa-6 text-medium-emphasis"
         >
           <v-icon size="48" color="grey-lighten-1" class="mb-2">mdi-check-circle-outline</v-icon>
           <p>No crashes reported. Nice.</p>
         </div>
 
-        <v-table v-else density="compact" class="crashes-table">
+        <v-table v-else-if="!refused" density="compact" class="crashes-table">
           <thead>
             <tr>
               <th style="width: 32px"></th>
@@ -139,6 +152,9 @@ const agentStore = useAgentStore()
 const crashes = ref<AgentCrash[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
+/** The caller may not read this device's crash reports (`null` from the
+ *  store): explained, never shown as an error or as "no crashes". */
+const refused = ref(false)
 const expandedId = ref<string | null>(null)
 
 async function load() {
@@ -146,8 +162,11 @@ async function load() {
   loading.value = true
   error.value = null
   try {
-    crashes.value = await agentStore.fetchCrashes(props.tenantId, props.agentId)
+    const items = await agentStore.fetchCrashes(props.tenantId, props.agentId)
+    refused.value = items === null
+    crashes.value = items ?? []
   } catch (e) {
+    refused.value = false
     error.value = (e as Error).message
     crashes.value = []
   } finally {

@@ -33,12 +33,16 @@
         @click="emit('action', 'rotate-key')"
       />
       <v-list-subheader>Diagnostics</v-list-subheader>
+      <!-- MANAGE_AGENTS on the server: a menu item that opens onto a refusal
+           is worse than none. -->
       <v-list-item
+        v-if="mayReadDiagnostics"
         prepend-icon="mdi-alert-circle-outline"
         title="Crash reports"
         @click="emit('action', 'crashes')"
       />
       <v-list-item
+        v-if="mayReadDiagnostics"
         prepend-icon="mdi-text-box-search-outline"
         title="Agent logs"
         @click="emit('action', 'logs')"
@@ -198,6 +202,10 @@ const props = defineProps<{
   /** FR-69 P9 — the overlay-key rotation and the SSH policy are the network
    *  module's routes; a menu item that leads to a 404 is worse than none. */
   networkMounted?: boolean
+  /** May the caller read the device's crash reports and uploaded logs
+   *  (`canReadDeviceDiagnostics`: `MANAGE_AGENTS`, failing open while the
+   *  mask is unknown)? Absent hides both items. */
+  mayReadDiagnostics?: boolean
   updateBusy?: boolean
   rotateKeyBusy?: boolean
   /** Why "Update now" will not take, when it will not (FR-67 P7). */

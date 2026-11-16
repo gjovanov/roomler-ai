@@ -27,16 +27,26 @@ pub mod diagnostics;
 /// #2338 — the enroll step every daemon pipeline shares: the fresh
 /// enrollment folded into the config already at its path.
 pub mod enroll_step;
+/// #3432 — the one failure an install ends with: its step, its kind (decided on
+/// the error's types), words a person can act on, and the whole cause chain.
+pub mod failure;
 /// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
 pub mod features;
 /// FR-129 C3 — the wizard's command line: what an elevated relaunch is
 /// handed, and the WebView2 folder an elevated run keeps apart.
 pub mod launch;
+/// #3609 — who writes a daemon install's config: the background-service
+/// role's machine enrollment is written by an administrator's process, the
+/// elevated wizard or the step that ran the installer.
+pub mod machine_write;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
 /// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded
 /// `install.sh` halves under the desktop's own administrator prompt.
 pub mod orchestrator_unix;
+/// #3246 — the file the wizard checks is the file `msiexec` runs: the publisher
+/// check, the hold, and the elevated step.
+pub mod package_step;
 /// FR-129 A3 — the pairing session: the device code and the delivered
 /// token live here, in this process, and never reach the webview.
 pub mod pairing;
@@ -45,9 +55,15 @@ pub mod role;
 /// FR-129 B1 (F3) — the running root daemon's own word on which device it is
 /// (Linux: its person socket), asked before a system-scope enroll.
 pub mod root_identity;
+/// #3523 — the configured server's clock, which the Token step judges a
+/// pasted token's expiry on.
+pub mod server_clock;
 /// FR-129 C — the gate on how the wizard's Windows path names a program.
 #[cfg(test)]
 mod spawn_gate;
+/// #3432 — the steps of an install, and the tracker each failure takes its
+/// step from.
+pub mod steps;
 /// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
 /// script, the halves' argv, the prompt tools, the exit codes, the private
 /// scratch directory.
@@ -150,12 +166,151 @@ mod front_tests {
         assert!(js.contains("invoke(\"cmd_relaunch_elevated\""));
     }
 
+    /// #3247 item 11 — `install.ps1 -Uninstall` removes the service and leaves
+    /// its hardened folder, so a limited wizard showed "Daemon: no existing
+    /// install detected." and, under it, "This device already has the
+    /// background service". The note's first sentence now follows detection.
+    #[test]
+    fn the_elevation_note_says_a_service_is_there_only_when_one_is() {
+        let html = include_str!("front/index.html");
+        let note = html
+            .find("<div id=\"elevation-note\"")
+            .expect("the elevation note");
+        let end = note + html[note..].find("</div>").expect("the note's end");
+        assert!(
+            html[note..end].contains("<span id=\"elevation-note-lead\">"),
+            "the first sentence is its own element, inside the note"
+        );
+        let js = include_str!("front/app.js");
+        assert!(
+            js.contains(
+                "document.getElementById(\"elevation-note-lead\").textContent = elevationNoteLead(a.kind);"
+            ),
+            "Welcome sets the sentence from what detection found"
+        );
+        assert!(
+            js.contains("return kind === \"permachine\" || kind === \"ambiguous\""),
+            "only an installed per-machine service is called one"
+        );
+        assert!(js.contains(
+            "\"An earlier background service left its settings on this device, in a folder only administrators may open.\""
+        ));
+    }
+
     /// FR-129 C1 — the operator, 2026-10-30: the wizard never calls the
     /// daemon an "agent". The text a person sees in the page (comments and
     /// markup aside) says `roomlerd`, "the daemon" or "device".
     #[test]
     fn the_page_text_never_says_agent() {
+        let text = visible_text(include_str!("front/index.html"));
+        assert!(
+            !text.to_ascii_lowercase().contains("agent"),
+            "visible text mentions an agent: {}",
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+
+    /// #3395 — after Open the browser comes up over this window and covers the
+    /// code the page asks for, and neither page said where the code was. The
+    /// waiting state says it before Open: the code is typed in the browser, the
+    /// browser opens over this window, and Copy code takes the code along. And
+    /// no line of the step says "nothing to copy" while a code has to be typed.
+    #[test]
+    fn the_pairing_step_says_where_the_code_goes_and_how_to_take_it_along() {
         let html = include_str!("front/index.html");
+        let js = include_str!("front/app.js");
+        let mut wrong = Vec::new();
+
+        let from = html
+            .find("<div id=\"pair-active\"")
+            .expect("the waiting state");
+        let to = from
+            + html[from..]
+                .find("<!-- Approved")
+                .expect("the state after the waiting one");
+        let waiting = one_line(&visible_text(&html[from..to]));
+        for said in [
+            "Type this code in your browser",
+            "The browser opens over this window",
+            "Press Copy code first to take it along",
+        ] {
+            if !waiting.contains(said) {
+                wrong.push(format!("the waiting state does not say {said:?}"));
+            }
+        }
+
+        // The lead line is in the markup and in `renderPairing`, which sets it
+        // when the server offers pairing. Neither may say "nothing to copy".
+        let literals = js_string_literals(js);
+        if !literals
+            .iter()
+            .any(|l| l.starts_with("Approve this device from your browser"))
+        {
+            wrong.push("renderPairing's lead line moved; point this test at it".into());
+        }
+        let page = one_line(&visible_text(html)).to_ascii_lowercase();
+        if page.contains("nothing to copy") {
+            wrong.push("index.html still says \"nothing to copy\"".into());
+        }
+        for literal in literals {
+            if one_line(literal)
+                .to_ascii_lowercase()
+                .contains("nothing to copy")
+            {
+                wrong.push(format!(
+                    "app.js still says \"nothing to copy\": {literal:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #3714 — each ticked box under Advanced options says what it does.
+    /// Auto-approve only drops this machine's own extra prompt: the
+    /// organization's consent policy still decides, the people it does not let
+    /// in are asked at the screen, and a notice with Disconnect shows while
+    /// someone views. The subnets box only suggests routes to the tunnel mesh,
+    /// which an administrator approves, so it sits with the tunnel's routes.
+    #[test]
+    fn the_advanced_boxes_say_what_they_do() {
+        let html = include_str!("front/index.html");
+        let from = html
+            .find("<details id=\"advanced-wrap\"")
+            .expect("the Advanced section");
+        let to = from + html[from..].find("</details>").expect("its end");
+        let advanced = one_line(&visible_text(&html[from..to]));
+        let mut wrong = Vec::new();
+        for said in [
+            "Trust the organization's consent policy (no extra prompt on this machine)",
+            "Everyone else is asked at this screen",
+            "a notice with Disconnect while someone is viewing",
+            "Suggest this machine's local networks as tunnel routes",
+            "until an administrator approves a route",
+        ] {
+            if !advanced.contains(said) {
+                wrong.push(format!("the Advanced section does not say {said:?}"));
+            }
+        }
+        if advanced.contains("Auto-approve") {
+            wrong.push("the Advanced section still says \"Auto-approve\"".into());
+        }
+        // The subnets box sits beside the tunnel field it adds to, after the
+        // overlay's routes, so it does not read as an overlay setting.
+        let at = |text: &str| advanced.find(text).unwrap_or(usize::MAX);
+        let subnets = at("Suggest this machine's local networks");
+        if !(at("Overlay subnet routes") < subnets && subnets < at("Tunnel subnet routes")) {
+            wrong.push("the subnets box is not beside \"Tunnel subnet routes\"".into());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `text` with every run of whitespace, line breaks included, as one space.
+    fn one_line(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The text of `html` a person sees: markup and comments dropped.
+    fn visible_text(html: &str) -> String {
         let mut text = String::new();
         let mut rest = html;
         while !rest.is_empty() {
@@ -170,10 +325,348 @@ mod front_tests {
                 rest = &rest[next..];
             }
         }
-        assert!(
-            !text.to_ascii_lowercase().contains("agent"),
-            "visible text mentions an agent: {}",
-            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        text
+    }
+
+    /// The MSI's flavour names and the service's switch, which a new person
+    /// does not know (#3247).
+    const JARGON: [&str; 3] = ["perUser", "perMachine", "SystemContext"];
+
+    /// #3247 — the cards, Welcome's summary, the warnings and Done speak a
+    /// person's words. The jargon stays in code, comments and the one event
+    /// name the page matches on.
+    #[test]
+    fn the_page_never_says_the_msi_flavour_names() {
+        let text = visible_text(include_str!("front/index.html"));
+        for word in JARGON {
+            assert!(!text.contains(word), "index.html shows {word}");
+        }
+        for literal in js_string_literals(include_str!("front/app.js")) {
+            // A template's `${…}` is code, whose names may say anything.
+            let shown = without_interpolations(literal);
+            for word in JARGON {
+                assert!(
+                    !shown.contains(word) || shown == "SystemContextError",
+                    "app.js shows {word}: {literal:?}"
+                );
+            }
+        }
+        // The scanner finds literals and skips comments, or the loop above
+        // could pass by reading nothing.
+        assert_eq!(
+            js_string_literals("// \"perUser\"\nf(\"a\", 'b', `c ${d}`); /* \"perMachine\" */"),
+            ["a", "b", "c ${d}"]
         );
+        assert_eq!(without_interpolations("a ${perUserWord} b ${c}"), "a  b ");
+    }
+
+    /// The text of `function name(…) { … }` in `js`: from its head to the
+    /// first brace at the start of a line, which ends it.
+    fn function_body<'a>(js: &'a str, name: &str) -> &'a str {
+        let start = js
+            .find(&format!("function {name}("))
+            .unwrap_or_else(|| panic!("app.js has no function {name}"));
+        let end = js[start..].find("\n}").map_or(js.len(), |at| start + at);
+        &js[start..end]
+    }
+
+    /// #3590 — the checklist is the wizard's list of steps. The page draws the
+    /// last `Steps` snapshot the tracker sent and keeps no row of its own: no
+    /// row keyed by an event's type (a failure left those running), and no
+    /// label made from an event's fields (`AssetResolving`'s `artifact` named
+    /// the MSI flavour).
+    #[test]
+    fn the_checklist_draws_the_steps_snapshot_and_nothing_else() {
+        let js = include_str!("front/app.js");
+        assert!(
+            function_body(js, "handleProgress").contains("type === \"Steps\""),
+            "the page does not read the Steps snapshot"
+        );
+        assert!(
+            function_body(js, "renderInstall").contains("for (const row of state.installSteps)"),
+            "renderInstall does not draw the snapshot's rows"
+        );
+        for own in [
+            "installRows",
+            "STEP_LABELS",
+            "checklistLabel",
+            "checklistClass",
+        ] {
+            assert!(!js.contains(own), "app.js keeps rows of its own: {own}");
+        }
+        for field in ["artifact", "existing"] {
+            assert!(
+                !js.contains(&format!("d.{field}")) && !js.contains(&format!("data.{field}")),
+                "app.js draws an event's {field}"
+            );
+        }
+    }
+
+    /// #3590 — every state a row can be in has a look of its own, and the page
+    /// maps each wire state to it.
+    #[test]
+    fn every_row_state_has_a_look_of_its_own() {
+        let css = include_str!("front/styles.css");
+        let js = include_str!("front/app.js");
+        for (state, class) in [
+            ("pending", "pending"),
+            ("running", "running"),
+            ("done", "ok"),
+            ("failed", "error"),
+            ("not_reached", "not-reached"),
+            ("warning", "warning"),
+        ] {
+            assert!(
+                css.contains(&format!(".checklist li.{class} .icon::before")),
+                "styles.css has no look for {class}"
+            );
+            assert!(
+                js.contains(&format!("{state}: \"{class}\"")),
+                "app.js maps no class for {state}"
+            );
+        }
+    }
+
+    /// #3590 — a warning the install raised can still be read on Done.
+    #[test]
+    fn the_done_page_lists_the_warnings() {
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("id=\"done-warnings\"") && html.contains("id=\"done-warnings-list\""),
+            "Done has no place for the warnings"
+        );
+        assert!(
+            function_body(include_str!("front/app.js"), "renderDone").contains("done.warnings"),
+            "renderDone does not list the report's warnings"
+        );
+    }
+
+    /// Why the device was not anchored and why the service was not restarted
+    /// are warnings like the rest: Done says each once, in its warnings, and
+    /// no note of its own repeats one. The anchor's manual command stays: it
+    /// is what to do, not why.
+    #[test]
+    fn the_done_page_says_each_warning_once() {
+        let html = include_str!("front/index.html");
+        let js = include_str!("front/app.js");
+        for repeat in [
+            "done-anchor-reason",
+            "done-restart-note",
+            "done-restart-reason",
+            "anchorSkipReason",
+            "restartSkipReason",
+        ] {
+            assert!(
+                !html.contains(repeat) && !js.contains(repeat),
+                "Done repeats a warning: {repeat}"
+            );
+        }
+        assert!(html.contains("id=\"done-anchor-command\""));
+    }
+
+    /// The preflight row says what is installed here already and what the
+    /// install does to it (`PreflightOk`'s words, the row's detail), in a
+    /// person's words: whatever is found, never a flavour's name.
+    #[test]
+    fn the_preflight_says_what_is_installed_in_a_persons_words() {
+        use roomlerd::install_detect::{ExistingInstall, InstallInfo};
+        let info = |version: Option<&str>| InstallInfo {
+            version: version.map(str::to_string),
+            install_location: None,
+        };
+        for requested in ["peruser", "permachine", "permachine-systemcontext"] {
+            for found in [
+                ExistingInstall::Clean,
+                ExistingInstall::PerUser(info(Some("0.4.207"))),
+                ExistingInstall::PerMachine(info(None)),
+                ExistingInstall::Ambiguous {
+                    peruser: info(Some("0.4.1")),
+                    permachine: info(Some("0.4.2")),
+                },
+            ] {
+                let words = crate::orchestrator_agent::label_existing(&found, requested);
+                assert!(words.starts_with("Roomler is "), "{words:?}");
+                let lower = words.to_lowercase();
+                for flavour in [
+                    "peruser",
+                    "permachine",
+                    "systemcontext",
+                    "per-user",
+                    "clean",
+                ] {
+                    assert!(!lower.contains(flavour), "{words:?} says {flavour}");
+                }
+                assert_eq!(
+                    words.ends_with("this install replaces it"),
+                    matches!(
+                        (&found, requested),
+                        (ExistingInstall::PerUser(_), "peruser")
+                            | (
+                                ExistingInstall::PerMachine(_),
+                                "permachine" | "permachine-systemcontext"
+                            )
+                    ),
+                    "{words:?} for {requested}"
+                );
+            }
+        }
+    }
+
+    /// `literal` with each `${…}` taken out.
+    fn without_interpolations(literal: &str) -> String {
+        let mut shown = String::new();
+        let mut rest = literal;
+        while let Some(at) = rest.find("${") {
+            shown.push_str(&rest[..at]);
+            rest = rest[at..].split_once('}').map_or("", |(_, r)| r);
+        }
+        shown.push_str(rest);
+        shown
+    }
+
+    /// Every quoted string in `js`, outside comments. Rough, but app.js holds no
+    /// quote inside a regex literal.
+    fn js_string_literals(js: &str) -> Vec<&str> {
+        let bytes = js.as_bytes();
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                quote @ (b'"' | b'\'' | b'`') => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    found.push(&js[start..i.min(js.len())]);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        found
+    }
+
+    /// #3523 — the Token page never refuses a token on this computer's clock
+    /// alone. Rust judges `exp` on the server's clock when it holds a reading
+    /// (`expiry`: `valid`, `expired`, `deviceClockOnly`); the page blocks only
+    /// on `expired`, for the first token and the macOS second one alike.
+    mod token_step_clock {
+        fn app_js() -> String {
+            include_str!("front/app.js").replace("\r\n", "\n")
+        }
+
+        /// `function name(…) { … }` in `js`, up to the first `}` at a line start.
+        fn js_function<'a>(js: &'a str, name: &str) -> &'a str {
+            let start = js
+                .find(&format!("function {name}("))
+                .unwrap_or_else(|| panic!("app.js has no function {name}"));
+            let end = js[start..].find("\n}").map_or(js.len(), |at| start + at);
+            &js[start..end]
+        }
+
+        #[test]
+        fn the_page_reads_no_verdict_of_the_device_clock() {
+            assert!(
+                !app_js().contains("appearsExpired"),
+                "the device clock's verdict is gone from the wire"
+            );
+        }
+
+        #[test]
+        fn both_tokens_are_judged_on_the_configured_servers_clock() {
+            let js = app_js();
+            for name in ["validateToken", "validateRootToken"] {
+                assert!(
+                    js_function(&js, name).contains(
+                        "invoke(\"cmd_validate_token\", { token: t, role: state.role, server: state.server })"
+                    ),
+                    "{name} names the server whose clock judges the token"
+                );
+            }
+            assert!(
+                js_function(&js, "validateToken").contains("if (state.token.trim() !== t) return;"),
+                "an answer that waited on the server's clock never overwrites a newer one"
+            );
+        }
+
+        #[test]
+        fn the_first_token_blocks_only_on_the_servers_expiry() {
+            let js = app_js();
+            let render = js_function(&js, "renderToken");
+            let blocks = render
+                .find("if (view.expiry === \"expired\") {\n    warnExpired.hidden = false;\n    return;\n  }")
+                .expect("an expiry by the server's clock blocks, as before");
+            let warns = render
+                .find("warnClock.hidden = clockWords === null;")
+                .expect("an expiry by this computer's clock alone warns");
+            let gate = render
+                .find("continueBtn.disabled = rootHalf && rootProblem !== null;")
+                .expect("the Continue gate");
+            assert!(blocks < warns && warns < gate);
+            assert!(
+                !render[warns..gate].contains("return"),
+                "the clock warning never disables Continue"
+            );
+        }
+
+        #[test]
+        fn the_second_token_blocks_only_on_the_servers_expiry() {
+            let js = app_js();
+            let problem = js_function(&js, "rootTokenProblem");
+            assert!(problem.contains(
+                "if (state.rootTokenView.expiry === \"expired\") return \"The second token has already expired. Mint a new one.\";"
+            ));
+            assert!(
+                !problem.contains("deviceClockOnly"),
+                "this computer's clock alone is no problem for the second token"
+            );
+            assert!(
+                js_function(&js, "renderToken").contains("clockWarning(state.rootTokenView)"),
+                "the second token's line carries the clock warning"
+            );
+        }
+
+        #[test]
+        fn the_expiry_shown_is_the_servers_time_when_known() {
+            let js = app_js();
+            let format = js_function(&js, "formatExpiry");
+            assert!(format.starts_with("function formatExpiry(unix, offsetSecs) {"));
+            assert!(format.contains("Date.now() - offsetSecs * 1000"));
+            let render = js_function(&js, "renderToken");
+            assert!(render.contains("formatExpiry(view.expiresAtUnix, view.clockOffsetSecs)"));
+            assert!(render.contains(
+                "formatExpiry(state.rootTokenView.expiresAtUnix, state.rootTokenView.clockOffsetSecs)"
+            ));
+        }
+
+        #[test]
+        fn the_clock_warning_is_a_warning_and_says_the_server_decides() {
+            let html = include_str!("front/index.html");
+            assert!(html.contains("<div id=\"token-warn-clock\" class=\"warning\" hidden></div>"));
+            let js = app_js();
+            let words = js_function(&js, "clockWarning");
+            assert!(words.contains("view.expiry !== \"deviceClockOnly\""));
+            assert!(
+                words.contains("ahead of the server's"),
+                "by how much, when known"
+            );
+            assert!(
+                words.contains("the server checks it when the device enrolls"),
+                "the server decides at enrollment"
+            );
+        }
     }
 }

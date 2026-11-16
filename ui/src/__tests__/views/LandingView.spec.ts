@@ -56,7 +56,9 @@ async function mountLanding() {
   return w
 }
 
-/** The install section's "Roomler Setup" buttons, by the OS they download for. */
+/** The install section's "Roomler Setup" downloads, by the platform they are for. The
+ *  Linux card's ARM64 link (#3247 item 13) goes with its button, so `linux-aarch64`
+ *  is there exactly when `linux` is. */
 function wizardOffered(): string[] {
   const section = document.getElementById('download')!
   return [...section.querySelectorAll('a[href*="/api/setup/"]')]
@@ -94,7 +96,7 @@ describe('LandingView — Roomler Setup on each OS card (FR-129 B1-s2)', () => {
     })
     const w = await mountLanding()
     expect(mockApi.get).toHaveBeenCalledWith('/setup/features')
-    expect(wizardOffered()).toEqual(['linux', 'windows'])
+    expect(wizardOffered()).toEqual(['linux', 'linux-aarch64', 'windows'])
     w.unmount()
   })
 
@@ -114,7 +116,7 @@ describe('LandingView — Roomler Setup on each OS card (FR-129 B1-s2)', () => {
   it('offers it on both for an older server’s wizard_unix_daemon', async () => {
     mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: true, wizard_pairing: false })
     const w = await mountLanding()
-    expect(wizardOffered()).toEqual(['linux', 'macos', 'windows'])
+    expect(wizardOffered()).toEqual(['linux', 'linux-aarch64', 'macos', 'windows'])
     w.unmount()
   })
 

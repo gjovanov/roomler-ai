@@ -66,7 +66,7 @@ Two more measurements shaped the design rather than motivating it:
   consent and cluster metrics. It is the device control-plane multiplexer, not a remote-desktop
   object — which is why device management becomes a module of its own (D3).
 - **The wire already groups by pillar.** `ClientMsg`/`ServerMsg`
-  (`crates/remote_control/src/signaling.rs:515`, `:2305`) carry ~134 variants; the `rc:` names
+  (`crates/remote_control/src/signaling.rs:503`, `:2363`) carry ~134 variants; the `rc:` names
   group as tunnel 35 · overlay 18 · agent 8 · rpc 5 · ssh 4 · sdp 4 · relay 4 · session 3 ·
   consent 3. The namespaces map onto modules without touching a byte (D7).
 
@@ -226,7 +226,7 @@ Considered: one `AppState` with `Option<…>` fields under cfg · **per-module s
   change is small because `AuthUser`, `OptionalAuthUser` and `TenantId` are already generic over
   `S` (only the bound moves from `AppState` to `Core`); `AuthAgent` moves to `fleet` because it
   loads the agent row; the membership guards in `routes/helpers.rs` split the same way
-  (`is_member` → core, `require_room_in_tenant` / `require_message_in_tenant` → chat).
+  (`is_member` → core, `require_room_in_tenant` / `require_message_in_tenant` → chat; the message guard is `require_message_in_room` since #3577).
 - *Cons*: mechanical churn across 216 + 206 sites (pure signature work, the bulk of P1);
   helpers that took `&AppState` to reach two pillars at once must be rewritten as hooks (D6).
 - *Why*: `Option` fields keep every handler compiling against everything and turn every

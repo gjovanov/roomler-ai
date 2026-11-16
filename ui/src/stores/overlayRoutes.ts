@@ -4,8 +4,10 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
 import { useCapabilitiesStore } from '@/stores/capabilities'
+import { useTenantStore } from '@/stores/tenant'
+import { canEditMagicDns } from '@/utils/permissions'
 
-// Matches `crates/api/src/routes/overlay_route.rs::OverlayNodeResponse`.
+// Matches `crates/modules/network/src/routes/overlay_route.rs::OverlayNodeResponse`.
 export interface OverlayNode {
   id: string
   name: string
@@ -147,8 +149,20 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     return res
   }
 
+  // Any member reads the org's MagicDNS settings: every overlay node receives
+  // them anyway. Changing them is `MANAGE_AGENTS` (see `mayEditMagicDns`).
   async function fetchMagicDns(tenantId: string): Promise<MagicDnsSettings> {
     return await api.get<MagicDnsSettings>(`/tenant/${tenantId}/magic-dns`)
+  }
+
+  /** May this caller change the org's MagicDNS (`MANAGE_AGENTS` on the
+   *  server)? Awaits the membership, since AppLayout's `/member/me` may still
+   *  be in flight while the page mounts; fails open when it could not be read
+   *  (`canEditMagicDns`), and then a save's 403 answers instead. */
+  async function mayEditMagicDns(tenantId: string): Promise<boolean> {
+    const tenants = useTenantStore()
+    await tenants.ensureMyMembership(tenantId)
+    return canEditMagicDns(tenants.myPermissions, tenants.isOwner)
   }
 
   async function saveMagicDns(
@@ -170,6 +184,7 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     setExitNode,
     evictNode,
     fetchMagicDns,
+    mayEditMagicDns,
     saveMagicDns,
   }
 })

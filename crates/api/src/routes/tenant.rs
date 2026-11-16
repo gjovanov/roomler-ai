@@ -164,11 +164,12 @@ pub async fn archive(
     let tenant = state.tenants.set_archived(tid, true).await?;
 
     // FR-69 P7b — the pillars tear down what they hold, through the core
-    // registry in HOOK_ORDER: `network` releases every mesh node (which
-    // pools its address and tells the peers) and quarantines the tenant's
-    // block — never re-issued, a device that never saw the archive still
-    // thinks it owns an address in that range — then `fleet` revokes every
-    // device's enrollment (the agent's long-lived JWT stays cryptographically
+    // registry in HOOK_ORDER: `network` revokes every tunnel client, releases
+    // every mesh node (which pools its address and tells the peers) and
+    // quarantines the tenant's block — never re-issued, a device that never
+    // saw the archive still thinks it owns an address in that range — then
+    // `fleet` revokes every device's enrollment (the agent's long-lived JWT
+    // stays cryptographically
     // valid for its full year, so the row is the only thing that can
     // withdraw it — `soft_delete` is what every auth path already checks). A
     // pillar this pod does not mount simply holds nothing.

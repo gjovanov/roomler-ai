@@ -57,6 +57,8 @@
 .home-os { display: flex; align-items: center; gap: 8px; }
 .home-os svg { color: var(--teal); }
 .home-muted { color: var(--ink-muted); font-size: .9rem; margin: 8px 0 6px; }
+/* #3202: what the wizard needs first, under its button and inside its <p>. */
+.home-hint { display: block; color: var(--ink-muted); font-size: .8rem; margin-top: 6px; }
 /* FR-129 B1-s: the Linux and macOS "Roomler Setup" buttons ship HIDDEN and
  * `home.js` shows them when the server says so. The attribute alone relies on
  * the UA stylesheet, which any later `display` rule on a card's `<p>` would

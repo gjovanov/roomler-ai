@@ -14,7 +14,7 @@ vi.mock('@/composables/useSnackbar', () => ({
   useSnackbar: () => ({ showError: mockShowError }),
 }))
 
-import { api, ApiError } from '@/api/client'
+import { api, ApiError, uploadsInProgress } from '@/api/client'
 import router from '@/plugins/router'
 
 const mockRouter = vi.mocked(router)
@@ -477,6 +477,31 @@ describe('api client', () => {
       await api.get('/tenant/123')
 
       expect(mockFetch).toHaveBeenCalledWith('/api/tenant/123', expect.anything())
+    })
+  })
+
+  describe('#3582: uploads in flight, for a reload that must wait for them', () => {
+    it('counts an upload while it runs, and not after it ends, failed or not', async () => {
+      let answer: (v: unknown) => void = () => {}
+      mockFetch.mockReturnValueOnce(new Promise((r) => (answer = r)))
+      const pending = api.upload('/tenant/t/file', new FormData())
+      expect(uploadsInProgress()).toBe(1)
+      answer(mockJsonResponse(201, { id: 'f' }))
+      await pending
+      expect(uploadsInProgress()).toBe(0)
+
+      mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      const failing = api.upload('/tenant/t/file', new FormData())
+      expect(uploadsInProgress()).toBe(1)
+      await expect(failing).rejects.toThrow()
+      expect(uploadsInProgress()).toBe(0)
+    })
+
+    it('does not count any other request', async () => {
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(200, {}))
+      const p = api.post('/tenant/t/thing', { a: 1 })
+      expect(uploadsInProgress()).toBe(0)
+      await p
     })
   })
 })

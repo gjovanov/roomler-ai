@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { RC_DECODER_COLOR_SPACE } from '@/workers/rc-decoder-config'
+import { DC_CODECS } from './dcCodecs'
 
 const SET_S = { ...RC_DECODER_COLOR_SPACE }
 
@@ -128,27 +129,14 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-const DC_WORKERS = [
-  {
-    name: 'rc-vp9-444-worker (VP9, AV1, H.264 over the data channel)',
-    load: () => import('@/workers/rc-vp9-444-worker'),
-    codec: 'vp09.01.10.08',
-  },
-  {
-    name: 'rc-hevc-worker (HEVC over the data channel)',
-    load: () => import('@/workers/rc-hevc-worker'),
-    codec: 'hev1.1.6.L153.B0',
-  },
-] as const
-
-describe.each(DC_WORKERS)('FR-130 P2 — $name', ({ load, codec }) => {
+describe.each(DC_CODECS)('FR-130 P2 — rc-dc-worker (the data channel) on $name', ({ codec }) => {
   /** The worker's config as it was before FR-130, field for field. */
   const base = { codec, optimizeForLatency: true, hardwareAcceleration: 'no-preference' }
 
   async function start(init: Record<string, unknown>) {
-    await load()
+    await import('@/workers/rc-dc-worker')
     const onmessage = scope.onmessage!
-    onmessage({ data: { type: 'init-canvas', canvas: fakeCanvas(), ...init } })
+    onmessage({ data: { type: 'init-canvas', canvas: fakeCanvas(), codec, ...init } })
     return (msg: Record<string, unknown>) => onmessage({ data: msg })
   }
 

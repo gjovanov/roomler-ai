@@ -41,6 +41,10 @@ permissions:
 env:
   IMAGE: ghcr.io/${{ github.repository }}
   KUSTOMIZATION: k8s/overlays/prod/kustomization.yaml
+  # FR-28 — the DaemonSet that holds the image on every node a roomler2 pod can
+  # land on. Its file in the deploy repo is the switch: no file, no pre-pull.
+  PREPULL: k8s/overlays/prod/daemonset-roomler2-prepull.yaml
+  PREPULL_WAIT_S: 30
 
 jobs:
   promote:
@@ -148,6 +152,33 @@ jobs:
             echo "bumped=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # FR-28 — the image first, then the roll. This commit moves only the
+          # DaemonSet, so no app pod is touched, and a replacement pod then starts
+          # without pulling: 3–4 s off each wave on the roll read live on 2026-10-31.
+          # Nothing here can hold a roll back. This runner cannot see the cluster, so
+          # the wait is fixed, and a pull that fails or outlasts it leaves today's
+          # roll, whose pods pull for themselves. ArgoCD sync waves would wait for the
+          # pull exactly, and would also park every sync on a node that is down.
+          PREPULLED=none
+          if [ -f "$PREPULL" ]; then
+            sed -i "s|^\(\s*image:\).*|\1 ${IMAGE}:${TAG}|" "$PREPULL"
+            if git diff --quiet; then
+              PREPULLED=already
+            else
+              git commit -qam "chore(k8s): pre-pull ${TAG} on the roomler2 nodes — promoted by ${GITHUB_ACTOR} via FR-28"
+              if git push -q; then
+                PREPULLED=pushed
+                echo "  pre-pull of ${TAG} pushed; the roll follows in ${PREPULL_WAIT_S} s"
+                sleep "$PREPULL_WAIT_S"
+              else
+                PREPULLED=failed
+                echo "::warning title=Pre-pull not pushed::The roll goes ahead, and its pods pull for themselves."
+                git reset -q --hard HEAD~1
+              fi
+              git pull -q --rebase
+            fi
+          fi
+          echo "prepull=$PREPULLED" >> "$GITHUB_OUTPUT"
           sed -i "s|^\(\s*newTag:\).*|\1 ${TAG}|" "$KUSTOMIZATION"
           git commit -am "chore(k8s): bump roomler-ai to ${TAG} (was ${OLD}) — promoted by ${GITHUB_ACTOR} via FR-73"
           git push
@@ -199,6 +230,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           BUMPED: ${{ steps.bump.outputs.bumped || 'no' }}
           OLD: ${{ steps.bump.outputs.old }}
+          PREPULLED: ${{ steps.bump.outputs.prepull || 'none' }}
         run: |
           was=""
           if [ -n "$OLD" ]; then was=" (was \`$OLD\`)"; fi
@@ -209,6 +241,7 @@ jobs:
             echo "|---|---|"
             echo "| tag | \`$TAG\` |"
             echo "| bumped | $BUMPED$was |"
+            echo "| pre-pull | $PREPULLED |"
             echo
             echo "Field-verify from the fleet now: pods on the new image, online-agent count, an RC session, an overlay pair, a tunnel forward."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -32,7 +32,7 @@
 
 ## C-1 — identity, directory, bus (implemented)
 
-### Pod identity (`crates/api/src/cluster/identity.rs`)
+### Pod identity (`crates/core/src/cluster/identity.rs`)
 
 `pod_id` — stable across restarts: `ROOMLER__APP__POD_ID` override (tests
 inject per-app values) → `ROOMLER__POD_HOST_IP` (hostNetwork ⇒ ≤1 API pod
@@ -47,7 +47,7 @@ The pub/sub **origin** stamped on every envelope is `<pod_id>/<epoch>`
 user-online SREM semantics are unchanged because the epoch differs per
 process).
 
-### Ownership directory (`crates/api/src/cluster/directory.rs`)
+### Ownership directory (`crates/core/src/cluster/directory.rs`)
 
 One Redis STRING per live entity, value = the canonical owner token
 `"<pod_id>/<epoch>/<extra>/<since_ms>"` (`OwnerRecord::parse`). Key
@@ -70,7 +70,7 @@ Three shared operations (Lua where atomicity matters):
 - **release** — compare-and-delete on the full token (a bare GET+DEL races
   a fresh re-home; a stale release must no-op against a newer claim).
 
-### Inter-pod bus (`crates/api/src/cluster/bus.rs`)
+### Inter-pod bus (`crates/core/src/cluster/bus.rs`)
 
 Each pod subscribes to `roomler:pod:<pod_id>` (stable — a restarted
 process re-subscribes and NACKs requests for entities it doesn't hold,
@@ -103,16 +103,16 @@ rejected there is NO data plane crossing pods), keyspace notifications
 
 - **rc (C-2)** — *client redial + idle-agent nudge*. On session-request
   hub-miss with a fresh foreign directory record: reply
-  `rc:session.rehome{tid}`; the browser re-pins its WS
+  `rc:error {code: "agent_on_other_pod"}` (designed as `rc:session.rehome{tid}`); the browser re-pins its WS
   (`setTenantAffinity` + a new `forceRedial` for the parked-socket case)
   and retries ONCE. After topology changes the *agent's* WS may sit on an
   old-hash pod: the owning pod closes it — **only when idle** (no active
   sessions, no tunnel sessions targeting it) — so its reconnect re-lands
-  at the current hash. Sessions stay pod-local for life; **cross-pod
+  at the current hash. Sessions stay pod-local (FR-138 rebuilds one on the pod its device's claim reaches, [below](#a-live-rc-session-through-its-pods-death-fr-138)); **cross-pod
   session frame-relay is rejected permanently** (a `LiveSession` pins its
   `controller_tx` on the creating pod; relaying is a durable bidirectional
   proxy with new failure modes, for a signaling-only channel whose media
-  is P2P). Consent + admin-kick become broadcast control events every pod
+  is P2P). **Reversed since by PR-2:** a session-request miss is now relayed first: the controller's `rc:*` frames cross the per-pod bus to the owning pod's hub (`crates/modules/remote/src/relay.rs`), and media stays P2P. The rehome reply above is the fallback when the relay is unavailable (`crates/modules/remote/src/controller.rs`). Consent + admin-kick become broadcast control events every pod
   applies to its local hub.
 - **tunnel (C-3)** — same pattern: open-path miss ⇒
   `TunnelOpenReject{reason:"rehome"}` ⇒ the headless CLI redials itself
@@ -179,9 +179,9 @@ bounded passive staleness; (4) pod-alive → advisory only.
 
 | Entity | Owner-pod death | Blast radius |
 |---|---|---|
-| Agent WS | socket breaks ⇒ agent redials; LWW re-register | that pod's rc sessions end (P2P media freezes → controller reconnect); listing stale ≤90 s |
+| Agent WS | socket breaks ⇒ agent redials; LWW re-register | that pod's rc sessions end (P2P media freezes → controller reconnect), except those FR-138 keeps: a live session on `direct` or `turn` whose device is in the resume scope with its switch on goes on peer to peer and is claimed back on the pod the redial reaches, about 3 s later in the field ([below](#a-live-rc-session-through-its-pods-death-fr-138)); listing stale ≤90 s |
 | Tunnel session | **data plane survives outright** (P2P); new opens rehome | bookkeeping blip only |
-| DERP peer | reconnect loop; the tenant pin answers 502 until the replacement listens, with no failover to the survivor | ~7.6 s of WG loss (p50 over 14 rolls, FR-28); corp pairs re-handshake |
+| DERP peer | reconnect loop; the tenant pin answers 502 until the replacement listens, with no failover to the survivor. `ws_flat_redial` (default OFF) redials that 502 flat instead of climbing the ladder (FR-28) | ~7.6 s of WG loss (p50 over 14 rolls, FR-28); corp pairs re-handshake |
 | Media room | claim gone (graceful: zero window; crash: ≤30 s TTL) ⇒ rejoin claims a live pod | one conference, ≤30 s gap on crash |
 
 **Redis-down degradation (hard requirement)**: directory ops fail soft to
@@ -190,11 +190,35 @@ suppressed, media falls back to the S6 belt (logged
 `media_belt_fallback_total`). On recovery, heartbeats re-assert every
 record within one beat and the fold rule resolves any belt-era splits.
 
+### A live RC session through its pod's death (FR-138)
+
+The rc hub is still pod-local, and nothing in a dying pod's memory survives it. What survives is
+the session's `remote_sessions` row, so the fourth principle holds: no live-state handoff. The pod
+that the device's next hello reaches folds the session back in through two join paths, the
+device's claim and the viewer's rejoin
+([remote-control.md §11.18](remote-control.md#1118-a-session-outlives-its-control-socket-the-servers-half-fr-138-p1b)):
+
+| What | Where it lives through the gap | What brings it back |
+|---|---|---|
+| The peer: pixels, input, its channels | the device and the page, peer to peer. No pod ever carried it | nothing has to: it never stopped |
+| The session's state | its row, still live, with `detached_at`, `resume_by` and the fencing number `attach_seq` when the dying pod got to write them | the device's claim, on whichever pod it reaches: it commits at the `attach_seq` it read, bumps it, and rebuilds the hub entry (`claim`, `crates/modules/remote/src/resume.rs:137`) |
+| The viewer's binding | nothing: the page holds the session and asks | the viewer's rejoin binds its new socket on the pod that holds the session, through the relay when that is another pod (`rejoin`, `crates/modules/remote/src/rejoin.rs:216`) |
+| An end issued during the gap | the row, written there because no hub holds the session | read by the claim and by the rejoin |
+| A row nobody claims | the row, past its `resume_by` | the sweep, one pod at a time (`run_sweep`, `crates/modules/remote/src/sweep.rs:94`) |
+
+The fencing number keeps a pod that no longer holds the session from undoing a resume: its late
+detach or end carries the number it held, and lands nowhere. A session on `derp` is the exception to
+the table's first row: `/derp` is pod-local, so its path goes down with the pod. It is kept when the
+mesh rebuilds that path before ICE gives up on the pair, as a Windows session's was about 4 s after
+the cut on 2026-11-12, and it redials otherwise, with no `agent_busy` either way. The switches, and
+what an operator reads before and after a roll, are in
+[deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138).
+
 ## Stages
 
 | Stage | Content | Gate |
 |---|---|---|
-| **C-1** | `crates/api/src/cluster/{identity,directory,bus}.rs`, origin swap, A-1 agent keys canonicalized, directory heartbeat, two-pod tests | zero behavior change |
+| **C-1** | `crates/api/src/cluster/{identity,directory,bus}.rs` (in `crates/core/src/cluster/` since FR-69 P1b), origin swap, A-1 agent keys canonicalized, directory heartbeat, two-pod tests | zero behavior change |
 | C-2 | rc rehome + `forceRedial` + idle-agent nudge + consent/kick broadcast | |
 | C-3 | tunnel rehome + CLI redial-retry + session ownership records | |
 | C-4 | media claim-or-route + command shim + conn-addressed events + conflict fold | **THE un-park gate** |
@@ -203,7 +227,7 @@ record within one beat and the fold rule resolves any belt-era splits.
 
 ## Not building (scope honesty)
 
-rc session frame-relay; DERP cross-pod frame forwarding / pod-TCP data
+~~rc session frame-relay~~ (built since by PR-2: the signalling relay, `crates/modules/remote/src/relay.rs`); DERP cross-pod frame forwarding / pod-TCP data
 mesh; live mediasoup room migration (fold-and-rejoin only); PipeTransport
 before the trigger fires; cross-pod piping for the (nonexistent) rc SFU
 bridge; Redis Streams / gRPC / gossip / Redlock; a per-WS-connection

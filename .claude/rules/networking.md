@@ -72,6 +72,9 @@ still held it, and the unique index would lock that joiner out **permanently**.
 This order only ever *leaks* a host.
 ⚠️ Rows are **tombstoned, not deleted**, and lookups are live-scoped ⇒ **removal is
 final**: a re-enrolled machine gets a fresh lease, never the revived tombstone.
+Its agent row comes back as a new device (#3627): before the row is live,
+`agent_revived` releases a lease the removal left, through `release_overlay_node`
+(the same order), and takes the device out of the tunnel policies.
 Evict = "force a new lease", **not** a ban.
 ⚠️ Client-side teardown is keyed by **pubkey**, never by IP.
 
@@ -127,6 +130,20 @@ server, but an SSH channel has no server in the path at all, so empty must mean
 ⚠️ A key-list session with an unset `ssh_account_mode` authenticates and then runs
 **nothing**, rather than quietly taking SYSTEM/root. An unparseable mode is a
 refusal, never a fallback.
+⚠️ **On Windows a session's command runs in a kill-on-close job, and a Fleet RPC
+command never does** (`ExecRequest::session_owned`, #3303). A lost session ends what
+it started, with no code running, because the kernel closes the handle as the daemon
+goes. A Fleet RPC command may stop that daemon (`roomler exec … self-update`) and has
+to outlive it, so a job there would kill its own updater. A one-shot that ends by
+itself has its job let go, or `ssh node 'Start-Process msiexec …'` would kill the
+installer's client a moment after it started, and a client gone that early rolls the
+install back (1603). Neither is a simplification to make: `docs/roomler-ssh.md`
+§ What outlives a session.
+⚠️ **An interactive pump can't hear its client go.** A shell at a prompt writes
+nothing that could fail, so `channel_close` and `Handler::drop` fire an abort for a
+shell as they do for a command, and on it the pump returns without `wait`, which
+drops the pty. Awaiting `wait` there keeps the shell alive for as long as the daemon
+lives (#3303).
 ⚠️ **Session CONTENT is never recorded** — recording a terminal means shipping
 whatever the operator typed (passwords into `sudo`, `mysql -p`) off the host, which
 is the exact property this pillar exists to provide.
@@ -207,3 +224,10 @@ note, with the diagnostic one-liner: `docs/tunnels.md`.
 ⚠️ It shares the PGP check, NOT `code_signature.rs`: WinTrust stays in `roomlerd`
 (tunnel-core is on `windows-sys` **0.61**, the agent on **0.59**), and no OS needed
 it, because Windows takes the same `.asc` check.
+
+**The Windows machine folder, by handle (FR-145)** — SYSTEM, or an elevated process,
+acts below the machine's `%ProgramData%\roomler` only through `machine_tree::HeldPath`:
+each folder opened below the handle above it, never through a link, its final path
+checked; what it makes sealed when made; a write is a fresh file renamed in by handle;
+a removal deletes what the same walk opened. ⚠️ Never check a path, then act on it.
+The walk, the seals and the leaf policy: `docs/security-baseline.md`.

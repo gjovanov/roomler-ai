@@ -122,9 +122,10 @@ pub async fn rebuild(state: &NetworkState, tenant_id: ObjectId, network_id: Obje
 
     // One `OverlaySource` per node (owner + roles), resolved once and reused
     // across the N² pair evaluation.
+    let roles = super::overlay::CompileRoles::new(tenant_id);
     let mut sources = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        sources.push(super::overlay::overlay_source_of(state, n).await);
+        sources.push(super::overlay::overlay_source_of(state, n, &roles).await);
     }
 
     let mut allow: HashMap<DerpPubKey, HashSet<DerpPubKey>> = HashMap::new();

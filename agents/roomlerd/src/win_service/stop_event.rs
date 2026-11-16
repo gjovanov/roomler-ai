@@ -298,7 +298,7 @@ impl WorkerStopEvent {
 }
 
 /// Worker side: resolve when the SCM host signals the stop event named `name`.
-/// One arm of the worker's shutdown `select!` (`terminate_signal` in main.rs).
+/// One arm of the worker's shutdown `select!` (`terminate_signal` in app.rs).
 ///
 /// It POLLS ([`STOP_EVENT_POLL`]) instead of parking a blocking task on the
 /// event — see the module docs: a blocking wait that lost the `select!` would

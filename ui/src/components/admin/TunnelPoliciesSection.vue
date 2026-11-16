@@ -6,6 +6,7 @@
       <span>Tunnel ACL</span>
       <v-spacer />
       <v-btn
+        v-if="!store.refused"
         prepend-icon="mdi-plus"
         color="primary"
         variant="flat"
@@ -28,7 +29,24 @@
         {{ store.error }}
       </v-alert>
 
-      <p v-if="!store.loading && store.policies.length === 0" class="text-medium-emphasis">
+      <!-- Every tunnel-policy route is MANAGE_AGENTS on the server, the reads
+           too: a policy is an access grant, and the list is the org's whole
+           ACL. The store sends nothing for a caller the mask refuses, and a
+           server 403 lands here as well, so the page explains rather than
+           drawing an editor whose every save would fail. -->
+      <v-alert
+        v-if="store.refused"
+        type="info"
+        variant="tonal"
+        class="mb-4"
+        data-testid="tunnel-acl-refused"
+      >
+        Tunnel policies are managed by people with the
+        <strong>Manage devices</strong> permission. To reach a device through a
+        tunnel, ask an organization administrator for a policy that names you.
+      </v-alert>
+
+      <p v-if="!store.refused && !store.loading && store.policies.length === 0" class="text-medium-emphasis">
         No tunnel policies defined yet. Server-side ACL is default-deny — until
         you add at least one policy, every <code>roomler forward</code>
         request will be rejected with <code>acl_denied</code>.
@@ -775,8 +793,11 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`
 }
 
-onMounted(() => {
-  store.fetchPolicies(props.tenantId)
+onMounted(async () => {
+  await store.fetchPolicies(props.tenantId)
+  // The pickers' data serves the editor only: a caller who may not manage
+  // the policies gets no editor, so nothing is fetched for it.
+  if (store.refused) return
   roleStore.fetchRoles(props.tenantId)
   membersStore.fetchMembers(props.tenantId)
   if (agentStore.agents.length === 0) agentStore.fetchAgents(props.tenantId)

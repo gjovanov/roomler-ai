@@ -47,6 +47,73 @@ or releases one OS request:
 and no external display sleeps whatever the policy says. That is an OS limit,
 and the places where the policy is set say so (§2).
 
+### 1.1 The keeper never waits for the OS (#3871)
+
+A pass of the keeper runs on the daemon's async runtime
+([`power.rs:610`](../agents/roomlerd/src/power.rs#L610) `keep`). Taking a request
+can block for as long as the OS takes to answer it, and on Linux that is for as
+long as logind does not answer: zbus sets no timeout on `Inhibit`. Until #3871 the
+keeper took it on a `power-inhibit` thread and **joined** that thread on its async
+worker. A session that started while logind hung held that worker until logind
+answered, and with it the whole runtime. The keeper is woken by its own timer, so
+its worker was usually the one driving the runtime's I/O and timers, and tokio
+hands that role only to a worker that parks ([`stall-watch.md` §10](stall-watch.md)).
+On a lab host an SFTP session's start froze every session, exec and the control
+connection for 20 s. It ended when the person socket's lookup gave up at
+`loginctl`'s 25 s timeout and woke another worker (#3822, read per thread:
+`Thread::join` ← `PowerKeeper::reconcile` ← `power::run`). It was a race, because
+the keeper reads the sessions every 5 s and asked only when a pass fell inside one.
+
+Now a pass never waits:
+
+```mermaid
+sequenceDiagram
+    participant K as keeper, an async task
+    participant T as power-inhibit thread
+    participant L as logind
+    K->>K: a pass finds a live session, an RC row or an SSH or exec hold
+    K->>T: take a request, none being in flight
+    K->>K: publish held false, and go on
+    T->>L: Inhibit
+    Note over L: paused, no answer
+    K->>K: each later pass, still waiting, held false
+    Note over K: 5 s on, said once in the log
+    L-->>T: the inhibitor's file descriptor
+    T-->>K: the answer, over a oneshot
+    K->>K: a pass at once, held true
+    K->>K: the pass after the session ends closes the fd, held false
+```
+
+| Rule | Where |
+|---|---|
+| A pass starts the request on `power-inhibit` and goes on | [`power.rs:381`](../agents/roomlerd/src/power.rs#L381) `start_taking` |
+| One request at a time: a pass that finds one running leaves it running | [`power.rs:343`](../agents/roomlerd/src/power.rs#L343) `reconcile` |
+| `held` is published only once the OS granted the request. While it waits, nothing is held | `reconcile`, [`power.rs:432`](../agents/roomlerd/src/power.rs#L432) `took` |
+| A granted request is held at once: the loop waits on its answer beside its 5 s tick | [`power.rs:636`](../agents/roomlerd/src/power.rs#L636) |
+| A request granted after every session ended is let go by the pass that follows at once, and never published as held | `took`, then `reconcile` |
+| A refused request is asked again at the next pass, never in a loop | `reconcile` |
+| A keeper that stops while its request runs closes the channel, and the thread lets the request go when it lands | [`power.rs:485`](../agents/roomlerd/src/power.rs#L485) `Drop`, `start_taking` |
+| A request unanswered for 5 s is said once: `power: the OS has not answered the request to stay awake …` | [`power.rs:465`](../agents/roomlerd/src/power.rs#L465) `say_if_late` |
+
+Nothing else a pass does waits on the OS. `on_ac` reads `/sys/class/power_supply`
+on Linux (no D-Bus, no UPower), `GetSystemPowerStatus` on Windows and IOKit's
+power source on a Mac. Releasing a logind inhibitor closes its file descriptor
+([`power.rs:985`](../agents/roomlerd/src/power.rs#L985)), which logind notices by
+itself. A Windows power request and a Mac assertion are released with one local
+call.
+
+Tested in `power::keeper_tests`
+([`power.rs:1202`](../agents/roomlerd/src/power.rs#L1202)) on a two-worker
+runtime with the OS stood in, on Linux, Windows and macOS. With the request
+unanswered, for an RC row and for an SSH hold, the passes go on at their pace and
+publish nothing held, a 10 ms timer beside them stays within 200 ms, and one
+request is in flight. Once answered, it is held at once and let go when the
+session ends. A request answered after the session ended is let go and never
+published as held. A keeper that stops while its request hangs stops at once, and
+the request is let go when it lands. A refused request is asked once a pass.
+Field verification is owed: a paused logind under a daemon-mode SSH session on a
+Linux system install.
+
 ## 2. `power_policy`
 
 | value | holds the machine awake | |
@@ -58,14 +125,14 @@ and the places where the policy is set say so (§2).
 The policy belongs to the device. A server cannot push it (whether it should is
 an open decision in the spec). It is set in two places, and both carry the
 clamshell sentence from the key's description
-([`config_surface.rs:323`](../crates/agent-core/src/config_surface.rs#L323)):
+([`config_surface.rs:420`](../crates/agent-core/src/config_surface.rs#L420)):
 
 - **The companion's settings row** (Settings → Essentials), which renders the
   description under the control
-  ([`settings.js:350`](../agents/roomler-desktop/src/front/settings.js#L350)).
+  ([`settings.js:354`](../agents/roomler-desktop/src/front/settings.js#L354)).
 - **`roomler config set power_policy <value>`**, which on a Mac prints the
   description's ⚠️ sentence after the change
-  ([`localclient.rs:1611`](../agents/roomler-cli/src/localclient.rs#L1611)
+  ([`localclient.rs:1629`](../agents/roomler-cli/src/localclient.rs#L1629)
   `config_set_note`).
 
 A test pins the sentence in the description, so a rewrite that drops it fails
@@ -107,13 +174,14 @@ sequenceDiagram
 ### 3.1 The posture
 
 `PowerBrief { policy, on_ac?, held }`
-([`models.rs:2148`](../crates/remote_control/src/models.rs#L2148)) rides the
+([`models.rs:1955`](../crates/remote_control/src/models.rs#L1955)) rides the
 heartbeat as an optional `power`
-([`signaling.rs:704`](../crates/remote_control/src/signaling.rs#L704)). It is a
+([`signaling.rs:686`](../crates/remote_control/src/signaling.rs#L686)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4734`](../agents/roomlerd/src/app.rs#L4734)) and
+anything connects ([`app.rs:4975`](../agents/roomlerd/src/app.rs#L4975)) and
 after every pass, with what it actually holds, not what it wanted
-([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
+([`power.rs:371`](../agents/roomlerd/src/power.rs#L371)). A request the OS has
+not answered yet holds nothing (§1.1).
 
 - `policy` is a string, so a policy a newer agent knows reaches an older
   dashboard as a word it can print.
@@ -121,44 +189,44 @@ after every pass, with what it actually holds, not what it wanted
   stay two answers.
 - `held: false` is what **asleep by policy** means: nothing was holding the
   machine, so the OS slept it as the policy allows
-  ([`models.rs:2169`](../crates/remote_control/src/models.rs#L2169)
+  ([`models.rs:1976`](../crates/remote_control/src/models.rs#L1976)
   `by_policy`). `held: true` means it slept past the hold: a closed lid, a
   person, or the OS overruling it.
 
 ### 3.2 The goodbye, per OS
 
 Every hook only listens, takes nothing, and is bounded
-([`sleep_notice.rs:392`](../agents/roomlerd/src/sleep_notice.rs#L392)
+([`sleep_notice.rs:402`](../agents/roomlerd/src/sleep_notice.rs#L402)
 `will_sleep`). It tells the remote-desktop viewers first (FR-93 P5h), then hands
 every live control connection its goodbye
-([`sleep_notice.rs:211`](../agents/roomlerd/src/sleep_notice.rs#L211)
+([`sleep_notice.rs:221`](../agents/roomlerd/src/sleep_notice.rs#L221)
 `register_control`), and returns within its bound whatever happened.
 
 | OS | the hook | how long the OS waits | our bound |
 |---|---|---|---|
-| Linux | logind `PrepareForSleep(true)` ([`sleep_notice.rs:569`](../agents/roomlerd/src/sleep_notice.rs#L569)) | while we hold the delay inhibitor (`InhibitDelayMaxSec`, 5 s by default), else not at all | 3.2 s |
-| Windows | `PowerRegisterSuspendResumeNotification`, `PBT_APMSUSPEND` ([`sleep_notice.rs:708`](../agents/roomlerd/src/sleep_notice.rs#L708)) | for the callback, about 2 s | 1.5 s |
-| macOS | `IORegisterForSystemPower`, `kIOMessageSystemWillSleep` ([`sleep_notice.rs:783`](../agents/roomlerd/src/sleep_notice.rs#L783)) | until `IOAllowPowerChange`, 30 s at most | 1.5 s |
+| Linux | logind `PrepareForSleep(true)` ([`sleep_notice.rs:579`](../agents/roomlerd/src/sleep_notice.rs#L579)) | while we hold the delay inhibitor (`InhibitDelayMaxSec`, 5 s by default), else not at all | 3.2 s |
+| Windows | `PowerRegisterSuspendResumeNotification`, `PBT_APMSUSPEND` ([`sleep_notice.rs:718`](../agents/roomlerd/src/sleep_notice.rs#L718)) | for the callback, about 2 s | 1.5 s |
+| macOS | `IORegisterForSystemPower`, `kIOMessageSystemWillSleep` ([`sleep_notice.rs:793`](../agents/roomlerd/src/sleep_notice.rs#L793)) | until `IOAllowPowerChange`, 30 s at most | 1.5 s |
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2097`](../agents/roomlerd/src/signaling.rs#L2097)). Then the run
+([`signaling.rs:2345`](../agents/roomlerd/src/signaling.rs#L2345)). Then the run
 loop holds every new dial until the wake
-([`signaling.rs:1069`](../agents/roomlerd/src/signaling.rs#L1069),
-[`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
+([`signaling.rs:1232`](../agents/roomlerd/src/signaling.rs#L1232),
+[`sleep_notice.rs:329`](../agents/roomlerd/src/sleep_notice.rs#L329)
 `hold_while_asleep`). A dial inside the window the OS gave the computer to go to
 sleep would say hello again and erase the reason.
 
 ### 3.3 The server
 
 - The fleet socket treats `rc:agent.sleeping` as the goodbye
-  ([`socket.rs:737`](../crates/modules/fleet/src/socket.rs#L737)). It records the
+  ([`socket.rs:709`](../crates/modules/fleet/src/socket.rs#L709)). It records the
   notice first, then leaves its loop, so the ordinary teardown runs at once: the
   hub unregistration, the `Offline` write, and the offline transition. Without
   the goodbye the device would read online until the receive deadline reaped a
   socket nobody answers.
 - `AgentDao::record_sleep`
-  ([`agent.rs:529`](../crates/services/src/dao/agent.rs#L529)) is keyed by the
+  ([`agent.rs:600`](../crates/services/src/dao/agent.rs#L600)) is keyed by the
   connection's `conn_id`, like `mark_offline_if_conn`: a displaced connection's
   late notice matches nothing, so it can never mark a reconnected device asleep.
 - The offline `device:presence` row carries `sleep`
@@ -166,21 +234,21 @@ sleep would say hello again and erase the reason.
   without one is byte-for-byte the old shape
   ([`presence.rs:190`](../crates/modules/fleet/src/presence.rs#L190)).
 - The next hello `$unset`s `sleep`
-  ([`agent.rs:517`](../crates/services/src/dao/agent.rs#L517)), and every reader
+  ([`agent.rs:588`](../crates/services/src/dao/agent.rs#L588)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
-  online ([`models.rs:2198`](../crates/remote_control/src/models.rs#L2198)). A
+  online ([`models.rs:2005`](../crates/remote_control/src/models.rs#L2005)). A
   read between the reconnect and that write never shows a stale "asleep".
 
 ### 3.4 What each surface shows
 
 | surface | field | reads |
 |---|---|---|
-| `roomler status` | `power` ([`lib.rs:211`](../crates/localapi/src/lib.rs#L211)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2441`](../agents/roomler-cli/src/localclient.rs#L2441)) |
-| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3112`](../agents/roomler-cli/src/localclient.rs#L3112)) |
+| `roomler status` | `power` ([`lib.rs:207`](../crates/localapi/src/lib.rs#L207)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2471`](../agents/roomler-cli/src/localclient.rs#L2471)) |
+| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3448`](../agents/roomler-cli/src/localclient.rs#L3448)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
-| the admin agent API | `power`, `sleep` ([`agent.rs:629`](../crates/modules/fleet/src/agent.rs#L629)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3576`](../crates/remote_control/src/models.rs#L3576)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| the admin agent API | `power`, `sleep` ([`agent.rs:913`](../crates/modules/fleet/src/agent.rs#L913)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3509`](../crates/remote_control/src/models.rs#L3509)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 
@@ -208,7 +276,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
   a std channel with a hard bound. A hook that hung would hold a laptop awake in
   a bag.
 - ⚠️ **The announcement ends itself after 60 s** (`HOLD_MAX`,
-  [`sleep_notice.rs:308`](../agents/roomlerd/src/sleep_notice.rs#L308)), for a
+  [`sleep_notice.rs:318`](../agents/roomlerd/src/sleep_notice.rs#L318)), for a
   sleep that never came or a wake the OS never reported. It ends the
   announcement, not just one wait: an announcement that outlived it would hand
   every new connection its goodbye at once. On Linux and macOS the monotonic
@@ -221,7 +289,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
   `powercfg /requests` show nothing new and `never` stays byte-for-byte (AC3).
   The Linux delay inhibitor keeps FR-93 P5h's scope on a `never` device, live
   sessions only, and covers the control connections only under `on-ac` and
-  `always` ([`sleep_notice.rs:489`](../agents/roomlerd/src/sleep_notice.rs#L489)
+  `always` ([`sleep_notice.rs:499`](../agents/roomlerd/src/sleep_notice.rs#L499)
   `inhibitor_wanted`). So a `never` device's goodbye on Linux is best effort,
   sent in whatever time logind leaves. The operator chose that on 2026-10-30
   (the spec's open decisions), and it held in the field (§3.8).
@@ -243,6 +311,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
 
 | test | proves |
 |---|---|
+| `power::keeper_tests` (`roomlerd`) | the keeper never waits for the OS: a request logind does not answer holds neither the keeper nor the runtime, and is held once answered (§1.1) |
 | `power_brief_rides_the_heartbeat_and_is_optional`, `the_sleep_announcement_carries_the_posture_and_belongs_to_fleet` (`remote_control`) | the wire, both ways, and that a pre-P4 heartbeat still parses |
 | `an_announced_sleep_rides_the_offline_row_and_nothing_else_changes` (`fleet` `presence`) | the presence row, and the pre-P4 shape without a reason |
 | `sleep_notice::tests` (`roomlerd`) | the goodbye registry, the hold, the bound, the inhibitor rule |

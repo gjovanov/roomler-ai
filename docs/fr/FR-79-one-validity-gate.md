@@ -1,6 +1,6 @@
 # FR-79: One validity gate — a window is evidence about the pipe, or it is not
 
-**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b built 2026-11-03** (the operator chose A on 2026-11-02), rides the first release after the FR-63 read has started; AC8 and AC9 need that build ·
+**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). V1 to V5a stay live, and V3b's `Pipe` stays in shadow. V3b's flip is FR-148's first invariant, V5b (PR #3374) is the first step of FR-148 P1, and AC8 and AC9 are read there. FR-148 §12 maps each open criterion. At the close: proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b built 2026-11-03** for the V5 loop FR-71's 2026-10-29 fleet read found (the operator chose A on 2026-11-02), parked for the FR-63 read ·
 **Parent:** the consolidation FR-70's AC4 asks for (8 estimators → 1) and the rule
 FR-71's three field events wrote by induction. Deletes rather than adds:
 `transit_hold`, `transit_classify`, T2's quarantine and T2b's shadow all go.
@@ -566,7 +566,7 @@ own starvation.
   3.0 → 0.68 M in 22 s at a paint age of 50–104 ms. V5 accounts for two of those
   cuts at most. The rest read `overproduced`, the classifier's verdict for the
   queue budget's gate, which is denominated in the same `pipe_bps`
-  (`peer.rs:7896`): the door FR-70 P1 was written for, opened this time by a
+  (`peer.rs:8108`): the door FR-70 P1 was written for, opened this time by a
   measurement rather than a seed. At 12:04:06 the shape repeated: one 106 ms
   block, 709,460, the arrival-rate clamp at 3.19 → 0.52 M, and 4.66 M delivered
   two seconds later. A does not touch this, because a blocked-send number is a
@@ -603,21 +603,21 @@ own starvation.
   So what cut the rate is the comparison reading the stand-in, and that is
   what V5b fixes. V5b does not remove the anchor. Until it climbs back, at
   ×1.1 per ten clean windows, `pipe_bps` still offers it to FR-59 P6's
-  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:7869`), the
-  queue budget (`peer.rs:7896`) and the write-back. V5b also still reads the
+  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:8081`), the
+  queue budget (`peer.rs:8108`) and the write-back. V5b also still reads the
   arrival rate itself for its 15 s TTL. That is why the onset decision may
   belong beside this one.
 
   ⚠️ **The stand-in reaches the pair memory: field-seen once.** When the learner
   holds no above-nominal stable rate, the write-back takes `pipe_bps` as the
-  session's evidence (`peer.rs:9191`–`8994`), and `pipe_bps`'s last source is
+  session's evidence (`peer.rs:9437`–`8994`), and `pipe_bps`'s last source is
   the stand-in (`governor.rs:648`). The 2026-10-30 12:19 session anchored at
   180,484, lost its goodput to the TTL at 12:20:50, and walked eight rungs down
   in 28 s: 180,484 → 164,076 → … → 84,195, the last one exact to the unit. It
   ended with `prior_bps=84195` and `goodput_bps=None`, and at 12:22:06 wrote
   `evidence=Some(84195) kept=84195` as a new entry. Nobody measured 84,195.
   FR-71's "next session 2.55 → 0.20 M" stays unconfirmed: its read did not pull
-  the write-back's line (`peer.rs:2133`–`2118`). V5b's second half closes the
+  the write-back's line (`peer.rs:2151`–`2118`). V5b's second half closes the
   stall's path into the memory.
 
   It does not settle an older tension, which is not part of this decision.

@@ -137,16 +137,13 @@ enum Command {
         /// something privileged enough to bring up a TUN.
         #[arg(long)]
         overlay: bool,
-        /// FR-90 P2h-1 — enroll as an archive replica of the organization, as
-        /// the archive image does: it holds copies of the org's sessions and
-        /// offers itself as an archive (`hive_replica`, `hive_archive`), runs
-        /// no session, takes no command or SSH session, is no tunnel exit,
-        /// and never updates itself. Written with the enrolled config, so the
-        /// first start is already one. Needs a fresh config, and a standard
-        /// (never an ephemeral) token; an `ADMINISTRATOR` still designates
-        /// the device before it holds anything.
+        /// FR-43 P3d — a Mac's root half as its ONE row: writes
+        /// `macos_supervise_gui_worker` and `macos_one_row` beside the
+        /// enrollment, so the daemon serves the person's screen through a
+        /// worker that holds no enrollment, and the person enrolls nothing.
+        /// macOS and root only; off by default, so a Mac enrolls as before.
         #[arg(long)]
-        archive_replica: bool,
+        one_row: bool,
         /// FR-102 — how this daemon was installed, for the server's install
         /// trace: one of `wizard`, `script-sh`, `script-ps1`, `msi`, `deb`,
         /// `pkg`, `manual`, `container`, `other`. Falls back to the
@@ -209,6 +206,26 @@ enum Command {
         #[command(subcommand)]
         action: OrgAction,
     },
+    /// FR-43 P3c — make a two-row Mac one row, as root: every person's
+    /// enrollment comes off their file (retired where the root half holds the
+    /// org, moved into the root's `[[orgs]]` where it does not), the root runs
+    /// the GUI worker with no enrollment, and the daemon restarts, which ends
+    /// live sessions. It says the plan first, keeps a copy of every file it
+    /// writes, and puts everything back if the restarted daemon is not one row
+    /// within 60 s. macOS only.
+    OneRow {
+        /// Say the plan, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Put back the two rows from the copies a migration kept. A row a
+        /// person has deleted since cannot come back.
+        #[arg(long)]
+        revert: bool,
+        /// Go ahead without asking. Without a terminal (`roomler exec`), the
+        /// only way to.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Connect to the server and sit in the signaling loop (default command
     /// if none is given).
     Run {
@@ -231,6 +248,12 @@ enum Command {
         /// readable via `ps`, while the pipe is only the parent's.
         #[arg(long, hide = true)]
         supervised: bool,
+        /// FR-43 P3a (macOS) — this worker holds no enrollment: the root daemon
+        /// that spawned it does (`macos_one_row`). It dials no server and takes
+        /// its sessions from the delegation channel alone, and any enrollment
+        /// in the person's config is ignored and left in the file.
+        #[arg(long, hide = true, requires = "supervised")]
+        unenrolled: bool,
         /// FR-84 D3 (Windows) — which spawner started this worker: `scm` (the
         /// SCM service host's supervisor, `win_service::worker_args`) or
         /// `task` (the per-user Scheduled Task's action, `service.rs`). It is
@@ -265,6 +288,20 @@ enum Command {
         /// the same reason as `--stop-event`.
         #[arg(long, hide = true)]
         gpu_pin_event: Option<String>,
+        /// #3289 (Windows) — the SCM service host's word for how the last
+        /// worker ended, when it saw that end and it was not the worker failing
+        /// (`supervisor::worker_end_is_no_crash`). This start then does not
+        /// count the last run as a crash. Passed only by the host; hidden for
+        /// the same reason as `--stop-event`.
+        #[arg(long, hide = true)]
+        prior_end: Option<String>,
+        /// #3387 (Windows) — the SCM service host started this worker on its
+        /// user-context arm, as the person signed in, because SystemContext is
+        /// on and SYSTEM can open no machine enrollment yet. The worker says
+        /// so in `roomler status` and in its hello. Passed only by the host;
+        /// hidden for the same reason as `--stop-event`.
+        #[arg(long, hide = true)]
+        system_context_waiting: bool,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -392,19 +429,26 @@ enum Command {
     /// parser runs: see `daemon_main`.
     #[command(hide = true, name = "update-helper")]
     UpdateHelper,
-    /// Smoke-test the encoder cascade: open the preferred encoder at
-    /// a small resolution, feed 10 synthetic frames, assert at least
-    /// one IDR output. Exits non-zero if no encoder could be opened or
-    /// no keyframe was produced. Used in the release CI smoke check
-    /// to catch regressions in the MF init path before shipping.
+    /// Smoke-test one encoder cell: open it as a session would, encode 10
+    /// synthetic frames, and pass only if what opened is what was asked for.
+    ///
+    /// Judged by the FR-16 L1 bench's verdict (#3652): it exits non-zero
+    /// when hardware was asked for and software answered, when another codec
+    /// answered, when nothing opened, or when no keyframe came out, and then
+    /// says what it tried on this OS and build. The release lane's Windows
+    /// smoke runs it as `--name h264_mf`.
     EncoderSmoke {
-        /// Encoder preference for the test. Defaults to `hardware` so
-        /// the CI exercise actually verifies the MF path.
+        /// Encoder preference: `hardware` (the default), `auto` or
+        /// `software`. `hardware` passes only on a hardware encoder, so on a
+        /// host with none the software smoke is `--encoder software`.
         #[arg(long, default_value = "hardware")]
         encoder: String,
-        /// Codec to smoke-test. `h264` (default) or `h265` — HEVC
-        /// goes through `open_for_codec` and the MF HEVC cascade.
-        /// Accepts `hevc` as an alias.
+        /// Codec to smoke-test: `h264` (default), `h265` (alias `hevc`) or
+        /// `av1`, through the RTP track's opener (`open_for_codec`: FFmpeg's
+        /// HEVC cascade, then Media Foundation's). `--encoder hardware` on a
+        /// build without the track's Media Foundation opens the DataChannel's
+        /// FFmpeg cascade instead. Anything else is refused: VP9 is the
+        /// DataChannel's (`--bench --bench-cells dc:vp9:444`).
         #[arg(long, default_value = "h264")]
         codec: String,
         /// FR-62 A0 — instead of the 10-frame smoke, open once and sweep the
@@ -413,13 +457,16 @@ enum Command {
         /// and how closely the encoder tracked the target. Measures, on real
         /// silicon, the cost the whole rate-control patch-work exists to
         /// ration. Best with `--codec hevc`/`av1` and `--encoder hardware`.
+        /// It measures only a cell the plain smoke would pass.
         #[arg(long)]
         reconfigure_sweep: bool,
         /// FR-78 P2 — open exactly this FFmpeg encoder name (`hevc_d3d12va`,
         /// `av1_vulkan`, `h264_vaapi`, …) instead of the cascade, so a
         /// backend the vendor SDK outranks on this host can be driven with
-        /// real bytes (and swept, with `--reconfigure-sweep`). `--encoder`
-        /// and `--codec` are ignored when set.
+        /// real bytes (and swept, with `--reconfigure-sweep`). A Media
+        /// Foundation cell's name (`h264_mf`, `hevc_mf`, `av1_mf`) opens that
+        /// MF cascade alone, on either MFT. `--encoder` and `--codec` are
+        /// ignored when set.
         #[arg(long)]
         name: Option<String>,
         /// FR-78 P3 — write every packet's bytes, back to back, to this file:
@@ -786,13 +833,13 @@ enum Command {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Write a single name=value entry into the `Roomler`
-    /// SCM `Environment` REG_MULTI_SZ block. Omit `--value` to REMOVE
-    /// the entry. Operators may use this directly, or the higher-level
-    /// `enable-system-context` / `disable-system-context` wrappers.
-    /// The rc.30 Done-page snippet in the installer wizard references
-    /// this subcommand by name, so the surface is load-bearing for
-    /// any rc.28+ wizard EXE in the field. Requires admin (HKLM write).
+    /// Write a single name=value entry into the `Roomler` SCM `Environment` REG_MULTI_SZ
+    /// block. Omit `--value` to REMOVE the entry. Operators may use this directly, or the
+    /// higher-level `enable-system-context` / `disable-system-context` wrappers. The rc.30
+    /// Done-page snippet in the installer wizard references this subcommand by name, so the
+    /// surface is load-bearing for any rc.28+ wizard EXE in the field. Requires admin (HKLM
+    /// write). An entry stays through updates (from 0.4.200 on, #3375) and repairs, and an
+    /// uninstall removes it; an update decides the SystemContext switch itself.
     ///
     /// Typical use:
     ///   roomlerd set-service-env-var --name ROOMLERD_VP9_FPS --value 60
@@ -1049,96 +1096,111 @@ enum ServiceAction {
     },
 }
 
-/// rc.52: pure config-path precedence ladder. `exists` is injected so
-/// the resolution is unit-testable without touching the filesystem.
+/// The config a process loads, as a pure ladder: `opens` is injected so the
+/// resolution is unit-testable without touching the filesystem.
 ///
-/// Precedence:
-///   1. explicit `--config <path>` — operator override, used verbatim
-///      (no existence check; the operator named it deliberately).
-///   2. machine-global `%PROGRAMDATA%` config — **SystemContext
-///      workers only**, when the file exists. This is the canonical
-///      pre-logon-readable SC config source (a LocalSystem worker
-///      cannot reach a user-profile path before anyone logs in).
-///   3. the platform default (`%APPDATA%` perUser) when it exists.
-///   4. the active-user fallback — **SystemContext workers only**,
-///      when it exists (post-logon: a perUser config the SC worker
-///      reaches via `WTSQueryUserToken`).
-///   5. nothing exists → the platform default, so `config::load`
-///      fails with an honest "not found" naming that path.
+/// 1. An explicit `--config <path>`: an operator override, used verbatim (no
+///    check; the operator named it deliberately).
+/// 2. A SystemContext worker (LocalSystem) runs the machine's own enrollment
+///    and nothing else (#3387):
+///    - the machine-global `%PROGRAMDATA%` config, when it opens: the
+///      canonical one, readable before anyone signs in;
+///    - else the SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
+///      without `--machine-global`), when it lies in the service account's
+///      own profile as the system names it (`system_profile`,
+///      `appdirs::system_profile`) and opens;
+///    - else the machine-global path, so `config::load` fails with an honest
+///      "not found" naming where the machine's enrollment belongs.
 ///
-/// For a non-SystemContext worker the ladder collapses to
-/// `explicit > default` — unchanged pre-rc.52 behaviour.
+///    The config of the person signed in at the console is never one of them.
+///    That enrollment runs as that person, on the service host's user-context
+///    arm, until the machine has its own
+///    (`win_service::supervisor::want_system_worker`, which reads the same two
+///    rungs).
+/// 3. Every other process: the platform default (`%APPDATA%` per user).
 fn pick_config_path(
     explicit: Option<PathBuf>,
     is_system_context: bool,
     machine_global: Option<&std::path::Path>,
     default: &std::path::Path,
-    active_user: Option<&std::path::Path>,
-    exists: impl Fn(&std::path::Path) -> bool,
+    system_profile: &std::path::Path,
+    opens: impl Fn(&std::path::Path) -> bool,
 ) -> PathBuf {
     if let Some(p) = explicit {
         return p;
     }
-    if is_system_context
-        && let Some(mg) = machine_global
-        && exists(mg)
-    {
+    if is_system_context && let Some(mg) = machine_global {
+        if opens(mg) {
+            return mg.to_path_buf();
+        }
+        if roomlerd::appdirs::in_windows_folder(default, system_profile) && opens(default) {
+            return default.to_path_buf();
+        }
         return mg.to_path_buf();
-    }
-    if exists(default) {
-        return default.to_path_buf();
-    }
-    if is_system_context
-        && let Some(au) = active_user
-        && exists(au)
-    {
-        return au.to_path_buf();
     }
     default.to_path_buf()
 }
 
-/// rc.52: resolve the config path by wiring [`pick_config_path`] to
-/// the real environment — the worker-role probe, the candidate paths,
-/// and `Path::exists`. Logs the chosen path so a "wrong config" or
-/// "config not found" investigation lands on a clear line.
+/// #3609 — why the SystemContext ladder named the machine config although it
+/// failed the machine tree's check, set once by [`resolve_config_path`]. A
+/// SYSTEM worker (`Run`) refuses to load the config while this holds a
+/// reason; every other command runs as before.
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+static MACHINE_CONFIG_REFUSED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Resolve the config path by wiring [`pick_config_path`] to the real
+/// environment: the worker-role probe, the candidate paths, and a read open.
+/// Logs the chosen path so a "wrong config" or "config not found"
+/// investigation lands on a clear line.
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let default = config::default_config_path().context("resolving default config path")?;
 
     #[cfg(all(feature = "system-context", target_os = "windows"))]
     {
-        use roomlerd::system_context::{user_profile, worker_role};
+        use roomlerd::system_context::worker_role;
         let is_sc = matches!(
             worker_role::probe_self(),
             Ok(worker_role::WorkerRole::SystemContext)
         );
         let machine_global = config::machine_global_config_path();
-        let active_user = user_profile::active_user_config_path();
-        // #3096 — `exists()` reads "cannot open" as "absent". A machine-global
-        // config this worker cannot read (a folder that seals SYSTEM out,
-        // #3073) sends it to the person's config, and to that config's device
-        // keys, without a word, and back again once the folder is readable.
+        // #3096 — a machine-global config this worker cannot read (a folder
+        // that shuts SYSTEM out, #3073) is not loaded: said here, because the
+        // ladder reads "cannot open" as "not there".
         if is_sc && let Err(e) = machine_global.try_exists() {
             tracing::warn!(
                 machine_global = %machine_global.display(), error = %e,
                 "config: the machine-global config cannot be read, so this SystemContext \
-                 worker falls back; it signs with the fallback config's device keys"
+                 worker cannot run it"
             );
         }
+        // The service host's own question (`sc_config_opens`), through the
+        // same function: a read open for the SYSTEM profile's config (a file
+        // in a folder that refuses SYSTEM lists, and does not open), and for
+        // the machine config #3609's repair, then its check. The SYSTEM
+        // worker never runs a machine config that fails it: the last rung
+        // still names the machine path, and `Run` refuses to load it then.
+        let tree = roomler_node_core::machine_tree::MachineTree::here();
+        let switches = roomler_node_core::machine_tree::Switches::from_env();
+        let refused = std::cell::RefCell::new(None);
         let chosen = pick_config_path(
             explicit,
             is_sc,
             Some(machine_global.as_path()),
             &default,
-            active_user.as_deref(),
-            |p| p.exists(),
+            &roomlerd::appdirs::system_profile(),
+            |p| match roomlerd::win_service::supervisor::rung(&tree, switches, p) {
+                Ok(()) => true,
+                Err(roomler_node_core::machine_tree::Refusal::NotPrivate(why)) => {
+                    *refused.borrow_mut() = Some(why);
+                    false
+                }
+                Err(roomler_node_core::machine_tree::Refusal::Absent) => false,
+            },
         );
-        // #3096 — on the machine-global config, an enrollment with no key yet
-        // takes the one it had in the person's config before minting one.
-        if is_sc
-            && chosen == machine_global
-            && let Some(au) = active_user.as_ref()
+        if chosen == machine_global
+            && let Some(why) = refused.into_inner()
         {
-            roomlerd::peer_auth::adopt_keys_from(au.clone());
+            let _ = MACHINE_CONFIG_REFUSED.set(why);
         }
         tracing::info!(
             config_path = %chosen.display(),
@@ -1151,96 +1213,18 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     #[cfg(not(all(feature = "system-context", target_os = "windows")))]
     {
         // No SystemContext + no machine-global config concept on this
-        // build — the ladder collapses to `explicit > default`.
+        // build — the ladder collapses to `explicit > default`, and the
+        // service account's profile is never asked for.
         Ok(pick_config_path(
             explicit,
             false,
             None,
             &default,
-            None,
-            |p| p.exists(),
+            &default,
+            |p| std::fs::File::open(p).is_ok(),
         ))
     }
 }
-
-/// rc.52 Phase 4: should a healthy-run SystemContext worker copy its
-/// config to the machine-global `%PROGRAMDATA%` location? Pure +
-/// cross-platform-testable. True only when all three hold: this is a
-/// SystemContext worker; the config was loaded from somewhere OTHER
-/// than the machine-global path (a perUser `%APPDATA%` / active-user
-/// fallback); and the machine-global path does not already hold a
-/// config. That is exactly an rc.50-or-earlier SystemContext install
-/// pre-dating the machine-global path — promoting it makes the next
-/// boot pre-logon-controllable with zero operator action.
-///
-/// Only the `system-context` + Windows build calls this in non-test
-/// code (via [`self_heal_machine_global_config`]); on other builds it
-/// is exercised solely by the unit tests, so suppress the dead-code
-/// lint there rather than cfg-gating the pure logic out of reach.
-#[cfg_attr(
-    not(all(feature = "system-context", target_os = "windows")),
-    allow(dead_code)
-)]
-fn should_self_heal_config(
-    is_system_context: bool,
-    loaded_path: &std::path::Path,
-    machine_global: &std::path::Path,
-    machine_global_exists: bool,
-) -> bool {
-    is_system_context && loaded_path != machine_global && !machine_global_exists
-}
-
-/// rc.52 Phase 4: promote a perUser-loaded SystemContext config to the
-/// machine-global `%PROGRAMDATA%` path after a healthy run. No-op on
-/// non-Windows, non-SystemContext, or when the machine-global config
-/// already exists. The worker runs as LocalSystem here so it has the
-/// rights to write `%PROGRAMDATA%`.
-#[cfg(all(feature = "system-context", target_os = "windows"))]
-fn self_heal_machine_global_config(loaded_path: &std::path::Path, cfg: &config::AgentConfig) {
-    use roomlerd::system_context::worker_role;
-    let is_sc = matches!(
-        worker_role::probe_self(),
-        Ok(worker_role::WorkerRole::SystemContext)
-    );
-    let mg = config::machine_global_config_path();
-    if !should_self_heal_config(is_sc, loaded_path, &mg, mg.exists()) {
-        return;
-    }
-    // #3096 — the device keys go FIRST. The next start loads the
-    // machine-global config as soon as it exists, so it must never land there
-    // without the keys beside it: that start would mint new ones, and every
-    // browser that pinned this device would refuse it as `key-changed`.
-    match roomlerd::peer_auth::promote(loaded_path, &mg) {
-        Ok(0) => {}
-        Ok(files) => tracing::info!(
-            files,
-            "config: self-heal carried the device keys (peer-auth) to the machine-global path"
-        ),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "config: machine-global self-heal withheld: the device keys (peer-auth) \
-                 could not be copied (will retry next healthy run)"
-            );
-            return;
-        }
-    }
-    match config::save(&mg, cfg) {
-        Ok(()) => tracing::info!(
-            from = %loaded_path.display(),
-            to = %mg.display(),
-            "config: self-healed perUser config to machine-global path \
-             (machine_id preserved; next boot is pre-logon-controllable)"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "config: machine-global self-heal copy failed (will retry next healthy run)"
-        ),
-    }
-}
-
-#[cfg(not(all(feature = "system-context", target_os = "windows")))]
-fn self_heal_machine_global_config(_loaded_path: &std::path::Path, _cfg: &config::AgentConfig) {}
 
 /// `roomlerd cli <args...>` → the argv to hand to the embedded `roomler`
 /// CLI, or `None` for every other invocation.
@@ -1335,7 +1319,7 @@ pub fn main() -> Result<()> {
             shut_down_runtime(rt);
             purge_after_daemon();
             if let Err(e) = res {
-                tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
+                roomlerd::daemon_error::say(&e);
                 std::process::exit(1);
             }
             // FR-84 D3 — a requested restart leaves with its own code (launchd
@@ -1388,6 +1372,19 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    // #3665 — the virtual desktop's keeper is this binary, re-run by the
+    // daemon with one hidden argument. It must not become a second daemon.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(code) = roomlerd::virtual_desktop::answer_keeper() {
+            std::process::exit(code);
+        }
+    }
+    // #3702 — on the service account, the process's folder variables are the
+    // machine's and the service account's own, before this process has a
+    // second thread: the runtime below starts its workers.
+    #[cfg(target_os = "windows")]
+    roomlerd::appdirs::pin_system_folders(roomlerd::win_token::own_user_sid().as_deref());
     if let Some(code) = answer_stall_watch_cost() {
         std::process::exit(code);
     }
@@ -1405,7 +1402,77 @@ pub fn main() -> Result<()> {
         // Diverges when a restart was requested; otherwise a no-op.
         exit_for_requested_restart();
     }
+    // #3230 — a per-Machine MSI step's end line, and every queued line written
+    // out, before the process ends. A process that began no step skips it.
+    let (error, exit_code) = step_outcome(&res);
+    logging::end_step(error.as_deref(), exit_code);
     res
+}
+
+/// #3230 — the log role of the command this process runs, which decides where
+/// its file log goes ([`logging::ServiceLogRole`]). `None` for a person's verbs
+/// and for the daemon, which log in the profile. The SystemContext worker's role
+/// is read from the process itself, after this.
+fn service_log_role(command: Option<&Command>) -> Option<logging::ServiceLogRole> {
+    match command? {
+        Command::ServiceRun => Some(logging::ServiceLogRole::Host),
+        // Track A — netd is a LocalSystem session-0 child like the host; its own
+        // basename keeps three concurrent SYSTEM logs apart.
+        Command::Netd => Some(logging::ServiceLogRole::Netd),
+        command if is_installer_step(command) => Some(logging::ServiceLogRole::Installer),
+        _ => None,
+    }
+}
+
+/// #3230, #3640 — a step the per-Machine MSI runs as LocalSystem: what one of its
+/// custom actions runs (`wix-perMachine/main.wxs`, each deferred with
+/// `Impersonate='no'`). Such a step logs in the installer log, beside the
+/// service, with a start line and an end line, and what it repairs in the
+/// machine tree (`resolve_config_path`, for every SYSTEM command) is kept there.
+/// The per-user MSI runs its steps as the person, who cannot write that folder,
+/// and none of them is one: the same verbs without `--as-service`, or for the
+/// other flavour, keep the profile's log.
+/// `the_installer_role_is_what_each_msi_runs_as_local_system` holds every custom
+/// action of both WiX files to this rule.
+fn is_installer_step(command: &Command) -> bool {
+    use roomlerd::install_cleanup::TargetFlavour;
+    match command {
+        Command::Service {
+            action: ServiceAction::Install { as_service } | ServiceAction::Uninstall { as_service },
+        } => *as_service,
+        Command::CleanupLegacyInstall { target_flavour, .. } => {
+            TargetFlavour::parse(target_flavour) == Some(TargetFlavour::PerMachine)
+        }
+        Command::EnableSystemContext { .. }
+        | Command::DisableSystemContext { .. }
+        | Command::KeepSystemContext { .. } => true,
+        _ => false,
+    }
+}
+
+/// The code a process exits with when `main` returns an `Err`: std's
+/// `ExitCode::FAILURE`, which its `Termination` gives such a result.
+#[cfg_attr(
+    all(target_os = "macos", feature = "viewer-indicator-macos"),
+    allow(dead_code)
+)]
+const EXIT_CODE_OF_AN_ERR: i32 = 1;
+
+/// #3230 — what a per-Machine MSI step's end line says of how `main` ends: the
+/// error with its whole cause chain ([`roomlerd::error_chain::error_chain`]),
+/// and the exit code.
+#[cfg_attr(
+    all(target_os = "macos", feature = "viewer-indicator-macos"),
+    allow(dead_code)
+)]
+fn step_outcome(res: &Result<()>) -> (Option<String>, i32) {
+    match res {
+        Ok(()) => (None, 0),
+        Err(e) => (
+            Some(roomlerd::error_chain::error_chain(e.as_ref())),
+            EXIT_CODE_OF_AN_ERR,
+        ),
+    }
 }
 
 async fn daemon_main() -> Result<()> {
@@ -1430,103 +1497,6 @@ async fn daemon_main() -> Result<()> {
     // line (the FR-85 recorder lane, #2225).
     if updater::answer_capabilities_query() {
         return Ok(());
-    }
-
-    // FR-90 P1a — `roomlerd hive-mcp <socket>`: a Hive session's toolbelt
-    // relay, started by Claude Code as the session's account. Like the
-    // embedded CLI it runs none of the setup below, and it EXITS rather than
-    // returns: the runtime's shutdown would wait on a stdin read the harness
-    // may hold open.
-    #[cfg(hive_host)]
-    if let Some(socket) = roomlerd::hive::relay_args() {
-        let code = match roomlerd::hive::relay(&socket).await {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("roomlerd hive-mcp: {e:#}");
-                1
-            }
-        };
-        std::process::exit(code);
-    }
-
-    // FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's or the device's worker,
-    // which the daemon starts as its own supervised child with its channel (fd 3;
-    // P8-2b-1 on Windows, an inherited pipe). It runs none of the setup below.
-    #[cfg(hive_host)]
-    if roomlerd::hive::worker_args() {
-        std::process::exit(roomlerd::hive::worker_main().await);
-    }
-
-    // FR-90 P2e-7 — `roomlerd hive-resume-note <file>`: a Hive session's
-    // `SessionStart` hook, run by Claude Code as the session's account. It
-    // prints the resume note the daemon left for a session moved here, if
-    // there is one. None of the setup below is its.
-    #[cfg(hive_host)]
-    if let Some(file) = roomlerd::hive::note_args() {
-        std::process::exit(roomlerd::hive::note_main(&file));
-    }
-
-    // FR-90 P2b-3a — `roomlerd hive-checkpoint <request>`: a session's
-    // checkpoint, which the daemon runs AS THE SESSION'S ACCOUNT at a turn's
-    // end; it writes the checkpoint to stdout. None of the setup below is its.
-    #[cfg(hive_host)]
-    if let Some(request) = roomlerd::hive::checkpoint_args() {
-        std::process::exit(roomlerd::hive::checkpoint_main(&request));
-    }
-
-    // FR-90 P2b-4a — `roomlerd hive-materialize`: its reverse, a checkpoint
-    // written back into a session's config directory AS THE ACCOUNT, from the
-    // frames the daemon streams on its stdin.
-    #[cfg(hive_host)]
-    if roomlerd::hive::materialize_args() {
-        std::process::exit(roomlerd::hive::materialize_main());
-    }
-
-    // FR-90 P2f-2a — `roomlerd hive-pack`: git's have and want for a
-    // session's workspace AS THE ACCOUNT — which commits its folder's
-    // repository holds, or a pack thin against them. P2f-2b — the request
-    // on stdin, the answer to stdout.
-    #[cfg(hive_host)]
-    if roomlerd::hive::pack_args() {
-        std::process::exit(roomlerd::hive::pack_main());
-    }
-
-    // FR-90 P2f-4a — `roomlerd hive-import`: an ended terminal session's own
-    // history, put in place as the managed session it is made AS THE
-    // TERMINAL'S ACCOUNT. The request on stdin, one line to stdout.
-    #[cfg(hive_host)]
-    if roomlerd::hive::import_args() {
-        std::process::exit(roomlerd::hive::import_main());
-    }
-
-    // FR-90 P2g-1 — `roomlerd hive-purge`: what a purged session's account
-    // holds of it (its state directory, its checkpoints' refs and index),
-    // deleted AS THE ACCOUNT. The request on stdin, one line to stdout.
-    #[cfg(hive_host)]
-    if roomlerd::hive::purge_args() {
-        std::process::exit(roomlerd::hive::purge_main());
-    }
-
-    // FR-90 P4-3b-1 — `roomlerd knowhow-scan`: one root of a knowhow scan,
-    // read AS THE ACCOUNT THAT OWNS IT, for metadata alone. The request on
-    // stdin, one line to stdout.
-    #[cfg(all(hive_host, unix))]
-    if roomlerd::hive::knowhow::scan_args() {
-        std::process::exit(roomlerd::hive::knowhow::scan_main());
-    }
-
-    // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
-    // which the daemon runs AS THE CONSOLE USER before the harness starts, as
-    // the Unix wrapper runs as the account. None of the setup below is its.
-    #[cfg(all(windows, feature = "hive"))]
-    if let Some(prep) = roomlerd::hive_win::PrepArgs::from_env() {
-        std::process::exit(match prep.and_then(|a| roomlerd::hive_win::prep(&a)) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("roomlerd hive-prep: {e}");
-                1
-            }
-        });
     }
 
     // #1705 — the desktop companion's service probes (every 10 s) answer one
@@ -1569,6 +1539,9 @@ async fn daemon_main() -> Result<()> {
     #[cfg(target_os = "windows")]
     let _timer_guard = win_timer::TimerResolutionGuard::request_1ms();
 
+    // Reads no appdirs: every default of `Cli` is a constant.
+    let cli = Cli::parse();
+
     // RETIRED-NAME-ANCHOR: a migration note names BOTH halves by necessity.
     // docs/fr/FR-21
     // S1b — one-shot legacy-tree migration (`roomler-agent` → `roomler`).
@@ -1576,12 +1549,26 @@ async fn daemon_main() -> Result<()> {
     // before ANY appdirs consumer (segment decisions are OnceLock-cached per
     // process). Skipped while the desktop companion is running — it may hold
     // open handles in the tree; the read-both resolution keeps everything
-    // working until the next start retries.
+    // working until the next start retries. #3702 — it runs only for the
+    // account that owns the folders: never in an installer step, and only
+    // over folders in the profile (on Unix the home) the system names for
+    // the account this process runs as.
     #[cfg(target_os = "windows")]
     let companion_running = roomlerd::companion::desktop_running();
     #[cfg(not(target_os = "windows"))]
     let companion_running = false;
-    roomlerd::appdirs::migrate_legacy_trees(companion_running);
+    let installer_step =
+        cfg!(target_os = "windows") && cli.command.as_ref().is_some_and(is_installer_step);
+    #[cfg(target_os = "windows")]
+    let own_profile = roomlerd::win_token::own_user_sid()
+        .and_then(|sid| roomlerd::appdirs::profile_of_account(&sid));
+    #[cfg(unix)]
+    let own_profile = roomlerd::appdirs::own_home();
+    roomlerd::appdirs::migrate_legacy_trees(
+        companion_running,
+        installer_step,
+        own_profile.as_deref(),
+    );
 
     // Same one-shot, same reason, different axis: a Linux SYSTEM install's
     // config belongs at `/etc/roomler/config.toml` (what the packaged unit
@@ -1589,23 +1576,20 @@ async fn daemon_main() -> Result<()> {
     // or any config read, and before logging::init, so it collects notes the
     // same way.
     #[cfg(target_os = "linux")]
-    roomlerd::appdirs::migrate_system_config();
+    roomlerd::appdirs::migrate_system_config(own_profile.as_deref());
 
-    let cli = Cli::parse();
-
-    // S1b — the SCM service host and the SystemContext worker log into the
-    // machine-global `service-logs` dir (the one the desktop app has always
-    // advertised — it was EMPTY until now because ProjectDirs resolves SYSTEM
-    // processes into the invisible systemprofile). Must precede logging::init.
+    // S1b — the SCM service host, netd, the SystemContext worker and the
+    // per-Machine MSI's own steps log into the machine-global `service-logs`
+    // dir (the one the desktop app has always advertised — it was EMPTY until
+    // S1b because ProjectDirs resolves SYSTEM processes into the invisible
+    // systemprofile). Must precede logging::init. Off Windows no role is set.
+    let log_role = service_log_role(cli.command.as_ref());
+    #[cfg(not(target_os = "windows"))]
+    let _ = log_role;
     #[cfg(target_os = "windows")]
     {
-        if matches!(cli.command, Some(Command::ServiceRun)) {
-            logging::set_service_logging(logging::ServiceLogRole::Host);
-        }
-        // Track A — netd is a LocalSystem session-0 child like the host;
-        // its own basename keeps three concurrent SYSTEM logs apart.
-        if matches!(cli.command, Some(Command::Netd)) {
-            logging::set_service_logging(logging::ServiceLogRole::Netd);
+        if let Some(role) = log_role {
+            logging::set_service_logging(role);
         }
         #[cfg(feature = "system-context")]
         if matches!(cli.command, Some(Command::Run { .. }) | None) {
@@ -1620,6 +1604,22 @@ async fn daemon_main() -> Result<()> {
     }
 
     logging::init();
+
+    // #3230 — a per-Machine MSI step's start line, before the step does anything
+    // (`resolve_config_path` below already repairs the machine tree). Its end
+    // line is written in `main`, after the step returns.
+    #[cfg(target_os = "windows")]
+    if log_role == Some(logging::ServiceLogRole::Installer) {
+        let command: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        logging::begin_step(
+            &command.join(" "),
+            env!("CARGO_PKG_VERSION"),
+            roomlerd::win_token::own_user_sid().as_deref(),
+        );
+    }
 
     // #3292 — the per-user task's daemon has no console, and its launcher gave it
     // `NUL`: what only stderr carries (a panic, a stack overflow, FFmpeg) goes to
@@ -1709,6 +1709,7 @@ async fn daemon_main() -> Result<()> {
         // A bare `roomlerd` is never a supervised worker: the supervisor always
         // spawns `run --supervised` explicitly.
         supervised: false,
+        unenrolled: false,
         // Likewise the Windows spawners always say which one they are.
         supervisor: None,
         // #1683 — only the SCM service host passes a stop-event name.
@@ -1717,6 +1718,10 @@ async fn daemon_main() -> Result<()> {
         sas_event: None,
         // FR-119 P2b-16 — and a GPU-pin relay.
         gpu_pin_event: None,
+        // #3289 — and what it saw of the last worker's end.
+        prior_end: None,
+        // #3387 — and whether SystemContext waits for a machine enrollment.
+        system_context_waiting: false,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1742,7 +1747,7 @@ async fn daemon_main() -> Result<()> {
             replace,
             ephemeral,
             overlay,
-            archive_replica,
+            one_row,
             install_method,
             install_scope,
         } => {
@@ -1750,6 +1755,10 @@ async fn daemon_main() -> Result<()> {
             // names nothing must be seen at the prompt, not after a browser
             // approval.
             let token = enroll_token_source(token.as_deref(), pair, pair_org.as_deref())?;
+            // FR-43 P3d — the same rule: a Mac's root half or nothing.
+            if let Some(why) = one_row_refusal(one_row, cfg!(target_os = "macos"), euid_is_root()) {
+                bail!("{why}");
+            }
             enroll_cmd(
                 &config_path,
                 EnrollOptions {
@@ -1761,7 +1770,7 @@ async fn daemon_main() -> Result<()> {
                     replace,
                     ephemeral,
                     overlay,
-                    archive_replica,
+                    one_row,
                     install_method: install_method.as_deref(),
                     install_scope: install_scope.as_deref(),
                 },
@@ -1807,11 +1816,27 @@ async fn daemon_main() -> Result<()> {
         Command::Run {
             encoder,
             supervised,
+            unenrolled,
             supervisor,
             stop_event,
             sas_event,
             gpu_pin_event,
+            prior_end,
+            system_context_waiting,
         } => {
+            // #3387 — the host's word that this worker runs the person's own
+            // enrollment while SystemContext waits for a machine one.
+            #[cfg(target_os = "windows")]
+            if system_context_waiting {
+                roomlerd::win_service::note_system_context_waiting();
+                tracing::warn!(
+                    "SystemContext is on, but SYSTEM can open no machine enrollment: this \
+                     worker runs the signed-in person's own enrollment as that person until \
+                     one is written (the setup wizard, or `roomlerd enroll --machine-global`)"
+                );
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = system_context_waiting;
             // FR-97 P4a — the host's relay, for the real Ctrl+Alt+Del.
             #[cfg(target_os = "windows")]
             if let Some(name) = sas_event {
@@ -1826,12 +1851,26 @@ async fn daemon_main() -> Result<()> {
             }
             #[cfg(not(target_os = "windows"))]
             let _ = gpu_pin_event;
+            // #3609 — a SYSTEM worker loads the machine config only while it
+            // passes the machine tree's check. The host asks the same question
+            // before it starts one, so this answers only a tree that changed
+            // in between; the host then runs the device as one with no machine
+            // enrollment.
+            #[cfg(all(feature = "system-context", target_os = "windows"))]
+            if let Some(why) = MACHINE_CONFIG_REFUSED.get() {
+                bail!(
+                    "the machine config at {} is not run as SYSTEM: {why}",
+                    config_path.display()
+                );
+            }
             run_cmd(
                 &config_path,
                 encoder.as_deref(),
                 supervised,
+                unenrolled,
                 supervisor.as_deref(),
                 stop_event.as_deref(),
+                prior_end.as_deref(),
             )
             .await
             .map(|restart| {
@@ -2116,6 +2155,11 @@ async fn daemon_main() -> Result<()> {
         Command::SystemContextProbe { mode } => system_context_probe_cmd(&mode),
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
+        Command::OneRow {
+            dry_run,
+            revert,
+            yes,
+        } => roomlerd::one_row::run(dry_run, revert, yes).await,
         #[cfg(feature = "system-context")]
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action, &config_path).await,
@@ -2232,9 +2276,9 @@ fn exit_for_requested_restart() {
         exit_code = code,
         "requested restart: exiting for the supervisor to relaunch this daemon"
     );
-    // The file layer is non-blocking and its guard lives in a static that is
-    // never dropped; give it a moment to write the line above.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The file layer is non-blocking and `exit` drops nothing: write the line
+    // above and everything queued before it (#3230), rather than sleep and hope.
+    logging::finish();
     std::process::exit(code);
 }
 
@@ -2288,7 +2332,7 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
     let target = match roomlerd::install_cleanup::TargetFlavour::parse(target_flavour) {
         Some(t) => t,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "cleanup-legacy-install: unrecognised --target-flavour {target_flavour:?}; \
                  expected `perUser` or `perMachine` (no-op)"
             );
@@ -2296,10 +2340,11 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
         }
     };
     let report = roomlerd::install_cleanup::run_cleanup(target, dry_run)?;
-    // Always print the one-line summary so the MSI's session log
-    // (msiexec /l*v) shows what happened. Exit 0 even on errors —
-    // a cleanup failure shouldn't sink the install.
-    println!("{}", report.summary());
+    // The one-line summary is the step's answer. Windows Installer keeps
+    // nothing it prints (`msiexec /l*v` shows only the return code), so for the
+    // per-Machine flavour it reaches the installer log (#3230). Exit 0 even on
+    // errors — a cleanup failure shouldn't sink the install.
+    logging::answer(report.summary());
     if !report.errors.is_empty() {
         for e in &report.errors {
             tracing::warn!(error = %e, "cleanup-legacy-install: partial failure");
@@ -2576,6 +2621,27 @@ fn rollback_attention_msg(
     msg
 }
 
+/// #3289 — what a crash loop says where the installer cannot go back
+/// ([`updater::ROLLBACK_CAN_DOWNGRADE`]). Nothing was attempted, so nothing failed,
+/// and running the older installer over this version is the one thing it refuses.
+/// The way back it gives is measured: an uninstall keeps the config and the
+/// enrollment, and with updates left on the older version took this one back in 25 s.
+fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
+    format!(
+        "Roomler agent: crash loop detected.\n\n\
+         Version {current} has crashed {crash_count} times within {win_min} min. \
+         Last known good version: {target}.\n\n\
+         This device did not roll back: the Windows installer refuses to install an \
+         older version over a newer one. It stays on {current} and updates itself as \
+         usual when a newer release is published.\n\n\
+         To go back sooner: set auto_update = false in this device's config.toml, \
+         uninstall Roomler, then install {target} from\n\
+         https://github.com/gjovanov/roomler-ai/releases\n\
+         With updates left on, it takes {current} again at its first check.",
+        win_min = config::CRASH_WINDOW_SECS / 60,
+    )
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2668,8 +2734,9 @@ struct EnrollOptions<'a> {
     /// server's response (not this flag) decides what the CONFIG records.
     ephemeral: bool,
     overlay: bool,
-    /// FR-90 P2h-1 — the archive replica's posture ([`roomlerd::archive_replica`]).
-    archive_replica: bool,
+    /// FR-43 P3d — both macOS switches beside the enrollment
+    /// ([`one_row_refusal`] has already said it may).
+    one_row: bool,
     /// FR-102 P3 — the install trace, flag-first; `None` falls back to the
     /// env, then to `manual` / `unknown` (`enrollment::resolve_install`).
     install_method: Option<&'a str>,
@@ -2686,7 +2753,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         replace,
         ephemeral,
         overlay,
-        archive_replica,
+        one_row,
         install_method,
         install_scope,
     } = opts;
@@ -2719,11 +2786,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 
     // FR-129 A4 — `--pair` waits, minutes if need be, for a person in a
     // browser, so the pairing runs HERE: after the refusals above (the
-    // install trace, the target path) and the archive replica's, which reads
-    // the config — so a refusal costs nobody an approval — and BEFORE
-    // everything below, which then runs exactly as it runs for a pasted
-    // token: the same read of the existing config, the same machine id, the
-    // same `apply_enrollment` merge, the same save. The read belongs AFTER
+    // install trace, the target path), so a refusal costs nobody an
+    // approval, and BEFORE everything below, which then runs exactly as it
+    // runs for a pasted token: the same read of the existing config, the
+    // same machine id, the same `apply_enrollment` merge, the same save. The
+    // read belongs AFTER
     // the wait: a daemon running on this machine saves its own config in
     // the meantime (token renewal, remote configuration, the companion's
     // settings), and a copy read before the wait would be merged and saved
@@ -2733,12 +2800,6 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         TokenSource::Given(t) => t,
         TokenSource::Pair { expect_org } => {
             // `--ephemeral` cannot reach here: clap refuses it beside `--pair`.
-            if archive_replica {
-                roomlerd::archive_replica::preflight(
-                    config::read_if_present(&target_path).is_some(),
-                    ephemeral,
-                )?;
-            }
             let approved = pairing_terminal::pair_from_terminal(
                 pairing_terminal::PairParams {
                     server,
@@ -2772,7 +2833,29 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // must be re-enrolled` at ERROR — so enrolling a clean machine told the
     // operator to re-enroll it, mid-enrollment. Behaviour is unchanged: absent
     // still means "no machine_id to reuse".
-    let existing = config::read_if_present(&target_path);
+    //
+    // #3609 — at the machine-global location the config is folded into only
+    // when it is private to this computer's administrators once the machine
+    // tree is repaired (`config::read_merge_base`); one that is not is set
+    // aside, and a fresh config is written in its place. A config there that
+    // is absent, does not load or may not be read is nothing to fold, as the
+    // probe reads it.
+    let existing = if machine_global {
+        match config::read_merge_base(&target_path) {
+            config::MergeBase::Loaded(cfg) => Some(cfg),
+            config::MergeBase::NotPrivate { reason } => {
+                let said = config::describe_not_private(&target_path, &reason);
+                tracing::warn!(path = %target_path.display(), %reason, "enroll: {said}");
+                eprintln!("WARNING: {said}");
+                None
+            }
+            config::MergeBase::Absent
+            | config::MergeBase::Unreadable { .. }
+            | config::MergeBase::Denied { .. } => None,
+        }
+    } else {
+        config::read_if_present(&target_path)
+    };
     // FR-51 P3 — an ephemeral enrollment is a FRESH identity by definition:
     // folding it into an existing config would either hand this machine's
     // real device row a random fingerprint or hand the ephemeral row the
@@ -2786,11 +2869,6 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
              for free) or remove the existing enrollment first.",
             target_path.display()
         );
-    }
-    // FR-90 P2h-1 — before the single-use token is spent, so a refusal
-    // leaves no device row behind.
-    if archive_replica {
-        roomlerd::archive_replica::preflight(existing.is_some(), ephemeral)?;
     }
     let machine_id = match &existing {
         Some(cfg) => {
@@ -2831,6 +2909,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // (operator state preserved — rc.204 semantics); a NEW pair → APPEND a
     // secondary org (with its own freshly minted WG key); `--replace` →
     // legacy whole-primary rebind.
+    let folds = existing.is_some();
     let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
 
     // FR-51 P3 — the CREDENTIAL decided what was minted; say so when it
@@ -2880,18 +2959,47 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     if overlay {
         roomlerd::org_join::apply_overlay_flag(&mut cfg, &outcome);
     }
-    // FR-90 P2h-1 — the archive replica's posture, before the first save. The
-    // preflight made this a fresh primary enrollment.
-    if archive_replica {
-        roomlerd::archive_replica::apply(&mut cfg);
-    }
     // FR-99 decision 3 — a fresh Windows service install (`--machine-global`)
     // starts at `lock_on_end = auto`; a refresh keeps what the device had.
     if enrollment::takes_service_install_defaults(machine_global, &outcome) {
         enrollment::apply_service_install_defaults(&mut cfg);
     }
+    // FR-43 P3d — set before the save, like `--overlay`, so the daemon's first
+    // start is already one row.
+    if one_row {
+        apply_one_row(&mut cfg);
+    }
 
-    config::save(&target_path, &cfg).map_err(|e| {
+    // #3609 — an elevated save of the machine config takes the machine folder
+    // for Administrators first, the owner and nothing else, so the save's own
+    // repair seals it: the repair never takes over a folder another account
+    // made (a person's daemon stages received files below it).
+    #[cfg(target_os = "windows")]
+    if machine_global {
+        match config::take_machine_folder(&target_path) {
+            Ok(true) => tracing::info!(
+                path = %target_path.display(),
+                "enroll: the machine folder was taken for Administrators"
+            ),
+            Ok(false) => {}
+            Err(why) => {
+                tracing::warn!(%why, "enroll: the machine folder was not taken for Administrators");
+                eprintln!(
+                    "WARNING: {why}. Until the folder belongs to Administrators the service may \
+                     not run this enrollment as SYSTEM."
+                );
+            }
+        }
+    }
+
+    // #3666 — nothing folded, nothing kept: at the machine location a config
+    // that was not the machine's leaves no `.prev` and no unknown key behind.
+    if folds {
+        config::save(&target_path, &cfg)
+    } else {
+        config::save_fresh(&target_path, &cfg)
+    }
+    .map_err(|e| {
         if machine_global {
             anyhow::anyhow!(
                 "{e}\n\nWriting the machine-global config requires an elevated \
@@ -3061,6 +3169,14 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
              prompt).",
             config::describe_denied(&target, &reason)
         ),
+        // #3609 — not private to the computer's administrators: never folded
+        // into; the adopted enrollment is written fresh in its place.
+        config::MergeBase::NotPrivate { reason } => {
+            let said = config::describe_not_private(&target, &reason);
+            tracing::warn!(path = %target.display(), %reason, "adopt-enrollment: {said}");
+            eprintln!("WARNING: {said}");
+            None
+        }
     };
     let previous = existing.clone();
     let new_agent_id = fresh.agent_id.clone();
@@ -3098,7 +3214,14 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
             .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
     }
-    config::save(&target, &cfg).context("saving the adopted config")?;
+    // #3666 — nothing folded, nothing kept: at the machine location a config
+    // that was not the machine's leaves no `.prev` and no unknown key behind.
+    if previous.is_none() {
+        config::save_fresh(&target, &cfg)
+    } else {
+        config::save(&target, &cfg)
+    }
+    .context("saving the adopted config")?;
     let what = match &outcome {
         EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
         EnrollOutcome::RefreshedPrimary => {
@@ -3142,10 +3265,10 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
 /// builds always return false (no risk of asymmetry).
 #[cfg(all(feature = "system-context", target_os = "windows"))]
 fn enroll_user_context_warning_due() -> bool {
-    // main.rs is the bin crate; reach into the lib via its crate name
-    // — mirrors the existing call sites at :404, :476, :637, :1032, :1792.
-    // Local cargo test caught this only via the bin-tests build path
-    // because the test binary doesn't exercise the system-context feature.
+    // `roomlerd::` is this lib's own name (`extern crate self as roomlerd`,
+    // lib.rs), kept from when this file was the bin crate's `main.rs`.
+    // Only a system-context Windows build compiles this, so a default
+    // `cargo test` never sees it.
     use roomlerd::system_context::worker_role::{WorkerRole, probe_self};
     !matches!(probe_self(), Ok(WorkerRole::SystemContext))
 }
@@ -3187,6 +3310,9 @@ async fn re_enroll_cmd(
             config_path.display()
         );
     }
+    // #3666 — a machine config is loaded, and its server sent a token, only
+    // when it was the machine's as found.
+    config::machine_config_as_found(config_path)?;
     let existing = config::load(config_path).context("loading existing config")?;
     // rc.52 BLOCKER-6: preserve the EXISTING machine_id verbatim — do
     // NOT re-derive from `config_path`. `derive_machine_id` hashes the
@@ -3285,6 +3411,9 @@ async fn re_enroll_cmd(
 /// changes on its next start. Runtime org verbs over the LocalAPI land with
 /// the desktop org-management UI in a later phase.
 fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
+    // #3666 — a machine config is loaded, and changed or its servers sent a
+    // token, only when it was the machine's as found.
+    config::machine_config_as_found(config_path)?;
     let mut cfg = config::load(config_path).with_context(|| {
         format!(
             "loading config at {} (run `roomlerd enroll` first)",
@@ -3475,7 +3604,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
         wm: node_env("VIRTUAL_DESKTOP_WM").unwrap_or_else(|| "openbox".to_string()),
         startup,
     };
-    let vd = virtual_desktop::start(&cfg).context("starting virtual desktop")?;
+    let vd = virtual_desktop::start(&cfg); // cannot fail, by design (#3643)
     // Point capture at the virtual display + (by default) pin media to TURNS/TCP.
     // Set here (early in `run_cmd`, before the agent spawns its session tasks) so
     // the caps/display probe and every later capture see it. `set_var` is
@@ -3739,6 +3868,26 @@ fn defer_to_launch_agent() {
     }
 }
 
+/// #3802 — who owns the folder `file` is in and its mode, as `lstat` reads it
+/// (a link at the folder is read as the link), for an error that says why a
+/// write there was refused. Empty when the folder cannot be read, and off Unix.
+fn owner_of_folder(file: &Path) -> String {
+    #[cfg(unix)]
+    if let Some(dir) = file.parent() {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            return format!(
+                " (its folder {} is uid {}'s, mode {:o})",
+                dir.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            );
+        }
+    }
+    let _ = file;
+    String::new()
+}
+
 /// The daemon. `Ok(Some(code))` = it ended through the graceful path a
 /// requested restart (FR-84 D3, `Request::RestartDaemon`) started, and the
 /// process must leave with `code` for its supervisor to relaunch it;
@@ -3747,15 +3896,22 @@ async fn run_cmd(
     config_path: &PathBuf,
     cli_encoder: Option<&str>,
     supervised: bool,
+    // FR-43 P3a — a GUI worker with no enrollment (`run --supervised
+    // --unenrolled`). Its own branches below are few on purpose: most of what
+    // it does not do follows from the view of the config it runs on.
+    unenrolled: bool,
     supervisor_flag: Option<&str>,
     // #1683 (Windows) — the SCM host's stop event, waited on by
     // `terminate_signal`. `None` on every non-service run and every other
     // platform.
     stop_event: Option<&str>,
+    // #3289 (Windows) — the SCM host's word for the last worker's end, when it
+    // saw that end and it was not the worker failing. `None` everywhere else.
+    prior_end: Option<&str>,
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
-    if !config_path.exists() {
+    if !config_path.exists() && !unenrolled {
         bail!(
             "no config found at {}. Run `roomlerd enroll` first.",
             config_path.display()
@@ -3807,6 +3963,22 @@ async fn run_cmd(
     // with the session (`PartOf=`), and a user manager that outlives a logout
     // never reaches `default.target` twice. Per-user only, on its own thread.
     roomlerd::service::repair_session_wants_at_start();
+    // FR-43 P3a — a person with no enrollment on a one-row Mac has no file yet,
+    // and `caps`, `record` and `config set` all load it. After the lock, so one
+    // process writes it.
+    if unenrolled && !config_path.exists() {
+        let name = roomlerd::machine::hostname().unwrap_or_default();
+        let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
+        // #3802 — the reason names the folder and who owns it. The macOS release build's
+        // AppKit `main` writes it on stderr as std would (`daemon_error::say`), then exits 1.
+        config::save(config_path, &blank).with_context(|| {
+            format!(
+                "writing the person's config {}{}",
+                config_path.display(),
+                owner_of_folder(config_path)
+            )
+        })?;
+    }
     let mut cfg = config::load(config_path).context("loading config")?;
     // #3116 — every save below, up to the LocalAPI coming up, writes THIS
     // copy, so each goes through `startup_writes`: it refuses to write over a
@@ -3814,23 +3986,20 @@ async fn run_cmd(
     // enrollment, a second after the MSI restarted the service). The runtime
     // writers after it reload under the write lock instead.
     let mut startup_writes = config::StartupWrites::after_load(config_path);
-    // FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
-    // joined the mesh joins it at its first start in a newer image, before
-    // anything reads the overlay keys (the WG key is minted below from them).
-    if roomlerd::archive_replica::reconcile_at_start(
-        &mut cfg,
-        std::env::var(roomlerd::archive_replica::IMAGE_ENV).is_ok_and(|v| v == "1"),
-    ) {
-        match startup_writes.save(&cfg) {
-            Ok(()) => tracing::info!(
-                "archive replica: joined the mesh, in the userspace stack (FR-90 P2k-4)"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "archive replica: on the mesh for this run; persisting it failed, so the \
-                 next start in the image joins it again"
-            ),
-        }
+    // FR-43 P3a — from here this process runs on a view of the person's file,
+    // pointed at its own stand-in control plane. The file stays as it is: its
+    // startup saves are off, and the writers after them reload it first.
+    if unenrolled {
+        let stand_in = roomlerd::unenrolled::StandIn::start().await?;
+        cfg = cfg.for_unenrolled_worker(
+            &stand_in.server_url(),
+            &stand_in.ws_url(),
+            stand_in.secret(),
+        );
+        startup_writes = config::StartupWrites::read_only(config_path);
+        tracing::info!(
+            "a GUI worker with no enrollment: sessions come from the root daemon alone (FR-43 P3a)"
+        );
     }
 
     // FR-84 D3 — who will relaunch this process if it exits, decided once,
@@ -4049,7 +4218,10 @@ async fn run_cmd(
     // routing was active when it died — then had overlay disabled — is still
     // healed (else a persisted Windows Wintun `/1` blackholes egress to a dead
     // NIC until reboot). No-op on non-`overlay-l3` builds.
-    roomlerd::purge_exit_routes();
+    // #3291 — the start waits for the exit-DNS purge for a bounded time only:
+    // a starved host held its `powershell` for as long as the load lasted, and
+    // the device stayed offline meanwhile. The purge still runs to its end.
+    roomlerd::purge_exit_routes_at_start();
 
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     // FR-84 D4 — publish the RESOLVED preference, so the LocalAPI reports
@@ -4124,54 +4296,62 @@ async fn run_cmd(
         ?encoder_preference,
         "agent starting"
     );
+    // FR-67 P3 — what the last install came to, one line, right under the
+    // version it produced. This is the "startup reads last-install.json" the
+    // watcher's module doc claimed for months and nothing did.
+    post_install::log_at_startup();
 
     // Phase 8: pre-flight diagnostics (DNS / TCP / clock-skew). Non-
     // blocking — the signaling loop runs unconditionally afterward —
     // but logs an actionable hint up front so the operator doesn't
     // chase the wrong rabbit hole when the WS reconnect ladder kicks
     // in. 15 s overall budget, 5 s per probe in parallel.
-    let preflight_report = preflight::run_checks(&cfg.server_url).await;
-    preflight_report.log();
+    // FR-43 P3a — not a worker with no enrollment: it has no server to check.
+    if !unenrolled {
+        let preflight_report = preflight::run_checks(&cfg.server_url).await;
+        preflight_report.log();
+    }
 
     // Crash-loop bookkeeping: if the previous run was marked
     // `last_run_unhealthy=true` (started, never reached the clean
-    // threshold, never exited gracefully) → count it as a crash. Then
-    // mark THIS run as tentatively unhealthy; either the 5-min healthy
+    // threshold, never exited gracefully) and neither the OS nor its
+    // service host ended it (#3289) → count it as a crash. Then mark
+    // THIS run as tentatively unhealthy; either the 5-min healthy
     // task or the Ctrl-C handler will flip the flag back to false.
     // Save before checking for rollback so the worst-case state is
     // durable on disk if we then crash again.
     let now_unix = unix_now();
     let current_pkg = env!("CARGO_PKG_VERSION");
-    if cfg.last_run_unhealthy {
-        config::record_crash_at(&mut cfg, now_unix);
-        tracing::warn!(
+    let boot_now = roomlerd::boot_id::current();
+    match config::previous_run(&cfg, boot_now.as_deref(), prior_end.is_some()) {
+        config::PreviousRun::Clean => {}
+        config::PreviousRun::Crashed => {
+            config::record_crash_at(&mut cfg, now_unix);
+            tracing::warn!(
+                crash_count = cfg.crash_count,
+                "previous run did not reach clean-run threshold — counting as crash"
+            );
+        }
+        ended => tracing::info!(
+            ?ended,
+            prior_end,
             crash_count = cfg.crash_count,
-            "previous run did not reach clean-run threshold — counting as crash"
-        );
+            "previous run did not reach clean-run threshold, but it did not crash — not counting it"
+        ),
     }
     config::mark_run_starting(&mut cfg);
+    cfg.last_run_boot = boot_now;
     if let Err(e) = startup_writes.save(&cfg) {
         tracing::warn!(error = %format!("{e:#}"), "could not persist crash-tracking state");
     }
 
     // If the crash counter has tripped the rollback threshold AND we
     // have a known-good fallback to roll back TO that isn't this same
-    // version, raise an attention sentinel. v1 does NOT auto-execute
-    // the rollback install — that requires fetching a specific tag's
-    // installer and ships in 0.1.52 alongside the SHA256 / HMAC
-    // manifest work. The operator can downgrade manually via
-    // `roomlerd self-update --pin <version>` (also 0.1.52) or
-    // by reinstalling the previous MSI by hand.
+    // version: go back to it where the installer can, and raise the
+    // attention sentinel where it cannot or when the attempt fails.
     if config::should_rollback(&cfg, current_pkg, now_unix)
         && let Some(target) = cfg.last_known_good_version.clone()
     {
-        let target_tag = format!("agent-v{target}");
-        tracing::error!(
-            current = %current_pkg,
-            target = %target_tag,
-            crash_count = cfg.crash_count,
-            "crash loop detected; attempting automatic rollback"
-        );
         // Mark attempted FIRST so a crash during the rollback
         // itself doesn't loop us back into another rollback. If the
         // rollback fetch / install fails, the operator still gets
@@ -4179,65 +4359,96 @@ async fn run_cmd(
         config::mark_rollback_attempted(&mut cfg);
         let _ = startup_writes.save(&cfg);
 
-        let outcome = updater::pin_version(&target_tag).await;
-        match outcome {
-            updater::CheckOutcome::UpdateReady {
-                latest,
-                installer_path,
-                ..
-            } => {
-                tracing::warn!(
-                    target = %latest,
-                    path = %installer_path.display(),
-                    "rollback installer downloaded — spawning + exiting"
-                );
-                if let Err(e) = updater::spawn_installer_with_watch(&installer_path, Some(&latest))
-                {
-                    tracing::error!(error = %e, "rollback installer spawn failed");
-                    let _ = notify::raise_attention_with_reason_for_version(
-                        notify::REASON_ROLLBACK,
+        if updater::ROLLBACK_CAN_DOWNGRADE {
+            let target_tag = format!("agent-v{target}");
+            tracing::error!(
+                current = %current_pkg,
+                target = %target_tag,
+                crash_count = cfg.crash_count,
+                "crash loop detected; attempting automatic rollback"
+            );
+            let outcome = updater::pin_version(&target_tag).await;
+            match outcome {
+                updater::CheckOutcome::UpdateReady {
+                    latest,
+                    installer_path,
+                    ..
+                } => {
+                    tracing::warn!(
+                        target = %latest,
+                        path = %installer_path.display(),
+                        "rollback installer downloaded — spawning + exiting"
+                    );
+                    if let Err(e) =
+                        updater::spawn_installer_with_watch(&installer_path, Some(&latest))
+                    {
+                        tracing::error!(error = %e, "rollback installer spawn failed");
+                        // FR-53: the build being accused, so a later healthy
+                        // connect from a different one can clear this.
+                        let _ = notify::raise_rollback_attention(
+                            &rollback_attention_msg(
+                                current_pkg,
+                                &target,
+                                cfg.crash_count,
+                                Some(&format!("automatic install failed: {e}")),
+                            ),
+                            current_pkg,
+                        );
+                    } else {
+                        // Installer is running, agent is about to exit.
+                        // The post-install watcher (spawned by
+                        // spawn_installer_with_watch) will record the
+                        // verdict in last-install.json; the new binary
+                        // can surface it on next start. #3289 — this exit is
+                        // our own, so the next start must not count it.
+                        config::mark_clean_shutdown(&mut cfg);
+                        let _ = startup_writes.save(&cfg);
+                        return Ok(None);
+                    }
+                }
+                updater::CheckOutcome::Skipped(reason)
+                | updater::CheckOutcome::Unreachable(reason) => {
+                    tracing::error!(%reason, "rollback fetch skipped — operator action required");
+                    let _ = notify::raise_rollback_attention(
                         &rollback_attention_msg(
                             current_pkg,
                             &target,
                             cfg.crash_count,
-                            Some(&format!("automatic install failed: {e}")),
+                            Some(&reason),
                         ),
-                        // FR-53: the build being accused, so a later
-                        // healthy connect from a different one can clear this.
-                        Some(current_pkg),
+                        current_pkg,
                     );
-                } else {
-                    // Installer is running, agent is about to exit.
-                    // The post-install watcher (spawned by
-                    // spawn_installer_with_watch) will record the
-                    // verdict in last-install.json; the new binary
-                    // can surface it on next start.
-                    return Ok(None);
+                }
+                updater::CheckOutcome::UpToDate { .. } => {
+                    tracing::warn!(
+                        "rollback target reports as up-to-date — odd state, raising sentinel"
+                    );
+                    let _ = notify::raise_rollback_attention(
+                        &rollback_attention_msg(
+                            current_pkg,
+                            &target,
+                            cfg.crash_count,
+                            Some(
+                                "target version reports as up-to-date — manual investigation needed",
+                            ),
+                        ),
+                        current_pkg,
+                    );
                 }
             }
-            updater::CheckOutcome::Skipped(reason) | updater::CheckOutcome::Unreachable(reason) => {
-                tracing::error!(%reason, "rollback fetch skipped — operator action required");
-                let _ = notify::raise_attention_with_reason_for_version(
-                    notify::REASON_ROLLBACK,
-                    &rollback_attention_msg(current_pkg, &target, cfg.crash_count, Some(&reason)),
-                    Some(current_pkg),
-                );
-            }
-            updater::CheckOutcome::UpToDate { .. } => {
-                tracing::warn!(
-                    "rollback target reports as up-to-date — odd state, raising sentinel"
-                );
-                let _ = notify::raise_attention_with_reason_for_version(
-                    notify::REASON_ROLLBACK,
-                    &rollback_attention_msg(
-                        current_pkg,
-                        &target,
-                        cfg.crash_count,
-                        Some("target version reports as up-to-date — manual investigation needed"),
-                    ),
-                    Some(current_pkg),
-                );
-            }
+        } else {
+            // #3289 — no download and no exit: the installer would refuse, and this
+            // process is still the device's remote access for as long as it stays up.
+            tracing::error!(
+                current = %current_pkg,
+                last_known_good = %target,
+                crash_count = cfg.crash_count,
+                "crash loop detected; the installer here refuses a downgrade, so no rollback runs"
+            );
+            let _ = notify::raise_rollback_attention(
+                &crash_loop_no_rollback_msg(current_pkg, &target, cfg.crash_count),
+                current_pkg,
+            );
         }
     }
 
@@ -4406,6 +4617,7 @@ async fn run_cmd(
     let _ = watchdog::install(wd.clone());
     watchdog::spawn_thread_watchdog(wd.clone());
     tokio::spawn(roomlerd::resource_watch::run(shutdown_rx.clone()));
+    tokio::spawn(roomlerd::runtime_canary::run(shutdown_rx.clone()));
     let wd_task = tokio::spawn({
         let wd = wd.clone();
         let rx = shutdown_rx.clone();
@@ -4446,6 +4658,11 @@ async fn run_cmd(
         let token = primary_token.clone();
         let mut shutdown = shutdown_rx.clone();
         async move {
+            // FR-43 P3a — a worker with no enrollment has no token to upload
+            // on. Its supervisor records a crash the panic hook could not.
+            if unenrolled {
+                return;
+            }
             // Initial drain (formerly the only call site).
             crash_uploader::drain_and_upload(&cfg, &token).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -4478,7 +4695,20 @@ async fn run_cmd(
     // `ROOMLERD_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
     let logs_upload_disabled =
         roomlerd::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
-    if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
+    // FR-43 P3a — a worker with no enrollment has no token to upload on, so its
+    // lines go to the root daemon over the delegation channel, and the daemon
+    // uploads them on its row (`delegate_worker`). Its kill switch is this one.
+    let worker_log_lines = if unenrolled && !logs_upload_disabled {
+        logging::take_log_upload_receiver()
+    } else {
+        None
+    };
+    if unenrolled {
+        tracing::info!(
+            forwarded = worker_log_lines.is_some(),
+            "logs upload: through the root daemon, since this worker holds no enrollment"
+        );
+    } else if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
         let host_hash = roomlerd::logs_upload::hash_hostname(
             &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
         );
@@ -4515,26 +4745,26 @@ async fn run_cmd(
     // signaling loop prompts on; its live `pending` set gates LocalAPI consent
     // decisions (a decision is honoured only for an actively-prompting session).
     let consent_mode = roomlerd::consent::Mode::from_config(cfg.auto_grant_session);
-    let consent_dir =
-        roomlerd::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
-            std::env::temp_dir().join("roomlerd-consent")
-        });
-    let consent_broker = roomlerd::consent::ConsentBroker::new(consent_mode, consent_dir)
-        .unwrap_or_else(|e| {
-            // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
-            // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
-            // dir doesn't match the tray's simply times out → deny (safe), instead
-            // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
-            tracing::error!(error = %e, ?consent_mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
-            roomlerd::consent::ConsentBroker::new(consent_mode, std::env::temp_dir())
-                .expect("consent broker init cannot fail with temp_dir")
-        });
-    tracing::info!(
-        mode = ?consent_broker.mode(),
-        sentinel_dir = %consent_broker.sentinel_dir().display(),
-        "operator-consent broker ready"
-    );
+    // #3939 — the broker's folder, where an answer can also be a file
+    // (`<session>.approve` or `.deny`: the file channel), is the daemon's own:
+    // `default_sentinel_dir`, in this account's data folder, made as before.
+    // When it cannot be resolved or set up, no other folder stands in for it,
+    // neither one under the temporary folder nor that folder itself, and the
+    // file channel is off. The broker then keeps each question's `.pending`
+    // marker and each answer in memory, under the lock of its books: the
+    // tray, `roomlerd consent` and a native panel answer as before, and a
+    // question nobody answers times out as before. On Unix a folder that
+    // another account owns is not its own either.
+    //
+    // It keeps the CONFIGURED mode whatever its folder: prompt mode fails
+    // closed, never downgraded to AutoGrant (the pre-P2b fail-OPEN granted
+    // every session on a glitch). `for_daemon` says once that the file channel
+    // is off, and why; its `operator-consent broker ready` line names the
+    // folder or says that the file channel is off. A console-run agent and a
+    // `roomlerd consent` that cannot reach the device service still meet in
+    // that folder, in the profile both run in (`consent_cmd`). Pinned by the
+    // tests in `consent::tests::own_folder` and `localapi_state::tests`.
+    let consent_broker = roomlerd::consent::ConsentBroker::for_daemon(consent_mode);
     let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (overlay_view_tx, overlay_view_rx) =
         tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -4559,9 +4789,6 @@ async fn run_cmd(
     // flows verbs) and the signaling loop (publish the live egress + demux).
     let tunnel_hub =
         roomlerd::tunnel::client_mgr::TunnelClientHub::new(env!("CARGO_PKG_VERSION").to_string());
-    // FR-90 P3-7-3c — the primary enrollment's hub is where an agent
-    // session's own egress opens its flows (`net_socks`, `net_forward`).
-    tunnel_hub.set_primary();
     // P3b-3: shared RTT cache — filled by the prober task (below), read by
     // `peers()`. Clone the pinger for the prober; the original moves into
     // `DaemonState` for the `ping` verb.
@@ -4581,30 +4808,12 @@ async fn run_cmd(
         cfg_write_lock.clone(),
         cfg.exec_enabled,
         cfg.remote_config_enabled,
-    );
+    )
+    // FR-132 P1c — what this process runs, for the `needs_restart` it reports.
+    .running_on(&cfg);
     // FR-100 P1c — and every other live key it holds (`peer_auth`), from the
     // same config: a fresh `new` judges offers under `audit` until told.
     remote_cfg.adopt_local(&cfg);
-    // FR-90 — the agent-session supervisor, from this start's `hive_*` keys
-    // (restart-required). Built with every gate closed too, so a start is
-    // answered with the device's actual refusal rather than silence.
-    #[cfg(hive_host)]
-    {
-        roomlerd::hive::init(&cfg);
-        // FR-90 P1d-2 — every way the daemon stops signals this first (an
-        // update, a requested restart, a rollback, an OS stop), before its
-        // connections close: from that moment, what its sessions do is going
-        // down with it, and what the device hosts is frozen for the next one.
-        let mut stopping = shutdown_rx.clone();
-        tokio::spawn(async move {
-            while stopping.changed().await.is_ok() {
-                if *stopping.borrow() {
-                    roomlerd::hive::begin_shutdown();
-                    break;
-                }
-            }
-        });
-    }
     // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
     // from the loaded config into live hub flows, and backs the LocalAPI
     // Route* verbs (persisting through the write lock).
@@ -4620,21 +4829,11 @@ async fn run_cmd(
     // terminal-error slot / OrgCtx) are minted here so the registry rows and
     // the spawned supervisors share the SAME instances.
     let primary_ctx = signaling::OrgCtx::primary(primary_token.clone()).with_renewal(token_renewal);
-    // FR-90 P4-3b-1 — the primary's knowhow scanner, reading its roots from
-    // this config file under the LocalAPI's own write lock. A secondary's
-    // context has none (decision 43).
-    #[cfg(all(hive_host, unix))]
-    let primary_ctx = primary_ctx.with_knowhow(roomlerd::hive::knowhow::Scanner::subprocess(
-        config_path.clone(),
-        cfg_write_lock.clone(),
-    ));
-    // FR-90 P4-5-1b — and its prober, reading `knowhow_probe_reach` from the
-    // same file under the same lock at each probe. A secondary has none.
-    #[cfg(hive_host)]
-    let primary_ctx = primary_ctx.with_prober(roomlerd::hive::knowhow_probe::Prober::new(
-        config_path.clone(),
-        cfg_write_lock.clone(),
-    ));
+    let primary_ctx = if unenrolled {
+        primary_ctx.unenrolled()
+    } else {
+        primary_ctx
+    };
     let mut org_spawns: Vec<OrgSpawn> = Vec::new();
     // Multi-org — every secondary org.s live overlay view, so `peers` can
     // report all orgs (the receivers used to be dropped on the floor).
@@ -4719,6 +4918,48 @@ async fn run_cmd(
     // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
     #[cfg(target_os = "macos")]
     delegate_host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
+    // FR-43 P3b — on a one-row Mac's daemon every org's session goes to the one
+    // worker, so a secondary org's loop gets the host too, and the host applies
+    // the person's floor. Everywhere else a secondary keeps `Delegation::Off`.
+    #[cfg(target_os = "macos")]
+    let secondary_host = roomlerd::delegate::one_row_daemon(
+        cfg.macos_one_row,
+        cfg.macos_supervise_gui_worker,
+        supervised,
+    )
+    .then(|| {
+        delegate_host.set_one_row();
+        delegate_host.clone()
+    });
+    #[cfg(not(target_os = "macos"))]
+    let secondary_host: Option<roomlerd::delegate::DelegateHost> = None;
+    // FR-43 P3a — a one-row Mac's worker holds no enrollment, so its log lines
+    // arrive over the delegation channel and go up on this row, each marked as
+    // the worker's. Root only: no other process supervises a worker.
+    #[cfg(target_os = "macos")]
+    if !unenrolled
+        && !logs_upload_disabled
+        && cfg.macos_one_row
+        && cfg.macos_supervise_gui_worker
+        // SAFETY: geteuid never fails.
+        && unsafe { libc::geteuid() } == 0
+    {
+        let (sink, lines) = tokio::sync::mpsc::channel(roomlerd::logs_upload::CHANNEL_CAPACITY);
+        delegate_host.set_worker_log_sink(sink);
+        let upload_cfg = roomlerd::logs_upload::UploadConfig {
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            agent_jwt: primary_token.clone(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_id_hash: roomlerd::logs_upload::hash_hostname(
+                &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            source: roomlerd::logs_upload::LogSource::Agent,
+        };
+        tokio::spawn(roomlerd::logs_upload::run_uploader(lines, upload_cfg));
+        tracing::info!("logs upload: the GUI worker's lines go up on this row (FR-43 P3a)");
+    }
 
     // FR-55 — keep the device reachable instead of letting it quietly sleep.
     // Default `never`, so on a device that has not opted in this task holds
@@ -4751,15 +4992,19 @@ async fn run_cmd(
     #[cfg(unix)]
     let (delegation_role, worker_channels) = if supervised {
         // Two ordinary channels rather than the socket: the socket outlives a
-        // WS reconnect and the signalling loop does not.
+        // WS reconnect and the signalling loop does not. FR-138 P2b — and a
+        // third for the daemon's orders about the sessions it will claim,
+        // which the loop serves wherever it waits.
         let (in_tx, in_rx) = tokio::sync::mpsc::channel(64);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+        let (orders_tx, orders_rx) = tokio::sync::mpsc::channel(64);
         (
             roomlerd::delegate::Delegation::Worker(roomlerd::delegate::WorkerLink {
                 inbound: in_rx,
                 outbound: out_tx,
+                orders: Some(orders_rx),
             }),
-            Some((in_tx, out_rx)),
+            Some((in_tx, out_rx, orders_tx)),
         )
     } else {
         #[cfg(target_os = "macos")]
@@ -4837,7 +5082,10 @@ async fn run_cmd(
     // companion's device list and mesh.
     .with_org_http(org_http.clone())
     // FR-51 P4 — surface the enrollment's nature in `roomler status`.
-    .with_ephemeral(cfg.ephemeral);
+    .with_ephemeral(cfg.ephemeral)
+    // FR-43 P3a — a worker with no enrollment sends what needs a server to the
+    // root half.
+    .with_no_enrollment(unenrolled);
     // FR-85 — the local recording verbs: this daemon launches `roomlerd
     // record` (its own image, resolved now, before any package upgrade can
     // leave `/proc/self/exe` pointing at a deleted inode).
@@ -4953,6 +5201,7 @@ async fn run_cmd(
     // revokes the worker. An abort would skip exactly that.
     let _macos_supervisor_task = tokio::spawn(roomlerd::macos_supervisor::run(
         cfg.macos_supervise_gui_worker,
+        cfg.macos_one_row,
         delegate_host.clone(),
         shutdown_rx.clone(),
     ));
@@ -4965,6 +5214,11 @@ async fn run_cmd(
     // Same: exits on the shutdown watch, so no abort.
     let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
         supervised,
+        unenrolled,
+        // FR-43 P3b — the person's own, from their file: handed to the daemon
+        // by a worker with no enrollment.
+        cfg.auto_grant_session,
+        worker_log_lines,
         worker_channels,
         shutdown_rx.clone(),
         // #2987 — a worker whose daemon is gone stops through this door.
@@ -5039,14 +5293,16 @@ async fn run_cmd(
         );
         let rx = shutdown_rx.clone();
         let broker = consent_broker.clone();
+        // FR-43 P2b — a secondary org never drives the host-global GUI worker
+        // (`handle_server_msg`'s gate), except on a one-row Mac's daemon,
+        // where it has no other way to the screen (FR-43 P3b).
+        let org_delegation = roomlerd::delegate::Delegation::for_secondary(secondary_host.as_ref());
         let span = tracing::info_span!("org", label = %org.label);
         org_tasks.push(tokio::spawn(tracing::Instrument::instrument(
             async move {
                 match signaling::run(
                     org_ctx,
-                    // FR-43 P2b — secondary orgs never drive the host-global
-                    // GUI worker (see `handle_server_msg`'s primary gate).
-                    roomlerd::delegate::Delegation::Off,
+                    org_delegation,
                     org_cfg,
                     encoder_preference,
                     rx,
@@ -5103,6 +5359,7 @@ async fn run_cmd(
         // it must not consume the captured services.
         let remote_cfg2 = remote_cfg.clone();
         let rc_sessions2 = rc_sessions.clone();
+        let secondary_host2 = secondary_host.clone();
         roomlerd::org_join::install(roomlerd::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
@@ -5224,13 +5481,15 @@ async fn run_cmd(
                 // and this closure runs once per join.
                 let remote_cfg_join = remote_cfg2.clone();
                 let rc_sessions_join = rc_sessions2.clone();
+                // Secondary org — see above.
+                let org_delegation =
+                    roomlerd::delegate::Delegation::for_secondary(secondary_host2.as_ref());
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
                     async move {
                         match signaling::run(
                             org_ctx,
-                            // Secondary org — see above.
-                            roomlerd::delegate::Delegation::Off,
+                            org_delegation,
                             org_cfg,
                             enc,
                             rx,
@@ -5352,17 +5611,19 @@ async fn run_cmd(
                                     "clean-run threshold reached; promoted to last-known-good"
                                 );
                             }
-                            // rc.52 Phase 4: this run proved healthy.
-                            // If we're a SystemContext worker that
-                            // loaded its config from a perUser path,
-                            // promote a copy to the machine-global
-                            // %PROGRAMDATA% location so the NEXT boot
-                            // can load it pre-logon. machine_id is the
-                            // stored config field — copying the loaded
-                            // struct preserves it verbatim.
-                            self_heal_machine_global_config(&path, &current);
                         }
                         Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
+                    }
+                    drop(_write_guard);
+                    // #3302 — a watcher stopped before its verdict leaves the record
+                    // at InProgress for good. Healthy this long, this daemon can say.
+                    if let Some(wait) = post_install::settle_record(&pkg) {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {
+                                let _ = post_install::settle_record(&pkg);
+                            }
+                            _ = shutdown.changed() => {}
+                        }
                     }
                 }
                 _ = shutdown.changed() => {}
@@ -5418,11 +5679,6 @@ async fn run_cmd(
     let mut os_initiated_stop = false;
     tokio::select! {
         res = sig_task => {
-            // FR-90 P1d-2 — first, on every way out: a harness that ends from
-            // here on went down with the daemon, and its session is resumed
-            // by the next one instead of being ended.
-            #[cfg(hive_host)]
-            roomlerd::hive::begin_shutdown();
             // FR-84 D3 — an accepted restart leaves through the graceful door
             // whatever the signalling loop did on its way out (an error, even
             // a panic): the shutdown is our own, and a crash counted here
@@ -5458,8 +5714,6 @@ async fn run_cmd(
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            #[cfg(hive_host)]
-            roomlerd::hive::begin_shutdown();
             tracing::info!("shutdown requested");
             graceful_shutdown = true;
             os_initiated_stop = true;
@@ -5471,10 +5725,6 @@ async fn run_cmd(
         // for what this cost before it existed (#1040 on Unix; #1683 on the
         // Windows SCM service, where the stop arrived only as a hard kill).
         _ = terminate_signal(stop_event, config_path) => {
-            // Under systemd the same stop reaches every harness a moment
-            // after this (`KillMode=control-group`).
-            #[cfg(hive_host)]
-            roomlerd::hive::begin_shutdown();
             tracing::info!("OS/service-manager stop received; shutting down gracefully");
             graceful_shutdown = true;
             os_initiated_stop = true;
@@ -5515,14 +5765,6 @@ async fn run_cmd(
     // `_virtual_desktop` and by `exit_for_requested_restart`.
     #[cfg(target_os = "linux")]
     virtual_desktop::teardown();
-    // FR-90 P1h — the same for the agent sessions this daemon launched: each
-    // harness leads its own process group, which a service manager reaches
-    // only when it kills a whole cgroup (systemd's `KillMode=control-group`).
-    // launchd does not, and nothing does for an unsupervised daemon, so the
-    // daemon takes them down itself — after `begin_shutdown`, so each session
-    // is kept for the next daemon to resume. Bounded.
-    #[cfg(hive_host)]
-    roomlerd::hive::wind_down().await;
     tracing::info!(
         elapsed_ms = teardown.elapsed().as_millis() as u64,
         "shutdown: tasks stopped"
@@ -5556,14 +5798,16 @@ async fn run_cmd(
             // (rollbacks included); the policy itself is one pure table
             // (`updater::should_self_unenroll`). Platform-neutral on purpose.
             let update_in_flight = updater::update_in_flight();
-            if updater::should_self_unenroll(current.ephemeral, os_initiated_stop, update_in_flight)
-            {
+            // FR-43 P3a — `current` is the person's file, and a worker with no
+            // enrollment is not the row in it, whatever kind that row is.
+            let ephemeral = current.ephemeral && !unenrolled;
+            if updater::should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight) {
                 match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
                     Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
                     Err(e) => tracing::warn!(error = %e,
                         "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
                 }
-            } else if current.ephemeral && os_initiated_stop {
+            } else if ephemeral && os_initiated_stop {
                 // The one way the gate says no to an ephemeral OS stop. Named,
                 // so "why is this row still here?" has an answer in the log.
                 tracing::info!(
@@ -5722,23 +5966,24 @@ fn service_stop_as_service() -> Result<()> {
 fn service_install_as_service() -> Result<()> {
     let exe = std::env::current_exe().context("locating current_exe for service install")?;
     let registered = win_service::install(&exe).context("registering Roomler with the SCM")?;
+    // #3230 — the answer reaches the installer log as well as the terminal.
     match registered {
         // #3115 — an existing service is reconfigured, never deleted: it keeps
         // running on its old configuration until its next start.
-        win_service::lifecycle::Registered::Reconfigured => println!(
+        win_service::lifecycle::Registered::Reconfigured => logging::answer(format!(
             "Service reconfigured in place: {} ({}). A running service keeps running; \
              the change applies from its next start.",
             win_service::NEW_SERVICE_NAME,
             win_service::SERVICE_DISPLAY_NAME
-        ),
+        )),
         win_service::lifecycle::Registered::Created
-        | win_service::lifecycle::Registered::CreatedAfterDelete => println!(
+        | win_service::lifecycle::Registered::CreatedAfterDelete => logging::answer(format!(
             "Service registered: {} ({}). Launching `sc start {}` will run the service \
              under LocalSystem; AutoStart fires on next boot.",
             win_service::NEW_SERVICE_NAME,
             win_service::SERVICE_DISPLAY_NAME,
             win_service::NEW_SERVICE_NAME
-        ),
+        )),
     }
     // FR-84 D6 — the machine-wide companion login start (`HKLM\…\Run`),
     // written here because this is the elevated step every perMachine install
@@ -5762,10 +6007,15 @@ fn service_install_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_uninstall_as_service() -> Result<()> {
     win_service::uninstall().context("deregistering Roomler")?;
-    println!("Service deregistered ({}).", win_service::NEW_SERVICE_NAME);
-    // FR-84 D6 — no service, no machine-wide companion login start.
+    // #3230 — the step's answer, in the installer log as well as on the terminal.
+    logging::answer(format!(
+        "Service deregistered ({}).",
+        win_service::NEW_SERVICE_NAME
+    ));
+    // FR-84 D6 — no service, no machine-wide companion login start. Logged, so
+    // the step's answer stays the deregistration.
     match roomlerd::companion::remove_login_autostart(true) {
-        Ok(true) => println!("Companion login start removed."),
+        Ok(true) => tracing::info!("Companion login start removed."),
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "companion login start"),
     }
@@ -5838,12 +6088,15 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
         ));
         return Err(e).with_context(|| format!("setting {SYSTEM_CONTEXT_ENV_VAR}=1"));
     }
-    println!("{SYSTEM_CONTEXT_ENV_VAR}=1 written to SCM service env block.");
+    // #3230 — each answer reaches the installer log as well as the terminal.
+    logging::answer(format!(
+        "{SYSTEM_CONTEXT_ENV_VAR}=1 written to SCM service env block."
+    ));
 
     if no_restart {
         let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-        println!(
-            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply."
+        logging::answer(
+            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply.",
         );
         return Ok(());
     }
@@ -5864,7 +6117,7 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
         return Err(e).context("restarting Roomler");
     }
     let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-    println!("Roomler restarted. SystemContext mode is active.");
+    logging::answer("Roomler restarted. SystemContext mode is active.");
     Ok(())
 }
 
@@ -5890,12 +6143,15 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
         ));
         return Err(e).with_context(|| format!("unsetting {SYSTEM_CONTEXT_ENV_VAR}"));
     }
-    println!("{SYSTEM_CONTEXT_ENV_VAR} removed from SCM service env block.");
+    // #3230 — each answer reaches the installer log as well as the terminal.
+    logging::answer(format!(
+        "{SYSTEM_CONTEXT_ENV_VAR} removed from SCM service env block."
+    ));
 
     if no_restart {
         let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-        println!(
-            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply."
+        logging::answer(
+            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply.",
         );
         return Ok(());
     }
@@ -5913,7 +6169,7 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
         return Err(e).context("restarting Roomler");
     }
     let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-    println!("Roomler restarted. SystemContext mode is disabled.");
+    logging::answer("Roomler restarted. SystemContext mode is disabled.");
     Ok(())
 }
 
@@ -5931,13 +6187,17 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 /// product's own record of the last switch.
 ///
 /// An unreadable record reads as "off": that is what an install with no
-/// property always did, so no host is worse off than before.
+/// property always did, so no host is worse off than before. #3609 — the
+/// record's folder is repaired first, and a record that SYSTEM and
+/// Administrators are not alone to change reads as unreadable, so as off.
 #[cfg(target_os = "windows")]
 fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
     use roomlerd::win_service::system_context_attempt as attempt;
 
-    let last = attempt::read_last().unwrap_or_else(|e| {
-        eprintln!(
+    // #3230 — a warning, so the installer log has it: Windows Installer keeps
+    // nothing on stderr.
+    let last = attempt::read_last_private().unwrap_or_else(|e| {
+        tracing::warn!(
             "keep-system-context: cannot read {} ({e}); treating it as off",
             attempt::path().display()
         );
@@ -5945,14 +6205,14 @@ fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
     });
     let on = attempt::last_switched_on(last.as_ref());
     match &last {
-        Some(a) => println!(
+        Some(a) => logging::answer(format!(
             "keep-system-context: the last recorded switch was `{}` ({:?}) at {} -> SystemContext {}",
             a.command,
             a.stage,
             a.ts,
             if on { "ON" } else { "off" }
-        ),
-        None => println!("keep-system-context: no recorded switch -> SystemContext off"),
+        )),
+        None => logging::answer("keep-system-context: no recorded switch -> SystemContext off"),
     }
     if on {
         enable_system_context_cmd(no_restart)
@@ -5966,6 +6226,28 @@ fn keep_system_context_cmd(_no_restart: bool) -> Result<()> {
     bail!("`keep-system-context` is Windows-only.")
 }
 
+/// #3375 — how long an entry `set-service-env-var` wrote lasts, as the verb
+/// tells it. The per-Machine MSI carries the service's `Environment` across
+/// an update from 0.4.200 on, a repair reconfigures the service in place
+/// (#3115), and an uninstall deletes the service, the block with it. The
+/// SystemContext switch, in either spelling the daemon reads, is not carried:
+/// an update decides it from the last enable or disable, which the installer
+/// records (`agents/roomler-msi-ca/src/carry.rs`, `INSTALLER_OWNED`). Off
+/// Windows only the unit tests call it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn service_env_var_lifetime(name: &str) -> &'static str {
+    let switch = tunnel_core::env::PREFIXES
+        .iter()
+        .any(|p| format!("{p}ENABLE_SYSTEM_SWAP").eq_ignore_ascii_case(name));
+    if switch {
+        "An update does not keep this entry as written: it decides SystemContext from the last \
+         `roomlerd enable-system-context` or `disable-system-context`, so use those to keep it."
+    } else {
+        "It stays through updates (from 0.4.200 on) and repairs. Uninstalling Roomler removes it \
+         with the service."
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
     use roomlerd::win_service::environment;
@@ -5974,14 +6256,15 @@ fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
             environment::set_service_env_var(name, v)
                 .with_context(|| format!("set-service-env-var: {name}={v}"))?;
             println!(
-                "{name}={v} written to SCM service env block. Run `roomlerd restart-service` to apply."
+                "{name}={v} written to the Roomler service's Environment. Run `roomlerd restart-service` to apply."
             );
+            println!("{}", service_env_var_lifetime(name));
         }
         None => {
             environment::unset_service_env_var(name)
                 .with_context(|| format!("unset-service-env-var: {name}"))?;
             println!(
-                "{name} removed from SCM service env block. Run `roomlerd restart-service` to apply."
+                "{name} removed from the Roomler service's Environment. Run `roomlerd restart-service` to apply."
             );
         }
     }
@@ -6213,18 +6496,18 @@ async fn restart_daemon_beside_self_update(exe: Option<&std::path::Path>, latest
     }
 }
 
-/// Open the preferred encoder, feed it 10 synthetic BGRA frames, and
-/// assert at least one keyframe comes out. Used in CI to catch MF init
-/// regressions before shipping an MSI. Exits with a non-zero code on
-/// any failure so a failed smoke check fails the release build.
+/// Open the cell the flags ask for, feed it 10 synthetic BGRA frames, and
+/// pass only when what opened is what was asked for and a keyframe came out
+/// (`encode::smoke`). Any failure is an `Err`, so the process exits non-zero
+/// and a failed smoke check fails the release build.
 async fn encoder_smoke_cmd(
     pref_raw: &str,
     codec_raw: &str,
     name: Option<&str>,
     dump: Option<&str>,
 ) -> Result<()> {
-    use roomlerd::encode::{open_default, open_for_codec};
-    use std::io::Write as _;
+    use roomlerd::encode::bench::{BuildCaps, SessionOpener};
+    use roomlerd::encode::smoke;
 
     // FR-78 P3 — the raw bitstream, for an offline decode (see the flag's doc).
     let mut dump_file = match dump {
@@ -6256,100 +6539,22 @@ async fn encoder_smoke_cmd(
 
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
-    let w = 640u32;
-    let h = 480u32;
-    let codec = codec_raw.to_ascii_lowercase();
-    tracing::info!(width = w, height = h, ?pref, codec = %codec, "encoder smoke: opening encoder");
-
-    // For H.264 keep the historical `open_default` path (preserves
-    // logging + behaviour that CI smoke output is pinned to). For any
-    // other codec, go through `open_for_codec` which runs the codec-
-    // specific cascade and reports whether a demotion happened.
-    let (mut enc, actual_codec) = if let Some(name) = name {
-        // FR-78 P2 — a named backend, past every cascade: the same open the
-        // capability probe runs, so what the probe advertised opens here.
-        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-            )
-        })?;
-        (e, actual.to_string())
-    } else if codec == "h264" {
-        (open_default(w, h, pref), "h264".to_string())
-    } else {
-        let (e, actual) = open_for_codec(&codec, w, h, pref);
-        (e, actual.to_string())
+    // #3652 — the cell the request asks for, opened the way a session opens
+    // it (the FR-16 L1 bench's opener), and judged in `encode::smoke`.
+    let req = smoke::Request {
+        pref,
+        codec: codec_raw,
+        name,
     };
-    let backend = enc.name();
-    tracing::info!(backend, actual_codec = %actual_codec, "encoder smoke: backend selected");
-    if codec != "h264" && actual_codec != codec {
-        tracing::warn!(
-            requested = %codec,
-            actual = %actual_codec,
-            "encoder smoke: demoted from requested codec"
-        );
-    }
-
-    let mut keyframes = 0usize;
-    let mut total_bytes = 0usize;
-    for i in 0..10 {
-        let mut data = vec![0u8; (w * h * 4) as usize];
-        // Alternate solid colours so the encoder has content to encode.
-        let (b, g, r) = match i % 3 {
-            0 => (255, 0, 0),
-            1 => (0, 255, 0),
-            _ => (0, 0, 255),
-        };
-        for px in data.chunks_exact_mut(4) {
-            px[0] = b;
-            px[1] = g;
-            px[2] = r;
-            px[3] = 255;
-        }
-        let frame = std::sync::Arc::new(roomlerd::capture::Frame {
-            width: w,
-            height: h,
-            stride: w * 4,
-            pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data: data.into(),
-            monotonic_us: (i as u64) * 33_333,
-            monitor: 0,
-            damage: roomlerd::capture::Damage::Unknown,
-            source: None,
-        });
-        if i == 5 {
-            enc.request_keyframe();
-        }
-        let packets = enc.encode(frame).await?;
-        for p in &packets {
-            total_bytes += p.data.len();
-            if p.is_keyframe {
-                keyframes += 1;
-            }
-            if let Some(f) = dump_file.as_mut() {
-                f.write_all(&p.data)
-                    .context("encoder smoke: --dump write failed")?;
-            }
-        }
-    }
-    if let Some(mut f) = dump_file.take() {
-        f.flush().context("encoder smoke: --dump flush failed")?;
-        tracing::info!(
-            path = dump.unwrap_or(""),
-            total_bytes,
-            "encoder smoke: bitstream dumped"
-        );
-    }
-    tracing::info!(backend, keyframes, total_bytes, "encoder smoke: done");
-    if backend == "noop" {
-        bail!("encoder smoke: fell through to NoopEncoder — HW and SW backends both failed");
-    }
-    if keyframes == 0 {
-        bail!("encoder smoke: no keyframes produced (backend={backend})");
-    }
-    println!(
-        "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
-    );
+    let build = BuildCaps::this_build();
+    let plan = smoke::plan(&req, smoke::WIDTH, smoke::HEIGHT, build)?;
+    let mut opener = SessionOpener { pref };
+    let dump = match (dump, dump_file.as_mut()) {
+        (Some(path), Some(file)) => Some(smoke::Dump { path, file }),
+        _ => None,
+    };
+    let mut stdout = std::io::stdout();
+    smoke::run(&plan, &req, build, &mut opener, &mut stdout, dump).await?;
     Ok(())
 }
 
@@ -6374,32 +6579,35 @@ async fn encoder_reconfigure_sweep_cmd(
     constrained: bool,
     json: bool,
 ) -> Result<()> {
-    use roomlerd::encode::{open_default, open_for_codec};
+    use roomlerd::encode::bench::{BuildCaps, CellPath, SessionOpener};
+    use roomlerd::encode::smoke;
     use std::time::Instant;
 
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
-    let codec = codec_raw.to_ascii_lowercase();
     if constrained {
         tracing::info!(
             "reconfigure-sweep: --constrained noted; A0 opens the encoder's default HRD window \
              (the IDR-on-reconfigure question is independent of HRD %; burst sizes may differ)"
         );
     }
-    let (mut enc, actual_codec) = if let Some(name) = name {
-        // FR-78 P2 — a named backend, past every cascade: the same open the
-        // capability probe runs, so what the probe advertised opens here.
-        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-            )
-        })?;
-        (e, actual.to_string())
-    } else if codec == "h264" {
-        (open_default(w, h, pref), "h264".to_string())
+    // #3652 — the plain smoke's request → cell → verdict, so a fallback, a
+    // demotion or nothing opening measures nothing. `--name` (FR-78 P2) is a
+    // named backend past every cascade: the open the capability probe runs.
+    let req = smoke::Request {
+        pref,
+        codec: codec_raw,
+        name,
+    };
+    let build = BuildCaps::this_build();
+    let plan = smoke::plan(&req, w, h, build)?;
+    let (mut enc, opened) =
+        smoke::open(&plan, pref, build, &mut SessionOpener { pref }).into_ok(&plan, &req)?;
+    // The A0 JSON's `codec` stays a named encoder's wire name.
+    let actual_codec = if plan.cell.path == CellPath::Named && opened.codec == "h265" {
+        "hevc"
     } else {
-        let (e, actual) = open_for_codec(&codec, w, h, pref);
-        (e, actual.to_string())
+        opened.codec
     };
     let backend = enc.name();
     tracing::info!(
@@ -6408,9 +6616,6 @@ async fn encoder_reconfigure_sweep_cmd(
         width = w, height = h, frames_per_rung,
         "reconfigure-sweep: backend selected"
     );
-    if backend == "noop" {
-        bail!("reconfigure-sweep: fell through to NoopEncoder — no HW/SW backend on this host");
-    }
 
     // Deterministic moving-block-over-stripes frame. `n` advances the block.
     let make_frame = |n: u32| -> std::sync::Arc<roomlerd::capture::Frame> {
@@ -6986,6 +7191,9 @@ fn input_smoke_cmd(
     use roomlerd::input::{Button, InputMsg};
 
     let mut inj = roomlerd::input::open_default();
+    // #3787 — a missing display is said from a thread of its own, which the
+    // daemon never waits for. This one-shot command does, so the line prints.
+    roomlerd::input::no_display::wait_for_the_line();
     println!("input-smoke: has_permission={}", inj.has_permission());
     let pause = || std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 
@@ -7458,6 +7666,45 @@ mod tests {
         }
     }
 
+    /// #3289 — nothing was attempted, so it does not say an attempt failed, and it
+    /// does not send a person to the one thing the installer refuses.
+    #[test]
+    fn a_crash_loop_with_no_rollback_says_what_is_true() {
+        let msg = crash_loop_no_rollback_msg("0.4.220", "0.4.197", 3);
+        assert!(msg.contains("0.4.220 has crashed 3 times within 10 min"));
+        assert!(msg.contains("Last known good version: 0.4.197"));
+        assert!(msg.contains("did not roll back"));
+        assert!(msg.contains("auto_update = false"));
+        assert!(msg.contains("uninstall Roomler, then install 0.4.197"));
+        assert!(!msg.contains("auto-rollback failed"));
+        assert!(!msg.contains("reinstall manually"));
+    }
+
+    /// #3289 — a worker the host hands a flag this build does not parse exits at
+    /// once, on every spawn, so the host's spelling is read back here.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_a_worker_as_the_service_host_spawns_it() {
+        use roomlerd::win_service::supervisor::{ENDED_BY_HOST, prior_end_args};
+        for word in [Some(ENDED_BY_HOST), None] {
+            let mut argv = vec!["roomlerd".to_string()];
+            argv.extend(win_service::worker_args());
+            argv.extend(prior_end_args(word));
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    supervisor,
+                    prior_end,
+                    ..
+                }) => {
+                    assert_eq!(supervisor.as_deref(), Some("scm"));
+                    assert_eq!(prior_end.as_deref(), word);
+                }
+                other => panic!("expected run, got {other:?}"),
+            }
+        }
+    }
+
     /// #3292 — the spellings in the per-user MSI's `StopOldDaemon` and
     /// `StopDaemon`. Both are Return='ignore', so a flag that stopped parsing
     /// would fail silently, and an upgrade would keep the old daemon again.
@@ -7510,6 +7757,108 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// #3230, #3640 — the installer role is exactly what each MSI runs as
+    /// LocalSystem. Every custom action that runs the daemon, in both WiX files,
+    /// is parsed as the daemon parses it: one that runs as LocalSystem
+    /// (`Impersonate='no'`: all of the per-Machine MSI's) takes the installer
+    /// role, and one that runs as the person (all of the per-user MSI's; the
+    /// person cannot write `service-logs`) takes none. A new custom action is held
+    /// to the same rule.
+    #[test]
+    fn the_installer_role_is_what_each_msi_runs_as_local_system() {
+        fn exe_actions(wxs: &str) -> Vec<(String, String, String)> {
+            // The WiX files break the line after `<CustomAction`.
+            wxs.split("<CustomAction")
+                .skip(1)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .filter_map(|element| {
+                    let element = &element[..element.find("/>")?];
+                    let attr = |name: &str| -> Option<String> {
+                        let key = format!("{name}='");
+                        let (at, _) = element.match_indices(&key).find(|(i, _)| {
+                            *i == 0 || element[..*i].ends_with(char::is_whitespace)
+                        })?;
+                        let value = &element[at + key.len()..];
+                        Some(value[..value.find('\'')?].to_string())
+                    };
+                    // WiX's default for a deferred action is to impersonate.
+                    let impersonate = attr("Impersonate").unwrap_or_else(|| "yes".into());
+                    Some((attr("Id")?, attr("ExeCommand")?, impersonate))
+                })
+                .collect()
+        }
+        let per_machine = exe_actions(include_str!("../wix-perMachine/main.wxs"));
+        let per_user = exe_actions(include_str!("../wix/main.wxs"));
+        // The parse found them: seven each today.
+        assert!(per_machine.len() >= 7, "{per_machine:?}");
+        assert!(per_user.len() >= 7, "{per_user:?}");
+        assert!(per_machine.iter().all(|a| a.2 == "no"), "{per_machine:?}");
+        assert!(per_user.iter().all(|a| a.2 == "yes"), "{per_user:?}");
+        let mut wrong = Vec::new();
+        for (id, exe, impersonate) in per_machine.iter().chain(&per_user) {
+            let argv = std::iter::once("roomlerd").chain(exe.split_whitespace());
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{id}: `{exe}`: {e}"));
+            let want = (impersonate == "no").then_some(logging::ServiceLogRole::Installer);
+            let got = service_log_role(cli.command.as_ref());
+            if got != want {
+                wrong.push(format!("{id} `{exe}`: {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #3230 — the log role of the commands around those the MSIs run: the same
+    /// verbs without `--as-service`, for the other flavour, and the person's own
+    /// service verbs keep the profile's log.
+    #[test]
+    fn the_log_role_of_each_command() {
+        use logging::ServiceLogRole::{Host, Installer, Netd};
+        for (argv, want) in [
+            ("service-run", Some(Host)),
+            ("netd", Some(Netd)),
+            ("service install --as-service", Some(Installer)),
+            ("service uninstall --system", Some(Installer)),
+            (
+                "cleanup-legacy-install --target-flavour perMachine",
+                Some(Installer),
+            ),
+            ("enable-system-context", Some(Installer)),
+            ("disable-system-context", Some(Installer)),
+            ("keep-system-context", Some(Installer)),
+            ("service install", None),
+            ("service uninstall", None),
+            ("service status --as-service", None),
+            ("service start --as-service", None),
+            ("service stop --as-service", None),
+            ("cleanup-legacy-install --target-flavour perUser", None),
+            ("cleanup-legacy-install --target-flavour bogus", None),
+        ] {
+            let cli =
+                Cli::try_parse_from(std::iter::once("roomlerd").chain(argv.split_whitespace()))
+                    .unwrap_or_else(|e| panic!("`{argv}`: {e}"));
+            assert_eq!(service_log_role(cli.command.as_ref()), want, "`{argv}`");
+        }
+        assert_eq!(service_log_role(None), None);
+    }
+
+    /// #3230 — a failed step's end line carries every layer of its error, and the
+    /// code `main` exits with.
+    #[test]
+    fn a_failed_step_ends_with_its_whole_chain_and_its_exit_code() {
+        let res: Result<()> = Err(anyhow::Error::new(std::io::Error::from_raw_os_error(1072))
+            .context("CreateServiceW")
+            .context("registering Roomler with the SCM"));
+        let (error, code) = step_outcome(&res);
+        let error = error.expect("an error");
+        assert!(
+            error.starts_with("registering Roomler with the SCM: CreateServiceW: "),
+            "{error}"
+        );
+        assert!(error.ends_with("(os error 1072)"), "{error}");
+        assert_eq!(code, EXIT_CODE_OF_AN_ERR);
+        assert_eq!(step_outcome(&Ok(())), (None, 0));
     }
 
     /// #3292 — no marker, no stop: an ephemeral device's identity is at stake.
@@ -7610,16 +7959,42 @@ mod tests {
         }
     }
 
-    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --encoder hardware` on
-    /// every freshly built EXE. The bench is opt-in: that line, and the bare
-    /// command, still parse to the plain 10-frame smoke with every flag where
-    /// it was before the bench existed.
+    /// #3375 — the verb says what an update does with the entry it wrote: an
+    /// operator's entry is carried, the SystemContext switch (either spelling
+    /// the daemon reads, any case) is the installer's to decide.
+    #[test]
+    fn set_service_env_var_says_what_an_update_keeps() {
+        for kept in ["ROOMLERD_SFTP_AS_USER", "ROOMLERD_UPDATE_URL", "RUST_LOG"] {
+            let said = service_env_var_lifetime(kept);
+            assert!(said.contains("stays through updates"), "{kept}: {said}");
+            assert!(said.contains("removes it"), "{kept}: {said}");
+        }
+        for switch in [
+            "ROOMLERD_ENABLE_SYSTEM_SWAP",
+            "ROOMLER_NODE_ENABLE_SYSTEM_SWAP",
+            "roomlerd_enable_system_swap",
+        ] {
+            let said = service_env_var_lifetime(switch);
+            assert!(said.contains("enable-system-context"), "{switch}: {said}");
+        }
+        // A name that only contains the switch's is an ordinary entry.
+        assert!(service_env_var_lifetime("X_ROOMLERD_ENABLE_SYSTEM_SWAP").contains("stays"));
+    }
+
+    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --name h264_mf` on
+    /// every freshly built EXE (#3652): Media Foundation's H.264 on either MFT,
+    /// since the runner has no GPU. The bench is opt-in: that line, and the
+    /// bare command (`--encoder hardware`), still parse to the plain 10-frame
+    /// smoke with every other flag where it was before the bench existed.
     #[test]
     fn the_release_lanes_encoder_smoke_is_still_the_plain_smoke() {
         use roomlerd::encode::bench::{SmokeMode, smoke_mode};
-        for argv in [
-            &["roomlerd", "encoder-smoke", "--encoder", "hardware"][..],
-            &["roomlerd", "encoder-smoke"][..],
+        for (argv, lane_name) in [
+            (
+                &["roomlerd", "encoder-smoke", "--name", "h264_mf"][..],
+                Some("h264_mf"),
+            ),
+            (&["roomlerd", "encoder-smoke"][..], None),
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             match cli.command {
@@ -7638,7 +8013,7 @@ mod tests {
                 }) => {
                     assert_eq!((encoder.as_str(), codec.as_str()), ("hardware", "h264"));
                     assert!(!reconfigure_sweep && !constrained && !json);
-                    assert_eq!((name, dump), (None, None));
+                    assert_eq!((name.as_deref(), dump), (lane_name, None));
                     assert_eq!((width, height, frames_per_rung), (1280, 800, 30));
                     assert!(!bench.bench && !bench.bench_full && !bench.bench_paced);
                     assert!(bench.bench_cells.is_empty() && bench.bench_sizes.is_empty());
@@ -7923,6 +8298,12 @@ mod tests {
 
     // ─── rc.52: config-path resolution ladder ──────────────────────────────
 
+    /// The service account's profile the ladder's cases are given, as the
+    /// system names it on a stock install.
+    fn system_profile() -> &'static Path {
+        Path::new(r"C:\Windows\System32\config\systemprofile")
+    }
+
     #[test]
     // RETIRED-NAME-ANCHOR-BEGIN
     // These cases feed the PRE-RENAME machine-global config path on purpose: that is
@@ -7941,8 +8322,8 @@ mod tests {
                 r"C:\ProgramData\roomler\roomler-agent\config.toml",
             )),
             Path::new(r"C:\Users\u\AppData\config.toml"),
-            None,
-            |_| true, // everything "exists" — explicit still wins
+            system_profile(),
+            |_| true, // everything opens — explicit still wins
         );
         assert_eq!(got, explicit);
     }
@@ -7951,7 +8332,7 @@ mod tests {
     fn pick_config_path_system_context_prefers_machine_global() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, None, |p| p == mg);
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |_| true);
         assert_eq!(got, mg);
     }
 
@@ -7961,48 +8342,183 @@ mod tests {
         // machine-global path even if it exists.
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Users\u\AppData\config.toml");
-        let got = pick_config_path(None, false, Some(mg), default, None, |p| {
+        let got = pick_config_path(None, false, Some(mg), default, system_profile(), |p| {
             p == mg || p == default
         });
         assert_eq!(got, default);
     }
 
+    /// #3387 — a SystemContext worker runs the machine's own enrollment, and
+    /// nothing else: whatever exists on the disk, it never takes the config of
+    /// the person signed in at the console. That person's enrollment runs as
+    /// that person, on the service host's user-context arm, until the machine
+    /// has one of its own (`win_service::supervisor::want_system_worker`).
     #[test]
-    fn pick_config_path_system_context_falls_to_active_user() {
-        // Machine-global absent, default (SYSTEM profile) absent —
-        // post-logon SC worker uses the active-user fallback.
+    fn pick_config_path_system_context_never_takes_the_persons_config() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let active = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, Some(active), |p| p == active);
-        assert_eq!(got, active);
+        let person = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
+        // Every combination of what opens: the machine config, the
+        // SYSTEM-profile one, the person's.
+        for bits in 0u8..8 {
+            let on = |p: &Path| {
+                (p == mg && bits & 1 != 0)
+                    || (p == default && bits & 2 != 0)
+                    || (p == person && bits & 4 != 0)
+            };
+            let got = pick_config_path(None, true, Some(mg), default, system_profile(), on);
+            assert_ne!(got, person, "opens bits {bits:03b}");
+            assert!(
+                got == mg || got == default,
+                "opens bits {bits:03b}: {got:?}"
+            );
+        }
+        // The case the person's rung served: only the person's config is there.
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |p| {
+            p == person
+        });
+        assert_eq!(got, mg);
     }
 
+    /// #3387 — with nothing on the disk a SystemContext worker names the
+    /// machine path, so its "no config found" says where the machine's
+    /// enrollment belongs, not the SYSTEM profile. Any other worker still
+    /// names its own default.
     #[test]
-    fn pick_config_path_returns_default_when_nothing_exists() {
-        // Nothing on disk → default, so config::load fails with an
-        // honest "not found" naming that path.
+    fn pick_config_path_system_context_names_the_machine_path_when_nothing_exists() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, None, |_| false);
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |_| false);
+        assert_eq!(got, mg);
+        let user_default = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
+        let got = pick_config_path(
+            None,
+            false,
+            Some(mg),
+            user_default,
+            system_profile(),
+            |_| false,
+        );
+        assert_eq!(got, user_default);
+    }
+
+    /// The SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
+    /// without `--machine-global`) stays a rung: only SYSTEM and
+    /// Administrators can write it.
+    #[test]
+    fn pick_config_path_system_context_keeps_the_system_profile_rung() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |p| {
+            p == default
+        });
         assert_eq!(got, default);
     }
 
-    // ─── rc.52: self-heal predicate ────────────────────────────────────────
-
+    /// #3702 — the second rung is the SYSTEM profile's own config, and only
+    /// that: a SystemContext process whose profile config resolves anywhere
+    /// else names the machine path, whatever opens there.
     #[test]
-    fn should_self_heal_only_for_system_context_peruser_load_without_machine_global() {
-        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
-        let peruser = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        // The one true case: SC worker, loaded from a perUser path,
-        // machine-global absent.
-        assert!(should_self_heal_config(true, peruser, mg, false));
-        // Not a SystemContext worker → never.
-        assert!(!should_self_heal_config(false, peruser, mg, false));
-        // Already loaded FROM the machine-global path → nothing to do.
-        assert!(!should_self_heal_config(true, mg, mg, false));
-        // Machine-global already exists → don't clobber it.
-        assert!(!should_self_heal_config(true, peruser, mg, true));
+    fn pick_config_path_system_context_takes_a_profile_config_only_in_the_system_profile() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let elsewhere = Path::new(r"C:\Users\u\AppData\Roaming\roomler\roomler\config\config.toml");
+        let got = pick_config_path(None, true, Some(mg), elsewhere, system_profile(), |p| {
+            p == elsewhere
+        });
+        assert_eq!(got, mg);
+        // The same config in the service account's own profile, named in
+        // another case, is the second rung.
+        let in_profile = Path::new(r"c:\WINDOWS\system32\config\SYSTEMPROFILE\config.toml");
+        let got = pick_config_path(None, true, Some(mg), in_profile, system_profile(), |p| {
+            p == in_profile
+        });
+        assert_eq!(got, in_profile);
+    }
+
+    /// #3609 — the service host and the worker's ladder read the machine rung
+    /// through one function (`win_service::supervisor::rung_opens`), so they
+    /// cannot disagree: both refuse a machine config another account may
+    /// change while the repair is off, and both take it once the repair has
+    /// put it back to SYSTEM and Administrators. #3666 — the repair puts back
+    /// only a config an administrator's entry reached (here this elevated
+    /// account's own); one another account could write, it leaves, and both
+    /// refuse it with the repair on too.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_host_and_the_worker_refuse_the_same_config() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        use roomlerd::win_service::supervisor::{config_opens_in, rung_opens};
+        if !elevated_or_skip("the host and the worker on one config") {
+            return;
+        }
+        for (account, an_administrator) in [(me(), true), (GUESTS.to_string(), false)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let tree = enrolled_tree(root.path());
+            assert!(icacls(
+                &tree.config(),
+                &["/grant", &format!("*{account}:(M)")]
+            ));
+            let mg = tree.config();
+            let absent = root.path().join("systemprofile").join("config.toml");
+            for switches in [
+                Switches {
+                    repair: false,
+                    ..Switches::ON
+                },
+                Switches::ON,
+            ] {
+                let host = config_opens_in(&tree, switches, Some(absent.clone()));
+                let ladder_opened = std::cell::Cell::new(None);
+                let picked = pick_config_path(
+                    None,
+                    true,
+                    Some(mg.as_path()),
+                    &absent,
+                    &root.path().join("systemprofile"),
+                    |p| {
+                        let opens = rung_opens(&tree, switches, p);
+                        if p == mg {
+                            ladder_opened.set(Some(opens));
+                        }
+                        opens
+                    },
+                );
+                assert_eq!(picked, mg);
+                assert_eq!(Some(host), ladder_opened.get(), "{account}: {switches:?}");
+                assert_eq!(
+                    host,
+                    switches.repair && an_administrator,
+                    "{account}: {switches:?}"
+                );
+            }
+        }
+    }
+
+    /// #3387 — the service host hands a worker it starts as the person, while
+    /// SystemContext waits for a machine enrollment, one more flag; a worker
+    /// that did not parse it would exit at once on every spawn.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_a_waiting_worker_as_the_service_host_spawns_it() {
+        use roomlerd::win_service::supervisor::system_context_waiting_args;
+        for waiting in [true, false] {
+            let mut argv = vec!["roomlerd".to_string()];
+            argv.extend(win_service::worker_args());
+            argv.extend(system_context_waiting_args(waiting));
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    supervisor,
+                    system_context_waiting,
+                    ..
+                }) => {
+                    assert_eq!(supervisor.as_deref(), Some("scm"));
+                    assert_eq!(system_context_waiting, waiting);
+                }
+                other => panic!("expected run, got {other:?}"),
+            }
+        }
     }
     // RETIRED-NAME-ANCHOR-END
 
@@ -8280,5 +8796,245 @@ mod tests {
             std::fs::read_to_string(&kept).unwrap(),
             "overlay_enabled = ture\n"
         );
+    }
+}
+
+/// FR-43 P3d — why `enroll --one-row` cannot run here; `None` when it can, or
+/// when it was not asked for. Pure, so every lane tests both refusals.
+fn one_row_refusal(asked: bool, is_macos: bool, is_root: bool) -> Option<&'static str> {
+    if !asked {
+        None
+    } else if !is_macos {
+        Some(
+            "--one-row is for a Mac: only a Mac has a root half and a person's half to make one row",
+        )
+    } else if !is_root {
+        Some("--one-row enrolls the Mac's root half: run it with sudo")
+    } else {
+        None
+    }
+}
+
+fn euid_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// FR-43 P3d — what `enroll --one-row` writes beside the enrollment, so the
+/// daemon's first start is already one row: the supervisor on, and its worker
+/// unenrolled.
+fn apply_one_row(cfg: &mut config::AgentConfig) {
+    cfg.macos_supervise_gui_worker = true;
+    cfg.macos_one_row = true;
+}
+
+#[cfg(test)]
+mod one_row_enroll_tests {
+    use super::*;
+
+    const SERVER: &str = "https://roomler.example";
+
+    fn enroll(extra: &[&str]) -> Option<bool> {
+        let mut argv = vec![
+            "roomlerd", "enroll", "--server", SERVER, "--name", "mac-1", "--token", "tok",
+        ];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).ok()?.command {
+            Some(Command::Enroll { one_row, .. }) => Some(one_row),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn one_row_is_a_flag_and_off_unless_given() {
+        assert_eq!(enroll(&[]), Some(false));
+        assert_eq!(enroll(&["--one-row"]), Some(true));
+        assert_eq!(enroll(&["--one-row", "--overlay"]), Some(true));
+    }
+
+    #[test]
+    fn one_row_is_a_macs_root_half_or_nothing() {
+        assert_eq!(one_row_refusal(false, false, false), None, "not asked");
+        let off_mac = one_row_refusal(true, false, true).unwrap();
+        assert!(off_mac.contains("for a Mac"), "{off_mac}");
+        let not_root = one_row_refusal(true, true, false).unwrap();
+        assert!(not_root.contains("sudo"), "{not_root}");
+        assert_eq!(one_row_refusal(true, true, true), None);
+    }
+
+    #[test]
+    fn one_row_writes_both_switches_and_nothing_else() {
+        let before = config::test_fixture();
+        assert!(!before.macos_supervise_gui_worker && !before.macos_one_row);
+        let mut after = before.clone();
+        apply_one_row(&mut after);
+        assert!(after.macos_supervise_gui_worker);
+        assert!(after.macos_one_row);
+        after.macos_supervise_gui_worker = before.macos_supervise_gui_worker;
+        after.macos_one_row = before.macos_one_row;
+        assert_eq!(
+            toml::to_string(&after).unwrap(),
+            toml::to_string(&before).unwrap(),
+            "every other key as it was"
+        );
+    }
+
+    /// `install.sh --one-row` asks this binary's own `enroll --help` for the
+    /// flag before it spends the token, then passes it with the overlay. A
+    /// rename on either side would stop every one-row install at that check.
+    #[test]
+    fn install_sh_asks_for_the_flag_this_binary_prints() {
+        use clap::CommandFactory;
+        let script = include_str!("../../../scripts/install.sh");
+        assert!(script.contains("enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'"));
+        assert!(script.contains("enroll \"$@\" --overlay --one-row"));
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("enroll")
+            .expect("the enroll verb")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--one-row"), "{help}");
+    }
+}
+
+/// #3652 — the plain smoke, real code, on a build whose only encoder is
+/// OpenH264: no Media Foundation, no FFmpeg, so nothing here touches a GPU.
+/// Hardware asked for and software answering is not a pass. The recorder lane
+/// runs these (`ci.yml`, its OpenH264 `--lib` line), the one lane that builds
+/// OpenH264 without an FFmpeg; a build with hardware backends would prove
+/// nothing here, so it does not compile them.
+#[cfg(all(
+    test,
+    feature = "openh264-encoder",
+    not(all(target_os = "windows", feature = "mf-encoder")),
+    not(feature = "ffmpeg-encoder")
+))]
+mod smoke_openh264_tests {
+    use super::*;
+    use roomlerd::encode::bench::{Backend, Reach, Verdict};
+    use roomlerd::encode::smoke::Failed;
+
+    fn failed(e: &anyhow::Error) -> &Failed {
+        e.downcast_ref::<Failed>()
+            .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"))
+    }
+
+    #[tokio::test]
+    async fn hardware_answered_by_openh264_is_not_a_pass() {
+        let smoke = encoder_smoke_cmd("hardware", "h264", None, None).await;
+        assert!(
+            smoke.is_err(),
+            "hardware was asked for, OpenH264 answered, and the smoke passed"
+        );
+        let e = smoke.unwrap_err();
+        let f = failed(&e);
+        assert_eq!(f.verdict, Verdict::SwOnly, "{e:#}");
+        assert_eq!(f.opened.map(|o| o.name), Some("openh264"), "{e:#}");
+    }
+
+    /// The `.deb` lanes' call (`scripts/deb-bare-check.sh`).
+    #[tokio::test]
+    async fn software_h264_still_passes() {
+        encoder_smoke_cmd("software", "h264", None, None)
+            .await
+            .expect("the software smoke passes on OpenH264");
+    }
+
+    /// This build has no HEVC encoder at all, so the failure has to say that,
+    /// not that a hardware and a software backend both failed.
+    #[tokio::test]
+    async fn hevc_fails_and_names_what_this_build_has() {
+        let e = encoder_smoke_cmd("hardware", "hevc", None, None)
+            .await
+            .expect_err("no HEVC encoder in this build");
+        assert!(!format!("{e:#}").contains("HW and SW"), "{e:#}");
+        let f = failed(&e);
+        assert_eq!(f.verdict, Verdict::None, "{e:#}");
+        let media_foundation = if cfg!(target_os = "windows") {
+            Reach::NotCompiled
+        } else {
+            Reach::WindowsOnly
+        };
+        assert_eq!(
+            f.tried.backends,
+            [
+                (Backend::Ffmpeg, Reach::NotCompiled),
+                (Backend::MediaFoundation, media_foundation),
+            ],
+            "{e:#}"
+        );
+    }
+}
+
+/// #3652 — on a host with no hardware encoder, a hardware smoke fails and
+/// names each FFmpeg candidate it tried and why, and nothing this build does
+/// not carry. CI's `ffmpeg-encoder` job runs it (its plain `--lib` step), on a
+/// GPU-less runner with the vendored FFmpeg. Anywhere else a GPU could
+/// answer, and a local run would open it, so outside GitHub Actions it skips.
+#[cfg(all(test, target_os = "linux", feature = "ffmpeg-encoder"))]
+mod smoke_ffmpeg_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::VideoCodec;
+    use roomlerd::encode::bench::{Backend, Reach, Verdict};
+    use roomlerd::encode::ffmpeg::{FfmpegEncoder, USE_FFMPEG_LOCK};
+    use roomlerd::encode::smoke::Failed;
+
+    // `encode::ffmpeg`'s own tests switch `ROOMLERD_USE_FFMPEG` off in this
+    // process, and this run needs FFmpeg on from its first read of the switch
+    // to its last open: it holds their lock across its awaits on purpose, and
+    // nothing it awaits takes that lock.
+    #[allow(clippy::await_holding_lock)]
+    async fn fails_naming_what_it_tried(codec_raw: &str, codec: VideoCodec) {
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            eprintln!("skipped: a GPU-less CI runner only; here a GPU could answer");
+            return;
+        }
+        let _use_ffmpeg = USE_FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let e = encoder_smoke_cmd("hardware", codec_raw, None, None)
+            .await
+            .expect_err("a GPU-less runner has no hardware encoder to pass on");
+        let f = e
+            .downcast_ref::<Failed>()
+            .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"));
+        assert_eq!(f.verdict, Verdict::None, "{e:#}");
+        assert!(
+            f.tried
+                .backends
+                .contains(&(Backend::Ffmpeg, Reach::InBuild)),
+            "{e:#}"
+        );
+        // The dispatch locks pin the names the vendored build carries, and
+        // every one of them fails here: the value names them, with a reason.
+        assert!(!f.tried.failed.is_empty(), "{e:#}");
+        for (name, why) in &f.tried.failed {
+            assert!(
+                FfmpegEncoder::cascade_names(codec).contains(&name.as_str()),
+                "{name} is not in the {codec_raw} cascade: {e:#}"
+            );
+            assert!(FfmpegEncoder::carried(name), "{name} is not carried: {e:#}");
+            assert!(!why.is_empty(), "{name} failed without a reason: {e:#}");
+        }
+        assert!(!format!("{e:#}").contains("HW and SW"), "{e:#}");
+    }
+
+    /// The RTP track's HEVC: FFmpeg's cascade, then Media Foundation.
+    #[tokio::test]
+    async fn hardware_hevc_names_each_candidate_it_tried() {
+        fails_naming_what_it_tried("hevc", VideoCodec::Hevc).await;
+    }
+
+    /// D1 A: no Media Foundation in this build, so hardware H.264 is the
+    /// DataChannel's FFmpeg cascade, and OpenH264 never answers it.
+    #[tokio::test]
+    async fn hardware_h264_names_each_candidate_it_tried() {
+        fails_naming_what_it_tried("h264", VideoCodec::H264).await;
     }
 }

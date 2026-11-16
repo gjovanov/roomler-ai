@@ -23,16 +23,19 @@ flowchart TB
 | Backend integration | `cargo test -p roomler-ai-tests` | MongoDB `localhost:27019`, Redis `6379` |
 | Remote-control crate | `cargo test -p roomler-ai-remote-control --lib` | nothing (wire-format locks, Hub, consent) |
 | Agent library | `cargo test -p roomlerd --lib` | nothing (default features) |
-| Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
+| Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux. The tests that write the real clipboard or change an X display skip unless opted in ([below](#tests-that-change-a-real-desktop-3813)) |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2562`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2939`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
+| Self-host quickstart | `bash scripts/selfhost-pull-check.sh` (lane `Self-host pull`, amd64 and arm64) | a throwaway machine with Docker, since it ends with `down -v`: no registry login, an empty image cache, `pull` then `up -d`, and every image pinned |
+| A call over the self-host relay | `cd ui && E2E_EXPECT_TURN_RELAY=1 bun x playwright test e2e/selfhost-turn-relay.spec.ts` | a compose stack started with `ROOMLER__TURN__FORCE_RELAY=true` and an announced address outside its deny list, with the browser on the same machine as the server. Fails unless every connected peer connection selected a `relay` pair and both sides decode advancing remote frames |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
 | Soft-keyboard harness | `cd ui && bun run test:harness` | nothing — one harness page on the Vite dev server, in a real Chromium (`ui/e2e-harness/`, #2888) |
+| Data-channel worker harness | the same run (`e2e-harness/dcworker.spec.ts`, FR-135 R3) | nothing — two peer connections looped in one page, `VideoEncoder` on one side and the real decode worker on the other, on both arms of `roomler-rc-dc-worker` ([below](#the-data-channel-worker-harness-fr-135-r3)) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
-| Encoder smoke | `roomlerd encoder-smoke --encoder hardware [--codec hevc]` | the host's GPU — 10 synthetic frames, prints the cascade's decisions |
+| Encoder smoke | `roomlerd encoder-smoke [--encoder hardware] [--codec h264/hevc/av1]`, or `--name <encoder>` | the host's encoders: one cell opened as a session opens it, 10 synthetic frames, judged by [the L1 verdict](#the-plain-smoke-and-the-sweep-judge-by-the-same-verdict): only `ok` passes, and a failure says what it tried. The default asks for hardware; `--encoder software` is the software smoke |
 
 ## Rust integration tests (`crates/tests/`)
 
@@ -47,50 +50,7 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 (+messages, +the FR-127 view: a view client's video consumers against its `media:view`
 reports, the viewer's pause against the owner's, the kill switch, a report through the
 other pod) · cluster · stats · relay-region · remote-control · agent
-(+e2e, +crash, +exec, +presence) · overlay · tunnel · hive.
-
-> [!NOTE]
-> **`tests/hive_canary.rs` is a second test binary, on purpose.** FR-90's
-> canary test (AC2) drives a real in-process device with the Hive supervisor
-> on, and that supervisor is process-global. In the lib's binary every other
-> in-process agent would re-point it at its own socket. `cargo test -p
-> roomler-ai-tests` runs both binaries, and the lane's count sums them. The
-> test is Linux-only and turns on `roomlerd`'s `hive-test-launcher` feature
-> through a Linux-only dev-dependency. That feature launches sessions as the
-> test's own account and refuses to run as root. Its log checks run under a
-> thread-default subscriber around a current-thread runtime, so they see
-> every task of the server and the device without `RUST_LOG`.
->
-> **Since P2d-6 it starts a second device, a member, as a child process: the
-> same binary**, running its `member_device_process` test with
-> `HIVE_CANARY_MEMBER` set, a no-op in an ordinary run (so it counts one
-> passed test). A `[[bin]]` could not do it: binaries get no
-> dev-dependencies, and the test launcher is one on purpose. Under that
-> feature a device takes its checkpoints in process, because the binary is a
-> test's and knows no `hive-checkpoint`.
->
-> **`tests/hive_drivers.rs` is a third, for the same reason** (FR-90 P1c-2b,
-> AC6): a reader's message in the session's room and a prompt over their own
-> viewer peer must reach no harness, while the owner's and a named driver's
-> do, each labelled `[Name] …`. Its harness writes every line it reads on
-> stdin to a file — what a model would be sent — and the test reads that
-> file. The scaffolding both binaries share (the server, the in-process
-> device, a browser's socket and viewer peer, the harness's side of a
-> toolbelt) is `tests/hive_support/mod.rs`, a module each includes, not a
-> test target of its own.
->
-> **`tests/hive_memory.rs` and `tests/hive_memory_off.rs` are a fourth and a
-> fifth** (FR-90 P1e-4, AC8): the same device, with its owner's
-> `hive_core_memory` on and then off. The gate is read once, when the
-> supervisor starts, and a process has one supervisor. The harness
-> (`MEMORY_HARNESS`) copies out what it finds where Claude Code reads core
-> memory — `$CLAUDE_CONFIG_DIR/CLAUDE.md` and the auto-memory `MEMORY.md` —
-> when it starts and at every turn.
->
-> | gate | what the test asserts |
-> |---|---|
-> | on | An org fact kept before a session starts is in its `CLAUDE.md`, and a device fact is in its `MEMORY.md`. A fact kept while it runs is not, even at its next turn. The next session has both, at a later revision. A write past the org's budget is `409 over_budget` with the numbers, and nothing is evicted |
-> | off | The transcript shows the frame arrived (its revision, and that the gate is off). Nothing reached the session's config directory, nor even the daemon's own disk |
+(+e2e, +crash, +exec, +presence) · overlay · tunnel.
 
 ## Frontend tests
 
@@ -98,6 +58,17 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   the `rc:*` channel — notifications, conference, tenants, files, agents…),
   composables (`useRemoteControl` HID + button-mapping locks, validation,
   markdown, snackbar), API client, plugins.
+- **The data-channel worker, black-box** (`ui/src/__tests__/workers/`, FR-135 R3):
+  `rcDcWorker`, `rcMediaWindow`, `rcDecodeRecovery` and `rcDecodeWorkersColorSpace`
+  drive the real `rc-dc-worker.ts` through the messages the page sends it, with
+  WebCodecs, the canvas and the clock faked, once for each of the six codec strings
+  the page names (`dcCodecs.ts`, which `useRemoteControl.spec.ts` checks against the
+  composable's constants). One worker serves every codec, so a branch on the codec
+  string shows up as the one codec whose cases fail. `rcDcWorker` also locks the
+  `stats` message's keys and the crop handling on every codec, and reads a channel
+  moved into the worker (its open, close, gap and messages, with no page hop) and the
+  queue read at arrival beside the old one read at paint. `rcVideoChannel` covers the
+  page's half: a transfer taken, a transfer refused, the delivery-gap clock.
 - **The setup wizard's page** (`ui/src/__tests__/setupWizardPage.spec.ts`, FR-129 C): the
   real `index.html` and `app.js` of `agents/roomler-setup` in jsdom, with Tauri's `invoke`
   mocked. What is preselected, when Continue opens and which cards show are the product there,
@@ -107,7 +78,9 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   websocket + connection status, billing, invite, oauth, email flows,
   notifications, observability, profile, responsive, 404 — plus the
   remote-control lane: `remote-session-smoke`, `remote-file-upload-smoke`,
-  `rc-vp9-444` (needs an agent built with the feature),
+  `rc-vp9-444` (the data-channel worker behind two peers looped in one page; no
+  agent, but it loads the worker from the Vite dev path, so it runs against
+  `bun run dev` only: `scripts/e2e-expected-failures.txt`),
   `remote-recording-refused` and `remote-recording-smoke` (FR-85; the second
   needs an agent that advertises `record`), and a field-host upload spec. Chromium runs with fake media devices for WebRTC.
 - **The phone-width smoke** (`ui/e2e-phone/`, FR-116 D6): the BUILT SPA served
@@ -146,8 +119,8 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14854`,
-  `:14334`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:15317`,
+  `:15377`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -190,14 +163,44 @@ other pod) · cluster · stats · relay-region · remote-control · agent
       R --> A{"one owner<br/>per key?"}
   ```
 
+## The data-channel worker harness (FR-135 R3)
+
+`ui/e2e-harness/dcworker.spec.ts` runs the real `rc-dc-worker.ts` in a real Chromium on both arms of
+`roomler-rc-dc-worker` ([remote-control.md §11.14.1](remote-control.md#11141-the-channel-in-the-worker-roomler-rc-dc-worker)).
+jsdom has no `RTCPeerConnection`, no transferable channel and no WebCodecs, so only a browser can say whether it
+takes the transfer, whether the moved channel's events reach the worker, and whether frames still decode once the
+main thread is out of the path. `dcworker.ts` loops two peer connections in one page: the "viewer" side opens
+`video-bytes` and moves it through the real `moveVideoChannelToWorker`, as `startDcPath` does, and the "agent"
+side encodes a moving 320×180 picture with `VideoEncoder` (VP9 profile 0, else H.264, else AV1) and sends it framed
+as the agent frames it, 13-byte header and 16 KiB messages. It needs no agent and no server. It runs with
+`bun run test:harness`, beside the soft-keyboard harness, on the Vite dev server, and CI runs it with that job on
+any PR that touches `ui/`.
+
+| Case | Asserts |
+|---|---|
+| the relay | every frame decodes, the page's channel is not a husk, `fwd` counts the page's hop, and the far end's close reaches the page |
+| the channel in the worker | the transfer is taken and the page is left a closed husk, the worker says it has the channel (`attached`) before it opens, every frame decodes off the moved channel, `fwd` counts nothing while `arr_gap` counts every arrival, `queueArrMs` is read, and the far end's close reaches the worker |
+| a refused transfer | `DataCloneError` leaves the channel on the page, whole, and the relay carries every frame |
+| every case | the size the worker paints is the picture's, 320×180. Chromium's software VP9 decoder reports a coded width 64 px wider, and with `classifyCrop` acting on VP9 this read 384×180 ([remote-control.md §11.14](remote-control.md#1114-one-data-channel-worker-fr-135-r3)) |
+
+```mermaid
+flowchart LR
+  D["vite dev :4174<br/>e2e-harness/dcworker.html"] --> PW["Playwright Chromium"]
+  PW --> E["VideoEncoder<br/>agent side"] -->|"video-bytes, 16 KiB"| V["viewer side"]
+  V -->|"relay or transfer"| W["rc-dc-worker"]
+  W --> R{"every frame decoded?<br/>fwd · arr_gap · close"}
+```
+
+⚠️ It proves the mechanism and not the gain: two peers on one loopback say nothing about a main thread under a
+real page's load at 60 Mbit/s. That is S11's read, on a real session (FR-135 §8.2). Only Chromium runs here, so
+Firefox's and Safari's transfers are unread.
+
 ## In-crate Rust unit tests
 
 The load-bearing ones: `remote_control` locks the **wire format** (every `rc:*`
 tag pinned, ObjectId-as-hex, pipe-separated `Permissions`) so a rename is a
 deliberate break; agent-side crates cover encoder cascades, config migration,
-ACLs, and overlay internals under their feature flags. `roomlerd`'s Hive
-supervisor tests (`--features hive -- hive::`) run twice: on Linux in the agent job, and on macOS
-in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor for a Mac. The
+ACLs, and overlay internals under their feature flags. The
 **whole** `roomlerd --lib` suite also runs natively on Windows, in `ci.yml`'s
 `windows-agent-sessions` job (#2886) — every `#[cfg(windows)]` test, with the features the
 table below names; before it, the Windows jobs ran filtered subsets and a Windows-only failure
@@ -216,8 +219,8 @@ the Windows path. A new spawn on that path is a decision someone writes down in 
 > capture set on the test's own thread then never sees that line. Keep a second dispatcher
 > registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
 > event; and assert a line the capture must see before one it must not, since a capture that
-> sees nothing passes every absence check. The pattern: `Logs::capture` in
-> [`tests.rs:746`](../agents/roomlerd/src/hive/view/tests.rs#L746).
+> sees nothing passes every absence check. The pattern: `LogCapture::install` in
+> [`extauth_tests.rs:1164`](../crates/tests/src/extauth_tests.rs#L1164).
 
 Flakes fixed on 2026-10-30, and what each one teaches:
 
@@ -227,15 +230,18 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > description (`ErrNoRemoteDescription`), and a test that ignores the refusal and loses every
 > candidate both ways never connects. `privacy_dc` (10-30) and `control_dc_record` (10-28) hit
 > their 30 s `on_data_channel` timeout that way in CI. The pattern: `exchange` in
-> [`privacy_dc.rs:416`](../agents/roomlerd/tests/privacy_dc.rs#L416), as `dc_throughput.rs`'s
+> [`privacy_dc.rs:424`](../agents/roomlerd/tests/privacy_dc.rs#L424), as `dc_throughput.rs`'s
 > `connect` always did; `control_dc_record` and `file_dc` follow it too.
 
 > [!WARNING]
 > **A Mongo TTL index deletes on a monitor pass every 60 s, at any moment after expiry.** A test
 > that expires a row and then reads it races that pass: "one pairing row … 0" once in the
-> integration lane. `pairing_tests`' expiry test reads `serverStatus.metrics.ttl.passes`
-> ([`pairing_tests.rs:201`](../crates/tests/src/pairing_tests.rs#L201)) around each try, and
-> reruns only a try that a pass ran through. A missing row with no pass is still a failure.
+> integration lane (#3084). Don't count passes around the read to excuse a missing row:
+> `serverStatus.metrics.ttl.passes` moves when a pass *ends*, so a pass still running has
+> deleted the row and not been counted. Hold the sweep off in the test's own database instead:
+> `pairing_tests`' `hold_off_the_ttl_sweep`
+> ([`pairing_tests.rs:206`](../crates/tests/src/pairing_tests.rs#L206)) checks the index is
+> the product's, then gives it an hour's grace with `collMod`.
 
 > [!WARNING]
 > **An external tool's deadline in a test is the test's, sized for the busiest runner.**
@@ -247,24 +253,187 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > busy Windows runner once needed 35.3 s to start PowerShell and echo, so it now runs under a
 > deadline four times the others'.
 
+Fixed since:
+
+> [!WARNING]
+> **A lib test that runs the signalling loop in process holds the probe's fixture for the whole
+> run** (#3548). `signaling::run` starts the capability probe, and in a test binary the probe's
+> child is the test binary itself. So each such test ran the real probe, and its fallback answer
+> filled the process's first answer at a moment no other test controlled. Two probe tests failed
+> whenever it landed inside them. The probe's state is now one value, `ProbeState`, and a test
+> that asks whether there is an answer holds an instance of its own. A loop test is a plain
+> `#[test]` that takes `caps::loop_fixture()`
+> ([`caps.rs:2574`](../agents/roomlerd/src/encode/caps.rs#L2574)) and runs its body with the
+> fixture's `block_on`. The first answer is in, the probe counts as started (no thread, no
+> child), and `DENY_ENV_LOCK` is held, so no probe test runs beside the loop: unlocked, a loop's
+> session ask landed in a retry test's quiet wait and held that test, and the lock, for 60 s.
+> Each loop test ends by asserting that `caps_probe_spawns()` is zero. The pattern:
+> [`unenrolled.rs:543`](../agents/roomlerd/src/unenrolled.rs#L543).
+
+### Tests that change a real desktop (#3813)
+
+A native `cargo test` runs on someone's own machine. A unit test that writes the real clipboard,
+moves the pointer or replaces the keyboard layouts does that to the session of whoever is at it.
+One did: the clipboard round trip ran in every native run that built `clipboard`, with no
+opt-in, and replaced what a developer had copied. Each such test now runs only under an opt-in.
+CI sets it in steps whose runner has nobody at its screen. Without it the test prints a skip line
+and passes.
+
+| Opt-in | Tests | What they do | CI step that sets it |
+|---|---|---|---|
+| `ROOMLERD_TEST_REAL_CLIPBOARD=1` | the clipboard round trip, every OS ([`clipboard.rs:4350`](../agents/roomlerd/src/clipboard.rs#L4350)); the change gate on X11 ([`:2629`](../agents/roomlerd/src/clipboard.rs#L2629), which also needs `ROOMLERD_TEST_X11=1`) and on a Mac ([`:3560`](../agents/roomlerd/src/clipboard.rs#L3560)) | write the clipboard; on X11, take `CLIPBOARD`, which empties it | "The real clipboard on X11", "… on a Mac", "… on Windows" ([`ci.yml:1333`](../.github/workflows/ci.yml#L1333), [`:1676`](../.github/workflows/ci.yml#L1676), [`:2112`](../.github/workflows/ci.yml#L2112)) |
+| `ROOMLERD_TEST_X11=1` | `capture::pointer::x11_tests` ([`pointer.rs:325`](../agents/roomlerd/src/capture/pointer.rs#L325)), `capture::x11_cursor::x11_tests` ([`x11_cursor.rs:422`](../agents/roomlerd/src/capture/x11_cursor.rs#L422)) and `input::layout_x11`'s `x11_real_switch_round_trip` ([`layout_x11.rs:838`](../agents/roomlerd/src/input/layout_x11.rs#L838)), which until #3813 ran on any display they reached; and, from before, `indicator::x11`, `capture::xwayland_probe_tests`, `keep_busy::host_x11` and `virtual_desktop`'s X tests | move the pointer, set the root cursor, replace the layouts with `setxkbmap` and leave `us` behind, send XTest input, put a window up | the Xvfb step, "The recorder's pointer (FR-85 P1d) and keep busy (FR-92 P3) on X11" ([`ci.yml:1224`](../.github/workflows/ci.yml#L1224)) |
+
+- **The gate.** A real-clipboard test calls `clipboard::real_clipboard_opted_in` first
+  ([`clipboard.rs:2607`](../agents/roomlerd/src/clipboard.rs#L2607)). Only `1` opts in. Once it
+  is set, a clipboard that does not open is a failure, so a step that sets it cannot pass by
+  running nothing. The decision is a pure function
+  ([`:2598`](../agents/roomlerd/src/clipboard.rs#L2598)) whose test neither reads nor sets the
+  variable: a test that set it would open the gate for every real-clipboard test running beside
+  it.
+- **How a step proves it.** Each "real clipboard" step runs the clipboard module twice, from a
+  build its job already has. The first run has no opt-in. A sentinel put on the clipboard before
+  it (`xclip`, `pbcopy`, `Set-Clipboard`) must still be there afterwards, and each test's skip
+  line is grepped: that is what a developer's own run has to leave alone. The second run has the
+  opt-in, and each test's own line is grepped. The sentinel check was RED on the code before
+  #3813, on X11 and on a Mac.
+- **One test at a time (#3876).** Both runs of each step pass `--test-threads=1`, so that each
+  grep finds its line whole. The runs without the opt-in are
+  [`ci.yml:1344`](../.github/workflows/ci.yml#L1344),
+  [`:1682`](../.github/workflows/ci.yml#L1682) and [`:2120`](../.github/workflows/ci.yml#L2120).
+  A skip line is one `eprintln!` of four pieces, the variable's name and the test's among them
+  ([`clipboard.rs:2610`](../agents/roomlerd/src/clipboard.rs#L2610)). Stderr is not buffered,
+  so each piece is a write of its own. On several threads, libtest prints a finished test's
+  `test NAME ... ok` while other tests still run, and those writes can land between the pieces.
+  The grep then misses a line that was printed, and the step fails after every test passed: it
+  did on macOS and on Windows. One at a time, libtest prints a test's name before the test
+  starts and its result after it returns, so while a test runs, libtest writes nothing and no
+  other test runs. A new step that greps a line a test prints runs its tests the same way.
+- **A new test** that writes the real clipboard calls `real_clipboard_opted_in` first, and gets
+  a line to grep in its OS's step. One that changes an X display runs only under
+  `ROOMLERD_TEST_X11=1`. That variable alone never opens the clipboard: a developer may set it to
+  run the X11 tests against their own display.
+
+> [!WARNING]
+> **A WSL shell is the same desktop.** Under WSLg `DISPLAY` is `:0`, and WSLg shares the X
+> `CLIPBOARD` with the Windows clipboard. A test run in WSL reaches the clipboard and the display
+> of the person at the Windows machine, as a native run does. Set neither opt-in there.
+
 ## CI & special lanes
 
 | Lane | What it does |
 |---|---|
-| `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the twelve heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1309`). A push to master always runs everything |
-| `installer-smoke.yml` | Installs and uninstalls the freshly-built per-user MSI on a Windows runner |
+| `ci.yml` | fmt + clippy (`--workspace -D warnings`, which compiles no test code, then `--all-targets` on the audited server crates and every `roomler-ai-mod-*` crate through [`scripts/clippy-audited-crates.sh`](../scripts/clippy-audited-crates.sh), whose module list is read from the workspace, #3594) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the thirteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1507`). A push to master always runs everything |
+| `installer-smoke.yml` | On a Windows runner: installs, audits and uninstalls the freshly built per-User MSI; upgrades, reinstalls, repairs and uninstalls the per-Machine MSI over its running service; upgrades the newest released MSIs of both flavours at or below the branch's version to the branch's, so a ref behind the newest release still upgrades (#3774). Every installer run goes through one runner ([`installer-smoke.yml:143`](../.github/workflows/installer-smoke.yml#L143), #3754) that waits for that process alone, fails the step past a 300 s deadline or on any exit but 0, prints the MSI log's `RESTART MANAGER` and held-in-use lines, and saves a process list with image paths and the service logs; a negative control proves the deadline on every run ([`:241`](../.github/workflows/installer-smoke.yml#L241)). Each per-Machine step has a timeout of its own (6 or 10 min, well under the job's 40; [`:1166`](../.github/workflows/installer-smoke.yml#L1166), #3810), so a step that never returns fails by itself and the evidence step runs, which adds the boot time, the System events 1074, 41 and 6008 since the job began and the service's state ([`:1764`](../.github/workflows/installer-smoke.yml#L1764)). A runner that goes away mid-job leaves a step that never reports an end: GitHub closes the job `cancelled` 5 min past its 40 min timeout, with the evidence step still `pending`. When the Windows job does not succeed, a check job on a fresh Ubuntu runner reads it through the API ([`:2723`](../.github/workflows/installer-smoke.yml#L2723), #3810), writes which steps reported an end and which did not, as an error annotation and in its summary, and ends 1. When not every step of attempt 1 reported an end, the workflow `installer-smoke-rerun`, which GitHub runs from the default branch's copy when the smoke run completes, asks GitHub to re-run that one job once, as attempt 2 of the same run, unless one of its guards refuses. Attempt 2 is never re-run by this workflow, and until a re-run replaces the lost job's check the run reads `cancelled` (the flow, the guards and the known limits: [below](#a-lost-windows-job-is-re-run-once-3810)). The per-Machine service is opted out of the live update channel from its first start: `ROOMLERD_AUTO_UPDATE=0` goes into the machine environment, from which each spawn builds the worker's environment ([`:1178`](../.github/workflows/installer-smoke.yml#L1178)), and the step fails if a log of the service says its updater was armed. On a macOS runner: installs the pkg with the live update channel shut by the product's own opt-out marker (`/etc/roomler/disable-auto-update`) until the job's last install, which asserts the update helper is installed by default; every step that runs the bundle's `roomlerd` first checks that its `--version` is the build's (#3774); `roomlerd caps` must report `has_input_permission` and `permissions` consistently, and the hosted image grants both Screen Recording and Accessibility |
 | `deb-bare-image.yml` | On a PR that changes what a `.deb` declares: packages the latest release's binaries with the checkout's control file through the lane's own `cargo deb`, installs them on five bare images on both arches, by apt and by the real `install.sh`, and starts them. A control proves the check still refuses agent-v0.4.190. The release lane runs the same script on what it is about to publish (`verify-linux-debs`) — [installation.md](installation.md#what-a-bare-host-needs-3204) |
+| `selfhost-coturn.yml` | On a PR or a master push that changes either compose file, `turnserver.conf`, `.env.selfhost.example` or the check: starts the file's own coturn, with the stack it needs, and runs `scripts/selfhost-coturn-check.sh`, which fails a crash loop, a coturn left outside the server's namespace, a refused CreatePermission to the public address, a relay that carries no bytes, and a hole in the deny list. It runs on `docker-compose.selfhost.yml` with a documentation address as the public one, three times in a row, because a run that costs too many relay ports fails on its own leftovers; then after a `kill -9` of the server's process, on the same file with the example's defaults, and on `docker-compose.yml`. It pulls the published server image and compiles no Rust, so a run takes minutes. `scripts/selfhost-smoke.sh` runs the same check after a full install — [self-hosting.md](self-hosting.md#the-turn-relay) |
 | `integration-tests.yml` | The integration suite against a real MongoDB and Redis, as **four shards** (FR-6 waves 24 and 27). Each shard lists the same test binaries, sorts the (test, binary) pairs and runs every fourth with `--exact`, so between them the shards run each test once. Each shard must report every test it was handed, and the whole listing must clear a floor. 2 threads per shard, each with its own mongod: at 4 threads against one mongod, the dropped test databases' files reached the 64,000-descriptor ceiling and mongod aborted. Dispatch inputs: `filter`, `threads`, `mongo_tmpfs`, `report_time` (per-test durations and the slowest tests, in the step summary) |
 | k8s e2e (`scripts/e2e-k8s.sh`, `Dockerfile.agent-e2e`) | The suite against a standing cluster namespace — validates the real multi-pod topology |
 | Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, **with the specs from the commit that image was built from** (master's can run ahead of the image: #2573), diffed against an expected-failures list; regressions file an issue. With the **agent-e2e harness** up, its six remote-session specs run against three synthetic-frame agents — [below](#the-agent-e2e-lane-fr-114) |
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 | **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
-| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002) |
+| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002). Since #3813 a step of its own follows the suite with `clipboard` added, so the suite builds and runs as before: the clipboard module without the opt-in, with a sentinel on the runner's clipboard that must survive, then the round trip with it ([above](#tests-that-change-a-real-desktop-3813)) |
+| **The Windows jobs' shell** (#3352, [`scripts/windows-shell-guard.sh`](../scripts/windows-shell-guard.sh)) | Every `ci.yml` job on a Windows runner runs its `run:` steps in bash, which GitHub starts with `-eo pipefail`, so a step stops at its first failing command. Under the runner's default pwsh the LAST native command decided a step: six steps ran `cargo clippy … -D warnings` and then `cargo test`, and a lint was printed while the step passed with the tests. The default is set per job, because a workflow-wide bash would add `pipefail` to every Linux step. A guard in `rust-lint` fails a Windows job that leaves it out, after it has refused a planted workflow. A step that needs PowerShell says `shell: pwsh` and checks `$LASTEXITCODE` after each native command, which is also the rule in the release and installer workflows, whose Windows steps are PowerShell by design |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
 are tracked in `scripts/e2e-expected-failures.txt` rather than papered over.
+
+### A lost Windows job is re-run once (#3810)
+
+A hosted runner that goes away mid-job (Windows restarted, the network lost, the runner's
+process ended) cannot report the end of the step it was running. GitHub closes such a job
+`cancelled` 5 min past its 40 min timeout
+([`installer-smoke.yml:118`](../.github/workflows/installer-smoke.yml#L118)). In every loss
+read so far, the step it was running stayed `in_progress` and every later step `pending`, the
+evidence step among them although it runs on any failure or cancel, and the only annotation was
+"The job has exceeded the maximum execution time of 40m0s". The job's check then reads
+`cancelled`, and so does the run. Only a re-run of the same run, as attempt 2, replaces that
+check, and a job cannot re-run its own run while the run is in progress. So the smoke run only
+says what it read, and a second workflow asks for the re-run once the run has completed.
+
+```mermaid
+sequenceDiagram
+    participant W as Windows job
+    participant C as check job
+    participant G as GitHub
+    participant L as installer-smoke-rerun
+    Note over W,C: attempt 1 of an installer-smoke run
+    W--xG: a step never reports an end
+    G->>W: closed cancelled, 5 min past its 40 min timeout
+    G->>C: started, since the Windows job did not succeed
+    C->>G: reads the job's steps, prints what it read, exits 1
+    G->>L: the run completed, the default branch's file runs
+    L->>G: G1, G2, the decision, then G3 last
+    alt not every step reported an end, and every guard passes
+        L->>G: re-run that one job, by its job id
+        G->>W: attempt 2 of the same run, the check job after it
+    else every step reported an end, or a guard refuses
+        L->>L: one summary line that says why, exits 0
+    end
+```
+
+| Part | Where | What it does |
+|---|---|---|
+| The decision | [`scripts/job-steps-ended.sh:13-20`](../scripts/job-steps-ended.sh#L13-L20) | `complete` when GitHub lists at least one step of the job and every one of them reports `completed`, `incomplete` otherwise. Neither the job's conclusion nor its annotations decide. Its lines name no cause: the job's conclusion, the steps that reported an end other than success or skipped, the steps that reported none with the API's own status word, GitHub's annotations, and whether the job is re-run ([`:174-181`](../scripts/job-steps-ended.sh#L174-L181)). Each control character in a string from the API is printed as a space, so no step name can start a line of its own |
+| The check job | [`installer-smoke.yml:2720-2762`](../.github/workflows/installer-smoke.yml#L2720-L2762) | Runs in the smoke run when the Windows job neither succeeded nor was skipped, unless the run was cancelled first ([`:2723`](../.github/workflows/installer-smoke.yml#L2723)). It only reads (`actions`, `checks`, `contents`), prints the decision's lines as an error annotation and in its summary, and ends 1 whenever it runs. Its name, "Did every step of the Windows job report an end? (#3810)", is true on both attempts |
+| The listener | [`installer-smoke-rerun.yml:36-39`](../.github/workflows/installer-smoke-rerun.yml#L36-L39) | Starts when an `installer-smoke` run completes, always from the default branch's file, and acts only on attempt 1 of a run that did not succeed ([`:53`](../.github/workflows/installer-smoke-rerun.yml#L53)). Its one job holds `actions: write` and `contents: read` ([`:58-60`](../.github/workflows/installer-smoke-rerun.yml#L58-L60)) and checks out the default branch's two scripts with no credentials kept, never a pull request's code ([`:62-68`](../.github/workflows/installer-smoke-rerun.yml#L62-L68)). One concurrency group per smoke run ([`:46-48`](../.github/workflows/installer-smoke-rerun.yml#L46-L48)) makes a second delivery of the same event wait for the first, so that its G1 reads the run's attempt after any re-run the first one asked for |
+| The re-run | [`scripts/job-steps-ended-rerun.sh:88-149`](../scripts/job-steps-ended-rerun.sh#L88-L149) | G1: the run's live attempt is 1 ([`:88-92`](../scripts/job-steps-ended-rerun.sh#L88-L92)). G2: in attempt 1 the check job is listed and reads neither `skipped` nor `cancelled`, and the Windows job is listed ([`:94-108`](../scripts/job-steps-ended-rerun.sh#L94-L108)). The decision, on that same list ([`:110-119`](../scripts/job-steps-ended-rerun.sh#L110-L119)). G3, read last: no smoke run created after this one exists for the same branch, event and head repository ([`:121-141`](../scripts/job-steps-ended-rerun.sh#L121-L141)). Then ONE request, `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`, which re-runs the Windows job and the check job that needs it ([`:143-149`](../scripts/job-steps-ended-rerun.sh#L143-L149)). Whatever it prints of the run is plain log inside a `::stop-commands::` block whose token is random per run ([`:65-72`](../scripts/job-steps-ended-rerun.sh#L65-L72)). After it comes ONE line in the script's own words, with only numbers and GitHub's status words from the run, in the log and in its summary. It always ends 0 |
+| The tests | [`scripts/job-steps-ended-test.sh`](../scripts/job-steps-ended-test.sh), the `job-steps-ended` job of [`ci.yml`](../.github/workflows/ci.yml) | The decision on the API data of five real runs whose Windows job failed or was lost, and on made-up replies built from one of them; the re-run script against a stand-in `gh`, a test for each guard, each of them red on a deliberately broken copy; and the job names the listener matches by equality, held equal to `installer-smoke.yml`'s. On every pull request |
+
+Two runs read the flow after the merge, on 2026-11-15:
+
+- Smoke run 43679591433 lost its Windows job in attempt 1 (`cancelled`, 12 of its 39 steps with
+  no end). Listener run 43682860831 asked for the re-run with the listener's own token, so
+  attempt 2's triggering actor reads `github-actions[bot]`, and the one-job endpoint re-ran the
+  job that had ended `cancelled`. Attempt 2 passed.
+- Smoke run 43684707567 lost its Windows job on both attempts. Listener run 43688211403 asked
+  for one re-run; listener run 43692046103, for attempt 2's end, was skipped, and no attempt 3
+  followed.
+
+Known limits:
+
+- Until a re-run replaces the lost job's check, the run reads `cancelled`, and a reader that
+  reads the checks by name stops on it. When attempt 2 passes, its check job is skipped and that
+  reader passes with no re-run by hand (smoke run 43679591433).
+- Attempt 2 is never re-run by this workflow; a person can still re-run it by hand. If it does
+  not succeed either, lost again or out of time, its check job prints what it read in attempt 2
+  and ends 1, no third attempt follows, and that reader stops on it (smoke run 43684707567).
+- A job whose every listed step reported an end is never re-run, whatever ended it: a step that
+  failed, the job's own timeout while its runner still answered, a failed "Set up job", a runner
+  shut down after its last step reported, or one lost after its last step but before "Complete
+  job". The check job still prints what it read and ends 1.
+- A push that lands between G3's read and the request is not seen. Whether a re-run enters the
+  smoke's concurrency group again, GitHub's documentation does not say, and neither run of
+  2026-11-15 showed it: neither branch had a newer smoke run. If it does, it could cancel that
+  newer push's run.
+- G3 does not see a run of the same branch created in the same second, and reads one page of
+  100 runs.
+- For a pull request from a fork, G3's branch filter on GitHub's side was not read; there G2 is
+  the guard (a superseded run's check job does not run).
+- A person's cancel that arrives after the check job has ended is still followed by one re-run:
+  the API does not say who cancelled.
+- Whether the run reads attempt 2 as soon as GitHub accepts the re-run is still not read: in
+  smoke run 43679591433 the first read after the accept came 38 seconds later, and it read
+  attempt 2. If the run does not, a second delivery in that window passes G1 and asks again;
+  GitHub's answer to that is not documented, and the script then ends 0 with a warning.
+- That the runner ignores a workflow command printed inside the `::stop-commands::` block is
+  GitHub's documented behaviour, not shown here: in listener run 43682860831 no line inside
+  the block was shaped like a command.
+- When no attempt 2 follows, look at the `installer-smoke-rerun` runs in the Actions list: the
+  one for that smoke run says in one summary line, which names the run's id, what it did and
+  why. It ends 0 on every path it controls, because a red run would sit on the default branch's
+  head, where nobody reading the smoke run looks; a cancel or its own 5-minute timeout
+  ([`installer-smoke-rerun.yml:55`](../.github/workflows/installer-smoke-rerun.yml#L55)) ends
+  it otherwise.
+- From a re-run run, the newest files carry the attempt in their names: what attempt 2 uploads
+  is named `installer-smoke-msis-attempt-2`, `installer-smoke-pm-msis-attempt-2` or
+  `msi-logs-attempt-2` ([`installer-smoke.yml:1730`](../.github/workflows/installer-smoke.yml#L1730),
+  [`:1747`](../.github/workflows/installer-smoke.yml#L1747),
+  [`:1788`](../.github/workflows/installer-smoke.yml#L1788)). Take the highest attempt's: the
+  plain name holds only what attempt 1 uploaded before it was lost.
+- A re-run runs the real test again, so a failure that comes and goes can pass on attempt 2.
 
 ## The agent-e2e lane (FR-114)
 
@@ -438,8 +607,8 @@ With the probe dropped in the input handler before it reaches the source, the te
 ### L4 in the real viewer
 
 The same probe, timed by the browser that a person would actually use, on whatever paints the
-frames. That is one of the three decode workers, or the plain `<video>` element on the RTP
-track.
+frames. That is one of the two decode workers (the data-channel worker, one for every codec since
+FR-135 R3, or the RTP transform's), or the plain `<video>` element on the RTP track.
 
 ```mermaid
 sequenceDiagram
@@ -458,7 +627,10 @@ sequenceDiagram
 and `ROOMLERD_BENCH=1`; its hello then advertises `bench` in `AgentCaps.video`. In the viewer's
 browser, set `localStorage['roomler-rc-bench'] = '1'`, reload, and connect with input. About
 every ten seconds the console prints `[rc] bench L4 n=… lost=… p50=… p95=… max=… path=…`, and
-the same batch is posted as one `rc.l4` line to `agent_logs`.
+the same batch is posted as one `rc.l4` line to `agent_logs`. Since FR-135 R0 the line also names
+what it measured (`target_fps`, `width`, `height`, `codec`, `chroma`, `carrier`, `render`,
+`decoder_hw`), each absent when the page did not know it, so a record reads without a join
+([remote-control.md §11.13.1](remote-control.md#11131-the-viewers-half-r0c)).
 
 | Piece | File | What it does |
 |---|---|---|
@@ -473,6 +645,14 @@ the same batch is posted as one `rc.l4` line to `agent_logs`.
   `<video>` uses the moment the frame was submitted for composition. The display's own latency
   (a vsync or two, and the panel) comes after both. That gap is what the FR-16 AC compares
   against a 240 fps camera.
+- ⚠️ **Both stamps on the page's clock.** The prober stamps the send on the page's clock, and a
+  decode worker stamps its paint on its own, which reads a constant apart from the page's when the
+  worker was made after its page (7.25 ms, 162 s after the page, on the Windows dev box: #3566).
+  So a worker hands `paintedAt` back on the page's clock, through the skew the page measured when
+  it started the worker (`toPageEpochMs`, `ui/src/workers/rc-clock-cal.ts:191`;
+  [remote-control.md §11.14.3](remote-control.md#11143-one-clock-for-the-page-and-its-worker-3566)).
+  The `<video>` sampler stamps on the page's own clock. Under `roomler-rc-clock-cal=0`, or where
+  no round trip came back fast enough to trust, a worker's stamp is its own, as before.
 - ⚠️ **Readbacks are paid only while a probe is out.** A GPU-backed frame reads back whole
   however small the rect, so sampling every frame would tax the path being measured.
 
@@ -589,11 +769,13 @@ the smoke that every build already carries, so the fleet profiles itself through
 ```mermaid
 flowchart LR
     A["encoder-smoke --bench<br/>flags → plan()"] --> B["rows: cell × size × rate × motion<br/>(the cells this build can open)"]
+    S["encoder-smoke, no --bench<br/>flags → smoke::plan(): one cell"] --> C
     B --> C["SessionOpener<br/>the constructor a session calls"]
     C -- "the opened encoder: name(),<br/>is_hardware(), codec, chroma" --> D["verdict()<br/>asked for vs opened"]
     C --> E["the bench's own thread:<br/>Scene::render → encode(),<br/>a keyframe each second of content"]
     D --> F["one L1 row,<br/>printed when its cell ends"]
     E --> F
+    D --> G["the plain smoke: PASSED only on ok,<br/>else FAILED + what it tried, exit 1"]
 ```
 
 **Run it.** The default profile fits `roomler exec`'s 30 s default timeout, so it needs no flag
@@ -611,7 +793,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1831`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7618`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --name h264_mf`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7990`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -622,10 +804,10 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 | `--bench-paced` | off | Feed frames at `--bench-fps` instead of back to back |
 | `--bench-budget-secs` | 25, or 280 with `--bench-full` | Start no cell after this; the rest print `skipped` |
 | `--encoder` | `hardware` | The smoke's own flag: what the RTP rows ask for |
-| `--name` | — | One FFmpeg encoder by name (FR-78 P2), as path `named` |
+| `--name` | — | One FFmpeg encoder by name (FR-78 P2), as path `named`. A Media Foundation cell's name (`h264_mf`, `hevc_mf`, `av1_mf`) opens that MF cascade alone and asks for MF on either MFT |
 
 **What each cell opens.** The bench opens every cell through the constructor a session calls for
-it (`SessionOpener`, `agents/roomlerd/src/encode/bench.rs:808`), so the encoder that answers is the
+it (`SessionOpener`, `agents/roomlerd/src/encode/bench.rs:906`), so the encoder that answers is the
 one a session would get. The quick profile is the seven cells a session opens by default (the
 VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCaps`, `bench.rs:329`).
 
@@ -634,9 +816,9 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5384`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5511`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
-| `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
+| `named` | `encode::open_named`: an FFmpeg name past every cascade and the denylist; an MF cell's name, that MF cascade alone (MF still refuses a denied MF cell) | FFmpeg; an MF name asks for MF, not hardware |
 
 ⚠️ The DataChannel rows **mirror** the pump's open; they do not call it, because `FfmpegDcCodec`
 is private to `peer.rs`. A change to how a session opens its encoder needs the same change in
@@ -647,7 +829,7 @@ the table. An `L1 #` preamble (version, OS, build, encoder, fps, frames, pace, b
 clock) comes first, then the header, then one row per cell as each one finishes, so a run that
 `roomler exec` cuts off keeps the rows it finished. An `L1 # done` line counts the verdicts.
 
-The columns (`COLUMNS`, `bench.rs:694`) are a contract: a fleet run splits rows on whitespace and
+The columns (`COLUMNS`, `bench.rs:792`) are a contract: a fleet run splits rows on whitespace and
 reads them by position, so a column is only ever appended, never renamed, moved or dropped
 (pinned by `the_header_is_the_contract`). An empty field is `-`.
 
@@ -665,7 +847,7 @@ reads them by position, so a column is only ever appended, never renamed, moved 
 | `idr_n` `idr_p50_B` `idr_max_B` | Keyframes: the first frame, and one requested every `fps` frames after it. A frame is everything one `encode()` returned: OpenH264 returns an IDR as two packets (the parameter sets, then the slice), and counted by packet every IDR would count twice |
 | `delta_p50_B` `delta_p95_B` `delta_max_B` | Every other frame |
 
-The verdict (`verdict()`, `bench.rs:601`) is always read from the encoder that opened, never
+The verdict (`verdict()`, `bench.rs:699`) is always read from the encoder that opened, never
 from what was requested or advertised:
 
 | Verdict | When |
@@ -690,7 +872,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:3673`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:4579`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.
@@ -765,6 +947,47 @@ skip and run nothing. Send plain text: an encoded payload is the shape endpoint 
 Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
 the run too. Take the denominator from the server's device list, not from who answered exec.
 
+### The plain smoke and the sweep judge by the same verdict
+
+`roomlerd encoder-smoke` without `--bench` is the bench's judgement on ONE cell (#3652). Its flags map
+to a cell (`encode::smoke::plan`, `agents/roomlerd/src/encode/smoke.rs:97`), the cell opens through the
+same `SessionOpener`, and `verdict()` judges what opened. Only `ok` passes and every other verdict exits
+1. An encoder that opened and then failed to encode, or gave no keyframe, is `error`, and a request no
+build can serve is refused before anything opens. The FR-62 sweep (`--reconfigure-sweep`) opens through
+the same plan and verdict (`smoke::open`), so it measures only a cell the smoke would pass. Before this,
+the smoke failed only when nothing opened: `--encoder hardware` passed on OpenH264 on every Linux host
+whatever its GPU, and the release lane's Windows smoke passed on Microsoft's software MFT, or on
+OpenH264 after Media Foundation failed.
+
+| Request | Cell | Passes on | Otherwise |
+|---|---|---|---|
+| `--encoder hardware` (the default), H.264, a build with Media Foundation (the MSI) | `rtp:h264` | a hardware MFT | `fallback` on Microsoft's software MFT or on OpenH264 |
+| the same, no Media Foundation, FFmpeg on (the `.deb`, the `.pkg`) | `dc:h264`: FFmpeg's H.264 cascade, under the denylist | a hardware FFmpeg encoder | `none`, naming each candidate that failed |
+| the same, no Media Foundation and no FFmpeg (or `ROOMLERD_USE_FFMPEG=0`) | `rtp:h264` | nothing: the build has no hardware H.264 | `sw-only` on OpenH264 |
+| `--encoder hardware --codec hevc` (or `h265`) | `rtp:h265`: FFmpeg's cascade, then MF's | a hardware encoder | `none` |
+| `--encoder hardware --codec av1`, Media Foundation | `rtp:av1` | MF's AV1 | `none` |
+| `--encoder hardware --codec av1`, no MF, FFmpeg on | `dc:av1` | a hardware FFmpeg AV1 encoder | `none` |
+| `--encoder auto` | `rtp:<codec>` | whatever opens there, as a session's RTP track takes it | `none`, or `demoted` if another codec answers |
+| `--encoder software`, H.264 (the `.deb` lanes' call) | `rtp:h264` | OpenH264 | `none` |
+| `--encoder software`, HEVC or AV1 | — | refused before anything opens: no build has a software encoder for either | |
+| `--codec` anything else, `vp9` included | — | refused: VP9 is the DataChannel's (`--bench --bench-cells dc:vp9:444`) | |
+| `--name <FFmpeg encoder>` | `named:<codec>`, past every cascade and the denylist | that encoder | `none` |
+| `--name h264_mf` (`hevc_mf`, `av1_mf`) | `named:<codec>`: that MF cascade alone | MF on either MFT, which is what the release lane's Windows smoke asks (`release-agent.yml:1850`) | `none`, with MF's own error |
+
+A failure prints two lines on stdout, then the error:
+
+```text
+encoder smoke FAILED: verdict=sw-only cell=rtp:h264 request="--encoder hardware --codec h264" backend=openh264 hw=false
+encoder smoke tried: media-foundation: Windows only; ffmpeg: not compiled into this build; openh264: in this build
+```
+
+`tried` (`Tried`, `smoke.rs:217`) names each backend the request could reach and why one was not there
+(`Reach`, `bench.rs:366`); each candidate that failed to open, with its error, as FFmpeg's cascade and
+the RTP track's Media Foundation note it (`media_plan::OpenTrail`, only names this build carries); and
+each FFmpeg cell the denylist kept out. Tests assert on that value, not on its prose. The PASSED line
+keeps its three fields first and appends the rest, so a script that reads it keeps working:
+`encoder smoke PASSED: backend=… keyframes=… total_bytes=… verdict=ok cell=dc:h264 hw=true`.
+
 ## The overlay stress lane (FR-81)
 
 Everything the mesh promises is a **latency and stability** claim, and before this lane nothing
@@ -792,7 +1015,7 @@ flowchart LR
 | arm | how the VM gets its carrier | why it exists |
 |---|---|---|
 | `direct` | the overlay's defaults — the carrier ladder picks the best path that works | the real-world numbers |
-| `relay` | `overlay_direct = false` on the VM only ([`config.rs:411`](../crates/agent-core/src/config.rs#L411)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
+| `relay` | `overlay_direct = false` on the VM only ([`config.rs:517`](../crates/agent-core/src/config.rs#L517)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
 
 The direct arm's corp-laptop rows are the **control** for the relay arm: those laptops have no
 direct path at all, so where both arms relay, matching numbers show the forcing knob is not what
@@ -835,9 +1058,9 @@ corporate laptop, a real relay path, or both:
 
 | found | defect | fix |
 |---|---|---|
-| round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1104`](../agents/roomlerd/src/ssh.rs#L1104)) |
-| round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:404`](../agents/roomlerd/src/ssh.rs#L404)) |
-| round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:587`](../crates/modules/network/src/routes/agent_ssh.rs#L587)) |
+| round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1084`](../agents/roomlerd/src/ssh.rs#L1084)) |
+| round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:410`](../agents/roomlerd/src/ssh.rs#L410)) |
+| round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:478`](../crates/modules/network/src/routes/agent_ssh.rs#L478)) |
 | round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:617`](../agents/roomler-cli/src/localclient.rs#L617)) |
 
 ### Reference run — `20260924-155559`, every target on agent 0.4.101

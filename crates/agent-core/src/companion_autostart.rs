@@ -10,6 +10,11 @@
 //! | Linux (.deb) | `/etc/xdg/autostart/roomler-desktop.desktop` | the package | `~/.config/autostart/roomler-desktop.desktop` with `Hidden=true` |
 //! | macOS (.pkg) | the `com.roomler.desktop` LaunchAgent (`RunAtLoad`) | the package's postinstall | macOS Login Items — not ours to write |
 //!
+//! The companion reads why it was started from its argument:
+//! [`AUTOSTART_ARG`] at login, [`FIRST_RUN_ARG`] after install,
+//! [`FOR_PROMPT_ARG`] for a consent question or a banner (#3887), none at a
+//! person's own start. Every start on macOS carries none (launchd's).
+//!
 //! Shared by the daemon and the companion so both spell the value, the
 //! argument and the entry the same way. Pure helpers are tested on every
 //! platform; the registry calls are Windows-only and take the subkey as a
@@ -24,6 +29,11 @@ pub const AUTOSTART_ARG: &str = "--autostart";
 /// The argument the daemon's one-shot post-install launch passes: open the
 /// Welcome tour.
 pub const FIRST_RUN_ARG: &str = "--first-run";
+/// #3887 — the argument the daemon's start for a consent question or a banner
+/// passes (Windows, Linux): stay in the tray, and keep a Welcome tour that is
+/// not done for the person's own start. macOS's start is launchd's and carries
+/// no argument, so there the companion asks the daemon instead.
+pub const FOR_PROMPT_ARG: &str = "--for-prompt";
 
 /// `HKLM`/`HKCU` subkey that holds login-start commands.
 pub const WINDOWS_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -352,6 +362,25 @@ pub mod registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3887 — the companion reads each start's argument by equality, so the
+    /// three must stay distinct and none may be a prefix of another: a reader
+    /// that slipped to `starts_with` would take one start for another.
+    #[test]
+    fn the_start_arguments_are_distinct_and_none_is_a_prefix_of_another() {
+        let all = [AUTOSTART_ARG, FIRST_RUN_ARG, FOR_PROMPT_ARG];
+        for (i, a) in all.iter().enumerate() {
+            assert!(a.starts_with("--") && a.len() > 2, "{a}");
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert!(!b.starts_with(a), "{a} is a prefix of {b}");
+                }
+            }
+        }
+        // A compatibility surface: a daemon and a companion of different
+        // releases must spell it the same.
+        assert_eq!(FOR_PROMPT_ARG, "--for-prompt");
+    }
 
     #[test]
     fn run_command_quotes_a_path_with_spaces() {

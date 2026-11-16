@@ -30,6 +30,8 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 
+mod dc_stage;
+
 /// One owner gate per process: one test at a time.
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
@@ -153,6 +155,7 @@ async fn rig(attach: Attach, up_ok: bool) -> Result<Rig> {
 /// [`rig`] over a host endpoint that starts as `speakers` (P4; `None` = none).
 async fn rig_with(attach: Attach, up_ok: bool, speakers: Option<bool>) -> Result<Rig> {
     let (browser_pc, agent_pc) = mk_pc_pair().await?;
+    let stages = dc_stage::Stages::watch(&browser_pc, &agent_pc);
     let endpoint = Arc::new(Endpoint(StdMutex::new(speakers)));
     let session_id = ObjectId::new();
     let overlay = Arc::new(Overlay {
@@ -185,10 +188,9 @@ async fn rig_with(attach: Attach, up_ok: bool, speakers: Option<bool>) -> Result
             }
         })
     }));
-    exchange(&browser_pc, &agent_pc).await?;
-    let agent_dc = tokio::time::timeout(Duration::from_secs(30), agent_dc_rx)
-        .await
-        .map_err(|_| anyhow!("agent on_data_channel timed out"))??;
+    exchange(&browser_pc, &agent_pc, &stages).await?;
+    let agent_dc =
+        dc_stage::agent_channel(agent_dc_rx, &stages, &browser_dc, Duration::from_secs(30)).await?;
     let dir = tempfile::tempdir()?;
     let (outbound, reports) = mpsc::channel::<ClientMsg>(32);
     match attach {
@@ -223,9 +225,14 @@ async fn rig_with(attach: Attach, up_ok: bool, speakers: Option<bool>) -> Result
     if browser_dc.ready_state()
         != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
     {
-        tokio::time::timeout(Duration::from_secs(30), open_rx)
-            .await
-            .map_err(|_| anyhow!("privacy DC open timed out"))??;
+        match tokio::time::timeout(Duration::from_secs(30), open_rx).await {
+            Ok(opened) => opened?,
+            Err(_) => {
+                return Err(stages
+                    .timed_out("privacy DC open timed out", &browser_dc)
+                    .await);
+            }
+        }
     }
     Ok(Rig {
         dc: browser_dc,
@@ -412,8 +419,13 @@ async fn the_channel_going_away_takes_the_curtain_down() -> Result<()> {
 /// `set_remote_description`: `add_ice_candidate` refuses a candidate before
 /// it (`ErrNoRemoteDescription`), the refusal was ignored, and a run that
 /// lost every candidate both ways never connected — "agent on_data_channel
-/// timed out" after 30 s (Recorder tests, 2026-10-30).
-async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) -> Result<()> {
+/// timed out" after 30 s (Recorder tests, 2026-10-30). Each step goes on
+/// `stages`' timeline (#3078).
+async fn exchange(
+    browser_pc: &RTCPeerConnection,
+    agent_pc: &RTCPeerConnection,
+    stages: &dc_stage::Stages,
+) -> Result<()> {
     let offer = browser_pc.create_offer(None).await?;
     let mut gathered = browser_pc.gathering_complete_promise().await;
     browser_pc.set_local_description(offer).await?;
@@ -422,7 +434,9 @@ async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) 
         .local_description()
         .await
         .ok_or_else(|| anyhow!("no local offer"))?;
+    stages.gathered("offer", &offer);
     agent_pc.set_remote_description(offer).await?;
+    stages.mark("the agent has the offer");
     let answer = agent_pc.create_answer(None).await?;
     let mut gathered = agent_pc.gathering_complete_promise().await;
     agent_pc.set_local_description(answer).await?;
@@ -431,7 +445,9 @@ async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) 
         .local_description()
         .await
         .ok_or_else(|| anyhow!("no local answer"))?;
+    stages.gathered("answer", &answer);
     browser_pc.set_remote_description(answer).await?;
+    stages.mark("the browser has the answer");
     Ok(())
 }
 

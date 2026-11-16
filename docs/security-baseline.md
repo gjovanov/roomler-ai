@@ -25,6 +25,7 @@ flowchart TB
         MEMB["Tenant membership"]
         OBJ["Object-level scoping — resolve WITHIN the tenant"]
         PERM["Permission bits + managed-role reconcile"]
+        ROLES["A member's roles — the org's own, read where a rule is evaluated"]
     end
     subgraph plane["Data-plane guards"]
         AGENT["Agent token → row status-checked on every use"]
@@ -44,7 +45,7 @@ flowchart TB
 | Access token | 7 d (`ROOMLER__JWT__*`) |
 | Refresh token | 30 d |
 | Hashing | Argon2 |
-| Audiences | `Access` · `Refresh` · `Enrollment` (single-use, 10 min) · `Agent` (1 y) |
+| Audiences | `Access` · `Refresh` · `Enrollment` (single-use, 10 min) · `Agent` (1 y) · `TunnelEnrollment` (single-use, 10 min) · `TunnelClient` (1 y) |
 
 `verify_agent_token` rejects a user JWT and vice-versa; locked by tests in
 `crates/services/src/auth/mod.rs::tests`.
@@ -79,6 +80,47 @@ the server still appends `#token=` for cached older bundles, and
 `OAuthCallbackView.vue`'s comments still describe accepting a query-string form
 the code no longer reads.
 
+### Native clients' credentials ride a header (#3656)
+
+The daemon's agent JWT, the tunnel CLI's TunnelClient JWT and a regional relay's
+admission ticket are long-lived bearer credentials, and a request line is what
+access logs and URL-logging proxies record. So `/ws` (agent and tunnel-client
+roles), `/derp` and `derp-relay` take them as `Authorization: Bearer`, the header
+every other native route already reads.
+
+- **The query form stays.** Every daemon and CLI before 0.4.210 sends `token=` (or
+  `ticket=`), and a device that cannot connect cannot update. It goes only when no
+  supported client sends it.
+- **The header decides.** With a Bearer header present the query is not read, so a
+  good query never rescues a refused header. Another scheme counts as no header.
+- **Only the carrier changed.** The credential reaches the same checks in both
+  forms: audience, `tid`, the device's row (deletion first) and its token
+  generation.
+- **A refusal says which it was.** `WWW-Authenticate: Bearer realm="roomler"`,
+  with `error="invalid_token"` when a credential arrived. A client tries the query
+  form only after a refusal without that `error`, so a refused credential is never
+  sent again in a URL.
+- **Not ambient.** A browser cannot put a header on a WebSocket handshake, so
+  reading one on the native roles opens nothing to a page; the browser role still
+  reads no header.
+- The relay PoP's nginx logs the path without its query
+  (`scripts/relay-pop/nginx-pop.conf.tpl`), as the pod's nginx logs neither
+  socket (`files/nginx-pod.conf`). The server's own spans drop a query that names a
+  token (`crates/api/src/lib.rs`).
+- **Only the header keeps a credential out of every log.** An access-log setting
+  does not reach nginx's error log, which names the whole request line, query
+  included, whenever the upstream cannot be reached: a pod restarting behind the
+  load balancer, an API still booting behind the pod's nginx, a PoP whose
+  `derp-relay` is down. A client that still puts its credential in the URL can
+  land there, whatever the access log says.
+- **The clients send the header (0.4.210) and fall back once.** A redial in the
+  query form follows only a refusal with no verdict on the credential, and an
+  endpoint where that redial upgraded keeps the query form for 6 h, in memory
+  ([real-time.md](real-time.md#how-the-daemon-and-the-cli-dial-3656)).
+- **No client log writes the request.** tungstenite writes a client's whole upgrade
+  request at TRACE, the `Authorization` line included; the daemon's and the CLI's
+  subscribers drop those lines whatever `RUST_LOG` asks (`upgrade_auth::may_log`).
+
 ### Open: user sessions are irrevocable
 
 `logout` only clears the cookie, there is **no password-change flow at all** (no
@@ -91,8 +133,8 @@ not rotated, so reuse is undetectable.
 
 ⚠️ The **agent** half of this is fixed. `agent_log.rs` / `agent_crash.rs` no
 longer parse the bearer themselves: both go through
-`crates/api/src/extractors/agent.rs::AuthAgent`, which loads the row
-(`find_in_tenant`) and refuses via `refusal_reason`.
+`crates/modules/fleet/src/auth_agent.rs::AuthAgent`, which loads the row
+(`find_any_in_tenant`) and refuses via `refusal_reason`.
 ⚠️ A lookup **failure is deliberately 500, not 401** — a Mongo blip must not tell
 a healthy fleet its credentials were revoked, which would turn a database wobble
 into an enrollment storm.
@@ -218,21 +260,154 @@ and live call state to any authenticated account, and allowed injecting
 `@everyone` messages into another org's channel.
 
 **The invariant now: resolve the object WITHIN the tenant before touching it** —
-`helpers::require_room_in_tenant` / `require_message_in_tenant`. They check
-membership *and* `find_by_id_in_tenant`, so a foreign id 404s and leaks neither
-content nor existence.
+`guards::require_room_in_tenant` / `require_message_in_room` / `require_file`
+(chat's `guards.rs`). They check membership *and* resolve the object in the
+tenant, so a foreign id 404s and leaks neither content nor existence.
 
 ⚠️ A handler keyed by `message_id` **must** use the message guard, not the room
 one — the two ids are decoupled, so a caller can pass their own room with a
-foreign message. This is why `reaction::add/remove` fan out to `message.room_id`,
-not the path room.
+foreign message. `guards::require_message_in_room` binds them: the path room
+passes the room guard, and the message is a live message of that room. The path
+room is then the message's own, and every message route fans out to it.
+⚠️ **One guard per id kind, room visibility included** (`crates/modules/chat/src/guards.rs`):
+
+| Id | Guard |
+|---|---|
+| room | `require_room_in_tenant` |
+| message | `require_message_in_room`: the path room, then a live message of it |
+| file | `require_file`: a live file of the path tenant, then its own room through the same visibility gate |
+| recording (`conference`) | `recording::delete`: the path room through `require_room_in_tenant`, then a live recording of that room (`RecordingDao::find_live_in_room`); deleted by its starter or a `MANAGE_CHANNELS` holder, as a room delete removes its recordings |
+
+A listing that spans rooms (the org's files, search) keeps to `room_reach`, the
+same rule over every room of the org at once: content only from rooms the caller
+may read, and a Secret room listed to its members only. An upload names a room
+through the room guard, an edit is the author's (404 otherwise), and a file
+delete is the uploader's (403 otherwise, as a message delete is the author's).
+`room_access_tests::every_message_and_file_route_answers_only_for_a_room_the_caller_can_read`
+walks every route with a message or file id in its path, as the composition
+baseline lists them, so a new one cannot skip its guard unnoticed.
 ⚠️ **Never re-fetch with a bare `find_by_id` after a tenant-scoped write**:
 `message::update` did, and returned another tenant's content in the response even
 though the write itself was correctly scoped.
+⚠️ **An id in a request body is resolved like one in the path.** A reply's
+`thread_id` and `referenced_message_id` must name a live message of the reply's own
+room (`MessageDao::find_live_in_room`), or the send answers the 404 a nonexistent
+message gets, before anything is written. The thread-metadata write, the thread
+listing, the root's re-read and the boot-time thread repair are scoped to that
+tenant and room, and a mention notifies members of the room only.
 ⚠️ `room::join` additionally requires `is_open` — it previously had **no checks at
 all**, so anyone could join any private room in any org and receive its WS
 fan-out. `room::update`/`delete` now require `MANAGE_CHANNELS` (they were
 member-only, so any guest could archive or cascade-delete a channel).
+
+### A member's roles are the org's own, read where a rule is evaluated
+
+A role is a group of people inside one org, and an id in a membership row only
+points at it. **Every gate counts the ids of a member's row that are `roles` rows
+of the org it decides for, read at that decision**, and nothing else. The
+permission mask (`TenantDao::get_member_permissions`) and every rule that names a
+role (the tunnel forward, the overlay ACL, a device's remote-control, SSH and exec
+allow-lists) read through one filter, `TenantDao::org_roles_among`
+(`crates/services/src/dao/tenant.rs:660`). Each reader, each writer and the delete
+are in [permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used).
+
+- **Scoped to the org like any id.** A role of another org never satisfies a rule
+  here and never grants a bit here, whatever a membership row lists.
+- **Read where it is used.** Nothing caches a member's roles at an enrollment, a
+  socket's connect or a session's start. A role taken back or deleted stops
+  counting at the next decision, and a change of roles re-fans the org's overlay
+  while its ACL is `warn` or `enforce`.
+- **Written only from the org, for every caller.** `ADMINISTRATOR` passes the
+  permission-bit check of a grant, never the lookup. Assigning a role, adding a
+  member and creating an invite resolve each role in the org (404 otherwise); a
+  policy write that adds a role id the org does not have is a 400
+  `Unknown role id`; an invite gives at redemption only the roles its org still has.
+- **Deleting a role takes it from its holders**: the role row goes, then its id is
+  pulled from the org's membership rows (`RoleDao::delete`,
+  `crates/services/src/dao/role.rs:114`).
+- ⚠️ **The read-time filter stays, with the writes checked too.** It is the half no
+  write path can get around, and a membership row can still list an id the org no
+  longer has (a pull that failed, an assign that raced a delete). Such an id is
+  inert, so correctness needs no migration.
+- ⚠️ **Default-deny.** A failed read, a non-member and a missing role all give an
+  empty role set: role entries do not match, the failure is logged at WARN, and
+  every other subject kind is decided as before. A failed read never becomes an
+  allow.
+- ⚠️ **An empty role set is not an empty allow-list.** On a device's policies an
+  allow-list with no entries means no restriction by role. So a stored role id is
+  never pruned, on a write or on a role's delete: removing the last one would turn
+  "nobody by role" into "everybody". A policy write accepts back the ids it already
+  stores, because the editors send them on every save.
+
+`crates/tests/src/member_role_ids_tests.rs` pins each reader, each writer and the
+delete, with a positive control that every member keeps the permissions their roles
+give.
+
+### A tunnel policy is a grant: `MANAGE_AGENTS`, reads included
+
+A tunnel policy names who may reach which `host:port` through which of the org's
+devices, so writing one is granting access. Every `…/tunnel-policy` route needs
+**`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:800`; the
+overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:150`).
+The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
+roles do not.
+
+- **Membership authorizes no grant.** The rule above is about ids; a route that
+  creates a grant has no id to resolve, and `is_member` is still not enough for it.
+  Being someone a policy may name does not make you someone who may write one.
+- **The reads too.** The list is the org's whole tunnel ACL: every subject, every
+  target device, and the internal hosts, ranges and ports behind them. A member
+  learns what they may reach by reaching it; a refused forward says `acl_denied`.
+- **The bit is decided first**, before the policy id is parsed, the body validated or
+  a policy looked up. A member without it gets one 403 `forbidden` whatever the id
+  names (a policy of their org, another org's, nothing) or the body says, so the
+  refusal says nothing about which policies exist. It is never `not_a_member`, the
+  one 403 the web app leaves the org on; someone outside the org is still told
+  `not_a_member`. For a holder, another org's policy or an id that names nothing is
+  a 404.
+- ⚠️ **The forward itself reads no permission bit, and must not.**
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
+  the policies: default deny, first match. The policy IS the grant. It exists to let
+  people who hold no management bit reach what a holder named them for, so a bit on
+  the forward would either defeat it or repeat it. When a policy names a role, the
+  forward reads which roles the person holds in the org at that forward; in a policy a
+  role is a group of people, and its permission bits are not read
+  ([tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635)). What keeps the
+  chain sound is who may write the policy, and the exit device's own `forward_acl`
+  stays its last word ([tunnels.md](tunnels.md#policy--two-independent-gates)).
+- **The web app asks the mask first** (`canManageTunnelPolicies`,
+  `ui/src/utils/permissions.ts:375`). The store sends nothing for a caller without
+  the bit, a server 403 lands in the same state, and the Tunnel ACL tab then says who
+  manages policies instead of drawing an editor ([permissions.md](permissions.md) §5).
+
+`crates/tests/src/tunnel_policy_permission_tests.rs` pins each point, the last one
+end to end through a member's own tunnel client.
+
+### The org's MagicDNS: `MANAGE_AGENTS` to change it, any member to read it
+
+The org's MagicDNS domain and upstream resolvers (`…/magic-dns`) are applied by every
+overlay node of the org: its resolver answers for the domain and forwards every other
+name upstream, and under an exit node the host's whole DNS goes there
+([magicdns.md](magicdns.md#who-sets-the-domain-and-the-upstreams)). Changing them
+changes every node's DNS, so **`PUT …/magic-dns` needs `MANAGE_AGENTS`**, like the
+overlay ACL's mode and the retired-key switch (`set_magic_dns`,
+`crates/modules/network/src/routes/overlay_route.rs:552`):
+
+- **Decided first**, before the body is normalized, the plan gate or the domain
+  checks run. A member without the bit gets one 403 `forbidden` whatever the body
+  says, never `not_a_member`; someone outside the org still gets `not_a_member`.
+  Switching MagicDNS off, or setting only the upstreams, is a change like any other.
+- **The read stays any member's**, unlike the tunnel ACL's above, and the difference
+  is the content: every node of the org receives the domain and the resolvers in its
+  netmap anyway, and a member reaches peers by `<node>.<domain>`. The tunnel ACL is a
+  map of everyone's grants that no member needs.
+- **The web app asks the mask first** (`canEditMagicDns`,
+  `ui/src/utils/permissions.ts:392`): a member without the bit sees the
+  current settings read-only with a note, and a save the server refuses turns the page
+  read-only rather than showing an error.
+
+`crates/tests/src/magic_dns_permission_tests.rs` pins each point.
 
 ### A 403 is an answer, not an expired credential (FR-82)
 
@@ -304,6 +479,61 @@ distinguish "agent exists" (200 + refusal) from "no such agent" (404) across
 tenants, write attacker-timed rows into another org's `ssh_audit`, and read
 whether that org had `remote_ssh_enabled`.
 
+### The media socket admits only the call's participants
+
+A `media:*` command on the user socket names a room by id, so it gets the same
+object-level check a REST route does, on the path that carries the media. A connection
+may use `media:*` for a room only while it is a participant of that room's call, which
+is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.rs`):
+
+- **`media:join`** needs a member of the **room's** tenant (read from the room, never from
+  the frame), the room's visibility, and an open call session for this connection, or one
+  with no connection id (an older client). The socket path admits only someone the REST
+  path admitted. The join is admitted before placement, so a refused one claims no room.
+- **Every other command** needs this connection's seat in the room's media, as this user,
+  which only an admitted join creates. It is checked on the pod that holds the seat, so a
+  command forwarded to the owner pod is checked there.
+- The handlers take the gate's proof, a `JoinPass` or a `Seat`, never a bare room, user or
+  connection id. ⚠️ A new `media:*` handler takes one too: a handler keyed by the frame's
+  `room_id` alone is the cross-tenant IDOR above, on a socket.
+- A refusal is one answer for every reason, so it says neither whether a room exists nor
+  whose it is.
+- **A seat ends with the membership that admitted it.** Removed from the org or leaving
+  it, or leaving the room, ends any seat the person holds in a call there at once, on the
+  pod that holds it, through core's `MembershipLifecycle` hook run after the membership
+  row is gone (`crates/modules/conference/src/revoke.rs`). A join on its way at that
+  moment asks the gate again once its seat exists. ⚠️ A new way to lose a membership (a
+  room kick, a deleted account) calls the hook too, after the row is gone, or the seats it
+  admitted outlive it. A room deleted mid-call ends every membership of it, and its whole
+  call with them: `chat`'s room delete calls the hook's `room_removed` once the room is
+  gone, and the pod serving the call ends it for everyone in it. That pod also ends it on its own when it
+  finds the room's document gone in two reconcile reads in a row, so a lost word cannot
+  keep the call alive. The same holds for one seat: the pod serving a call checks its own
+  seats every 10 s (`crates/modules/conference/src/seat_check.rs`), and a seat whose
+  admission (the org membership, and the room membership where the room's visibility wants
+  one) reads as gone in two complete reads in a row ends there, within 30 s, so a withdrawal
+  that did not reach that pod cannot keep it. ⚠️ The check re-reads the room guard's own
+  rule, never a second copy: wherever the guard admits, it keeps the seat, and a failed or
+  late read keeps every seat. `docs/real-time.md` has the flow.
+- **A room membership ends with the org membership.** Every room fan-out (messages,
+  edits, reactions, pins, typing, mentions) reaches the people holding a row in
+  `room_members`, so the same hook, run after the org membership row is gone, drops the
+  person's rows in that org's rooms: `chat`'s `MembershipLifecycle`
+  (`crates/modules/chat/src/membership.rs`), after `conference` has ended the call seats
+  those rows held. Room memberships of people no longer in the org are ended by the
+  operator step `POST /api/admin/room-members/prune`: platform operators only, a dry run
+  by default, bounded per call, and idempotent.
+- **Each socket's `media:*` frames are limited** by a token bucket
+  (`crates/modules/conference/src/frame_limit.rs`, `[meetings] media_frame_burst` /
+  `media_frame_rate`), checked before the gate: a frame over it is answered
+  `media:error {code: "rate_limited"}` and not run, and the socket stays. The HTTP governor
+  never sees socket frames, so this is the socket's own ceiling. ⚠️ Size it from a measured
+  join burst (`conference_rate_tests`), never down by a guess: a consume refused in a join is
+  a tile with no media.
+
+`GET /api/cluster/status` lists every live meeting room on a pod, so it is a platform
+admin's route (`require_platform_admin`, 404 otherwise), like `/api/admin/*`.
+
 ---
 
 ## 4 · The device plane
@@ -319,6 +549,17 @@ route enforces `exp`.
   row's `token_gen`, removing the device increments it in the same atomic update
   that tombstones the row, and all five verification sites compare the two.
   Re-enrolling the same machine revives the row, but never its old tokens.
+- **A removed device that enrolls again starts from a new device's settings**
+  (#3627). The revive replaces the row with what a new enrollment writes and keeps
+  only its identity and history (`_id`, `machine_id`, `created_at`,
+  `enrolled_by`), `token_gen`, the desired-config revision counter and a quarantine
+  (a restriction, which a re-enrollment never lifts), so nothing
+  the removed device was allowed comes back: policies, approvals, the connect code,
+  approved routes, a pending config, the owner. Before the row is live, `network`
+  takes the device out of the org's tunnel policies and releases a lease its
+  removal left. A live row's re-enrollment keeps everything, and it writes only
+  while the row is live, so a removal landing mid-enrollment is never undone
+  ([`device-credentials.md`](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)).
 - ⚠️ The deleted/quarantined check stays FIRST at each site, so a removed device is
   still told it was removed (and stops), rather than seeing a bare 401 it would
   retry forever.
@@ -327,6 +568,508 @@ route enforces `exp`.
   unaware, until something else dropped it. Nothing could act through it, since
   every action re-checks the row, but the device's own status still read
   "connected".
+
+### A program the daemon starts keeps its standard streams only
+
+A command, a terminal session's shell, `sftp-server`, an app launch, the virtual
+desktop, the recorder and an installer keep 0-2 and nothing else of the daemon's:
+the daemon's own descriptors (a session's pty ends, the overlay TUN) are close-on-exec,
+those children mark everything above stderr close-on-exec before they exec, and on
+Windows a terminal session's own pipe handles are not inheritable
+([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)).
+
+### A Windows machine config is the machine's only as found (#3609, #3666)
+
+The service runs the machine enrollment as SYSTEM, so it takes it only from
+`%PROGRAMDATA%\roomler\roomler` files that SYSTEM and Administrators alone may
+change, and it repairs drift before it checks. A repair seals whatever an entry
+holds, so it first reads the tree as found
+([`installation.md`](installation.md), the as-found rule): the parent gave no
+account other than an administrator a right to replace the machine folder, and
+the folder and the config none to add to or change them. A config that fails is
+never sealed, run, folded into a new enrollment, or re-enrolled from (its server
+would receive the token); an elevated Setup or `roomlerd enroll --machine-global`
+writes a fresh one that keeps no `.prev` and no unknown key of the old. A wrong
+answer only ever stops a device: a deny is never credited, and a domain account
+that is an administrator only through a domain group reads as no administrator,
+because an answer that needed a domain controller would flap SYSTEM mode.
+
+The SYSTEM service's FR-94 anchor is no file: it is read only from `HKLM\SOFTWARE\Roomler\ExecService`, a key that SYSTEM or Administrators own and no other account may change, read or create, below a parent no other account may change, neither of them a registry link (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)). A writer makes a key that fails that check again rather than sealing it where it stands, so a handle opened while it was loose reaches nothing.
+
+### SYSTEM acts below the machine's folders by handle (FR-145)
+
+A process running as SYSTEM, or elevated, acts on a path below a known base only through
+handles. The base is opened as itself, and its final path must be the base's own name.
+Every folder below it is opened relative to the handle above it (`NtCreateFile` with
+`RootDirectory` and `FILE_OPEN_REPARSE_POINT`), never through a link, and its final path
+must be its parent's plus its own name. A folder it makes is sealed when it is made, its
+security descriptor in the create call itself, so it never inherits anything first. A
+file it writes is made fresh and published by a rename relative to the held folder. A
+removal deletes, by handle, what the same walk opened.
+
+Why: a check made by path and an act made by path are two lookups of the same name, and
+the name can change in between; a walk by handle looks each name up once, and every act
+goes through the handle that was checked. One helper carries the rule,
+`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:341`), so a new
+SYSTEM writer gets it by calling the helper rather than by re-deriving it
+([FR-145](fr/FR-145-machine-tree-by-handle.md)). `OBJ_DONT_REPARSE` goes on every
+relative open as a second lock where the build honours it, and nothing relies on it
+alone.
+
+The writer's walk (`walk_sealed`, `HeldPath::machine`); the clean-up's `walk` makes
+nothing, refuses a link at any name, and ends in `remove_tree`:
+
+```mermaid
+flowchart TD
+    B["HeldPath::base: the base opened as itself"] --> F{"its final path is its own name?"}
+    F -- no --> R1["refused: Elsewhere, naming the final path"]
+    F -- yes --> C["the next name, opened below the handle above it,<br/>FILE_OPEN_REPARSE_POINT"]
+    C --> M{"the last name?"}
+    M -- no --> L{"a link, or a final path that is not<br/>its parent's plus its name?"}
+    L -- yes --> R2["refused: Link or Elsewhere, one WARN;<br/>the site does without"]
+    L -- no --> C
+    M -- yes --> P["the leaf policy: made sealed, sealed in place,<br/>or moved aside and made sealed"]
+    P --> A["act by handle: write_file, read_file, rename_file,<br/>remove_file, remove_tree"]
+```
+
+| `Seal` | Owner and DACL | Used for |
+|---|---|---|
+| `Private` | owner Administrators; protected; SYSTEM and Administrators full control, handed down to what is made below | what only SYSTEM and Administrators read (P3) |
+| `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`) | `crashes`, which a worker running as the signed-in person drains; `service-logs` (P2) |
+
+What SYSTEM makes is owned by Administrators from its creation. A thread that acts as
+another account (it holds an impersonation token) never makes anything there: where that
+account could not name Administrators as the owner, the make is refused rather than
+left to that account, and the site logs its one line.
+
+What SYSTEM finds where it writes (the leaf policy):
+
+| Found at the leaf | What happens | What a person or an operator sees |
+|---|---|---|
+| nothing | made sealed | nothing |
+| a folder SYSTEM or Administrators own (every folder the service made before FR-145) | sealed in place, by handle, on the folder alone (`SetKernelObjectSecurity`): nothing is handed down to what it holds, so a hard link left in it never carries the seal to a file outside. A name in it that the site writes or reads is sealed through its own handle when it is a plain file of one link owned by SYSTEM or Administrators, and deleted by handle when it is not; other names are never opened and keep what they had | nothing; the files in it stay |
+| a folder another account owns | moved aside whole, by handle, as `<name>.moved-<unix>`, its owner and contents unchanged, and a sealed one made. One WARN | a `<name>.moved-<unix>` entry |
+| a link, or anything else that is not a folder | the entry itself moved aside by its own handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; what a link led to is untouched |
+| above the leaf: a link, or a folder whose final path is elsewhere | refused, one WARN, and the site does without | the WARN line, which names the path |
+
+The machine folder and its parent are only opened (made sealed when they are not there),
+never moved or re-sealed: they hold the machine config, and their repair is FR-94's
+(above). A worker running as the signed-in person reads `crashes` below a machine folder
+it may not list: a name its read walk passes through is then held with
+`FILE_READ_ATTRIBUTES` alone, which NTFS grants through the parent's list right, and is
+still checked for a link and for its final path. Nothing is listed, read or done in such
+a folder, and no write walk does this.
+
+The sites on it since P1:
+
+| Site | By handle | Code |
+|---|---|---|
+| A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:399` |
+| Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:652`, `crates/agent-core/src/crash_recorder.rs:539` |
+| The uploader's verdicts ledger in a SYSTEM worker's `service-logs` (`crash-verdicts.txt`) | `HeldPath::machine(.., Seal::Readable)`, then `append_file`; read with `read_file`. A link, or a file with more than one name, at its name is deleted as itself and the file made again | `crates/agent-core/src/crash_recorder.rs:750` |
+| The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:1160` |
+| The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
+| The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
+| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1449` |
+
+P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
+machine folder, with a test that fails on a new path-based one; until then those sites
+write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
+sends the crash recorder back to its writes by path, with one WARN naming the switch
+(`crates/agent-core/src/machine_tree.rs:377`). The clean-up's removals have no switch: a
+removal that follows a link has no safe old way to return to.
+
+### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
+
+On a Windows background-service install the worker is LocalSystem. What a
+viewer's file transfer touches on the person's side runs through `FsAs`
+(`agents/roomlerd/src/files.rs`): a received file is placed, and a download, a
+folder download and the drawer's listing are read, as the person signed in to
+the session the worker serves, their token impersonated on a blocking thread for
+one step at a time. With nobody signed in, each is refused with a reason the
+viewer shows ([`desktop-companion.md`](desktop-companion.md) §9.2, §9.3). A
+worker that cannot read its own token is taken for LocalSystem here: the answer
+is then the person or nobody, never the worker itself. Only the service's own
+staging is written as the service. A new file verb takes the
+same path: `FsAs::now()` for a write, `FsAs::for_read()` for a read, and every
+call on the person's side inside `FsAs::run`. The person's token is the boundary;
+`validate_outgoing_path`'s denylists and `is_agent_secret` stay, as a second
+line.
+
+On a Linux system install the daemon is root, and the same `FsAs` takes the
+person at seat0 in both directions: a received file is written as them (FR-97
+P3d), and a download, a folder download and the drawer's listing are read as
+them (#3688). Each read step runs on a blocking thread with their fsuid, fsgid
+and groups and an empty effective capability set
+(`fs_identity::FsIdentity::begin_reading`), and every handle it opens, a
+file's or a folder's, is held to what was asked and kept off the kernel's own
+file systems before it leaves the step; a folder is then listed through its
+handle, never through its path again. A folder download ends with an error
+once the person has left seat0. With nobody at seat0, a read is refused with a
+reason the viewer shows, and a received file is the daemon's, 0600 and root's
+only, in root's own Downloads, but never in a folder a controller chose. A host
+with no logind at all has no seat0, so nobody is there. Any other lookup of
+seat0 that fails or runs out of time refuses the read too, saying it could not
+tell who is there.
+root itself at seat0, a user install and `ROOMLERD_FILES_AS_SEAT_USER=0`
+are the daemon, both ways. Only root sets that switch, in the service's own
+environment (a systemd drop-in); remote config cannot reach it
+([`desktop-companion.md`](desktop-companion.md) §9.4).
+
+### An upload's id is one plain name (#3688)
+
+The viewer chooses an upload's `id`, and the daemon names the upload's staging
+folder after it. So the id is one plain name: letters, digits, `.`, `_` and
+`-`, not starting with `.`, at most 128 bytes (`transfer_id`,
+`agents/roomlerd/src/files.rs:1652`). Every entry that takes an id from the
+files channel checks it first, on every OS and before anything on disk is
+touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
+other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
+which builds the staging path, refuses one too, so a new verb that forgets the
+check still builds no path from it. The viewer's own ids
+(`up-<base36>-<base36>`) are such names. A download's id (`files:get`,
+`files:get-folder`) names no path and is only echoed back. Pinned by
+`files::transfer_id_tests`, one test per entry.
+
+### What a viewer sends is escaped in the device's log (#3688, #3733)
+
+A viewer chooses every string it sends on a session's data channels, the
+channel's own name included, and the daemon's log writes one event a line. So
+on every channel the session's peer routes (`on_data_channel`,
+`agents/roomlerd/src/peer.rs:1219`: input, control, cursor, clipboard, files,
+record, privacy, video-bytes, and a channel of any other name), a string the
+viewer sent, and a reason or an error built from one, is logged with Debug
+escaping (`?`), so a line break or another control character in it stays inside
+its own log line. A parse error counts: serde quotes a `t` it does not know as
+it came, so every channel logs one as `e = ?e.to_string()`. A `&str` field
+logged bare prints through `str`'s Debug, which escapes too. A string is logged
+as it is only after a check of its own shape:
+
+| Logged as it is | The check it passed |
+|---|---|
+| an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11579`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10916`) |
+
+The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
+host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
+logged as they are. Text the server relays from a person follows the same rule:
+a fleet RPC command's `caller`, the server's name for who asked (their display
+name, or `name (via device)`), and what an SSH grant brings (below). Pinned by
+`peer::files_log_tests` (the files channel) and `peer::wire_text_log_tests` (the
+clipboard channel, and a channel named with a line break).
+
+### What an SSH client sends, and what a grant names, are escaped too (#3815)
+
+The device's SSH server writes its log by the same rule. A client chooses its
+login name, the terminal it asks for, a subsystem's name and every place it
+asks to forward to. A grant brings two strings a person typed: `caller`, the
+server's name for who asked, and the account a `named` policy runs as, which an
+admin typed into the device's SSH policy. So each of these is logged with Debug
+escaping, on every line that holds it:
+
+| Field | What it holds | Its lines |
+|---|---|---|
+| `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
+| `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2221`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2087`) | the four `ssh: forward …` lines |
+| `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:901`, `:924`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
+| `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
+| `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
+| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2172`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
+
+Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
+question's id), which the SYSTEM service checks with `valid_object_id` before it
+logs one; the server's word for the account mode (`account_mode`: `daemon`,
+`console_user` or `named`); a key's fingerprint; the resolver's error for a
+forward, which names no host; and a refusal the worker sends back to the SYSTEM
+service, which `clean_reason` has stripped of control characters. The exec
+engine's lines serve fleet RPC too, so a fleet RPC command's `caller` is escaped
+there as well. Pinned by `ssh::tests::wire_text_log_tests`: a client's login
+name, terminal, subsystem and forward hosts; a grant's caller, through the
+question to the person at the device and on the SYSTEM service's port; a
+named account; and a stand-in `sftp-server`'s stderr, exactly one line for it
+(#3890). Each holds a line break and a control character; one more stand-in
+writes 6000 bytes and its line keeps 4 KiB.
+
+### A received file's folders are its writer's own (#3688)
+
+On Linux, where the daemon writes a received file as itself (a system install
+with nobody at seat0, root at it, or the switch off; a per-user daemon), no
+folder on its way is one another account can write
+([`desktop-companion.md`](desktop-companion.md) §9.5):
+
+- **Its default folder** is its XDG Downloads when that exists and passes, else
+  `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:4986`). The folder each
+  is opened to must be the writer's own: for root, one no other account may
+  write; for a per-user daemon, one not every account may, unless its file
+  system keeps no owners or modes, where it need only be one the daemon can
+  write into. Never the temp dir. Root's home is the one its account names,
+  never `HOME`, and must pass root's rule itself
+  (`own_home_and_downloads`, `files.rs:5299`); FR-84's rule judges a
+  configured or a chosen folder against that home too.
+- **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
+  explicit modes whatever the umask, and is used, resumed or registered by the
+  startup sweep only when each piece is its stager's own and nobody else may
+  write it, every step below the folder opened without following a link
+  (`agents/roomlerd/src/files/staging.rs`).
+- **A folder whose file system keeps no Unix modes** (a FAT disk, a share
+  mounted with fixed modes) cannot hold staging of the writer's own: its upload
+  stages in the writer's own private folder, `~/.local/state/roomler/staging` or
+  root's `/var/lib/roomler/staging`, and is copied across at its end
+  (`stage_held`, `files.rs:5080`). There root still never places into a
+  folder another account can write, and its private folder sits only in a
+  `/var/lib/roomler` that is root's and no other account may write.
+- **A root writer's resume and end** place only in a folder the rule gives it
+  now (`root_may_place_in`, `files.rs:5200`): the one the partial sits beside,
+  or, for one staged in root's private folder, the one its notes record. Never
+  where its notes alone say.
+- **A transfer holds** its folders from its begin, or its resume, to its end, and
+  renames, or copies, from those handles.
+
+A new step on a received file's staging goes through `files/staging.rs`, on
+the stager's own thread (`FsAs::run`), so the thread's fsuid is the owner every
+check asks for. Pinned by `files::seat_user_tests::own_staging`, which CI runs
+again as root.
+
+### An enrollment token is spent once, through one owner (#3328)
+
+**A single-use enrollment token enrolls once**, at every door: the daemon's
+`POST /api/agent/enroll`, `POST /api/tunnel-client/enroll`, and the anchor. Single use
+used to be a convention each door had to remember, and a door that forgot it minted a
+year-long credential per replay. It is a type now (`crates/services/src/auth/single_use.rs`):
+
+| Step | What holds it |
+|---|---|
+| Verifying a single-use audience (`Enrollment`, `TunnelEnrollment`) yields an **unspent** token | it reads claims and mints nothing |
+| `UsedTokenDao::spend(token, purpose)` records the one use and yields a **spent** token | the `used_tokens` insert, `_id` = the `jti`: the unique key arbitrates, with no read-then-write race |
+| `issue_agent_token`, `issue_tunnel_client_token` and `issue_agent_service_token` take the spent token by value | nothing outside the services crate can make one, so a door that skips the spend does not compile, and one spend mints one credential |
+| An FR-51 ephemeral key's use is claimed on its own row (`EnrollmentKeyDao::claim_use`) | the agent mint takes that claimed use instead; the key is reusable by design |
+| Renewal keeps its own entry (`renew_agent_token`, `renew_tunnel_client_token`, `renew_agent_service_token`) | a renewal authenticates with a credential the device already holds |
+
+The rules each door keeps:
+
+- **Every refusal that must leave the token usable runs before the spend**: an archived
+  org, a tunnel token whose subject is no longer a member of its org
+  ([below](#a-tunnel-client-ends-with-its-owners-membership)), a daemon or anchor token
+  whose issuer may no longer enroll devices in its org
+  ([below](#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)), the
+  plan's cap, a tunnel re-enrollment the token's subject may not make, a read that
+  failed. **The spend runs before anything is written.**
+- **Two answers, never one.** A token spent before is 401 `This enrollment token has
+  already been used`. A ledger that cannot answer is a retryable 503 and the token stays
+  valid. "Already used" sends a person looking for whoever used the token, so a ledger
+  blip must not borrow those words (`From<SpendRefusal> for ApiError`,
+  `crates/core/src/error.rs`).
+- **The spend fails closed.** An enrollment cannot succeed without MongoDB, so failing
+  open never rescued one; it only let a replay through in the one window where the insert
+  failed and the row write did not.
+- FR-104's anchor second use stays an explicit, named spend
+  (`UsedTokenDao::spend_anchor_second_use`, key `<jti>:anchor`).
+
+**Re-enrolling a known machine id revives a tunnel client only for its owner, while
+the client is live, or for a holder of `MANAGE_AGENTS`.** A **removed** tunnel client
+comes back only through a holder of `MANAGE_AGENTS`, its owner included. The enroll
+request carries no user session, so "who" is the person the enrollment token was minted
+for (its `sub`), with their permissions read at enrollment time.
+- Anyone else gets **409**, before the spend, and **nothing is written**: no row, no
+  ledger entry, no overlay lease or address. The refused token still enrolls a machine of
+  its own. The 409 comes first on purpose: a refusal the person can only fix elsewhere
+  must not burn the token, and the spend would otherwise write to the ledger.
+- The write holds the decision again (`ReviveScope`,
+  `crates/services/src/dao/tunnel_client.rs`): an owner's re-enrollment refreshes the row
+  only while it is still live and theirs, so a removal that lands between the check and
+  the write is not undone. That race is the one case where a refused token is spent.
+- An allowed re-enrollment changes no `token_gen` (a removed client's revival mints at
+  the generation its removal set, so its old tokens stay dead), and it leaves the
+  overlay alone; the client takes a lease when it joins. It keeps a live client's owner.
+  **A removed client a device manager brings back becomes theirs** (`owner_user_id` =
+  the reviver, the person its new token acts for, as a removed device enrolled again
+  takes its enroller, #3627), so a client whose owner left the org does not come back
+  owned by someone who is not a member. One pipeline update reads the tombstone and
+  writes the owner (`TunnelClientDao::rehydrate`), so a removal or revival racing the
+  route's read cannot get it wrong.
+
+### A tunnel client ends with its owner's membership
+
+A tunnel client acts for the person whose enrollment token enrolled it
+(`owner_user_id`; for a paired client, whoever approved the pairing): the forward gate
+matches it as that person (`AllUsers`, `UserId`, and the roles they hold in the org),
+and its overlay node is a peer of the org's mesh. So it lasts only as long as that
+person's membership of the org, as a call seat and a room membership do
+([§3](#the-media-socket-admits-only-the-calls-participants)):
+
+- **Removed from the org, or leaving it, removes the person's tunnel clients there**,
+  the way a device manager's `DELETE …/tunnel-client/{cid}` removes one
+  (`end_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs`): the row is
+  tombstoned and its `token_gen` advanced, THEN the overlay node is released (the peers
+  hear `removes`, the address is pooled). From the tombstone on, a reconnect, a renewal,
+  the agent roster and an overlay join refuse it, and its open socket closes at the next
+  60 s poll ([below](#a-removed-thing-answers-nothing-1821-1829)). This is `network`'s
+  `MembershipLifecycle` hook (`crates/modules/network/src/membership.rs`), first in
+  `HOOK_ORDER`.
+- **That hook never stops the cascade.** The cascade stops on a failing holder because
+  `chat` must not drop the room rows `conference` reads to find the person's calls;
+  nothing after `network` reads what it holds, so it tries every client, logs one it
+  could not finish (`alert = membership_tunnel_end`), and answers `Ok`. A tunnel-client
+  write that failed must not keep the person in a live call or on the org's rooms.
+- **What a removal left is an operator step's**: `POST /api/admin/tunnel-clients/prune`
+  ends the tunnel clients, and the overlay leases of removed ones, whose owner is no
+  longer a member: platform operators only, a dry run by default that lists each client
+  a real run would end, bounded per call, the membership re-read per pair, the removal's
+  own cascade per pair, and nothing found on a second run.
+- **An enrollment token acts for the person it was minted for**, so once they are no
+  longer a member it enrolls nothing: **403** before the spend, nothing written, for a
+  new machine, their own removed client, and a token a pairing delivered (the
+  approver's). The enrollment asks again after its write: a removal deletes the
+  membership and then lists the person's clients, so a write that landed after that
+  list is seen by the second read and removed.
+- **Devices the person enrolled are not removed with them**: a device belongs to the
+  org's fleet, and removing one stays a device manager's decision
+  (`DELETE …/agent/{id}`). Tunnel policies naming the person are left in place for an
+  admin to edit; they apply again if the person is added back.
+
+### An enrollment credential ends with its issuer's right to enroll devices
+
+A single-use enrollment token and an FR-51 ephemeral key act for the admin who minted
+them (the token's `sub`, the key's `created_by`): the device they enroll is that
+person's, and an anchor records them as `anchored_by`. So every use asks again what the
+mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
+(`issuer_may_enroll`, `crates/modules/fleet/src/agent.rs:160`, the mint's own
+`require_permission`, which nobody outside the org passes):
+
+- **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
+  (`crates/modules/fleet/src/agent.rs:353`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
+  gate and before the token's spend or the key's claim
+  ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a
+  pairing delivered acts for the approver, and a join-org push's token for the admin
+  who pushed it.
+- **A refusal is a plain 403 `forbidden`**, with one sentence whether the issuer left
+  the org or no longer manages its devices, so the credential tells whoever holds it
+  nothing more about its issuer; the log line keeps the reason. It is never
+  `not_a_member`, the code that sends a page out of the org
+  ([§3](#a-403-is-an-answer-not-an-expired-credential-fr-82)): these doors are a
+  device's. The token stays unspent, the key's `uses` stay as they were, and nothing is
+  written. A read that failed is a 500 that spends nothing.
+- **Removed from the org, or leaving it, revokes the live keys the person minted
+  there**, the way `DELETE …/agent/enroll-key/{key_id}` revokes one. This is `fleet`'s
+  `MembershipLifecycle` hook (`crates/modules/fleet/src/membership.rs`), after
+  `network` in `HOOK_ORDER`. It is one write under the claim's own liveness filter
+  (`EnrollmentKeyDao::revoke_minted_by`), so a use racing it either claimed first or is
+  refused, and a key that expired or was used up keeps how it ended. The key list shows
+  the revoked keys as revoked, and a second run changes nothing.
+- **That hook never stops the cascade either.** It logs a write that failed
+  (`alert = membership_key_revoke`) and answers `Ok`. A key it could not revoke still
+  enrolls nothing while its minter is not a member, and its first refused use revokes
+  it, as it does any key whose minter's membership ended without the hook. Until then
+  the key is listed as active, and it works again once its minter is back in the org
+  with Manage devices: revoke such a key by hand to end it for good.
+- **Losing Manage devices while staying a member pauses a credential**, whether a role
+  was taken away or a role's bits were edited. The credential is refused but not
+  revoked, the key list still shows the key as active, and it works again if the person
+  regains the permission. A single-use token is never revoked: it lives ten minutes,
+  and each use asks.
+- **Nothing is asked after the write.** Devices the person enrolled stay theirs when
+  they leave, so an enrollment that passed the check just before a removal ends like
+  one that finished before it. For a key, the claim and the removal's revoke arbitrate
+  on the key row itself.
+- **What an issuer's departure leaves as it was**: the devices they enrolled (an
+  ephemeral one still ends by its own TTL), who owns a device that enrolls again
+  ([#3627](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)),
+  and the anchors they set. A join-org push asks for `MANAGE_AGENTS` in both orgs at
+  the click; at enrollment its token is asked about in the target org only.
+
+### A removed thing answers nothing (#1821, #1829)
+
+Devices, tunnel clients, tunnel policies, overlay ACL policies, chat messages,
+files and recordings are **tombstoned, not deleted**: the row stays with a
+`deleted_at`, so `{_id, tenant_id}` still finds it unless the query asks for a live
+row. **A removed thing answers nothing by default** (#3327).
+`BaseDao::find_by_id_in_tenant`, the per-id lookup the routes reach for, answers
+live rows only, and a tombstone gets `NotFound`, the answer an unknown id gets:
+
+| Lookup | Finds a tombstone | For |
+|---|---|---|
+| `BaseDao::find_by_id_in_tenant`, and each DAO's `find_live_in_tenant` | no: `NotFound`, like a bogus id | every GET of the thing itself, every write, every session start |
+| `BaseDao::find_any_by_id_in_tenant`, only through a DAO's named `find_any_in_tenant` | yes | a reader whose job is the tombstone, with the reason on the DAO method |
+
+- **The live predicate is `deleted_at: null`**, which matches null and absent
+  alike and is the one every live listing uses. `{"$type": "null"}` is the
+  spelling for partial unique indexes only: in a query it would 404 a live row
+  whose field is absent. Locked for chat by
+  `chat_tombstone_tests::a_message_or_file_with_no_deleted_at_field_is_live`, and
+  for devices, tunnel clients and policies, and overlay policies by their own
+  `…_whose_deleted_at_field_is_absent_is_still_live` tests.
+- **The rule is a lint.** `find_any_by_id_in_tenant` is listed under
+  `disallowed-methods` in the root `clippy.toml`, so a call from a route fails the
+  clippy gate CI runs. Each legitimate reader is a named DAO method that carries
+  `#[expect(clippy::disallowed_methods, reason = "…")]` and a doc comment saying why
+  it must see a tombstone. ⚠️ The lint catches a call of that method, not every way
+  to read a tombstone: the tenant-less `BaseDao::find_by_id` and a hand-written
+  `find_one` filter are not covered.
+- **Why a default.** Until #3327 the un-suffixed lookup was the ANY one, so every
+  call site had to opt in to liveness, and the hole was closed one DAO at a time:
+  devices (#1821); tunnel clients, tunnel policies and overlay ACL policies (#1829);
+  FR-52's External access routes, which reached through `base` after #1821 and
+  reopened the device hole (#3322: they minted connect codes and wrote approvals
+  onto removed devices, and a tombstone then revived whole when its machine
+  re-enrolled, until #3627); and chat (#3327), where a deleted file's GET and download, and a
+  deleted message's edit, reaction and thread, still answered 200.
+- **A write that raced the removal matches nothing.** The admin setters are
+  live-scoped on their own (`AgentDao::live_row`), the anchor and the desired
+  config among them, and so is the soft delete
+  (`BaseDao::soft_delete_in_tenant`), so the route answers 404 and the first
+  removal time stays.
+
+**Chat files and messages** (#3327). Every route keyed by a message or file id
+resolves it live through its guard (`require_message_in_room`, `require_file`,
+[above](#object-level-tenant-scoping-closes-a-critical-cross-tenant-break-2026-08-23)).
+After a `DELETE` that answered 200:
+
+- the file's GET and download, and the message's edit, reaction add and remove,
+  thread, pin and unpin answer 404, and the room hears nothing more about it;
+- a second `DELETE` of either answers 404, and the first removal time stays;
+- attaching the file to a new message attaches nothing, and playing it in a call
+  starts nothing.
+
+The writes behind those routes keep to live rows on their own too, so one that
+passed its guard before the delete landed matches nothing: the soft delete, a pin,
+an edit, a reaction count. The soft delete is shared with recordings, whose route
+answers as it did. A room's `DELETE` removes it outright (`cascade_delete`), but a
+room deleted before that change still carries a `deleted_at`. Every room listing
+left it out already, and now its id agrees: its routes, files and messages answer
+404, and the org's file list and search leave it out (`guards::room_reach`). The
+web app takes a 404 on its own delete of a message or file as "already deleted":
+the row leaves the list and no error is shown (`ui/src/utils/alreadyDeleted.ts`).
+A deleted file's stored bytes stay: purging them is a decision of its own.
+
+Readers that keep the tombstone, and why:
+
+| Reader | Why it must see one |
+|---|---|
+| `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
+| `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash` (both read under `MANAGE_AGENTS`, [below](#device-diagnostics-manage_agents-and-a-second-scrub)), the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
+| External access's re-read of its gates as a session opens (`extauth::org_gates_open`) | a removed device is its removal's to end (`removal::kick`), not this read's, and a tombstone answering here keeps a removal that raced the open from reading as a failed read. It reached through `base` until #3327, and reads through `AgentDao::find_any_in_tenant` now |
+| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone, and a device's row comes back with a new device's settings, everything else it was allowed staying with the removal ([#3627](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)). A tunnel client's tombstone revives only through a holder of `MANAGE_AGENTS` ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)) |
+| `overlay_nodes` by id after a release | the release's own `removes` frame goes to the tombstone's address (`docs/overlay-communication.md` §1). The lease order is not changed by any of this: a node is tombstoned first, then its host goes back to the pool, and pooling first would lock the next joiner out permanently |
+
+**An overlay join reads the row, and a removed row does not join.** A socket can
+outlive its row: a tunnel client's by up to the 60 s of its revocation poll, and a
+device's until the kick reaches the pod holding it. The join used to read the row by
+id, not ask whether it was live, and lease a fresh address to something already
+removed. Peers were told of it, and `DELETE` on that row is a 404, which left only an
+admin finding the node and evicting it by hand. `handle_overlay_join` now refuses a
+tombstoned identity, and any identity in an archived org. A tunnel client's `DELETE`
+tombstones before it releases, so the window is the join already past that check; an
+agent's removal keeps its own load-bearing order (`crates/modules/fleet/src/removal.rs`).
+
+What stays open by design: an **already admitted** tunnel-client socket can keep
+opening tunnels and forwards until that 60 s poll closes it. Those flows end with the
+socket and leave nothing behind, so the lag is bounded; a push on removal would need a
+cross-pod channel the tunnel socket does not have.
 
 **A WG public key cannot be claimed by two live nodes in a network** —
 `overlay_nodes::wg_key_taken_by_other`, checked in `ws::overlay` join,
@@ -343,41 +1086,140 @@ device grid — an *order* the device answers with a locally minted key, never a
 the server chose or saw; the device's re-join under the new key is what the server
 verifies: [`overlay-key-rotation.md`](overlay-key-rotation.md) (FR-40).
 
+**A key a node moved away from cannot rejoin, where the org enforces it** (FR-40 P2).
+Each node row keeps the public halves of the keys it moved away from, written by the
+accepted join that replaced them, never by a device's report. Under the org's
+`retired_key_mode = enforce`, a join or a DERP registration presenting one — a `.prev`
+rollback, a restored backup, a config copied to another machine of the org — is refused
+`key_retired`, checked against every row of the network, tombstones included, so removal
+is not a pardon. A device that supports rotation is ordered to rotate instead of being
+left off the mesh, through the same order path, ceiling and audit as an admin's order,
+with the server named as the actor. The switch defaults to `off`: a refusal fails
+closed, but a wrong one costs a legitimate device the mesh, and `warn` shows what it
+would refuse first: [`overlay-key-rotation.md` § Retired keys](overlay-key-rotation.md#retired-keys).
+
 **The LocalAPI's ACL is the local trust boundary.** The daemon's local control
 endpoint carries administrative verbs: exec, SSH grants, config, routes, restart. On
 Windows it is a named pipe whose security descriptor admits `SYSTEM`,
-`Administrators` and the interactive user. On Unix a root daemon's socket is
+`Administrators` and the daemon's own account (OWNER RIGHTS) in full, and the
+interactive user to read and write data only (`0x12008b`): only the first three may add
+an instance of the pipe, and every instance carries the first one's owner, which a
+client checks. On Unix a root daemon's socket is
 `/var/run/roomler/roomler.sock`, 0700 / 0600, root only. Per-verb checks sit on top:
-the recording verbs require the console user (FR-85) and an update hold requires
-root (FR-90).
+the recording verbs require the console user (FR-85, on Windows the person at the screen
+the daemon shows, below), and a consent answer
+(`ConsentDecide`, an approval or a denial) and a Disconnect (`RcDisconnect`) require the
+person at the screen the daemon shows, `SYSTEM` or an elevated administrator
+(`peer_may_decide_for_the_screen`,
+[`lib.rs:2641`](../crates/localapi/src/lib.rs#L2641)). An approval lets someone see and
+control the screen, and the pipe admits every interactive user, so the ACL alone does not
+say whose screen a caller is at. The peer is what the OS read at accept: the client's
+session, and its account and elevation from its token. `SYSTEM` is named by its SID
+(`S-1-5-18`; LocalService and NetworkService are not `SYSTEM`).
+- **The screen's session** on Windows is the daemon's own: a worker's, which the service
+  host starts in the active console session, or a per-user daemon's, where its person
+  signed in, over RDP too. The person at the console is then someone else and is refused.
+  A daemon in session 0 takes the console session; with neither known, only `SYSTEM` and
+  an elevated administrator are taken (`screen_session`,
+  [`lib.rs:2614`](../crates/localapi/src/lib.rs#L2614)).
+- **Fail closed**: a peer whose session and account the pipe could not read is refused,
+  in words, with a warn line, and nothing reaches the daemon (`not_the_screens_person`,
+  [`lib.rs:3785`](../crates/localapi/src/lib.rs#L3785)).
+- **On Unix nothing changes**: the daemon's own account or root are taken, who its
+  owner-only socket admits. The person socket keeps its own seat check (below).
+- The tray's Approve, Deny and Disconnect and `roomlerd consent` run as the person in their
+  own session, so they are taken; the native consent panel and the Windows badge's
+  Disconnect never cross the pipe (`desktop-companion.md` §12.4).
+- **The console person's gates follow the same screen.** A console person's `ConfigSet`
+  key (`CONSOLE_PERSON_KEYS`), the recording verbs, keep busy on and the external-access
+  password's set and clear take, on Windows, a peer in the screen's session
+  (`peer_is_console_user`, [`lib.rs:2539`](../crates/localapi/src/lib.rs#L2539);
+  `peer_may_start_keep_busy`, [`lib.rs:2483`](../crates/localapi/src/lib.rs#L2483)).
+  Nothing else about them changed: keep busy on still takes only a person's account
+  (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
+  elevation passes none of them, and the person socket keeps its own rules. A machine-wide
+  install's worker runs in the console session, so there they decide as they always did.
+  Their refusals name the person they take, "only the person at this device's screen …"
+  (#3907), never the console, whose person a per-user install over Remote Desktop refuses.
+
+**A LocalAPI client keeps an endpoint only when its own account or the system serves
+it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
+through `localapi::connect()` ([`lib.rs:5247`](../crates/localapi/src/lib.rs#L5247)), and
+each check runs on the connected endpoint, before the client sends anything:
+
+| OS | The endpoint is kept when | Otherwise |
+|---|---|---|
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4679`](../crates/localapi/src/lib.rs#L4679) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:5273`](../crates/localapi/src/lib.rs#L5273) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5522`](../crates/localapi/src/lib.rs#L5522) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5554`](../crates/localapi/src/lib.rs#L5554) `connect_windows_checked`) |
+
+- **Where a per-user endpoint lives.** Only in a directory private to its account: a
+  real directory, not a link, owned by that account and writable by neither its group nor
+  anyone else ([`lib.rs:4653`](../crates/localapi/src/lib.rs#L4653)
+  `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
+  macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
+  with no such directory (root under `sudo`, a cron job, a system service) has no
+  per-user candidate and goes straight to the system socket.
+- **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
+  alone. A per-user daemon serves its own per-user socket, and with no private directory
+  it serves none and logs why ([`lib.rs:4693`](../crates/localapi/src/lib.rs#L4693)
+  `unix_endpoints`); `roomler`'s "not running" line then says the same
+  ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
+- **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
+  (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
+  right to create an instance of the pipe, and the server may learn who the client is but
+  never act as it ([`lib.rs:5534`](../crates/localapi/src/lib.rs#L5534)). It works
+  against every daemon version.
+- ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
+  and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
+  (`roomler exec` through an anchor, FR-94), is refused with the owner named: run the
+  command as that person.
 
 ⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911; FR-97 P2g).** A
 Linux system install's companion runs as the desktop user and could not reach the root
 socket. That left the person at the screen with no "being viewed" banner, no
 Disconnect, and on Wayland no consent prompt. The root daemon therefore also serves
 `/run/user/<uid>/roomler.sock`:
-- it belongs to the user of the **active** graphical session only;
+- it belongs to the person signed in at the machine's own screen: logind's active session
+  on `seat0`, when that session is a person's (`companion::seat0_uid`,
+  `agents/roomlerd/src/companion.rs:4072` — the rule received files and `console_user`
+  already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
+  although logind calls it active. Until #2871's review the socket went to the first
+  active graphical session anywhere, which on a host with remote logins could be one;
 - it is 0600 and theirs because it is **made as them**: the bind and the `chmod` run on a
   thread switched to their filesystem ids (`setfsuid`/`setfsgid`). Their own directory
   lets them swap the path between any two root calls, and `chmod`/`chown` follow
   symlinks, so a root `chown` of that path could be raced into handing them
   `/etc/shadow`. The daemon therefore never runs a root path operation there;
-- `SO_PEERCRED` is checked against that user or root on every connection;
+- `SO_PEERCRED` is checked against that user or root on every connection, and again by
+  the per-peer gates (below);
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
   `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
-  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; and
-  since FR-85 P2e, `RecordStart`, `RecordStop`, `RecordingsList` and
-  `RecordingDelete`, the start, stop and delete gated again on the peer.
+  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; since FR-85
+  P2e, `RecordStart`, `RecordStop`, `RecordingsList` and `RecordingDelete`, the start,
+  stop and delete gated again on the peer; and since #2871 (design A, the operator's
+  decision) `ConfigGet` — the listing, no secret being on that surface, with every key
+  the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
+  the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
+  `crates/localapi/src/lib.rs:3365`): the keys the daemon's own endpoint already
+  gated to that person because Windows' pipe admits every interactive user.
+  Never the device-owned gates `exec_enabled`, `ssh_enabled` and
+  `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
+  administrator's command (`not_on_the_person_socket_for_key`, `:3708`).
 
 The recording verbs (P2e) are the second widening past the safety surface, and
 **Stop** is safety on its own: without `RecordStop` the host could not end a remote
 recording of their own screen from the banner. They reach nothing the person could not
 reach already. The recorder runs as the person at the seat, the daemon lists and deletes
 with that person's filesystem identity (`FsIdentity`), never in the unattended folder,
-and `ConfigSet` stays refused, so `record_dir` and the remote switches remain root's. The
+and `ConfigSet` of `record_dir` stays refused, so where recordings go remains root's on
+a root-mode install, pending a check of the folder each time a recording starts. Since
+#2871's design A the two remote switches (`record_remote_*`) are the person's there. The
 socket follows a user switch within 5 s, so a background user's client can act for that
-long, as the consent verbs can; it acts as the person now at the seat, whose folder it is.
+long, as Disconnect and keep busy can; it acts as the person now at the seat, whose folder
+it is. A `ConfigSet` does not wait for the switch, and since #3845 neither does a consent
+answer: the daemon asks the seat again, fresh, before it writes or takes the answer
+(`LocalApiState::at_the_seat_now`).
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -416,7 +1258,63 @@ the directory is not the person's:
 
 The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
 new verb cannot reach it by default. Widening it is a security change and needs
-review like one. The root socket itself is unchanged. Kill switch:
+review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
+for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
+`exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
+install pending a separate policy call. The dispatcher gates the peer again, three ways
+(#2871's review):
+- **who**: the connection's uid, which the kernel read, must be the person the socket was
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2582`, by
+  `person_peer_ok`, `:4903`). The listener makes that check before a byte is read, and a
+  test drives the listener itself over a real socket: another account's connection is
+  closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
+  (`serve_person_listener`, `:4967`). The gate makes the check again where the decision
+  is, so the rule does not rest on that one call site. An unknown peer is refused;
+- **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
+  and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
+  daemon asks once more, fresh, whether that uid is at the seat
+  (`LocalApiState::at_the_seat_now`, `:2966`), so a person who switched away cannot change
+  the next person's settings over a connection still open. #3845 — it asks the same before
+  it takes a consent answer, an approval or a denial (`:4009`): an approval lets someone
+  see and control the screen, so it must come from whoever is at the seat now. Root is not
+  asked. The daemon's own endpoint takes one only from the person at the screen it shows,
+  `SYSTEM` or an elevated administrator (above). On Linux that is a logind lookup, which a stalled logind can hold, so it waits
+  1.5 s at most, one lookup in flight whoever asks (#3796). With no answer in that time,
+  or any look that cannot tell (#3845), the change or the answer is refused with "Could not
+  tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`,
+  `:3733`), never applied and never "the seat changed" (`desktop-companion.md` §9.4). A
+  look that cannot tell also never closes the socket as if nobody were there: not known is
+  not nobody, so the socket stays where it is while nothing changes through it
+  (`desktop-companion.md` §12.3);
+- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3339`). The
+  `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
+  widen this one, so a new key reaches the person socket only by a decision.
+
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:4130`),
+beside the daemon's own `config key updated` line, which carries the value. Its target,
+`roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
+default filter, so the daemon's filter keeps that crate at INFO under any spec that would
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:494`, #3525). A
+spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
+`roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
+person at the device cannot turn the record off.
+
+The value in the daemon's line is never a secret, because no secret is on the config surface:
+`agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
+password record have no row there, and `apply` refuses them like any unknown key
+(`crates/agent-core/src/config_surface.rs:2844`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:4748`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5339`).
+
+#3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
+daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,
+`agents/roomlerd/src/encode/caps.rs:298`), which starts no probe, runs no vendor code
+(`not_probed_never_triggers_a_probe`) and changes nothing on the host. Besides what the probe
+found, it carries the denylist and the encoder preference, which the configuration listing
+(`ConfigGet`) already shows. Like `Status` and `Peers`, it has no per-peer gate of its own.
+
+The server reaches none of it (the socket is local, and `remote_config_enabled` stays
+structurally outside `DesiredConfig`). The root socket itself is unchanged. Kill switch:
 `ROOMLERD_PERSON_SOCKET=0`.
 
 **A remote-desktop session's media transport is hardened past webrtc-rs' defaults**
@@ -557,7 +1455,7 @@ its Redis, or a TLS-inspecting box on a signalling leg could otherwise stand in 
 
 | Who signs | With what | Checked by | Shipped |
 |---|---|---|---|
-| The device, its answer | a P-256 key per enrollment, made on the device; the private half in `<config dir>/peer-auth/<tenant>.json` with the config's protection (0600 on Unix), never sent | the browser, **before** it applies the answer; the key is pinned per (user, device) on first use | key + signature 0.4.145 (P1a, P1b); the browser's check P2a |
+| The device, its answer | a P-256 key per enrollment, made on the device; the private half in `<config dir>/peer-auth/<tenant>.json`, never sent: 0600 on Unix, and on Windows sealed to SYSTEM and Administrators wherever the daemon runs elevated or as SYSTEM, where a key file another account can change is not offered ([`docs/remote-control.md` §11.4a](remote-control.md#114a-the-device-and-the-browser-prove-who-they-are-fr-100-p1p2b)). A per-user install's stays in its person's profile | the browser, **before** it applies the answer; the key is pinned per (user, device) on first use | key + signature 0.4.145 (P1a, P1b); the browser's check P2a |
 | The browser, its offer | a P-256 key per user, made in the browser, non-extractable, kept in IndexedDB | the device, which remembers each browser key per user in `<tenant>.controllers.json` | the signature P2b; the device's check 0.4.146 (P1c) |
 
 - **The browser fails closed.** A different key, or a signature that does not verify, ends the attempt
@@ -571,6 +1469,45 @@ its Redis, or a TLS-inspecting box on a signalling leg could otherwise stand in 
   browser's key sign anything (FR-100 §1).
 - ⚠️ **The verdict on `session_started` is the device's word**, kept on the server's row on purpose (§11.4a):
   the hub checks the word, never the judgement behind it.
+
+### Device diagnostics: `MANAGE_AGENTS`, and a second scrub
+
+A device's crash reports (`GET …/agent/{aid}/crash`, the last 50) and its uploaded logs
+(`GET …/agent/{aid}/logs`, up to 500 batches of the last 7 days, every structured field
+included) are the least-filtered view of a device. The ordinary device list needs only
+membership. These two need **`MANAGE_AGENTS` in the path org**, the bit the connect code is
+read under (`require_reader`, `crates/modules/fleet/src/diagnostics.rs`):
+
+- **The bit is decided before the device is looked up.** A caller without it gets one 403
+  `forbidden` whatever the id names, so the refusal says nothing about which devices exist.
+  It is never `not_a_member`, the one 403 the web app leaves the org on; someone outside the
+  org is still told `not_a_member`.
+- **Then the device resolves within the org, ANY rather than live.** Another org's id, or one
+  that names nothing, is a 404. A removed device still reads: both are audit views (the table
+  above).
+- **The web app asks the mask first.** It sends neither request for a caller without the bit,
+  the device menu leaves both views out, and a dialog that meets a refusal anyway explains it
+  instead of showing an error (`canReadDeviceDiagnostics`, `ui/src/utils/permissions.ts`).
+
+**What a device uploads is scrubbed again on the way in.** The device scrubs first: the crash
+recorder before it writes a report, and a config file's parse error names where the file
+broke, never what it held (§8). The server scrubs again, because a device that predates a
+device-side fix sends what it had. The pass covers **every string a log line carries**
+(`msg`, `target`, each string in `fields` at any depth) and every string of a crash report,
+on the agent and the browser ingest alike. It knows four shapes:
+
+| Shape | Recognised as | Stored as |
+|---|---|---|
+| the source line a `toml` parse error quotes | the `N \| …` line under its own `TOML parse error at line N` header, its newlines escaped or not | `N \| [REDACTED_TOML_LINE]` |
+| a JWT | `eyJ…` with two dots, 64 characters or more | `[REDACTED_JWT]` |
+| a bearer credential | `Bearer ` (or `bearer `) and 8 or more RFC 6750 token characters | `[REDACTED_BEARER]` |
+| a WireGuard key, public or private | exactly 32 bytes of standard base64 standing alone: 43 characters, the last one a character that can end 32 bytes, then one `=` | `[REDACTED_KEY]` |
+
+⚠️ Each rule is tight on purpose, and the tests pin what each one leaves alone: a hex digest,
+an ObjectId, an address, a base64 value of any other length, `==` padding, a run inside a
+longer one, the word "Bearer" with no credential after it. A public key is redacted with a
+private one, because the shape cannot tell them apart, and the server holds the public keys
+anyway.
 
 ---
 
@@ -768,6 +1705,14 @@ The actual fix for the account is GitHub Settings → Emails.
   lives in the operator's `ROOMLER__TURN__SHARED_SECRET` env.
 - **No git hooks for secrets**: there is no gitleaks/trufflehog scanner in CI.
   *(Open, [LOW], 2026-03-10.)*
+- **An error about a config file says where, never what** (#3086). The daemon's and
+  the CLI's config hold a bearer token, and a `toml` error quotes the line it stopped
+  at, so a typo on that line put the token in the daemon's log, which uploads to the
+  server, on the wizard's page and in the terminal. The parser's error ends where it
+  happens, so no chain holds it for a `{:#}` or `{:?}` to print:
+  [`docs/installation.md`](installation.md). Rows uploaded before the fix were not
+  rewritten. The server's ingest scrub redacts such a quoted line wherever a log line
+  or a crash report carries it (§4, [device diagnostics](#device-diagnostics-manage_agents-and-a-second-scrub)).
 
 ### Dependency-uplift pass (2026-07-29)
 

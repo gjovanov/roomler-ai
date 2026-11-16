@@ -50,6 +50,8 @@ export function describeDisplayMatchRefusal(word: string): string {
       return 'the display could not be switched'
     case 'unsupported':
       return "this device can't switch its display"
+    case 'recording':
+      return 'a recording is running on this computer'
     default:
       return word
   }

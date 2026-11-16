@@ -21,11 +21,22 @@
 //! reads as "cannot prove who it is". That is the SSH host key's rule
 //! (FR-52 §2b).
 //!
-//! ⚠️ The file holds a PRIVATE key, and gets the config's own protection. On
-//! Windows the machine-global config directory grants only SYSTEM and
-//! Administrators, inherited by what is made inside it; a per-user install's
-//! is the person's own profile. On Unix the directory is made 0700 and the
-//! file 0600, whoever runs the daemon.
+//! ⚠️ The file holds a PRIVATE key. Who may change the folder, by how the
+//! daemon runs ([`Keeping`]):
+//!
+//! | Run | `peer-auth` |
+//! |---|---|
+//! | Unix | made 0700, its files 0600, whoever runs the daemon |
+//! | Windows, the machine config (the SYSTEM service) | `machine_tree` seals and checks it: SYSTEM and Administrators |
+//! | Windows, elevated or SYSTEM, any other config | sealed here to SYSTEM and Administrators, owner Administrators, read and written by handle |
+//! | Windows, neither elevated nor SYSTEM (a per-user install) | the person's own profile, as it is: nothing is sealed |
+//!
+//! Where it is sealed, a file another account can change is not trusted: a
+//! key file is not offered, and a browser-key file is not read. The first
+//! seal keeps a key file only when Administrators or SYSTEM own it and its
+//! folder; anything else is moved aside, never deleted, and a new key is
+//! made. `ROOMLERD_PEER_AUTH_SEAL=0` in the service's `Environment` value
+//! turns the seal off.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -460,8 +471,10 @@ fn judge(
         return Verdict::Mismatch;
     }
     match remember(check.config_path, check.tenant_id, user_id, key) {
-        Ok(true) => Verdict::Verified,
-        Ok(false) => Verdict::Unknown,
+        Ok(Pinned::Before) => Verdict::Verified,
+        // Refused: this folder keeps no browser keys, said once where that
+        // was found.
+        Ok(Pinned::Now | Pinned::Refused) => Verdict::Unknown,
         Err(why) => {
             tracing::warn!(%session_id, %why, "peer-auth: a browser key that cannot be remembered");
             Verdict::Unknown
@@ -507,24 +520,42 @@ fn pins_path(config_path: &Path, tenant_id: &str) -> Result<PathBuf, String> {
     )))
 }
 
+/// What [`remember`] found of a browser key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pinned {
+    /// Seen before for this user: `verified`.
+    Before,
+    /// New, and now remembered: `unknown`.
+    Now,
+    /// This folder keeps no browser keys (one that cannot be sealed), which
+    /// was said once where that was found: `unknown`, and nothing written.
+    Refused,
+}
+
 /// Has `user_id` offered with `key` before, on this enrollment? Remembered now
-/// if not (`Ok(false)`). Read once per process and kept in memory; a new key
-/// is written through, whole or not at all, BEFORE it counts as remembered.
+/// if not ([`Pinned::Now`]). Read once per process and kept in memory; a new
+/// key is written through, whole or not at all, BEFORE it counts as
+/// remembered.
 fn remember(
     config_path: &Path,
     tenant_id: &str,
     user_id: bson::oid::ObjectId,
     key: &str,
-) -> Result<bool, String> {
+) -> Result<Pinned, String> {
     static PINS: OnceLock<Mutex<HashMap<PathBuf, PinFile>>> = OnceLock::new();
     let path = pins_path(config_path, tenant_id)?;
+    let folder = Folder::of(config_path, keeping_for(config_path))?;
+    if folder.keeps_no_pins()? {
+        return Ok(Pinned::Refused);
+    }
+    let name = file_name(&path);
     let mut all = PINS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let file = match all.entry(path.clone()) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::hash_map::Entry::Vacant(e) => e.insert(load_pins(&path)?),
+        std::collections::hash_map::Entry::Vacant(e) => e.insert(load_pins(&folder, &name)?),
     };
     let user = user_id.to_hex();
     if file
@@ -532,7 +563,7 @@ fn remember(
         .get(&user)
         .is_some_and(|keys| keys.iter().any(|k| k.key == key))
     {
-        return Ok(true);
+        return Ok(Pinned::Before);
     }
     let mut next = file.clone();
     next.version = VERSION;
@@ -559,9 +590,9 @@ fn remember(
         next.users.remove(&stalest);
     }
     let bytes = serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?;
-    write_private(&path, &bytes)?;
+    folder.write(&name, &bytes)?;
     *file = next;
-    Ok(false)
+    Ok(Pinned::Now)
 }
 
 /// The newest `first_seen` among `keys`: RFC 3339 in UTC sorts as text.
@@ -572,13 +603,32 @@ fn newest(keys: &[PinnedKey]) -> &str {
         .unwrap_or("")
 }
 
-/// The pins at `path`. None yet is an empty set. A file that is not a pin
-/// file starts over (it is only ever a cache of first sightings, and the
-/// verdicts say so as `unknown` again); a NEWER version is left alone, and
-/// nothing is remembered on top of it.
-fn load_pins(path: &Path) -> Result<PinFile, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
+/// The pins in `folder`'s file `name`. None yet is an empty set. A file that
+/// is not a pin file starts over (it is only ever a cache of first sightings,
+/// and the verdicts say so as `unknown` again); a NEWER version is left
+/// alone, and nothing is remembered on top of it. Where the folder is sealed,
+/// a file another account can change is not read: the set starts over, said
+/// once, and the next write moves that file aside before it writes.
+fn load_pins(folder: &Folder, name: &str) -> Result<PinFile, String> {
+    let path = folder.dir().join(name);
+    let path = path.as_path();
+    match folder.read(name, PINS_MAX)? {
+        Found::Absent => Ok(PinFile::default()),
+        Found::TooLarge => {
+            tracing::warn!(path = %path.display(), "peer-auth: the browser-key file is too large to be one; starting it over");
+            Ok(PinFile::default())
+        }
+        Found::Refused(why) => {
+            if first_time(format!("pins-refused {} {why}", path.display())) {
+                tracing::warn!(
+                    path = %path.display(), reason = %why,
+                    "peer-auth: the browser-key file is not read, so each browser reads \
+                     `unknown` until this device has seen it again"
+                );
+            }
+            Ok(PinFile::default())
+        }
+        Found::Bytes(bytes) => {
             #[derive(Deserialize)]
             struct Header {
                 version: u32,
@@ -599,8 +649,6 @@ fn load_pins(path: &Path) -> Result<PinFile, String> {
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PinFile::default()),
-        Err(e) => Err(format!("reading {}: {e}", path.display())),
     }
 }
 
@@ -621,10 +669,18 @@ enum Read {
 /// use. Empty when this enrollment has no key it can keep (see the module
 /// docs), which the hello reports as "cannot prove who it is".
 pub fn hello_key(config_path: &Path, tenant_id: &str) -> String {
+    // FR-43 P3a — a GUI worker with no enrollment says hello to no one, and the
+    // root signs its answers.
+    if tenant_id.is_empty() {
+        return String::new();
+    }
     match device_key(config_path, tenant_id) {
         Ok(key) => key.public_b64(),
         Err(why) => {
-            tracing::warn!(tenant = %tenant_id, %why, "peer-auth: no device key this run, so the hello offers none");
+            // Once per reason: every reconnect says hello again.
+            if first_time(format!("no-key {tenant_id} {why}")) {
+                tracing::warn!(tenant = %tenant_id, %why, "peer-auth: no device key this run, so the hello offers none");
+            }
             String::new()
         }
     }
@@ -646,133 +702,17 @@ pub fn device_key(config_path: &Path, tenant_id: &str) -> Result<Arc<DeviceKey>,
     // Read, or made and written, under the lock: two callers for one
     // enrollment can never each write a different key, leaving one of them
     // offering a key that is no longer on disk.
-    let key = Arc::new(load_adopt_or_make(&path, || {
-        ADOPT_FROM
-            .get()
-            .and_then(|from| adoption_source(from, config_path, tenant_id))
-    })?);
+    let folder = Folder::of(config_path, keeping_for(config_path))?;
+    let key = Arc::new(load_or_make(&folder, &file_name(&path))?);
     keys.insert(path, key.clone());
     Ok(key)
 }
 
-/// #3096 — the config a SystemContext worker's machine-global config was
-/// promoted from: the active user's, where every enrollment's key lived
-/// before the move. Set once, at start, by that worker alone.
-static ADOPT_FROM: OnceLock<PathBuf> = OnceLock::new();
-
-/// #3096 — a SystemContext worker that loaded the machine-global config names
-/// the config it may take an enrollment's key from, instead of minting one.
-///
-/// The machine-global config is a COPY of the person's own (the self-heal
-/// promotes it), and a copy made before [`promote`] existed carried no
-/// `peer-auth/`. So the first start that loaded it minted a new key for every
-/// enrollment, and every browser that had pinned the device refused it as
-/// `key-changed` — on a device whose identity had not changed at all
-/// (measured 2026-10-29). A sealed machine-global folder that turns readable
-/// again (#3073) does the same.
-pub fn adopt_keys_from(config_path: PathBuf) {
-    let _ = ADOPT_FROM.set(config_path);
-}
-
-/// #3096 — the key `tenant_id` has beside `from`, when `from` holds the SAME
-/// enrollment as `loaded`: the same machine, and the same agent id for this
-/// tenant. A key of anything else (another person's install, an enrollment
-/// replaced since) is never adopted; a new key is the honest answer then.
-///
-/// It asks for no new trust: the person's config is what this worker already
-/// runs on, keys included, whenever the machine-global one is absent.
-fn adoption_source(from: &Path, loaded: &Path, tenant_id: &str) -> Option<PathBuf> {
-    if from == loaded {
-        return None;
-    }
-    let key = key_path(from, tenant_id).ok()?;
-    if !key.is_file() {
-        return None;
-    }
-    let ours = crate::config::read_if_present(&loaded.to_path_buf());
-    let theirs = crate::config::read_if_present(&from.to_path_buf());
-    let same = matches!((&ours, &theirs), (Some(a), Some(b)) if same_enrollment(a, b, tenant_id));
-    if !same {
-        tracing::info!(
-            from = %from.display(), tenant = %tenant_id,
-            "peer-auth: the active user's config holds no matching enrollment, so its device key is not adopted"
-        );
-        return None;
-    }
-    Some(key)
-}
-
-/// Do `a` and `b` hold the same enrollment of `tenant_id`?
-fn same_enrollment(
-    a: &crate::config::AgentConfig,
-    b: &crate::config::AgentConfig,
-    tenant_id: &str,
-) -> bool {
-    fn agent_of<'c>(c: &'c crate::config::AgentConfig, tenant_id: &str) -> Option<&'c str> {
-        if c.tenant_id.eq_ignore_ascii_case(tenant_id) {
-            return Some(&c.agent_id);
-        }
-        c.orgs
-            .iter()
-            .find(|o| o.tenant_id.eq_ignore_ascii_case(tenant_id))
-            .map(|o| o.agent_id.as_str())
-    }
-    !a.machine_id.is_empty()
-        && a.machine_id == b.machine_id
-        && matches!(
-            (agent_of(a, tenant_id), agent_of(b, tenant_id)),
-            (Some(x), Some(y)) if !x.is_empty() && x == y
-        )
-}
-
-/// #3096 — carry every key and pin file beside `from_config` to the
-/// directory of `to_config`, BEFORE the config itself moves there (the
-/// SystemContext self-heal promotes a per-user config to the machine-global
-/// path). A key left behind is minted afresh by the next start that loads
-/// `to_config`, and every browser that pinned the device refuses it.
-///
-/// Never overwrites: a file already at the destination may hold a key that
-/// browsers have pinned since. Returns how many files it copied.
-pub fn promote(from_config: &Path, to_config: &Path) -> Result<usize, String> {
-    let dir_of = |p: &Path| -> Result<PathBuf, String> {
-        p.parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .map(|d| d.join(DIR_NAME))
-            .ok_or_else(|| format!("config path {} has no directory", p.display()))
-    };
-    let (src, dst) = (dir_of(from_config)?, dir_of(to_config)?);
-    let entries = match std::fs::read_dir(&src) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(format!("reading {}: {e}", src.display())),
-    };
-    let mut copied = 0;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("reading {}: {e}", src.display()))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str().filter(|n| is_peer_auth_file(n)) else {
-            continue;
-        };
-        let to = dst.join(name);
-        match to.try_exists() {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(e) => return Err(format!("checking {}: {e}", to.display())),
-        }
-        let bytes = std::fs::read(entry.path())
-            .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
-        write_private(&to, &bytes)?;
-        copied += 1;
-    }
-    Ok(copied)
-}
-
-/// `<24 hex>.json` (a key) or `<24 hex>.controllers.json` (its pins), and
-/// nothing else: never a write's `.tmp` sibling.
-fn is_peer_auth_file(name: &str) -> bool {
-    name.strip_suffix(".controllers.json")
-        .or_else(|| name.strip_suffix(".json"))
-        .is_some_and(|stem| stem.len() == 24 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+/// The last component of a path [`key_path`] or [`pins_path`] made.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Where `tenant_id`'s key lives: `<config dir>/peer-auth/<tenant id>.json`.
@@ -795,22 +735,15 @@ fn key_path(config_path: &Path, tenant_id: &str) -> Result<PathBuf, String> {
         .join(format!("{}.json", tenant_id.to_ascii_lowercase())))
 }
 
-/// Read the key at `path`, or make one and write it there. A key is returned
-/// only once it is on disk as the next start will read it.
-#[cfg(test)]
-fn load_or_make(path: &Path) -> Result<DeviceKey, String> {
-    load_adopt_or_make(path, || None)
-}
-
-/// [`load_or_make`], except that a key about to be made is first taken from
-/// `adopt()`, when that names this enrollment's key from before a config move
-/// (#3096). `adopt` runs only when there is no key to read.
-fn load_adopt_or_make(
-    path: &Path,
-    adopt: impl FnOnce() -> Option<PathBuf>,
-) -> Result<DeviceKey, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => match parse(&bytes) {
+/// Read the key file `name` of `folder`, or make a key and write it there. A
+/// key is returned only once it is on disk as the next start will read it.
+fn load_or_make(folder: &Folder, name: &str) -> Result<DeviceKey, String> {
+    let path = folder.dir().join(name);
+    let path = path.as_path();
+    // Present but unreadable (permissions, I/O): `?`, never overwriting a
+    // file that may hold a good key this process merely cannot open.
+    match folder.read(name, KEY_MAX)? {
+        Found::Bytes(bytes) => match parse(&bytes) {
             Read::Key(key) => return Ok(*key),
             Read::Foreign(why) => {
                 return Err(format!(
@@ -824,15 +757,20 @@ fn load_adopt_or_make(
                  a browser that pinned the old one will warn"
             ),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // Present but unreadable (permissions, I/O): never overwrite a file
-        // that may hold a good key this process merely cannot open.
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
-    }
-    if let Some(from) = adopt()
-        && let Some(key) = adopt_key(&from, path)
-    {
-        return Ok(key);
+        Found::TooLarge => tracing::warn!(
+            path = %path.display(),
+            "peer-auth: the device key file is too large to be one, so a new key replaces it; \
+             a browser that pinned the old one will warn"
+        ),
+        Found::Absent => {}
+        // Sealed, and another account can change it: not offered, and left
+        // as it is (a key that cannot be kept is never offered).
+        Found::Refused(why) => {
+            return Err(format!(
+                "{} is not used, and is left as it is: {why}",
+                path.display()
+            ));
+        }
     }
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
@@ -843,9 +781,16 @@ fn load_adopt_or_make(
         pkcs8: STANDARD.encode(pkcs8.as_ref()),
     };
     let bytes = serde_json::to_vec_pretty(&stored).map_err(|e| e.to_string())?;
-    write_private(path, &bytes)?;
-    let written =
-        std::fs::read(path).map_err(|e| format!("reading back {}: {e}", path.display()))?;
+    folder.write(name, &bytes)?;
+    let written = match folder.read(name, KEY_MAX) {
+        Ok(Found::Bytes(written)) => written,
+        Ok(Found::Absent | Found::TooLarge) => {
+            return Err(format!("{} did not read back as written", path.display()));
+        }
+        Ok(Found::Refused(why)) | Err(why) => {
+            return Err(format!("reading back {}: {why}", path.display()));
+        }
+    };
     match parse(&written) {
         Read::Key(key) => {
             tracing::info!(path = %path.display(), "peer-auth: made this enrollment's device key");
@@ -856,54 +801,6 @@ fn load_adopt_or_make(
             path.display()
         )),
     }
-}
-
-/// #3096 — copy the key at `from` to `to` and read it back as the next start
-/// will, with its pins when `to` has none yet. `None` means "make a new one
-/// instead", with the reason logged: a key this build cannot read is never
-/// adopted, and neither is one that does not survive the copy.
-fn adopt_key(from: &Path, to: &Path) -> Option<DeviceKey> {
-    let bytes = match std::fs::read(from) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(from = %from.display(), %e, "peer-auth: the device key to adopt is unreadable, so a new one is made");
-            return None;
-        }
-    };
-    if !matches!(parse(&bytes), Read::Key(_)) {
-        tracing::warn!(from = %from.display(), "peer-auth: the device key to adopt is not one this build reads, so a new one is made");
-        return None;
-    }
-    if let Err(why) = write_private(to, &bytes) {
-        tracing::warn!(to = %to.display(), %why, "peer-auth: the device key could not be adopted, so a new one is made");
-        return None;
-    }
-    let Ok(Read::Key(key)) = std::fs::read(to).map(|b| parse(&b)) else {
-        tracing::warn!(to = %to.display(), "peer-auth: the adopted device key did not read back as written, so a new one is made");
-        return None;
-    };
-    // Its pins as well: without them every browser it knew reads `unknown`
-    // once more. Best effort, since the pins are only a cache of first
-    // sightings.
-    if let (Some(stem), Some(from_dir), Some(to_dir)) = (
-        to.file_stem().and_then(|s| s.to_str()),
-        from.parent(),
-        to.parent(),
-    ) {
-        let name = format!("{stem}.controllers.json");
-        let to_pins = to_dir.join(&name);
-        if !to_pins.exists()
-            && let Ok(pins) = std::fs::read(from_dir.join(&name))
-            && let Err(why) = write_private(&to_pins, &pins)
-        {
-            tracing::warn!(to = %to_pins.display(), %why, "peer-auth: the browser keys this device knew could not be carried over");
-        }
-    }
-    tracing::info!(
-        from = %from.display(), to = %to.display(),
-        "peer-auth: adopted this enrollment's device key from the config this one was promoted from, so browsers that pinned it still know the device"
-    );
-    Some(*key)
 }
 
 fn parse(bytes: &[u8]) -> Read {
@@ -941,18 +838,26 @@ fn parse(bytes: &[u8]) -> Read {
 }
 
 /// Write `bytes` to `path` whole or not at all (a sibling, synced, renamed),
-/// readable by the daemon's own identity alone.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// by path: [`Keeping::Plain`]'s writer. On Unix readable by the daemon's own
+/// identity alone; on Windows with what the folder hands down. Each error
+/// keeps its kind, so a run that is not elevated can say why it was denied.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("{} has no directory", path.display()))?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("making {}: {e}", dir.display()))?;
+    let context = |what: String| {
+        move |e: std::io::Error| std::io::Error::new(e.kind(), format!("{what}: {e}"))
+    };
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no directory", path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(dir).map_err(context(format!("making {}", dir.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("restricting {}: {e}", dir.display()))?;
+            .map_err(context(format!("restricting {}", dir.display())))?;
     }
     let tmp = path.with_extension("json.tmp");
     // A stale sibling would keep its own mode: `mode` applies only to a file
@@ -967,12 +872,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let mut file = opts
         .open(&tmp)
-        .map_err(|e| format!("making {}: {e}", tmp.display()))?;
+        .map_err(context(format!("making {}", tmp.display())))?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        .map_err(context(format!("writing {}", tmp.display())))?;
     drop(file);
-    std::fs::rename(&tmp, path).map_err(|e| format!("placing {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(context(format!("placing {}", path.display())))?;
     // The rename itself survives a power cut only once the directory is
     // synced. Best effort: the key is already whole on disk either way.
     #[cfg(unix)]
@@ -980,6 +885,653 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+// ─── Where the folder is kept ───────────────────────────────────────────────
+
+/// A key file is a few hundred bytes; past this it is not one.
+const KEY_MAX: u64 = 64 * 1024;
+/// 256 users of 16 keys each stay well below this.
+const PINS_MAX: u64 = 1024 * 1024;
+
+/// How this process keeps the `peer-auth` folder of a config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keeping {
+    /// Read, and written by path, with what the folder hands down ([`Plain`]
+    /// says why).
+    Plain(Plain),
+    /// Windows, elevated or SYSTEM, a config outside the machine folder: the
+    /// folder sealed to SYSTEM and Administrators, read and written by handle.
+    Sealed,
+}
+
+/// Why a folder is kept [`Keeping::Plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plain {
+    /// Unix: the folder is made 0700 and its files 0600.
+    NotWindows,
+    /// The machine config's folder, which `machine_tree` seals and checks.
+    MachineFolder,
+    /// Neither elevated nor SYSTEM (a per-user install): this run may not
+    /// seal, and changes nothing. A folder an elevated run sealed is closed
+    /// to it.
+    NotElevated,
+    /// `ROOMLERD_PEER_AUTH_SEAL=0` in the service's `Environment` value.
+    SwitchedOff,
+}
+
+/// The decision, pure. `seal_on` is read only when it decides.
+pub(crate) fn keeping(
+    windows: bool,
+    elevated: bool,
+    machine_folder: bool,
+    seal_on: impl FnOnce() -> bool,
+) -> Keeping {
+    if !windows {
+        Keeping::Plain(Plain::NotWindows)
+    } else if machine_folder {
+        Keeping::Plain(Plain::MachineFolder)
+    } else if !elevated {
+        Keeping::Plain(Plain::NotElevated)
+    } else if !seal_on() {
+        Keeping::Plain(Plain::SwitchedOff)
+    } else {
+        Keeping::Sealed
+    }
+}
+
+/// What [`seal_enabled_in`] reads, after one of `tunnel_core::env::PREFIXES`.
+const SEAL_SWITCH: &str = "PEER_AUTH_SEAL";
+
+/// The seal's switch over the service's `Environment` value, read as #3814's
+/// companion switch is: under the first of `tunnel_core::env::PREFIXES` it is
+/// named with, in any case, as `flag` reads it. A value that could not be read
+/// (`None`), or one that does not name it, leaves the seal on. Never the
+/// process's own environment or the config: the switch is the service's, set
+/// where only an administrator sets it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn seal_enabled_in(service_env: Option<&[(String, String)]>) -> bool {
+    let value = service_env.and_then(|env| {
+        tunnel_core::env::PREFIXES.iter().find_map(|prefix| {
+            let name = format!("{prefix}{SEAL_SWITCH}");
+            env.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v.as_str())
+        })
+    });
+    tunnel_core::env::flag_value(value, true)
+}
+
+/// [`keeping`] for this process and `config_path`.
+fn keeping_for(config_path: &Path) -> Keeping {
+    #[cfg(test)]
+    if let Some(kept) = KEPT_AS.with(std::cell::Cell::get) {
+        return kept;
+    }
+    #[cfg(windows)]
+    {
+        let machine = roomler_node_core::machine_tree::MachineTree::here();
+        keeping(
+            true,
+            process_elevated(),
+            config_path.starts_with(machine.folder()),
+            service_seal_enabled,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config_path;
+        keeping(false, false, false, || true)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: how this thread's test keeps every folder.
+    static KEPT_AS: std::cell::Cell<Option<Keeping>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(windows)]
+fn process_elevated() -> bool {
+    static ELEVATED: OnceLock<bool> = OnceLock::new();
+    *ELEVATED.get_or_init(crate::win_identity::process_is_elevated)
+}
+
+/// [`seal_enabled_in`] for this install's service. The service host's
+/// environment is fixed from its start, so the first read that succeeds
+/// stands for this process's life; a read that fails leaves the seal on, and
+/// the next asks again.
+#[cfg(windows)]
+fn service_seal_enabled() -> bool {
+    static READ: OnceLock<bool> = OnceLock::new();
+    if let Some(on) = READ.get() {
+        return *on;
+    }
+    match crate::win_service::environment::read_service_env() {
+        Ok(env) => *READ.get_or_init(|| seal_enabled_in(Some(&env))),
+        Err(_) => seal_enabled_in(None),
+    }
+}
+
+/// Whether `what` is said for the first time in this process: a line logged
+/// once, not at every hello or offer. Bounded: past 256 it starts over.
+fn first_time(what: String) -> bool {
+    static SAID: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let mut said = SAID
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if said.len() >= 256 {
+        said.clear();
+    }
+    said.insert(what)
+}
+
+/// The `peer-auth` folder of one config, as this process keeps it.
+struct Folder {
+    /// The config's own folder, from which a sealed `peer-auth` is reached.
+    base: PathBuf,
+    keeping: Keeping,
+}
+
+/// What [`Folder::read`] found at a name.
+enum Found {
+    Absent,
+    Bytes(Vec<u8>),
+    /// Larger than a file of its kind can be (a sealed read only).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    TooLarge,
+    /// Sealed, and not used: the folder or the file lets an account other
+    /// than SYSTEM or Administrators change it, or it is not a plain file.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Refused(String),
+}
+
+/// [`Keeping`], once this process has tried to seal the folder.
+enum Mode {
+    Plain(Plain),
+    #[cfg(windows)]
+    Sealed,
+    /// The config's folder cannot be held as itself (a share, a link, a
+    /// redirected profile): the key is kept as before, the browser keys not
+    /// at all.
+    #[cfg(windows)]
+    Unsealable,
+}
+
+impl Folder {
+    fn of(config_path: &Path, keeping: Keeping) -> Result<Self, String> {
+        let base = config_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .ok_or_else(|| format!("config path {} has no directory", config_path.display()))?;
+        if keeping == Keeping::Plain(Plain::SwitchedOff)
+            && first_time(format!("seal switched off {}", base.display()))
+        {
+            tracing::warn!(
+                path = %base.join(DIR_NAME).display(),
+                "peer-auth: ROOMLERD_PEER_AUTH_SEAL=0 in the service's environment, so the \
+                 folder is not sealed: it is read and written as before"
+            );
+        }
+        Ok(Self {
+            base: base.to_path_buf(),
+            keeping,
+        })
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.base.join(DIR_NAME)
+    }
+
+    fn mode(&self) -> Result<Mode, String> {
+        match self.keeping {
+            Keeping::Plain(why) => Ok(Mode::Plain(why)),
+            #[cfg(windows)]
+            Keeping::Sealed => sealed::ensure(&self.base),
+            #[cfg(not(windows))]
+            Keeping::Sealed => Ok(Mode::Plain(Plain::NotWindows)),
+        }
+    }
+
+    /// No browser keys are read or kept here: a folder that cannot be sealed.
+    fn keeps_no_pins(&self) -> Result<bool, String> {
+        let mode = self.mode()?;
+        #[cfg(windows)]
+        let none = matches!(mode, Mode::Unsealable);
+        #[cfg(not(windows))]
+        let none = {
+            let _ = mode;
+            false
+        };
+        Ok(none)
+    }
+
+    /// The file `name`: by handle and judged where the folder is sealed (at
+    /// most `max_len` bytes), by path otherwise.
+    fn read(&self, name: &str, max_len: u64) -> Result<Found, String> {
+        let why = match self.mode()? {
+            Mode::Plain(why) => Some(why),
+            #[cfg(windows)]
+            Mode::Sealed => return sealed::read(&self.base, name, max_len),
+            #[cfg(windows)]
+            Mode::Unsealable => None,
+        };
+        let _ = max_len;
+        let path = self.dir().join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Found::Bytes(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Found::Absent),
+            Err(e) => Err(self
+                .denied(&e, why)
+                .unwrap_or_else(|| format!("reading {}: {e}", path.display()))),
+        }
+    }
+
+    /// Write `bytes` as the file `name`: sealed and by handle where the
+    /// folder is sealed, by path otherwise.
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let why = match self.mode()? {
+            Mode::Plain(why) => Some(why),
+            #[cfg(windows)]
+            Mode::Sealed => return sealed::write(&self.base, name, bytes),
+            #[cfg(windows)]
+            Mode::Unsealable => None,
+        };
+        write_private(&self.dir().join(name), bytes)
+            .map_err(|e| self.denied(&e, why).unwrap_or_else(|| e.to_string()))
+    }
+
+    /// A run that is neither elevated nor SYSTEM, denied: the cause, and what
+    /// to do about it. It deletes nothing.
+    fn denied(&self, e: &std::io::Error, why: Option<Plain>) -> Option<String> {
+        (why == Some(Plain::NotElevated) && e.kind() == std::io::ErrorKind::PermissionDenied).then(
+            || {
+                format!(
+                    "{} is closed to this run ({e}): an elevated run seals it to SYSTEM and \
+                     Administrators, and this run is neither elevated nor SYSTEM. Start \
+                     roomlerd elevated again, as its service does; or an administrator moves \
+                     that folder away, and a new device key is made, which each browser that \
+                     knew this device warns about once",
+                    self.dir().display()
+                )
+            },
+        )
+    }
+}
+
+/// [`Keeping::Sealed`]: the seal, and the reads and writes by handle
+/// (`machine_tree::HeldPath`, FR-145's rule).
+#[cfg(windows)]
+mod sealed {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use roomler_node_core::machine_tree::{
+        self, ADMINISTRATORS, HeldPath, OpenFor, Sd, Seal, WRITE_LIKE, Why, trusted, verdict,
+    };
+
+    use super::{DIR_NAME, Found, KEY_MAX, Mode, PINS_MAX, first_time};
+
+    /// Per config folder, once this process sealed it: whether it cannot be
+    /// sealed here. Its lock is also held by every sealed write, so two never
+    /// move or seal the same entry at once.
+    fn state() -> MutexGuard<'static, HashMap<PathBuf, bool>> {
+        static STATE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+        STATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The first time this process keeps `base`'s folder, [`seal`] it; after
+    /// that, what that found. A folder that cannot be sealed is said once.
+    pub(super) fn ensure(base: &Path) -> Result<Mode, String> {
+        let mut state = state();
+        if let Some(&unsealable) = state.get(base) {
+            return Ok(if unsealable {
+                Mode::Unsealable
+            } else {
+                Mode::Sealed
+            });
+        }
+        match seal(base) {
+            Ok(_) => {
+                state.insert(base.to_path_buf(), false);
+                Ok(Mode::Sealed)
+            }
+            Err(Failure::Unsealable(why)) => {
+                tracing::warn!(
+                    path = %base.join(DIR_NAME).display(), reason = %why,
+                    "peer-auth: the folder cannot be sealed here, so the device key is read and \
+                     written as before, and the browser keys are neither read nor kept: each \
+                     browser reads `unknown`"
+                );
+                state.insert(base.to_path_buf(), true);
+                Ok(Mode::Unsealable)
+            }
+            Err(Failure::Failed(why)) => Err(why),
+        }
+    }
+
+    /// `name`, written sealed and by handle, after the seal's as-found rule
+    /// ran again: whatever changed in the folder since is judged first.
+    pub(super) fn write(base: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let _one = state();
+        let held = seal(base).map_err(Failure::into_reason)?;
+        held.write_file(name, bytes, Seal::Private)
+            .map_err(|r| r.to_string())
+    }
+
+    /// `name`, read by handle: the folder held below `base`, its owner and
+    /// DACL judged, the file opened below it and judged the same way
+    /// ([`verdict`]: SYSTEM or Administrators own it, and no other account
+    /// may change it), then read through that handle.
+    pub(super) fn read(base: &Path, name: &str, max_len: u64) -> Result<Found, String> {
+        let dir = base.join(DIR_NAME);
+        let folder = match machine_tree::held_below(base, &dir) {
+            Ok(Some(folder)) => folder,
+            Ok(None) => return Ok(Found::Absent),
+            Err(why) => return Ok(Found::Refused(why)),
+        };
+        let judged = folder
+            .security()
+            .and_then(|sd| verdict(&sd, WRITE_LIKE, &dir.display().to_string()));
+        if let Err(why) = judged {
+            return Ok(Found::Refused(why));
+        }
+        let file = match folder.file(name, OpenFor::Read) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(Found::Absent),
+            Err(why) => return Ok(Found::Refused(why)),
+        };
+        let path = dir.join(name);
+        let judged = file
+            .security()
+            .and_then(|sd| verdict(&sd, WRITE_LIKE, &path.display().to_string()));
+        if let Err(why) = judged {
+            return Ok(Found::Refused(why));
+        }
+        Ok(match file.read_bytes(max_len)? {
+            Some(bytes) => Found::Bytes(bytes),
+            None => Found::TooLarge,
+        })
+    }
+
+    pub(super) enum Failure {
+        /// The config's folder cannot be held as itself: a share, a link, a
+        /// redirected profile.
+        Unsealable(String),
+        /// Anything else, this time.
+        Failed(String),
+    }
+
+    impl Failure {
+        fn into_reason(self) -> String {
+            match self {
+                Self::Unsealable(why) | Self::Failed(why) => why,
+            }
+        }
+    }
+
+    /// The folder as found, before anything is sealed.
+    enum AsFound {
+        Absent,
+        /// SYSTEM or Administrators own it; `closed`: no other account could
+        /// change what it holds.
+        Ours {
+            closed: bool,
+        },
+        /// Another account owns it.
+        Foreign(String),
+        /// A link, or not a folder.
+        NotAFolder(String),
+        /// Anything else that kept it from being read.
+        Unread(String),
+    }
+
+    /// A file the folder holds that this module reads.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Key,
+        Pins,
+    }
+
+    /// `<tenant id>.json` or `<tenant id>.controllers.json` (`key_path`,
+    /// `pins_path`); nothing else is read, sealed or moved.
+    fn kind_of(name: &str) -> Option<Kind> {
+        let id = |id: &str| id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit());
+        if let Some(tenant) = name.strip_suffix(".controllers.json") {
+            return id(tenant).then_some(Kind::Pins);
+        }
+        name.strip_suffix(".json")
+            .filter(|tenant| id(tenant))
+            .map(|_| Kind::Key)
+    }
+
+    /// Owner Administrators, protected, SYSTEM and Administrators full
+    /// control and nothing else: what [`Seal::Private`] gives a file.
+    fn exactly_sealed(sd: &Sd) -> bool {
+        let want = Seal::Private.aces(0);
+        sd.owner == ADMINISTRATORS
+            && sd.protected
+            && sd.dacl.as_ref().is_some_and(|aces| {
+                aces.len() == want.len() && want.iter().all(|w| aces.contains(w))
+            })
+    }
+
+    /// Seal `<base>/peer-auth`, reading as found first, because a seal makes
+    /// every later check pass on whatever the folder holds:
+    ///
+    /// - the folder: made sealed when absent, sealed in place when SYSTEM or
+    ///   Administrators own it, and moved aside whole (never followed, nothing
+    ///   in it deleted) when another account owns it or it is not a folder
+    ///   (`HeldPath::sealed_dir`'s leaf policy);
+    /// - a key file is kept, with the same bytes, only when SYSTEM or
+    ///   Administrators own it and its folder: an elevated or SYSTEM run made
+    ///   both. Any other is moved aside, and a new key is made;
+    /// - a browser-key file is kept only when its folder and the file were
+    ///   both closed to every other account as found; any other is moved
+    ///   aside, and each browser reads `unknown` once more.
+    ///
+    /// A file kept is written fresh with the seal and renamed into place by
+    /// handle, unless it already has exactly the seal. What is moved aside
+    /// goes to the config's folder as `peer-auth.<name>.not-sealed-<UTC
+    /// time>`. Nothing is deleted. Nothing changes, and nothing is said, when
+    /// everything already has the seal.
+    pub(super) fn seal(base_path: &Path) -> Result<HeldPath, Failure> {
+        // The config's folder, made as before when it is not there yet: the
+        // plain writer made it the same way.
+        if !base_path.exists() {
+            std::fs::create_dir_all(base_path)
+                .map_err(|e| Failure::Failed(format!("making {}: {e}", base_path.display())))?;
+        }
+        let base = HeldPath::base(base_path).map_err(|r| match r.why {
+            // Reached through a link, on a share, or not a folder: no seal
+            // made here could hold.
+            Why::Elsewhere { .. } | Why::Link | Why::NotFolder => {
+                Failure::Unsealable(r.to_string())
+            }
+            _ => Failure::Failed(r.to_string()),
+        })?;
+        let dir = base_path.join(DIR_NAME);
+        let found = match base.open_dir(DIR_NAME) {
+            Ok(None) => AsFound::Absent,
+            Ok(Some(held)) => match held.folder().security() {
+                Ok(sd) if trusted(&sd.owner) => AsFound::Ours {
+                    closed: verdict(&sd, WRITE_LIKE, "the folder").is_ok(),
+                },
+                Ok(sd) => AsFound::Foreign(sd.owner),
+                Err(why) => AsFound::Unread(why),
+            },
+            Err(refusal) => match refusal.why {
+                Why::Link | Why::NotFolder => AsFound::NotAFolder(refusal.to_string()),
+                _ => AsFound::Unread(refusal.to_string()),
+            },
+        };
+        let held = base
+            .sealed_dir(DIR_NAME, Seal::Private)
+            .map_err(|r| Failure::Failed(r.to_string()))?;
+        let folder_closed = match &found {
+            AsFound::Absent => true,
+            AsFound::Ours { closed } => *closed,
+            AsFound::Foreign(owner) => {
+                tracing::warn!(
+                    path = %dir.display(), %owner,
+                    "peer-auth: the folder was owned by an account other than SYSTEM or \
+                     Administrators, so the device keys in it are not kept: it is moved aside \
+                     whole, and nothing in it is deleted. New device keys are made, and each \
+                     browser that knew this device's old key warns once"
+                );
+                false
+            }
+            AsFound::NotAFolder(why) => {
+                tracing::warn!(
+                    path = %dir.display(), reason = %why,
+                    "peer-auth: the folder was not a plain folder: it is moved aside, never \
+                     followed, and nothing is deleted. New device keys are made, and each \
+                     browser that knew this device's old key warns once"
+                );
+                false
+            }
+            AsFound::Unread(why) => {
+                tracing::warn!(
+                    path = %dir.display(), reason = %why,
+                    "peer-auth: the folder could not be read as found, so no browser-key file \
+                     in it is kept"
+                );
+                false
+            }
+        };
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let mut sealed = held.resealed();
+        let entries = held.entries().map_err(|r| Failure::Failed(r.to_string()))?;
+        for entry in entries {
+            let Some(kind) = kind_of(&entry.name) else {
+                continue;
+            };
+            let done = if entry.is_dir || entry.is_link {
+                Err("it is not a plain file".to_string())
+            } else {
+                seal_file(&held, &base, &entry.name, kind, folder_closed, &stamp)
+            };
+            match done {
+                Ok(now) => sealed |= now,
+                // One file's trouble is that file's: the rest are sealed, and
+                // a later read refuses this one, so nothing in it is used.
+                Err(why) => {
+                    let path = dir.join(&entry.name);
+                    if first_time(format!("left {} {why}", path.display())) {
+                        tracing::warn!(
+                            path = %path.display(), reason = %why,
+                            "peer-auth: this file could be neither sealed nor moved aside, so it \
+                             is not used, and it is left as it is"
+                        );
+                    }
+                }
+            }
+        }
+        if sealed {
+            tracing::warn!(
+                path = %dir.display(),
+                "peer-auth: sealed the folder in place to SYSTEM and Administrators; the device \
+                 keys in it are kept"
+            );
+        }
+        Ok(held)
+    }
+
+    /// One key or browser-key file of a folder [`seal`] holds: kept and
+    /// sealed, or moved aside, by the rules there. `Ok(true)`: it was sealed
+    /// now.
+    fn seal_file(
+        held: &HeldPath,
+        base: &HeldPath,
+        name: &str,
+        kind: Kind,
+        folder_closed: bool,
+        stamp: &str,
+    ) -> Result<bool, String> {
+        let Some(file) = held.folder().file(name, OpenFor::Read)? else {
+            return Ok(false);
+        };
+        let sd = file.security()?;
+        let keep = match kind {
+            Kind::Key if trusted(&sd.owner) => Ok(()),
+            Kind::Key => Err(format!(
+                "it was owned by {}, an account other than SYSTEM or Administrators",
+                sd.owner
+            )),
+            Kind::Pins if folder_closed => verdict(&sd, WRITE_LIKE, "it"),
+            Kind::Pins => Err(
+                "its folder let an account other than SYSTEM or Administrators change what it \
+                 held"
+                    .to_string(),
+            ),
+        };
+        if keep.is_ok() && exactly_sealed(&sd) {
+            return Ok(false);
+        }
+        let max_len = if kind == Kind::Key { KEY_MAX } else { PINS_MAX };
+        let bytes = match keep {
+            Ok(()) => file.read_bytes(max_len)?,
+            Err(_) => None,
+        };
+        drop(file);
+        if let Some(bytes) = bytes {
+            held.write_file(name, &bytes, Seal::Private)
+                .map_err(|r| r.to_string())?;
+            return Ok(true);
+        }
+        let why = keep
+            .err()
+            .unwrap_or_else(|| "it is too large to be one".to_string());
+        let path = held.path().join(name);
+        let aside = move_aside(held, base, name, stamp)?;
+        match kind {
+            Kind::Key => tracing::warn!(
+                path = %path.display(), moved_to = %aside.display(), reason = %why,
+                "peer-auth: the device key in this file is not kept: it is moved aside, and \
+                 nothing is deleted. A new device key is made, and each browser that knew this \
+                 device's old key warns once"
+            ),
+            Kind::Pins => tracing::warn!(
+                path = %path.display(), moved_to = %aside.display(), reason = %why,
+                "peer-auth: the browser-key file is not kept: it is moved aside, and nothing is \
+                 deleted. Each browser reads `unknown` once more"
+            ),
+        }
+        Ok(false)
+    }
+
+    /// Move the file `name` of `held` to `base` as `peer-auth.<name>.not-sealed-
+    /// <stamp>`, by its handle: never through a link, and nothing replaced.
+    fn move_aside(
+        held: &HeldPath,
+        base: &HeldPath,
+        name: &str,
+        stamp: &str,
+    ) -> Result<PathBuf, String> {
+        let mut last = String::new();
+        for n in 0..10 {
+            let aside = if n == 0 {
+                format!("{DIR_NAME}.{name}.not-sealed-{stamp}")
+            } else {
+                format!("{DIR_NAME}.{name}.not-sealed-{stamp}-{n}")
+            };
+            match held.rename_file(name, base, &aside, false) {
+                Ok(()) => return Ok(base.path().join(aside)),
+                Err(refusal) => match &refusal.why {
+                    Why::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        last = refusal.to_string();
+                    }
+                    _ => return Err(refusal.to_string()),
+                },
+            }
+        }
+        Err(last)
+    }
 }
 
 #[cfg(test)]
@@ -994,16 +1546,45 @@ mod tests {
         dir.path().join("config.toml")
     }
 
+    /// [`load_or_make`] for the key file at `path` (`key_path`'s), kept as
+    /// this process keeps that config's folder.
+    fn load_at(path: &Path) -> Result<DeviceKey, String> {
+        let cfg = path.parent().unwrap().parent().unwrap().join("config.toml");
+        let folder = Folder::of(&cfg, keeping_for(&cfg))?;
+        load_or_make(&folder, &file_name(path))
+    }
+
+    /// `f`, with every folder this thread's test touches kept as `kept`.
+    fn kept_as<T>(kept: Keeping, f: impl FnOnce() -> T) -> T {
+        struct Reset(Option<Keeping>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                KEPT_AS.with(|k| k.set(self.0));
+            }
+        }
+        let _reset = Reset(KEPT_AS.with(|k| k.replace(Some(kept))));
+        f()
+    }
+
+    /// What a per-user install does on this platform: nothing sealed.
+    fn plain() -> Keeping {
+        Keeping::Plain(if cfg!(windows) {
+            Plain::NotElevated
+        } else {
+            Plain::NotWindows
+        })
+    }
+
     #[test]
     fn a_key_is_made_once_and_read_back_the_same() {
         let dir = tempfile::tempdir().unwrap();
         let path = key_path(&config_in(&dir), TENANT_A).unwrap();
         assert!(!path.exists());
-        let made = load_or_make(&path).unwrap().public_b64();
+        let made = load_at(&path).unwrap().public_b64();
         assert!(path.exists());
         assert!(peer_auth_key_is_well_formed(&made), "{made}");
         // A second read — a restart — finds the same key, and makes none.
-        assert_eq!(load_or_make(&path).unwrap().public_b64(), made);
+        assert_eq!(load_at(&path).unwrap().public_b64(), made);
     }
 
     /// AC7 at the unit level: two enrollments on one device, two keys, two
@@ -1015,8 +1596,8 @@ mod tests {
         let b = key_path(&config_in(&dir), TENANT_B).unwrap();
         assert_ne!(a, b);
         assert_ne!(
-            load_or_make(&a).unwrap().public_b64(),
-            load_or_make(&b).unwrap().public_b64()
+            load_at(&a).unwrap().public_b64(),
+            load_at(&b).unwrap().public_b64()
         );
     }
 
@@ -1038,16 +1619,16 @@ mod tests {
             b"{\"version\":1,\"alg\":\"ecdsa-p256-sha256\",\"pkcs8\":\"AAAA\"}",
         )
         .unwrap();
-        let key = load_or_make(&path).unwrap().public_b64();
+        let key = load_at(&path).unwrap().public_b64();
         assert!(peer_auth_key_is_well_formed(&key));
         assert_eq!(
-            load_or_make(&path).unwrap().public_b64(),
+            load_at(&path).unwrap().public_b64(),
             key,
             "the replacement stuck"
         );
         std::fs::write(&path, b"\0\0\0\0").unwrap();
         assert!(
-            load_or_make(&path).is_ok(),
+            load_at(&path).is_ok(),
             "NUL-filled, as an unclean shutdown leaves"
         );
     }
@@ -1056,26 +1637,31 @@ mod tests {
     /// as it was, and this build offers none.
     #[test]
     fn a_newer_key_file_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = key_path(&config_in(&dir), TENANT_A).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let newer = br#"{"version":2,"alg":"ecdsa-p256-sha256","pkcs8":"from the future"}"#;
-        std::fs::write(&path, newer).unwrap();
-        assert!(load_or_make(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), newer);
+        kept_as(plain(), || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = key_path(&config_in(&dir), TENANT_A).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let newer = br#"{"version":2,"alg":"ecdsa-p256-sha256","pkcs8":"from the future"}"#;
+            std::fs::write(&path, newer).unwrap();
+            assert!(load_at(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), newer);
+        });
     }
 
     /// A key that cannot be written is not offered: `peer-auth` is a FILE
-    /// here, so the directory cannot be made.
+    /// here, so the directory cannot be made. (Where the folder is sealed,
+    /// what is in the way is moved aside instead.)
     #[test]
     fn a_key_that_cannot_be_kept_is_not_offered() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(DIR_NAME), b"in the way").unwrap();
-        assert_eq!(hello_key(&config_in(&dir), TENANT_A), "");
-        assert!(
-            device_key(&config_in(&dir), TENANT_A).is_err(),
-            "and nothing was cached"
-        );
+        kept_as(plain(), || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(DIR_NAME), b"in the way").unwrap();
+            assert_eq!(hello_key(&config_in(&dir), TENANT_A), "");
+            assert!(
+                device_key(&config_in(&dir), TENANT_A).is_err(),
+                "and nothing was cached"
+            );
+        });
     }
 
     /// A bare config name has no directory of its own: no key, and nothing
@@ -1117,7 +1703,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = key_path(&config_in(&dir), TENANT_A).unwrap();
-        load_or_make(&path).unwrap();
+        load_at(&path).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
@@ -1244,23 +1830,25 @@ mod tests {
 
     #[test]
     fn an_enrollment_without_a_kept_key_signs_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(DIR_NAME), b"in the way").unwrap();
-        let offers = PendingOffers::default();
-        let (session, user) = (ObjectId::new(), ObjectId::new());
-        offers.note_request(session, user);
-        offers.note_offer(session, OFFER_SDP, Some(&ask()));
-        assert!(
-            sign_answer(
-                &offers,
-                &config_in(&dir),
-                TENANT_A,
-                AGENT,
-                session,
-                ANSWER_SDP
-            )
-            .is_none()
-        );
+        kept_as(plain(), || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(DIR_NAME), b"in the way").unwrap();
+            let offers = PendingOffers::default();
+            let (session, user) = (ObjectId::new(), ObjectId::new());
+            offers.note_request(session, user);
+            offers.note_offer(session, OFFER_SDP, Some(&ask()));
+            assert!(
+                sign_answer(
+                    &offers,
+                    &config_in(&dir),
+                    TENANT_A,
+                    AGENT,
+                    session,
+                    ANSWER_SDP
+                )
+                .is_none()
+            );
+        });
     }
 
     /// The FR-43 choke point: a worker's answer leaves signed by the daemon,
@@ -1654,7 +2242,7 @@ mod tests {
         let user = ObjectId::new();
         let keys: Vec<String> = (0..=MAX_KEYS_PER_USER).map(|_| browser().key).collect();
         for key in &keys {
-            assert_eq!(remember(&cfg, TENANT_A, user, key), Ok(false));
+            assert_eq!(remember(&cfg, TENANT_A, user, key), Ok(Pinned::Now));
         }
         let stored: PinFile =
             serde_json::from_slice(&std::fs::read(pins_path(&cfg, TENANT_A).unwrap()).unwrap())
@@ -1673,21 +2261,23 @@ mod tests {
     /// `unknown`, honestly).
     #[test]
     fn a_newer_pin_file_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = config_in(&dir);
-        let path = pins_path(&cfg, TENANT_A).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let newer = br#"{"version":2,"users":{"from":"the future"}}"#;
-        std::fs::write(&path, newer).unwrap();
-        let offers = PendingOffers::default();
-        let session = ObjectId::new();
-        let user = ObjectId::new();
-        let ask = signed_offer(&browser(), session, user);
-        assert_eq!(
-            judged(&offers, &cfg, PeerAuthPolicy::Audit, session, user, &ask),
-            Some(Verdict::Unknown)
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), newer);
+        kept_as(plain(), || {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let path = pins_path(&cfg, TENANT_A).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let newer = br#"{"version":2,"users":{"from":"the future"}}"#;
+            std::fs::write(&path, newer).unwrap();
+            let offers = PendingOffers::default();
+            let session = ObjectId::new();
+            let user = ObjectId::new();
+            let ask = signed_offer(&browser(), session, user);
+            assert_eq!(
+                judged(&offers, &cfg, PeerAuthPolicy::Audit, session, user, &ask),
+                Some(Verdict::Unknown)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), newer);
+        });
     }
 
     /// A bare config name has no directory: nothing is remembered, nothing is
@@ -1720,205 +2310,568 @@ mod tests {
         );
     }
 
-    // ── #3096: a config that moves keeps its device keys ─────────────────
+    // ─── where the folder is kept ───────────────────────────────────────
 
-    const AGENT_A: &str = "66f0c0ffee00000000000aa1";
-    const AGENT_B: &str = "66f0c0ffee00000000000bb2";
-    const PINS: &[u8] = br#"{"version":1,"users":{}}"#;
-
-    /// A config in `dir` holding `tenant`'s enrollment as `agent` on
-    /// `machine`, as the self-heal writes one.
-    fn enrolled(dir: &tempfile::TempDir, tenant: &str, agent: &str, machine: &str) -> PathBuf {
-        let mut cfg = crate::config::test_fixture();
-        cfg.tenant_id = tenant.into();
-        cfg.agent_id = agent.into();
-        cfg.machine_id = machine.into();
-        let path = config_in(dir);
-        crate::config::save(&path, &cfg).unwrap();
-        path
-    }
-
-    fn key_of(config: &Path, tenant: &str) -> String {
-        load_or_make(&key_path(config, tenant).unwrap())
-            .unwrap()
-            .public_b64()
-    }
-
+    /// The seal applies on Windows to an elevated or SYSTEM run whose config
+    /// is outside the machine folder, unless the service's switch is off; the
+    /// switch is read only when it decides.
     #[test]
-    fn promote_carries_keys_and_pins_and_overwrites_nothing() {
-        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let a = key_of(&config_in(&user), TENANT_A);
-        key_of(&config_in(&user), TENANT_B);
-        let src = user.path().join(DIR_NAME);
-        std::fs::write(src.join(format!("{TENANT_A}.controllers.json")), PINS).unwrap();
-        std::fs::write(src.join("notes.txt"), b"x").unwrap();
-        std::fs::write(src.join(format!("{TENANT_A}.json.tmp")), b"x").unwrap();
-        // B already has a key at the destination, which browsers may have
-        // pinned since: it stays.
-        let b_there = key_of(&config_in(&mg), TENANT_B);
-
-        assert_eq!(promote(&config_in(&user), &config_in(&mg)), Ok(2));
-        assert_eq!(key_of(&config_in(&mg), TENANT_A), a);
-        assert_eq!(key_of(&config_in(&mg), TENANT_B), b_there);
-        let dst = mg.path().join(DIR_NAME);
-        assert!(dst.join(format!("{TENANT_A}.controllers.json")).exists());
-        assert!(!dst.join("notes.txt").exists());
-        assert!(!dst.join(format!("{TENANT_A}.json.tmp")).exists());
-        assert_eq!(promote(&config_in(&user), &config_in(&mg)), Ok(0));
-    }
-
-    #[test]
-    fn promote_without_keys_carries_nothing() {
-        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        assert_eq!(promote(&config_in(&user), &config_in(&mg)), Ok(0));
-        assert!(!mg.path().join(DIR_NAME).exists());
-        assert!(promote(Path::new("config.toml"), &config_in(&mg)).is_err());
-    }
-
-    #[test]
-    fn only_a_key_or_its_pins_is_carried() {
-        assert!(is_peer_auth_file(&format!("{TENANT_A}.json")));
-        assert!(is_peer_auth_file(&format!("{TENANT_A}.controllers.json")));
-        assert!(!is_peer_auth_file(&format!("{TENANT_A}.json.tmp")));
-        assert!(!is_peer_auth_file(&format!("x{TENANT_A}.json")));
-        assert!(!is_peer_auth_file("notes.json"));
-    }
-
-    /// The field case (2026-10-29): the machine-global config was promoted
-    /// before `promote` existed, so no keys came with it. Its first start
-    /// takes the key the person's config holds instead of minting one.
-    #[test]
-    fn a_promoted_enrollment_adopts_its_own_key_and_pins() {
-        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let from = enrolled(&user, TENANT_A, AGENT_A, "machine-1");
-        let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
-        let pinned = key_of(&from, TENANT_A);
-        std::fs::write(
-            user.path()
-                .join(DIR_NAME)
-                .join(format!("{TENANT_A}.controllers.json")),
-            PINS,
-        )
-        .unwrap();
-
-        let to = key_path(&loaded, TENANT_A).unwrap();
-        let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
+    fn the_seal_applies_to_an_elevated_windows_run_outside_the_machine_folder() {
+        let unread = || -> bool { panic!("the switch is read only when it decides") };
         assert_eq!(
-            key.public_b64(),
-            pinned,
-            "the key browsers pinned, not a new one"
+            keeping(false, true, false, unread),
+            Keeping::Plain(Plain::NotWindows)
         );
         assert_eq!(
-            key_of(&loaded, TENANT_A),
-            pinned,
-            "on disk for the next start"
+            keeping(true, true, true, unread),
+            Keeping::Plain(Plain::MachineFolder)
         );
-        assert!(
-            mg.path()
-                .join(DIR_NAME)
-                .join(format!("{TENANT_A}.controllers.json"))
-                .exists(),
-            "with its pins"
+        assert_eq!(
+            keeping(true, false, false, unread),
+            Keeping::Plain(Plain::NotElevated),
+            "a per-user install is left as it is"
         );
+        assert_eq!(
+            keeping(true, true, false, || false),
+            Keeping::Plain(Plain::SwitchedOff)
+        );
+        assert_eq!(keeping(true, true, false, || true), Keeping::Sealed);
     }
 
+    /// The switch comes from the service's `Environment` value, under either
+    /// prefix and in any case; nothing read, or nothing named, leaves it on.
     #[test]
-    fn a_secondary_org_adopts_its_key_by_its_own_agent_id() {
-        let with_org = |dir: &tempfile::TempDir| {
-            let mut cfg = crate::config::test_fixture();
-            cfg.tenant_id = TENANT_A.into();
-            cfg.agent_id = AGENT_A.into();
-            cfg.machine_id = "machine-1".into();
-            cfg.orgs.push(crate::config::OrgEntry {
-                label: "acme".into(),
-                server_url: "https://example.invalid".into(),
-                ws_url: None,
-                agent_token: "t2".into(),
-                agent_id: AGENT_B.into(),
-                tenant_id: TENANT_B.into(),
-                enabled: true,
-                overlay_mode: crate::config::OrgOverlayMode::Off,
-                overlay_wg_secret_key: None,
-                overlay_wg_key_epoch: 0,
-                overlay_advertised_routes: Vec::new(),
-                overlay_exit_node_enabled: false,
-                advertise_routes: Vec::new(),
-                netstack_socks_port: None,
-            });
-            let path = config_in(dir);
-            crate::config::save(&path, &cfg).unwrap();
-            path
+    fn the_switch_is_read_from_the_services_environment() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
         };
-        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (from, loaded) = (with_org(&user), with_org(&mg));
-        let pinned = key_of(&from, TENANT_B);
-        let to = key_path(&loaded, TENANT_B).unwrap();
-        let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_B)).unwrap();
-        assert_eq!(key.public_b64(), pinned);
-    }
-
-    /// Same tenant under another agent id (an enrollment replaced since), and
-    /// the same agent id on another machine: neither key is this
-    /// enrollment's, so each start mints one of its own.
-    #[test]
-    fn another_enrollments_key_is_never_adopted() {
-        for (agent, machine) in [
-            ("66f0c0ffee000000000000ff", "machine-1"),
-            (AGENT_A, "machine-2"),
+        assert!(seal_enabled_in(None), "a value that could not be read");
+        assert!(seal_enabled_in(Some(&env(&[]))));
+        assert!(seal_enabled_in(Some(&env(&[("ROOMLERD_OTHER", "0")]))));
+        for off in [
+            ("ROOMLERD_PEER_AUTH_SEAL", "0"),
+            ("roomlerd_peer_auth_seal", "off"),
+            ("ROOMLER_NODE_PEER_AUTH_SEAL", "false"),
         ] {
-            let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            let from = enrolled(&user, TENANT_A, agent, machine);
-            let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
-            let theirs = key_of(&from, TENANT_A);
-            assert_eq!(adoption_source(&from, &loaded, TENANT_A), None);
-            let to = key_path(&loaded, TENANT_A).unwrap();
-            let made =
-                load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
-            assert_ne!(made.public_b64(), theirs, "{agent} on {machine}");
+            assert!(!seal_enabled_in(Some(&env(&[off]))), "{off:?}");
         }
+        assert!(seal_enabled_in(Some(&env(&[(
+            "ROOMLERD_PEER_AUTH_SEAL",
+            "1"
+        )]))));
     }
 
-    #[test]
-    fn a_key_already_there_is_kept_and_adoption_not_even_looked_at() {
-        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let from = enrolled(&user, TENANT_A, AGENT_A, "machine-1");
-        let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
-        key_of(&from, TENANT_A);
-        let ours = key_of(&loaded, TENANT_A);
-        let mut asked = false;
-        let to = key_path(&loaded, TENANT_A).unwrap();
-        let key = load_adopt_or_make(&to, || {
-            asked = true;
-            adoption_source(&from, &loaded, TENANT_A)
-        })
-        .unwrap();
-        assert_eq!(key.public_b64(), ours);
-        assert!(!asked);
+    /// What `f` logged, with what it returned.
+    #[cfg(windows)]
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (out, text)
     }
 
-    #[test]
-    fn a_corrupt_key_is_never_adopted() {
-        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let from = enrolled(&user, TENANT_A, AGENT_A, "machine-1");
-        let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
-        let src = key_path(&from, TENANT_A).unwrap();
-        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-        std::fs::write(
-            &src,
-            b"{\"version\":1,\"alg\":\"ecdsa-p256-sha256\",\"pkcs8\":\"AAAA\"}",
-        )
-        .unwrap();
-        let to = key_path(&loaded, TENANT_A).unwrap();
-        let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
-        assert!(peer_auth_key_is_well_formed(&key.public_b64()));
-        assert_ne!(std::fs::read(&to).unwrap(), std::fs::read(&src).unwrap());
-    }
+    /// The Windows cases. Each needs a token that may name Administrators as
+    /// an owner, so each runs elevated: CI's elevated `--lib` lane runs them,
+    /// and an unelevated local run says it skipped them.
+    #[cfg(windows)]
+    mod sealed_folder {
+        use super::*;
+        use roomler_node_core::machine_tree::test_support as ts;
 
-    #[test]
-    fn a_config_never_adopts_from_itself() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = enrolled(&dir, TENANT_A, AGENT_A, "machine-1");
-        key_of(&cfg, TENANT_A);
-        assert_eq!(adoption_source(&cfg, &cfg, TENANT_A), None);
+        /// `BUILTIN\Guests`: an account that is neither SYSTEM nor an
+        /// administrator.
+        const GUESTS: &str = "*S-1-5-32-546";
+
+        /// `path` has exactly the seal: owner Administrators, protected,
+        /// SYSTEM and Administrators full control and nothing else, handed
+        /// down when it is a folder.
+        fn assert_sealed(path: &Path, folder: bool) {
+            let sddl = ts::sddl(path);
+            assert_eq!(ts::owner(&sddl), "BA", "{}: {sddl}", path.display());
+            assert!(ts::protected(&sddl), "{}: {sddl}", path.display());
+            let flags = if folder { "OICI" } else { "" };
+            let mut aces = ts::aces(&sddl);
+            aces.sort();
+            let mut want = vec![format!("A;{flags};FA;;;BA"), format!("A;{flags};FA;;;SY")];
+            want.sort();
+            assert_eq!(aces, want, "{}: {sddl}", path.display());
+        }
+
+        /// The entries of `dir` whose names start with `prefix`.
+        fn named(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix))
+                .collect()
+        }
+
+        /// A key file as an earlier build wrote it, by path: its public half.
+        fn made_plain(cfg: &Path, tenant: &str) -> String {
+            kept_as(plain(), || {
+                let folder = Folder::of(cfg, keeping_for(cfg)).unwrap();
+                let name = file_name(&key_path(cfg, tenant).unwrap());
+                load_or_make(&folder, &name).unwrap().public_b64()
+            })
+        }
+
+        /// A browser-key file listing `browser` for `user`.
+        fn pins_listing(browser: &Browser, user: ObjectId) -> Vec<u8> {
+            let mut file = PinFile {
+                version: VERSION,
+                ..Default::default()
+            };
+            file.users.insert(
+                user.to_hex(),
+                vec![PinnedKey {
+                    key: browser.key.clone(),
+                    first_seen: "2026-11-01T00:00:00Z".into(),
+                }],
+            );
+            serde_json::to_vec_pretty(&file).unwrap()
+        }
+
+        #[test]
+        fn a_new_folder_is_made_sealed_and_its_files_written_sealed() {
+            if !ts::elevated_or_skip("a_new_folder_is_made_sealed_and_its_files_written_sealed") {
+                return;
+            }
+            kept_as(Keeping::Sealed, || {
+                let dir = tempfile::tempdir().unwrap();
+                let cfg = config_in(&dir);
+                assert!(peer_auth_key_is_well_formed(&hello_key(&cfg, TENANT_A)));
+                assert_eq!(
+                    remember(&cfg, TENANT_A, ObjectId::new(), &browser().key),
+                    Ok(Pinned::Now)
+                );
+                let folder = dir.path().join(DIR_NAME);
+                assert_sealed(&folder, true);
+                assert_sealed(&key_path(&cfg, TENANT_A).unwrap(), false);
+                assert_sealed(&pins_path(&cfg, TENANT_A).unwrap(), false);
+                // Written by handle, renamed into place: no temp file stays.
+                assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2);
+            });
+        }
+
+        /// An earlier build's folder, owned by Administrators and inheriting
+        /// an entry for another account: sealed in place, the device key kept
+        /// byte for byte, the browser keys moved aside (nothing deleted), and
+        /// nothing said again at the next start.
+        #[test]
+        fn a_folder_administrators_own_is_sealed_in_place_and_keeps_its_key() {
+            if !ts::elevated_or_skip(
+                "a_folder_administrators_own_is_sealed_in_place_and_keeps_its_key",
+            ) {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let before = made_plain(&cfg, TENANT_A);
+            let folder = dir.path().join(DIR_NAME);
+            let key_file = key_path(&cfg, TENANT_A).unwrap();
+            let pins_file = pins_path(&cfg, TENANT_A).unwrap();
+            let pins = pins_listing(&browser(), ObjectId::new());
+            write_private(&pins_file, &pins).unwrap();
+            assert!(ts::icacls(
+                &folder,
+                &["/grant", &format!("{GUESTS}:(OI)(CI)(M)")]
+            ));
+            for path in [&folder, &key_file, &pins_file] {
+                assert!(ts::icacls(path, &["/setowner", "*S-1-5-32-544"]));
+            }
+            let key_bytes = std::fs::read(&key_file).unwrap();
+
+            let (after, said) = logged(|| kept_as(Keeping::Sealed, || hello_key(&cfg, TENANT_A)));
+            assert_eq!(after, before, "the same device key: no browser warns");
+            assert_eq!(
+                std::fs::read(&key_file).unwrap(),
+                key_bytes,
+                "byte for byte"
+            );
+            assert_sealed(&folder, true);
+            assert_sealed(&key_file, false);
+            assert_eq!(
+                said.matches("sealed the folder in place").count(),
+                1,
+                "{said}"
+            );
+            assert!(!pins_file.exists(), "the browser keys are not kept");
+            let moved = named(
+                dir.path(),
+                "peer-auth.66f0c0ffee00000000000a01.controllers.json.not-sealed-",
+            );
+            assert_eq!(moved.len(), 1, "{moved:?}");
+            assert_eq!(
+                std::fs::read(&moved[0]).unwrap(),
+                pins,
+                "moved aside, not deleted"
+            );
+
+            // The next start finds it sealed: nothing changes, nothing is said.
+            let (again, said) = logged(|| sealed::seal(dir.path()).map(|_| ()));
+            assert!(again.is_ok());
+            assert!(!said.contains("peer-auth"), "{said}");
+            assert_eq!(std::fs::read(&key_file).unwrap(), key_bytes);
+        }
+
+        /// A folder another account owns (an earlier per-user install's, or
+        /// one put in place later) is never adopted: moved aside whole,
+        /// nothing in it deleted, and a new key made in a sealed folder.
+        #[test]
+        fn a_folder_another_account_owns_is_moved_aside_and_a_new_key_made() {
+            if !ts::elevated_or_skip(
+                "a_folder_another_account_owns_is_moved_aside_and_a_new_key_made",
+            ) {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let before = made_plain(&cfg, TENANT_A);
+            let folder = dir.path().join(DIR_NAME);
+            let key_file = key_path(&cfg, TENANT_A).unwrap();
+            let key_bytes = std::fs::read(&key_file).unwrap();
+            assert!(ts::icacls(&key_file, &["/setowner", GUESTS]));
+            assert!(ts::icacls(&folder, &["/setowner", GUESTS]));
+
+            let (after, said) = logged(|| kept_as(Keeping::Sealed, || hello_key(&cfg, TENANT_A)));
+            assert!(peer_auth_key_is_well_formed(&after));
+            assert_ne!(after, before, "a key another account held is never used");
+            assert_sealed(&folder, true);
+            assert_sealed(&key_file, false);
+            let moved = named(dir.path(), "peer-auth.moved-");
+            assert_eq!(moved.len(), 1, "{moved:?}");
+            let old = moved[0].join(key_file.file_name().unwrap());
+            assert_eq!(std::fs::read(old).unwrap(), key_bytes, "nothing deleted");
+            assert!(said.contains("S-1-5-32-546"), "the owner is named: {said}");
+            assert!(said.contains("warns once"), "{said}");
+        }
+
+        /// The same for one key file another account owns, in a folder
+        /// Administrators own: that file moved aside, a new key for it.
+        #[test]
+        fn a_key_file_another_account_owns_is_moved_aside_and_a_new_key_made() {
+            if !ts::elevated_or_skip(
+                "a_key_file_another_account_owns_is_moved_aside_and_a_new_key_made",
+            ) {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let before = made_plain(&cfg, TENANT_A);
+            let folder = dir.path().join(DIR_NAME);
+            let key_file = key_path(&cfg, TENANT_A).unwrap();
+            let key_bytes = std::fs::read(&key_file).unwrap();
+            assert!(ts::icacls(&folder, &["/setowner", "*S-1-5-32-544"]));
+            assert!(ts::icacls(&key_file, &["/setowner", GUESTS]));
+
+            let (after, said) = logged(|| kept_as(Keeping::Sealed, || hello_key(&cfg, TENANT_A)));
+            assert!(peer_auth_key_is_well_formed(&after));
+            assert_ne!(after, before);
+            assert_sealed(&key_file, false);
+            let moved = named(
+                dir.path(),
+                "peer-auth.66f0c0ffee00000000000a01.json.not-sealed-",
+            );
+            assert_eq!(moved.len(), 1, "{moved:?}");
+            assert_eq!(
+                std::fs::read(&moved[0]).unwrap(),
+                key_bytes,
+                "nothing deleted"
+            );
+            assert!(said.contains("S-1-5-32-546"), "{said}");
+        }
+
+        /// A browser-key file another account may change is not read: the
+        /// browser it lists reads `unknown`, said once.
+        #[test]
+        fn a_pin_file_another_account_may_change_is_not_read() {
+            if !ts::elevated_or_skip("a_pin_file_another_account_may_change_is_not_read") {
+                return;
+            }
+            kept_as(Keeping::Sealed, || {
+                let dir = tempfile::tempdir().unwrap();
+                let cfg = config_in(&dir);
+                assert!(
+                    !hello_key(&cfg, TENANT_A).is_empty(),
+                    "the folder is sealed"
+                );
+                let (browser, user) = (browser(), ObjectId::new());
+                let pins_file = pins_path(&cfg, TENANT_A).unwrap();
+                std::fs::write(&pins_file, pins_listing(&browser, user)).unwrap();
+                assert!(ts::icacls(&pins_file, &["/setowner", "*S-1-5-32-544"]));
+                assert!(ts::icacls(
+                    &pins_file,
+                    &["/grant", &format!("{GUESTS}:(M)")]
+                ));
+                let offers = PendingOffers::default();
+                let offer = |session| signed_offer(&browser, session, user);
+                let (verdicts, said) = logged(|| {
+                    let (first, second) = (ObjectId::new(), ObjectId::new());
+                    let audit = PeerAuthPolicy::Audit;
+                    (
+                        judged(&offers, &cfg, audit, first, user, &offer(first)),
+                        judged(&offers, &cfg, audit, second, user, &offer(second)),
+                    )
+                });
+                assert_eq!(
+                    verdicts.0,
+                    Some(Verdict::Unknown),
+                    "listed, but not trusted"
+                );
+                assert_eq!(
+                    verdicts.1,
+                    Some(Verdict::Verified),
+                    "the device's own sealed memory of it"
+                );
+                assert_eq!(
+                    said.matches("the browser-key file is not read").count(),
+                    1,
+                    "{said}"
+                );
+            });
+        }
+
+        /// A key file another account may change is not offered, is left as
+        /// it is, and the cause is said once.
+        #[test]
+        fn a_key_file_another_account_may_change_is_not_offered() {
+            if !ts::elevated_or_skip("a_key_file_another_account_may_change_is_not_offered") {
+                return;
+            }
+            kept_as(Keeping::Sealed, || {
+                let dir = tempfile::tempdir().unwrap();
+                let cfg = config_in(&dir);
+                assert!(
+                    !hello_key(&cfg, TENANT_A).is_empty(),
+                    "the folder is sealed"
+                );
+                let other = tempfile::tempdir().unwrap();
+                made_plain(&config_in(&other), TENANT_B);
+                let bytes = std::fs::read(key_path(&config_in(&other), TENANT_B).unwrap()).unwrap();
+                let key_file = key_path(&cfg, TENANT_B).unwrap();
+                std::fs::write(&key_file, &bytes).unwrap();
+                assert!(ts::icacls(&key_file, &["/setowner", "*S-1-5-32-544"]));
+                assert!(ts::icacls(&key_file, &["/grant", &format!("{GUESTS}:(M)")]));
+                let (keys, said) =
+                    logged(|| (hello_key(&cfg, TENANT_B), hello_key(&cfg, TENANT_B)));
+                assert_eq!(keys, (String::new(), String::new()), "no key offered");
+                assert_eq!(said.matches("no device key this run").count(), 1, "{said}");
+                assert!(
+                    said.contains("lets an account other than SYSTEM or Administrators change it"),
+                    "the cause: {said}"
+                );
+                assert_eq!(std::fs::read(&key_file).unwrap(), bytes, "left as it is");
+            });
+        }
+
+        /// A config folder that cannot be held as itself (here a junction):
+        /// one WARN, the key still offered, the browser keys never kept.
+        #[test]
+        fn a_folder_that_cannot_be_sealed_keeps_signing_and_refuses_pins() {
+            if !ts::elevated_or_skip(
+                "a_folder_that_cannot_be_sealed_keeps_signing_and_refuses_pins",
+            ) {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let real = root.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let link = root.path().join("link");
+            ts::junction(&link, &real);
+            let cfg = link.join("config.toml");
+            kept_as(Keeping::Sealed, || {
+                let (browser, user) = (browser(), ObjectId::new());
+                let offers = PendingOffers::default();
+                let offer = |session| signed_offer(&browser, session, user);
+                let (out, said) = logged(|| {
+                    let (first, second) = (ObjectId::new(), ObjectId::new());
+                    let audit = PeerAuthPolicy::Audit;
+                    (
+                        hello_key(&cfg, TENANT_A),
+                        judged(&offers, &cfg, audit, first, user, &offer(first)),
+                        judged(&offers, &cfg, audit, second, user, &offer(second)),
+                    )
+                });
+                assert!(peer_auth_key_is_well_formed(&out.0), "signing goes on");
+                assert_eq!(out.1, Some(Verdict::Unknown));
+                assert_eq!(out.2, Some(Verdict::Unknown), "never remembered");
+                assert_eq!(said.matches("cannot be sealed here").count(), 1, "{said}");
+                assert!(!pins_path(&cfg, TENANT_A).unwrap().exists());
+            });
+        }
+
+        /// The switch off: today's folder, inheriting what its parent hands
+        /// down, and the switch said once.
+        #[test]
+        fn with_the_switch_off_the_folder_is_kept_as_before() {
+            if !ts::elevated_or_skip("with_the_switch_off_the_folder_is_kept_as_before") {
+                return;
+            }
+            kept_as(Keeping::Plain(Plain::SwitchedOff), || {
+                let dir = tempfile::tempdir().unwrap();
+                let cfg = config_in(&dir);
+                let (key, said) = logged(|| {
+                    let key = hello_key(&cfg, TENANT_A);
+                    remember(&cfg, TENANT_A, ObjectId::new(), &browser().key).unwrap();
+                    key
+                });
+                assert!(peer_auth_key_is_well_formed(&key));
+                for path in [dir.path().join(DIR_NAME), key_path(&cfg, TENANT_A).unwrap()] {
+                    assert!(!ts::protected(&ts::sddl(&path)), "{}", path.display());
+                }
+                assert_eq!(
+                    said.matches("ROOMLERD_PEER_AUTH_SEAL=0").count(),
+                    1,
+                    "{said}"
+                );
+            });
+        }
+
+        /// A run that is neither elevated nor SYSTEM seals nothing: a
+        /// per-user install's folder keeps what it had.
+        #[test]
+        fn a_run_that_is_not_elevated_changes_nothing() {
+            if !ts::elevated_or_skip("a_run_that_is_not_elevated_changes_nothing") {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let folder = dir.path().join(DIR_NAME);
+            std::fs::create_dir(&folder).unwrap();
+            assert!(ts::icacls(
+                &folder,
+                &["/grant", &format!("{GUESTS}:(OI)(CI)(M)")]
+            ));
+            let as_found = ts::sddl(&folder);
+            kept_as(Keeping::Plain(Plain::NotElevated), || {
+                assert!(peer_auth_key_is_well_formed(&hello_key(&cfg, TENANT_A)));
+                assert_eq!(
+                    remember(&cfg, TENANT_A, ObjectId::new(), &browser().key),
+                    Ok(Pinned::Now)
+                );
+            });
+            assert_eq!(ts::sddl(&folder), as_found, "the folder is as it was");
+            for path in [
+                key_path(&cfg, TENANT_A).unwrap(),
+                pins_path(&cfg, TENANT_A).unwrap(),
+            ] {
+                assert!(!ts::protected(&ts::sddl(&path)), "{}", path.display());
+            }
+            assert!(named(dir.path(), "peer-auth.").is_empty(), "nothing moved");
+        }
+
+        /// A run that is neither elevated nor SYSTEM, at a key an elevated run
+        /// sealed: no key, the cause and the remedy said once, nothing deleted.
+        #[test]
+        fn a_run_that_is_not_elevated_says_why_a_sealed_key_is_not_offered() {
+            if !ts::elevated_or_skip(
+                "a_run_that_is_not_elevated_says_why_a_sealed_key_is_not_offered",
+            ) {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let key_file = key_path(&cfg, TENANT_A).unwrap();
+            let folder = Folder::of(&cfg, Keeping::Sealed).unwrap();
+            load_or_make(&folder, &file_name(&key_file)).unwrap();
+            let bytes = std::fs::read(&key_file).unwrap();
+            // Closed to this token as the seal closes it to a person's own:
+            // SYSTEM alone may read it.
+            ts::set_dacl(&key_file, "D:P(A;;FA;;;SY)");
+            let (keys, said) = kept_as(Keeping::Plain(Plain::NotElevated), || {
+                logged(|| (hello_key(&cfg, TENANT_A), hello_key(&cfg, TENANT_A)))
+            });
+            ts::set_dacl(&key_file, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            assert_eq!(keys, (String::new(), String::new()));
+            assert_eq!(said.matches("is closed to this run").count(), 1, "{said}");
+            assert!(said.contains("Start roomlerd elevated again"), "{said}");
+            assert_eq!(std::fs::read(&key_file).unwrap(), bytes, "nothing deleted");
+        }
+
+        /// One file the seal can neither read nor move (here it shuts out
+        /// Administrators) is that file's trouble alone: it is left as it is
+        /// and not used, said once, and the other enrollment's key is kept.
+        #[test]
+        fn a_file_the_seal_cannot_open_leaves_the_rest_sealed() {
+            if !ts::elevated_or_skip("a_file_the_seal_cannot_open_leaves_the_rest_sealed") {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let before = made_plain(&cfg, TENANT_A);
+            made_plain(&cfg, TENANT_B);
+            let folder = dir.path().join(DIR_NAME);
+            let (a, b) = (
+                key_path(&cfg, TENANT_A).unwrap(),
+                key_path(&cfg, TENANT_B).unwrap(),
+            );
+            for path in [&folder, &a] {
+                assert!(ts::icacls(path, &["/setowner", "*S-1-5-32-544"]));
+            }
+            assert!(ts::icacls(&b, &["/setowner", GUESTS]));
+            ts::set_dacl(&b, "D:P(A;;FA;;;BG)");
+            let (keys, said) = logged(|| {
+                kept_as(Keeping::Sealed, || {
+                    (hello_key(&cfg, TENANT_A), hello_key(&cfg, TENANT_B))
+                })
+            });
+            assert_eq!(keys.0, before, "the other enrollment's key is kept");
+            assert_eq!(keys.1, "", "not used");
+            assert_sealed(&folder, true);
+            assert_sealed(&a, false);
+            assert_eq!(
+                said.matches("could be neither sealed nor moved aside")
+                    .count(),
+                1,
+                "{said}"
+            );
+            assert!(b.exists(), "left as it is");
+        }
+
+        /// A junction at `peer-auth` is never followed: moved aside, and what
+        /// it led to is left as it was.
+        #[test]
+        fn a_link_at_the_folder_is_never_followed() {
+            if !ts::elevated_or_skip("a_link_at_the_folder_is_never_followed") {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_in(&dir);
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("kept.txt"), b"untouched").unwrap();
+            let as_found = ts::sddl(&elsewhere);
+            ts::junction(&dir.path().join(DIR_NAME), &elsewhere);
+            kept_as(Keeping::Sealed, || {
+                assert!(peer_auth_key_is_well_formed(&hello_key(&cfg, TENANT_A)));
+            });
+            assert_sealed(&dir.path().join(DIR_NAME), true);
+            assert_eq!(ts::sddl(&elsewhere), as_found);
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+        }
     }
 }

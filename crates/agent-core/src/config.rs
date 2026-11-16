@@ -16,7 +16,6 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::acl::AgentForwardAcl;
@@ -107,17 +106,26 @@ pub struct AgentConfig {
     #[serde(default)]
     pub files_dir: Option<String>,
 
-    /// Whether incoming `rc:session.request` messages are
-    /// auto-granted without operator interaction. Default `true` to
-    /// match historical self-host behaviour (`docs/remote-control.md`
-    /// §11.2 + signaling.rs's pre-Plan-3 auto-grant). Org-controlled
-    /// fleets set this to `false` so every session start waits for
-    /// an explicit operator decision via the `roomlerd consent
-    /// --session <hex> --approve|--deny` CLI fallback (or, in a
-    /// future version, a tray prompt). 30 s timeout → auto-deny.
-    /// Has NO effect on the file-DC path — uploads/downloads/dir
-    /// browsing remain gated by `enable_remote_browse` + the
-    /// agent's denylist.
+    /// This device's own floor under the consent decision for a
+    /// remote-control session and for `exec`: the stricter of the
+    /// server's directive and this setting wins (FR-27,
+    /// `consent::strictest_of`). Read at start.
+    ///
+    /// - `true` (the default) adds nothing, so the directive decides. An
+    ///   `Auto` directive (the device owner, unless the device asks the
+    ///   owner too; an ADMINISTRATOR's break-glass; a device whose consent
+    ///   policy is `auto`) starts without a prompt, and every other
+    ///   directive asks the person at this machine.
+    /// - `false` turns an `Auto` directive into that prompt too, so every
+    ///   session and every `exec` asks someone here, the owner's included.
+    ///
+    /// A prompt nobody answers within the server's window is refused; with
+    /// no surface to show it on, the refusal is `NoPromptSurface`. With no
+    /// directive (an older server) this setting is the whole answer. A
+    /// session from outside the organization is floored the same way against
+    /// `external_consent_mode`. SSH asks under its own policy and does not
+    /// read this, and nothing inside a granted session (its file channel
+    /// included) is prompted by it.
     #[serde(default = "default_auto_grant_session")]
     pub auto_grant_session: bool,
 
@@ -131,9 +139,9 @@ pub struct AgentConfig {
     /// refusal that survives a compromised server. Defaulting it on would
     /// make the other three the whole story.
     ///
-    /// Commands inherit the daemon's identity — SYSTEM under a perMachine
-    /// Windows install, root under systemd. Turning this on is granting
-    /// root, and the admin UI says so.
+    /// Commands run as root under systemd; on Windows as SYSTEM once anchored
+    /// (FR-94), else as the console worker: the signed-in user, or SYSTEM in
+    /// SystemContext mode. Turning this on grants that, as the admin UI says.
     #[serde(default)]
     pub exec_enabled: bool,
 
@@ -150,6 +158,20 @@ pub struct AgentConfig {
     /// No effect on any other platform.
     #[serde(default)]
     pub macos_supervise_gui_worker: bool,
+
+    /// FR-43 P3 — on macOS, ONE device row: the GUI worker holds no enrollment
+    /// of its own (`run --supervised --unenrolled`), so the root daemon's row
+    /// serves every session. Read by the root daemon at its start, and only
+    /// with [`Self::macos_supervise_gui_worker`] on: with no supervisor there
+    /// is no worker to run that way.
+    ///
+    /// Default OFF: a person's enrollment on this Mac stays what the worker
+    /// runs on, and a Mac with none has no worker. Device-owned like the key
+    /// above, so it is absent from `DesiredConfig` and no server can push it.
+    ///
+    /// No effect on any other platform.
+    #[serde(default)]
+    pub macos_one_row: bool,
 
     /// FR-55 — whether this device asks the OS to stay awake so it remains
     /// reachable: `never` (default) | `on-ac` | `always`.
@@ -458,196 +480,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ssh_activity_log: bool,
 
-    // ─── FR-90: Hive agent sessions ─────────────────────────────────────
-    // The device's own gates, every one of them default-deny, and none of them
-    // settable by the server: which local account runs a session and where it
-    // may run are the DEVICE's answer, so a compromised server can neither
-    // pick SYSTEM/root nor point a session at `/etc` (design §4.2, §13).
-    /// May this device RUN agent sessions (`rc:hive.start`)? Default
-    /// **`false`** — gate 4, the refusal that survives a compromised server,
-    /// like [`Self::exec_enabled`] and [`Self::ssh_enabled`]. A session is a
-    /// model running commands on this machine as one of its accounts.
-    #[serde(default)]
-    pub hive_enabled: bool,
-
-    /// Which local account a Roomler user's sessions run as:
-    /// `{ "<user id, or the user's proven email>" = "<account>" }`.
-    ///
-    /// **Unmapped means refused** (`no_account`) — never a fallback to the
-    /// daemon's own identity, and never an account the server names (the
-    /// start frame carries none). A mapping to a uid-0 account is refused at
-    /// launch too, by the same privilege path exec and SSH use.
-    #[serde(default)]
-    pub hive_accounts: BTreeMap<String, String>,
-
-    /// The folders sessions may run in, checked on the resolved path, so
-    /// `..` and a symlink out of a root do not count. **Empty means nowhere**,
-    /// never anywhere — the overlay ACL's `Some([])` lesson, applied before
-    /// anyone ships the other reading.
-    #[serde(default)]
-    pub hive_roots: Vec<String>,
-
-    /// The most sessions this device runs at once (`at_capacity` past it).
-    /// `None` = 4.
-    #[serde(default)]
-    pub hive_max_sessions: Option<u32>,
-
-    /// The harness binary (Claude Code), absolute. `None` = the first of
-    /// `~/.local/bin/claude`, `/usr/local/bin/claude`, `/usr/bin/claude` that
-    /// exists, the first one resolved in the mapped account's home.
-    #[serde(default)]
-    pub hive_harness: Option<String>,
-
-    /// FR-90 P0e — the command the DAEMON runs (as SYSTEM/root) to print the
-    /// model provider's API key. The key stays in the daemon: a session's
-    /// Claude Code gets a per-session token for the loopback model sidecar,
-    /// which checks it (this session, still running here at its fence, and a
-    /// device not offline past `offline_grace`) and swaps the key in on the
-    /// way out. Unset = no model credential, and a session's model calls fail
-    /// (a per-session config directory holds no login of its own).
-    #[serde(default)]
-    pub hive_api_key_helper: Option<String>,
-    /// FR-90 P0g — the provider workspace the model calls are made in, for
-    /// a key that is not scoped to one: the API then requires an
-    /// `anthropic-workspace-id` header on every call. The sidecar adds it
-    /// with the key; a session never sets it (field, 2026-10-07: such a key
-    /// answered every call `400 This API key is not scoped to a workspace`).
-    /// Unset = no header — right for a workspace-scoped key.
-    #[serde(default)]
-    pub hive_api_workspace_id: Option<String>,
-    /// FR-90 P1d-1 (AC7) — how long an update waits for running agent turns
-    /// before it restarts the daemon, which cuts every session's turn, in
-    /// seconds. A turn is a person's work in progress, so the wait holds a
-    /// server-pushed update too; it is bounded, so a busy session cannot hold
-    /// the device's updates back. `None` = 1800 (30 min); `0` = never wait.
-    #[serde(default)]
-    pub hive_update_wait_secs: Option<u32>,
-    /// FR-90 P1e — show the org's core memory to the sessions on this device:
-    /// the snapshot the server sends with a start, written into the session's
-    /// own config dir as `CLAUDE.md` and the auto-memory `MEMORY.md`. Default
-    /// OFF, and never pushable: Claude Code reads `CLAUDE.md` as the user's
-    /// own OVERRIDING instructions, so this is the one place server-authored
-    /// text reaches a session's model, and whether it may is the device
-    /// owner's call alone.
-    #[serde(default)]
-    pub hive_core_memory: bool,
-    /// FR-90 P1j — let the people who use this device adopt the Claude Code
-    /// sessions they run in a terminal (`roomler hive adopt`): mirrored into
-    /// this device's store and listed for their owner alone, read-only.
-    /// Default OFF, and never pushable: a terminal session passed none of
-    /// Hive's start gates, so whether this machine reports on its terminals
-    /// at all is the device owner's call alone. Each person still opts in
-    /// themselves, and their account must map in `hive_accounts`.
-    #[serde(default)]
-    pub hive_adopt: bool,
-    /// FR-90 decision 15 — on a Mac, run sessions as an account whose `sudo`
-    /// needs no password. Default OFF: such a start is refused, because
-    /// macOS's `sudo` reads the account's groups from the directory, so the
-    /// session would have root whatever groups it drops. Never pushable:
-    /// whether an agent on this machine may be root is the device owner's
-    /// call alone. Linux needs no such key: a session there cannot `sudo`.
-    #[serde(default)]
-    pub hive_allow_passwordless_sudo: bool,
-    /// FR-90 P2c — hold copies of the sessions this device's owner runs on
-    /// their other devices: a replica, which a promotion can move a session
-    /// to once its device is gone. Default OFF, and never pushable: a replica
-    /// is a plaintext copy of everything the agent saw, so whether this
-    /// device holds one is its owner's call alone. Off, it advertises no
-    /// `hive-replica` and refuses a join on its own word.
-    #[serde(default)]
-    pub hive_replica: bool,
-    /// FR-90 P2c — offer this device as an archive replica of the org: once
-    /// an `ADMINISTRATOR` designates it, it holds every session the org's
-    /// rules allow, for their retention. Counts only with `hive_replica` on.
-    /// Default OFF, never pushable: offering is the device owner's, as
-    /// designating is the org's.
-    #[serde(default)]
-    pub hive_archive: bool,
-    /// FR-90 P2c — the most this device keeps of the sessions it holds as a
-    /// replica, in MiB; `None` = no bound but the disk's. Never pushable: the
-    /// device owner's disk.
-    #[serde(default)]
-    pub hive_store_quota_mib: Option<u32>,
-    /// FR-90 P3-3 — let the org's vault lease values to the agent sessions on
-    /// this device. On, the daemon makes a vault key at start (in memory
-    /// only, a new one each start) and publishes its public half in the
-    /// primary enrollment's hello; off, it makes none, publishes none, and
-    /// the vault leases it nothing. Default OFF, and never pushable: whether
-    /// org secrets are ever decrypted on this machine is the device owner's
-    /// call alone, as whether sessions run here at all is `hive_enabled`'s.
-    #[serde(default)]
-    pub vault_enabled: bool,
-    /// FR-90 P3-4d-2 — report to the organization what this device does with
-    /// the values its vault leases it: each command a session ran with them
-    /// (the program and how it ended) and each file it wrote (the name),
-    /// never a value. Off by default because it is the DEVICE that decides
-    /// what it says about itself, as `ssh_activity_log` is; the org's record
-    /// of what it released lives in `vault_audit` and does not depend on this
-    /// key. Never pushable.
-    #[serde(default)]
-    pub vault_activity_log: bool,
-    /// FR-90 P3-7-3c — offer the agent sessions on this device their own
-    /// egress: `net_socks` and `net_forward`, a loopback listener per call,
-    /// served to the session's account alone, its flows leaving from another
-    /// device of the organization as its vault and tunnel policies decide.
-    /// Only beside `vault_enabled`. Default OFF, and never pushable: whether
-    /// a session here reaches a network beyond this device is the owner's call.
-    #[serde(default)]
-    pub hive_net: bool,
-    /// FR-90 P3-8-2b-2 — offer the agent sessions on this device `ssh_run`:
-    /// one command on another device of the organization over Roomler SSH,
-    /// as the account that device's SSH policy maps (which may be SYSTEM or
-    /// root there), its key minted by this daemon for the one call. Only
-    /// beside `vault_enabled`: the vault decides each call, and a person
-    /// approves it. Default OFF, and never pushable: whether a session here
-    /// reaches into another device is the owner's call.
-    #[serde(default)]
-    pub hive_ssh: bool,
-    /// FR-90 P3b-1b-2 — run every agent session on this device in Claude
-    /// Code's sandbox, its commands' connections sent through the session's
-    /// egress proxy, each host decided by the organization's vault
-    /// (`net:egress`; decisions 27 and 28). Only beside `vault_enabled`. On
-    /// Windows, where no sandbox runs, every session gets the proxy named in
-    /// its environment, advisory (P3b-5-1, decision 30). Default OFF, and
-    /// never pushable: whether a session here reaches the network only as
-    /// the vault decides is the owner's call.
-    #[serde(default)]
-    pub hive_egress: bool,
-    /// FR-90 P8-2a-1 — run a worker beside each agent session on this device
-    /// (`roomlerd hive-worker`, the same binary as the daemon's supervised
-    /// child) and, P8-2d-1, one for the device itself, so a fault in what one
-    /// serves costs that worker and never the daemon. Default OFF, and never
-    /// pushable: how this device's own processes are arranged is the owner's
-    /// call. Read as the daemon starts: a change waits for its next start.
-    #[serde(default)]
-    pub hive_worker: bool,
-    /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):
-    /// absolute paths, a folder walked for its git checkouts, each read as
-    /// the account that owns it and never as the daemon, for metadata alone.
-    /// **Empty means nothing is read** (the scan answers `no_roots`), never
-    /// everything. Read from this file again at each scan, so an edit takes
-    /// the next one, and never pushable: what a device reads is its owner's
-    /// call, not the server's.
-    #[serde(default)]
-    pub knowhow_scan_roots: Vec<String>,
-    /// FR-90 P4-3b-3 — whether this device's knowhow scans report the TCP
-    /// ports it listens on (decision 47): each port, its bound address and
-    /// the process holding it, read by the daemon from the system's own
-    /// table. Default **off**: a listener is under no root, and its process
-    /// names software a person runs. Read from this file again at each scan,
-    /// and never pushable.
-    #[serde(default)]
-    pub knowhow_scan_listeners: bool,
-    /// FR-90 P4-5-1b — where this device's knowhow probes may go (decision
-    /// 53), in [`crate::probe_reach`]'s syntax (`100.64.0.0/10:22`,
-    /// `db.example.com:5432`, `*.example.com:443`). **Empty means nowhere**:
-    /// every probe is answered `not_allowed`, since a probe leaves from
-    /// inside this device's own network. Link-local and the cloud metadata
-    /// addresses are never reached, whatever it lists. Read from this file
-    /// again at each probe, and never pushable: where a device connects to on
-    /// the map's word is its owner's call, not the server's.
-    #[serde(default)]
-    pub knowhow_probe_reach: Vec<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -794,6 +626,19 @@ pub struct AgentConfig {
     /// needed none of it (`ROOMLERD_WS_REPLACED_EXIT`).
     #[serde(default)]
     pub ws_replaced_exit: Option<bool>,
+    /// FR-28 — redial the control WS and the central `/derp` WS at a flat pace
+    /// while the front load balancer answers 502, instead of climbing the ladder
+    /// (`ROOMLERD_WS_FLAT_REDIAL`). Built-in default: OFF. See `ws_flat_redial`
+    /// in the config surface.
+    #[serde(default)]
+    pub ws_flat_redial: Option<bool>,
+    /// FR-138 — keep a live remote-control session's peer through the loss of
+    /// the control socket, for the window the server announces (capped at
+    /// 120 s), instead of closing it with the socket
+    /// (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`). Built-in default: ON (P4-1). See
+    /// `rc_sessions_survive_reattach` in the config surface.
+    #[serde(default)]
+    pub rc_sessions_survive_reattach: Option<bool>,
     /// C4 stage 1 — the standing warm TURN/UDP allocation, established
     /// while UDP works and kept alive so corp-VPN flow-grandfathering
     /// preserves a UDP relay leg across a VPN connect. Measurement-only
@@ -847,6 +692,13 @@ pub struct AgentConfig {
     /// Built-in default: 750.
     #[serde(default)]
     pub overlay_netmon_debounce_ms: Option<u32>,
+    /// FR-65 P3 — seconds a signal burst with no snapshot delta waits behind
+    /// the last forced revalidation
+    /// (`ROOMLERD_OVERLAY_NETCHANGE_POKE_QUIET_SECS`, 0–3600). Built-in
+    /// default: 60. `0` restores the arm as it was before the gate. A real
+    /// network move never waits on this.
+    #[serde(default)]
+    pub overlay_netchange_poke_quiet_secs: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
     /// the corp-VPN field probe (`ROOMLERD_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
@@ -1649,6 +1501,27 @@ pub struct AgentConfig {
     /// `zero_copy` itself is NOT pushable (FR-132 decision 1).
     #[serde(default)]
     pub zero_copy_deny: Option<String>,
+    /// FR-135 §7.1 — media paths a session must run on their OLD code,
+    /// comma-separated (`media_plan`, `stats`, … one name per FR-135 phase).
+    /// Unset or `none` = no entries. Entries match whole names, never a prefix;
+    /// an unknown name is ignored. LIVE: read at each session's open, so the
+    /// next session runs the new value with no restart. Pushable through remote
+    /// config: a push can send sessions back to code they already ran, or clear
+    /// the list to the defaults, never turn new code on early. Pushed and local
+    /// values share this one key, so a cleared push also clears an entry set
+    /// here, as `zero_copy_deny`'s does. On a supervised Mac the root's entries
+    /// travel with each session to the GUI worker that builds it. Beats
+    /// `rc_media_canary`. Temporary: it is removed when FR-135's last old path
+    /// is deleted.
+    #[serde(default)]
+    pub rc_media_legacy: Option<String>,
+    /// FR-135 §7.1 — media paths a session runs on their NEW code before the
+    /// built-in default does, comma-separated, the same names as
+    /// `rc_media_legacy`. LOCAL ONLY: never pushable, because turning a path on
+    /// stays a decision made on the device or by a release. Live like
+    /// `rc_media_legacy`, which it loses to. Temporary, like it.
+    #[serde(default)]
+    pub rc_media_canary: Option<String>,
     /// FR-119 P2b-10 — how NVENC splits a frame across its engines above
     /// 60 fps: `auto` (unset; the driver picks the number of strips), `off`
     /// (never ask, as before P2b-10), or a strip count `2`–`4` (applied only
@@ -1862,6 +1735,13 @@ pub struct AgentConfig {
     /// crash on its first run.
     #[serde(default)]
     pub last_run_unhealthy: bool,
+
+    /// #3289 — the boot of the OS the last run started in
+    /// ([`crate::boot_id::current`]), so the next start can tell a crash from
+    /// the OS restarting under the daemon ([`previous_run`]). `None` on a
+    /// config an older build wrote, or where the OS cannot say.
+    #[serde(default)]
+    pub last_run_boot: Option<String>,
 
     /// Last config-schema version this file was migrated to. Used by
     /// [`migrate`] to decide which migration steps to apply at startup.
@@ -2256,6 +2136,75 @@ impl AgentConfig {
         c.tunnel_routes = Vec::new();
         c.orgs = Vec::new();
         c
+    }
+
+    /// FR-43 P3a — the config a GUI worker with no enrollment runs on: this
+    /// file with every enrollment and every host-global role taken out, and
+    /// its signalling loop pointed at the stand-in control plane
+    /// (`roomlerd::unenrolled`). The person's session knobs stay: they are why
+    /// the worker reads the file at all.
+    ///
+    /// ⚠️ A VIEW, and never written back. An unmigrated person's enrollment is
+    /// still in the file, which is what makes `macos_one_row = false` a real
+    /// off: [`StartupWrites::read_only`] keeps the daemon's startup saves off
+    /// it, and every later writer reloads the file first.
+    ///
+    /// The root holds what this takes out, so a worker running any of it would
+    /// be a second one on the machine. Crash bookkeeping goes too: a worker
+    /// cannot install a package, so it has no rollback to count towards, and the
+    /// supervisor records its crashes on the root's enrollment.
+    pub fn for_unenrolled_worker(&self, server_url: &str, ws_url: &str, secret: &str) -> Self {
+        let mut c = self.clone();
+        c.server_url = server_url.to_string();
+        c.ws_url = Some(ws_url.to_string());
+        c.agent_token = secret.to_string();
+        c.agent_id = String::new();
+        c.tenant_id = String::new();
+        c.ephemeral = false;
+        c.orgs = Vec::new();
+        c.tunnel_routes = Vec::new();
+        c.overlay_enabled = false;
+        c.overlay_multi_org = false;
+        c.netstack_socks_port = None;
+        c.overlay_wg_secret_key = None;
+        c.overlay_exit_node_enabled = false;
+        c.overlay_exit_node = None;
+        c.overlay_advertised_routes = Vec::new();
+        c.advertise_routes = Vec::new();
+        c.advertise_local_subnets = false;
+        c.relay_server_enabled = None;
+        c.ssh_enabled = false;
+        c.ssh_host_key = None;
+        c.ssh_authorized_keys = Vec::new();
+        c.exec_enabled = false;
+        c.remote_config_enabled = false;
+        c.external_access_enabled = false;
+        c.auto_update = Some(false);
+        c.crash_count = 0;
+        c.last_crash_unix = 0;
+        c.last_run_unhealthy = false;
+        c.rollback_attempted = false;
+        c
+    }
+
+    /// FR-43 P3a — the file a worker with no enrollment writes when the person
+    /// has none: blank identity fields, and every default. `caps`, `record` and
+    /// `config set` load this file, and a person's own settings land in it.
+    pub fn for_person_with_no_enrollment(machine_name: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(
+            "server_url = \"\"\nagent_token = \"\"\nagent_id = \"\"\ntenant_id = \"\"\n\
+             machine_id = \"\"\nmachine_name = \"\"\n",
+        )
+        .context("the defaults of an empty config")?;
+        cfg.machine_name = machine_name.to_string();
+        Ok(cfg)
+    }
+
+    /// Does this file hold a primary enrollment? A person's file on a one-row
+    /// Mac does not (FR-43 P3): [`Self::for_person_with_no_enrollment`], or an
+    /// enrolled file the migration blanked.
+    pub fn has_primary_enrollment(&self) -> bool {
+        !self.agent_token.trim().is_empty() && !self.agent_id.trim().is_empty()
     }
 
     /// Per-entry runnability partition for the daemon supervisor: each
@@ -2666,6 +2615,48 @@ pub fn mark_clean_shutdown(cfg: &mut AgentConfig) {
     cfg.last_run_unhealthy = false;
 }
 
+/// #3289 — how the run before this one ended, as far as this start can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousRun {
+    /// It marked itself clean or reached the clean-run threshold, or there was
+    /// no run before this one.
+    Clean,
+    /// It went away unannounced while the OS stayed up. The one case that counts
+    /// against this version ([`record_crash_at`]).
+    Crashed,
+    /// The OS restarted during it: a restart, a power cut, a kernel fault.
+    EndedWithTheOs,
+    /// Its service host watched it end, and that was not the daemon failing: the
+    /// session it ran in went away, or the host replaced it.
+    EndedByItsHost,
+}
+
+/// #3289 — a crash is the daemon dying on its own while the OS was up and nobody
+/// had asked it to go. `last_run_unhealthy` alone says only that nothing marked
+/// the last run clean, and Windows can end a worker before its service host hears
+/// of a restart: three ordinary restarts within five minutes of a self-update read
+/// as a crash loop, and a healthy device tried to roll itself back.
+///
+/// `boot_now` is [`crate::boot_id::current`]. Either boot unknown reads as the same
+/// boot, and `host_saw_no_crash` is true only when a service host says so: when in
+/// doubt this counts, because a real crash loop must still reach the rollback.
+pub fn previous_run(
+    cfg: &AgentConfig,
+    boot_now: Option<&str>,
+    host_saw_no_crash: bool,
+) -> PreviousRun {
+    if !cfg.last_run_unhealthy {
+        return PreviousRun::Clean;
+    }
+    if host_saw_no_crash {
+        return PreviousRun::EndedByItsHost;
+    }
+    match (cfg.last_run_boot.as_deref(), boot_now) {
+        (Some(then), Some(now)) if then != now => PreviousRun::EndedWithTheOs,
+        _ => PreviousRun::Crashed,
+    }
+}
+
 /// Record a crash at the given unix timestamp. Increments the
 /// counter when the prior crash was within `CRASH_WINDOW_SECS` of
 /// `now_unix`; otherwise starts a fresh crash window at 1.
@@ -2837,11 +2828,9 @@ fn default_enable_remote_browse() -> bool {
     true
 }
 
-/// Default for `auto_grant_session` — `true` for back-compat with
-/// every pre-0.3.x agent which auto-granted unconditionally
-/// (signaling.rs:365 TODO). Org-controlled fleets opt out via
-/// `config.toml`. See [`AgentConfig::auto_grant_session`] for the
-/// security model.
+/// Default for `auto_grant_session`: `true`, so the server's consent
+/// directive alone decides. See [`AgentConfig::auto_grant_session`] for
+/// what `false` adds.
 fn default_auto_grant_session() -> bool {
     true
 }
@@ -2883,6 +2872,7 @@ pub fn test_fixture() -> AgentConfig {
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,
+        macos_one_row: false,
         power_policy: String::new(),
         companion_autostart: true,
         remote_config_enabled: false,
@@ -2899,29 +2889,6 @@ pub fn test_fixture() -> AgentConfig {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
-        hive_enabled: false,
-        hive_accounts: BTreeMap::new(),
-        hive_roots: Vec::new(),
-        hive_max_sessions: None,
-        hive_harness: None,
-        hive_api_key_helper: None,
-        hive_api_workspace_id: None,
-        hive_update_wait_secs: None,
-        hive_core_memory: false,
-        hive_adopt: false,
-        hive_allow_passwordless_sudo: false,
-        hive_replica: false,
-        hive_archive: false,
-        hive_store_quota_mib: None,
-        vault_enabled: false,
-        vault_activity_log: false,
-        hive_net: false,
-        hive_ssh: false,
-        hive_egress: false,
-        hive_worker: false,
-        knowhow_scan_roots: Vec::new(),
-        knowhow_scan_listeners: false,
-        knowhow_probe_reach: Vec::new(),
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,
@@ -2941,6 +2908,8 @@ pub fn test_fixture() -> AgentConfig {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
+        rc_sessions_survive_reattach: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -2950,6 +2919,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -3058,6 +3028,8 @@ pub fn test_fixture() -> AgentConfig {
         zero_copy: None,
         color_description: None,
         zero_copy_deny: None,
+        rc_media_legacy: None,
+        rc_media_canary: None,
         nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,
@@ -3084,6 +3056,7 @@ pub fn test_fixture() -> AgentConfig {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         config_schema_version: None,
         forward_acl: AgentForwardAcl::default(),
         virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig::default(),
@@ -3180,7 +3153,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 97] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3246,6 +3219,11 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95]
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
+        ("WS_FLAT_REDIAL", cfg.ws_flat_redial),
+        (
+            "RC_SESSIONS_SURVIVE_REATTACH",
+            cfg.rc_sessions_survive_reattach,
+        ),
         ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
         ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),
@@ -3294,7 +3272,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 32] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 33] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -3333,6 +3311,10 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 3
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
+        (
+            "OVERLAY_NETCHANGE_POKE_QUIET_SECS",
+            cfg.overlay_netchange_poke_quiet_secs,
+        ),
         ("RELAY_SERVER_PORT", cfg.relay_server_port),
     ]
 }
@@ -3477,10 +3459,10 @@ pub fn default_config_path() -> Result<PathBuf> {
 }
 
 // RETIRED-NAME-ANCHOR(2): names the PRE-RENAME appdirs segment a host installed before
-// P4b still has; appdirs::app_segment resolves it, so it is an input.
+// P4b still has; appdirs::machine_global_dir resolves it, so it is an input.
 /// rc.52: machine-global config path —
 /// `%PROGRAMDATA%\roomler\roomler\config.toml` (a pre-rename host keeps
-/// its `\roomler\roomler-agent\` tree — see `appdirs::app_segment`).
+/// its `\roomler\roomler-agent\` tree — see `appdirs::machine_global_dir`).
 ///
 /// `default_config_path()` resolves to a per-USER profile
 /// (`%APPDATA%` via `ProjectDirs`). A SystemContext worker runs as
@@ -3492,83 +3474,14 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// the enrolled config here; the worker's resolution ladder consults
 /// it ahead of the (never-populated) SYSTEM-profile default.
 ///
-/// Windows-only — there is no machine-global config concept on
-/// Linux/macOS (the agent there is perUser). Returns `None` if
-/// `%PROGRAMDATA%` can't be resolved (it always can on a sane
-/// Windows install; the `C:\ProgramData` literal is the documented
-/// fallback used elsewhere in the crate).
-/// W4(c) — restrict the machine-global config directory to SYSTEM +
-/// Administrators, inheritance OFF, applied to existing children (`/T`).
-/// SIDs, not names, so it survives localized Windows (this fleet runs
-/// German builds where BUILTIN\Users is "Benutzer"): S-1-5-18 = SYSTEM,
-/// S-1-5-32-544 = Administrators, S-1-5-32-545 = Users, S-1-5-11 =
-/// Authenticated Users. Idempotent and best-effort: a failure WARNs and
-/// the save proceeds — an unhardened save is the pre-W4 status quo, not a
-/// new exposure. Closing the remaining pre-planted-CONTENT hole (verify
-/// the file's OWNER at SystemContext load) is tracked for the Track-A
-/// config unification.
+/// Windows-only. The folder is rooted in the machine's `ProgramData`
+/// as the system names it ([`crate::appdirs::machine_program_data`]),
+/// never in a variable, so every account's process names the same file.
 ///
-/// ⚠️ #3073 — the OWNER goes first and the GRANT second ([`HARDEN_STEPS`]),
-/// and nothing that removes access runs unless both took. The daemon never
-/// enables the privileges that override a DACL, so once inherited ACEs are
-/// gone, SYSTEM reaches an object only through an ACE of its own or by
-/// owning it. Whatever a user-mode process created (the desktop companion,
-/// an earlier per-user install) belongs to that user:
-/// - with inheritance dropped first, the directory itself came out sealed
-///   against SYSTEM: the grant failed `Access is denied`, and every later
-///   daemon start ran with no log, no crash records and no machine-global
-///   config. Administrators as the owner fixed the directory;
-/// - but each CHILD the user owned still came out with an empty DACL
-///   (0.4.185, measured: `crashes`, `service-logs`, `config.toml.prev`). The
-///   grant reaches a child only by inheritance, and inheritance can rewrite
-///   only a child SYSTEM can still write. Granted first, the explicit
-///   SYSTEM and Administrators ACEs are already on every child when the
-///   inherited ones go.
-///
-/// A child keeps its owner: only the directory is taken for Administrators.
-#[cfg(windows)]
-fn harden_machine_global_dir(dir: &std::path::Path) {
-    let d = dir.display().to_string();
-    for (i, args) in HARDEN_STEPS.iter().enumerate() {
-        match std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
-            .arg(&d)
-            .args(*args)
-            .output()
-        {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                tracing::warn!(
-                    dir = %d, ?args,
-                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                    "config: machine-global dir ACL hardening step failed"
-                );
-                // Steps 0 and 1, the owner and the grant: never strip
-                // inheritance unless both took. Inheritance is still intact
-                // at either point, so stopping leaves the directory as open
-                // as it was.
-                if i < 2 {
-                    return;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(dir = %d, %e, "config: icacls spawn failed; dir ACL unhardened");
-                return;
-            }
-        }
-    }
-}
-
-/// The `icacls` steps of [`harden_machine_global_dir`], in order (#3073):
-/// take ownership for Administrators, grant SYSTEM and Administrators, drop
-/// inheritance, then remove Users and Authenticated Users down the tree.
-#[cfg(any(windows, test))]
-const HARDEN_STEPS: [&[&str]; 4] = [
-    &["/setowner", "*S-1-5-32-544"],
-    &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
-    &["/inheritance:r"],
-    &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
-];
-
+/// #3609 — the folder, this file, its `.prev` and its keys are kept to SYSTEM
+/// and Administrators by [`crate::machine_tree`]: every save repairs the chain
+/// first, in-process (it replaced W4(c)'s four `icacls` steps, #3073, #3291),
+/// and SYSTEM runs the file only while the chain passes its check.
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
     crate::appdirs::machine_global_dir().join("config.toml")
@@ -3576,7 +3489,9 @@ pub fn machine_global_config_path() -> PathBuf {
 
 /// Sibling copy of the last config that both saved AND parsed, kept so an
 /// unreadable live file can be recovered without re-enrolling the host.
-fn prev_path(path: &std::path::Path) -> PathBuf {
+/// Public for a writer that keeps the outgoing config itself under the name
+/// [`load`] recovers from (`roomlerd one-row-home convert`).
+pub fn prev_path(path: &std::path::Path) -> PathBuf {
     path.with_extension("toml.prev")
 }
 
@@ -3600,7 +3515,7 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     // server reconciles the rest. Loud, because silently running on an
     // older config must never look like a normal boot.
     let prev = prev_path(path);
-    match try_load(&prev) {
+    match load_prev(path, &prev) {
         Ok(cfg) => {
             tracing::error!(
                 path = %path.display(),
@@ -3612,7 +3527,7 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
             // Reinstate it as the live file so the next save has a base. The
             // keys this build does not know are the copy's to keep (#2078):
             // the live file, which a save reads them from, parses as nothing.
-            if let Err(e) = save_with_base(path, &prev, &cfg) {
+            if let Err(e) = save_with_base(path, &prev, &cfg, Kept::Keep) {
                 tracing::warn!(error = %format!("{e:#}"), "could not reinstate recovered config");
             }
             note_unknown_keys(path);
@@ -3695,6 +3610,15 @@ pub enum MergeBase {
         /// Why, on one line, for the person.
         reason: String,
     },
+    /// #3609 — Windows, the machine-global config: it is there, and after the
+    /// machine tree's repair it is still not private to the computer's
+    /// administrators. It is never folded into an enrollment: whoever else
+    /// could change it may have chosen what it holds. The caller writes a
+    /// fresh config in its place and says so ([`describe_not_private`]).
+    NotPrivate {
+        /// Why, on one line: the entry and the reason.
+        reason: String,
+    },
 }
 
 impl MergeBase {
@@ -3702,7 +3626,7 @@ impl MergeBase {
     /// none to give; a caller stops on it before it gets here.
     pub fn into_config(self) -> Option<AgentConfig> {
         match self {
-            MergeBase::Absent | MergeBase::Denied { .. } => None,
+            MergeBase::Absent | MergeBase::Denied { .. } | MergeBase::NotPrivate { .. } => None,
             MergeBase::Loaded(cfg) => Some(cfg),
             MergeBase::Unreadable { recovered, .. } => recovered,
         }
@@ -3729,7 +3653,46 @@ impl MergeBase {
 /// is [`MergeBase::Denied`], never `Unreadable`, whose wording ("a fresh
 /// config is written, and this device's earlier settings do not carry over")
 /// would be false about a file that is only closed to the reader.
+///
+/// #3609 — at the machine-global location on Windows the merge base is the
+/// config SYSTEM runs, and only an elevated writer reads it (Setup's machine
+/// write, `roomlerd enroll --machine-global`, `roomlerd adopt-enrollment`). The
+/// machine tree is repaired first, as the save that follows will, and a config
+/// that then fails its check is [`MergeBase::NotPrivate`], never folded into;
+/// a config that does not load is recovered only from a `.prev` that passes.
 pub fn read_merge_base(path: &PathBuf) -> MergeBase {
+    #[cfg(windows)]
+    if let Some(tree) = machine_tree_of(path) {
+        return machine_merge_base(path, &tree, crate::machine_tree::Switches::from_env());
+    }
+    merge_base(path, || Ok(()), try_load)
+}
+
+/// #3609 — [`read_merge_base`] at the machine-global location: the repair and
+/// the check before anything is folded (`machine_tree::may_fold`), and the
+/// checked `.prev` ([`load_private_prev`]).
+#[cfg(windows)]
+fn machine_merge_base(
+    path: &PathBuf,
+    tree: &crate::machine_tree::MachineTree,
+    switches: crate::machine_tree::Switches,
+) -> MergeBase {
+    merge_base(
+        path,
+        || crate::machine_tree::may_fold(tree, switches),
+        load_private_prev,
+    )
+}
+
+/// The merge base at `path`. `private` says, once the file is known to be
+/// there and open to this process, whether it may be folded into at all;
+/// `prev` reads the last good copy that a config which does not load is
+/// recovered from.
+fn merge_base(
+    path: &PathBuf,
+    private: impl FnOnce() -> Result<(), String>,
+    prev: impl FnOnce(&PathBuf) -> Result<AgentConfig>,
+) -> MergeBase {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MergeBase::Absent,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -3739,14 +3702,24 @@ pub fn read_merge_base(path: &PathBuf) -> MergeBase {
         }
         _ => {}
     }
-    match try_load(path) {
-        Ok(cfg) => MergeBase::Loaded(cfg),
-        Err(e) if permission_denied(&e) => MergeBase::Denied {
+    let loaded = try_load(path);
+    if let Err(e) = &loaded
+        && permission_denied(e)
+    {
+        return MergeBase::Denied {
             reason: one_line(&format!("{e:#}")),
-        },
+        };
+    }
+    if let Err(reason) = private() {
+        return MergeBase::NotPrivate {
+            reason: one_line(&reason),
+        };
+    }
+    match loaded {
+        Ok(cfg) => MergeBase::Loaded(cfg),
         Err(e) => MergeBase::Unreadable {
             reason: one_line(&format!("{e:#}")),
-            recovered: try_load(&prev_path(path)).ok(),
+            recovered: prev(&prev_path(path)).ok(),
         },
     }
 }
@@ -3768,6 +3741,18 @@ pub fn describe_denied(path: &std::path::Path, reason: &str) -> String {
     format!(
         "{} is there, but this process may not read it ({reason}). It is not damaged, and \
          nothing was written over it.",
+        path.display()
+    )
+}
+
+/// #3609 — what to tell the person about a machine-global config that is not
+/// private to the computer's administrators ([`MergeBase::NotPrivate`]): it is
+/// set aside, and the enrollment is written fresh in its place.
+pub fn describe_not_private(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "{} is set aside, because {reason}: a config that is not private to this computer's \
+         administrators is never carried over. A fresh config is written in its place, and this \
+         device's earlier settings (its private network, routes, lock policy …) do not carry over.",
         path.display()
     )
 }
@@ -3797,9 +3782,28 @@ pub fn unreadable_copy_path(path: &std::path::Path) -> PathBuf {
 /// Copy a config that does not load aside ([`unreadable_copy_path`]) before it
 /// is written over, so whatever the person can still read out of it by hand
 /// is not lost. 0600 on Unix: a damaged config can still hold a bearer token.
+///
+/// #3609 — into a new file of its own (`machine_tree::create_fresh`): a file
+/// left under that name would keep its owner and DACL through a copy into it.
+/// At the machine-global location on Windows it gets SYSTEM and Administrators
+/// alone through its handle, as the config does.
 pub fn keep_unreadable(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
     let dest = unreadable_copy_path(path);
-    std::fs::copy(path, &dest)?;
+    let bytes = std::fs::read(path)?;
+    let mut copy = crate::machine_tree::create_fresh(&dest)?;
+    copy.write_all(&bytes)?;
+    copy.sync_all()?;
+    #[cfg(windows)]
+    if machine_tree_of(path).is_some()
+        && let Err(e) = crate::machine_tree::seal_new_file(&copy)
+    {
+        tracing::warn!(
+            path = %dest.display(), %e,
+            "config: could not give the kept copy its own owner and DACL; \
+             it keeps what its folder hands down"
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3840,9 +3844,8 @@ pub fn describe_unreadable(
     }
 }
 
-/// An error chain on one line, bounded: a TOML parse error carries a source
-/// snippet over several lines, which a progress row or a terminal line cannot
-/// show.
+/// An error chain on one line, bounded, which is what a progress row or a
+/// terminal line can show.
 fn one_line(text: &str) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() > 300 {
@@ -3853,27 +3856,85 @@ fn one_line(text: &str) -> String {
     }
 }
 
+/// #3086 — what may be said about a config that does not parse: where it stopped,
+/// and a key the schema wanted. Nothing of the file. A `toml` error quotes the
+/// line it stopped at in its `Display` and its `Debug`, and its message can quote
+/// a value (`invalid type: string "…"`), and this file holds the agent token and
+/// the overlay keys. A daemon's log goes to the server, and a wizard's page and a
+/// terminal show the same words.
+///
+/// So the parser's error ends here: what leaves is a string with no source, and
+/// nothing built on it can reach those words, however it is printed. The file is
+/// there to open at that line.
+fn parse_failure(raw: &str, e: &toml::de::Error) -> String {
+    let mut said = String::from("TOML parse error");
+    if let Some(before) = e.span().and_then(|span| raw.get(..span.start)) {
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        said.push_str(&format!(" at line {line}, column {column}"));
+    }
+    // The schema's word for a key it wanted, which no file can put there. It is
+    // the one message kept: a lost key otherwise reads as something near line 1.
+    // A key name read off the file never is, because a broken line can turn a
+    // value into one.
+    if let Some(field) = e
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        && field
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        said.push_str(&format!(": missing field `{field}`"));
+    }
+    said
+}
+
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
+    parse_raw(&raw, &path.display().to_string())
+}
+
+/// FR-147 — a config's text, parsed by [`try_load`]'s rules, for a reader
+/// that holds the bytes and not the file: `sudo roomlerd one-row` parses what
+/// a person's own process read in that person's home. `origin` names the
+/// text in errors and log lines in place of a path. The keys this build does
+/// not know are noted from the text itself. No `.prev` repair: that rewrite
+/// ([`load`]'s) belongs to the file's own agent.
+pub fn parse_text(raw: &str, origin: &str) -> Result<AgentConfig> {
+    let cfg = parse_raw(raw, origin)?;
+    if let Some(keys) = unknown_keys_said(raw) {
+        tracing::warn!(
+            origin = %origin,
+            keys = %keys,
+            "config keys this build does not know: ignored here, and kept in the file through every save"
+        );
+    }
+    Ok(cfg)
+}
+
+/// What [`try_load`] does with the text it read, `origin` standing for its
+/// path: every reader parses through here.
+fn parse_raw(raw: &str, origin: &str) -> Result<AgentConfig> {
     // An all-NUL file of the correct length is the signature of a power loss
     // between `rename` and the data reaching disk. `toml` reports it as a
     // parse error at line 1, which reads like a hand-edit typo; name it.
     if !raw.is_empty() && raw.bytes().all(|b| b == 0) {
         anyhow::bail!(
             "config at {} is {} bytes of NUL (truncated by an unclean shutdown)",
-            path.display(),
+            origin,
             raw.len()
         );
     }
-    let mut cfg: AgentConfig =
-        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
+    let mut cfg: AgentConfig = toml::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("parsing config at {}: {}", origin, parse_failure(raw, &e)))?;
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
     for (field, was) in cfg.secure_server_urls() {
         tracing::warn!(
-            path = %path.display(),
+            path = %origin,
             field = %field,
             was = %was,
             "a plaintext server URL in the config is read as TLS; set \
@@ -3897,12 +3958,14 @@ enum KeyStep {
 /// that knows it or left behind by a rollback. Paths only, never values: the
 /// file holds the agent token and the overlay keys.
 ///
-/// `Err` when `raw` does not parse as a config at all.
-fn unknown_keys(raw: &str) -> Result<Vec<Vec<KeyStep>>> {
+/// `None` when `raw` does not parse as a config at all. Not the parser's error,
+/// which quotes the file (#3086): no caller wants it, so none can print it.
+fn unknown_keys(raw: &str) -> Option<Vec<Vec<KeyStep>>> {
     let mut found = Vec::new();
-    let de = toml::de::Deserializer::parse(raw)?;
-    let _: AgentConfig = serde_ignored::deserialize(de, |path| found.push(key_steps(&path)))?;
-    Ok(found)
+    let de = toml::de::Deserializer::parse(raw).ok()?;
+    let _: AgentConfig =
+        serde_ignored::deserialize(de, |path| found.push(key_steps(&path))).ok()?;
+    Some(found)
 }
 
 fn key_steps(path: &serde_ignored::Path<'_>) -> Vec<KeyStep> {
@@ -4051,54 +4114,102 @@ fn merge_unknown_keys(
     Ok((merged, lost))
 }
 
+/// #3609 — `file`'s text, when it is a plain file that SYSTEM and
+/// Administrators alone may change (`machine_tree::read_checked`, through the
+/// handle it was checked on); `None` otherwise, or when it is not there.
+fn private_text(file: &std::path::Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let bytes = crate::machine_tree::read_checked(file, 1 << 20).ok()??;
+        String::from_utf8(bytes).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        None
+    }
+}
+
 /// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
 /// holds that this build does not model. `base` is the file being replaced:
 /// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
-/// the live file it then writes over parses as nothing. Before this, every
-/// save erased them: a key set ahead of the update that knows it was gone by
-/// the old daemon's stop, and a rollback erased every newer key for good.
+/// that live file may not even be there. Before this, every save erased them:
+/// a key set ahead of the update that knows it was gone by the old daemon's
+/// stop, and a rollback erased every newer key for good.
+///
+/// #3087 — a `base` that is there and does not read as a config holds no keys
+/// this can see, and its last good copy does. That is the config a recovery has
+/// just loaded, and [`read_merge_base`]'s callers name no base when they save it.
 ///
 /// A base with no such key is written exactly as before, byte for byte, and
 /// any failure to keep them saves `cfg` alone and says so: the worst case is
 /// the old behaviour. Comments are still lost; that needs an in-place editor.
+///
+/// #3609 — at the machine location (`machine`) a key is kept only from a file
+/// that SYSTEM and Administrators alone may change (`machine_tree::read_checked`,
+/// after the save's own repair): what any other account could have put in a
+/// file there never reaches the machine config, as the fold refuses such a
+/// config ([`read_merge_base`]).
+///
+/// This half chooses the base and reads it; [`keep_unknown_keys`] makes the
+/// text from what it read, as it does for [`serialise_over`], which is handed
+/// the outgoing bytes and reads no file.
 fn serialise_for(
     path: &std::path::Path,
     base: &std::path::Path,
     cfg: &AgentConfig,
+    machine: bool,
 ) -> Result<String> {
     let plain = toml::to_string_pretty(cfg).context("serialising config")?;
-    let raw = match std::fs::read_to_string(base) {
-        Ok(raw) => raw,
-        // No file yet: a first save, nothing to keep.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                base = %base.display(),
-                error = %e,
-                "the config being replaced could not be read: keys this build does not know \
-                 in it, if any, are NOT kept through this save"
-            );
-            return Ok(plain);
-        }
+    let read = |file: &std::path::Path| {
+        let raw = if machine {
+            private_text(file)?
+        } else {
+            std::fs::read_to_string(file).ok()?
+        };
+        let unknown = unknown_keys(&raw)?;
+        Some((raw, unknown))
     };
-    // Said with a fixed string: a parse error quotes the line it stopped at,
-    // and the file holds the agent token and the overlay keys. A live file
-    // that does not parse is what `load` recovers from `.prev`, and a save
-    // over it keeps the copy's keys only when its caller names the copy.
-    let Ok(unknown) = unknown_keys(&raw) else {
+    // No file yet: a first save, nothing to keep.
+    if matches!(base.try_exists(), Ok(false)) {
+        return Ok(plain);
+    }
+    let copy = prev_path(path);
+    let (raw, base, unknown) = if let Some((raw, unknown)) = read(base) {
+        (raw, base, unknown)
+    } else if let Some((raw, unknown)) = read(&copy) {
+        (raw, copy.as_path(), unknown)
+    } else {
+        // Said with a fixed string: a parse error quotes the line it stopped
+        // at, and the file holds the agent token and the overlay keys.
         tracing::warn!(
             path = %path.display(),
             base = %base.display(),
-            "the config being replaced does not parse: keys this build does not know in it, \
-             if any, are NOT kept through this save"
+            "the config being replaced does not read as a config (at the machine location: or \
+             is not private to the computer's administrators), and neither does its last good \
+             copy: keys this build does not know in them, if any, are NOT kept through this save"
         );
         return Ok(plain);
     };
+    Ok(keep_unknown_keys(path, base, &raw, plain, &unknown).0)
+}
+
+/// #2078 — `plain`, the text of the config being saved, with every key of
+/// `unknown` copied in from `raw`, the text of `base` it replaces at `path`;
+/// and the dotted names of those keys it could not keep. `plain` alone when
+/// `unknown` is empty, and when the merge fails (every key is then one it did
+/// not keep). A key not kept is said, with a fixed string.
+fn keep_unknown_keys(
+    path: &std::path::Path,
+    base: &std::path::Path,
+    raw: &str,
+    plain: String,
+    unknown: &[Vec<KeyStep>],
+) -> (String, Vec<String>) {
     if unknown.is_empty() {
-        return Ok(plain);
+        return (plain, Vec::new());
     }
-    match merge_unknown_keys(&raw, &plain, &unknown) {
+    match merge_unknown_keys(raw, &plain, unknown) {
         Ok((merged, lost)) => {
             if !lost.is_empty() {
                 tracing::warn!(
@@ -4109,7 +4220,7 @@ fn serialise_for(
                      the org, route or table that held them is not in it"
                 );
             }
-            Ok(merged)
+            (merged, lost)
         }
         Err(why) => {
             let keys: Vec<String> = unknown.iter().map(|s| dotted(s)).collect();
@@ -4120,31 +4231,83 @@ fn serialise_for(
                 why,
                 "config keys this build does not know were NOT kept through this save"
             );
-            Ok(plain)
+            (plain, keys)
         }
     }
+}
+
+/// FR-147 — the text [`save`] writes over a config file that holds
+/// `outgoing`, made from those bytes alone: it reads no file. For a caller
+/// that has read the live file once and checked it, and must write over the
+/// bytes it checked and nothing read later (`roomlerd one-row-home convert`).
+/// Also returns the dotted names of the keys this build does not know that it
+/// could not keep; `origin` names the file where that is said. An `outgoing`
+/// that does not read as a config holds no key this can see: the text is
+/// `cfg` alone, as [`save`] writes when neither the file nor its last good
+/// copy reads.
+pub fn serialise_over(
+    cfg: &AgentConfig,
+    outgoing: &str,
+    origin: &std::path::Path,
+) -> Result<(String, Vec<String>)> {
+    let plain = toml::to_string_pretty(cfg).context("serialising config")?;
+    let Some(unknown) = unknown_keys(outgoing) else {
+        return Ok((plain, Vec::new()));
+    };
+    Ok(keep_unknown_keys(origin, origin, outgoing, plain, &unknown))
 }
 
 /// #2078 — names the keys this build ignores in the config it runs on, once per
 /// process and file: after a rollback, or a key set ahead of the update that
 /// knows it, "my setting did nothing" has its answer in the log. Key paths
 /// only; the file holds secrets.
+/// FR-137 S-B7 (decision D11) — FR-90's 23 config keys, retired with Hive.
+/// Every recent agent wrote them, Hive host or not (`false` and `[]` included),
+/// so nearly every `config.toml` in the fleet carries them. They stay through
+/// every save (the unknown-key merge, S-B6: never add `deny_unknown_fields`),
+/// and a build from a revert reads them again. What they are not is news: the
+/// once-per-start WARN below leaves them out, or every host would log the same
+/// twenty-odd keys at every start.
+pub(crate) const RETIRED_KEYS: [&str; 23] = [
+    "hive_enabled",
+    "hive_accounts",
+    "hive_roots",
+    "hive_max_sessions",
+    "hive_harness",
+    "hive_api_key_helper",
+    "hive_api_workspace_id",
+    "hive_update_wait_secs",
+    "hive_core_memory",
+    "hive_adopt",
+    "hive_allow_passwordless_sudo",
+    "hive_replica",
+    "hive_archive",
+    "hive_store_quota_mib",
+    "vault_enabled",
+    "vault_activity_log",
+    "hive_net",
+    "hive_ssh",
+    "hive_egress",
+    "hive_worker",
+    "knowhow_scan_roots",
+    "knowhow_scan_listeners",
+    "knowhow_probe_reach",
+];
+
+/// Is this dotted path one of [`RETIRED_KEYS`], or inside one (the
+/// `hive_accounts` table)?
+fn is_retired_key(dotted: &str) -> bool {
+    RETIRED_KEYS.contains(&dotted.split('.').next().unwrap_or(dotted))
+}
+
 fn note_unknown_keys(path: &PathBuf) {
     static NOTED: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
-    let Ok(unknown) = unknown_keys(&raw) else {
+    let Some(keys) = unknown_keys_said(&raw) else {
         return;
     };
-    if unknown.is_empty() {
-        return;
-    }
-    let keys = unknown
-        .iter()
-        .map(|s| dotted(s))
-        .collect::<Vec<_>>()
-        .join(", ");
     {
         let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
         if noted.iter().any(|(p, k)| p == path && *k == keys) {
@@ -4159,8 +4322,46 @@ fn note_unknown_keys(path: &PathBuf) {
     );
 }
 
+/// The keys in `raw` this build does not know, the retired ones left out,
+/// joined for one log line. `None` when there are none, or `raw` does not
+/// parse as a config.
+fn unknown_keys_said(raw: &str) -> Option<String> {
+    let keys = unknown_keys(raw)?
+        .iter()
+        .map(|s| dotted(s))
+        .filter(|k| !is_retired_key(k))
+        .collect::<Vec<_>>();
+    (!keys.is_empty()).then(|| keys.join(", "))
+}
+
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
-    save_with_base(path, path, cfg)
+    save_with_base(path, path, cfg, Kept::Keep)
+}
+
+/// #3666 — [`save`] for an elevated writer that folded nothing into what was
+/// at `path` (`roomlerd enroll`, `roomlerd adopt-enrollment` and Setup's
+/// machine write, whose merge base was absent, damaged past recovery, or not
+/// the machine's as found). At the machine-global location on Windows it keeps
+/// nothing the folder held: the old `.prev` is removed once the save's repair
+/// has sealed the folder, the outgoing config is not kept as `.prev`, and no
+/// key this build does not know is carried over. Otherwise a planted `.prev`
+/// would be sealed by the repair and recovered from after any damage, and a
+/// planted key would ride into the new config. Anywhere else it is [`save`].
+pub fn save_fresh(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
+    save_with_base(path, path, cfg, Kept::Drop)
+}
+
+/// #3666 — what a save keeps of the files it replaces: the outgoing config as
+/// `.prev`, and the keys this build does not know ([`Kept::Keep`]), or, at the
+/// machine-global location on Windows, nothing ([`Kept::Drop`],
+/// [`save_fresh`]). Decided by the writer from its merge base and carried to
+/// the save, never read again there: between the two, the writer takes the
+/// machine folder and seals its parent, and after that a tree that was not the
+/// machine's reads as if it were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    Keep,
+    Drop,
 }
 
 /// #3116 — the saves a daemon makes while it starts. They write the copy it
@@ -4185,6 +4386,9 @@ pub struct StartupWrites {
     /// after each of its own saves. `None` when it could not be read, which
     /// leaves the saves unguarded, as they all were before.
     seen: Option<Vec<u8>>,
+    /// FR-43 P3a — this daemon runs on a view of the file, so its copy is
+    /// never the file's to write ([`Self::read_only`]).
+    read_only: bool,
 }
 
 impl StartupWrites {
@@ -4197,6 +4401,18 @@ impl StartupWrites {
         Self {
             path: path.to_path_buf(),
             seen: std::fs::read(path).ok(),
+            read_only: false,
+        }
+    }
+
+    /// FR-43 P3a — for a process running on
+    /// [`AgentConfig::for_unenrolled_worker`]'s view: every save succeeds and
+    /// writes nothing, so a view never lands on the person's file.
+    pub fn read_only(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: None,
+            read_only: true,
         }
     }
 
@@ -4205,6 +4421,9 @@ impl StartupWrites {
     /// read back, is not written either: an uninstall or an unenroll removed
     /// it, and a startup save must not bring the enrollment back.
     pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if let Some(seen) = &self.seen {
             let now = std::fs::read(&self.path).with_context(|| {
                 format!(
@@ -4230,13 +4449,60 @@ impl StartupWrites {
 /// [`save`], keeping the keys this build does not know of `base` rather than
 /// of the file at `path` (#2078): [`load`]'s recovery reinstates the `.prev`
 /// copy it loaded over a live file that does not parse, and the keys to keep
-/// are the copy's.
-fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> Result<()> {
+/// are the copy's. `kept`: [`Kept`].
+fn save_with_base(
+    path: &PathBuf,
+    base: &std::path::Path,
+    cfg: &AgentConfig,
+    kept: Kept,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
-    let serialised = serialise_for(path, base, cfg)?;
+    // #3609 — at the machine-global location on Windows, the chain is
+    // repaired before anything is written into it, so the temp file below is
+    // made in a folder only SYSTEM and Administrators may change. The repair
+    // replaced W4(c)'s four `icacls` steps (#3073, #3291): it runs in-process,
+    // and on a chain already as it should be it changes nothing.
+    #[cfg(windows)]
+    let machine = machine_tree_of(path);
+    #[cfg(windows)]
+    if let Some(tree) = &machine
+        && crate::machine_tree::Switches::from_env().repair
+    {
+        crate::machine_tree::log_repairs(&crate::machine_tree::repair(tree, true));
+    }
+    // #3666 — a fresh machine save keeps nothing the folder held. The old
+    // `.prev` goes now, in a folder the repair has just sealed, so no other
+    // account can put one back before the new config takes its name.
+    #[cfg(windows)]
+    let fresh = machine.is_some() && kept == Kept::Drop;
+    #[cfg(not(windows))]
+    let fresh = {
+        let _ = kept;
+        false
+    };
+    if fresh {
+        let prev = prev_path(path);
+        match std::fs::remove_file(&prev) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %prev.display(), %e,
+                "config: the old machine .prev was not removed; a load recovers from it \
+                 only while it passes the machine tree's check"
+            ),
+        }
+    }
+    #[cfg(windows)]
+    let serialised = if fresh {
+        toml::to_string_pretty(cfg).context("serialising config")?
+    } else {
+        serialise_for(path, base, cfg, machine.is_some())?
+    };
+    #[cfg(not(windows))]
+    let serialised = serialise_for(path, base, cfg, false)?;
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -4258,15 +4524,31 @@ fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> 
     // `sync_all()` before the rename is what makes the guarantee real:
     // the bytes are on disk first, so the crash window can only ever
     // yield the OLD file or the NEW file.
+    //
+    // #3609 — and the temp file is one this save made: a file left under its
+    // name is removed first and `create_new` refuses one that appears, because
+    // a write into it would keep that file's owner and DACL, and the rename
+    // would hand them to the config. At the machine location it is given its
+    // own owner and DACL through its handle before it takes the name.
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     {
         use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp)
+        let mut f = crate::machine_tree::create_fresh(&tmp)
             .with_context(|| format!("creating config temp file {}", tmp.display()))?;
         f.write_all(serialised.as_bytes())
             .with_context(|| format!("writing config temp file {}", tmp.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync config temp file {}", tmp.display()))?;
+        #[cfg(windows)]
+        if machine.is_some()
+            && let Err(e) = crate::machine_tree::seal_new_file(&f)
+        {
+            tracing::warn!(
+                path = %tmp.display(), %e,
+                "config: could not give the new machine config its own owner and DACL; \
+                 it keeps what its folder hands down until the next repair"
+            );
+        }
     }
 
     // Tighten permissions on Unix BEFORE the rename — the file holds a
@@ -4279,26 +4561,26 @@ fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> 
         perms.set_mode(0o600);
         std::fs::set_permissions(&tmp, perms)?;
     }
-    // W4(c) — the Windows twin, for the MACHINE-GLOBAL location only: the
-    // ProgramData default ACL leaves the config (agent bearer token!)
-    // BUILTIN\Users-readable, and a non-admin could even pre-create the
-    // dir/file a SYSTEM-context worker later loads. Harden the directory
-    // before the rename so the renamed file and the `.prev` rotation
-    // inherit the tightened ACEs; `/T` re-ACLs children already present.
-    #[cfg(windows)]
-    if path.starts_with(crate::appdirs::machine_global_dir())
-        && let Some(dir) = path.parent()
-    {
-        harden_machine_global_dir(dir);
-    }
 
     // Rotate the outgoing file to `.prev` so `load` has something to recover
     // from. Gated on it still parsing: a corrupt live file must never be
     // allowed to overwrite the last known-good rotation. Best-effort — a
-    // failed rotation costs recoverability, not correctness. On Unix
-    // `fs::copy` carries the source's 0600 across, so the token stays private.
-    if try_load(path).is_ok() {
-        let _ = std::fs::copy(path, prev_path(path));
+    // failed rotation costs recoverability, not correctness. #3609 — through a
+    // new file of its own, as the config's own temp, and at the machine
+    // location only from a config that passes the machine tree's check.
+    // #3666 — and never on a fresh machine save: the outgoing config was not
+    // the machine's, and the repair has just made it pass that check.
+    if !fresh && try_load(path).is_ok() {
+        #[cfg(windows)]
+        let rotated = rotate_prev(path, machine.is_some());
+        #[cfg(not(windows))]
+        let rotated = rotate_prev(path, false);
+        if let Err(e) = rotated {
+            tracing::warn!(
+                path = %path.display(), error = %format!("{e:#}"),
+                "config: the outgoing config was not kept as .prev"
+            );
+        }
     }
 
     std::fs::rename(&tmp, path).with_context(|| {
@@ -4318,6 +4600,188 @@ fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> 
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// #3609 — the machine tree `path` is the config of, when it is the
+/// machine-global one: what [`save_with_base`] repairs before it writes.
+#[cfg(windows)]
+fn machine_tree_of(path: &std::path::Path) -> Option<crate::machine_tree::MachineTree> {
+    #[cfg(test)]
+    if let Some(tree) = STAND_IN.with(|tree| tree.borrow().clone()) {
+        return path.starts_with(tree.folder()).then_some(tree);
+    }
+    let tree = crate::machine_tree::MachineTree::here();
+    path.starts_with(tree.folder()).then_some(tree)
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Tests only: the tree this thread's test stands in for the computer's
+    /// own machine tree, which [`machine_tree_of`] then never answers.
+    static STAND_IN: std::cell::RefCell<Option<crate::machine_tree::MachineTree>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #3666 — what `roomlerd re-enroll` and `roomlerd org` ask before they
+/// [`load`] the config at `path`, which they then send an enrollment token on
+/// or change: on Windows, at the machine-global location, the config must
+/// have been the machine's as found (`machine_tree::as_found`), with nothing
+/// repaired first. A config another account could have put there, or chosen
+/// what it holds, names the server the token goes to. `Ok` anywhere else,
+/// with no config there, and, logged, with `ROOMLERD_MACHINE_TREE_CHECK=0`.
+/// An entry this process may not read is a refusal too: nothing is decided
+/// about a config that could not be looked at.
+pub fn machine_config_as_found(path: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    if let Some(tree) = machine_tree_of(path) {
+        use crate::machine_tree::Refusal;
+        match crate::machine_tree::as_found(&tree) {
+            Ok(()) | Err(Refusal::Absent) => {}
+            Err(Refusal::NotPrivate(why)) if !crate::machine_tree::Switches::from_env().check => {
+                tracing::warn!(
+                    path = %path.display(), reason = %why,
+                    "config: the machine config was not the machine's as found; \
+                     ROOMLERD_MACHINE_TREE_CHECK=0, so it is loaded anyway"
+                );
+            }
+            Err(Refusal::NotPrivate(why)) => anyhow::bail!(
+                "the machine config at {} is not loaded, and nothing was sent: {why}. \
+                 Whoever could do that may have chosen what it holds, the server an \
+                 enrollment goes to included. Run Setup, or `roomlerd enroll \
+                 --machine-global` from an elevated prompt, to write a fresh one",
+                path.display()
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+
+/// #3609 — what an elevated save of the machine config (Setup's machine write,
+/// `roomlerd enroll --machine-global`) runs right before it [`save`]s at
+/// `path`: the machine folder is made if it is not there yet, as the save
+/// would make it, and it and its parent, `%ProgramData%\roomler`, are taken for
+/// Administrators (`machine_tree::adopt_machine_parent`, `::adopt_machine_folder`),
+/// so that the save's own repair seals the folder and the check takes the
+/// parent. A person's daemon may have made both to stage a received file before
+/// the service ever ran. Never the daemon's: its saves and repairs take nothing
+/// over. `Ok(true)` when either was taken; `Ok(false)` at any other path, when
+/// there was nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+#[cfg(windows)]
+pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
+    let Some(tree) = machine_tree_of(path) else {
+        return Ok(false);
+    };
+    if !crate::machine_tree::Switches::from_env().repair {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(tree.folder())
+        .map_err(|e| format!("creating {}: {e}", tree.folder().display()))?;
+    let parent = crate::machine_tree::adopt_machine_parent(&tree);
+    let folder = crate::machine_tree::adopt_machine_folder(&tree);
+    match (parent, folder) {
+        (Ok(parent), Ok(folder)) => Ok(parent || folder),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+        (Err(parent), Err(folder)) => Err(format!("{parent}; {folder}")),
+    }
+}
+
+/// #3609 — the parent alone, `%ProgramData%\roomler`, for the machine config at
+/// `path` (`machine_tree::adopt_machine_parent`): what Setup's machine write runs
+/// before it seals the parent, so that the seal, which names it by path, finds a
+/// plain folder that belongs to Administrators. An `Err` for a parent that is
+/// not a plain folder. `Ok(false)` at any other path, when there was nothing to
+/// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+#[cfg(windows)]
+pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, String> {
+    let Some(tree) = machine_tree_of(path) else {
+        return Ok(false);
+    };
+    if !crate::machine_tree::Switches::from_env().repair {
+        return Ok(false);
+    }
+    crate::machine_tree::adopt_machine_parent(&tree)
+}
+
+/// #3609 — keep the outgoing config at `path` as its `.prev`, through a new
+/// file: the bytes go into a temp file this save made (never into a `.prev` or
+/// a temp file that was there, which would keep their owner and DACL), which
+/// then takes the `.prev` name. At the machine location (`machine`) the bytes
+/// are read only from a config that passes the machine tree's check, through
+/// the handle it was checked on, and the new file gets its own owner and DACL
+/// before it takes the name.
+fn rotate_prev(path: &std::path::Path, machine: bool) -> Result<()> {
+    use std::io::Write as _;
+    let prev = prev_path(path);
+    let Some(bytes) = outgoing_bytes(path, machine)? else {
+        return Ok(());
+    };
+    let tmp = prev.with_extension(format!("prev.tmp.{}", std::process::id()));
+    let written = (|| -> Result<()> {
+        let mut f = crate::machine_tree::create_fresh(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(&bytes)
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        #[cfg(windows)]
+        if machine {
+            crate::machine_tree::seal_new_file(&f)
+                .with_context(|| format!("setting the owner and DACL of {}", tmp.display()))?;
+        }
+        Ok(())
+    })();
+    let placed = written.and_then(|()| {
+        std::fs::rename(&tmp, &prev).with_context(|| format!("placing {}", prev.display()))
+    });
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    placed
+}
+
+/// The outgoing config's bytes for [`rotate_prev`]; `None` when it is gone.
+fn outgoing_bytes(path: &std::path::Path, machine: bool) -> Result<Option<Vec<u8>>> {
+    #[cfg(windows)]
+    if machine {
+        return crate::machine_tree::read_checked(path, 1 << 20).map_err(|why| {
+            anyhow::anyhow!("{why}; it is not kept as {}", prev_path(path).display())
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = machine;
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// #3609 — the `.prev` copy [`load`] recovers from. At the machine-global
+/// location on Windows it is taken only while it passes the machine tree's
+/// check ([`load_private_prev`]). It is not part of the chain the service
+/// checks before it runs the config, so an old copy another account made never
+/// stops a device: the next save replaces it with a new file ([`rotate_prev`]).
+fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
+    #[cfg(windows)]
+    if machine_tree_of(path).is_some() {
+        return load_private_prev(prev);
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    try_load(prev)
+}
+
+/// #3609 — a machine-global `.prev`, only while it is a plain file owned by
+/// SYSTEM or Administrators that no other account may change, checked through
+/// its handle (`machine_tree::read_checked`): what [`load`] and an elevated
+/// writer's merge base ([`read_merge_base`]) recover from.
+#[cfg(windows)]
+fn load_private_prev(prev: &PathBuf) -> Result<AgentConfig> {
+    if let Err(why) = crate::machine_tree::read_checked(prev, 1 << 20) {
+        anyhow::bail!("{why}");
+    }
+    try_load(prev)
 }
 
 fn derive_ws_url(http_url: &str) -> String {
@@ -4458,6 +4922,51 @@ machine_name = "devbox"
         .to_string()
     }
 
+    /// FR-147 — `parse_text` is `try_load` without the file: the same config
+    /// from the same text, the same TLS rule, a key this build does not know
+    /// still ignored, and nothing read or written beside it.
+    #[test]
+    fn parse_text_reads_what_try_load_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = format!(
+            "{}\nnot_a_key_of_this_build = 1\n",
+            minimal_toml().replace("https://roomler.ai", "http://roomler.example")
+        );
+        std::fs::write(&path, &text).unwrap();
+        let from_file = try_load(&path).expect("try_load");
+        let from_text = parse_text(&text, "the person's config").expect("parse_text");
+        assert_eq!(
+            toml::to_string(&from_text).unwrap(),
+            toml::to_string(&from_file).unwrap()
+        );
+        assert!(
+            from_text.server_url.starts_with("https://roomler.example"),
+            "{}",
+            from_text.server_url
+        );
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "parse_text left nothing beside the file");
+    }
+
+    /// Its errors name `origin`, never a path, and keep `try_load`'s words:
+    /// the NUL signature, and a parse error by line with no quoted text.
+    #[test]
+    fn parse_text_names_its_origin_in_its_errors() {
+        let nul = format!(
+            "{:#}",
+            parse_text("\0\0\0\0", "uid 501's config").unwrap_err()
+        );
+        assert!(nul.contains("uid 501's config is 4 bytes of NUL"), "{nul}");
+        let broken = "server_url = \"https://roomler.ai\"\nagent_token = \"secret-value\n";
+        let said = format!("{:#}", parse_text(broken, "uid 501's config").unwrap_err());
+        assert!(
+            said.starts_with("parsing config at uid 501's config: TOML parse error at line"),
+            "{said}"
+        );
+        assert!(!said.contains("secret-value"), "{said}");
+    }
+
     /// Locks the devbox incident (2026-08-12): an unclean shutdown left
     /// config.toml the right LENGTH and entirely NUL, and the worker exit-1'd
     /// every 60 s for hours because a bricked config had no recovery path.
@@ -4523,6 +5032,50 @@ machine_name = "devbox"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3609 — a save writes only files it made itself. A file left under the
+    /// save's temp name or the `.prev` name keeps its own owner and DACL
+    /// through a write into it, and a rename carries them to the config. So
+    /// neither may receive the config: each is replaced by a new file. A hard
+    /// link to each pre-made file is the witness, on any filesystem: it still
+    /// reads what it held when the save is done.
+    #[test]
+    fn a_save_never_writes_into_a_file_it_did_not_make() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).expect("parses");
+        save(&path, &cfg).expect("a first save, so the next one rotates");
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        let made_before: [(std::path::PathBuf, &str); 2] = [
+            (tmp, "made before the save"),
+            (prev_path(&path), "an old .prev"),
+        ];
+        let witnesses = dir.path().join("witnesses");
+        std::fs::create_dir(&witnesses).unwrap();
+        for (i, (file, text)) in made_before.iter().enumerate() {
+            std::fs::write(file, text).unwrap();
+            std::fs::hard_link(file, witnesses.join(i.to_string())).expect("a hard link");
+        }
+        let mut next = cfg.clone();
+        next.machine_name = "renamed".into();
+        save(&path, &next).expect("the save");
+        let written_into: Vec<String> = made_before
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, text))| {
+                std::fs::read_to_string(witnesses.join(i.to_string())).unwrap() != *text
+            })
+            .map(|(_, (file, _))| file.display().to_string())
+            .collect();
+        assert!(written_into.is_empty(), "written into: {written_into:?}");
+        assert_eq!(load(&path).unwrap().machine_name, "renamed");
+        assert_eq!(
+            try_load(&prev_path(&path))
+                .expect(".prev is the config before")
+                .machine_name,
+            "devbox"
+        );
+    }
+
     fn unknown_names(path: &std::path::Path) -> Vec<String> {
         let mut names: Vec<String> = unknown_keys(&std::fs::read_to_string(path).unwrap())
             .unwrap()
@@ -4581,6 +5134,58 @@ machine_name = "devbox"
         assert_eq!(try_load(&path).unwrap().machine_name, "renamed");
     }
 
+    /// FR-137 S-B6 / S-B7 — FR-90's 23 real keys, as a 0.4.199 save wrote
+    /// them (`hive_accounts` a whole table), survive two saves of a build that
+    /// no longer knows them, so a build from a revert finds every one of them
+    /// again, `hive_enabled = true` included. And they are no news: the
+    /// once-per-start WARN leaves them out, and only them.
+    #[test]
+    fn fr90s_retired_keys_survive_two_saves_and_are_not_warned_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let hive = "hive_enabled = true\nhive_roots = [\"/srv/work\"]\nhive_max_sessions = 2\n\
+            hive_harness = \"claude\"\nhive_api_key_helper = \"/usr/local/bin/key\"\n\
+            hive_api_workspace_id = \"ws1\"\nhive_update_wait_secs = 600\n\
+            hive_core_memory = false\nhive_adopt = true\nhive_allow_passwordless_sudo = false\n\
+            hive_replica = false\nhive_archive = false\nhive_store_quota_mib = 512\n\
+            vault_enabled = false\nvault_activity_log = false\nhive_net = false\n\
+            hive_ssh = false\nhive_egress = true\nhive_worker = false\n\
+            knowhow_scan_roots = []\nknowhow_scan_listeners = false\nknowhow_probe_reach = []\n";
+        let raw = format!(
+            "{hive}{}\n[hive_accounts]\nalice = \"alice\"\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let mut want: Vec<String> = RETIRED_KEYS.iter().map(|k| k.to_string()).collect();
+        want.sort();
+        assert_eq!(unknown_names(&path), want, "all 23, and nothing else");
+
+        let mut cfg = load(&path).expect("a 0.4.199 file still loads");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        save(&path, &back).unwrap();
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+        let table = saved_table(&path);
+        assert_eq!(table["hive_enabled"].as_bool(), Some(true));
+        assert_eq!(table["hive_egress"].as_bool(), Some(true));
+        assert_eq!(table["hive_store_quota_mib"].as_integer(), Some(512));
+        assert_eq!(table["hive_accounts"]["alice"].as_str(), Some("alice"));
+        assert_eq!(table["hive_roots"][0].as_str(), Some("/srv/work"));
+
+        for k in RETIRED_KEYS {
+            assert!(is_retired_key(k), "{k}");
+        }
+        assert!(is_retired_key("hive_accounts.alice"), "inside the table");
+        assert!(!is_retired_key("a_key_from_a_newer_build"));
+        assert!(!is_retired_key("hive"), "a prefix is not a key");
+        assert!(
+            !is_retired_key("forward_acl.hive_enabled"),
+            "nor a key elsewhere"
+        );
+    }
+
     /// #2078 — only keys this build IGNORES are carried over. One it knows and
     /// the save cleared stays cleared, though the file being replaced had it.
     #[test]
@@ -4619,6 +5224,51 @@ machine_name = "devbox"
             std::fs::read_to_string(&path).unwrap(),
             toml::to_string_pretty(&cfg).unwrap()
         );
+    }
+
+    /// FR-147 — what [`serialise_over`] makes from the bytes a caller holds is
+    /// exactly what [`save`] writes over a file holding them: with nothing
+    /// unknown in them, with a key this build does not know, and with one it
+    /// cannot keep, which it names.
+    #[test]
+    fn serialise_over_makes_what_a_save_writes_over_the_same_bytes() {
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        let plain = toml::to_string_pretty(&cfg).unwrap();
+        let mut with_gone = cfg.clone();
+        with_gone.orgs.push(org_fixture("gone", "tid-gone"));
+        let mut table: toml::Table =
+            toml::from_str(&toml::to_string_pretty(&with_gone).unwrap()).unwrap();
+        table["orgs"].as_array_mut().unwrap()[1]
+            .as_table_mut()
+            .unwrap()
+            .insert("a_key_from_a_newer_build".into(), 1.into());
+        let in_a_gone_org = toml::to_string_pretty(&table).unwrap();
+        let cases = [
+            ("nothing unknown", plain.clone(), false, Vec::<&str>::new()),
+            (
+                "a key this build does not know",
+                format!("a_key_from_a_newer_build = 1\n{plain}"),
+                true,
+                Vec::new(),
+            ),
+            (
+                "a key in an org this save no longer holds",
+                in_a_gone_org,
+                false,
+                vec!["orgs.1.a_key_from_a_newer_build"],
+            ),
+        ];
+        for (case, outgoing, kept, lost) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &outgoing).unwrap();
+            let (made, not_kept) = serialise_over(&cfg, &outgoing, &path).unwrap();
+            save(&path, &cfg).unwrap();
+            assert_eq!(made, std::fs::read_to_string(&path).unwrap(), "{case}");
+            assert_eq!(made.contains("a_key_from_a_newer_build"), kept, "{case}");
+            assert_eq!(not_kept, lost, "{case}");
+        }
     }
 
     /// #2078 — a key a newer build wrote into an org's entry follows THAT org,
@@ -4778,8 +5428,8 @@ machine_name = "devbox"
     /// for every thread: a parallel test with no subscriber of its own makes
     /// it `never`, and the capture misses that line for good, though this
     /// thread emitted it. Measured in CI on two of the save tests. With two,
-    /// every registered dispatcher is asked, as `pairing_terminal`'s and the
-    /// hive tests' captures hold. The scope ends first, then the second.
+    /// every registered dispatcher is asked, as `pairing_terminal`'s captures
+    /// hold. The scope ends first, then the second.
     struct CaptureGuard {
         _scoped: tracing::dispatcher::DefaultGuard,
         _second: tracing::Dispatch,
@@ -4905,6 +5555,194 @@ machine_name = "devbox"
             "a recovered config's unknown keys are named, as every load's are; got: {log}"
         );
         assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #3087 — the two callers of [`read_merge_base`] (the setup wizard's
+    /// enrollment and `adopt-enrollment`) recover from `.prev` and then
+    /// [`save`] over the live file that does not parse. The save read the keys
+    /// to keep off that file, found nothing, and the recovered host lost them
+    /// with a WARN, which is the case [`load`]'s own recovery already handled.
+    #[test]
+    fn a_save_over_a_corrupt_live_file_keeps_the_last_good_copys_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        std::fs::write(
+            &path,
+            format!("a_key_from_a_newer_build = true\n{}", minimal_toml()),
+        )
+        .unwrap();
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"],
+            "the premise: the last good copy holds the key"
+        );
+
+        // The live file breaks; what those callers do next.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        let recovered = read_merge_base(&path)
+            .into_config()
+            .expect("recovered from .prev");
+        let (cap, _guard) = captured();
+        save(&path, &recovered).unwrap();
+        assert_eq!(
+            unknown_names(&path),
+            ["a_key_from_a_newer_build"],
+            "the recovered file lost the copy's key: {}",
+            cap.text()
+        );
+        assert!(!cap.text().contains("NOT kept"), "{}", cap.text());
+
+        // …and it survives the next save, whose rotation the copy goes through.
+        save(&path, &recovered).unwrap();
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"]
+        );
+
+        // With no copy that parses there is nothing to keep, and it says so.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        std::fs::write(prev_path(&path), "agent_token = \"broken too\n").unwrap();
+        save(&path, &recovered).unwrap();
+        assert!(unknown_names(&path).is_empty());
+        assert!(cap.text().contains("NOT kept"), "{}", cap.text());
+        assert_eq!(
+            std::fs::read_to_string(prev_path(&path)).unwrap(),
+            "agent_token = \"broken too\n",
+            "a save never rotates a file that does not parse into .prev"
+        );
+    }
+
+    /// Shaped like an agent token, and not one. Built at run time, because the
+    /// secret scanner reads a literal of this shape as a live credential.
+    fn token_shaped() -> String {
+        let segment = |word: &str| format!("eyJ{}", word.repeat(3));
+        [
+            segment("notreal"),
+            segment("alsofake"),
+            "nosignature".repeat(2),
+        ]
+        .join(".")
+    }
+
+    /// Every way a hand edit leaves a value on a line the parser stops at: the
+    /// syntax errors, whose `Display` quotes the line, and the schema errors,
+    /// whose message can quote the value itself.
+    fn lines_that_do_not_parse() -> Vec<(&'static str, String)> {
+        let t = token_shaped();
+        vec![
+            ("an unterminated string", format!("agent_token = \"{t}")),
+            ("a lost opening quote", format!("agent_token = {t}\"")),
+            ("no quotes at all", format!("agent_token = {t}")),
+            ("a value with no key", t.clone()),
+            (
+                "a string where a bool belongs",
+                format!("agent_token = \"tok\"\noverlay_enabled = \"{t}\""),
+            ),
+            ("an array of it", format!("agent_token = [\"{t}\"]")),
+            (
+                "the key twice",
+                format!("agent_token = \"{t}\"\nagent_token = \"{t}\""),
+            ),
+        ]
+    }
+
+    fn with_token_line(line: &str) -> String {
+        let raw = minimal_toml();
+        assert!(raw.contains("agent_token = \"tok\""), "the premise");
+        raw.replace("agent_token = \"tok\"", line)
+    }
+
+    fn assert_no_value(shape: &str, what: &str, text: &str) {
+        let token = token_shaped();
+        for part in token.split('.') {
+            assert!(
+                !text.contains(part),
+                "{shape}: {what} carries a value from the file: {text}"
+            );
+        }
+    }
+
+    /// #3086 — a config that does not parse puts nothing of the file in any error
+    /// or log. A `toml` error quotes the line it stopped at, so a typo on
+    /// `agent_token` printed the token: in the daemon's log, which uploads to the
+    /// server, on the wizard's page and in the terminal. Every reader goes
+    /// through [`try_load`], so nothing built on its error can carry a value.
+    #[test]
+    fn a_config_that_does_not_parse_puts_no_value_in_any_error_or_log() {
+        for (shape, line) in lines_that_do_not_parse() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let raw = with_token_line(&line);
+            std::fs::write(&path, &raw).unwrap();
+            let (cap, _guard) = captured();
+
+            let err = try_load(&path).expect_err(shape);
+            assert_no_value(shape, "Display", &format!("{err}"));
+            assert_no_value(shape, "the chain", &format!("{err:#}"));
+            assert_no_value(shape, "Debug", &format!("{err:?}"));
+            for cause in err.chain() {
+                assert_no_value(shape, "a cause", &cause.to_string());
+            }
+
+            // What the wizard and `adopt-enrollment` show the person.
+            match read_merge_base(&path) {
+                MergeBase::Unreadable { reason, recovered } => {
+                    assert!(recovered.is_none(), "{shape}: no .prev yet");
+                    assert_no_value(shape, "the reason", &reason);
+                    let kept = Ok(unreadable_copy_path(&path));
+                    let told = describe_unreadable(&path, &reason, false, &kept);
+                    assert_no_value(shape, "what the person is told", &told);
+                }
+                other => panic!("{shape}: {other:?}"),
+            }
+
+            // The probe's DEBUG line, and both of `load`'s: the live file's error
+            // alone, then with the same line in the copy it falls back to.
+            assert!(read_if_present(&path).is_none(), "{shape}");
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+            std::fs::write(prev_path(&path), &raw).unwrap();
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+
+            let log = cap.text();
+            assert!(
+                log.contains("config unreadable") && log.contains("treating as absent"),
+                "the premise: the loggers ran: {log}"
+            );
+            assert_no_value(shape, "the log", &log);
+        }
+    }
+
+    /// #3086 — what is left is still useful: the error says where, so the person
+    /// can open the file and look, and a lost key is named, because otherwise it
+    /// reads as a problem somewhere near line 1.
+    #[test]
+    fn a_parse_error_still_says_where_and_names_a_lost_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, with_token_line("agent_token = \"unterminated")).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("line 3"), "{err}");
+
+        // The schema's own word for it, not the file's.
+        let raw = minimal_toml().replace("agent_token = \"tok\"\n", "");
+        std::fs::write(&path, raw).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains("missing field `agent_token`"), "{err}");
+
+        // An unreadable file is still read apart from a parse error.
+        match read_merge_base(&path) {
+            MergeBase::Unreadable { reason, .. } => {
+                assert!(reason.contains("parsing config"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// #2078 — a key a newer build wrote into a route's entry follows THAT
@@ -5917,6 +6755,141 @@ tenant_id = "tid2"
         assert_eq!(cfg.last_crash_unix, 1_000_000);
     }
 
+    /// #3289 — one start, through the calls `run_cmd` makes at the top of a run.
+    fn start_a_run(cfg: &mut AgentConfig, boot: Option<&str>, host_word: bool, now: u64) {
+        if previous_run(cfg, boot, host_word) == PreviousRun::Crashed {
+            record_crash_at(cfg, now);
+        }
+        mark_run_starting(cfg);
+        cfg.last_run_boot = boot.map(str::to_string);
+    }
+
+    /// A device a self-update has just moved to 0.4.197: 0.4.196 is proven, the
+    /// new version is not yet, and the run the update's exit ended was clean.
+    fn just_updated() -> AgentConfig {
+        let mut cfg = fixture();
+        cfg.last_known_good_version = Some("0.4.196".into());
+        cfg
+    }
+
+    #[test]
+    fn a_clean_last_run_is_clean_whatever_the_boot_or_the_host_says() {
+        let mut cfg = fixture();
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, Some("8"), false), PreviousRun::Clean);
+        assert_eq!(previous_run(&cfg, Some("7"), true), PreviousRun::Clean);
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Clean);
+    }
+
+    #[test]
+    fn an_unhealthy_last_run_is_a_crash_only_while_the_os_stayed_up() {
+        let mut cfg = fixture();
+        mark_run_starting(&mut cfg);
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, Some("7"), false), PreviousRun::Crashed);
+        assert_eq!(
+            previous_run(&cfg, Some("8"), false),
+            PreviousRun::EndedWithTheOs
+        );
+        assert_eq!(
+            previous_run(&cfg, Some("7"), true),
+            PreviousRun::EndedByItsHost
+        );
+    }
+
+    /// When in doubt it counts: a real crash loop must still reach the rollback,
+    /// on a host that cannot name its boot and on a config an older build wrote.
+    #[test]
+    fn an_unknown_boot_reads_as_the_same_boot() {
+        let mut cfg = fixture();
+        mark_run_starting(&mut cfg);
+        assert_eq!(cfg.last_run_boot, None);
+        assert_eq!(previous_run(&cfg, Some("8"), false), PreviousRun::Crashed);
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Crashed);
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Crashed);
+    }
+
+    /// The field read, in its order: Windows kills the worker with its session
+    /// (0x40010004), the host spawns another, and only then hears of the restart.
+    /// That worker either stops cleanly or dies with the session too, and the next
+    /// boot's worker finds it. Two restarts took 0.4.197 to `crash_count=3`.
+    #[test]
+    fn restarts_after_an_update_never_reach_a_rollback() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        let mut tick = |cfg: &mut AgentConfig, boot: &str, host_word: bool| {
+            now += 20;
+            start_a_run(cfg, Some(boot), host_word, now);
+            assert_eq!(cfg.crash_count, 0, "nothing crashed");
+            assert!(!should_rollback(cfg, "0.4.197", now));
+        };
+        // The update's own worker.
+        tick(&mut cfg, "7", false);
+        // Restart 1: its session is torn down, the host's next worker stops cleanly.
+        tick(&mut cfg, "7", true);
+        mark_clean_shutdown(&mut cfg);
+        tick(&mut cfg, "8", false);
+        // Restart 2: the host's next worker dies with the session as well.
+        tick(&mut cfg, "8", true);
+        tick(&mut cfg, "9", false);
+        // Restart 3: no worker in between, the host never saw it end.
+        tick(&mut cfg, "10", false);
+    }
+
+    /// The other side of the same table: a worker that keeps dying on its own, with
+    /// the OS up and no word from a host, reaches the rollback on the third start.
+    #[test]
+    fn a_real_crash_loop_still_reaches_the_rollback() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, now);
+        for expected in 1..=3u32 {
+            assert!(!should_rollback(&cfg, "0.4.197", now));
+            now += 20;
+            start_a_run(&mut cfg, Some("7"), false, now);
+            assert_eq!(cfg.crash_count, expected);
+        }
+        assert!(should_rollback(&cfg, "0.4.197", now));
+    }
+
+    /// A restart in the middle of a crash loop neither counts nor wipes the count:
+    /// the two crashes before it are still crashes of this version.
+    #[test]
+    fn a_restart_during_a_crash_loop_keeps_the_count() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, now);
+        for _ in 0..2 {
+            now += 20;
+            start_a_run(&mut cfg, Some("7"), false, now);
+        }
+        assert_eq!(cfg.crash_count, 2);
+        now += 60;
+        start_a_run(&mut cfg, Some("8"), false, now);
+        assert_eq!(cfg.crash_count, 2);
+        assert!(!should_rollback(&cfg, "0.4.197", now));
+        now += 20;
+        start_a_run(&mut cfg, Some("8"), false, now);
+        assert_eq!(cfg.crash_count, 3);
+        assert!(should_rollback(&cfg, "0.4.197", now));
+    }
+
+    #[test]
+    fn a_config_from_before_the_boot_key_loads_without_it() {
+        let mut cfg = fixture();
+        cfg.last_run_boot = Some("7".into());
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("last_run_boot = \"7\""));
+        let old: String = text
+            .lines()
+            .filter(|l| !l.starts_with("last_run_boot"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: AgentConfig = toml::from_str(&old).unwrap();
+        assert_eq!(back.last_run_boot, None);
+    }
+
     // ---- Migration tests (rc.18 P4) ---------------------------------
 
     #[test]
@@ -6184,6 +7157,273 @@ tenant_id = "tid2"
         );
     }
 
+    /// #3609 — the copy of a config that does not load goes into a new file of
+    /// its own. A file left under the copy's name keeps its owner and DACL
+    /// through a copy into it, and the copy can hold a bearer token. A hard
+    /// link to the file left there is the witness: it still reads what it held.
+    #[test]
+    fn the_unreadable_copy_is_never_written_into_a_file_it_did_not_make() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, vec![0u8; 16]).expect("a damaged config");
+        let dest = unreadable_copy_path(&path);
+        std::fs::write(&dest, b"made before").expect("a file left under the name");
+        let witness = dir.path().join("witness");
+        std::fs::hard_link(&dest, &witness).expect("a hard link");
+        let kept = keep_unreadable(&path).expect("kept");
+        assert_eq!(kept, dest);
+        assert_eq!(
+            std::fs::read(&witness).unwrap(),
+            b"made before",
+            "written into"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![0u8; 16]);
+    }
+
+    /// #3609 — what an elevated writer (Setup's machine write, `roomlerd enroll
+    /// --machine-global`, `roomlerd adopt-enrollment`) folds a new enrollment
+    /// into at the machine-global location: only a config that is private to
+    /// the computer's administrators once the machine tree is repaired. On
+    /// trees made by `machine_tree::test_support`, never the computer's own.
+    #[cfg(windows)]
+    mod machine_merge_base {
+        use super::*;
+        use crate::machine_tree::test_support::*;
+        use crate::machine_tree::{MachineTree, Switches};
+
+        fn base(tree: &MachineTree) -> MergeBase {
+            machine_merge_base(&tree.config(), tree, Switches::ON)
+        }
+
+        /// #3666 — `tree` stands in for the computer's own machine tree on
+        /// this test's thread: a save or a check at its config takes the
+        /// machine path.
+        fn stand_in(tree: &MachineTree) {
+            super::super::STAND_IN.with(|it| *it.borrow_mut() = Some(tree.clone()));
+        }
+
+        /// #3666 — a config with a key this build does not know, which a save
+        /// that keeps the outgoing file's keys would carry over.
+        fn planted() -> String {
+            format!("{}planted_marker = \"planted\"\n", minimal_toml())
+        }
+
+        /// #3666 — a config an administrator wrote into a machine folder that
+        /// `%ProgramData%` still lets Users add to is never folded into: as
+        /// found, before any repair, any account could have put it there.
+        #[test]
+        fn a_config_in_an_open_machine_folder_is_never_folded() {
+            if !elevated_or_skip("a config in an open machine folder, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&tree.folder().display().to_string()),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// #3666 — a writer that folds nothing keeps nothing the folder held:
+        /// not the outgoing config as `.prev`, not an old `.prev`, not the
+        /// keys this build does not know.
+        #[test]
+        fn a_fresh_machine_save_keeps_nothing_the_folder_held() {
+            if !elevated_or_skip("a fresh machine save") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            std::fs::write(tree.config(), planted()).unwrap();
+            std::fs::write(tree.prev(), planted()).unwrap();
+            stand_in(&tree);
+            let cfg = try_load(&tree.config()).unwrap();
+            save_fresh(&tree.config(), &cfg).unwrap();
+            assert!(!tree.prev().exists(), "no .prev is kept");
+            let written = std::fs::read_to_string(tree.config()).unwrap();
+            assert!(!written.contains("planted"), "{written}");
+            assert_eq!(crate::machine_tree::check(&tree), Ok(()));
+        }
+
+        /// #3666 — `roomlerd re-enroll` and `roomlerd org` ask before they
+        /// load: a config that was not the machine's as found is refused with
+        /// nothing read from it; once an elevated save has sealed the tree,
+        /// it is the machine's.
+        #[test]
+        fn re_enroll_and_org_refuse_a_config_that_was_not_the_machines() {
+            if !elevated_or_skip("re-enroll's check") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            stand_in(&tree);
+            let why = machine_config_as_found(&tree.config()).expect_err("an open folder");
+            assert!(format!("{why:#}").contains("nothing was sent"), "{why:#}");
+            crate::machine_tree::repair(&tree, true);
+            machine_config_as_found(&tree.config()).expect("the machine's");
+        }
+
+        fn other_account() -> String {
+            local_guest().unwrap_or_else(|| USERS.to_string())
+        }
+
+        /// What a save keeps of the file it replaces at the machine location,
+        /// the keys this build does not know, it keeps only from a file that
+        /// SYSTEM and Administrators alone may change: from one another account
+        /// owns, nothing. Elsewhere nothing changes.
+        #[test]
+        fn a_machine_save_keeps_no_key_from_a_file_another_account_owns() {
+            if !elevated_or_skip("the keys a machine save keeps") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            let path = tree.config();
+            std::fs::write(&path, format!("{}future_switch = true\n", minimal_toml())).unwrap();
+            crate::machine_tree::repair(&tree, false);
+            let cfg = try_load(&path).unwrap();
+            let kept = serialise_for(&path, &path, &cfg, true).unwrap();
+            assert!(kept.contains("future_switch"), "a private file's: {kept}");
+
+            assert!(icacls(
+                &path,
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            let dropped = serialise_for(&path, &path, &cfg, true).unwrap();
+            assert!(!dropped.contains("future_switch"), "{dropped}");
+            let elsewhere = serialise_for(&path, &path, &cfg, false).unwrap();
+            assert!(elsewhere.contains("future_switch"), "{elsewhere}");
+        }
+
+        /// A config another account owns is never folded into: what it
+        /// holds may be that account's choice. The reason names it.
+        #[test]
+        fn a_machine_config_another_account_owns_is_never_folded() {
+            if !elevated_or_skip("a machine config another account owns, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            assert!(icacls(
+                &tree.config(),
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&format!("{} is owned by", tree.config().display())),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// The same for a config in a machine folder another account owns (a
+        /// person's daemon made it to stage files): that account may have put
+        /// any file there, whoever owns the file.
+        #[test]
+        fn a_machine_config_in_a_folder_another_account_owns_is_never_folded() {
+            if !elevated_or_skip("a machine folder another account owns, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            assert!(icacls(
+                tree.folder(),
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&format!("{} is owned by", tree.folder().display())),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// A config of an administrator's that an administrator's own entry
+        /// on its folder reaches (Explorer's prompt, its usual case) is
+        /// repaired first, and then folded: the device's settings carry over.
+        /// #3666 — one that another account's entry reaches is not folded:
+        /// that account could have chosen what it holds.
+        #[test]
+        fn a_drifted_machine_config_is_folded_once_repaired() {
+            if !elevated_or_skip("a drifted machine config, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = unsealed_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            crate::machine_tree::repair(&tree, true);
+            let me = me();
+            // Inheritance on, so the folder's entry reaches the config.
+            assert!(icacls(&tree.config(), &["/inheritance:e"]));
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", &format!("*{me}:(OI)(CI)F")]
+            ));
+            match base(&tree) {
+                MergeBase::Loaded(cfg) => assert_eq!(cfg.machine_name, "devbox"),
+                other => panic!("{other:?}"),
+            }
+            let config = sddl(&tree.config());
+            assert!(sealed(&config, false), "repaired before the fold: {config}");
+            assert!(icacls(&tree.config(), &["/inheritance:e"]));
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+            ));
+            assert!(
+                names(&sddl(&tree.config()), GUESTS),
+                "it reaches the config"
+            );
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&tree.folder().display().to_string()),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// A config that does not load is recovered from its last good copy
+        /// only when that copy is private too.
+        #[test]
+        fn a_damaged_machine_config_recovers_only_from_a_private_previous_copy() {
+            if !elevated_or_skip("a damaged machine config's recovery") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.config(), "overlay_enabled = ture\n").unwrap();
+            std::fs::write(tree.prev(), minimal_toml()).unwrap();
+            match base(&tree) {
+                MergeBase::Unreadable { recovered, .. } => assert!(
+                    recovered.is_some_and(|c| c.machine_name == "devbox"),
+                    "a private copy is recovered from"
+                ),
+                other => panic!("{other:?}"),
+            }
+            assert!(icacls(
+                &tree.prev(),
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            match base(&tree) {
+                MergeBase::Unreadable { recovered, .. } => assert!(
+                    recovered.is_none(),
+                    "a copy another account owns is never recovered from"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     /// #3116 — a read this process is refused is `Denied`, never `Unreadable`:
     /// the file is closed to the reader, not damaged, and the wizard that read
     /// it as damaged told the person their settings were lost.
@@ -6294,184 +7534,118 @@ tenant_id = "tid2"
         assert!(!path.exists());
     }
 
-    /// #3073 — ownership and the grant come before anything that can remove
-    /// access: once `/inheritance:r` has run, SYSTEM keeps the directory by
-    /// owning it, and a child it does not own only through an ACE the
-    /// directory already hands down.
+    /// FR-43 P3a — a GUI worker's view holds no enrollment and no host role,
+    /// because the root holds them and a second one on the machine would be a
+    /// defect, and it keeps the person's session knobs, which are why it reads
+    /// the file at all.
     #[test]
-    fn harden_takes_ownership_and_grants_before_it_drops_inheritance() {
-        assert_eq!(HARDEN_STEPS[0], &["/setowner", "*S-1-5-32-544"][..]);
-        let step = |flag: &str| {
-            HARDEN_STEPS
-                .iter()
-                .position(|s| s.contains(&flag))
-                .unwrap_or_else(|| panic!("{flag} is a step"))
-        };
-        assert_eq!(
-            step("/grant:r"),
-            1,
-            "harden_machine_global_dir stops on a failed step 0 or 1"
-        );
-        assert!(
-            step("/inheritance:r") > step("/grant:r"),
-            "never before SYSTEM and Administrators hold ACEs of their own"
-        );
+    fn a_workers_view_drops_every_enrollment_and_keeps_the_persons_knobs() {
+        let mut file = test_fixture();
+        file.ephemeral = true;
+        file.orgs = vec![OrgEntry {
+            label: "acme".into(),
+            server_url: "https://b.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "t-acme".into(),
+            enabled: true,
+            overlay_mode: OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        file.overlay_enabled = true;
+        file.overlay_wg_secret_key = Some("WG".into());
+        file.ssh_enabled = true;
+        file.exec_enabled = true;
+        file.remote_config_enabled = true;
+        file.external_access_enabled = true;
+        file.auto_update = Some(true);
+        file.crash_count = 3;
+        file.rollback_attempted = true;
+        file.auto_grant_session = false;
+        file.keep_busy_enabled = true;
+        file.record_remote_enabled = true;
+        file.rc_clipboard = roomler_ai_remote_control::models::FeaturePolicy::Off;
+
+        let view =
+            file.for_unenrolled_worker("http://127.0.0.1:1", "ws://127.0.0.1:1/ws", "SECRET");
+
+        // Its signalling loop dials the stand-in, with the stand-in's secret.
+        assert_eq!(view.server_url, "http://127.0.0.1:1");
+        assert_eq!(view.ws_url.as_deref(), Some("ws://127.0.0.1:1/ws"));
+        assert_eq!(view.agent_token, "SECRET");
+        // No enrollment of any kind.
+        assert!(view.agent_id.is_empty());
+        assert!(view.tenant_id.is_empty());
+        assert!(!view.ephemeral);
+        assert!(view.orgs.is_empty());
+        assert!(!view.has_primary_enrollment());
+        // No host role, and no updater: the root owns the package.
+        assert!(!view.overlay_enabled);
+        assert_eq!(view.overlay_wg_secret_key, None);
+        assert!(!view.ssh_enabled);
+        assert!(!view.exec_enabled);
+        assert!(!view.remote_config_enabled);
+        assert!(!view.external_access_enabled);
+        assert_eq!(view.auto_update, Some(false));
+        assert_eq!(view.crash_count, 0);
+        assert!(!view.rollback_attempted);
+        // The person's own.
+        assert!(!view.auto_grant_session);
+        assert!(view.keep_busy_enabled);
+        assert!(view.record_remote_enabled);
+        assert_eq!(view.rc_clipboard, file.rc_clipboard);
+        assert_eq!(view.machine_name, file.machine_name);
     }
 
-    /// The DACL of `path` in SDDL, through `icacls /save` (a UTF-16 file: the
-    /// object's name, then its descriptor). `None` when it cannot be read.
-    #[cfg(windows)]
-    fn dacl_of(path: &std::path::Path) -> Option<String> {
-        let out = tempfile::NamedTempFile::new().ok()?;
-        let saved = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/save")
-            .arg(out.path())
-            .output()
-            .ok()?;
-        if !saved.status.success() {
-            return None;
-        }
-        let bytes = std::fs::read(out.path()).ok()?;
-        let wide: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let text = String::from_utf16_lossy(&wide);
-        text.lines()
-            .nth(1)
-            .map(|l| l.trim().trim_start_matches('\u{feff}').to_string())
-    }
-
-    /// #3073 — put this process where the daemon is: SeBackup, SeRestore and
-    /// SeTakeOwnership held but DISABLED, as in a service's SYSTEM token. A
-    /// Cygwin or OpenSSH shell hands its children a token with them enabled,
-    /// and then the inheritance an `icacls` call sets off rewrites children
-    /// the daemon cannot reach: 0.4.185's order passed from such a shell.
-    /// Every `icacls` the test spawns afterwards inherits the result; one that
-    /// needs a privilege (`/setowner`) still enables it for itself.
-    #[cfg(windows)]
-    fn disable_dacl_override_privileges() {
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-        use windows_sys::Win32::Security::{
-            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
-            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-        };
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-        let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: this process's pseudo-handle; `token` is written on success.
-        let opened =
-            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) };
-        assert_ne!(
-            opened,
-            0,
-            "OpenProcessToken: {}",
-            std::io::Error::last_os_error()
-        );
-        for name in [
-            "SeBackupPrivilege",
-            "SeRestorePrivilege",
-            "SeTakeOwnershipPrivilege",
-        ] {
-            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            let mut luid = LUID {
-                LowPart: 0,
-                HighPart: 0,
-            };
-            // SAFETY: a NUL-terminated name, and a LUID to write.
-            let found =
-                unsafe { LookupPrivilegeValueW(std::ptr::null(), wide.as_ptr(), &mut luid) };
-            assert_ne!(found, 0, "{name}: {}", std::io::Error::last_os_error());
-            // Attributes 0: disabled, still held. A token that does not hold
-            // the privilege reports ERROR_NOT_ALL_ASSIGNED, and is already
-            // where the test wants it.
-            let state = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: 0,
-                }],
-            };
-            // SAFETY: a token opened for TOKEN_ADJUST_PRIVILEGES, one entry,
-            // and no previous state asked for.
-            let adjusted = unsafe {
-                AdjustTokenPrivileges(
-                    token,
-                    0,
-                    &state,
-                    0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_ne!(adjusted, 0, "{name}: {}", std::io::Error::last_os_error());
-        }
-        // SAFETY: opened above, closed once.
-        unsafe { CloseHandle(token) };
-    }
-
-    /// #3073 — hardening a tree someone else owns keeps SYSTEM in, on the
-    /// directory and on every child. The field case was SYSTEM hardening a
-    /// tree the signed-in user owned. Here an administrator hardens one
-    /// SYSTEM owns: the same shape, a caller that owns none of it.
-    /// - Before the owner went first, step 1 emptied the DACL, the grant
-    ///   failed `Access is denied`, and the directory came out `D:PAI`, open
-    ///   to nobody.
-    /// - With the owner first but inheritance dropped before the grant
-    ///   (0.4.185), the directory came out right and each child came out with
-    ///   an empty DACL: inheritance could no longer rewrite them.
-    ///
-    /// The hardening runs with the override privileges disabled, as the
-    /// daemon's does; otherwise the second case passes from a Cygwin shell.
-    #[cfg(windows)]
+    /// FR-43 P3a — the file a person with no enrollment gets: it loads, in a
+    /// directory that wasn't there, reads as not enrolled, and holds a setting.
     #[test]
-    fn hardening_a_tree_someone_else_owns_keeps_system_in() {
+    fn a_blank_persons_file_loads_and_reads_as_no_enrollment() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("config.toml"), "x").unwrap();
-        let crashes = dir.path().join("crashes");
-        std::fs::create_dir(&crashes).unwrap();
-        std::fs::write(crashes.join("a.json"), "x").unwrap();
-        // Hand the tree to SYSTEM. That takes an elevated token
-        // (SeRestorePrivilege); a plain one cannot set the case up, so the
-        // test says so and stops.
-        let handed = std::process::Command::new("icacls")
-            .arg(dir.path())
-            .args(["/setowner", "*S-1-5-18", "/T"])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !handed {
-            // The CI lane runs elevated on purpose; there, skipping would
-            // pass without proving anything.
-            assert!(
-                std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
-                "this lane must run elevated for #3073's case to be set up"
-            );
-            eprintln!(
-                "skipped: this token cannot hand a directory to SYSTEM; run elevated to cover #3073"
-            );
-            return;
-        }
-        disable_dacl_override_privileges();
-        harden_machine_global_dir(dir.path());
-        let dacl = dacl_of(dir.path()).expect("the hardened directory is still readable");
-        assert!(dacl.starts_with("D:P"), "protected: {dacl}");
+        let path = dir.path().join("first-run").join("config.toml");
+        let mut blank = AgentConfig::for_person_with_no_enrollment("mac").expect("blank");
+        blank.keep_busy_enabled = true;
+        save(&path, &blank).expect("save");
+
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded.machine_name, "mac");
+        assert!(loaded.keep_busy_enabled);
+        assert!(!loaded.has_primary_enrollment());
         assert!(
-            dacl.contains("(A;OICI;FA;;;SY)"),
-            "SYSTEM keeps full control: {dacl}"
+            test_fixture().has_primary_enrollment(),
+            "control: an enrolled file reads as one"
         );
-        assert!(
-            dacl.contains("(A;OICI;FA;;;BA)"),
-            "Administrators keep full control: {dacl}"
+    }
+
+    /// FR-43 P3a — a worker's startup saves leave the person's file as it was,
+    /// so their token survives for the switch's off. The control is the ordinary
+    /// startup save, which would have put the view over it.
+    #[test]
+    fn a_read_only_startup_save_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut file = test_fixture();
+        file.agent_token = "THE-PERSONS".into();
+        save(&path, &file).expect("save");
+        let on_disk = std::fs::read(&path).unwrap();
+        let view = load(&path).unwrap().for_unenrolled_worker(
+            "http://127.0.0.1:1",
+            "ws://127.0.0.1:1/ws",
+            "SECRET",
         );
-        // The children SYSTEM owns inherit both ACEs, so neither is sealed.
-        for (child, inherited) in [(&crashes, "OICIID"), (&crashes.join("a.json"), "ID")] {
-            let dacl =
-                dacl_of(child).unwrap_or_else(|| panic!("{} is still readable", child.display()));
-            for sid in ["SY", "BA"] {
-                let ace = format!("(A;{inherited};FA;;;{sid})");
-                assert!(dacl.contains(&ace), "{}: {ace} in {dacl}", child.display());
-            }
-        }
+
+        let mut writes = StartupWrites::read_only(&path);
+        writes.save(&view).expect("a save that writes nothing");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        let mut writes = StartupWrites::after_load(&path);
+        writes.save(&view).expect("the ordinary save");
+        assert_eq!(load(&path).unwrap().agent_token, "SECRET", "control");
     }
 }

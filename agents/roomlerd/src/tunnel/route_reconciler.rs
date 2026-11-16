@@ -22,7 +22,7 @@
 //!
 //! Persistence: the reconciler is the daemon-side writer of the
 //! `tunnel_routes` config field. Every load-modify-save runs under the
-//! daemon-wide config-write lock shared with main.rs's other runtime
+//! daemon-wide config-write lock shared with app.rs's other runtime
 //! writers (clean-run promotion, graceful shutdown) — see
 //! `config::WriteLock`. Cross-PROCESS writers (tray enroll/device-name,
 //! CLI, wizard) remain last-writer-wins on the whole file; `config::save`
@@ -88,7 +88,7 @@ struct Inner {
     /// The SAME config file the daemon loaded (resolution ladder already
     /// applied by `run_cmd`) — never re-derived here.
     config_path: PathBuf,
-    /// Daemon-wide config write lock (shared with main.rs's writers).
+    /// Daemon-wide config write lock (shared with app.rs's writers).
     cfg_lock: crate::config::WriteLock,
     /// Declared routes — in-memory mirror of `config.tunnel_routes`.
     routes: StdMutex<Vec<RouteDescriptor>>,

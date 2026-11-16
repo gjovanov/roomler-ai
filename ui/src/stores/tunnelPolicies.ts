@@ -3,9 +3,29 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { useTenantStore } from '@/stores/tenant'
+import { canManageTunnelPolicies } from '@/utils/permissions'
+
+/**
+ * Every tunnel-policy route is `MANAGE_AGENTS` on the server, the reads too.
+ * Gated here, in the store, so no caller can forget it (permissions.md §5).
+ * It awaits the membership: AppLayout's `/member/me` may still be in flight
+ * while the page mounts, and a synchronous read of the mask would be a
+ * coin-flip.
+ */
+async function mayManageTunnelPolicies(tenantId: string): Promise<boolean> {
+  const tenants = useTenantStore()
+  await tenants.ensureMyMembership(tenantId)
+  return canManageTunnelPolicies(tenants.myPermissions, tenants.isOwner)
+}
+
+/** FR-82 — a 403 is an answer, "you may not", never a failed session. */
+function isRefusal(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 403
+}
 
 // Snake-case + adjacently-tagged enums match the Rust wire shape —
-// see `crates/api/src/routes/tunnel.rs::TunnelPolicyResponse` and
+// see `crates/modules/network/src/routes/tunnel.rs::TunnelPolicyResponse` and
 // `crates/remote_control/src/models.rs`.
 
 export interface ExactHost {
@@ -124,18 +144,30 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
   const total = ref(0)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** The caller may not manage this org's tunnel policies: the mask lacks
+   *  `MANAGE_AGENTS` (and nothing was sent), or the server answered 403. The
+   *  page explains that instead of drawing an editor whose every save fails. */
+  const refused = ref(false)
 
   async function fetchPolicies(tenantId: string) {
     loading.value = true
     error.value = null
+    refused.value = false
     try {
+      if (!(await mayManageTunnelPolicies(tenantId))) {
+        refused.value = true
+        policies.value = []
+        total.value = 0
+        return
+      }
       const resp = await api.get<TunnelPolicyListResponse>(
         `/tenant/${tenantId}/tunnel-policy`,
       )
       policies.value = resp.items
       total.value = resp.total
     } catch (e) {
-      error.value = (e as Error).message
+      if (isRefusal(e)) refused.value = true
+      else error.value = (e as Error).message
       policies.value = []
       total.value = 0
     } finally {
@@ -181,6 +213,7 @@ export const useTunnelPolicyStore = defineStore('tunnelPolicies', () => {
     total,
     loading,
     error,
+    refused,
     fetchPolicies,
     createPolicy,
     updatePolicy,

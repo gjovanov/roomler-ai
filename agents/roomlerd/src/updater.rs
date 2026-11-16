@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Self-update against GitHub Releases.
+//! Self-update against the release feed.
 //!
-//! Polls `https://api.github.com/repos/gjovanov/roomler-ai/releases/latest`
-//! every ~6 h, compares the release tag to the running binary's
-//! `CARGO_PKG_VERSION`, and — when newer — downloads the platform-
+//! Reads the update feed on roomler.ai ([`DEFAULT_PROXY_URL`], a cached copy
+//! of GitHub's release list) every 4 h, compares the newest tag to the running
+//! binary's `CARGO_PKG_VERSION`, and — when newer — downloads the platform-
 //! appropriate installer (MSI / .deb / .pkg) and spawns it detached.
 //!
 //! Scope: the agent exits after spawning the installer so the installer
@@ -14,14 +14,14 @@
 //! minute of the install (Windows, the registration's one-shot starts,
 //! #3292) or immediately (Restart=on-failure on Linux, KeepAlive on macOS).
 //!
-//! Trust model: we assume GitHub-over-TLS is sufficient for now. No
-//! signature check beyond the MSI's cargo-wix / codesign identity
-//! (which the OS verifies at install time).
+//! Trust model: the feed is not a trust anchor. `download_asset` checks
+//! whose bytes they are (Authenticode and the publisher, or the pinned `.asc`)
+//! and which release they are (`artifact_version`) before anything runs.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tunnel_core::env::node_env;
 
 /// GitHub "Releases" repo slug. Centralised here so a fork can redirect
@@ -31,9 +31,9 @@ pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 /// Default proxy endpoint that caches GitHub's releases response on
 /// the roomler-ai API server. Eliminates the per-IP GitHub rate
 /// limit (60 req/hr unauth) that bites fleets of agents behind one
-/// NAT. Override via `ROOMLERD_UPDATE_URL` env var for self-
-/// hosted deployments or to bypass the proxy in dev. When the proxy
-/// is unreachable we fall back to direct GitHub.
+/// NAT. Override via `ROOMLERD_UPDATE_URL` env var for self-hosted
+/// deployments or in dev. The update check falls back to direct GitHub
+/// when it is unreachable; a lookup by tag follows `release_sources`.
 pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release";
 
 /// How often `run_periodic` wakes up and checks for a newer release.
@@ -190,190 +190,6 @@ pub fn decide_defer(active: usize, net_transition: bool, consecutive_defers: u32
     } else {
         DeferDecision::DeferOnce
     }
-}
-
-/// FR-90 P1d-1 (AC7) — what the updater does about running agent turns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnWait {
-    /// No turn running: go ahead.
-    Proceed,
-    /// Turns running and time left: wait.
-    Wait,
-    /// Turns still running after the whole wait: go ahead, cutting them.
-    Cut,
-}
-
-/// Decide about `running` agent turns after `waited` of at most `max`. Pure
-/// — tested directly. `max` zero cuts at once: the owner's choice.
-pub fn decide_turn_wait(running: usize, waited: Duration, max: Duration) -> TurnWait {
-    if running == 0 {
-        TurnWait::Proceed
-    } else if waited >= max {
-        TurnWait::Cut
-    } else {
-        TurnWait::Wait
-    }
-}
-
-/// How often the updater looks again while agent turns run.
-const TURN_POLL: Duration = Duration::from_secs(5);
-/// How often a deferral for agent turns is logged while it lasts.
-const TURN_LOG_EVERY: Duration = Duration::from_secs(60);
-
-/// The agent sessions mid-turn (ids), as the Hive supervisor sees them; none
-/// in a build without agent sessions.
-fn agent_turns_running() -> Vec<String> {
-    #[cfg(hive_host)]
-    {
-        crate::hive::turns_running()
-            .into_iter()
-            .map(|s| s.to_hex())
-            .collect()
-    }
-    #[cfg(not(hive_host))]
-    {
-        Vec::new()
-    }
-}
-
-/// The device's `hive_update_wait_secs`; zero without agent sessions.
-fn agent_turn_wait() -> Duration {
-    #[cfg(hive_host)]
-    {
-        crate::hive::update_wait()
-    }
-    #[cfg(not(hive_host))]
-    {
-        Duration::ZERO
-    }
-}
-
-/// Hold (or release) new agent prompts and starts around an install.
-pub(crate) fn hold_agent_prompts(hold: bool) {
-    #[cfg(hive_host)]
-    {
-        if hold {
-            crate::hive::begin_update();
-        } else {
-            crate::hive::end_update();
-        }
-    }
-    #[cfg(not(hive_host))]
-    {
-        let _ = hold;
-    }
-}
-
-/// FR-90 P1d-1 (AC7) — wait for running agent turns before an installer
-/// restarts the daemon, and with it every session's harness: at most the
-/// device's `hive_update_wait_secs` (30 min by default), the deferral logged
-/// when it starts and once a minute while it lasts. A turn is a person's work
-/// in progress, so this holds a PUSHED update too — unlike a transfer — and
-/// it is bounded, so a busy session cannot hold the device's updates back.
-///
-/// Once no turn runs, new prompts and starts are refused
-/// ([`crate::hive::begin_update`]) BEFORE a last look, so none begins in the
-/// gap; a prompt admitted before that still runs, and is waited for.
-/// `false` = the daemon is shutting down instead.
-pub(crate) async fn wait_for_agent_turns(
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
-    by: &'static str,
-) -> bool {
-    let max = agent_turn_wait();
-    let started = Instant::now();
-    let mut logged: Option<Instant> = None;
-    let mut held = false;
-    loop {
-        let running = agent_turns_running();
-        if running.is_empty() && !held {
-            // Hold new prompts first, then look once more: a prompt that
-            // arrived between the two looks began a turn to wait for.
-            hold_agent_prompts(true);
-            held = true;
-            continue;
-        }
-        let waited = started.elapsed();
-        match decide_turn_wait(running.len(), waited, max) {
-            TurnWait::Proceed => {
-                if logged.is_some() {
-                    tracing::info!(
-                        by,
-                        waited_secs = waited.as_secs(),
-                        "auto-updater: the agent turns are done — installing"
-                    );
-                }
-                return true;
-            }
-            TurnWait::Cut => {
-                hold_agent_prompts(true);
-                tracing::warn!(
-                    by,
-                    waited_secs = waited.as_secs(),
-                    turns = running.len(),
-                    sessions = ?running,
-                    "auto-updater: agent turns still running after the whole wait — installing anyway, which cuts them"
-                );
-                return true;
-            }
-            TurnWait::Wait => {
-                if logged.is_none_or(|t| t.elapsed() >= TURN_LOG_EVERY) {
-                    tracing::info!(
-                        by,
-                        turns = running.len(),
-                        sessions = ?running,
-                        waited_secs = waited.as_secs(),
-                        max_secs = max.as_secs(),
-                        "auto-updater: update deferred — agent turns running"
-                    );
-                    logged = Some(Instant::now());
-                }
-            }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(TURN_POLL) => {}
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    hold_agent_prompts(false);
-                    return false;
-                }
-            }
-        }
-    }
-}
-
-/// FR-90 P1h-2 (AC7 on macOS) — the daemon's half of the root update
-/// helper's hold ([`tunnel_core::localapi::Request::HiveUpdateHold`]): the
-/// wait above, then new prompts and starts held until
-/// [`release_install_hold`]. On macOS the helper installs, never this
-/// process, so this is the only wait there.
-pub async fn hold_for_install(
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tunnel_core::localapi::Response {
-    use tunnel_core::localapi::Response;
-    if !cfg!(hive_host) {
-        return Response::Error {
-            message: "this build runs no agent sessions".into(),
-        };
-    }
-    let started = Instant::now();
-    if !wait_for_agent_turns(&mut shutdown, "update-helper").await {
-        return Response::Error {
-            message: "the daemon is stopping".into(),
-        };
-    }
-    Response::HiveUpdateHeld {
-        waited_secs: started.elapsed().as_secs(),
-        cut: u32::try_from(agent_turns_running().len()).unwrap_or(u32::MAX),
-    }
-}
-
-/// FR-90 P1h-2 — the helper's connection closed and this daemon is still
-/// here, so its install did not happen: take prompts and starts again.
-pub fn release_install_hold() {
-    hold_agent_prompts(false);
-    tracing::info!(
-        "update-helper: the hold is released — agent prompts and starts are taken again"
-    );
 }
 
 /// Work an installer would cut short: file transfers in flight, plus an
@@ -818,26 +634,27 @@ pub const INSTALL_FOLDER_NAME: &str = "Roomler";
 pub(crate) const LEGACY_INSTALL_FOLDER_NAME: &str = "roomler-agent";
 
 /// Resolve a flavour's MSI install directory for a given folder name:
-/// perUser → `%LOCALAPPDATA%\Programs\<name>`, perMachine →
-/// `%ProgramFiles%\<name>` (the same roots the two wxs files install
-/// under). Callers pass [`INSTALL_FOLDER_NAME`] to find the current
-/// install (post-install watcher fallback) or
-/// [`LEGACY_INSTALL_FOLDER_NAME`] to find the directory a rename-hop
-/// upgrade vacated (`install_cleanup` sweep). `None` when the root
-/// env var is unset (effectively never on a real Windows session).
+/// perUser → `<LocalAppData>\Programs\<name>`, the running account's own
+/// known folder ([`crate::appdirs::local_app_data`]), perMachine →
+/// `C:\Program Files\<name>` as the system names it
+/// ([`crate::appdirs::machine_program_files`]): the same roots the two wxs
+/// files install under. Callers pass [`INSTALL_FOLDER_NAME`] to find the
+/// current install (post-install watcher fallback) or
+/// [`LEGACY_INSTALL_FOLDER_NAME`] to find the directory a rename-hop upgrade
+/// vacated (`install_cleanup` sweep). `None` only for perUser, when the shell
+/// names no `LocalAppData` folder for the account.
 #[cfg(target_os = "windows")]
 pub fn install_dir_with_name(
     flavour: WindowsInstallFlavour,
     folder_name: &str,
 ) -> Option<std::path::PathBuf> {
     match flavour {
-        WindowsInstallFlavour::PerUser => std::env::var_os("LOCALAPPDATA").map(|root| {
-            std::path::PathBuf::from(root)
-                .join("Programs")
-                .join(folder_name)
-        }),
-        WindowsInstallFlavour::PerMachine => std::env::var_os("ProgramFiles")
-            .map(|root| std::path::PathBuf::from(root).join(folder_name)),
+        WindowsInstallFlavour::PerUser => {
+            crate::appdirs::local_app_data().map(|root| root.join("Programs").join(folder_name))
+        }
+        WindowsInstallFlavour::PerMachine => {
+            Some(crate::appdirs::machine_program_files().join(folder_name))
+        }
     }
 }
 
@@ -1060,7 +877,7 @@ fn pick_linux_asset<'a>(
 /// landed. Always pull the full list and let `pick_latest_release`
 /// apply our own filter (draft=false + tag prefix + parseable).
 async fn fetch_latest_release() -> Result<GithubRelease> {
-    let proxy_url = node_env("UPDATE_URL").unwrap_or_else(|| DEFAULT_PROXY_URL.to_string());
+    let proxy_url = update_feed_url();
     // Proxy first — handles rate limiting, returns the same JSON shape
     // as GitHub's /releases endpoint (slimmed to fields we read).
     match fetch_releases_from(&proxy_url).await {
@@ -1077,6 +894,21 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
     // but fine for occasional use when the proxy is offline.
     let github_url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases?per_page=30");
     fetch_releases_from(&github_url).await
+}
+
+/// The update feed's URL, read where the update check reads it:
+/// `ROOMLERD_UPDATE_URL` when set, else [`DEFAULT_PROXY_URL`].
+fn update_feed_url() -> String {
+    update_feed_url_from(node_env("UPDATE_URL"))
+}
+
+/// [`update_feed_url`] from the override as read, so a test needs no
+/// environment. A blank override counts as none: a lookup that asks the feed
+/// alone would otherwise fail on every try.
+fn update_feed_url_from(over: Option<String>) -> String {
+    over.map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROXY_URL.to_string())
 }
 
 async fn fetch_releases_from(url: &str) -> Result<GithubRelease> {
@@ -1260,12 +1092,11 @@ fn stage_dir_as_current_user() -> std::io::Result<PathBuf> {
 /// A security descriptor built from SDDL, and the `SECURITY_ATTRIBUTES` that
 /// hand it to `CreateDirectoryW`. Freed on drop.
 ///
-/// Deliberately its own copy rather than a shared import: `hive_win::Sddl` is
-/// the identical shape but compiles only with the optional `hive` feature,
-/// and `win_service::stop_event` builds its descriptor inline for one event —
-/// neither is reachable from every Windows build the way this fix must be.
-/// `exec_service.rs` carries the same duplicate for the same reason (its own
-/// doc comment says so); this is the fourth copy, not the first.
+/// Deliberately its own copy rather than a shared import:
+/// `win_service::stop_event` builds its descriptor inline for one event, which
+/// is not reachable from every Windows build the way this fix must be.
+/// `exec_service.rs` has one of the same shape for its pipes (`win::Sddl`);
+/// since #3737 it makes no folder (the anchor is a registry key).
 #[cfg(target_os = "windows")]
 struct ProtectedDirSd {
     sa: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
@@ -1274,9 +1105,9 @@ struct ProtectedDirSd {
 
 #[cfg(target_os = "windows")]
 impl ProtectedDirSd {
-    /// `O:BA` — owner explicitly Administrators, same as the exec-service
-    /// anchor dir's `DIR_SDDL` (`exec_service.rs`) and for the identical
-    /// reason: an owner always keeps WRITE_DAC on its own object regardless
+    /// `O:BA` — owner explicitly Administrators, as the registry key holding
+    /// the SYSTEM service's anchor has (#3737, `machine_key.rs`), and for the
+    /// same reason: an owner always keeps WRITE_DAC on its own object regardless
     /// of the DACL, so leaving the owner field out would default it to
     /// whichever token happened to call `CreateDirectoryW` — correct when
     /// that is SYSTEM (the only caller [`running_as_system`] permits in
@@ -1344,34 +1175,47 @@ impl Drop for ProtectedDirSd {
 /// here because its `Builder` has no way to pass Windows security attributes.
 #[cfg(target_os = "windows")]
 fn create_fresh_protected_dir(base: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     for _ in 0..8 {
         let name = format!("{}{:016x}", STAGING_DIR_PREFIX, rand::random::<u64>());
         let dir = base.join(name);
-        let wide: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut sd = ProtectedDirSd::new()?;
-        // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
-        // duration of this call.
-        let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
-        if ok != 0 {
-            return Ok(dir);
+        match create_protected_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            // Name collision — try again with a fresh random suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        // Name collision — try again with a fresh random suffix.
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique staging dir name",
     ))
+}
+
+/// Make `dir`, which must not exist yet, readable and writable by SYSTEM and
+/// Administrators alone: the DACL is set AT CREATION ([`ProtectedDirSd`]), and
+/// the create fails if anything is already at the name, so a folder someone else
+/// made first is never taken for ours. It also fails for a caller who cannot
+/// name Administrators as the owner. The setup wizard stages what it runs
+/// elevated in one of these (#3246).
+#[cfg(target_os = "windows")]
+pub fn create_protected_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = ProtectedDirSd::new()?;
+    // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
+    // duration of this call.
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// macOS: the per-user `confstr(_CS_DARWIN_USER_TEMP_DIR)` temp dir is
@@ -1464,7 +1308,7 @@ fn is_stale(age: Duration) -> bool {
 }
 
 /// GHSA-r3xj-4wh9-xh2v — remove this daemon's own abandoned staging
-/// directories from a PRIOR update, once, at startup (called from `main.rs`
+/// directories from a PRIOR update, once, at startup (called from `app.rs`
 /// next to the Linux `tarball_owner` repair, behind the same single-instance
 /// lock).
 ///
@@ -1478,8 +1322,8 @@ fn is_stale(age: Duration) -> bool {
 /// exists at startup: this runs once, before any update task is spawned, so
 /// every directory it can find was made by a PREVIOUS process generation
 /// that already exited after creating it (every success path here ends in
-/// [`spawn_installer_with_watch`] followed by `std::process::exit` — see its
-/// doc comment). [`STALE_STAGING_DIR_AGE`] is the second, independent guard
+/// [`spawn_installer_with_watch`] and an exit: a graceful one, or `process::exit`
+/// for `roomlerd self-update`). [`STALE_STAGING_DIR_AGE`] is the second, independent guard
 /// for the one remaining edge: an update's watcher may still be running when
 /// the FRESH binary it just installed reaches ITS OWN startup (an MSI install
 /// restarts the service while the watcher is still polling it), so a
@@ -1558,7 +1402,11 @@ fn discard_download(path: &std::path::Path) {
 /// (`agent-v0.3.0-rc.458`). It is not decoration: the artifact has to
 /// self-identify as that release or it is discarded — see
 /// [`crate::artifact_version`] for the downgrade this closes.
+///
+/// An asset's name must be a plain file name ([`plain_file_name`]); any other
+/// is refused before anything is downloaded or written.
 pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -> Result<PathBuf> {
+    let file_name = plain_file_name(&asset.name)?;
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
@@ -1599,7 +1447,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
         );
     }
     let dir = stage_dir().context("creating the staging dir")?;
-    let path = dir.join(&asset.name);
+    let path = dir.join(file_name);
     write_installer(&path, &bytes).context("writing installer to disk")?;
 
     // Publisher check — the anchor the serving channel cannot forge. Whatever
@@ -1723,6 +1571,23 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
     Ok(path)
 }
 
+/// An asset's name must be a plain file name: exactly one normal path
+/// component, with no separator of either kind, no colon and no control
+/// character.
+fn plain_file_name(name: &str) -> Result<&str> {
+    use std::path::{Component, Path};
+    let mut parts = Path::new(name).components();
+    let one_normal = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(only)), None) if only == std::ffi::OsStr::new(name)
+    );
+    let odd_char = name.contains(|c: char| matches!(c, '/' | '\\' | ':') || c.is_control());
+    if !one_normal || odd_char {
+        bail!("refusing the asset {name:?}: an asset's name must be a plain file name");
+    }
+    Ok(name)
+}
+
 /// Verify a payload's SHA256 against a `"<algo>:<hex>"` formatted
 /// digest string (GitHub's convention as of late 2024). Returns
 /// `Err` on mismatch, unsupported algorithm, or malformed digest.
@@ -1752,21 +1617,175 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch a specific release by tag from GitHub. Bypasses the
-/// roomler-ai proxy because pinning is rare (per-agent crash-loop
-/// recovery, not a fleet-wide poll), so the proxy's per-IP rate-
-/// limit insulation isn't needed and the round-trip via our backend
-/// would just add latency to a path that's already on the slow side
-/// of the agent's failure recovery.
+/// #3818 — what a release is looked up FOR, which decides where
+/// ([`release_sources`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseLookup {
+    /// This daemon's OWN release, `agent-v<CARGO_PKG_VERSION>`: the Windows
+    /// tray refresh (`companion::refresh_inner`) and the Linux companion's
+    /// package sync (`companion::package_sync`), both through
+    /// [`fetch_release_by_tag`].
+    Own,
+    /// A PINNED release, through [`pin_version`]: the crash-loop rollback's
+    /// last known good version, or an operator's pin.
+    Pinned,
+}
+
+/// #3818 — one place a release can be looked up by its tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseSource {
+    /// The update feed (`/api/agent/latest-release` on roomler.ai, or
+    /// `ROOMLERD_UPDATE_URL`): the list of releases the update check reads,
+    /// searched for the tag.
+    Feed(String),
+    /// GitHub's by-tag endpoint, unauthenticated: that one release.
+    GithubByTag(String),
+}
+
+impl ReleaseSource {
+    /// The URL this source asks.
+    pub(crate) fn url(&self) -> &str {
+        match self {
+            Self::Feed(url) | Self::GithubByTag(url) => url,
+        }
+    }
+
+    /// What a log line or an error calls this source.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Feed(_) => "the update feed",
+            Self::GithubByTag(_) => "GitHub by tag",
+        }
+    }
+}
+
+/// #3818 — where a lookup of `tag` asks, in order: the first source that
+/// names the release wins. `feed` is the update feed ([`update_feed_url`]).
+///
+/// - [`ReleaseLookup::Own`] asks the feed alone. Every device asks for its own
+///   release at every release, and behind a corporate network's shared egress
+///   address GitHub's unauthenticated per-address limit refused that call
+///   (403). A lookup that fails is the caller's skip-and-retry.
+/// - [`ReleaseLookup::Pinned`] asks the feed, then GitHub by tag. The feed
+///   lists the newest releases only (the server's cache of GitHub's first
+///   page), and a pinned lookup runs on one device, once per crash loop or per
+///   operator's pin, where reaching the release counts for more than one
+///   origin.
+pub(crate) fn release_sources(lookup: ReleaseLookup, feed: &str, tag: &str) -> Vec<ReleaseSource> {
+    let feed = ReleaseSource::Feed(feed.to_string());
+    match lookup {
+        ReleaseLookup::Own => vec![feed],
+        ReleaseLookup::Pinned => vec![
+            feed,
+            ReleaseSource::GithubByTag(github_release_by_tag_url(tag)),
+        ],
+    }
+}
+
+/// GitHub's by-tag endpoint for `tag`.
+fn github_release_by_tag_url(tag: &str) -> String {
+    format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}")
+}
+
+/// #3818 — this daemon's OWN release by its tag, `agent-v<CARGO_PKG_VERSION>`,
+/// for the Windows tray refresh (`companion::refresh_inner`) and the Linux
+/// companion's package sync (`companion::package_sync`): looked up in the
+/// update feed alone ([`ReleaseLookup::Own`]), never at GitHub's API. An error
+/// is the caller's to log, and its retry's to clear.
 pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
-    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
+    fetch_release_from(
+        &release_sources(ReleaseLookup::Own, &update_feed_url(), tag),
+        tag,
+    )
+    .await
+}
+
+/// #3818 — look `tag` up in `sources`, in order; the first that names the
+/// release wins. A source that cannot is logged when another follows it (the
+/// pinned lookup's fallback), and the last one's error is the lookup's, after
+/// the earlier ones' (each named by its source).
+async fn fetch_release_from(sources: &[ReleaseSource], tag: &str) -> Result<GithubRelease> {
+    let mut earlier: Vec<String> = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        let found = match source {
+            ReleaseSource::Feed(url) => fetch_release_in_feed(url, tag).await,
+            ReleaseSource::GithubByTag(url) => fetch_github_release(url, tag).await,
+        };
+        let e = match found {
+            Ok(release) => return Ok(release),
+            Err(e) => e,
+        };
+        let Some(next) = sources.get(i + 1) else {
+            if earlier.is_empty() {
+                return Err(e);
+            }
+            earlier.push(source.label().to_string());
+            return Err(e.context(earlier.join("; ")));
+        };
+        tracing::info!(
+            %tag,
+            source = source.label(),
+            next = next.label(),
+            next_url = %next.url(),
+            error = %format!("{e:#}"),
+            "release lookup: a source could not name the release; asking the next"
+        );
+        earlier.push(format!("{}: {e:#}", source.label()));
+    }
+    bail!("no source to look release {tag} up in")
+}
+
+/// #3818 — the release tagged exactly `tag` in the update feed at `url`. A
+/// draft never counts.
+async fn fetch_release_in_feed(url: &str, tag: &str) -> Result<GithubRelease> {
+    let releases = fetch_feed(url).await?;
+    pick_release_by_tag(releases, tag)
+        .ok_or_else(|| anyhow::anyhow!("release {tag} is not in the update feed {url}"))
+}
+
+/// #3818 — every release the update feed at `url` lists. Its errors keep the
+/// updater's split: a transport failure stays a `reqwest::Error` in the chain
+/// ([`is_transport_failure`]), and an HTTP status is a verdict.
+async fn fetch_feed(url: &str) -> Result<Vec<GithubRelease>> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
     let resp = client
-        .get(&url)
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .with_context(|| format!("GET the update feed {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("the update feed {url} answered {status}");
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("parsing the update feed {url}"))
+}
+
+/// #3818 — the release tagged exactly `tag` in a feed's list, never a draft.
+pub(crate) fn pick_release_by_tag(
+    releases: Vec<GithubRelease>,
+    tag: &str,
+) -> Option<GithubRelease> {
+    releases
+        .into_iter()
+        .find(|release| !release.draft && release.tag_name == tag)
+}
+
+/// One release from GitHub's by-tag endpoint at `url`.
+async fn fetch_github_release(url: &str, tag: &str) -> Result<GithubRelease> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building reqwest client")?;
+    let resp = client
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -1778,9 +1797,24 @@ pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
     Ok(release)
 }
 
+/// #3289 — whether a crash loop's rollback can put an older version in place here.
+///
+/// On Windows it cannot. Both MSI flavours refuse a downgrade
+/// (`DowngradeErrorMessage`), so an attempt spent a download and a daemon exit to
+/// change nothing: measured 1603 in about a second on both flavours of released
+/// 0.4.197, with the newer files still there. Nothing raised the sentinel either way,
+/// and on a per-user device the exit took it offline: nothing restarts that daemon
+/// (#3295).
+pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
+
 /// Pin to a specific release tag. Used by the rollback path when
 /// the crash-loop detector decides the current version is broken
-/// and the last known-good version should be reinstalled.
+/// and the last known-good version should be reinstalled, and by an
+/// operator's pinned update (`rc:agent.update`).
+///
+/// #3818 — the release is looked up in the update feed first, and at
+/// GitHub's by-tag endpoint only when the feed cannot name it
+/// (`ReleaseLookup::Pinned`).
 ///
 /// Returns `CheckOutcome::UpdateReady` with an installer path on
 /// success — caller spawns the installer. Returns `Skipped` on any
@@ -1788,11 +1822,13 @@ pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
 /// running (broken rollback is better than a hard exit because
 /// "the rollback recovery itself failed").
 ///
-/// Network errors fold into `Skipped` like the rest of the
-/// updater paths so a flaky link can't crash the agent.
+/// Network errors fold into `Unreachable`, verdicts into `Skipped`
+/// (`failed`), like the rest of the updater paths, so a flaky link
+/// can't crash the agent.
 pub async fn pin_version(tag: &str) -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
-    let release = match fetch_release_by_tag(tag).await {
+    let sources = release_sources(ReleaseLookup::Pinned, &update_feed_url(), tag);
+    let release = match fetch_release_from(&sources, tag).await {
         Ok(r) => r,
         Err(e) => return failed(&format!("pin fetch {tag}"), e),
     };
@@ -1864,8 +1900,8 @@ pub async fn check_once() -> CheckOutcome {
 }
 
 /// Spawn the installer detached. Returns after the installer is
-/// running so the caller can `std::process::exit(0)` — the agent's
-/// binary is about to be overwritten.
+/// running so the caller can exit (a graceful shutdown, or `process::exit`
+/// for `roomlerd self-update`) — the agent's binary is about to be overwritten.
 ///
 /// - **Windows**: `msiexec /i <path> /qn /norestart`. Requires
 ///   per-user MSI (no UAC) — which is what cargo-wix emits by
@@ -1891,14 +1927,14 @@ pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
 /// agent exits the installer is reparented to init/explorer and the
 /// watcher polls it from there.
 ///
-/// `expected_version=None` keeps the legacy "fire and forget" path —
-/// useful for tests and the manual `self-update` CLI where the
-/// outcome JSON adds nothing the operator can't see directly.
+/// `expected_version=None` keeps the legacy "fire and forget" path
+/// ([`spawn_installer`]). No caller takes it: every install the daemon spawns,
+/// the manual `self-update` CLI's included since rc.18, passes its version.
 pub fn spawn_installer_with_watch(
     installer_path: &std::path::Path,
     expected_version: Option<&str>,
 ) -> Result<()> {
-    // FR-90 P1d-1 — a DEBUG build under ROOMLERD_UPDATE_DRY_RUN installs
+    // A DEBUG build under ROOMLERD_UPDATE_DRY_RUN installs
     // nothing by ANY path. The periodic and pushed updates stop earlier, in
     // `act_on_outcome`; this also covers the crash-loop rollback and the CLI.
     // Its field checks run on workstations whose packaged daemon must not be
@@ -1967,7 +2003,9 @@ pub fn spawn_installer_with_watch(
 /// exiting, service left stopped) were undiagnosable because silent
 /// installs leave no trace; the log names the exact action a wedged
 /// run was in. The staging dir is recycled per update, so the log
-/// doesn't accumulate.
+/// doesn't accumulate. #2107 — each attempt on one staged installer
+/// gets its own name ([`next_msi_log`]): the watcher retries a wedged
+/// install from the same path, and `/l*v` truncates.
 #[cfg(any(target_os = "windows", test))]
 pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour) -> Vec<String> {
     let path = installer.to_string_lossy().into_owned();
@@ -1975,7 +2013,7 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         WindowsInstallFlavour::PerUser => "/qn",
         WindowsInstallFlavour::PerMachine => "/qn",
     };
-    let log = format!("{path}.log");
+    let log = next_msi_log(&path, |candidate| std::path::Path::new(candidate).exists());
     vec![
         "/i".to_string(),
         path,
@@ -1984,6 +2022,20 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         "/l*v".to_string(),
         log,
     ]
+}
+
+/// #2107 — the first free verbose-log name for one more attempt on `installer`:
+/// `<installer>.log`, then `<installer>.2.log`, and so on.
+#[cfg(any(target_os = "windows", test))]
+fn next_msi_log(installer: &str, exists: impl Fn(&str) -> bool) -> String {
+    let first = format!("{installer}.log");
+    if !exists(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|attempt| format!("{installer}.{attempt}.log"))
+        .find(|name| !exists(name))
+        .unwrap_or(first)
 }
 
 /// rc.44: variant of [`msiexec_argv`] that appends operator-supplied
@@ -2130,31 +2182,15 @@ pub fn spawn_installer_as_flavour(
 /// invocation re-asserts the env var via the WiX `EnableSystemContext`
 /// CA instead of stripping it via `DisableSystemContext`.
 ///
-/// Thin wrapper around [`preserve_system_context_property_for`] that
-/// reads the SCM env block; the inner pure helper is unit-tested
-/// against synthetic env-var values without an SCM dependency.
+/// Thin wrapper around [`preserve_system_context_property_for`], which
+/// makes the SCM read only for a perMachine install (#3889); the helper
+/// is unit-tested against synthetic reads without an SCM dependency.
 #[cfg(target_os = "windows")]
 fn preserve_system_context_property(flavour: WindowsInstallFlavour) -> Vec<(String, String)> {
-    let env_value =
+    preserve_system_context_property_for(flavour, || {
         crate::win_service::environment::read_service_env_var("ROOMLERD_ENABLE_SYSTEM_SWAP")
-            .map_err(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
-                     not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
-                     but may strip SystemContext if it was enabled)"
-                );
-                format!("{e}")
-            });
-    let result = preserve_system_context_property_for(flavour, env_value);
-    if !result.is_empty() {
-        tracing::info!(
-            "updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env; \
-             passing ENABLE_SYSTEM_CONTEXT=1 to msiexec to preserve SystemContext mode \
-             across auto-update (rc.56 hotfix)"
-        );
-    }
-    result
+            .map_err(|e| format!("{e}"))
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2166,27 +2202,32 @@ fn preserve_system_context_property(_flavour: WindowsInstallFlavour) -> Vec<(Str
 /// rc.56 pure decision logic. Split from the SCM read so the rules
 /// are unit-testable without mocking the registry.
 ///
+/// #3889 — the flavour comes FIRST: `read_service_env` is called only for
+/// a PerMachine install. A perUser install registers no service, so the
+/// read could only fail, and its WARN named a SystemContext that install
+/// cannot have, on every perUser self-update.
+///
 /// Returns `vec![("ENABLE_SYSTEM_CONTEXT", "1")]` iff:
 ///   * flavour is PerMachine (perUser installs have no SCM service)
-///   * env_value == Ok(Some("1")) — the SCM block has the swap on
+///   * the read answers Ok(Some("1")) — the SCM block has the swap on
 ///
 /// All other paths return an empty vec (pass nothing to msiexec):
-///   * PerUser flavour
+///   * PerUser flavour: no read, and no log line
 ///   * env var absent (plain perMachine install — DisableSystemContext
 ///     is a harmless idempotent no-op)
 ///   * env var present but != "1" (operator may have set a non-"1"
 ///     truthy variant the agent's `system_swap_enabled` accepts, but
 ///     the WiX CA condition compares strictly against the string
 ///     `"1"`; we follow WiX's strictness here)
-///   * SCM read error (best-effort; falling back matches pre-rc.56
+///   * SCM read error (best-effort, WARNed; falling back matches pre-rc.56
 ///     behaviour — `enable-system-context` CLI remains the manual
 ///     escape hatch)
 //
 // cfg-gate so the function is only compiled where it's actually
-// reachable: on Windows (the SCM wrapper at line 869 calls it) and
-// under `cfg(test)` (the unit tests at lines 1959+ exercise it
-// directly without going through the Windows wrapper). Without the
-// gate, the Linux clippy job fails with `-D dead_code` because the
+// reachable: on Windows (`preserve_system_context_property` calls it) and
+// under `cfg(test)` (the `preserve_system_context_*` and #3889 tests
+// exercise it directly without going through the Windows wrapper). Without
+// the gate, the Linux clippy job fails with `-D dead_code` because the
 // non-Windows `preserve_system_context_property` stub returns early
 // and never reaches this helper. Pre-existing master regression
 // repro'd in CI run 26375071253; fix landed alongside the
@@ -2194,14 +2235,30 @@ fn preserve_system_context_property(_flavour: WindowsInstallFlavour) -> Vec<(Str
 #[cfg(any(target_os = "windows", test))]
 fn preserve_system_context_property_for(
     flavour: WindowsInstallFlavour,
-    env_value: Result<Option<String>, String>,
+    read_service_env: impl FnOnce() -> Result<Option<String>, String>,
 ) -> Vec<(String, String)> {
     if flavour != WindowsInstallFlavour::PerMachine {
         return Vec::new();
     }
-    match env_value {
-        Ok(Some(v)) if v == "1" => vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())],
-        _ => Vec::new(),
+    match read_service_env() {
+        Ok(Some(v)) if v == "1" => {
+            tracing::info!(
+                "updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env; \
+                 passing ENABLE_SYSTEM_CONTEXT=1 to msiexec to preserve SystemContext mode \
+                 across auto-update (rc.56 hotfix)"
+            );
+            vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
+        }
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
+                 not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
+                 but may strip SystemContext if it was enabled)"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -2497,7 +2554,12 @@ fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
 fn run_linux_install_candidates(euid: u32, path: &str) -> Result<u32> {
     let mut attempts: Vec<String> = Vec::new();
     for (bin, args) in linux_install_candidates(euid, path) {
-        let mut child = match std::process::Command::new(bin).args(&args).spawn() {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(&args);
+        // The installer may outlive this daemon: it keeps its stdio and
+        // nothing else of ours.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(bin, error = %e, "update install: candidate not spawnable");
@@ -2612,10 +2674,12 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         // silently does nothing, on the one platform whose grants are keyed to
         // the binary. `/` is also what scripts/install.sh uses, so the update
         // path and the install path finally agree.
-        let child = std::process::Command::new("installer")
-            .args(["-pkg", &path_str, "-target", "/"])
-            .spawn()
-            .context("spawning installer(8)")?;
+        let mut cmd = std::process::Command::new("installer");
+        cmd.args(["-pkg", &path_str, "-target", "/"]);
+        // The installer outlives this daemon: it keeps its stdio and nothing
+        // else of ours.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
+        let child = cmd.spawn().context("spawning installer(8)")?;
         Ok(child.id())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2922,6 +2986,9 @@ fn spawn_watcher(
     // #2718 — the watcher outlives whoever ran this (by ~30 s). It logs to its
     // file; nothing reads its stdio.
     without_caller_stdio(&mut cmd);
+    // ...and it keeps nothing else of ours either.
+    #[cfg(unix)]
+    tunnel_core::child::inherit_only_stdio(&mut cmd);
     let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;
@@ -3088,6 +3155,16 @@ pub fn request_update_now(pin: Option<String>) -> bool {
 /// exit (installer running, agent about to be replaced). Shared by the
 /// periodic and forced paths.
 fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sender<bool>) -> bool {
+    act_on_outcome_with(outcome, shutdown_tx, spawn_installer_with_watch)
+}
+
+/// [`act_on_outcome`] with the installer's spawn handed in, so a test reaches
+/// the shutdown an update signals without running an installer (FR-138 AC6).
+fn act_on_outcome_with(
+    outcome: CheckOutcome,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    spawn: impl FnOnce(&std::path::Path, Option<&str>) -> Result<()>,
+) -> bool {
     match outcome {
         CheckOutcome::UpToDate { current, latest } => {
             tracing::info!(current = %current, latest = %latest, "up to date");
@@ -3098,10 +3175,10 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
             latest,
             installer_path,
         } => {
-            // FR-90 P1d-1 — a DEBUG build's field check of the wait: it
-            // downloads and waits exactly as a real update does, then installs
-            // nothing (a debug daemon on a workstation must not replace the
-            // packaged one there). Not compiled into a release build.
+            // A DEBUG build's dry run: it downloads exactly as a real update
+            // does, then installs nothing (a debug daemon on a workstation
+            // must not replace the packaged one there). Not compiled into a
+            // release build.
             #[cfg(debug_assertions)]
             if std::env::var_os("ROOMLERD_UPDATE_DRY_RUN").is_some() {
                 tracing::warn!(
@@ -3110,7 +3187,6 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
                     path = %installer_path.display(),
                     "auto-updater: DRY RUN — would spawn the installer now; nothing installed"
                 );
-                hold_agent_prompts(false);
                 // FR-96 review — the dry run downloaded but will not install, so
                 // nothing else will clean the private staging dir up.
                 #[cfg(target_os = "linux")]
@@ -3123,10 +3199,8 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
                 path = %installer_path.display(),
                 "new release available — spawning installer and exiting"
             );
-            if let Err(e) = spawn_installer_with_watch(&installer_path, Some(&latest)) {
+            if let Err(e) = spawn(&installer_path, Some(&latest)) {
                 tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
-                // FR-90 P1d-1 — no restart is coming: take agent prompts again.
-                hold_agent_prompts(false);
                 // A failed install is otherwise INVISIBLE: the version the
                 // server sees simply never moves, which reads as "the update
                 // button does nothing". Raise the same operator sentinel the
@@ -3326,14 +3400,6 @@ pub async fn run_periodic(
                 crate::companion::sync_package().await;
             }
             let retry = recheck_after(&outcome, &mut transport_failures, interval);
-            // FR-90 P1d-1 — even a pushed update waits for running agent
-            // turns (bounded): a person asked for the update, not for their
-            // agent to be cut mid-step.
-            if matches!(outcome, CheckOutcome::UpdateReady { .. })
-                && !wait_for_agent_turns(&mut shutdown, "auto-updater").await
-            {
-                return;
-            }
             if act_on_outcome(outcome, &shutdown_tx) {
                 return;
             }
@@ -3396,12 +3462,6 @@ pub async fn run_periodic(
             crate::companion::sync_package().await;
         }
         let retry = recheck_after(&outcome, &mut transport_failures, interval);
-        // FR-90 P1d-1 — AC7: the installer waits for running agent turns.
-        if matches!(outcome, CheckOutcome::UpdateReady { .. })
-            && !wait_for_agent_turns(&mut shutdown, "auto-updater").await
-        {
-            return;
-        }
         if act_on_outcome(outcome, &shutdown_tx) {
             return;
         }
@@ -3780,54 +3840,6 @@ async fn forward_triggers_to(
     }
 }
 
-/// How long the update helper waits for the daemon's word before it installs
-/// anyway (FR-90 P1h-2). The daemon bounds its own wait by the device's
-/// `hive_update_wait_secs` (30 min by default); this is only the ceiling for
-/// a daemon that never answers.
-#[cfg(target_os = "macos")]
-const HOLD_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
-
-/// What the update helper got from the daemon before installing (FR-90 P1h-2).
-#[cfg(any(target_os = "macos", all(test, unix)))]
-pub(crate) enum InstallHold {
-    /// The daemon holds, for as long as the helper keeps this client: until
-    /// `installer(8)` returns.
-    Held {
-        _client: tunnel_core::localapi::Client,
-        waited_secs: u64,
-        cut: u32,
-    },
-    /// No hold, and why: no daemon here, one older than the verb, a refusal,
-    /// or no answer in time. The install goes ahead as it did before P1h-2.
-    Without(String),
-}
-
-/// FR-90 P1h-2 (AC7 on macOS) — ask the root daemon at `socket` to hold for
-/// its agent turns before the helper's `installer(8)` restarts it, and every
-/// harness with it. Fail-open by design: a missing, older or silent daemon
-/// never keeps an update from installing; it gets the install it got before.
-#[cfg(any(target_os = "macos", all(test, unix)))]
-pub(crate) async fn hold_daemon_for_install(socket: PathBuf, ceiling: Duration) -> InstallHold {
-    use tunnel_core::localapi::{Request, Response, connect_unix_at};
-    let mut client = match connect_unix_at(socket).await {
-        Ok(c) => c,
-        Err(e) => return InstallHold::Without(format!("no daemon to hold ({e})")),
-    };
-    match tokio::time::timeout(ceiling, client.request(&Request::HiveUpdateHold)).await {
-        Ok(Ok(Response::HiveUpdateHeld { waited_secs, cut })) => InstallHold::Held {
-            _client: client,
-            waited_secs,
-            cut,
-        },
-        Ok(Ok(Response::Error { message })) => {
-            InstallHold::Without(format!("the daemon holds nothing: {message}"))
-        }
-        Ok(Ok(_)) => InstallHold::Without("an answer this helper does not know".into()),
-        Ok(Err(e)) => InstallHold::Without(format!("the daemon's answer was lost: {e}")),
-        Err(_) => InstallHold::Without(format!("no answer within {} s", ceiling.as_secs())),
-    }
-}
-
 // The operator's opt-out, current path first.
 // FR-46 P5a — dual-read, and the SENSE is what makes it mandatory: this is
 // an OPT-OUT. Reading only the current path would auto-update a host whose
@@ -3875,8 +3887,8 @@ pub enum AutoUpdate {
     OptedOut(&'static str),
 }
 
-/// #2901 — the start-up decision, pure so the lib tests can pin it (the
-/// daemon's `main.rs` has no test lane). `setting` is the resolved
+/// #2901 — the start-up decision, pure so a test can pin it without starting a
+/// daemon. `setting` is the resolved
 /// `AUTO_UPDATE` value (config key or env); `marker` is [`opt_out_marker`].
 /// Either opt-out turns the updater off. A setting that says off is reported
 /// first, because it is the one the operator set on this daemon.
@@ -4051,25 +4063,6 @@ async fn install_from_helper(
     installer_path: PathBuf,
 ) -> anyhow::Result<()> {
     use anyhow::{Context, bail};
-    // FR-90 P1h-2 (AC7 on macOS) — the root daemon runs agent sessions, and
-    // the install restarts it with every harness: hold it for its running
-    // turns first, as the in-process updater does on Linux. The hold ends
-    // when `hold` is dropped, right after the installer returns; a failed
-    // install takes prompts again.
-    let hold =
-        hold_daemon_for_install(tunnel_core::localapi::system_socket_path(), HOLD_CEILING).await;
-    match &hold {
-        InstallHold::Held {
-            waited_secs, cut, ..
-        } => tracing::info!(
-            waited_secs,
-            cut,
-            "update-helper: the daemon holds for its agent turns"
-        ),
-        InstallHold::Without(why) => {
-            tracing::info!(%why, "update-helper: installing without a hold")
-        }
-    }
     record_update_attempt();
     tracing::warn!(
         %current,
@@ -4083,7 +4076,6 @@ async fn install_from_helper(
         .args(["-target", "/"])
         .status()
         .context("running installer(8)");
-    drop(hold);
     let status = status?;
     if !status.success() {
         // Same operator sentinel act_on_outcome raises: a failed install is
@@ -4099,7 +4091,9 @@ async fn install_from_helper(
     }
     tracing::info!(
         %latest,
-        "update-helper: installed — postinstall re-bootstrapped the agent halves"
+        "update-helper: installer(8) exited 0; this helper cannot see what postinstall \
+         reloaded. /var/log/install.log says it: the root daemon when it is enabled, a \
+         person's login items when that person is signed in, and any WARNING"
     );
     Ok(())
 }
@@ -4330,92 +4324,6 @@ mod tests {
             !super::request_update_now(None),
             "a push to a daemon whose updater is off must report undeliverable"
         );
-    }
-
-    /// FR-90 P1h-2 — the macOS update helper holds the daemon for exactly as
-    /// long as it keeps the hold (until `installer(8)` returns), and installs
-    /// without one when nothing holds: no daemon, a daemon older than the
-    /// verb, one that never answers. Run on every Unix: the client is not
-    /// macOS's, only its caller is.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_update_helper_holds_the_daemon_while_it_installs() {
-        use std::time::Duration;
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        // A short path: a Unix socket's name is capped at 104 bytes on macOS.
-        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-
-        // A daemon that holds, and says when the helper lets go.
-        let sock = dir.path().join("hold.sock");
-        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
-        let (gone_tx, mut gone_rx) = tokio::sync::oneshot::channel::<String>();
-        tokio::spawn(async move {
-            let (s, _) = listener.accept().await.unwrap();
-            let (rd, mut wr) = s.into_split();
-            let mut rd = BufReader::new(rd);
-            let mut asked = String::new();
-            rd.read_line(&mut asked).await.unwrap();
-            wr.write_all(b"{\"t\":\"hive_update_held\",\"d\":{\"waited_secs\":12,\"cut\":1}}\n")
-                .await
-                .unwrap();
-            let mut rest = Vec::new();
-            let _ = rd.read_to_end(&mut rest).await;
-            let _ = gone_tx.send(asked);
-        });
-        let hold = super::hold_daemon_for_install(sock, Duration::from_secs(5)).await;
-        let super::InstallHold::Held {
-            waited_secs, cut, ..
-        } = &hold
-        else {
-            panic!("the daemon held")
-        };
-        assert_eq!((*waited_secs, *cut), (12, 1));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(150), &mut gone_rx)
-                .await
-                .is_err(),
-            "held while the installer runs"
-        );
-        drop(hold);
-        let asked = tokio::time::timeout(Duration::from_secs(5), gone_rx)
-            .await
-            .expect("the daemon sees the hold end")
-            .unwrap();
-        assert_eq!(asked.trim_end(), r#"{"t":"hive_update_hold"}"#);
-
-        // No daemon at all.
-        let none =
-            super::hold_daemon_for_install(dir.path().join("none.sock"), Duration::from_secs(5))
-                .await;
-        assert!(matches!(&none, super::InstallHold::Without(w) if w.contains("no daemon")));
-
-        // A daemon older than the verb.
-        let old = dir.path().join("old.sock");
-        let older = tokio::net::UnixListener::bind(&old).unwrap();
-        tokio::spawn(async move {
-            let (s, _) = older.accept().await.unwrap();
-            let (rd, mut wr) = s.into_split();
-            let mut line = String::new();
-            BufReader::new(rd).read_line(&mut line).await.unwrap();
-            wr.write_all(
-                b"{\"t\":\"error\",\"d\":{\"message\":\"bad request: unknown variant `hive_update_hold`\"}}\n",
-            )
-            .await
-            .unwrap();
-        });
-        let old = super::hold_daemon_for_install(old, Duration::from_secs(5)).await;
-        assert!(matches!(&old, super::InstallHold::Without(w) if w.contains("holds nothing")));
-
-        // One that never answers: the ceiling, and the install goes ahead.
-        let silent = dir.path().join("silent.sock");
-        let mute = tokio::net::UnixListener::bind(&silent).unwrap();
-        let _mute = tokio::spawn(async move {
-            let (s, _) = mute.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            drop(s);
-        });
-        let late = super::hold_daemon_for_install(silent, Duration::from_millis(300)).await;
-        assert!(matches!(&late, super::InstallHold::Without(w) if w.contains("no answer")));
     }
 
     /// #1206 — the post-install watcher must verify the INSTALL path, never
@@ -5150,10 +5058,9 @@ mod tests {
     }
 
     /// Read back `dir`'s owner + DACL and confirm only SYSTEM or
-    /// BUILTIN\Administrators have any write-like access — the same shape as
-    /// `exec_service`'s `check_private`, duplicated here for the same reason
-    /// that one duplicates `hive_win::Sddl` (see [`ProtectedDirSd`]'s doc
-    /// comment).
+    /// BUILTIN\Administrators have any write-like access — the rule of
+    /// `machine_tree::verdict` (FR-94's reader), written out here for the
+    /// same reason [`ProtectedDirSd`] is (see its doc comment).
     #[cfg(target_os = "windows")]
     fn assert_dacl_is_system_and_admins_only(dir: &std::path::Path) {
         use std::os::windows::ffi::OsStrExt;
@@ -6519,6 +6426,43 @@ mod tests {
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------
 
+    /// #3289 — the constant is only as true as the two tables it describes. Whoever
+    /// lets an MSI downgrade (`AllowDowngrades`, or a schedule that drops the refusal)
+    /// lands here, and a crash loop on Windows can then go back to rolling back.
+    #[test]
+    fn no_rollback_runs_where_the_msis_refuse_a_downgrade() {
+        for table in [
+            include_str!("../wix/main.wxs"),
+            include_str!("../wix-perMachine/main.wxs"),
+        ] {
+            assert!(table.contains("DowngradeErrorMessage="));
+            assert!(!table.contains("AllowDowngrades"));
+        }
+        assert_eq!(ROLLBACK_CAN_DOWNGRADE, !cfg!(target_os = "windows"));
+    }
+
+    /// #2107 — the verbose log exists to name the action a wedged run was in, and
+    /// the watcher's retry of the same staged installer truncated it.
+    #[test]
+    fn a_retry_never_reuses_the_log_of_the_attempt_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let msi = dir.path().join("roomlerd.msi");
+        let next_log = || {
+            msiexec_argv(&msi, WindowsInstallFlavour::PerMachine)
+                .pop()
+                .unwrap()
+        };
+        let first = next_log();
+        assert_eq!(first, format!("{}.log", msi.display()));
+        std::fs::write(&first, "the wedged attempt").unwrap();
+        let second = next_log();
+        assert_ne!(second, first);
+        std::fs::write(&second, "the retry").unwrap();
+        let third = next_log();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+    }
+
     #[test]
     fn msiexec_argv_per_user_uses_qn() {
         // perUser MSI installs without UAC; /qn (fully silent) is
@@ -6659,21 +6603,19 @@ mod tests {
         // property because perUser MSIs don't define the WiX
         // `EnableSystemContext` CA at all.
         assert_eq!(
-            preserve_system_context_property_for(
-                WindowsInstallFlavour::PerUser,
-                Ok(Some("1".into())),
-            ),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || Ok(Some(
+                "1".into()
+            )),),
             Vec::<(String, String)>::new()
         );
         assert_eq!(
-            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, Ok(None),),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || Ok(None)),
             Vec::<(String, String)>::new()
         );
         assert_eq!(
-            preserve_system_context_property_for(
-                WindowsInstallFlavour::PerUser,
-                Err("nope".into()),
-            ),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || Err(
+                "nope".into()
+            ),),
             Vec::<(String, String)>::new()
         );
     }
@@ -6684,10 +6626,10 @@ mod tests {
         // pass `ENABLE_SYSTEM_CONTEXT=1`. Without this assertion the
         // WiX DisableSystemContext CA would strip the env var on every
         // auto-update (field-repro WINHOST-A 2026-05-24, rc.55 self-update).
-        let result = preserve_system_context_property_for(
-            WindowsInstallFlavour::PerMachine,
-            Ok(Some("1".into())),
-        );
+        let result =
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || {
+                Ok(Some("1".into()))
+            });
         assert_eq!(
             result,
             vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
@@ -6701,7 +6643,7 @@ mod tests {
         // runs DisableSystemContext which is an idempotent no-op when
         // there's nothing to disable.
         assert_eq!(
-            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, Ok(None),),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || Ok(None)),
             Vec::<(String, String)>::new()
         );
     }
@@ -6717,10 +6659,9 @@ mod tests {
         // `system_swap_enabled` to also be strict.
         for v in ["0", "true", "yes", "on", "TRUE", "", "anything"] {
             assert_eq!(
-                preserve_system_context_property_for(
-                    WindowsInstallFlavour::PerMachine,
-                    Ok(Some(v.into())),
-                ),
+                preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || Ok(
+                    Some(v.into())
+                ),),
                 Vec::<(String, String)>::new(),
                 "non-\"1\" env value {v:?} must NOT pass ENABLE_SYSTEM_CONTEXT"
             );
@@ -6734,11 +6675,80 @@ mod tests {
         // Operator can re-enable SystemContext manually via
         // `roomlerd enable-system-context` if needed.
         assert_eq!(
-            preserve_system_context_property_for(
-                WindowsInstallFlavour::PerMachine,
-                Err("SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into()),
-            ),
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || Err(
+                "SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into()
+            ),),
             Vec::<(String, String)>::new()
+        );
+    }
+
+    /// #3889 — a per-user install registers no service, so its self-update
+    /// never asks for the service's environment and logs nothing about the
+    /// SystemContext switch: the flavour is checked first. Whatever the read
+    /// would have answered, it is never made.
+    #[test]
+    fn a_per_user_update_never_reads_the_service_environment() {
+        /// What the service's environment would have answered.
+        type Answer = fn() -> Result<Option<String>, String>;
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+        let answers: [Answer; 3] = [
+            || Ok(Some("1".into())),
+            || Ok(None),
+            || Err("the service is not installed".into()),
+        ];
+        for answer in answers {
+            let asked = std::cell::Cell::new(false);
+            let props =
+                preserve_system_context_property_for(WindowsInstallFlavour::PerUser, || {
+                    asked.set(true);
+                    answer()
+                });
+            assert!(props.is_empty(), "{props:?}");
+            assert!(
+                !asked.get(),
+                "a per-user update asked for the service environment ({:?})",
+                answer()
+            );
+        }
+        let text = log.text();
+        assert!(
+            !text.contains("ROOMLERD_ENABLE_SYSTEM_SWAP"),
+            "a per-user update logged about the SystemContext switch:\n{text}"
+        );
+    }
+
+    /// #3889 — a per-Machine update keeps its read, one per update, its INFO
+    /// when the switch is on and its WARN when the read fails.
+    #[test]
+    fn a_per_machine_update_reads_the_service_environment_and_says_what_it_found() {
+        let log = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+        let reads = std::cell::Cell::new(0);
+        let on = preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || {
+            reads.set(reads.get() + 1);
+            Ok(Some("1".into()))
+        });
+        assert_eq!(
+            on,
+            vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
+        );
+        let failed =
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, || {
+                reads.set(reads.get() + 1);
+                Err("SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into())
+            });
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(reads.get(), 2, "one read per update");
+        let text = log.text();
+        assert!(
+            text.lines().any(|l| l.contains("INFO")
+                && l.contains("updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env")),
+            "no INFO for the switch that was on:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l.contains("WARN")
+                && l.contains("updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP")
+                && l.contains("ERROR_ACCESS_DENIED")),
+            "no WARN for the read that failed:\n{text}"
         );
     }
 
@@ -6772,29 +6782,6 @@ mod tests {
         );
         // Both gates at once still just defers once per cycle.
         assert_eq!(decide_defer(2, true, 0), DeferDecision::DeferOnce);
-    }
-
-    /// FR-90 P1d-1 (AC7) — running agent turns hold an install, bounded: no
-    /// turn goes at once, a turn within the wait waits, a turn past it is
-    /// cut; a wait of zero (the owner's choice) cuts at once.
-    #[test]
-    fn decide_turn_wait_waits_for_turns_within_the_bound() {
-        let max = Duration::from_secs(1800);
-        assert_eq!(decide_turn_wait(0, Duration::ZERO, max), TurnWait::Proceed);
-        assert_eq!(
-            decide_turn_wait(0, Duration::from_secs(5000), max),
-            TurnWait::Proceed
-        );
-        assert_eq!(decide_turn_wait(1, Duration::ZERO, max), TurnWait::Wait);
-        assert_eq!(
-            decide_turn_wait(3, Duration::from_secs(1799), max),
-            TurnWait::Wait
-        );
-        assert_eq!(decide_turn_wait(1, max, max), TurnWait::Cut);
-        assert_eq!(
-            decide_turn_wait(1, Duration::ZERO, Duration::ZERO),
-            TurnWait::Cut
-        );
     }
 
     #[test]
@@ -6959,7 +6946,7 @@ mod tests {
     /// exec drain threads do.
     fn eof_after(mode: &str) -> Duration {
         use std::io::Read;
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let mut caller =
             std::process::Command::new(std::env::current_exe().expect("the test binary"))
                 .args([
@@ -6997,6 +6984,467 @@ mod tests {
             detached < Duration::from_secs(3),
             "EOF should come when the caller exits, not the lingerer: {detached:?}"
         );
+    }
+
+    /// FR-138 AC6 — an update ends every session as a shutdown does. Once the
+    /// installer is running, the updater sends `true` on the daemon's shutdown
+    /// watch (`app.rs` hands it a clone of the one sender), which the
+    /// connection's shutdown arm reads, and that arm closes every peer, a kept
+    /// one included (`session_table`'s `arm_shutdown_closes_every_peer`).
+    #[test]
+    fn an_update_reaches_the_shutdown_that_closes_every_peer() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut spawned = None;
+        let exits = act_on_outcome_with(
+            CheckOutcome::UpdateReady {
+                current: "0.4.216".into(),
+                latest: "agent-v0.4.217".into(),
+                installer_path: PathBuf::from("staged-installer.msi"),
+            },
+            &shutdown_tx,
+            |path, version| {
+                spawned = Some((path.to_path_buf(), version.map(str::to_owned)));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            spawned,
+            Some((
+                PathBuf::from("staged-installer.msi"),
+                Some("agent-v0.4.217".to_owned())
+            )),
+            "the installer is spawned, watched for the version it installs \
+             (a debug build under ROOMLERD_UPDATE_DRY_RUN spawns none)"
+        );
+        assert!(
+            *shutdown_rx.borrow(),
+            "the installer is running: the daemon is told to shut down"
+        );
+        assert!(exits, "and the update loop ends");
+    }
+
+    // ── #3818: where a release is looked up by its tag ──
+
+    /// The tag the field case asked for, in the agent-v0.4.218 push.
+    const TAG_3818: &str = "agent-v0.4.218";
+
+    fn urls_of(sources: &[ReleaseSource]) -> Vec<String> {
+        sources.iter().map(|s| s.url().to_string()).collect()
+    }
+
+    /// #3818 — the tray refresh, and the Linux companion's package sync, look
+    /// the daemon's own release up in the update feed on roomler.ai, the origin
+    /// the update check already reads, and nowhere else. They asked GitHub's
+    /// API by tag, unauthenticated, from every device at every release, and
+    /// behind a corporate network's shared egress GitHub answered 403.
+    #[test]
+    fn the_tray_refresh_looks_its_release_up_on_roomler_ai_alone() {
+        let urls = urls_of(&release_sources(
+            ReleaseLookup::Own,
+            &update_feed_url_from(None),
+            TAG_3818,
+        ));
+        assert_eq!(urls, ["https://roomler.ai/api/agent/latest-release"]);
+        assert!(
+            urls.iter().all(|u| !u.contains("api.github.com")),
+            "no api.github.com anywhere in the refresh's lookup: {urls:?}"
+        );
+    }
+
+    /// #3818 — a deployment that overrides the update feed
+    /// (`ROOMLERD_UPDATE_URL`) has the tray's release looked up there, as its
+    /// update check is.
+    #[test]
+    fn the_tray_refresh_reads_an_overridden_update_feed() {
+        let feed = update_feed_url_from(Some(
+            "https://feed.example/api/agent/latest-release".to_string(),
+        ));
+        assert_eq!(
+            urls_of(&release_sources(ReleaseLookup::Own, &feed, TAG_3818)),
+            ["https://feed.example/api/agent/latest-release"]
+        );
+    }
+
+    /// #3818 — a pinned release (the crash-loop rollback's, an operator's) is
+    /// looked up on roomler.ai first. GitHub's by-tag endpoint follows it only
+    /// as the fallback, for a tag the feed cannot name.
+    #[test]
+    fn a_pinned_release_is_looked_up_on_roomler_ai_first() {
+        let sources = release_sources(ReleaseLookup::Pinned, &update_feed_url_from(None), TAG_3818);
+        assert_eq!(
+            urls_of(&sources),
+            [
+                "https://roomler.ai/api/agent/latest-release",
+                "https://api.github.com/repos/gjovanov/roomler-ai/releases/tags/agent-v0.4.218",
+            ]
+        );
+    }
+
+    /// #3818 — a blank override is no override: the own-release lookup asks the
+    /// feed alone, so a blank URL would fail it on every try.
+    #[test]
+    fn a_blank_feed_override_counts_as_none() {
+        for blank in ["", "   "] {
+            assert_eq!(
+                update_feed_url_from(Some(blank.to_string())),
+                DEFAULT_PROXY_URL
+            );
+        }
+        assert_eq!(
+            update_feed_url_from(Some(" https://feed.example/x ".to_string())),
+            "https://feed.example/x"
+        );
+    }
+
+    /// #3818 — a stand-in for an HTTP endpoint on 127.0.0.1: every request is
+    /// answered with `status` and `body`, and its request line is kept.
+    struct FakeEndpoint {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeEndpoint {
+        async fn start(path: &str, status: &'static str, body: String) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}{path}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&head)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    log.lock().unwrap().push(line);
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            Self { url, seen }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// A URL nothing listens on: a port that was just free.
+    fn nothing_listens_at(path: &str) -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}{path}")
+    }
+
+    const FEED_PATH: &str = "/api/agent/latest-release";
+
+    /// A release as `/api/agent/latest-release` lists one: the per-Machine
+    /// MSI and the desktop companion's EXE, each with GitHub's download URL
+    /// and a digest.
+    fn release_value(tag: &str, draft: bool) -> serde_json::Value {
+        let version = tag.trim_start_matches("agent-v");
+        let asset = |name: String| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url":
+                    format!("https://github.com/gjovanov/roomler-ai/releases/download/{tag}/{name}"),
+                "size": 16_000_000,
+                "digest": format!("sha256:{}", "ab".repeat(32)),
+            })
+        };
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": draft,
+            "prerelease": false,
+            "published_at": "2026-11-12T17:00:00Z",
+            "assets": [
+                asset(format!("roomlerd-{version}-perMachine-x86_64-pc-windows-msvc.msi")),
+                asset(format!("roomler-desktop-{version}-x86_64-pc-windows-msvc.exe")),
+            ],
+        })
+    }
+
+    /// The update feed's answer: these releases, newest first.
+    fn feed_json(releases: &[(&str, bool)]) -> String {
+        serde_json::Value::Array(
+            releases
+                .iter()
+                .map(|(tag, draft)| release_value(tag, *draft))
+                .collect(),
+        )
+        .to_string()
+    }
+
+    /// The pinned lookup's sources, in `release_sources`' order, with GitHub's
+    /// by-tag endpoint swapped for `by_tag`: nothing here reaches GitHub.
+    fn pinned_sources(feed: &str, by_tag: &str, tag: &str) -> Vec<ReleaseSource> {
+        release_sources(ReleaseLookup::Pinned, feed, tag)
+            .into_iter()
+            .map(|source| match source {
+                ReleaseSource::GithubByTag(_) => ReleaseSource::GithubByTag(by_tag.to_string()),
+                feed => feed,
+            })
+            .collect()
+    }
+
+    /// #3818 — the feed names the release of the tag asked for, with the assets
+    /// the refresh picks from, their download URLs and their digests as the feed
+    /// lists them. One request, to the feed.
+    #[tokio::test]
+    async fn the_feed_names_the_release_of_its_tag_with_its_assets() {
+        let feed = FakeEndpoint::start(
+            FEED_PATH,
+            "200 OK",
+            feed_json(&[("agent-v0.4.218", false), ("agent-v0.4.217", false)]),
+        )
+        .await;
+        let tag = "agent-v0.4.217";
+        let release = fetch_release_from(&release_sources(ReleaseLookup::Own, &feed.url, tag), tag)
+            .await
+            .expect("the feed lists it");
+        assert_eq!(release.tag_name, tag);
+        let desktop = release
+            .assets
+            .iter()
+            .find(|a| a.name == "roomler-desktop-0.4.217-x86_64-pc-windows-msvc.exe")
+            .expect("the desktop companion's EXE");
+        assert_eq!(
+            desktop.browser_download_url,
+            "https://github.com/gjovanov/roomler-ai/releases/download/agent-v0.4.217/\
+             roomler-desktop-0.4.217-x86_64-pc-windows-msvc.exe"
+        );
+        assert_eq!(
+            desktop.digest.as_deref(),
+            Some(format!("sha256:{}", "ab".repeat(32)).as_str())
+        );
+        assert_eq!(feed.requests(), [format!("GET {FEED_PATH} HTTP/1.1")]);
+    }
+
+    /// #3818 — a tag the feed lacks (an older release, a build never released,
+    /// a bare version) or lists only as a draft is an error that names the tag
+    /// and the feed: a verdict, not a transport failure.
+    #[tokio::test]
+    async fn a_tag_the_feed_lacks_is_an_error_naming_the_tag_and_the_feed() {
+        let feed = FakeEndpoint::start(
+            FEED_PATH,
+            "200 OK",
+            feed_json(&[("agent-v0.4.218", false), ("agent-v0.4.150", true)]),
+        )
+        .await;
+        for tag in ["agent-v0.4.150", "agent-v0.4.149", "0.4.218"] {
+            let e = fetch_release_from(&release_sources(ReleaseLookup::Own, &feed.url, tag), tag)
+                .await
+                .expect_err(tag);
+            let text = format!("{e:#}");
+            assert!(
+                text.contains(&format!(
+                    "release {tag} is not in the update feed {}",
+                    feed.url
+                )),
+                "{text}"
+            );
+            assert!(
+                matches!(failed("fetch", e), CheckOutcome::Skipped(_)),
+                "a verdict"
+            );
+        }
+        assert_eq!(
+            feed.requests().len(),
+            3,
+            "one request a lookup, to the feed"
+        );
+    }
+
+    /// #3818 — when roomler.ai cannot answer, the own-release lookup is an error
+    /// and asks nothing else: the tray refresh logs `desktop companion refresh
+    /// skipped` and its retry tries again, as it did when GitHub refused. A 503
+    /// is a verdict; a refused connection is a transport failure.
+    #[tokio::test]
+    async fn an_unavailable_feed_is_an_error_and_the_own_lookup_asks_nothing_else() {
+        let down = FakeEndpoint::start(FEED_PATH, "503 Service Unavailable", "{}".into()).await;
+        let sources = release_sources(ReleaseLookup::Own, &down.url, TAG_3818);
+        assert_eq!(sources, [ReleaseSource::Feed(down.url.clone())]);
+        let e = fetch_release_from(&sources, TAG_3818)
+            .await
+            .expect_err("a 503");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(&format!("the update feed {} answered 503", down.url)),
+            "{text}"
+        );
+        assert!(!is_transport_failure(&e), "{text}");
+        assert_eq!(down.requests().len(), 1);
+
+        let gone = nothing_listens_at(FEED_PATH);
+        let e = fetch_release_from(
+            &release_sources(ReleaseLookup::Own, &gone, TAG_3818),
+            TAG_3818,
+        )
+        .await
+        .expect_err("nothing listens");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(&format!("GET the update feed {gone}")),
+            "{text}"
+        );
+        assert!(is_transport_failure(&e), "{text}");
+        assert!(matches!(failed("fetch", e), CheckOutcome::Unreachable(_)));
+    }
+
+    /// #3818 — the pinned lookup takes the feed's answer when the feed lists the
+    /// tag, and only then leaves GitHub alone. A tag the feed lacks, or a feed
+    /// that answers 503, is asked of GitHub by tag, once.
+    #[tokio::test]
+    async fn a_pinned_lookup_asks_github_only_when_the_feed_cannot_name_the_tag() {
+        let old = "agent-v0.4.150";
+        let feed =
+            FakeEndpoint::start(FEED_PATH, "200 OK", feed_json(&[("agent-v0.4.218", false)])).await;
+        let by_tag = FakeEndpoint::start(
+            "/releases/tags/agent-v0.4.150",
+            "200 OK",
+            release_value(old, false).to_string(),
+        )
+        .await;
+
+        let r = fetch_release_from(&pinned_sources(&feed.url, &by_tag.url, TAG_3818), TAG_3818)
+            .await
+            .expect("in the feed");
+        assert_eq!(r.tag_name, TAG_3818);
+        assert!(by_tag.requests().is_empty(), "GitHub is not asked");
+
+        let r = fetch_release_from(&pinned_sources(&feed.url, &by_tag.url, old), old)
+            .await
+            .expect("from GitHub by tag");
+        assert_eq!(r.tag_name, old);
+        assert_eq!(
+            by_tag.requests(),
+            ["GET /releases/tags/agent-v0.4.150 HTTP/1.1"]
+        );
+        assert_eq!(
+            feed.requests().len(),
+            2,
+            "the feed is asked first, each time"
+        );
+
+        let down = FakeEndpoint::start(FEED_PATH, "503 Service Unavailable", "{}".into()).await;
+        let r = fetch_release_from(&pinned_sources(&down.url, &by_tag.url, old), old)
+            .await
+            .expect("from GitHub by tag");
+        assert_eq!(r.tag_name, old);
+        assert_eq!(down.requests().len(), 1);
+        assert_eq!(by_tag.requests().len(), 2);
+    }
+
+    /// #3818 — when neither source names the tag, the error says what each
+    /// answered, the feed first, and the last answer decides the outcome: a
+    /// rate-limited GitHub is a verdict, so the rollback raises its sentinel
+    /// with the reason.
+    #[tokio::test]
+    async fn a_pinned_lookup_that_finds_nothing_names_both_answers() {
+        let old = "agent-v0.4.150";
+        let feed =
+            FakeEndpoint::start(FEED_PATH, "200 OK", feed_json(&[("agent-v0.4.218", false)])).await;
+        let refused = FakeEndpoint::start(
+            "/releases/tags/agent-v0.4.150",
+            "403 Forbidden",
+            "{}".into(),
+        )
+        .await;
+        let e = fetch_release_from(&pinned_sources(&feed.url, &refused.url, old), old)
+            .await
+            .expect_err("neither names it");
+        let text = format!("{e:#}");
+        let feed_part = format!(
+            "the update feed: release {old} is not in the update feed {}",
+            feed.url
+        );
+        let github_part = format!("GitHub by tag: GitHub returned 403 Forbidden for tag {old}");
+        assert!(
+            text.contains(&feed_part) && text.contains(&github_part),
+            "{text}"
+        );
+        assert!(
+            text.find(&feed_part) < text.find(&github_part),
+            "the feed's answer first: {text}"
+        );
+        assert!(matches!(failed("pin fetch", e), CheckOutcome::Skipped(_)));
+    }
+
+    /// An asset's name must be a plain file name. Every name a release
+    /// publishes is one; a name with a separator, or with `..`, is refused.
+    #[test]
+    fn an_asset_name_must_be_a_plain_file_name() {
+        for name in [
+            "roomlerd-0.4.218-x86_64-pc-windows-msvc.msi",
+            "roomlerd-0.4.218-perMachine-x86_64-pc-windows-msvc.msi",
+            "roomler-desktop-0.4.218-x86_64-pc-windows-msvc.exe",
+            "roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            "roomler-desktop-0.4.218-aarch64-unknown-linux-gnu.rpm",
+            "roomlerd-0.4.218-x86_64-unknown-linux-gnu.tar.gz",
+            "roomlerd-0.4.218-aarch64-apple-darwin.pkg",
+        ] {
+            assert_eq!(plain_file_name(name).ok(), Some(name), "{name}");
+        }
+        for name in [
+            "sub/roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            r"sub\roomlerd-0.4.218-x86_64-pc-windows-msvc.msi",
+            "/roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            "..",
+            "../roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            r"..\roomler-desktop-0.4.218-x86_64-pc-windows-msvc.exe",
+            "",
+            ".",
+            "roomlerd-0.4.218.msi:x",
+            "roomlerd-0.4.218\n.deb",
+        ] {
+            let e = plain_file_name(name).expect_err(name);
+            assert!(
+                format!("{e:#}").contains("an asset's name must be a plain file name"),
+                "{name:?}: {e:#}"
+            );
+        }
+    }
+
+    /// The name is refused before the download is asked for: nothing listens
+    /// at the asset's URL here, so a request would have failed as a connect
+    /// error instead.
+    #[tokio::test]
+    async fn a_name_that_is_not_plain_is_refused_before_any_download() {
+        for name in [
+            "sub/roomlerd-0.4.218-x86_64-unknown-linux-gnu.deb",
+            "../roomlerd-0.4.218-x86_64-pc-windows-msvc.msi",
+        ] {
+            let asset = GithubAsset {
+                name: name.to_string(),
+                browser_download_url: nothing_listens_at("/asset"),
+                size: 0,
+                digest: None,
+            };
+            let e = download_asset(&asset, TAG_3818).await.expect_err(name);
+            let text = format!("{e:#}");
+            assert!(
+                text.contains("an asset's name must be a plain file name"),
+                "{name}: {text}"
+            );
+            assert!(!is_transport_failure(&e), "not even attempted: {text}");
+        }
     }
 }
 // RETIRED-NAME-ANCHOR-END

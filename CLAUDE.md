@@ -153,7 +153,7 @@ cargo build -p roomlerd --release --features full-hw   # + Windows MF encoder, W
 cargo build -p roomlerd --release                      # signalling-only (no media, no input)
 ./target/release/roomlerd enroll --server <url> --token <enrollment-jwt> --name <label>
 ./target/release/roomlerd run [--encoder software|hardware]
-./target/release/roomlerd encoder-smoke --encoder hardware   # offline MFT/FFmpeg init diagnosis
+./target/release/roomlerd encoder-smoke --encoder hardware   # offline open; passes only on a hardware encoder
 ./scripts/dev-xvfb.sh                  # capture smoke test via a virtual framebuffer
 
 # Testing
@@ -164,7 +164,7 @@ cd ui && bun run e2e                   # Playwright
 # Static analysis — what CI runs
 cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
-cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings
+bash scripts/clippy-audited-crates.sh  # --all-targets: api, services, tests, core + every roomler-ai-mod-* crate
 cd ui && vue-tsc --noEmit
 
 # Dependency audit
@@ -211,15 +211,13 @@ crates/
   tunnel-core/        → tunnels + the overlay data plane, shared by the CLI and the agent
   derp-relay/         → the standalone regional DERP relay
   tcp-turn-conn/      → TURNS-over-TLS-over-TCP for UDP-blocked networks
-  hive-node/          → FR-90 Hive on the device
   roomler-setup-core/ → shared install-wizard machinery
   vendored/           → patched forks (scrap, webrtc*, rtp, wintun-bindings)
   core/               → roomler-core (AGPL, server only): Module trait, hooks, jobs, the module
                         DAG, composition, Core (/ws registry, Redis fan-out, storage, rate limits)
   modules/<name>/     → roomler-ai-mod-<name>: chat · conference (the only mediasoup crate) ·
                         fleet (devices, agent Hub, releases, consent, remote config, fleet RPC) ·
-                        remote + network (both on fleet) · hive · vault · knowhow (FR-90,
-                        default OFF) · saas (an add-on)
+                        remote + network (both on fleet) · saas (an add-on)
   api/                → Axum HTTP/WS server; compose.rs is the host composition
   tests/              → integration tests (real servers; drive the agent in-process)
 agents/
@@ -478,8 +476,8 @@ The rules that bind new code. The reasoning behind each is in
 `docs/permissions.md`.
 
 - **`is_member(tid)` is NOT authorization for anything keyed by id.** Resolve the
-  object *within* the tenant (`helpers::require_room_in_tenant` /
-  `require_message_in_tenant`; a `message_id` handler uses the message guard), so a
+  object *within* the tenant (`guards::require_room_in_tenant` /
+  `require_message_in_room` / `require_file`; a `message_id` handler uses the message guard), so a
   foreign id 404s.
 - **A 403 is an answer, not an expired credential.** It never ends a session. The only
   403 that navigates is `not_a_member`, matched on a server-sent code.

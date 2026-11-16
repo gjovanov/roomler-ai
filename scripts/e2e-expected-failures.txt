@@ -21,7 +21,8 @@
 #      CSP (`script-src 'self'`) forbids — so it never initialised at all
 #      against a built image. Fixed: the script is an external sibling file.
 #   2. it loads the worker from the Vite DEV path
-#      `/src/workers/rc-vp9-444-worker.ts`. A built image answers that with the
+#      `/src/workers/rc-dc-worker.ts` (`rc-vp9-444-worker.ts` until FR-135
+#      R3 made the two data-channel workers one). A built image answers that with the
 #      SPA fallback — index.html, HTTP **200**, text/html — so `new Worker`
 #      would parse HTML as a module. The harness now says exactly that instead
 #      of dying obscurely; the real built worker is a hashed asset.

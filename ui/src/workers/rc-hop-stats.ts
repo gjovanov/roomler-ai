@@ -10,9 +10,13 @@
  * costs nothing at steady state.
  *
  * Hops measured:
- *  - `fwd`    — main-thread DC `onmessage` → worker `chunk` arrival
- *               (epoch-absolute clocks via `epochNowMs`, valid across
- *               contexts because both sides use timeOrigin + now()).
+ *  - `fwd`    — main-thread DC `onmessage` → worker `chunk` arrival, on
+ *               one clock (`epochNowMs` is not one across contexts): the
+ *               page's `sentAt` is read through the skew the page measured
+ *               when it started the worker (#3566, `rc-clock-cal.ts`). A
+ *               reading below zero within the skew's error counts as 0, and
+ *               one further below is dropped (#3596). The relay only: a
+ *               channel moved into the worker (FR-135 R3) has no page hop.
  *  - `decode` — `decoder.decode(chunk)` submission → `output` callback
  *               (queue + decoder latency; indicts the decoder itself).
  *  - `paint`  — the `paintFrame` body (canvas blit cost).
@@ -106,9 +110,12 @@ export class QueueDrift {
   private n = 0
 
   /** One frame. `wireTsUs` is the agent-clock framing timestamp carried in
-   *  the frame header; `arrivalUs` is any consistent local clock — the
-   *  point in the pipeline does not matter, only that it is the same point
-   *  every frame, because a constant offset cancels in the delta. */
+   *  the frame header; `arrivalUs` is one consistent local clock, read at the
+   *  same point in the pipeline every frame, because a CONSTANT offset cancels
+   *  in the delta. A varying one does not: read after the decode queue and the
+   *  paint, a decoder falling behind adds to the sum as if the link had grown.
+   *  The DC worker keeps one read at paint (`queueMs`, which the live law
+   *  reads) and, since FR-135 R3, one read at arrival (`queueArrMs`). */
   add(wireTsUs: number, arrivalUs: number): void {
     if (!Number.isFinite(wireTsUs) || !Number.isFinite(arrivalUs)) return
     const prevWire = this.lastWireUs
@@ -145,9 +152,9 @@ export class QueueDrift {
   }
 }
 
-/** Epoch-absolute milliseconds, comparable across window/worker contexts
- *  (each context's `performance.now()` is relative to its own
- *  `timeOrigin`; adding them re-bases onto the shared epoch). */
+/** Epoch milliseconds, `timeOrigin + now()`. Not one clock across contexts:
+ *  each fixes its `timeOrigin` from the wall clock when it starts, so a worker
+ *  reads a page's stamps through the measured skew (#3566, `rc-clock-cal.ts`). */
 export function epochNowMs(): number {
   return performance.timeOrigin + performance.now()
 }
@@ -205,8 +212,8 @@ export function bestClockSample(samples: ClockSample[]): ClockSample | null {
   return best
 }
 
-/** Age of a frame at `epochUs` on the browser clock, given the frame's
- *  agent-clock wire timestamp and the probe offset. Covers everything from
+/** Age of a frame at `epochUs`, given its agent-clock wire timestamp and the
+ *  probe offset on `epochUs`'s clock (#3566). Covers everything from
  *  the agent's framing point (encode output + send queue + network + decode
  *  + paint queue); agent-side capture+encode (~10–15 ms) sits BEFORE the
  *  stamp and is not included. */

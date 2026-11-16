@@ -83,6 +83,11 @@ pub struct Existing {
 /// the caller stops before the enroll spends the token on a config it could
 /// not write either. The text says what was found; the caller adds what to do,
 /// which is per platform.
+///
+/// #3609 — at the machine-global location a config that is not private to the
+/// computer's administrators, once the machine tree is repaired, is set aside:
+/// `cfg` is `None`, so a fresh config is written in its place, and the warning
+/// says so.
 pub fn read_existing(path: &Path) -> Result<Existing, String> {
     match roomlerd::config::read_merge_base(&path.to_path_buf()) {
         MergeBase::Absent => Ok(Existing {
@@ -107,6 +112,13 @@ pub fn read_existing(path: &Path) -> Result<Existing, String> {
             tracing::warn!(path = %path.display(), %reason, "the existing config may not be read by this process");
             Err(roomlerd::config::describe_denied(path, &reason))
         }
+        MergeBase::NotPrivate { reason } => {
+            tracing::warn!(path = %path.display(), %reason, "the existing config is not private to this computer's administrators; it is set aside");
+            Ok(Existing {
+                cfg: None,
+                warning: Some(roomlerd::config::describe_not_private(path, &reason)),
+            })
+        }
     }
 }
 
@@ -129,15 +141,53 @@ pub async fn enroll_folded(
         }
         None => roomlerd::machine::derive_machine_id(config_path),
     };
-    let fresh = roomlerd::enrollment::enroll(EnrollInputs {
-        server_url: server,
-        enrollment_token: token,
-        machine_id: &machine_id,
-        machine_name: device_name,
-        install: Some(install),
-    })
+    let fresh = roomlerd::enrollment::enroll_with(
+        &client()?,
+        EnrollInputs {
+            server_url: server,
+            enrollment_token: token,
+            machine_id: &machine_id,
+            machine_name: device_name,
+            install: Some(install),
+        },
+    )
     .await?;
     fold(existing, fresh)
+}
+
+/// #3432 — the wizard's client for an enroll: the one its other requests use
+/// (`wizard_shared::http`), whose resolver fails with a type of its own, so a
+/// name that does not resolve is told from a refused connection. No timeout
+/// and no User-Agent, as `reqwest::Client::new()` had before.
+fn client() -> anyhow::Result<reqwest::Client> {
+    use anyhow::Context as _;
+    wizard_shared::http::builder()
+        .build()
+        .context("building the enroll's HTTP client")
+}
+
+/// #3609 — the enroll alone, as the person at the screen: the server's answer
+/// for `machine_id`, not yet a config. The fold is the writer's
+/// (`machine_write::write`), in this process or in the administrator step that
+/// writes a background-service install's machine config.
+pub async fn enroll_issued(
+    machine_id: &str,
+    server: &str,
+    token: &str,
+    device_name: &str,
+    install: InstallInfo,
+) -> anyhow::Result<roomlerd::enrollment::Issued> {
+    roomlerd::enrollment::enroll_issued_with(
+        &client()?,
+        EnrollInputs {
+            server_url: server,
+            enrollment_token: token,
+            machine_id,
+            machine_name: device_name,
+            install: Some(install),
+        },
+    )
+    .await
 }
 
 /// FR-129 B2 — enroll `device_name` with a machine id the caller chose, into
@@ -154,20 +204,23 @@ pub async fn enroll_fresh_as(
     install: InstallInfo,
 ) -> anyhow::Result<Enrolled> {
     tracing::info!(%machine_id, "enrolling with the machine fingerprint the caller chose");
-    let fresh = roomlerd::enrollment::enroll(EnrollInputs {
-        server_url: server,
-        enrollment_token: token,
-        machine_id,
-        machine_name: device_name,
-        install: Some(install),
-    })
+    let fresh = roomlerd::enrollment::enroll_with(
+        &client()?,
+        EnrollInputs {
+            server_url: server,
+            enrollment_token: token,
+            machine_id,
+            machine_name: device_name,
+            install: Some(install),
+        },
+    )
     .await?;
     fold(None, fresh)
 }
 
 /// The fold itself, without the network: `apply_enrollment`, then the
 /// previous row's key retired when the server made another row (F3).
-fn fold(existing: Option<AgentConfig>, fresh: AgentConfig) -> anyhow::Result<Enrolled> {
+pub(crate) fn fold(existing: Option<AgentConfig>, fresh: AgentConfig) -> anyhow::Result<Enrolled> {
     let previous = existing.clone();
     let (mut cfg, outcome) = roomlerd::enrollment::apply_enrollment(existing, fresh, None, false)?;
     let previous_row =

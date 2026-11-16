@@ -1200,15 +1200,22 @@ pub mod helper {
         })
     }
 
+    /// #3695 — the longest handshake line the daemon reads from the helper:
+    /// 64 KiB, the control-frame limit FR-142 sets for the session worker.
+    /// The largest legitimate line is the stream-failed reason, one sentence;
+    /// a [`StreamStarted`] is about 200 bytes.
+    pub const HANDSHAKE_LINE_MAX: usize = 64 * 1024;
+
     /// Read the streaming handshake line, skipping anything the child wrote
-    /// before it.
+    /// before it. #3695 — at most 64 lines of at most [`HANDSHAKE_LINE_MAX`]
+    /// bytes each; a longer line ends the handshake with the limit named.
     pub fn read_stream_handshake(r: &mut impl std::io::BufRead) -> anyhow::Result<StreamStarted> {
-        let mut line = String::new();
         for _ in 0..64 {
-            line.clear();
-            if r.read_line(&mut line)? == 0 {
+            let line = crate::line_limit::read_line(r, HANDSHAKE_LINE_MAX)
+                .map_err(|e| anyhow::anyhow!("the portal helper's handshake: {e}"))?;
+            let Some(line) = line else {
                 anyhow::bail!("the portal helper exited before announcing a stream");
-            }
+            };
             if let Some(json) = line.trim().strip_prefix(STREAM_MARKER) {
                 return Ok(serde_json::from_str(json)?);
             }
@@ -1285,6 +1292,9 @@ pub mod helper {
     ///
     /// `NoSession` is split out because it is the one arm that is a legitimate
     /// answer rather than a failure, and every caller maps it differently.
+    /// #3857 — so a session walk that gave no answer in time is `Other`, with
+    /// its reason: who is at the screen is then not known, not nobody.
+    #[derive(Debug)]
     pub(crate) enum SpawnError {
         NoSession,
         Other(String),
@@ -1309,21 +1319,45 @@ pub mod helper {
     ) -> Result<std::process::Child, SpawnError> {
         // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
         let euid = unsafe { libc::geteuid() };
+        spawn_child_in(&helper_session(euid)?, euid, extra_args, piped_stdin)
+    }
+
+    /// #3857 — the graphical session the helper runs in, from the walk every
+    /// caller on a blocking thread shares
+    /// ([`crate::companion::graphical_session_within`]). logind's own "nobody"
+    /// is [`SpawnError::NoSession`], as ever; a walk that gave no answer in
+    /// time is `Other`, with its reason.
+    pub(crate) fn helper_session(
+        euid: u32,
+    ) -> Result<crate::companion::GraphicalSession, SpawnError> {
+        use crate::companion::NoGraphicalSession;
         // A per-user daemon may open the portal only in its OWN session, so it
         // looks for that one: on a machine where two people are logged in,
         // "the first active session" could be the other person's.
-        let found = if euid == 0 {
-            crate::companion::graphical_session()
-        } else {
-            crate::companion::graphical_session_matching(Some(euid), false)
-        };
-        let sess = match found {
-            Ok(s) => s,
-            Err(e) => {
+        let want_uid = (euid != 0).then_some(euid);
+        match crate::companion::graphical_session_within(want_uid, false) {
+            Ok(s) => Ok(s),
+            Err(NoGraphicalSession::Answered(e)) => {
                 tracing::debug!(%e, "portal: no graphical session to run the helper in");
-                return Err(SpawnError::NoSession);
+                Err(SpawnError::NoSession)
             }
-        };
+            Err(NoGraphicalSession::NotKnown(why)) => {
+                tracing::warn!(%why, "portal: the helper's graphical session is not known");
+                Err(SpawnError::Other(why))
+            }
+        }
+    }
+
+    /// #3857 — [`spawn_child`] in `sess`, the session [`helper_session`]
+    /// found: a caller whose reason to start the helper can end while logind
+    /// answers (the notification prompt's question) asks for the two one at
+    /// a time.
+    pub(crate) fn spawn_child_in(
+        sess: &crate::companion::GraphicalSession,
+        euid: u32,
+        extra_args: &[&str],
+        piped_stdin: bool,
+    ) -> Result<std::process::Child, SpawnError> {
         let exe = std::env::current_exe()
             .map_err(|e| SpawnError::Other(format!("resolving our own path: {e}")))?;
 
@@ -1377,6 +1411,8 @@ pub mod helper {
                 )));
             }
         }
+        // It keeps its stdio and nothing else of the daemon's.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
         cmd.spawn()
             .map_err(|e| SpawnError::Other(format!("spawning the portal helper: {e}")))
     }
@@ -1421,14 +1457,8 @@ pub mod helper {
         // Drain stdout on another thread while waiting: a child that filled
         // the pipe would otherwise deadlock against our own wait.
         let out = child.stdout.take();
-        let reader = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = String::new();
-            if let Some(mut s) = out {
-                let _ = s.read_to_string(&mut buf);
-            }
-            buf
-        });
+        let reader =
+            std::thread::spawn(move || out.map(read_answer).unwrap_or_else(|| Ok(String::new())));
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1453,7 +1483,44 @@ pub mod helper {
             }
         }
 
-        Ok(reader.join().unwrap_or_default())
+        match reader.join() {
+            Ok(Ok(answer)) => Ok(answer),
+            // #3695 — the answer is over [`ANSWER_MAX`] or is not text: the
+            // caller hears why, as it does for a helper that hung.
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "portal: the helper's answer was refused");
+                Err(SpawnError::Other(e.to_string()))
+            }
+            Err(_) => Ok(String::new()),
+        }
+    }
+
+    /// #3695 — the longest answer the daemon reads from a one-shot run of the
+    /// helper ([`spawn_in_session`]: the probe, the screencast session report,
+    /// the notification probe). Each answer is one marked line on stdout, and
+    /// diagnostics go to stderr; the largest, the screencast session's report,
+    /// is about 1 KiB. 64 KiB is the limit a handshake line has
+    /// ([`HANDSHAKE_LINE_MAX`]).
+    pub const ANSWER_MAX: usize = 64 * 1024;
+
+    /// The helper's answer: its stdout, read to the end. #3695 — at most
+    /// [`ANSWER_MAX`] bytes of it: a longer answer is an error that names the
+    /// limit, and the rest is read and dropped, so the helper never blocks on
+    /// a full pipe while the daemon waits for it to exit.
+    fn read_answer(mut out: impl std::io::Read) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut kept = Vec::new();
+        (&mut out)
+            .take(ANSWER_MAX as u64 + 1)
+            .read_to_end(&mut kept)?;
+        if kept.len() > ANSWER_MAX {
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the portal helper's answer is longer than {ANSWER_MAX} bytes"),
+            ));
+        }
+        String::from_utf8(kept).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Pull the status out of the child's stdout.
@@ -1580,6 +1647,35 @@ pub mod helper {
             assert!(e.contains("exited before announcing a stream"), "{e}");
         }
 
+        /// #3695 — the handshake's line reader has a limit: a line over it
+        /// ends the read with the limit named, before anything behind it.
+        #[test]
+        fn a_handshake_line_over_the_limit_is_refused() {
+            let failed = format!(
+                "{STREAM_FAILED_MARKER}{}\n",
+                serde_json::to_string("declined").unwrap()
+            );
+            let mut input = "x".repeat(64 * 1024 + 1);
+            input.push('\n');
+            input.push_str(&failed);
+            let mut r = std::io::Cursor::new(input);
+            let e = read_stream_handshake(&mut r).unwrap_err().to_string();
+            assert!(e.contains("65536"), "{e}");
+        }
+
+        /// #3695 — the helper's one-shot answer (the probe, the screencast
+        /// session report, the notification probe) is read up to a limit: an
+        /// answer over it is refused with the limit named, and one at it is
+        /// read whole.
+        #[test]
+        fn an_answer_over_the_limit_is_refused() {
+            let at = "x".repeat(64 * 1024);
+            assert_eq!(read_answer(at.as_bytes()).unwrap(), at);
+            let over = "x".repeat(64 * 1024 + 1);
+            let e = read_answer(over.as_bytes()).unwrap_err().to_string();
+            assert!(e.contains("65536"), "{e}");
+        }
+
         /// #1719 run B: only a root daemon drops privilege; a per-user daemon
         /// IS the session's owner and runs the helper as itself; anyone else
         /// is refused with both uids named.
@@ -1628,6 +1724,75 @@ pub mod helper {
                 .spawn()
                 .expect_err("setgroups must refuse an unprivileged caller");
             assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        }
+
+        /// #3857 — the helper's session comes from the walk every blocking
+        /// caller shares (capture, audio, keep busy, the notification
+        /// prompt): with logind held, a root daemon and a per-user one are
+        /// each refused within the walk's wait, with the reason, as not
+        /// known, never as nobody at the screen.
+        ///
+        /// Red before #3857: the walk ran on the caller's thread for as long
+        /// as logind held it.
+        #[test]
+        fn a_held_walk_refuses_the_helper_within_its_wait_with_its_reason() {
+            use crate::companion::SESSION_WALK_WAIT;
+            use crate::companion::session_walk_stand_in::{
+                Held, OpenedAtTheEnd, StandIn, ana, blocking,
+            };
+            let held = Held::default();
+            let _opened = OpenedAtTheEnd(held.clone());
+            let stood = StandIn::held(&held, ana());
+            for euid in [0, 4242] {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let stood = stood.clone();
+                std::thread::spawn(move || {
+                    let asked = std::time::Instant::now();
+                    let found = blocking(&stood, || helper_session(euid));
+                    let _ = tx.send((found, asked.elapsed()));
+                });
+                let (found, waited) = rx
+                    .recv_timeout(SESSION_WALK_WAIT + std::time::Duration::from_secs(1))
+                    .unwrap_or_else(|_| panic!("euid {euid}: no answer within the walk's wait"));
+                match found {
+                    Err(SpawnError::Other(why)) => assert!(
+                        why.contains("no answer"),
+                        "euid {euid}: the reason says logind gave no answer: {why}"
+                    ),
+                    other => panic!("euid {euid}: logind held, and the helper got {other:?}"),
+                }
+                assert!(
+                    waited >= SESSION_WALK_WAIT,
+                    "euid {euid}: refused in {waited:?}, before the walk's wait"
+                );
+            }
+        }
+
+        /// The control: a walk in time gives the helper its session as
+        /// before. Root asks for anyone's, a per-user daemon for its own
+        /// uid's, neither for persons only, and logind's "nobody" is
+        /// `NoSession`.
+        #[test]
+        fn a_walk_in_time_gives_the_helper_its_session_as_today() {
+            use crate::companion::session_walk_stand_in::{StandIn, ana, blocking};
+            let stood = StandIn::new(|want_uid, users_only| {
+                assert!(!users_only, "the helper never asks for persons only");
+                match want_uid {
+                    None | Some(4242) => Ok(ana()),
+                    Some(_) => Err(
+                        "no active graphical session — nobody is at this machine's screen".into(),
+                    ),
+                }
+            });
+            assert_eq!(blocking(&stood, || helper_session(0)).ok(), Some(ana()));
+            assert_eq!(blocking(&stood, || helper_session(4242)).ok(), Some(ana()));
+            assert!(
+                matches!(
+                    blocking(&stood, || helper_session(1000)),
+                    Err(SpawnError::NoSession)
+                ),
+                "logind's own nobody stays NoSession"
+            );
         }
     }
 }

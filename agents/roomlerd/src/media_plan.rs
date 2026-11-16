@@ -11,8 +11,9 @@
 //! So a session now states its plan on the p2p control channel when it starts
 //! (the transport and the codec, known before any pump runs), and again on every
 //! change. The FFmpeg data-channel pump writes the rest: the cell it opened, the
-//! input form, the granted rate, and one `ladder` entry per step down. When
-//! nothing is left it says `stopped`, and why.
+//! input form, the rate (the grant's, or without `fps-high` the one the encoder
+//! opened at), and one `ladder` entry per step down. When nothing is left it
+//! says `stopped`, and why.
 //!
 //! The server sees none of it, and needs no change. It is additive: an older
 //! viewer drops an unknown `t`, and an older agent never sends it. The verb
@@ -23,8 +24,12 @@
 //! §7.5, the pumps its ratchet stops growing): their sessions carry the plan's
 //! start only. Their fault ladders arrive with their stages (R8, R11).
 //!
-//! The kill switch is `ROOMLERD_MEDIA_PLAN=0`, which R0 folds into
-//! `rc_media_legacy` as `media_plan`.
+//! The kill switch is a `media_plan` entry in `rc_media_legacy` (FR-135 §7.1,
+//! [`crate::media_paths`]), pushable and live from the next session.
+//! `ROOMLERD_MEDIA_PLAN=0` still works, read as that entry. The plan names the
+//! session's other key-chosen paths (`legacy`, `refused`), so a reader sees
+//! what the keys did; the verb follows the env switch alone, because a hello
+//! is not re-sent for a push and a viewer reads no fault into silence.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -74,6 +79,8 @@ pub struct Fps {
     /// The ask, when it was refused. An ask that was granted is `granted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asked: Option<u32>,
+    /// What the stream runs at: the grant's answer, or without `fps-high` the
+    /// rate the encoder opened at.
     pub granted: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -121,6 +128,15 @@ pub struct Plan {
     pub ladder: Vec<Step>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
+    /// FR-135 §7.1 — the media paths this session runs on their OLD code
+    /// because `rc_media_legacy` says so, listed or implied by a path they
+    /// stand on. Absent when no key sent one back.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub legacy: Vec<&'static str>,
+    /// FR-135 §7.1 — `rc_media_canary` entries this session did not honour,
+    /// `path:why` (`legacy`, `not_built`, `requires:<path>`). Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
 }
 
 /// What a backend's error text may put on a page: one line, bounded.
@@ -154,6 +170,8 @@ impl Plan {
             capture: None,
             ladder: Vec::new(),
             stopped: None,
+            legacy: Vec::new(),
+            refused: Vec::new(),
         }
     }
 
@@ -188,10 +206,15 @@ impl Plan {
         }
     }
 
+    /// `rate` is the frame rate the encoder opened at, `None` while a
+    /// `fps-high` grant runs, which [`Self::fps_answer`] alone then tells. A
+    /// rate the session never asked to change is where it stands, not a step
+    /// down, so it moves `granted` and adds no arrow.
     fn encoder_opened(
         &mut self,
         name: &str,
         chroma444: bool,
+        rate: Option<u32>,
         capture: Capture,
         failed: &[(String, String)],
         at_ms: u64,
@@ -204,6 +227,13 @@ impl Plan {
         self.failed_steps(failed, name, at_ms);
         self.chroma = Some(chroma);
         self.cell = Some(cell);
+        if let Some(granted) = rate {
+            self.fps = Some(Fps {
+                asked: None,
+                granted,
+                reason: None,
+            });
+        }
         self.capture = Some(capture);
         self.stopped = None;
     }
@@ -314,21 +344,26 @@ fn with(session_id: ObjectId, change: impl FnOnce(&mut Plan, u64)) {
 /// Begin this session's plan, and keep the viewer told of it until `until`.
 ///
 /// Called before the pump is spawned, when the stash of the control channel is
-/// still empty, so the first message waits in the retry below. With the switch
-/// off nothing is registered, and every writer here does nothing.
+/// still empty, so the first message waits in the retry below. With
+/// `media_plan` on the session's old path nothing is registered, and every
+/// writer here does nothing.
 pub fn start(
     session_id: ObjectId,
     transport: Option<&str>,
     chosen_codec: &str,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     until: CancellationToken,
+    paths: &crate::media_paths::MediaPaths,
 ) {
-    if !enabled() {
+    if !paths.is_new(crate::media_paths::MediaPath::MediaPlan) {
         return;
     }
+    let mut first = Plan::new(transport, chosen_codec);
+    first.legacy = paths.legacy_wire();
+    first.refused = paths.refused_wire();
     let plan = Arc::new(SessionPlan {
         started: Instant::now(),
-        plan: Mutex::new(Plan::new(transport, chosen_codec)),
+        plan: Mutex::new(first),
         changed: tokio::sync::Notify::new(),
     });
     registry().insert(session_id, plan.clone());
@@ -372,11 +407,17 @@ pub(crate) fn on_rtp_track(session_id: ObjectId, chosen_codec: &str) {
 }
 
 /// The encoder this session runs. `failed` is what the cascade tried first.
+///
+/// `rate` is the frame rate it opened at, or `None` when a `fps-high` grant
+/// tells the plan its rate through [`fps_answer`]. FR-135 N2: without the
+/// grant nothing else writes `fps`, and an `rc.l4` record reads its
+/// `target_fps` from it.
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub(crate) fn encoder_opened(
     session_id: ObjectId,
     name: &str,
     chroma444: bool,
+    rate: Option<u32>,
     capture_arm: &'static str,
     capture_gpu: bool,
     failed: &[(String, String)],
@@ -386,7 +427,7 @@ pub(crate) fn encoder_opened(
         form: if capture_gpu { "gpu" } else { "cpu" },
     };
     with(session_id, |p, at| {
-        p.encoder_opened(name, chroma444, capture, failed, at)
+        p.encoder_opened(name, chroma444, rate, capture, failed, at)
     });
 }
 
@@ -542,6 +583,7 @@ mod tests {
         p.encoder_opened(
             "h264_qsv",
             false,
+            None,
             cap(),
             &failed(&["h264_nvenc", "h264_amf"]),
             40,
@@ -589,7 +631,7 @@ mod tests {
     #[test]
     fn a_running_encoder_that_fails_past_its_rebuilds_says_which() {
         let mut p = plan();
-        p.encoder_opened("h264_qsv", false, cap(), &[], 1);
+        p.encoder_opened("h264_qsv", false, None, cap(), &[], 1);
         p.input_form(false, "switch_off", 2);
         p.encoder_fault("the driver went away", 900);
         assert_eq!(p.stopped.as_ref().unwrap().why, "encoder_fault");
@@ -606,7 +648,7 @@ mod tests {
     fn an_encoder_that_opens_clears_a_stop() {
         let mut p = plan();
         p.no_encoder("busy", &[], 1);
-        p.encoder_opened("h264_qsv", false, cap(), &[], 2);
+        p.encoder_opened("h264_qsv", false, None, cap(), &[], 2);
         assert!(p.stopped.is_none());
     }
 
@@ -615,10 +657,10 @@ mod tests {
     #[test]
     fn a_rebuild_is_an_arrow_only_when_the_cell_moved() {
         let mut p = plan();
-        p.encoder_opened("h264_nvenc", false, cap(), &[], 1);
-        p.encoder_opened("h264_nvenc", false, cap(), &[], 2);
+        p.encoder_opened("h264_nvenc", false, None, cap(), &[], 1);
+        p.encoder_opened("h264_nvenc", false, None, cap(), &[], 2);
         assert!(p.ladder.is_empty());
-        p.encoder_opened("h264_qsv", false, cap(), &[], 3);
+        p.encoder_opened("h264_qsv", false, None, cap(), &[], 3);
         assert_eq!(p.ladder[0].from, "h264_nvenc:yuv420");
         assert_eq!(p.ladder[0].to, "h264_qsv:yuv420");
     }
@@ -681,6 +723,47 @@ mod tests {
         assert_eq!(p.ladder.len(), 2);
     }
 
+    /// FR-135 N2 — without `fps-high` nothing else writes `fps`, so an open
+    /// names the rate it opened at: `granted` alone, where the session stands,
+    /// with no arrow. An `rc.l4` record reads its `target_fps` from it.
+    #[test]
+    fn an_open_without_a_grant_names_the_rate_it_opened_at() {
+        let mut p = plan();
+        p.encoder_opened("h264_qsv", false, Some(60), cap(), &[], 1);
+        let f = p.fps.as_ref().expect("fps");
+        assert_eq!((f.asked, f.granted, f.reason), (None, 60, None));
+        assert!(p.ladder.is_empty());
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains(r#""fps":{"granted":60}"#), "{json}");
+    }
+
+    /// A persisted transport flip reopens at the new profile's rate. The plan
+    /// follows it, and a rate the viewer never asked to change is no arrow.
+    #[test]
+    fn a_rebuild_at_a_new_rate_moves_it_with_no_arrow() {
+        let mut p = plan();
+        p.encoder_opened("h264_qsv", false, Some(60), cap(), &[], 1);
+        p.encoder_opened("h264_qsv", false, Some(30), cap(), &[], 2);
+        let f = p.fps.as_ref().expect("fps");
+        assert_eq!((f.asked, f.granted, f.reason), (None, 30, None));
+        assert!(p.ladder.is_empty());
+    }
+
+    /// While a grant runs it is the only writer: its open says `None`, and the
+    /// answer it told, a refusal included, stays.
+    #[test]
+    fn an_open_during_a_grant_keeps_the_grants_answer() {
+        let mut p = plan();
+        p.fps_answer(120, Some((144, "refresh")), 1);
+        p.encoder_opened("h264_qsv", false, None, cap(), &[], 2);
+        let f = p.fps.as_ref().expect("fps");
+        assert_eq!(
+            (f.asked, f.granted, f.reason),
+            (Some(144), 120, Some("refresh"))
+        );
+        assert_eq!(p.ladder.len(), 1);
+    }
+
     /// A backend's words on a page: one line, bounded, whatever it wrote.
     #[test]
     fn a_backends_words_are_one_bounded_line() {
@@ -716,6 +799,25 @@ mod tests {
         s.update(|p, at| p.input_form(false, "switch_off", at));
         assert_eq!(s.snapshot().0, 2);
         s.update(|p, at| p.fps_answer(60, None, at));
+        assert_eq!(s.snapshot().0, 3);
+    }
+
+    /// The first open, rate and all, is one change. An open at the same cell
+    /// and rate again, which every dims rebuild is, raises nothing, and a new
+    /// rate raises it once.
+    #[test]
+    fn the_same_open_again_does_not_raise_the_epoch() {
+        let s = SessionPlan {
+            started: Instant::now(),
+            plan: Mutex::new(plan()),
+            changed: tokio::sync::Notify::new(),
+        };
+        s.update(|p, at| p.encoder_opened("h264_qsv", false, Some(60), cap(), &[], at));
+        assert_eq!(s.snapshot().0, 2);
+        s.update(|p, at| p.encoder_opened("h264_qsv", false, Some(60), cap(), &[], at));
+        s.update(|p, at| p.encoder_opened("h264_qsv", false, Some(60), cap(), &[], at));
+        assert_eq!(s.snapshot().0, 2);
+        s.update(|p, at| p.encoder_opened("h264_qsv", false, Some(30), cap(), &[], at));
         assert_eq!(s.snapshot().0, 3);
     }
 
@@ -791,6 +893,7 @@ mod tests {
             "h264",
             Arc::new(tokio::sync::Mutex::new(None)),
             end.clone(),
+            &crate::media_paths::MediaPaths::default(),
         );
         assert!(registry().get(&id).is_some());
         fps_answer(id, 60, None);
@@ -802,5 +905,63 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("the plan outlived its session");
+    }
+
+    /// FR-135 §7.1 — `media_plan` on the session's old path registers no plan,
+    /// so no writer reaches a viewer; and a plan that does start names the
+    /// paths the keys sent back, and what they refused, with no fields at all
+    /// when no key spoke.
+    #[tokio::test]
+    async fn the_keys_switch_the_plan_off_and_are_named_in_it() {
+        use crate::media_paths::{MediaPath, parse, resolve};
+        let off = resolve(&parse(Some("media_plan")), &parse(None));
+        let id = ObjectId::new();
+        let end = CancellationToken::new();
+        let dc = Arc::new(tokio::sync::Mutex::new(None));
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            dc.clone(),
+            end.clone(),
+            &off,
+        );
+        assert!(registry().get(&id).is_none(), "no plan on the old path");
+
+        let keyed = resolve(&parse(Some("capture_stage")), &parse(Some("encode_stage")));
+        assert!(keyed.is_new(MediaPath::MediaPlan));
+        let id = ObjectId::new();
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            dc.clone(),
+            end.clone(),
+            &keyed,
+        );
+        let (_, payload) = registry().get(&id).expect("a plan").snapshot();
+        let v: serde_json::Value = serde_json::from_str(&payload.expect("a payload")).unwrap();
+        assert_eq!(
+            v["legacy"],
+            serde_json::json!(["capture_stage", "encode_stage", "rtp_sink", "high_refresh"])
+        );
+        assert_eq!(v["refused"], serde_json::json!(["encode_stage:legacy"]));
+
+        let id = ObjectId::new();
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            dc,
+            end.clone(),
+            &crate::media_paths::MediaPaths::default(),
+        );
+        let (_, payload) = registry().get(&id).expect("a plan").snapshot();
+        let v: serde_json::Value = serde_json::from_str(&payload.expect("a payload")).unwrap();
+        assert!(
+            v.get("legacy").is_none() && v.get("refused").is_none(),
+            "{v}"
+        );
+        end.cancel();
     }
 }

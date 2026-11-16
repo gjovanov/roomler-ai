@@ -6,6 +6,8 @@ paths:
   - "docker-compose*.yml"
   - "docs/deployment.md"
   - "docs/multi-pod-scale-out.md"
+  - "docs/production-mongo-reads.md"
+  - "scripts/prod-mongo-read.sh"
   - "crates/modules/conference/**"
 ---
 
@@ -65,3 +67,12 @@ Release, signing and promotion mechanics: the **`ship-it` skill**.
   workflow only proves the public `/health` kept answering. ⚠️ An exec sweep is a
   **biased sample** (it reaches only what is online) — query the server for the
   denominator.
+- ⚠️ **Read production Mongo with `scripts/prod-mongo-read.sh`, never
+  `kubectl exec -i mongodb-0 -- mongosh`.** A client inside the database container
+  counts against mongod's own 2 GiB limit; run that way, an unbounded read
+  OOM-killed production Mongo (2026-10-26). The runner keeps the client in a
+  throwaway container behind a port-forward, prints the pod's restarts and cgroup
+  memory before and after, and proves its teardown. The server still runs the
+  query inside that limit, so a read stays bounded: `estimatedDocumentCount()`
+  first, an indexed `$match`, `$limit`, `maxTimeMS`; a `$text` phrase costs as much
+  as its commonest word (`docs/production-mongo-reads.md`).

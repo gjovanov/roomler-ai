@@ -1625,6 +1625,46 @@ mod tests {
         assert!(diff(&home, &home.clone(), false, false).is_none());
     }
 
+    /// FR-65 P3 — condition 1 of the poke gate, on real diffs: whatever
+    /// `diff` calls a change acts at once with both windows just stamped, a
+    /// VPN capture and an address arriving alike, so neither can wait behind
+    /// the chatter. The Wi-Fi parameter notification that caused the storm is
+    /// the last case: it reaches `diff` with a signal and an identical snapshot.
+    #[test]
+    fn a_real_move_passes_the_poke_gate_and_chatter_does_not() {
+        use crate::overlay::lifecycle::{NETCHANGE_POKE_QUIET, netchange_action};
+        let now = Some(Duration::ZERO);
+        let act = |material| {
+            netchange_action(
+                material,
+                now,
+                now,
+                ROUTE_WAVE_MIN_INTERVAL,
+                NETCHANGE_POKE_QUIET,
+            )
+        };
+        let home = snap(&[("Wi-Fi", &["192.168.68.106"])], Some("12"));
+        let captured = snap(
+            &[
+                ("Wi-Fi", &["192.168.68.106"]),
+                ("Ethernet 3", &["10.138.80.110"]),
+            ],
+            Some("47"),
+        );
+        let extra = snap(
+            &[("Wi-Fi", &["192.168.68.106", "192.168.68.107"])],
+            Some("12"),
+        );
+        for (name, next) in [("capture", &captured), ("new address", &extra)] {
+            let d = diff(&home, next, true, true).expect("a real move");
+            let a = act(d.material);
+            assert!(a.check && a.poke, "{name} must not wait: {a:?}");
+        }
+        assert!(diff(&home, &home.clone(), false, true).is_none());
+        let a = act(false);
+        assert!(!a.check && !a.poke, "chatter behind chatter: {a:?}");
+    }
+
     /// #1856 — macOS `route -n monitor`, verbatim from the field MacBook (its
     /// en0 link-layer address replaced): two
     /// lookups (one of them is what `sample_snapshot` runs after every burst)

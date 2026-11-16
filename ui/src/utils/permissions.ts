@@ -75,7 +75,8 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     bit: 1 << 24,
     label: 'Manage devices',
     group: 'Remote control',
-    description: 'Enroll, rename, delete, reassign and set policy for remote-control devices.',
+    description:
+      'Enroll, rename, delete, reassign and set policy for remote-control devices, read their crash reports and uploaded logs, and manage the network ACLs (tunnel and overlay).',
   },
   {
     key: 'REMOTE_CONTROL',
@@ -102,7 +103,7 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     label: 'Run commands on devices',
     group: 'Fleet access',
     description:
-      'Run a command on a device via Fleet RPC. Commands execute as root (Linux) or, on Windows, as the daemon\'s worker: the signed-in user on an attended install, SYSTEM in SystemContext mode. Also requires the org switch, the device policy, and the device-local key.',
+      'Run a command on a device via Fleet RPC. Commands execute as root (Linux) or, on Windows, as SYSTEM through the device\'s service once an administrator has anchored it. A Windows device that is not anchored runs them as the signed-in user on an attended install, and as SYSTEM in SystemContext mode. Also requires the org switch, the device policy, and the device-local key.',
   },
   {
     key: 'VIEW_EXEC_AUDIT',
@@ -135,37 +136,6 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     description:
       'Record a device’s screen during a remote-control session. The device must allow it, and the person there sees it. A recording outlives the session, so no role gets this by default.',
   },
-  {
-    key: 'HIVE_RUN',
-    // FR-90 — the first flag above bit 31: `2 ** 32`, which a shift cannot
-    // even express in JS (`1 << 32` is 1).
-    bit: 2 ** 32,
-    label: 'Run agent sessions',
-    group: 'Fleet access',
-    description:
-      'Start and drive AI agent sessions on a device. A session runs as the account the device maps you to — never SYSTEM or root — and only where the device allows it. It runs commands on that device, so no role gets this by default.',
-  },
-  // ── Knowhow ──────────────────────────────────────────────────────
-  // FR-90 P4 — the organization's map. It grants nothing: the vault, the
-  // network and the device still decide every reach, so reading it is in the
-  // member preset (decision 37) and changing it in the admin one (36).
-  {
-    key: 'KNOWHOW_VIEW',
-    // `2 ** 33`: a shift cannot express it in JS.
-    bit: 2 ** 33,
-    label: 'View the map',
-    group: 'Knowhow',
-    description:
-      'Read the organization’s map: its machines, repositories, databases, clusters and services, and how each is reached. The map grants nothing: every reach is still decided by the vault, the network and the device.',
-  },
-  {
-    key: 'KNOWHOW_EDIT',
-    bit: 2 ** 34,
-    label: 'Edit the map',
-    group: 'Knowhow',
-    description:
-      'Add, change and archive what the map holds. Every change is recorded with who made it, and editing the map includes reading it.',
-  },
 ]
 
 /** Group names in display order (insertion order of the flags above). */
@@ -191,7 +161,6 @@ export const DEFAULT_MEMBER = byKeys([
   'CONNECT_VOICE',
   'SPEAK',
   'STREAM_VIDEO',
-  'KNOWHOW_VIEW',
 ])
 
 /**
@@ -221,12 +190,13 @@ export const DEFAULT_ADMIN = maskUnion(
     'VIEW_REMOTE_AUDIT',
     'VIEW_EXEC_AUDIT',
     'VIEW_SSH_AUDIT',
-    'KNOWHOW_EDIT',
   ]),
 )
 
 /**
- * Every defined bit — server `ALL = (1 << 35) - 1` = bits 0–34.
+ * Every defined bit — server `ALL = (1 << 35) - 1` = bits 0–34. Bits 32–34
+ * were FR-90's and are RESERVED since FR-137 (decision D1): stored masks keep
+ * them, so `ALL` does too, while the catalog above lists none of them.
  * Written as `2 ** 35 - 1` because the Rust spelling is not a JS expression
  * at all: a shift coerces to int32, so `1 << 35` is 8 (see the int32 note at
  * the top of this file).
@@ -373,6 +343,59 @@ export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolea
 }
 
 /**
+ * May this caller read a device's diagnostics: its crash reports and its
+ * uploaded logs (`…/agent/{id}/crash`, `…/agent/{id}/logs`)? Server gate:
+ * `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass included), the bit the connect
+ * code is read under. The ordinary device list needs only membership; these
+ * are the least-filtered view of a device.
+ *
+ * Deliberately FAIL-OPEN on `mask === null`, unlike {@link canQueryAnalytics}:
+ * the device menu renders before `/member/me` lands, and a holder whose fetch
+ * failed would lose both views for the session. Guessing wrong costs one
+ * refusal, and the dialogs explain a refusal rather than show it as an error.
+ */
+export function canReadDeviceDiagnostics(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
+ * May this caller read and write the org's tunnel policies (the Tunnel ACL tab,
+ * `…/tunnel-policy`)? Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass
+ * included) on every route, the reads too, as on the Overlay ACL beside it. A
+ * policy is an access grant, and the list is the org's whole ACL: who may reach
+ * which device, and which hosts and ports behind it.
+ *
+ * Deliberately FAIL-OPEN on `mask === null`, like
+ * {@link canReadDeviceDiagnostics}: the store awaits the membership first, so
+ * `null` means that fetch failed, and a holder must not lose the page over it.
+ * The server then decides, and its 403 lands in the same refused state.
+ */
+export function canManageTunnelPolicies(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
+ * May this caller CHANGE the org's MagicDNS domain and upstream resolvers
+ * (`PUT …/magic-dns`)? Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass
+ * included): every overlay node of the org applies them, its whole DNS under an
+ * exit node. Reading them stays any member's (`GET …/magic-dns`), so this gates
+ * the editor, not the page.
+ *
+ * FAIL-OPEN on `mask === null`, like {@link canManageTunnelPolicies}: the page
+ * awaited the membership, so `null` means that fetch failed; the server then
+ * decides, and its 403 turns the editor read-only rather than erroring.
+ */
+export function canEditMagicDns(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
  * Nav gate for the Invites surface (sidebar item + dashboard card).
  * Deliberately FAIL-CLOSED on `mask === null`, like {@link canQueryAnalytics}
  * and unlike {@link canSeeFleetNav}: `list_invites` requires INVITE_MEMBERS,
@@ -468,16 +491,4 @@ export function canGrantDeviceSsh(mask: number | null, isOwner: boolean): boolea
   if (isOwner) return true
   if (mask === null) return false
   return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'SSH_DEVICE']))
-}
-
-/**
- * FR-90 P2h-2 — may this caller set the organization's Hive replica policy:
- * designate archive replicas, and add one? Server gate: `ADMINISTRATOR`
- * (`crates/modules/hive/src/policy.rs`, `put_policy`). FAIL-CLOSED on
- * `mask === null`: the page shows its switches only once it knows.
- */
-export function canSetHivePolicy(mask: number | null, isOwner: boolean): boolean {
-  if (isOwner) return true
-  if (mask === null) return false
-  return hasPermission(mask, ADMINISTRATOR)
 }

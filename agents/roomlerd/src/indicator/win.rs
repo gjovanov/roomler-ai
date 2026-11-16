@@ -695,6 +695,15 @@ unsafe fn pump_ptr(hwnd: HWND) -> *mut PumpState {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PumpState }
 }
 
+/// #2116 — does the pump's timer run? While a session is up (the badge's reveal,
+/// the curtain), and while the consent panel is up (its countdown ticks on this
+/// timer). A prompt waits BEFORE its session exists, so a timer that ran only
+/// with a session left a lone prompt reading "Expires in 4:59" for as long as
+/// it was on screen.
+fn pump_timer_wanted(has_session: bool, consent_visible: bool) -> bool {
+    has_session || consent_visible
+}
+
 /// True while ≥1 session is active.
 unsafe fn has_session(p: *mut PumpState) -> bool {
     unsafe { !(*p).shared.lock().unwrap().sessions.is_empty() }
@@ -1357,7 +1366,11 @@ unsafe extern "system" fn border_wnd_proc(
                     }
                 } else {
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    let _ = KillTimer(hwnd, TIMER_ID);
+                    if pump_timer_wanted(false, (*p).consent_visible) {
+                        let _ = SetTimer(hwnd, TIMER_ID, TIMER_MS, None);
+                    } else {
+                        let _ = KillTimer(hwnd, TIMER_ID);
+                    }
                     hide_badge(p);
                 }
                 LRESULT(0)
@@ -1734,5 +1747,31 @@ unsafe fn draw_text(
         }
         let _ = SelectObject(hdc, prev);
         let _ = DeleteObject(HGDIOBJ(font.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pump_timer_wanted;
+
+    /// #2116 — a consent prompt waits BEFORE its session exists. The panel's
+    /// countdown ticks on the pump's timer, so the timer must run for a lone
+    /// prompt: on 0.4.132 it was killed whenever no session existed, and the
+    /// panel read "Expires in 4:59" for as long as it was up.
+    #[test]
+    fn a_lone_consent_prompt_keeps_the_timer_running() {
+        assert!(pump_timer_wanted(false, true));
+    }
+
+    #[test]
+    fn a_session_keeps_the_timer_running_with_or_without_a_prompt() {
+        assert!(pump_timer_wanted(true, false));
+        assert!(pump_timer_wanted(true, true));
+    }
+
+    /// Nothing on screen to drive: the timer stops, as it always did.
+    #[test]
+    fn no_session_and_no_prompt_stops_the_timer() {
+        assert!(!pump_timer_wanted(false, false));
     }
 }

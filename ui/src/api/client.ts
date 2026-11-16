@@ -246,13 +246,23 @@ async function request<T>(path: string, options: RequestOptions = {}, retried = 
   return resp.blob() as unknown as Promise<T>
 }
 
+/** #3582 — uploads in flight, page-wide: a reload for a new build waits for them (`utils/staleBuildWatch.ts`). */
+let uploadsInFlight = 0
+export function uploadsInProgress(): number {
+  return uploadsInFlight
+}
+
 export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body }),
   put: <T>(path: string, body?: unknown) => request<T>(path, { method: 'PUT', body }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
-  upload: <T>(path: string, formData: FormData) =>
-    request<T>(path, { method: 'POST', body: formData }),
+  upload: <T>(path: string, formData: FormData): Promise<T> => {
+    uploadsInFlight += 1
+    return request<T>(path, { method: 'POST', body: formData }).finally(() => {
+      uploadsInFlight -= 1
+    })
+  },
 }
 
 export { ApiError }

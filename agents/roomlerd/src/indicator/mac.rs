@@ -11,7 +11,7 @@
 //! `#[tokio::main]`, which parks the main thread in `block_on` for the
 //! daemon's whole life — and AppKit delivers every event, including the click
 //! on an Approve button, on the main run loop. A window created from that
-//! process shape appears and then never responds. The fix is in `main.rs`: on
+//! process shape appears and then never responds. The fix is in `app.rs`: on
 //! this configuration the runtime moves to a worker thread and the main thread
 //! is handed to [`run_main_loop`].
 //!

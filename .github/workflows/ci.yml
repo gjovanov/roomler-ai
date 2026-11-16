@@ -35,9 +35,9 @@ concurrency:
 jobs:
   # ─── What a pull request changed (FR-6 wave 35, #773, 2026-10-30) ─────────
   #
-  # A pull request that touches only docs skips the twelve heavy jobs: the
-  # five Rust lanes, the macOS overlay check, the three Windows jobs, both
-  # FFmpeg jobs and the profiles build. "Docs" is `docs/**`, a top-level
+  # A pull request that touches only docs skips the fourteen heavy jobs: the
+  # six Rust lanes, both macOS jobs, the three Windows jobs, both FFmpeg
+  # jobs and the profiles build. "Docs" is `docs/**`, a top-level
   # `*.md` and `.claude/**`. No Rust build, test or link reads them. The jobs
   # that do read them run on every PR: frontend builds the docs site and
   # tests the UI that uses docs/assets, machine-names and commit-identity run
@@ -193,6 +193,12 @@ jobs:
             exit 1
           fi
 
+      # #3352 — every job on a Windows runner in this file declares `bash` as
+      # its default shell, so a step stops at its first failing command. The
+      # script refuses a planted workflow first, then scans this one.
+      - name: Guard — every Windows job's steps stop at their first failing command (#3352)
+        run: bash scripts/windows-shell-guard.sh
+
       - name: Install Rust toolchain
         # Pinned to the version in rust-toolchain.toml so local dev
         # and CI reject the same lints. Bump both in one commit
@@ -317,8 +323,8 @@ jobs:
       - name: Vendored scrap drift check
         run: bash scripts/revendor-scrap.sh --check
 
-      # Same invariant for the webrtc-sctp fork (the FORWARD-TSN bundled-
-      # chunk parse fix; see crates/vendored/webrtc-sctp/Cargo.toml).
+      # Same invariant for the webrtc-sctp fork (its deltas are listed in
+      # crates/vendored/webrtc-sctp/Cargo.toml; its tests: vendored-sctp).
       - name: Vendored webrtc-sctp drift check
         run: bash scripts/revendor-webrtc-sctp.sh --check
 
@@ -367,12 +373,12 @@ jobs:
       # `#[cfg(test)]` gate compiles the module's helpers into the lib target as
       # dead code, which only `--all-targets` surfaces.
       #
-      # `roomler-ai-mod-conference` joined with FR-115 O4: it carries the
-      # room-capacity bench (`examples/room_capacity.rs`), which no other step
-      # compiles, so without this it would break unseen the first time the
-      # mediasoup API or the worker settings moved. Checked green first.
-      - name: Run clippy on the audited crates (incl. test targets)
-        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core -p roomler-ai-mod-conference --all-targets -- -D warnings
+      # `roomler-ai-mod-conference` joined with FR-115 O4 for its room-capacity
+      # bench (`examples/room_capacity.rs`), which no other step compiles. Since
+      # #3594 the script adds EVERY `roomler-ai-mod-*` member, read from the
+      # workspace, so a new module crate is linted from its first PR.
+      - name: Run clippy on the audited crates + every module crate (incl. test targets)
+        run: bash scripts/clippy-audited-crates.sh
 
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat
@@ -421,10 +427,7 @@ jobs:
         # `recording` (FR-85) is in `full` again (P4c, after the canaries). It
         # stays named so this lane keeps linting it if it is ever held out
         # of `full` again, as it was from 2026-09-26 to 09-27.
-        # `hive` (FR-90 P0c) is held out of `full` until the P0 field cell,
-        # so it is named here for the same reason: no other lane lints it.
-        # `vault` (FR-90 P3-3) implies `hive` and is in no release build yet.
-        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording,hive,vault --all-targets -- -D warnings -A dead_code
+        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
@@ -553,21 +556,9 @@ jobs:
       # S2: its orchestrator now decides the overlay default per install
       # flavour, and that rule ran in no lane either. `--lib` only — its
       # bin is `test = false` by the UAC lib-naming rule.
-      # `roomler-hive-node` (FR-90 P0a) joined with its first commit: the
-      # transcript chain's one-writer and no-gap checks, the replica store's
-      # search scoping and the empty-roots-means-nowhere rule are its tests.
-      # `roomler-ai-mod-hive` (FR-90 P0b) the same way: the start-ack table
-      # bound to its device, the status sets a device report may move, and
-      # the folder/title checks the start route applies.
       # `roomler-ai-mod-remote` (FR-101 P2a) joined with its first tests: how
       # the owner pod reads the session policy off the cross-pod relay (absent
       # vs unreadable), and the policy route's strict values.
-      # `roomler-ai-mod-vault` (FR-90 P3-1) with its first commit: a value
-      # moved to another place, altered, or held to another KEK does not
-      # open; a KEK never prints; paths and fields have one spelling.
-      # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
-      # an attribute have one spelling, and a person's change to one fact
-      # keeps every other fact's provenance.
       # `roomler-ai-mod-conference` (FR-127 P1) with its first unit tests: a
       # viewer's view keeps `None` (a legacy client, everything flows) apart
       # from `Some(empty)` (a view client showing nothing), an older report
@@ -582,9 +573,21 @@ jobs:
           -p roomler-ai-services -p roomler-ai-db -p roomler-ai-config
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
-          -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
-          -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
+          -p roomler-ai-mod-remote
           -p roomler-ai-mod-conference
+
+      # #3736 — the LocalAPI client keeps a socket only when its own account or
+      # root serves it. The step above proves the rule and the candidate loop
+      # as the runner; this one proves the kernel's credentials across real
+      # uids, which needs root: a socket another uid serves is refused, and
+      # root's socket is still reached after it. Built as the runner, run under
+      # sudo; ROOMLERD_TEST_REQUIRE_ROOT turns the test's skip into a failure.
+      - name: "LocalAPI, as root — a socket another uid serves is refused (#3736)"
+        run: |
+          cargo test -p roomler-localapi --lib --no-run --message-format=json > /tmp/lapi.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/lapi.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomler-localapi lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" as_root_
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above
@@ -695,10 +698,6 @@ jobs:
         #     of it ran here. It also puts the Unix half of the privilege drop
         #     under test on a real Linux host, which a Windows dev box cannot
         #     exercise at all. russh is pure Rust; the cost is compile time.
-        #   - Hive (`hive`, FR-90 P0c): the device's gates and the supervisor
-        #     driving a stand-in harness through start, prompt, turn, crash and
-        #     stop. Linux-only by construction and held out of `full`, so this
-        #     is the one lane that runs it. Bundled SQLite compiles from C.
         #   - the desktop portal + mutter capture helper (`portal-capture`,
         #     FR-45): the same trap a fourth time — `capture::portal`'s whole
         #     suite is behind that feature and ran in NO lane, which is how the
@@ -729,7 +728,7 @@ jobs:
         #     takes ~20 s.
         env:
           ROOMLERD_TEST_XKB: "1"
-        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,hive,vault,portal-capture,drm-capture,uinput-input,enigo-input,external-access --lib
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server,portal-capture,drm-capture,uinput-input,enigo-input,external-access --lib
 
       - name: Test tunnel-core --features overlay-l3,overlay-netstack
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
@@ -750,20 +749,20 @@ jobs:
         # tunnel-core's `pgp_verify`, tested in the step above.
         run: cargo test -p roomler-cli --lib
 
-      - name: Multi-org shared TUN against real kernel networking
-        # The mux's bookkeeping is unit-tested against a fake device; the half
-        # that touches the OS — a REFUSED registration leaving no address
-        # behind, a disjoint block really getting one, a released org really
-        # losing it — was never run against a kernel, because reproducing it
-        # in the field needs a third organization and there is no way to
-        # retire a throwaway one (docs/multi-org.md §12). A `tun` device is
-        # free here, so it runs on every push instead.
+      - name: Overlay TUN against real kernel networking (tun_kernel_tests)
+        # A real TUN, brought up as the daemon brings it up: its descriptor
+        # is close-on-exec, and neither a plain child nor an exec-engine
+        # command holds it (`agents/roomlerd/src/overlay.rs`,
+        # `tun_kernel_tests`). The shared-TUN mux this step was made for went
+        # with #516, and the step then ran no test at all
+        # (docs/multi-org.md §12). It now fails unless the test RAN.
         #
-        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test skips
-        # itself silently everywhere else, including developer machines).
+        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test says by
+        # name that it skipped everywhere else, including developer machines).
         # Built as the normal user and only RUN under sudo, so root never
         # takes ownership of the shared cargo cache.
         run: |
+          set -o pipefail
           sudo modprobe tun || true
           # Build FIRST with human diagnostics. The json pass below would
           # otherwise swallow a compile error into records jq drops, leaving
@@ -774,7 +773,12 @@ jobs:
                 | jq -r 'select(.profile.test == true) | .executable' | head -1)
           echo "test binary: $BIN"
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
-            --test-threads=1 --nocapture
+            --test-threads=1 --nocapture 2>&1 | tee tun-kernel-tests.txt
+          if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' tun-kernel-tests.txt \
+             || grep -q 'SKIPPED' tun-kernel-tests.txt; then
+            echo "::error::tun_kernel_tests did not run against the kernel"
+            exit 1
+          fi
 
       - name: DERP dialer — unit tests (#2512)
         # `derp.rs` compiles only under an overlay feature. Its suite already
@@ -899,10 +903,10 @@ jobs:
         # carries the colour description (and nothing with the switch off), the
         # recording profile's keeps its own. #3245 — `peer::codec_cap_tests::`: the
         # RTP pump holds that encoder's ceiling. No other lane builds the feature
-        # without a `recording::` filter, and this one built the test binary above.
+        # without a `recording::` filter, and this one built the test binary above. #3652 — `app::smoke_openh264_tests::`: the plain smoke, judged on a build whose only encoder is OpenH264.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests:: app::smoke_openh264_tests::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
@@ -967,18 +971,48 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" tarball_owner
 
-      - name: Received files on a Linux system install (FR-97 P3d) — as root, born the person's
+      - name: "Files on a Linux system install (FR-97 P3d, #3688) — as root, received files born the person's, reads taken as them"
         # FR-97 P3d. A root daemon writes a received file into the person's
         # folder with the thread's fsuid, fsgid and groups switched to theirs,
         # and a link planted in that folder gets only their rights (the test's
-        # control shows root's own rights go straight through it). Only root
-        # can take on another identity, so the lib test binary runs under sudo,
-        # and ROOMLERD_TEST_REQUIRE_ROOT turns the tests' skip into a failure.
+        # control shows root's own rights go straight through it). #3688 — a
+        # viewer's reads (a download, a folder download, the drawer's
+        # listing) take the same person, each step with no capability, and
+        # never read a kernel file system. Only root can take on another
+        # identity, so the lib test binary runs under sudo, and
+        # ROOMLERD_TEST_REQUIRE_ROOT turns the tests' skip into a failure.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/p3d.json
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/p3d.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" files::seat_user_tests
+
+      - name: "Exec and SSH as the console user and as a named account on a Linux system install (#3822, #3853) — as root, a held seat0 or account lookup refuses in time and nothing runs"
+        # #3822. A root daemon's `console_user` asks who is at seat0 through
+        # the one lookup in flight a received file asks, off the async
+        # worker, 1.5 s at most. With that lookup held up, Fleet RPC's exec,
+        # SSH's exec and SFTP are refused with the try-again text and run
+        # nothing, as root or as anyone; with a lookup that answers, they drop
+        # to the person (`nobody` here). Only root drops to another account,
+        # so the lib test binary runs under sudo, and ROOMLERD_TEST_REQUIRE_ROOT
+        # fails a test that is not root rather than letting it run as itself.
+        # SSH's shell is `ssh-server`'s: rust-agent's "Test agent under
+        # vp9-444" runs the same tests with it, as the runner.
+        # #3853 (`exec::console_lookup_tests::account_database`, in the same
+        # filter): `named` and `console_user` resolve their account through
+        # one lookup in flight per account, off the async worker, 1.5 s at
+        # most. With the account database held up, every way is refused with
+        # the try-again text and runs nothing; with one that answers, both
+        # modes drop to `nobody` as before.
+        # #3855 (`…::account_database::blocking`, in the same filter): the
+        # blocking callers (`drop_to_std`, `account_ids`, `account_home`,
+        # `account_name`) ask the same lookups within 1.5 s; as root the
+        # control's child runs as `nobody`.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib --no-run --message-format=json > /tmp/i3822.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/i3822.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" exec::console_lookup_tests
 
       - name: The Linux user unit's sandbox (FR-85 P2c) — it starts on a fresh host, and the recorder writes ~/Videos
         # FR-85 P2c. `roomler.service` (the per-user install; what
@@ -1194,7 +1228,10 @@ jobs:
         # this one runs against Xvfb: the pointer warped to a known place
         # reads back there, less its hotspot and less a monitor's origin.
         # ROOMLERD_TEST_X11 turns a missing server into a failure: the step
-        # cannot pass by running nothing.
+        # cannot pass by running nothing. Since #3813 it is also what lets a
+        # test that changes the display run at all (this one, the cursor
+        # channel's and the keyboard layout's): without it they skip, so a
+        # person's own display keeps its pointer, cursor and layouts.
         #
         # FR-92 P3 — keep busy's X11 host, against the same Xvfb: XTest motion
         # resets the MIT-SCREEN-SAVER idle counter; the whole engine
@@ -1231,10 +1268,18 @@ jobs:
         # the XKB group switched to the second and back. The test puts the
         # display's one layout back for the tests that share it.
         #
-        # FR-97 P3e-3a — the clipboard's X11 change gate, against the same
-        # Xvfb: another client takes CLIPBOARD, as a copy does, and the gate
-        # counts it once and then holds. `clipboard` joins the features for it
-        # (arboard is pure Rust on Linux).
+        # FR-97 P3e-3a — the clipboard's X11 change gate runs in the step
+        # below (#3813), with every other test that writes the real clipboard,
+        # under ROOMLERD_TEST_REAL_CLIPBOARD=1. `clipboard` stays in these
+        # features so that step runs in this build (arboard is pure Rust on
+        # Linux).
+        #
+        # #3665 — the virtual desktop's teardown, each test on an Xvfb of the
+        # desktop's own (never this one): a killed X server takes the
+        # SIGTERM-deaf `setsid` orphan of its X client with it, which the
+        # direct start (the kill switch) is shown not to do; and after two
+        # early exits of the desktop's keeper (vd-keeper) the desktop starts
+        # without one and stays up. Both `x11-real:` lines are grepped.
         #
         # `-noreset`: without it Xvfb regenerates whenever its last client
         # disconnects, and a test that connects during the regeneration gets
@@ -1254,16 +1299,169 @@ jobs:
           set -o pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xauth
-          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::pointer capture::x11_cursor keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 input::layout_x11 clipboard::x11_gate_tests virtual_desktop::wm_nudge_tests --nocapture --test-threads=1 2>&1 | tee /tmp/x11-tests.log
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::pointer capture::x11_cursor keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 input::layout_x11 virtual_desktop::wm_nudge_tests virtual_desktop::supervise_tests --nocapture --test-threads=1 2>&1 | tee /tmp/x11-tests.log
           grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
           grep -q "x11-real: ran with idle" /tmp/x11-tests.log
           grep -q "x11-real: Xvfb does not advertise XWAYLAND" /tmp/x11-tests.log
           grep -q "x11-real: an XWAYLAND monitor reads as Xwayland" /tmp/x11-tests.log
           grep -q "x11-real: a dismissed prompt left the screen" /tmp/x11-tests.log
           grep -q "x11-real: the X11 pointer reached the cursor channel" /tmp/x11-tests.log
+          grep -q "x11-real: the recorder's pointer read back where it was put" /tmp/x11-tests.log
           grep -q "x11-real: the layouts .* read back, and the switch to de-DE and back took" /tmp/x11-tests.log
-          grep -q "x11-real: the clipboard gate counted an owner change" /tmp/x11-tests.log
           grep -q "x11-real: a nudge woke a root listener" /tmp/x11-tests.log
+          grep -q "x11-real: a killed X server came back on" /tmp/x11-tests.log
+          grep -q "x11-real: after two vd-keeper exits the desktop on" /tmp/x11-tests.log
+          grep -q "x11-real: a killed X server on .* took the orphan of its X client with it" /tmp/x11-tests.log
+
+      # #3813 — the real clipboard on X11. A test that writes it replaces what
+      # the person at the display had copied, so each such test runs only
+      # under ROOMLERD_TEST_REAL_CLIPBOARD=1. In the step above's build, each
+      # half against an Xvfb of its own:
+      #   1. Without the opt-in: xclip puts a sentinel on CLIPBOARD, the
+      #      module's tests run (with ROOMLERD_TEST_X11=1, as a developer
+      #      running the X11 tests on their own display would), and the
+      #      sentinel must still be there afterwards, with each real-clipboard
+      #      test saying it skipped. That is what a developer's own
+      #      `cargo test` has to leave alone. xclip owns the selection from a
+      #      child it forks, so the first read waits for it.
+      #   2. With the opt-in, each real-clipboard test runs and prints its
+      #      line, and both lines are grepped, so the step cannot pass by
+      #      skipping: the change gate (FR-97 P3e-3a) counts another client
+      #      taking CLIPBOARD, and the round trip writes, reads back, and
+      #      outlives a clone's drop. A clipboard that does not open is then a
+      #      failure, not a skip.
+      - name: The real clipboard on X11 — untouched without the opt-in, its tests run with it (#3813)
+        run: |
+          set -euo pipefail
+          # The step above refreshed the index and installed xvfb.
+          sudo apt-get install -y --no-install-recommends xvfb xauth xclip
+          export SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env -u ROOMLERD_TEST_REAL_CLIPBOARD ROOMLERD_TEST_X11=1 bash -euo pipefail -c '
+            holds() { [ "$(xclip -selection clipboard -o 2>/dev/null)" = "$SENTINEL" ]; }
+            printf %s "$SENTINEL" | xclip -selection clipboard -i >/dev/null 2>&1
+            for _ in $(seq 50); do holds && break; sleep 0.1; done
+            holds || { echo "::error::the display did not take the sentinel"; exit 1; }
+            cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard:: --nocapture --test-threads=1 2>&1 | tee /tmp/clip-plain.log
+            holds || { echo "::error::a test replaced the clipboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
+          '
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_the_gate_counts_a_copy" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_the_clipboard_follows_a_new_x_server" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up" /tmp/clip-plain.log
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_gate_tests clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee /tmp/clip-real.log
+          grep -q "x11-real: the clipboard gate counted an owner change" /tmp/clip-real.log
+          grep -q "real-clipboard: the round trip ran and outlived a clone's drop" /tmp/clip-real.log
+
+      # #3671 — an X server that went away under an open session's capture,
+      # each test on an Xvfb of its own, SIGKILLed: the damage watcher warns
+      # once and never polls the dead connection again (it warned on every
+      # tick, 56 times a second in the field), and the capture sends no frame
+      # after the exit and warns at most twice (it sent the last picture at
+      # the full rate). The capture's test runs in a process of its own: it
+      # hears the capture's worker thread through a process-wide subscriber,
+      # which a process can set only once.
+      #
+      # This step and the two after it (#3918's input, #3671's clipboard) run
+      # even when a step before them failed (`!cancelled()`), so that one run
+      # shows each one's result: the commit that adds the tests ahead of the
+      # fix fails every one of them. They build nothing of their own (the X11
+      # step's features, in the same job; a build that failed fails here
+      # again), start an Xvfb per invocation through xvfb-run, and stop with
+      # a line that names what is missing when the steps above did not
+      # install it. Every invocation runs, its `x11-real:` line is grepped (a
+      # test that skipped itself prints none), and the step ends with one
+      # line per invocation and fails if any did.
+      - name: "#3671 — a session's capture after its X server exits, on a real X server"
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
+          rc=0
+          results=()
+          # One invocation: its output to a log, its `x11-real:` line grepped, its
+          # result kept for the summary; the next one runs whatever this one did.
+          check() {
+            local name=$1 log=$2 want=$3 r=0
+            shift 3
+            "$@" 2>&1 | tee "$log" || r=1
+            grep -q "$want" "$log" || { echo "::error::$name: no \"$want\" line in $log"; r=1; }
+            if [ "$r" = 0 ]; then results+=("$name: passed"); else results+=("$name: FAILED"); rc=1; fi
+          }
+          check capture::x11_damage /tmp/x11-damage.log "x11-real: a killed X server cost the damage watcher 1 warning in 200 ticks" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::x11_damage --nocapture --test-threads=1
+          check capture::scrap_backend::x11_exit_tests /tmp/x11-exit.log "x11-real: a capture whose X server went away sent" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::scrap_backend::x11_exit_tests --nocapture --test-threads=1
+          printf '%s\n' "${results[@]}"
+          exit $rc
+
+      # #3918 — remote input on a desktop whose X server is killed and started
+      # again on the same display: the releases, a move, the next key and
+      # click and keep busy's move reach the new server, and the old injector
+      # goes with no ERROR line. In a process of its own: it reads enigo's
+      # lines, which come from enigo's thread through `log`. Runs as the
+      # capture's step above does.
+      - name: "#3918 — remote input follows the virtual desktop to a new X server, on a real X server"
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
+          rc=0
+          results=()
+          # One invocation: its output to a log, its `x11-real:` line grepped, its
+          # result kept for the summary; the next one runs whatever this one did.
+          check() {
+            local name=$1 log=$2 want=$3 r=0
+            shift 3
+            "$@" 2>&1 | tee "$log" || r=1
+            grep -q "$want" "$log" || { echo "::error::$name: no \"$want\" line in $log"; r=1; }
+            if [ "$r" = 0 ]; then results+=("$name: passed"); else results+=("$name: FAILED"); rc=1; fi
+          }
+          check input::arbiter::x11_follow_tests /tmp/x11-input.log "x11-real: the input injector followed a new X server" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- input::arbiter::x11_follow_tests --nocapture --test-threads=1
+          printf '%s\n' "${results[@]}"
+          exit $rc
+
+      # #3671 — the clipboard worker follows the virtual desktop's next X
+      # server: an Xvfb of the test's own is SIGKILLed and started again on
+      # the same display, and a paste, a copy and a copy that a subscriber
+      # from before the restart hears all reach the new server. Its negative
+      # control takes the rebuild's second handle out, and the paste must
+      # then fail: if it ever passes, arboard's teardown rule has changed.
+      # The third asks for the clipboard first while the server is down, then
+      # once a new one answers, as the daemon's shared worker is asked: a
+      # paste and a copy must reach the new server (#3671).
+      # Each test in a process of its own, because arboard keeps one X
+      # connection per process. They write only their own Xvfb's clipboard,
+      # under ROOMLERD_TEST_REAL_CLIPBOARD=1; the real-clipboard step greps
+      # the three skip lines of its plain half. xclip, which the tests copy and
+      # read through, comes from that step, so it is installed here when the
+      # step did not run. Runs as the capture's step above does.
+      - name: "#3671 — the clipboard follows the virtual desktop to a new X server, on a real X server"
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
+          command -v xclip >/dev/null || sudo apt-get install -y --no-install-recommends xclip || { echo "::error::xclip is missing and did not install: the follow tests copy and read through it"; exit 1; }
+          rc=0
+          results=()
+          # One invocation: its output to a log, its `x11-real:` line grepped, its
+          # result kept for the summary; the next one runs whatever this one did.
+          check() {
+            local name=$1 log=$2 want=$3 r=0
+            shift 3
+            "$@" 2>&1 | tee "$log" || r=1
+            grep -q "$want" "$log" || { echo "::error::$name: no \"$want\" line in $log"; r=1; }
+            if [ "$r" = 0 ]; then results+=("$name: passed"); else results+=("$name: FAILED"); rc=1; fi
+          }
+          check clipboard::x11_follow_tests::x11_real_the_clipboard_follows_a_new_x_server /tmp/clip-follow.log "x11-real: the clipboard followed a new X server" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_follow_tests::x11_real_the_clipboard_follows_a_new_x_server --exact --nocapture --test-threads=1
+          check clipboard::x11_follow_tests::x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server /tmp/clip-follow-control.log "x11-real: without the second handle the clipboard stayed on the dead X server" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_follow_tests::x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server --exact --nocapture --test-threads=1
+          check clipboard::x11_follow_tests::x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up /tmp/clip-first-down.log "x11-real: a clipboard first asked for while the desktop was down started once it was up" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_follow_tests::x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up --exact --nocapture --test-threads=1
+          printf '%s\n' "${results[@]}"
+          exit $rc
 
       # FR-6 wave 34: the job's LAST step; see rust-lint's.
       - name: Publish the cargo cache (release-asset store)
@@ -1349,6 +1547,12 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
+      - name: The post-install script parses under this Mac's /bin/bash (#3783)
+        # Its shebang names /bin/bash, Apple's bash 3.2. The macOS post-install
+        # roads job runs its cases under a Linux build of the same version.
+        run: |
+          /bin/bash -c 'echo "/bin/bash $BASH_VERSION"'
+          /bin/bash -n agents/roomlerd/packaging/macos/postinstall
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Salt the cargo cache key with this job's definition
@@ -1416,20 +1620,13 @@ jobs:
       - name: cargo check agent BINARY (macOS cfg arms in main.rs)
         run: cargo check -p roomlerd --bins --features scrap-capture
 
-      # FR-90 P1h — agent sessions on macOS (`cfg(hive_host)`): the launcher,
-      # the harness's paths, its process lifetime (`hive/procs.rs` calls
-      # `proc_pidinfo`, which exists only here) and main.rs's `wind_down` arm.
-      # Then the supervisor's own tests, which need nothing a Mac runner lacks:
-      # a fake harness, a Unix socket and a loopback sidecar. Before this, the
-      # supervisor had never compiled for a Mac at all. FR-90 P3-5b-1:
-      # `vault_proxy::`, the vault's proxy engines (the system's roots read
-      # from the Mac's keychain here), which `vault::` does not match.
-      # FR-97 P6e-2: `macos_supervisor::` rides the same test build. Its crash
+      # The agent's unit tests that only a Mac can run, in one test build.
+      # FR-97 P6e-2: `macos_supervisor::` rides it. Its crash
       # classifier reads Darwin's signal numbers off a wait status, and a Mac
       # is the only runner where they are checked against `libc`.
-      # FR-97 P2e-1: so does the clipboard's change gate against the real
-      # pasteboard. Its write replaces whatever was copied, so the test skips
-      # unless `ROOMLERD_TEST_MAC_PASTEBOARD=1`; a runner has nobody's copy to lose.
+      # FR-97 P2e-1: the clipboard's change gate against the real pasteboard
+      # runs in the step after this one (#3813), with every other test that
+      # writes the real clipboard, under ROOMLERD_TEST_REAL_CLIPBOARD=1.
       # FR-97 P2d-2a: and the Mac keyboard layout's pure parts (the tag table,
       # the token, the snapshot), which build only with `enigo-input`.
       # FR-97 P2c: and Remote Apps (`apps::`), whose macOS backend compiles on
@@ -1442,12 +1639,80 @@ jobs:
       # reads this test process, and its real report must parse.
       # FR-112 P3: and `encode::clock::`, a thread's QoS class: it reads back,
       # and a thread it starts does not inherit it, which only a Mac can say.
-      - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
-        env:
-          ROOMLERD_TEST_MAC_PASTEBOARD: "1"
+      # And `exec::tests::a_command_keeps_only_its_standard_streams`: a command
+      # keeps 0-2 only, which on a Mac rests on the sweep alone. A filter on
+      # the build already made here; the pty's own tests need `ssh-server`,
+      # which this build does not carry.
+      # #3853: and `exec::mac_console_lookup_tests`: with the console's owner
+      # (`stat /dev/console`) or the account database held up, `console_user`
+      # and `named` are refused within 1.5 s with the try-again text, off the
+      # async worker, one lookup in flight; with both answering, the command
+      # runs as the runner, the person at its own screen.
+      # #3858: and `companion::tray_start_tests::`: with the process list, the
+      # console's owner, the account database or launchd held up, the tray's
+      # start for a prompt fails within 2.5 s naming the step, off the async
+      # worker, one start in flight; in time, it runs launchctl as today.
+      - name: cargo check + test the agent's Mac-only units
         run: |
-          cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock::
+          cargo check -p roomlerd --lib --bins
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power::
+
+      # #3813 — the real clipboard on a Mac. A test that writes it replaces
+      # what the person at the Mac had copied, so each such test runs only
+      # under ROOMLERD_TEST_REAL_CLIPBOARD=1. In the step above's build:
+      #   1. Without the opt-in: pbcopy puts a sentinel on the general
+      #      pasteboard, the module's tests run, and the sentinel must still
+      #      be there afterwards, with each real-clipboard test saying it
+      #      skipped. That is what a developer's own `cargo test` has to leave
+      #      alone.
+      #   2. With the opt-in, each real-clipboard test runs and prints its
+      #      line, and both lines are grepped: the change gate (FR-97 P2e-1)
+      #      counts a write, and the round trip writes, reads back, and
+      #      outlives a clone's drop. Until #3813 the gate's test had its own
+      #      variable, ROOMLERD_TEST_MAC_PASTEBOARD, and the round trip ran in
+      #      no Mac step.
+      # #3876 — one test at a time. A skip line is written in pieces; on several
+      # threads another test's line can land between them, and grep misses it.
+      - name: The real clipboard on a Mac — untouched without the opt-in, its tests run with it (#3813)
+        run: |
+          set -euo pipefail
+          SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf %s "$SENTINEL" | pbcopy
+          [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::the pasteboard did not take the sentinel"; exit 1; }
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard:: --nocapture --test-threads=1 2>&1 | tee /tmp/clip-plain.log
+          [ "$(pbpaste)" = "$SENTINEL" ] || { echo "::error::a test replaced the pasteboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping mac_real_the_gate_counts_a_copy" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
+          ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --lib --features clipboard,enigo-input -- clipboard::mac_gate_tests clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee /tmp/clip-real.log
+          grep -q "mac-real: the clipboard gate counted a write" /tmp/clip-real.log
+          grep -q "real-clipboard: the round trip ran and outlived a clone's drop" /tmp/clip-real.log
+
+      # #3757 — a Mac's root daemon declines the `files` channel of a session
+      # no GUI worker serves; every other process serves it. In the step above's
+      # build: the module (and the root half's hello still offering file
+      # transfer) as the runner's user, then under sudo, where euid 0 declines:
+      # the root test must run and pass (ROOMLERD_TEST_REQUIRE_ROOT: no skip).
+      # #3876 — one test at a time, or another test's output can split `... ok`.
+      - name: cargo test the files channel on a Mac's root daemon (#3757)
+        run: |
+          set -eu
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- peer::files_channel_tests:: encode::caps::tests::a_macs_root_half_still_offers_file_transfer --nocapture
+          cargo test -p roomlerd --lib --features clipboard,enigo-input --no-run --message-format=json > /tmp/files3757.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/files3757.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
+          RC=0
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture --test-threads=1 > /tmp/files3757-root.log 2>&1 || RC=$?
+          cat /tmp/files3757-root.log
+          if [ "$RC" != 0 ]; then echo "::error::the files channel tests failed under sudo (exit $RC)"; exit 1; fi
+          grep -q 'as_root::a_root_process_on_a_mac_declines_the_files_channel \.\.\. ok' /tmp/files3757-root.log \
+            || { echo "::error::the root test did not run and pass under sudo"; exit 1; }
+
+      # #3736 — the LocalAPI on a real Mac: the per-user socket lives in the
+      # person's own temp folder and nowhere shared, a client keeps a socket
+      # only when its own account or root serves it (getpeereid), and the
+      # whole crate's Unix tests run against the Mac's arms.
+      - name: cargo test the LocalAPI on a real Mac (#3736)
+        run: cargo test -p roomler-localapi --lib
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
@@ -1488,6 +1753,14 @@ jobs:
       # and this runner is itself a VM, so it reads the virtual-Mac branch.
       - name: cargo test the root half's machine id on a real Mac (FR-129 B2)
         run: cargo test -p roomler-node-core --lib -- machine::tests --nocapture
+
+      # #3802 — a roomlerd process on a Mac takes its folders from the account
+      # it runs as, not from the `HOME` sudo kept from its caller
+      # (`crates/agent-core/src/appdirs.rs`). Its test runs children of itself
+      # with another `HOME`; the rule's other tests run on every lane, and only
+      # a Mac runs the macOS rule against a real account database.
+      - name: cargo test the agent's folders on a real Mac (#3802)
+        run: cargo test -p roomler-node-core --lib -- appdirs::tests
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -1588,6 +1861,17 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
+    # #3352 — bash, not the runner's pwsh. pwsh's wrapper exits with the LAST
+    # native command's code, so `cargo clippy … -D warnings` followed by
+    # `cargo test` passed whatever clippy found. GitHub runs bash with
+    # `-eo pipefail`: the first failing command fails the step. Set per job (a
+    # workflow-wide bash would add pipefail to every Linux step), and the guard
+    # in rust-lint (scripts/windows-shell-guard.sh) fails a Windows job without
+    # it. A step that needs PowerShell says `shell: pwsh` and checks
+    # $LASTEXITCODE after each native command.
+    defaults:
+      run:
+        shell: bash
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
     permissions:
       contents: write
@@ -1625,10 +1909,9 @@ jobs:
       # stays in the same invocation deliberately: it is what makes tunnel-core's
       # helpers reachable, and dropping it turns pre-existing dead-code warnings
       # into errors that have nothing to do with the change under test.
-      # `hive` (FR-90 P1i): agent sessions on Windows, which no release build
-      # carries yet, so this is the only place their code is linted.
-      - name: Clippy roomlerd (overlay-l3 + ssh-server + hive, incl. tests)
-        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive,vault --tests -- -D warnings
+      # `system-context` too, so this lints what the Windows release ships.
+      - name: Clippy roomlerd (overlay-l3 + ssh-server + system-context, incl. tests)
+        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,system-context --tests -- -D warnings
       # FR-92 P10b — the LocalAPI crate's Windows half ran in NO lane: its
       # tests run on Linux, where every `#[cfg(windows)]` test compiles out,
       # and tunnel-core's clippy above builds only its library. That half is
@@ -1638,16 +1921,31 @@ jobs:
       # #3292 — the launcher is Windows-only code, and every Linux lane compiles
       # its stub. The rolling log's stderr capture is `cfg(windows)` too, in a crate
       # whose tests otherwise run only on Linux and on the Mac's machine id.
+      # #3230 — and the installer log of the per-Machine MSI's own steps, a
+      # Windows log, whose folder test is `cfg(windows)`.
+      # #3702 — and the machine's folders and the service account's profile as
+      # the system names them, the one-time folder move's gate and its link
+      # refusal: `appdirs`' Windows tests run in no other lane.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomler-localapi --all-targets -- -D warnings
           cargo test -p roomler-localapi --lib
+      # #3375 — the per-Machine MSI's custom-action DLL: its `msi` module (the
+      # registry and MSI calls msiexec runs on every per-Machine upgrade) is
+      # `#[cfg(windows)]`, so no Linux lane compiles it. The tests hold the
+      # carry's encoding and merge rule, and read the per-Machine wxs for the
+      # entry points, the hidden properties and the order the carry needs.
+      - name: The MSI's custom-action DLL on Windows — clippy + unit tests (#3375)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomler-msi-ca --all-targets -- -D warnings
+          cargo test -p roomler-msi-ca --lib
       # #3116 — the setup wizard's Windows half ran in NO lane: its unit tests
       # run on Linux and its `cargo check` on macOS, so every
       # `#[cfg(target_os = "windows")]` arm of the daemon pipeline (the MSI,
@@ -1657,8 +1955,14 @@ jobs:
       # FR-129 C3 — its mechanics crate too: `roomler-setup-core` holds the
       # wizard's Win32 calls (the elevated relaunch, the MSI wait), and its
       # Windows tests compiled out on the Linux step that runs its others.
+      # #3609 — `machine_write`'s NTFS cases (a background-service install's
+      # machine config, written by the step a Setup started without elevation
+      # crosses to) set owners, which takes this runner's elevated token: here
+      # a runner that is not elevated fails them instead of skipping them.
       - name: The setup wizard on Windows — clippy + unit tests (#3116)
         if: ${{ !cancelled() }}
+        env:
+          ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
         run: |
           cargo clippy -p roomler-setup -p roomler-setup-core --all-targets -- -D warnings
           cargo test -p roomler-setup -p roomler-setup-core --lib
@@ -1669,8 +1973,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo build -p roomler-setup --bin roomler-setup
-          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path target/debug/roomler-setup.exe -Expect 0x800 -NotImported secur32.dll
-      # FR-90 P1i's agent-session tests run in their own job,
+          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path target/debug/roomler-setup.exe -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll,wtsapi32.dll'
+      # The agent's Windows unit tests run in their own job,
       # windows-agent-sessions, below (FR-6 wave 27).
 
       # FR-99 P1b — the overlay behind `viewer-indicator`: the "being viewed"
@@ -1699,17 +2003,21 @@ jobs:
           exact: ${{ steps.seed.outputs.exact }}
 
   windows-agent-sessions:
-    # FR-6 wave 27 (#773): FR-90 P1i's agent-session tests, out of
+    # FR-6 wave 27 (#773): the agent's Windows unit tests, out of
     # windows-overlay-clippy and into a parallel job. With FR-99 P1b's step
     # beside them that job had grown to the slowest in this file: 11.2 min on
     # average over 13 master runs on 10-24 (max 13.3), 4.3-4.7 of it this one
     # step. Its own cache family, since it builds a test binary whose
     # dependencies the clippy job's check builds do not share.
-    name: Windows agent sessions (FR-90 P1i)
+    name: Windows agent unit tests
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
+    # #3352 — the first failing command fails the step; see windows-overlay-clippy.
+    defaults:
+      run:
+        shell: bash
     # A master push publishes this job's cargo cache as a release asset
     # (ci-seed-save), which needs `contents: write`.
     permissions:
@@ -1734,24 +2042,15 @@ jobs:
         with:
           family: windows-sessions
 
-      # FR-90 P1i — a Windows session's launcher: a process started SUSPENDED
-      # into a Job Object, with the session's variables over the user's
-      # environment; ending or closing the job ending what it started; the
-      # console-user mapping, the harness and its command line, and
-      # `roomlerd hive-prep`. The whole `win_service::supervisor` suite runs
-      # here too: it ran in no lane before. P1i-2: `hive::` as Windows compiles
-      # it: the toolbelt over its named pipe, processes by creation time, the
-      # store's file in a DACL'd directory. (The supervisor's own tests drive a
-      # `/bin/sh` stand-in for Claude Code, and run on Linux and macOS.)
+      # `win_service::supervisor` — a process started SUSPENDED into a Job
+      # Object, with its variables over the user's environment, and ending or
+      # closing the job ending what it started — ran in no lane before this one.
       # #2010: `win_service::tests` — the SCM host's own (the STOP_PENDING
       # report and its order against the supervisor), also in no lane before.
       # #2465: `win_service::orphan` — which roomlerd is an earlier host's
       # worker, and the reaper's reads through a real process handle.
-      # FR-90 P3-5b-1: `vault_proxy::` — the vault's proxy engines, against a
-      # fake upstream over real TLS. `proxy` is the only mode a session on
-      # Windows gets (decision 17), and `vault::` does not match the module.
-      # FR-90 P3-8-2a: `ssh_service::` — the SYSTEM service's claim and publish
-      # are `cfg(windows)`, so no other lane runs what they say of one command.
+      # `ssh_service::` — the SYSTEM service's claim and publish are
+      # `cfg(windows)`, so no other lane runs them.
       # #2836: `overlay::socket_inherit_tests` — no tokio socket is inheritable,
       # so a child the daemon spawns (the post-install watcher outlives it by
       # design) never holds its ports. `cfg(windows)`: Unix sockets are CLOEXEC.
@@ -1767,7 +2066,7 @@ jobs:
       # tests — the rest is building the test binary from the restored cache.
       # Locally (32 threads) the full suite is 2422 tests in about 42 s.
       #
-      # The features are the four this job already built plus `system-context`,
+      # The features are `overlay-l3`, `ssh-server` and `system-context`,
       # an empty marker (`system-context = []`) that gates the `system_context`
       # module: nothing to compile, one more module of tests. `overlay-netstack`
       # is already implied by `ssh-server`. The media half (`full-hw`,
@@ -1780,12 +2079,49 @@ jobs:
       # One step, every test in parallel: eleven local full-suite runs (six at
       # #2889's tip, five with its two test-order flakes fixed) found no
       # interference between the modules that spawn children (the supervisor,
-      # companion_spawn, hive_win, the vault's ssh engines); should one appear
+      # companion_spawn); should one appear
       # on the runner, those move to a second `--test-threads=1` step `--skip`ped
       # here — never the whole suite serial.
-      - name: Agent sessions on Windows — unit tests (FR-90 P1i)
+      # #3666 — the machine tree's NTFS cases in this suite (the host and the
+      # worker on one config, the supervisor's open machine folder) set owners,
+      # which takes this runner's elevated token: here a runner that is not
+      # elevated fails them instead of skipping them.
+      - name: Agent unit tests on Windows (the whole --lib suite)
+        env:
+          ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault,system-context --no-fail-fast
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
+
+      # #3813 — the real clipboard on Windows, where a developer's own native
+      # `cargo test` once replaced what they had copied. Each test that writes
+      # the real clipboard runs only under ROOMLERD_TEST_REAL_CLIPBOARD=1. A
+      # step of its own, with `clipboard` added to the features above, so the
+      # step above builds and runs as it did: this one builds roomlerd once
+      # more (its dependencies are the step above's), and runs the clipboard
+      # module twice from that build:
+      #   1. Without the opt-in: a sentinel goes on the clipboard, the module's
+      #      tests run, and the sentinel must still be there afterwards, with
+      #      the round trip saying it skipped.
+      #   2. With the opt-in, the round trip writes, reads back, and outlives a
+      #      clone's drop, and its line is grepped, so the step cannot pass by
+      #      skipping. A clipboard that does not open is then a failure.
+      # Before #3813 no Windows step built `clipboard`, so the round trip ran
+      # on Windows only on developers' own machines.
+      # #3876 — one test at a time. A skip line is written in pieces; on several
+      # threads another test's line can land between them, and grep misses it.
+      - name: The real clipboard on Windows — untouched without the opt-in, its test runs with it (#3813)
+        timeout-minutes: 20
+        run: |
+          F=overlay-l3,ssh-server,system-context,clipboard
+          SENTINEL="roomler-3813-sentinel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          holds() { [ "$(pwsh -NoProfile -Command Get-Clipboard | tr -d '\r')" = "$SENTINEL" ]; }
+          pwsh -NoProfile -Command "Set-Clipboard -Value '$SENTINEL'"
+          holds || { echo "::error::this runner's clipboard did not take the sentinel"; exit 1; }
+          env -u ROOMLERD_TEST_REAL_CLIPBOARD cargo test -p roomlerd --lib --features "$F" -- clipboard:: --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-plain.log"
+          holds || { echo "::error::a test replaced the clipboard without ROOMLERD_TEST_REAL_CLIPBOARD=1"; exit 1; }
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" "$RUNNER_TEMP/clip-plain.log"
+          ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --lib --features "$F" -- clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/clip-real.log"
+          grep -q "real-clipboard: the round trip ran and outlived a clone's drop" "$RUNNER_TEMP/clip-real.log"
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
@@ -1821,6 +2157,10 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 45
+    # #3352 — the first failing command fails the step; see windows-overlay-clippy.
+    defaults:
+      run:
+        shell: bash
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
     permissions:
       contents: write
@@ -1858,15 +2198,20 @@ jobs:
       - name: The installer's SystemContext record — unit tests (#1727)
         if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- win_service::system_context_attempt --nocapture
-      # #3073 — a SystemContext host's first healthy run hardens the
-      # machine-global dir. Proven here on a real tree someone else owns (the
-      # elevated runner hands it to SYSTEM): with the owner taken and the grant
-      # made before inheritance goes, SYSTEM keeps full control of the
-      # directory and of every child. The other lane that runs
-      # `roomler-node-core` is Linux, where the test does not exist.
-      - name: The machine-global hardening keeps SYSTEM in (#3073)
+      # #3609 — the machine tree's repair and check (`machine_tree::`, which
+      # replaced the config save's `icacls` hardening) on real NTFS trees: an
+      # owner set to another account, a junction, a tree someone else owns
+      # (#3073: the elevated runner hands it to SYSTEM, and the repair keeps
+      # SYSTEM in on the folder and on every child). Setting an owner takes
+      # this lane's elevated token. The other lane that runs
+      # `roomler-node-core` is Linux, where these tests do not exist. Also the
+      # elevated writers' merge base (`config::tests::machine_merge_base`): a
+      # machine config is folded into only when it is private.
+      # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
+      # the whole workflow file fails to load), and no ` #` in a name.
+      - name: "The machine tree is repaired and checked, the anchor key's check, and the machine folder by handle (#3073, #3609, #3737, FR-145)"
         if: ${{ !cancelled() }}
-        run: cargo test -p roomler-node-core --lib -- config::tests::harden --nocapture
+        run: cargo test -p roomler-node-core --lib -- machine_tree::tests machine_key::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base crash_recorder::tests machine_tree::held::tests --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
@@ -2125,17 +2470,23 @@ jobs:
         with:
           family: recording-ffmpeg
           max-target-mb: "5000"
-      - name: Configure apt retries and refresh the index
+      # 2026-11-11 (#3698): this lane's plain apt waited on the same dead
+      # resolver as the lint lanes (`Temporary failure resolving` for all three
+      # mirror names, 15:57-16:32Z). It now reaches the mirror the same way:
+      # ci-apt.sh probes the names, fails over to a public resolver when the
+      # runner's own has failed, and bounds the refresh and the install.
+      - name: Configure apt retries, reach the mirror, refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh prepare || echo "::warning::ci-apt.sh prepare failed (rc=$?): the install below still probes the mirror itself"
       - name: Install build deps
         # libclang: bindgen (ffmpeg-sys-next, env-libvpx-sys). libasound2-dev:
         # cpal, for `audio`. cmake: libopus from source (audiopus_sys).
         # libvpx-dev: `vp9-444` (see the job's env). Plain apt, not the cached
         # action — a handful of packages do not pay for a cache key that can
-        # silently restore nothing.
-        run: sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libasound2-dev cmake libvpx-dev
+        # silently restore nothing. Bounded, with one error that says why when
+        # the mirror cannot be reached (#3698).
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh fallback pkg-config libclang-dev libasound2-dev cmake libvpx-dev
       # 2026-10-24: `vp9-444-bindgen` under the image's newest libclang (22)
       # makes libvpx's encoder config opaque (see the action).
       - name: Point bindgen at the distro's libclang
@@ -2243,6 +2594,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Audit anchor ranges
         run: bash scripts/anchor-range-audit.sh
+
+  rc-media-ratchet:
+    name: The remote-desktop media path does not grow (FR-135 ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # FR-135 §7.1 — the media path's debt may only fall while the plan pays it
+    # down: env-knob reads in the agent's media path, the viewer's roomler-rc-*
+    # keys, and the length of each of the three copied pumps. A count may rise
+    # only with its baseline line raised in the same PR and naming the ledger
+    # row it adds (scripts/rc-media-ratchet.baseline). A count that falls
+    # passes, and the log says the lower number to lock in. On a PR the
+    # script reads the base's baseline, so a raised line that names no ledger
+    # row fails; the base branch arrives through env, never into the script.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the base's baseline (a PR's raised line must name a ledger row)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+      - name: Count the media path against its baseline
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ]; then export RATCHET_BASE_REF="origin/$BASE_REF"; fi
+          bash scripts/rc-media-ratchet.sh
 
   mermaid-sequences:
     name: Every mermaid sequence diagram parses
@@ -2443,15 +2820,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #3400 — bun's version has ONE record, .bun-version: every setup-bun
+      # step reads it, and the Dockerfile's BUN_VERSION defaults to it.
+      - name: bun's version has one record (#3400)
+        run: bash scripts/bun-version-check.sh
       - name: Install bun
-        # Pin bun to match local reproducible builds; setup-bun@v2 with
-        # no version input resolves to `latest`, which has silently
-        # shipped regressions that broke `vue-tsc --noEmit` for us in
-        # the past. Local 1.3.12 on Windows + Linux (WSL) passes, so
-        # we pin there and bump intentionally.
+        # Pinned, never `latest`: an unpinned bun shipped vue-tsc regressions.
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.12
+          bun-version-file: .bun-version
 
       - name: Cache bun dependencies
         uses: actions/cache@v4
@@ -2672,3 +3049,111 @@ jobs:
           family: profiles
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
+
+  code-maps:
+    name: Every code map names code that exists
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A doc's "Code map" table says which file owns what. It names functions and
+    # types and gives NO line numbers. A number is wrong after the next change
+    # above it: 97 of the 171 in docs/linux-capture.md had fallen behind by
+    # 2026-11-11, and a gate on the numbers would have made about four merges a
+    # day edit the same table rows. A name survives a move. It does not survive
+    # a rename or a delete, and then the doc sends its reader to something that
+    # is not there. So this job fails on a name that is no longer in its row's
+    # file, on a file that is gone, and on a line number coming back. A PR that
+    # only moves code needs no docs edit here. The self-test runs first, so a
+    # green job means the audit caught every planted fault on this runner's awk
+    # (#3686; the wider class is #3431).
+    #
+    # This job is the LAST in the file on purpose: appending it moved no line
+    # that a doc anchors.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the audit catches what it says (planted faults)
+        run: bash scripts/code-map-audit.sh --selftest
+      - name: Audit the code maps
+        run: bash scripts/code-map-audit.sh
+
+  macos-postinstall:
+    # #3783 — the macOS package's post-install script, run on both of its
+    # roads: a person signed in at the console, and nobody (the login window,
+    # where the update helper installs after every restart). It runs as root on
+    # every enrolled Mac at every update, and a wrong road takes the owner's
+    # remote access or freezes the Mac's updates with nobody at the keyboard.
+    # The real script runs in a throwaway container with stand-ins for
+    # launchctl and the other macOS tools (scripts/macos-postinstall-check.sh
+    # says what each case checks and what only a Mac shows).
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: macOS post-install roads
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the post-install script on both roads
+        run: bash scripts/macos-postinstall-check.sh
+      - name: Run the post-install script on both roads under bash 3.2, the version macOS ships
+        run: bash scripts/macos-postinstall-check.sh --bash 3.2
+      # #3881 — the served install script's own output (the release it names,
+      # the installed daemon's --version), under the /bin/sh of both hosts.
+      - name: Run the install script's output cases under dash, Debian's /bin/sh
+        run: bash scripts/install-sh-output-check.sh --shell dash
+      - name: Run the install script's output cases under bash 5 in POSIX mode
+        run: bash scripts/install-sh-output-check.sh --shell bash
+      - name: Run the install script's output cases under bash 3.2 in POSIX mode, the version of macOS's /bin/sh
+        run: bash scripts/install-sh-output-check.sh --shell bash3.2
+
+  vendored-sctp:
+    # #3755 — the webrtc-sctp fork's own tests, which ran in no lane: the fork
+    # is not a workspace member, so no `cargo test` here builds them, and the
+    # drift check in rust-lint compares text only. The workspace's Cargo.lock
+    # seeds the fork's standalone build, so the tests run against the versions
+    # the agent ships with (a write cut short leans on tokio's semaphore); a
+    # build of its own would take the newest. `fuzz_artifact_test` reads
+    # fuzz/artifacts, which the crates.io package does not ship. Not in the
+    # `rust` aggregator's needs: these upstream tests have never run in CI, so
+    # this job earns a record of its own before it can turn "Rust checks" red.
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: Vendored webrtc-sctp tests
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Test the fork against the workspace's pinned versions
+        run: |
+          cp Cargo.lock crates/vendored/webrtc-sctp/Cargo.lock
+          cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --skip fuzz_artifact_test
+
+  job-steps-ended:
+    # #3810 — the installer smoke's Windows job is re-run once, as attempt 2,
+    # when it ended without every step reporting an end, if no guard of the
+    # workflow installer-smoke-rerun refuses. This job runs
+    # scripts/job-steps-ended-test.sh: the decision (scripts/job-steps-ended.sh)
+    # on real runs' API data and on made-up replies, the re-run script
+    # (scripts/job-steps-ended-rerun.sh) against a stand-in for gh, and the
+    # check of the two workflow files (the job names that the listener matches,
+    # and its shape). The test file says what each case proves. It takes
+    # seconds, so it runs on every pull request.
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: The smoke's re-run decision on real and made-up job data (#3810)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the decision on every case
+        run: bash scripts/job-steps-ended-test.sh

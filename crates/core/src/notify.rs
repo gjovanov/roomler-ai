@@ -281,8 +281,8 @@ pub enum PushTo {
     /// Only the users with no socket anywhere — a mention, a call.
     Offline,
     /// Everyone notified: for a notification whose whole point is reaching
-    /// a person away from the screen (FR-90's approvals — a desk with the
-    /// app open is not a phone in a pocket).
+    /// a person away from the screen (FR-52's external-access notice — a
+    /// desk with the app open is not a phone in a pocket).
     Everyone,
 }
 

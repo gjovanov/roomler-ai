@@ -13,6 +13,11 @@
 #     never ended one nobody answered, and it held the closed agent and every
 #     socket it owned forever), and a candidate gathered after close() is
 #     closed instead of kept.
+#   - src/agent/agent_internal.rs (#3716): no candidate is closed while
+#     `local_candidates` is held, and the sweep closes each local candidate
+#     on a task of its own (naming one still closing after 5 s), so one
+#     close that waits on the network no longer holds the agent's close and
+#     every other socket with it.
 #   - this Cargo.toml: the `tcp-turn-conn` path dependency below.
 
 [package]

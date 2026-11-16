@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
 use crate::ConferenceState;
+use roomler_ai_db::models::role::permissions;
 use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
@@ -38,7 +39,7 @@ pub async fn list(
 
     crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
-    let result = state.recordings.find_by_room(rid, &params).await?;
+    let result = state.recordings.find_by_room(tid, rid, &params).await?;
     let items: Vec<RecordingResponse> = result.items.into_iter().map(to_response).collect();
 
     Ok(Json(serde_json::json!({
@@ -99,7 +100,15 @@ pub async fn create(
 
     let recording = state
         .recordings
-        .create(tid, rid, recording_type, storage_file, now, now)
+        .create(
+            tid,
+            rid,
+            auth.user_id,
+            recording_type,
+            storage_file,
+            now,
+            now,
+        )
         .await?;
 
     Ok(Json(to_response(recording)))
@@ -108,15 +117,33 @@ pub async fn create(
 pub async fn delete(
     State(state): State<ConferenceState>,
     auth: AuthUser,
-    Path((tenant_id, _room_id, recording_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, recording_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let rec_id = ObjectId::parse_str(&recording_id)
         .map_err(|_| ApiError::BadRequest("Invalid recording_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
+    // The path room passes the room guard (the org, the room in it, its
+    // visibility), and the recording is a live recording of that room: one of
+    // another room or org, or a deleted one, answers as a missing one does.
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    let recording = state.recordings.find_live_in_room(tid, rid, rec_id).await?;
+
+    // Who deletes it: whoever started it, as a message's author or a file's
+    // uploader deletes theirs, or whoever may delete the room
+    // (`MANAGE_CHANNELS`), since a room delete removes all its recordings.
+    if recording.created_by != Some(auth.user_id) {
+        roomler_core::guards::require_permission(
+            &state,
+            tid,
+            auth.user_id,
+            permissions::MANAGE_CHANNELS,
+            "MANAGE_CHANNELS",
+        )
+        .await?;
     }
 
     state.recordings.soft_delete(tid, rec_id).await?;

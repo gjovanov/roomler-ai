@@ -9,29 +9,24 @@ flowchart LR
     subgraph views["Views (ui/src/views/)"]
         L["LandingView · auth/ · legal/"]
         CORE["dashboard/ · rooms/ · chat/<br/>conference/ · files/ · invite/<br/>profile/ · billing/"]
-        FLEET["devices/ · remote/<br/>network/ · observability/<br/>analytics/ · admin/ · hive/"]
+        FLEET["devices/ · remote/<br/>network/ · observability/<br/>analytics/ · admin/"]
     end
 
-    subgraph state["Pinia stores (21)"]
-        S1["auth · tenant · rooms ·<br/>messages · conference · files ·<br/>invite · members · role ·<br/>notification · tasks · user · ws"]
-        S2["agents · tunnelClients ·<br/>tunnelPolicies · overlayRoutes ·<br/>overlayAcl · orgBadges · stats · hive"]
+    subgraph state["Pinia stores (24)"]
+        S1["auth · tenant · rooms ·<br/>messages · conference · files ·<br/>invite · members · role ·<br/>notification · tasks · user · ws ·<br/>capabilities · setupFeatures · growth"]
+        S2["agents · devices · tunnelClients ·<br/>tunnelPolicies · overlayRoutes ·<br/>overlayAcl · orgBadges · stats"]
     end
 
     subgraph rt["Real-time & media"]
         WS["useWebSocket → /ws"]
         MS["mediasoup-client<br/>(conference)"]
         RC["useRemoteControl<br/>(remote desktop viewer)"]
-        HV["useHiveViewer<br/>(agent-session viewer peer)"]
-        HS["useHiveSearch<br/>(search peer to the archive replica)"]
-        HR["utils/hiveRouter<br/>(one router for both peers' frames)"]
         WK["decode workers<br/>webcodecs · hevc · vp9-444"]
     end
 
     views --> state
     CORE --> WS & MS
     FLEET --> RC --> WK
-    FLEET --> HV & HS
-    HV & HS --> HR -->|"ws store: one handler a type"| S1
     state --> WS
 ```
 
@@ -42,23 +37,17 @@ flowchart LR
 | Marketing / auth | `LandingView`, `auth/{Login,Register,OAuthCallback}View`, `legal/{Terms,PrivacyPolicy}View` | |
 | Collaboration | `dashboard/{DashboardView,TenantDashboard}`, `rooms/{RoomList,ExploreView}`, `chat/ChatView`, `conference/ConferenceView`, `files/FilesBrowser`, `invite/{InviteLanding,InviteManage}View`, `profile/{Profile,ProfileEdit}View`, `billing/BillingView` | `ChatView`/`ConferenceView` own their layout (no `v-container`) |
 | Fleet | `devices/DevicesView` (enrolled machines), `remote/RemoteControl` (the viewer), `remote/ConsentView`, `network/NetworkPanel` (overlay mesh), `observability/ObservabilityView`, `analytics/AnalyticsView`, `admin/AdminPanel` | |
-| Agent sessions (FR-90, module `hive`) | `hive/HiveSessionsView` (your sessions, start dialog, stop; P2j-3: where sessions are copied, each of your own rows' **Delete for good** (never on a session of someone else's the list holds from its room or a hit), `components/hive/HivePurgeDialog`: the session's title typed to confirm, then the purge followed device by device, read again every 5 s until each answered; P2i-3: a **search box**, shown only where the organization's copies can be searched, `search` in `GET …/hive`, asked again at each visit; a query is asked 300 ms after the last keystroke, over `useHiveSearch`, and its hits replace the list while it stands: each with its session's title from your list, else "A session you can read", its snippet's `[` `]` drawn as `<mark>` from text, never `v-html`, and a click opening the session's room), `hive/HiveMemoryView` (P1e — **Agent memory**: the facts kept for the org's sessions by scope — organization, yours, a chosen device — each with its character budget; add, edit at the version read, archive; a refusal, `409 over_budget` or a 403 on a scope you may not write, shows in the server's words with the draft kept), `hive/HiveCopiesView` (P2h-2 — **Agent copies**: the org's replica policy read back, and its archive replicas: every device that offers itself as one (its `hive-archive` word, matched by equality) or is designated, with a **Designated** switch for administrators that writes the whole policy from the revision read (a stale write is read again and said so); P2j-4: an administrator edits the rules in place on the policy card (at least and at most, archive replicas, then the owner's own devices, the restricted tags with the org's device tags offered, the days kept), the whole policy written from the revision the form was opened on with everything it does not edit as read, the switches locked meanwhile; a stale write is read again and shown as stored now, any other refusal in the server's words with the draft kept; **Add an archive replica** mints an enrollment token and shows `docker run` and compose for the archive replica image, the token gone when the dialog closes; shown, and in the nav, only where the server copies sessions at all, `replicaset` in `GET …/hive`) | a session's own page is its chat room: `ChatView` opens `components/hive/HiveTranscript` as a side panel when the room's `binding.module` is `hive`. Its header's **People** button is `components/hive/HiveParticipants` (P1c): who takes part — the owner adds people as readers or drivers, changes their part, takes them out; everyone else sees the list. Its **Copies** button, only for a record that carries a replicaset, is `components/hive/HiveCopies` (P2j-1): each device that holds a copy, its role and state, and how far behind the primary's its copy is, by the server's own count (`holds`, read through `utils/hiveCopies.ts`); a move in flight; and the owner's **Move**, to the copy that holds the most, preselected, the answer in the server's words. Beside it (P2j-2), **Move elsewhere**, a teleport to an online device that holds no copy, and **Fork**, a new session from its conversation in a folder of its own, its room offered once made; both read the organization's devices once, matching each device's words by equality. Beside them (P2j-5), `components/hive/HiveManage`: an ended terminal session's owner makes it a managed one, offered where sessions are copied on an adopted session its terminal ended (`mayBecomeManaged`), its folder sent only when it is not its terminal's, the answer in the server's words, the word its device refused the last asking with said, and the asking in flight shown to anyone in the room (`isBecomingManaged`). The transcript's "ask the agent" composer is a driver's; the room's own composer is ordinary chat, which never reaches the agent. P1f: a tool call is drawn by its tool — `components/hive/HiveToolCall` and `HiveToolInput` over `utils/toolView.ts`: a command line, an edit as a diff (`utils/lineDiff.ts`), a new file's first lines, a file range, a search, a to-do list; its result (`HiveToolResult`) folded under it. A call that waited for an approval is drawn by its approval card, with the same input view, and its result after the answer. P1f-2: following the newest, the transcript keeps at most 1,000 events (`keep`; the oldest a "load earlier" away, never trimmed while someone reads further up). Output is coloured from SGR by `HiveAnsi` (`utils/ansi.ts`), as text: no `v-html` but assistant markdown. P1j: an adopted session (`origin: adopted`, a terminal's, `isAdopted`) is marked **Adopted** in the list, its Stop reads **Stop mirroring**, its transcript says it runs in a terminal and is read-only (the server's grant gives no composer), and its People dialog offers readers only; `ChatView` reads the record (`fetchSession`) to tell. P3-4e-3: a message the vault binds to an approval (`binding.module` `vault`, its `ref` the approval's id) carries `components/vault/VaultApprovalCard` under its text, through `MessageBubble`: where the approval stands, and **Approve** / **Deny** for a driver who may answer it now, **Approve** only where the policy would take their yes (`may_approve` in `GET …/vault/approval/{id}`, else off with why); a refusal in the server's words, and the approval read again whenever the vault edits its card (a new `updated_at` on the message) |
 | Fallback | `NotFoundView` | |
 
-## Stores (21)
+## Stores (24)
 
 `auth` · `tenant` · `user` · `rooms` · `messages` · `conference` · `files` ·
 `invite` · `members` · `role` · `notification` · `tasks` · `ws` — the
-collaboration core — plus the fleet set: `agents`, `tunnelClients`,
+collaboration core — plus the fleet set: `agents`, `devices`, `tunnelClients`,
 `tunnelPolicies`, `overlayRoutes`, `overlayAcl`, `orgBadges` (multi-org
-indicators), `stats` (observability series) — and `hive` (FR-90: the
-server's RECORD of your agent sessions, never their content; and the
-facts kept for them, `fetchBrain`/`keepFact`/`editFact`/`archiveFact`; P2h-2: whether sessions are copied there, `copied`, and the replica policy, `fetchPolicy`/`putPolicy`, with its bounds since P2j-4, `HIVE_MAX_MEMBERS`/`HIVE_MAX_RETENTION_DAYS`; P2i-3: whether they can be searched there now, `searchable`, from the same answer, which `checkSearchable` asks again at every call; P2j-1: a session's `replicaset` and `promotion` typed, and `promote`, a move to a copy; P2j-2: `teleport` and `fork`; P2j-3: `purge`, which takes a purged session out of the list, and `fetchPurge`; P2j-5: `manage`, which keeps the answer's record, and the record's `from_terminal`).
-
-⚠️ `hive` is the one module the server switches OFF by default, so the
-capability gate (`stores/capabilities.ts`) fails **closed** for it while
-`/api/capabilities` is unknown (`modules/registry.ts` `DEFAULT_OFF`), where every other
-module fails open.
+indicators), `stats` (observability series). Three more: `capabilities` (the
+module gate, which fails open), `setupFeatures` (the setup page's switches, which
+fail closed) and `growth`.
 
 ## Composables
 
@@ -68,8 +57,7 @@ module fails open.
 | `useWebSocket` | The `/ws` connection + event dispatch into stores |
 | `useRemoteControl` | The entire remote-desktop viewer engine (below) |
 | `useRemoteRecording` | The viewer's half of the session's `record` channel: start/stop, the device's list, a checked, resumable download ([recording.md](recording.md) §10) |
-| `useHiveViewer` | FR-90 — the browser's half of the agent-session viewer peer: `hive:view.*` signalling on the user socket, a data-only `RTCPeerConnection` dialled only after the device confirmed the grant, the `hive` DataChannel in `utils/hiveFraming.ts` frames (SCTP drops a message over 64 KiB), history + live follow + "ask the agent". A grant ended `role_changed` (the owner changed our part, P1c) is asked for again at once, and so is every grant at a redial, taken from the socket's drop: the store clears its connection id at a close, so a new id never follows an old one (P2i-3); `drivingRefused` carries the device's words when it keeps a driver the server named read only (P1c-2). ⚠️ The peer is `close()`d on every way out — a dropped peer frees nothing. Its frames come through `utils/hiveRouter.ts` (Everything else, below) |
-| `useHiveSearch` | FR-90 P2i-3 — a search's peer to the archive replica that holds the organization's copies: `hive:search.open` at the first search, then a viewer's handshake by the grant; over the `hive` channel `hello`, then `search {id, q, limit: 20}`, the query and its hits never through the server (P2i-1, P2i-2). `run(tenantId, q)` lands only the latest query's answer, waits out one `too_soon`, and asks once more on a fresh grant when the grant ends mid-search; a refusal (`status`, `reason`, `detail`) is not asked again for 10 s. `snippetParts` splits a hit's snippet at the device's `[` `]` marks, as text. ⚠️ The peer is `close()`d on every way out, after two minutes with no search included: a device serves 8 searches || `useConferenceLayout` / `useActiveSpeaker` / `useAudioPlayback` / `usePictureInPicture` | Conference UX |
+| `useConferenceLayout` / `useActiveSpeaker` / `useAudioPlayback` / `usePictureInPicture` | Conference UX |
 | `useMarkdown` | markdown-it + DOMPurify rendering |
 | `usePush` | Web-push subscribe/unsubscribe. #2817 — **an opt-in**: a sign-in or page load only re-subscribes where the browser already granted permission (`shouldSubscribeOnLoad`). The prompt comes only from `enablePushNotifications`, behind the notification panel's *Turn on* click. A browser that blocked it is told where to undo that. #2827 — clicking a push notification (`public/sw.js`) focuses a window **already on** its page, and otherwise opens a new one. It never navigates an open window away: the first roomler window may be a live remote session or a call, and on 2026-10-24 a consent request's own toast hung up the session it was asking about. |
 | `usePageViews` | SPA route-change beacon (`/api/stats/pageview`) |
@@ -88,22 +76,41 @@ flowchart TB
     IN["incoming session"] --> Q{"transport ×<br/>codec support probes"}
     Q -->|default| V["&lt;video&gt; element<br/>RTP → Chrome jitter buffer (~80 ms floor)"]
     Q -->|"WebCodecs path"| W["RTCRtpScriptTransform →<br/>VideoDecoder → OffscreenCanvas"]
-    Q -->|"DC H.264 / DC HEVC"| DC["reliable DataChannel bitstream →<br/>worker decode → canvas"]
-    Q -->|"VP9 4:4:4"| VP["DataChannel → rc-vp9-444-worker<br/>(chroma-full screen content)"]
-    W & DC & VP --> HUD["per-hop stats: fwd · decode · paint<br/>(rc-hop-stats, opt-in diag HUD)"]
+    Q -->|"DC: VP9 · AV1 · H.264 · HEVC"| DC["video-bytes DataChannel →<br/>rc-dc-worker decode → canvas"]
+    W & DC --> HUD["per-hop stats: fwd · decode · paint<br/>(rc-hop-stats, opt-in diag HUD)"]
 ```
 
-- **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker`, `rc-hevc-worker`,
-  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation. Each
+- **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker` (the RTP transform)
+  and `rc-dc-worker`, the one worker for every codec over the data channel (two
+  until FR-135 R3:
+  [remote-control.md §11.14](remote-control.md#1114-one-data-channel-worker-fr-135-r3)),
+  with `rc-hop-stats` shared hop-timing instrumentation. Each
   tells its decoder the agent's BT.601 limited colour space through
   `rc-decoder-config` (FR-130 P2; kill switch `roomler-rc-colorspace=off`):
   [remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2).
+  The data-channel worker also keeps `rc-media-window`: decode, paint, hop,
+  arrival and key-frame-gate times in the agent's log-2 buckets, the freeze and
+  painted counts, and whether the decoder is hardware, folded into its 1 s `stats`
+  message for the agent (FR-135 R0,
+  [remote-control.md §11.13.1](remote-control.md#11131-the-viewers-half-r0c)).
+  The page relays the `video-bytes` channel to it, one `postMessage` per
+  message; under `roomler-rc-dc-worker=1`, where the browser can transfer an
+  `RTCDataChannel`, the page moves the channel itself into the worker instead,
+  and a page whose move the worker does not confirm relays from then on.
+  The default is the relay until FR-135's S11 reads the move
+  ([remote-control.md §11.14.1](remote-control.md#11141-the-channel-in-the-worker-roomler-rc-dc-worker)).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
+  the codec × chroma picker, stored per device as one value per pair
+  ([encoders.md § The stored choice](encoders.md#the-stored-choice-one-value-per-pair-3651)),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
-  its frame-skip rate control), one `rc:decode-error` per decode error, counted into
+  its frame-skip rate control, and since FR-135 R0 also carries the worker's media
+  window, which only records; since R3 also `queue_arr_ms`, the transit queue read
+  at arrival beside `queue_ms`, which no agent reads yet:
+  [remote-control.md §11.14.2](remote-control.md#11142-the-arrival-reading-queue_arr_ms)),
+  one `rc:decode-error` per decode error, counted into
   the session's stats (FR-132 P1,
   [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
   a data-channel decoder that fails after its first frame replaced in place, off with
@@ -130,10 +137,14 @@ flowchart TB
 - **Clipboard bridge**: text / HTML / image / native formats, chunked over a DC,
   hash + echo-gate dedupe, auto-sync on focus; optional local-agent loopback
   bridge for full-fidelity RTF.
-- **File transfer**: chunked uploads/downloads, folder download (streamed zip),
-  resumable, cancellable; the Remote files drawer browses the host — its roots
-  view is the empty path (the drives on Windows, a single `/` on Unix), and `/`
-  itself is a directory (`isRootsRequest`, #2870).
+- **File transfer**: chunked uploads/downloads, a folder upload by a drop (each
+  file's path names the folder once, #3725), folder download (streamed zip),
+  resumable uploads, cancellable either way; the Remote files drawer browses the
+  host — its roots view is the empty path (the drives on Windows, a single `/` on
+  Unix), and `/` itself is a directory (`isRootsRequest`, #2870). A Transfers
+  row moves only through `moveTransfer`: a finished or cancelled row is final,
+  and its bar never moves back (#3726,
+  [remote-control.md §18.2](remote-control.md#182-data-channel-handlers-0131--0133)).
 - **Recording** (FR-85): Record, the REC chip and the device's recordings,
   over a `record` channel opened only when the grant kept `RECORD`; a stripped
   grant shows a disabled control that says why
@@ -148,7 +159,7 @@ flowchart TB
 
 The Video tab of the viewer's settings offers **Frame rate**, with 60, 120 and
 144, only for an agent whose hello carries `fps-high`
-(`views/remote/RemoteControl.vue:1783`). The agent's side, the grant and its
+(`views/remote/RemoteControl.vue:1770`). The agent's side, the grant and its
 step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119).
 
 - **The options** (`frameRateOptions`, `composables/frameRate.ts:52`): 60 is
@@ -157,7 +168,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7709`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8105`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -167,7 +178,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   …)". A reason word from a newer agent is shown as it came. With no session
   open, the hint reads "Above 60 only where this device has shown it can sustain
   it".
-- **"Try N fps again"** (`views/remote/RemoteControl.vue:1793`) appears under
+- **"Try N fps again"** (`views/remote/RemoteControl.vue:1780`) appears under
   the picker for an `unproven` refusal, from an agent that advertises
   `fps-retry` (`frameRateCanRetry`, `composables/frameRate.ts:166`). It re-sends
   the pick with `retry: true`, and the agent trials the step-down again from the
@@ -220,6 +231,140 @@ refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `mediaDataArrived`, `viewerHz`.
   `sendViewerHz` sends it only to an agent with the verb, again at each control
   channel `onopen`. The picker does not read it yet: it waits with the agent's cap,
   past FR-135 §7.1's gates.
+
+## A tab that outlives a promote (#3582)
+
+A promote rolls the pods, and every open tab reconnects in place: the `/ws` comes back,
+the remote-control page opens its next session by itself, and the tab keeps the build it
+loaded. `utils/staleBuild.ts` reloads only a tab whose navigation fails to load a chunk,
+and a tab that stays on one page never navigates. One controller's viewer ran a
+pre-November build through three promotes, so viewer fixes never reached the people who
+keep a remote-control tab open all day. The page now learns of a new build itself and
+reloads at a moment that loses nothing.
+
+**Which build.** The build names itself once (`buildIdPlugin`, `ui/buildIdPlugin.ts:43`):
+a hash of the names of the files it emits (`buildIdOf`, `buildIdPlugin.ts:36`), each one
+content-hashed by Vite, so the id changes whenever the bundle's code, styles or assets do. A
+file copied as it is from `ui/public/` and an edit to index.html alone do not change it; the
+viewer's code is in neither. The same
+value goes into `/version.json` beside the bundle (`buildIdPlugin.ts:54`) and into the
+shell as `<meta name="roomler-build">` (`buildIdPlugin.ts:64`). nginx serves the file from
+`location /` as a real file, `Cache-Control: no-cache`, security headers kept
+(`files/nginx-pod.conf:162-164`); the year-long asset rule does not match `.json`
+(`nginx-pod.conf:46`). An image older than this has no such file and answers the SPA shell
+(200, `text/html`), which the reader ignores (`readServedBuild`,
+`ui/src/utils/buildId.ts:71`). `scripts/public-site-smoke.sh:347` checks all three on every
+image.
+
+⚠️ **It is not the git commit, on purpose.** The image's UI stage has none (`GIT_SHA`
+reaches only the runtime stage, and `.dockerignore` drops `.git`), and an id that changed
+with every commit would reload every open tab after a server-only promote and rename every
+chunk with it.
+
+**When the page reads** (`createStaleBuildWatch`, `ui/src/utils/staleBuildWatch.ts:148`):
+at every `/ws` (re)connect, which the shell binds (`AppLayout.vue:770`); every 10 minutes
+while visible, and on becoming visible after that long; and once more 31 s after a first
+mismatch (`armConfirm`, `staleBuildWatch.ts:362`), so the second read does not wait 10
+minutes. A confirming read that teaches nothing (a 5xx mid-roll, a captive portal, a
+rolled-back image that answers the SPA shell for the file) doubles that wait, from 30 s up to
+10 minutes, rather than asking again at once; and reads closer than 5 s fold into one, so a
+socket that flaps asks once (`requestRead`, `staleBuildWatch.ts:373`).
+
+```mermaid
+flowchart TB
+    R["read /version.json<br/>no-store, a fresh ?t="] --> S{"this page's build?"}
+    S -->|yes| N["nothing is stale"]
+    S -->|"no, a first read"| P["pending: read again in 31 s"]
+    P --> R
+    S -->|"no, the same id ≥ 30 s later"| C["confirmed"]
+    C --> D{"decideStaleBuildAction"}
+    D -->|reload| RL["reload, one in 10 min"]
+    D -->|"reload-and-resume"| RR["stop the redial, record the resume, reload"]
+    D -->|banner| B["the banner; asked again as the page changes"]
+    B --> D
+```
+
+**What it does** (`decideStaleBuildAction`, `ui/src/utils/staleBuildPolicy.ts:159`):
+
+| The page, once a new build is confirmed | What it does |
+|---|---|
+| nothing live, nothing typed, no dialog | reloads |
+| a remote session already cut and waiting on its redial, on a socket connected for 30 s | reloads, and the next load resumes the session |
+| a live remote session, an external one (FR-52), a call or the call page, typed text, an open dialog, a hold | shows "A new version of Roomler is ready" with Reload, and reloads by itself at the next quiet moment |
+| typed text or a dialog (never a hold), in a page hidden with no input for 30 minutes | reloads |
+
+A **hold** is what a reload would lose for good, so no amount of hidden, idle time gives it
+up: an element marked `data-unsaved` (the machine key `GrowthChannels.vue:222` and the
+ephemeral enrollment key `EnrollKeysSection.vue:179`, each shown once), an upload in flight
+anywhere on the page (`uploadsInProgress`, `api/client.ts:251`), and a remote session that
+ended within 5 minutes, or whose rating prompt is still up (`RC_ENDED_HOLD_MS`,
+`useRemoteControl.ts:468`). The call page counts as a call whatever the store says
+(`AppLayout.vue:772`): it leaves and rejoins on a pod roll and stays after the call ends, and a
+reload there asks "Reload site?".
+
+A quiet moment is the session or the call ending, the text sent, the dialog closed, a hold
+gone, or, for a remote session, its next cut on a settled socket. The banner's Reload resumes
+a remote session, and where the device asks someone to allow each session (`consent_asks`),
+it says the device asks again; for an external session it says the device's password is
+needed again, and for a call that reloading leaves it (`bannerHint`,
+`staleBuildPolicy.ts:185`; `components/layout/NewBuildBanner.vue`, rendered by `App.vue:19`
+inside a fullscreen viewer too).
+
+**The guards**, each one a way the page could be left worse than before:
+
+| Guard | Why | Where |
+|---|---|---|
+| a mismatch reads the same twice, 30 s apart | during a roll one pod serves the old build and one the new | `trackServedBuild`, `staleBuildPolicy.ts:69` |
+| this page's own `/ws` connected for 30 s (down, or retrying, is never steady) | a roll that just cut it may still serve both builds, and a reload then can take its shell from one and its chunks from the other: a blank page | `settled`, `staleBuildWatch.ts:224` |
+| one automatic reload in 10 minutes, claimed in sessionStorage | never a loop. Where storage cannot be written, no automatic reload at all: the banner only | `NEW_BUILD_RELOAD_KEY`, `staleBuildPolicy.ts:47`; `claimReload` in `utils/staleBuild.ts` |
+| offline, nothing | a reload would trade the app for the browser's error page | `readNow`, `staleBuildWatch.ts:386` |
+| the person's hands | a plain reload waits until no key, click or wheel for 5 s | `BUSY_MS`, `staleBuildWatch.ts:72` |
+
+**The resume.** A remote session that a cut put on its redial (`scheduleReconnect`) is handed
+over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9899`), the args its
+redial would have used (with the held session it replaces, FR-138's `replaces`,
+[remote-control.md §11.17](remote-control.md#1117-a-session-outlives-its-control-socket-the-viewers-half-fr-138-p1c))
+are written to sessionStorage with the time, the path and the
+signed-in person (`writeRcResumeIntent`, `staleBuildPolicy.ts:249`), and the page reloads. A
+reload that has not happened 20 s later gives the redial back and deletes the record
+(`startReload`, `staleBuildWatch.ts:284`; `clearRcResumeIntent`, `staleBuildPolicy.ts:272`),
+or an F5 inside the minute would open the session a second time beside the redial. The next
+load takes the record out of storage before any page renders (`installStaleBuildWatch`,
+`staleBuildWatch.ts:515`, called before the router at `main.ts:46`). The viewer claims it once
+it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5505`): once,
+under a minute old, on the first page that load rendered, for the same person, device,
+organization and path (`resumeArgsFor`, `staleBuildPolicy.ts:318`). It resumes through the
+redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9924`), never as a first
+connect: a first connect starts the ladder at 0, and `rc:error` retries `agent_offline` only
+past it, so a tab that reloaded while its device restarted for an update would have stopped
+there, where the redial keeps trying. Its record is `after_drop`, out of FR-22's
+first-attempt numbers ([remote-control.md §11.15](remote-control.md#1115-a-new-build-takes-over-a-redial-3582)).
+
+- ⚠️ **Only on the redial path.** A request or a consent prompt in flight reads `live`
+  (`rcReloadState`, `useRemoteControl.ts:443`). A reload then would abandon a question the
+  host may be reading, and the resume would ask it again. On the redial path the device
+  decides consent as it would have for the redial, so a resume asks the host nothing more.
+- ⚠️ **Never an external session.** Its login opened one session, and another costs the
+  device's password (FR-52). It never reads `redialing`, and no resume is written for it.
+- ⚠️ **Not at the roll's own cut.** That cut is when the page's socket is not settled, and
+  the page's redial has the session back within seconds, long before a second read 30 s
+  later could confirm anything. So a session the roll cut comes back as it always did, the
+  banner shows, and the reload happens at the session's next cut on a settled socket (the
+  device restarting for an update, a network change on either end), at its end, or at a
+  click on Reload.
+- A file transfer the redial would resume (rc.19) and a recording's download keep the
+  redial too: they live in this page's memory only.
+
+**The instrument.** Every `rc.connect` record names the page's build (`fields.build`,
+`rcConnectTimingUpload.ts:182`; the record is `v` 2), so a field read can tell a stale
+viewer from a bug directly
+([remote-control.md §12.1.5](remote-control.md#1215-persisted-marks-part-4--where-a-stalls-phase-outlives-the-tab)).
+
+Tests: `staleBuildPolicy.spec.ts` (the table, the guards, the holds, the record),
+`staleBuildWatch.spec.ts` (the reads and their backoff, the reload, the hand-over and the
+claim, on fake timers), `rcResumeAfterReload.spec.ts` (the resume on the real composable:
+on the ladder, held, given back), `buildId.spec.ts` (the plugin's file and shell agree),
+`rcReloadState.spec.ts`, and `api/client.spec.ts` (uploads in flight).
 
 ## Observability components
 
@@ -372,11 +517,9 @@ only through a rendered tile, so a participant whose tile is hidden or past the 
 - **Theming**: Vuetify light/dark with localStorage persistence.
 - **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
 - **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
-- **Agent-session peers' frames** (FR-90): `utils/hiveRouter.ts` routes the `hive:*` frames of
-  every peer in the tab, a viewer's and a search's: an open's answer (`hive:view.ready`/`refused`,
-  `hive:search.ready`/`refused`) by the `ref` it was asked with, the rest of a handshake by its
-  grant. ⚠️ The ws store holds ONE handler per frame type (`onMediaMessage` is a `Map.set`), so a
-  peer that registered a type itself would take every other peer's frames of that type away.
+- ⚠️ **The ws store holds ONE handler per frame type** (`onMediaMessage` is a `Map.set`,
+  `stores/ws.ts:432`): a second registration of a type takes the first's frames away. Conference
+  registers its `media:*` types through it (`stores/conference.ts:146-151`).
 
 ## Conventions
 
@@ -390,6 +533,34 @@ The fix is route meta, not per-view watchers: `meta.remountOn: '<param>'`
 (`plugins/router.ts`), read by `components/layout/KeyedRouterView.vue`, keys the view by
 that one param. Every other route stays unkeyed on purpose — several views rewrite
 `route.query` in place and must not remount — so never key by `fullPath`.
+
+**The call page remounts by room, and asks before it leaves a call (#1637).** The app
+bar's Active Calls menu and the "Call started in …" snackbar push another room's call
+onto the call page in place. Until `room-call` carried `remountOn: 'roomId'`
+(`plugins/router.ts:242`), the page in room A's call kept A's call, chat and name under
+room B's URL: a message typed there went to B, and Leave left B, a call it was never in,
+while the server still listed the person in A. A remount alone would leave A's call
+running with nothing on the page to say so, because the mini-call widget hides on every
+call page. So the page settles its own call first, in `onBeforeRouteUpdate`
+(`views/conference/ConferenceView.vue:693`), with the question the Join button asks:
+
+| The page, when another room's call is pushed onto it | What happens |
+|---|---|
+| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:646`), then the page for the other room joins that room's call |
+| in its room's call, **Cancel**, Escape or a click outside | the navigation is refused. The call and the URL stay where they were |
+| in no call here | it remounts for the other room with no question, and joins nothing |
+
+The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
+taken at `ConferenceView.vue:776`). It is for that one room, spent by the next mount
+whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
+or a back-and-forward cannot put a camera into a call nobody just asked to join.
+`ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
+`e2e/conference-room-switch.spec.ts` drives the three rows in a browser against a real API
+and reads the outcome from the server's participant list for each room. Its join waits for
+the page's socket, as a person's does. Since #3416 the page waits too: a join sent before
+the socket had its connection id opened a call session with none, which a leave from that
+page, naming its connection, did not close
+([real-time.md](real-time.md#the-call-session-join-leave-socket-close-sweep-3416)).
 
 **A link clicked inside the app never takes a tab away from a live session (#2841).** A
 page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,
@@ -447,21 +618,21 @@ its desktop height** for the same data.
 | **The bar's phone budget** (&lt; 600 px): ☰ · title · your call · other calls · unread · search · bell · avatar. The tutorial `?` and the theme toggle move into the avatar menu, and the call and unread indicators become icons with a badge | `AppLayout.vue` `<v-app-bar>` | past ~344 px the avatar menu — and Logout with it — was pushed off-screen |
 | **What the drawer signals reaches the bar** when the drawer is closed: a dot on ☰ for another org's activity, and your call's controls (Return · Mute · Camera · Hang up) as a menu off the call page | `AppLayout.vue`; `composables/useCallControls.ts`, shared with `MiniConference` | the drawer is temporary below 1280 px, so a call kept a live mic with nothing on screen saying so |
 | **A dialog of any substance is full screen below 600 px** and carries its own close control. Its title never clips silently: a label then a name ("Agent logs — …") may shrink with an ellipsis to keep its buttons on screen, but **a question to confirm wraps**, because the name in it is what the reader confirms | `composables/useResponsiveDialog.ts` · the Devices page's evict, update-all, delete, add-to-an-org and routes dialogs, and its rotate-key question (`AgentsSection.vue`) · a member's roles · the viewer's agent log (its line count rides a second toolbar row on a phone) · GIFs | a centred dialog leaves 264 px of content at 360 px; a full-screen one has no scrim to tap. At 360 px the evict question was cut off before the device's name began, and the rotate-key one partway through it (FR-120 P3, measured); by its toolbar's own sizes the agent log's select and three buttons filled its 312 px dialog, leaving the title 0 px |
-| **A disabled control says why, as text** — a caption under it, or a list item's subtitle, never only its `title`. A toolbar icon that has no room for a caption says why on a tap: it sits in a span that takes the tap a disabled button does not, and the reason shows in the snackbar | the viewer's Settings toggles (each `rc-*-why` caption reads the reason its title holds) · the viewer's toolbar: clipboard, Record and Privacy, refused or not ready (`explainRefusal`, `RemoteControl.vue`) · its touch-mode control (a tap says how the new mode works) · a failed transfer's error · Vault's Approve (`VaultApprovalCard.vue`) | a disabled `v-btn` takes no pointer events, so its `title` reached **no one**, on any device; the touch-mode help, offered only to a finger, was a `title` a finger never sees (FR-120 P1b) |
+| **A disabled control says why, as text** — a caption under it, or a list item's subtitle, never only its `title`. A toolbar icon that has no room for a caption says why on a tap: it sits in a span that takes the tap a disabled button does not, and the reason shows in the snackbar | the viewer's Settings toggles (each `rc-*-why` caption reads the reason its title holds) · the viewer's toolbar: clipboard, Record and Privacy, refused or not ready (`explainRefusal`, `RemoteControl.vue`) · its touch-mode control (a tap says how the new mode works) · a failed transfer's error | a disabled `v-btn` takes no pointer events, so its `title` reached **no one**, on any device; the touch-mode help, offered only to a finger, was a `title` a finger never sees (FR-120 P1b) |
 | **A plain `v-table` with actions or results on its right is a card per row below 600 px**: `class="table-stack-xs"` on the table and `data-label="…"` on each cell. One template for both widths; above 600 px nothing changes. A `v-data-table` uses Vuetify's own mobile rows instead (next row) | `styles/responsive.css` (imported in `main.ts`); the ACL lists, Overlay routes, the audit lists, Roles, enrollment keys, the usage panel's Calls and Tunnel sessions, the keep-busy history (FR-120 P4b) | the rightmost columns — Save, Edit/Delete, Result, the command — sat off-screen behind a sideways scroll nobody finds |
 | **A list read row after row is compact on a phone, a screenful at a time**: `table-stack-xs--compact` puts a short cell's label beside its value (`stack-block` keeps a long cell's label above it), `usePhoneSlice()` shows 20 rows and then **Show N more**, and each card shows what decides and opens on a tap for the rest (next row but one): an audit card is the device, when and the result, plus an exec command's first two lines | `ExecAuditSection.vue`, `SshAuditSection.vue` (FR-116 P3d, FR-120 P4), `SshActivitySection.vue` (FR-116 P3d) | 100 audit rows as full cards were 43,398 px at 360 px on production; one script alone took 1,936 px. FR-116 made them 20 cards of ~205–270 px, still 3.3–3.6× the desktop's height; FR-120's summary cards are 68–128 px, and the audits measure 1.6–1.7× |
 | **A `v-data-table(-server)` takes `:mobile="xs"`**, and any natural-width rule on it (`width: max-content`, `white-space: nowrap`) is scoped to `:not(.<table>--stacked)`, with `overflow-wrap: anywhere` on a stacked value. **On a phone its row is one line**, through the table's `#item` slot (`<template v-if="xs" #item>`): what decides and at most one action, the rest on a tap. The row is `<tr class="v-data-table__tr">` with one `<td class="v-data-table__td stack-row">`, never `v-data-table__tr--mobile`, whose cells are a label \| value grid | `MembersSection.vue` (a name and roles), `InviteManageView.vue` (who for, the state, Copy link), `FilesBrowser.vue` (the name, the size, Download) (FR-120 P4b) | with the desktop rules left on, every stacked value sat past the right edge — the rows showed their titles and nothing else — and one unbroken email widened a row past the screen. Every column stacked made a row ~250–290 px: with 20 rows, Files was 4.65× its desktop height, Invites 4.72× and Members 3.81×; one line a row brings them to 1.28–1.36× (FR-120 P4b, the same rows served to both builds). ⚠️ In `v-data-table__tr--mobile` the line was squeezed into half the width ("An/yo/ne") and the opened details sat beside it |
 | **A page of independent settings is one expansion panel per setting below 600 px, titled with its current state** ("On", "Allowed", "Files: ask · Audio: off"); an unknown state shows nothing, never a guess | `components/admin/SettingsGate.vue`, used by `SettingsSection.vue` | Settings was ~4 screens of warnings and captions before its last switch; now one screen of decisions, each opening on demand. From 600 px up the gate renders the card it always was |
 | **Nothing is hover-only on a touch screen** (`(hover: none)`): what a tooltip or a hover reveals is reachable by a tap, or shown as a persistent hint — and a control hidden until hover takes no taps while hidden (`pointer-events: none`) | `RolesSection.vue` (grants on tap; descriptions as hints) · `MessageBubble.vue` (a ⋮ menu) · `VideoTile.vue` (a tap shows the tile's actions) · the viewer's files drawer (a › into a folder, "Upload here") · **a chip that explains itself is a `FactChip`** (`components/common/FactChip.vue`: its meaning in a small menu on a tap, its `title` kept for a mouse) — every titled chip on the Devices page, unless its tap already opens what explains it · **a chart reads a datum on a tap**: the uptime strip and the viewing windows report the period under a tap (or a mouse pointing, or the arrow keys) in a line below them, and the mesh graph gives each carrier a 14 px hit line whose tap pins its carrier and round trip | a permission's description was a tooltip on its label, so the tap meant to read it toggled the permission; a message's invisible hover buttons pinned it for the whole room; a tap on a face in a call hit an invisible picture-in-picture button. At 360 px the Devices cards held 10 dots and 19 chips that explained themselves only by hover, and Analytics 498 uptime segments (FR-120 P1a, measured) |
 | **On a touch screen a target is at least 36 × 36 px — a hit area, not a size.** Under `(pointer: coarse)` every `v-btn` and every tappable chip (`.v-chip--link`) gets an invisible `::before` grown to 36 px, centred, inside its own stacking context (`isolation: isolate`) and under its own content, so a chip's close button keeps its taps; a tappable chip clips its label instead of itself. A chip group, which scrolls sideways and so clips vertically, gives its chips the room their hit areas need | `styles/responsive.css` · `MeshGraph.vue` (the carrier filter's chips, 10 px above and below on a touch screen) (FR-120 P6) | `size="small"` buttons are 28 px tall and x-small chips 20 px: at 360 px the rooms list had 43 targets under 36 px and Devices 32 (FR-120 P6, measured on production). A mouse matches none of it, so a desktop is pixel-identical. ⚠️ A hit area cannot leave a box that clips (`overflow: hidden`, a scroller): give the target room inside it |
-| **On a phone, show what decides and open the rest on a tap — and a page at 360 px is at most twice its desktop height for the same data**: a row shows its name, its state, its total, and at most one action; access, details, grants and breakdowns open on demand. `useOpenRows()` holds which rows are open; the row's head is a `stack-toggle` button the width of the line, and in a `table-stack-xs` table a `stack-detail` cell shows only while its row is `stack-open` | `composables/useOpenRows.ts`, `styles/responsive.css` · the Devices cards (one line each until tapped, `AgentsSection.vue`) and the enrollment keys under them · the audits' cards · Billing's plans (users, devices and sessions at a time; the other six limits on a tap) · Members, Invites and Files (one line a row; the `v-data-table` row above) · the agent log (its newest 200 lines, then 200 more: `usePhoneSlice`) · the rooms list (a search lists the matching rooms, each with its path) · the Devices cards' Access / Details panels · `SettingsGate.vue` · `UsageTable.vue` (User · Total; a row opens the breakdown) · a role's grants · an agent session's row (`HiveSessionsView.vue`: its state is a word in the subtitle, its actions a ⋮) · agent memory's scopes (`HiveMemoryScope.vue`, each titled with how full it is) | the Devices page was ~11,900 px of open selects and checkboxes at 390 px; Settings was ~3,600 px before its last switch. At 360 px on production, Devices was still 3.66× its desktop height, the audits 3.3–3.6× and Billing 2.24×; FR-120 P4 brought them to 1.26×, 1.6–1.7× and 1.52× (measured) |
-| **A device is named by its display name everywhere a person reads one**: `deviceLabel()` (`composables/useHideDeviceName.ts`) and `useNodeLabel()` on the client, and the server sends the friendly name beside the machine's (`display_name`, `agent_display_name`; additive, `null` when none) | the Devices page and its dialogs, the audit and overlay pages, the Tunnel ACL, `crates/api/src/routes/stats.rs` (uptime), `crates/api/src/routes/usage.rs` (D4), the agent-session rows and dialogs (`HiveSessionsView.vue`, `HiveManage.vue`, `HiveCopies.vue`: the session's kept `device_name` only for a device the org no longer lists), and what the server writes into a session's room: the author line `Claude · <device>` and its notes (`crates/modules/hive/src/room.rs`, `for_people`; the record and the device's harness keep the machine's name, which the CLI's selectors resolve) | the device list said "Reception PC" while the dialogs, the audit lists, the uptime strip, the usage timeline and each agent session said `DESKTOP-…` |
+| **On a phone, show what decides and open the rest on a tap — and a page at 360 px is at most twice its desktop height for the same data**: a row shows its name, its state, its total, and at most one action; access, details, grants and breakdowns open on demand. `useOpenRows()` holds which rows are open; the row's head is a `stack-toggle` button the width of the line, and in a `table-stack-xs` table a `stack-detail` cell shows only while its row is `stack-open` | `composables/useOpenRows.ts`, `styles/responsive.css` · the Devices cards (one line each until tapped, `AgentsSection.vue`) and the enrollment keys under them · the audits' cards · Billing's plans (users, devices and sessions at a time; the other six limits on a tap) · Members, Invites and Files (one line a row; the `v-data-table` row above) · the agent log (its newest 200 lines, then 200 more: `usePhoneSlice`) · the rooms list (a search lists the matching rooms, each with its path) · the Devices cards' Access / Details panels · `SettingsGate.vue` · `UsageTable.vue` (User · Total; a row opens the breakdown) · a role's grants | the Devices page was ~11,900 px of open selects and checkboxes at 390 px; Settings was ~3,600 px before its last switch. At 360 px on production, Devices was still 3.66× its desktop height, the audits 3.3–3.6× and Billing 2.24×; FR-120 P4 brought them to 1.26×, 1.6–1.7× and 1.52× (measured) |
+| **A device is named by its display name everywhere a person reads one**: `deviceLabel()` (`composables/useHideDeviceName.ts`) and `useNodeLabel()` on the client, and the server sends the friendly name beside the machine's (`display_name`, `agent_display_name`; additive, `null` when none) | the Devices page and its dialogs, the audit and overlay pages, the Tunnel ACL, `crates/api/src/routes/stats.rs` (uptime) and `crates/api/src/routes/usage.rs` (D4) | the device list said "Reception PC" while the dialogs, the audit lists, the uptime strip, the usage timeline and each agent session said `DESKTOP-…` |
 | **A side panel that would squeeze the main view overlays it below 960 px**, one at a time, with a close button | `ConferenceView.vue` (chat, files) | a 320 px chat column left the call ~70 px wide and cut off the pre-join pickers; the chat now starts closed there, with a dot on its button when someone writes |
 | **A drawer that can cover a phone takes the full width and carries its own close button** | `GrowthView.vue` (org timeline), the viewer's files drawer | a 440 px temporary drawer on a 390 px screen leaves no scrim to tap — no way out |
 | **A tab window over wide content takes `:touch="false"`; a tab row that can overflow takes `show-arrows`** | `GrowthView.vue`, `AnalyticsView.vue`, the viewer's Settings tabs | a sideways swipe across a wide table switched the **tab**; and below 1280 px Vuetify hides the arrows unless asked, so tabs past the edge gave no sign of themselves |
 | **A number or caption that must be read never sits at the end of a card title** on a phone — it moves into the card's text | `GrowthView.vue` (the weekly-active-orgs north star) | a title never wraps: at 360 px the caption pushed the number off the card |
 | **While a session runs, the remote viewer's toolbar holds only Back, the device's name, Disconnect and Fullscreen**, at every width; the session's state chips and every tool ride their own row under it (`#rc-tb-strip`, one `<Teleport>`: one instance of each control, moved, never copied), state first, scrolling sideways; from 960 px the stats readout comes last, in whole pills only, so it never pushes a tool out of view. Connect's phases keep the one row (below 960 px its items in flex `order`). The stage's alerts overlay the stage | `RemoteControl.vue` (`rc-tb-*`, `sessionToolsOnStrip`, `.rc-stage-alerts`) | the title went to 0 px and Disconnect started off-screen; with every tool still in that one row, the row overflowed and the name was held at its 96 px minimum on a phone ("FR-…" at 360 px) and at 0 px on a 1300 px desktop, with the state chips past the edge or squeezed to stubs (FR-116 P5c); each alert's coming and going resized the frame, re-sent `rc:resolution` and rebuilt the agent's encoder |
-| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:440`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2690`; the pull-tab, `:934`; `.rc-immersive`, `:5758`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
+| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:414`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2781`; the pull-tab, `:949`; `.rc-immersive`, `:5897`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
 | **Text that cannot break still wraps** (`overflow-wrap: anywhere`) | message content (`MessageBubble.vue`), stacked table values | one long URL or email widened a whole list past the screen |
 | **Sign-in fields say what they are**: `autocapitalize="none"`, `autocorrect="off"`, `spellcheck="false"` on the username, `autocomplete` on every credential | `LoginView.vue`, `RegisterView.vue` | iOS capitalised the username, and the server matches it exactly |
 | **The public landing page's sections are a ☰ menu below 960 px**, and its wordmark never shrinks (`flex-0-0` on the title) | `LandingView.vue` | the links were hidden below 600 px with no other way to them, and the wordmark was clipped to "Roo" |
@@ -530,6 +701,11 @@ bun run build          # vue-tsc --noEmit + production build
 bun run test:unit      # Vitest (jsdom)
 bun run e2e            # Playwright (32 spec files)
 ```
+
+bun's version is pinned in [`.bun-version`](../.bun-version), its one record: CI's
+`setup-bun` steps read it, and the server image's UI stage defaults its `BUN_VERSION` to it.
+To move bun, change that file and the Dockerfile's `ARG BUN_VERSION` in one commit; the
+frontend checks fail while the two disagree (`scripts/bun-version-check.sh`, #3400).
 
 Test layout: unit specs in `ui/src/__tests__/` (stores, composables — including
 the `rc:*` ws channel and `useRemoteControl` HID/button-mapping locks), E2E specs

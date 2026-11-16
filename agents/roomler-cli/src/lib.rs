@@ -17,21 +17,19 @@
 /// duplicated crates the daemon already contains.
 pub mod cli;
 pub mod config;
-/// FR-90 P3-9-2b — `roomler connect`: a vault secret's upstream through a
-/// local endpoint the daemon serves, held in the foreground.
-pub mod connectcmd;
 /// FR-103 — the tunnel client renews its own token, and the renewal rule
 /// `roomlerd` shares.
 pub mod credential;
 pub mod forward;
-/// FR-90 P1j-3 — `roomler hive adopt | unadopt | hook`.
-pub mod hive_hooks;
 /// Thin-client read verbs (`status`/`peers`/`flows`) over the daemon LocalAPI.
 pub mod localclient;
 pub mod mesh;
 /// Display names on the CLI: the peers↔devices join and the device-selector
 /// rule for `ping` / `exec` / `ssh` (pure; `docs/device-naming.md`).
 pub mod names;
+/// #3898 — the note the read and config verbs add when a second daemon runs:
+/// its words, and which of them (a one-row Mac's screen worker is no half).
+mod other_daemon;
 pub mod sshcmd;
 pub mod update;
 

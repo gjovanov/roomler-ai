@@ -2,7 +2,7 @@
 
 **Status**: **every AC met except AC2**, which is deliberately deferred and is
 the operator's call to build or drop (see "Is AC2 worth its cost?"). The P1 tail
-(AC3, AC4, AC9's emitted WARN) is in review as
+(AC3, AC4, AC9's emitted WARN) merged on 2026-10-29 as
 [#3097](https://github.com/gjovanov/roomler-ai/pull/3097), each test shown RED on
 the shipped behaviour and GREEN on the fix (field log 2026-10-29);
 AC6 was re-read 2026-10-29 on two two-org hosts running the released 0.4.185.
@@ -47,7 +47,7 @@ Turn two overlay properties from **promises into properties**:
 
 - **The decoder pin.** No test feeds a P5d netmap *containing* `cidrs` into a pre-P5d
   decoder. `a_pre_p5d_netmap_still_decodes_and_carries_no_block_list`
-  (`crates/remote_control/src/signaling.rs:11289`) only tests old-server → new-decoder.
+  (`crates/remote_control/src/signaling.rs:7238`) only tests old-server → new-decoder.
   Copy `agent-v0.4.42`'s `OverlayNetworkInfo` verbatim as a local struct and decode a real
   grown-org netmap into it.
 - **Cross-tenant carve racing a grow.** `allocate`'s `DuplicateKey` arm
@@ -75,7 +75,7 @@ nothing on prod cluster nodes.
 ### Why each cell lands on the lane it does
 
 - **Multi-org ⇒ win11.** `defend_self_route` is **Windows-only**
-  (`crates/tunnel-core/src/overlay/tun.rs:2663-2719`; no-op default at `tun.rs:95`). An
+  (`crates/tunnel-core/src/overlay/tun.rs:2778-2834`; no-op default at `tun.rs:95`). An
   Ubuntu cell would pass vacuously.
 - **IPAM ⇒ ubuntu.** The pre-P5d degradation is in NAT *scope* — which CIDRs get a
   MASQUERADE rule (`crates/tunnel-core/src/overlay/nat.rs:119-133`) — which is
@@ -121,7 +121,7 @@ inside a live one) belongs to FR-47's reconciler, not here.
 There is **no counter** for route evictions or carrier revalidations. Both are log-only,
 throttled to **1 WARN/min/prefix** carrying `suppressed_since_last` — a naive `grep -c`
 under-reports by up to 40×. Three cumulative counters, following the canonical path
-`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:273` →
+`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:278` →
 `agents/roomler-cli/src/localclient.rs:1400-1406`:
 
 `ROUTE_EVICTIONS` (split `sibling` / `foreign`) · `ROUTE_WAVES` · `FORCED_REVALIDATIONS`

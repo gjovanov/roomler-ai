@@ -26,7 +26,7 @@ latency side; this FR is the cadence side.
 | The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9867`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
 | The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10285` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts were whole milliseconds (**fixed in P2a**, §4.2) | master `28156b3af` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
-| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1772`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2278`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2301`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
+| The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1779`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2285`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2308`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
 | The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
 | The default capture gate's period is whole milliseconds; the microsecond gate is opt-in | `capture/gate.rs` (the legacy rule caps `1000/144` at 166 fps and can phase-lock); the slot-first gate keeps µs (`:103`) behind `ROOMLERD_CAPTURE_GATE`, field A/B owed (FR-98 P1) | Above 60, the slot-first gate should be the one in use |
 | WGC and `CGDisplayStream` deliver at the panel's refresh | WGC is compositor-driven; scrap's quartz stream is unthrottled (`throttle: 0.0`, `crates/vendored/scrap/src/quartz/config.rs:69`) | A 60 Hz panel cannot produce 120 fps. A 120 Hz MacBook already can |
@@ -403,14 +403,17 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
 |---|---|---|
 | Windows, WGC | the captured monitor: `GetMonitorInfoW` → `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` → `dmDisplayFrequency` | `capture/refresh.rs` `of_monitor` |
 | Windows, scrap (DXGI) | the primary display, the same call | `of_primary` |
+| Windows, SYSTEM context (DXGI, or GDI after a fallback) | the primary display, the same call, on the capture thread once it is bound to the input desktop | `system_context/capture_pump.rs` |
 | macOS, scrap (quartz) | `CGDisplayModeGetRefreshRate` of the main display's current mode | `of_main_display` |
 | Linux, scrap (X11) | the primary RandR output's mode: the dot clock over `htotal × vtotal`, halved when interlaced, doubled when double-scanned | `of_x11_primary`, `of_mode_timings` |
 | Linux, DRM | the CRTC mode's `vrefresh` | `drm_backend.rs`, at the open |
 
 - **Read once, at the open,** like the gate (`ScreenCapture::refresh_hz`). A capture opened again reads it again.
   A reading of 0 or 1 is no rate: Windows reports those for the hardware's default, and macOS reports 0 for some
-  built-in panels. Neither decides anything, and a trial then finds out. The portal, the system context and the
-  synthetic source do not read it.
+  built-in panels. Neither decides anything, and a trial then finds out. The portal and the synthetic source do
+  not read it. The system context did not either until 2026-11-08, and a 120 was granted on a 60 Hz panel
+  ([FR-135](FR-135-one-rc-media-pipeline.md) §13). Since then the trait method has no default, so every backend
+  answers for itself.
 - **Where it goes:** the grant refuses a rate above it (`refresh`), the rate class is keyed on it, and
   `rc:video-info` carries it as `refresh_hz`, beside the frame-rate answer and only with `fps-high` on. The
   viewer's picker disables the rates above it, with the reason.
@@ -612,7 +615,7 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
 - ⚠️ **What the two timestamps mean.** The trial's is the capture worker's receipt (`frame.monotonic_us`). The wire
   header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9446`). So a trial that
   passes at p99 16.4 ms says the host CAN keep up; it says nothing about the cadence the viewer gets.
-- **Guards.** CI's macOS packaging lint (`ci.yml:1304`) fails if the daemon, agent or desktop job loses
+- **Guards.** CI's macOS packaging lint (`ci.yml:1311`) fails if the daemon, agent or desktop job loses
   `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1168`) asserts that launchd loaded the
   daemon as `spawn type = interactive (4)`, after an enabled install and after a plain re-install (the self-update
   path). Both checks were run red against the shipped job on the MacBook, which reads `daemon (3)`.

@@ -57,6 +57,9 @@ import {
   type SharpenMode,
 } from '@/workers/rc-fsr-render'
 import { colorSpaceLabel } from '@/workers/rc-decoder-config'
+import { MEDIA_BUCKETS, type ViewerMediaWindow } from '@/workers/rc-media-window'
+import { createChannelMoveWatch, createDeliveryGapClock, moveVideoChannelToWorker } from '@/workers/rc-video-channel'
+import { CAL_MAX_RTT_MS, createClockCalibration, storedClockCal, type ClockCalibration } from '@/workers/rc-clock-cal'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -89,6 +92,10 @@ import {
   type RcConnectRecorder,
 } from './rcConnectTiming'
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
+import { createResumeRecordUploader } from './rcResumeRecord'
+import { createHoldPaintGap, createSessionHold, holdWindowFor, type RcHoldPaintGap, type RcHoldSummary } from './rcSessionHold'
+import { PAINT_GAP_CLOSED, PAINT_GAP_MARK, PAINT_GAP_MARKED, createPaintGapMark } from '@/workers/rc-paint-gap'
+import type { RcReloadState, RcReloadSurface, RcResumeArgs } from '@/utils/staleBuildPolicy'
 import {
   PROBE_TARGET,
   benchSessionMode,
@@ -102,6 +109,7 @@ import {
   type BenchMode,
   type BenchPath,
   type BenchProber,
+  type RcL4Join,
   type VideoBenchSampler,
 } from './rcBench'
 import { useSnackbar } from './useSnackbar'
@@ -169,8 +177,8 @@ import { ctrlAltDelFrames } from './ctrlAltDel'
  * resolves in well under a second, and a 2 s first-retry would leave
  * a visible black-frame window every time the user touches the lock
  * screen. The last three (2 s / 4 s / 8 s) cover real network drops.
- * 6 attempts caps the worst case at ~16 s before we give up and
- * surface an error to the operator.
+ * Past them the ladder retries every `RC_RECONNECT_STEADY_MS` and never
+ * gives up on its own (rc.23): the operator's Disconnect ends it.
  */
 export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as const
 
@@ -422,6 +430,44 @@ export function isRetryableRcErrorCode(code: unknown): boolean {
 }
 
 /**
+ * #3582 - this viewer, as a reload for a new build sees it
+ * (`utils/staleBuildPolicy.ts`). `redialing` is the one state a reload can
+ * take over without cutting anything: the session is already gone, the
+ * ladder's timer is waiting (or a reload holds it), nothing is in flight, and
+ * the args to open the next one are known. A request or a consent prompt in
+ * flight is `live`: a reload then would abandon a question the host may be
+ * reading. An external session (FR-52) never redials, so it is never
+ * `redialing`. A session that ended within `RC_ENDED_HOLD_MS` holds the page:
+ * its notice, its error or the rating prompt is what the person is reading.
+ */
+export function rcReloadState(inp: {
+  phase: RcPhase
+  redialPending: boolean
+  hasArgs: boolean
+  external: boolean
+  work: boolean
+  endedRecently: boolean
+  asksConsent: boolean
+}): RcReloadState {
+  const session =
+    inp.phase === 'idle' || inp.phase === 'closed' || inp.phase === 'error'
+      ? 'none'
+      : inp.phase === 'reconnecting' && inp.redialPending && inp.hasArgs && !inp.external
+        ? 'redialing'
+        : 'live'
+  return {
+    session,
+    external: inp.external,
+    work: inp.work,
+    hold: session === 'none' && inp.endedRecently,
+    asksConsent: inp.asksConsent,
+  }
+}
+
+/** #3582 - how long a session's end holds the page against a reload for a new build. */
+export const RC_ENDED_HOLD_MS = 5 * 60_000
+
+/**
  * #2251 - is this `rc:error` fallout of a session the server already ended?
  * After a scoped `rc:terminate` the phase is `closed` and the view shows that
  * end's own sentence. Frames that were in flight as it ended (the ICE
@@ -654,11 +700,12 @@ export function nextStallTicks(prev: number, advanced: boolean, agentSaidNoPixel
   return advanced || agentSaidNoPixels ? 0 : prev + 1
 }
 
-/** The counters one media-watchdog tick compares. */
+/** The counters one media-watchdog tick compares. `dcFrames` is the one
+ *  data-channel path's decoded frames (FR-135 R3: one worker for every codec,
+ *  where VP9 and HEVC each had a counter). */
 export interface MediaProgress {
   rtpBytes: number
-  vp9Frames: number
-  hevcFrames: number
+  dcFrames: number
 }
 
 /**
@@ -671,11 +718,11 @@ export interface MediaProgress {
  * that first frame RTP still counts, because the viewer opens its channel
  * speculatively and an agent that ignores it sends RTP instead. A path taken
  * down reads zero frames, so a `<video>` fallback is judged on RTP again.
- * `transportOnly` false is the old rule, any of the three, for the kill switch.
+ * `transportOnly` false is the old rule, either counter, for the kill switch.
  */
 export function mediaAdvanced(prev: MediaProgress, cur: MediaProgress, transportOnly: boolean): boolean {
-  if (cur.vp9Frames > prev.vp9Frames || cur.hevcFrames > prev.hevcFrames) return true
-  const onDataChannel = transportOnly && (cur.vp9Frames > 0 || cur.hevcFrames > 0)
+  if (cur.dcFrames > prev.dcFrames) return true
+  const onDataChannel = transportOnly && cur.dcFrames > 0
   return !onDataChannel && cur.rtpBytes > prev.rtpBytes
 }
 
@@ -894,6 +941,10 @@ export function friendlyEndReason(
     return "This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."
   }
   switch (reason) {
+    // FR-138 §2.5 — an admin's end said nothing; so did a resume the server
+    // refused because this person may no longer control the device.
+    case 'admin_terminated':
+      return 'An administrator ended this session, or changed who may control this device.'
     case 'user_denied':
       if (asks === 'owner') return "The device's owner declined the request."
       // `prompt_then_email`: an explicit Deny at the device ends it, and so
@@ -930,9 +981,12 @@ export function classifyDegraded(inp: {
   pcState: string | null
   wsConnected: boolean
   stallTicks: number
+  /** FR-138 — the session is held: its device's socket dropped (`rc:session.detached`). */
+  held?: boolean
 }): RcDegradedReason | null {
   if (inp.pcState === 'disconnected') return 'transport_unstable'
   if (inp.stallTicks >= RC_STALL_PROBE_TICKS) return 'media_stalled'
+  if (inp.held) return 'signalling_offline'
   if (!inp.wsConnected) return 'signalling_offline'
   return null
 }
@@ -1568,6 +1622,11 @@ export type RcControlInbound =
   /** FR-101 P4b-2b — the device's idle limit: the session ends in `endsInMs`
    *  unless someone acts; `null` withdraws the warning. */
   | { kind: 'idle'; endsInMs: number | null }
+  /** FR-138 — the session ended while the server could not tell this page
+   *  (the person at the device, or the server's end of a session the device
+   *  holds): the device says it peer to peer, with the reason and limit an
+   *  `rc:terminate` carries, and the page reads it as one. */
+  | { kind: 'ended'; reason: string; limit: string | null }
   | { kind: 'control_state'; state: RcControlState }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
@@ -1841,6 +1900,11 @@ export function parseControlInbound(data: unknown): RcControlInbound {
       activeTag: obj.active,
       installed,
     }
+  }
+  // FR-138 — `{"t":"rc:ended","reason":…,"limit"?:…}`: an end the device
+  // says peer to peer. No reason, no message.
+  if (obj.t === 'rc:ended' && typeof obj.reason === 'string' && obj.reason.length > 0) {
+    return { kind: 'ended', reason: obj.reason, limit: typeof obj.limit === 'string' ? obj.limit : null }
   }
   return null
 }
@@ -2357,16 +2421,16 @@ export const RC_CODEC_CHOICES = [
   // FR-77 — the two-axis picker: codec "Auto" with an explicit chroma format.
   'auto-444',
   'auto-420',
+  // #3651 — HEVC and H.264 with "Standard (4:2:0)". Plain `hevc` / `h264` keep
+  // chroma "Auto" (the dial decides), which is what a value stored before means.
+  'hevc-420',
+  'h264-420',
 ] as const
 
 export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
   try {
     const raw = globalThis.localStorage?.getItem(CODEC_STORAGE_PREFIX + agentId)
-    if (
-      raw &&
-      raw !== 'auto' &&
-      (RC_CODEC_CHOICES as readonly string[]).includes(raw)
-    ) {
+    if (raw && raw !== 'auto' && (RC_CODEC_CHOICES as readonly string[]).includes(raw)) {
       return raw as RcCodecChoice
     }
   } catch {
@@ -2437,6 +2501,8 @@ export function decodeStatWireMessage(
   probeRttMs?: number | null,
   link?: { rxBps: number; queueMs: number | null } | null,
   arrival?: { avgMs: number } | null,
+  media?: Partial<ViewerMediaWindow> | null,
+  queueArrMs?: number | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -2486,6 +2552,54 @@ export function decodeStatWireMessage(
     // window cannot wrap into its own sign.
     msg.queue_ms = Math.min(Math.max(Math.round(link.queueMs), -32768), 32767)
   }
+  // FR-135 R3 — the same growth read at ARRIVAL: the worker's queue drift over
+  // whole frames as their last chunk lands, before the gate, the backlog drop
+  // and the decoder (`queueArrMs`), where `queue_ms` is read at paint, so a
+  // decoder falling behind cannot read as the link growing. Beside it, never
+  // instead: the live law and FR-63's shadow read `queue_ms`, and FR-63's B2
+  // chooses. Sent only when the worker counted it (two whole frames or more in
+  // the window), on its own, in `queue_ms`'s i16 clamp. No agent reads it yet.
+  if (typeof queueArrMs === 'number' && Number.isFinite(queueArrMs)) {
+    msg.queue_arr_ms = Math.min(Math.max(Math.round(queueArrMs), -32768), 32767)
+  }
+  // FR-135 R0 (N9-N12, N16) — the decode worker's window of media numbers
+  // (`rc-media-window.ts`), for the agent's heartbeat and the session's
+  // summary. Each field goes only when the worker counted it, so absent is
+  // **not counted**, never zero; nothing here is read by a rate law, and the
+  // fields above are unchanged. A `_ms` field is twelve log-2 ms buckets for
+  // this window; `chunk_gaps`, `freezes` and `painted` are cumulative.
+  if (media) {
+    const hist = (v: unknown): number[] | null =>
+      Array.isArray(v) &&
+      v.length === MEDIA_BUCKETS &&
+      v.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0)
+        ? v.map((n: number) => Math.min(n, 4_294_967_295))
+        : null
+    const count = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isInteger(v) && v >= 0 ? Math.min(v, Number.MAX_SAFE_INTEGER) : null
+    const hists: [string, unknown][] = [
+      ['dec_ms', media.dec],
+      ['paint_ms', media.paint],
+      ['fwd_ms', media.fwd],
+      ['backlog_ms', media.backlog],
+      ['arr_gap_ms', media.arrGap],
+      ['gate_ms', media.gate],
+    ]
+    for (const [key, v] of hists) {
+      const h = hist(v)
+      if (h) msg[key] = h
+    }
+    const counts: [string, unknown][] = [
+      ['chunk_gaps', media.chunkGaps],
+      ['freezes', media.freezes],
+      ['painted', media.painted],
+    ]
+    for (const [key, v] of counts) {
+      const n = count(v)
+      if (n !== null) msg[key] = n
+    }
+    if (typeof media.decoderHw === 'boolean') msg.decoder_hw = media.decoderHw
+  }
   // FR-132 P1 — this viewer counts its decode errors (one `rc:decode-error`
   // each, `decodeErrorWireMessage`), so the agent reports the session's count
   // and a zero is a measured one. An older viewer sends no `de`, and its
@@ -2512,7 +2626,8 @@ export function decodeErrorStage(type: string): DecodeErrorStage {
  *  session's `rc:session.stats` (`decode_errors`), which is how a fleet week
  *  of a GPU-input cell can be read for decode errors without anyone watching
  *  a viewer. `path` is the decode worker (`webcodecs` = the RTP transform,
- *  `vp9-444` and `hevc` = the data-channel workers). The codec and the
+ *  `vp9-444` and `hevc` = the data-channel worker, on VP9/AV1/H.264 and on
+ *  HEVC: the names it kept from its two workers, `DcPathLabel`). The codec and the
  *  decoder's message are cut short; the agent bounds them again. Pure so the
  *  wire shape is unit-tested. */
 export function decodeErrorWireMessage(
@@ -3056,18 +3171,28 @@ export async function isVp9_420DecodeSupported(): Promise<boolean> {
   }
 }
 
-/** rc.78 Ã¢ÂÂ feature-detect HEVC decode via WebCodecs. rc.94 Ã¢ÂÂ probes
- *  `hev1.1.6.L153.B0` (Main profile, Level **5.1**), matching the
- *  worker's `DEFAULT_HEVC_CODEC`. MUST stay in sync with the worker:
- *  the probe has to declare the SAME level the worker will configure,
- *  or we'd green-light a level the decoder then rejects on real bytes.
- *  Bumped from L3.1 (`L93`) which maxed at ~1280ÃÂ720 and rendered the
- *  field host's 1920ÃÂ1200 capture as a black screen (see worker note).
- *  The composable probes once on construction + caches in
- *  `hevcSupported`; `connect()` re-probes on the off-chance the cache
- *  hasn't resolved yet.
+/** The HEVC codec string the data-channel worker configures for a Main-profile
+ *  session, and the one `isHevcDecodeSupported` probes: HEVC Main, Level
+ *  **5.1**, no decoder description (Annex-B). One constant, so the probe
+ *  declares the level the decoder is then configured with: a probe at another
+ *  level would green-light a stream the decoder rejects on real bytes.
+ *  rc.94 — bumped from L3.1 (`L93`). L3.1 maxes at 983,040 luma samples
+ *  (~1280×720); the field SystemContext host (WINHOST-E) captures 1920×1200 =
+ *  2,304,000 samples, which exceeds even L4.1 (2,228,224), so Chromium's HW
+ *  HEVC decoder rejected the stream and rendered a BLACK screen. L5.1
+ *  (`L153`, 8,912,896 samples, up to 4K@64) covers every realistic desktop
+ *  resolution and is HW-decodable on Iris Xe / RTX 5090 (the Gate 0 hosts).
+ *  The level is a declared MAX; a smaller stream decodes fine under it.
+ *  FR-135 R3 moved it here from the HEVC worker's default when the two
+ *  data-channel workers became one. */
+export const HEVC_MAIN_CODEC_STRING = 'hev1.1.6.L153.B0'
+
+/** rc.78 — feature-detect HEVC decode via WebCodecs, at
+ *  {@link HEVC_MAIN_CODEC_STRING}. The composable probes once on construction
+ *  + caches in `hevcSupported`; `connect()` re-probes on the off-chance the
+ *  cache hasn't resolved yet.
  *
- *  Unlike VP9, HEVC has NO software fallback in WebCodecs Ã¢ÂÂ Chromium
+ *  Unlike VP9, HEVC has NO software fallback in WebCodecs - Chromium
  *  only enables HEVC decode when the OS provides a HW decoder.
  *  Returns false on:
  *  - any pre-WebCodecs browser (no `VideoDecoder` at all)
@@ -3084,7 +3209,7 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
   const isConfigSupported = g.VideoDecoder?.isConfigSupported
   if (typeof isConfigSupported !== 'function') return false
   try {
-    const res = await isConfigSupported({ codec: 'hev1.1.6.L153.B0' })
+    const res = await isConfigSupported({ codec: HEVC_MAIN_CODEC_STRING })
     return res?.supported === true
   } catch {
     return false
@@ -3093,7 +3218,7 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
 
 /** P7 — HEVC Rext (Range extensions) 8-bit 4:4:4 codec string, Level 5.1.
  *  The Annex-B no-description contract is identical to the Main-profile
- *  string the HEVC worker ships; only the profile fields differ
+ *  string ({@link HEVC_MAIN_CODEC_STRING}); only the profile fields differ
  *  (profile_idc 4 + the Rext compatibility flag). */
 export const HEVC_REXT_CODEC_STRING = 'hev1.4.10.L153.B0'
 
@@ -3762,6 +3887,9 @@ export function codecChoiceToSettings(
       return { videoTransport: 'data-channel-av1', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
     case 'hevc':
       return { videoTransport: 'data-channel-hevc', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'hevc-420':
+      // #3651 — HEVC with "Standard (4:2:0)": plain HEVC with the chroma pinned.
+      return { ...codecChoiceToSettings('hevc'), chroma: 'yuv420' }
     case 'hevc-444':
       // P7 — HEVC Rext 4:4:4 (hevc_nvenc + Chrome Rext decode; kills
       // ClearType chroma fringing on the HW pipeline). connect() gates on
@@ -3774,12 +3902,7 @@ export function codecChoiceToSettings(
         renderPath: 'webcodecs',
       }
     case 'vp9-444':
-      return {
-        videoTransport: 'data-channel-vp9-444',
-        chroma: 'yuv444',
-        preferredCodec: null,
-        renderPath: 'webcodecs',
-      }
+      return { videoTransport: 'data-channel-vp9-444', chroma: 'yuv444', preferredCodec: null, renderPath: 'webcodecs' }
     case 'vp9-420':
       return {
         videoTransport: 'data-channel-vp9-444',
@@ -3823,17 +3946,19 @@ export function codecChoiceToSettings(
         preferredCodec: 'h264',
         renderPath: 'webcodecs',
       }
-    case 'auto':
-    default:
+    case 'h264-420':
+      // #3651 — likewise; with `h264Rtp` that is the RTP track, 4:2:0 only anyway.
+      return { ...codecChoiceToSettings('h264', opts), chroma: 'yuv420' }
+    case 'auto': // no `default`: a choice added to RC_CODEC_CHOICES with no case here fails the type check
       return { videoTransport: 'auto', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
   }
 }
 
 /** Reverse of `codecChoiceToSettings` (for the picker's displayed value): map
- *  the stored transport + chroma back to a choice. A `data-channel-vp9-444`
- *  transport reads as 4:4:4 only when the chroma is explicitly `yuv444`;
- *  otherwise (incl. the legacy `auto`) it reads as the 4:2:0 efficient choice.
- *  Pure + exported for the round-trip test. */
+ *  the stored transport + chroma back to a choice. An explicit chroma reads back
+ *  as itself on every transport that can carry it (#3651: HEVC and H.264 too),
+ *  and `auto` as the codec's plain choice, which follows the dial. Pure +
+ *  exported for the round-trip test. */
 export function settingsToCodecChoice(
   transport: RcVideoTransport,
   chroma: Vp9ChromaPref,
@@ -3842,18 +3967,18 @@ export function settingsToCodecChoice(
     case 'data-channel-av1':
       return 'av1'
     case 'data-channel-hevc':
-      // P7 — an explicit yuv444 chroma on the HEVC transport is the Rext
-      // pick; everything else (incl. the legacy 'auto') reads as plain HEVC.
-      return chroma === 'yuv444' ? 'hevc-444' : 'hevc'
+      // P7 — an explicit yuv444 is the Rext pick; #3651 — an explicit yuv420 is
+      // "Standard (4:2:0)"; the legacy 'auto' reads as plain, dial-following HEVC.
+      return chroma === 'yuv444' ? 'hevc-444' : chroma === 'yuv420' ? 'hevc-420' : 'hevc'
     case 'data-channel-vp9-444':
       // FR-77 — an explicit chroma keeps its VP9 profile; `auto` is the
       // dial-following `vp9` choice (it used to read as 4:2:0, which hid that
       // the agent's default for an unstated chroma is profile 1).
       return chroma === 'yuv444' ? 'vp9-444' : chroma === 'yuv420' ? 'vp9-420' : 'vp9'
     case 'data-channel-h264':
-      return chroma === 'yuv444' ? 'h264-444' : 'h264'
-    case 'webrtc':
-      return 'h264'
+      return chroma === 'yuv444' ? 'h264-444' : chroma === 'yuv420' ? 'h264-420' : 'h264'
+    case 'webrtc': // the RTP track is 4:2:0 only: a legacy yuv444 here is plain H.264
+      return chroma === 'yuv420' ? 'h264-420' : 'h264'
     case 'auto':
     default:
       // FR-77 — codec Auto remembers an explicit chroma.
@@ -4330,6 +4455,39 @@ export function storedDecodeRecover(): boolean {
     return true
   }
 }
+
+/** FR-135 R3 — the per-browser switch that moves the `video-bytes` channel
+ *  into the data-channel decode worker, so the main thread leaves the
+ *  per-chunk path (`moveVideoChannelToWorker`). `localStorage.setItem(
+ *  'roomler-rc-dc-worker', '1')` turns it on and `'0'` off, then reconnect.
+ *  Anything else, no value, or storage that cannot be read is
+ *  {@link DC_WORKER_DEFAULT}. Where this browser cannot transfer an
+ *  RTCDataChannel the page relays the channel either way. Read once per
+ *  connect, like every `roomler-rc-*` knob. Pure + exported for tests. */
+export const DC_WORKER_STORAGE_KEY = 'roomler-rc-dc-worker'
+
+/** FR-135 R3 — whether the channel moves into the worker when this browser has
+ *  not said. OFF until S11, a real session at 60 Mbit/s or more, shows the
+ *  move beats the relay on `fwd_ms` p95 by more than run-to-run spread
+ *  (FR-135 §7.5's R3 row). The flip is this one line. */
+export const DC_WORKER_DEFAULT = false
+
+export function storedDcWorker(): boolean {
+  try {
+    const raw = (globalThis.localStorage?.getItem(DC_WORKER_STORAGE_KEY) ?? '').trim()
+    if (raw === '1') return true
+    if (raw === '0') return false
+  } catch {
+    /* storage unreadable: the default */
+  }
+  return DC_WORKER_DEFAULT
+}
+
+/** FR-135 R3 — how long after the worker's first answer the page waits to hear
+ *  a moved channel arrived. The worker answers `init-canvas` before it reads
+ *  the channel, in the same run of its queue, so this only has to cover a
+ *  worker that could not take the channel; a slow module load is not in it. */
+export const DC_WORKER_ATTACH_GRACE_MS = 2000
 
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
@@ -4895,6 +5053,12 @@ export function isChromeWithBrokenScriptTransform(): boolean {
  *  retransmit latency. */
 export const VP9_444_DC_LABEL = 'video-bytes'
 
+/** FR-135 R3 — the name a data-channel video path goes by: `hevc` on the HEVC
+ *  transport, `vp9-444` on VP9, AV1 and H.264, the names their two workers
+ *  had before R3 made them one. It is `rc:decode-error`'s `path`, which the
+ *  agent counts by, and the bench record's, so it stays as it was. */
+export type DcPathLabel = 'vp9-444' | 'hevc'
+
 /**
  * FR-17 stage B — how the `video-bytes` channel is opened.
  *
@@ -5391,7 +5555,7 @@ export function useRemoteControl(
   /** 1 Hz media-progress watchdog (runs only while connected). */
   let watchdogTimer: ReturnType<typeof setInterval> | null = null
   let stallTicks = 0
-  let lastMediaProgress: MediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+  let lastMediaProgress: MediaProgress = { rtpBytes: 0, dcFrames: 0 }
 
   function clearPcDisconnectedTimer() {
     if (pcDisconnectedTimer !== null) {
@@ -5405,6 +5569,163 @@ export function useRemoteControl(
       clearTimeout(signalingTimer)
       signalingTimer = null
     }
+  }
+
+  // ── FR-138 P1c — the hold (`rcSessionHold.ts`, spec §4.5) ──────────────
+  /** A session the server called resumable rides out the loss of its control
+   *  socket: `true` from the cut (this page's socket dropped, or
+   *  `rc:session.detached`) to its outcome. The phase stays `connected`, so the
+   *  stage stays mounted, and the chip reads `connected · server link down`. */
+  const sessionHeld = ref(false)
+  /** The held session a redial replaces: sent as `replaces` on every
+   *  `rc:session.request` until one is answered, so the server ends it before
+   *  its capacity gate (spec §4.4). Only a redial of a session the server
+   *  called resumable sets it; `null` is today's request, byte for byte. */
+  let replacesId: string | null = null
+  /** `rc.resume`'s `gap_ms` for the hold in progress, and the paint path that
+   *  answers for it. */
+  let holdGap: RcHoldPaintGap | null = null
+  let holdGapPath: 'dc' | 'webcodecs' | 'video' | null = null
+  let holdHiddenAtCut = false
+  /** The `<video>` path's frames, as the view's frame callback reports them. */
+  const videoPaintMark = createPaintGapMark()
+  const resumeRecordUploader = createResumeRecordUploader()
+  const hold = createSessionHold({
+    now: () => performance.now(),
+    wallNow: () => Date.now(),
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
+    socketUp: () => ws.status === 'connected',
+    sendRejoin: (sid) => {
+      console.info('[rc] FR-138: asking for the held session back (rc:session.rejoin)', sid)
+      ws.sendRaw({ t: 'rc:session.rejoin', session_id: sid })
+    },
+    onStart: (sid) => onHoldStart(sid),
+    onExpired: (s) => {
+      console.warn('[rc] FR-138: no answer by the held session\'s deadline - closing the peer and redialing', s.sessionId)
+      onHoldEnd(s)
+      scheduleReconnect()
+    },
+  })
+
+  /** The cut: ask the session's paint path how long ago it painted, and for
+   *  the first frame after it. */
+  function onHoldStart(sid: string) {
+    sessionHeld.value = true
+    holdHiddenAtCut = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+    const now = performance.now()
+    holdGap = createHoldPaintGap(now)
+    try {
+      if (dcWorker && dcActive.value) {
+        holdGapPath = 'dc'
+        dcWorker.postMessage({ type: PAINT_GAP_MARK })
+      } else if (webcodecsWorker && webcodecsActive.value) {
+        holdGapPath = 'webcodecs'
+        webcodecsWorker.postMessage({ type: PAINT_GAP_MARK })
+      } else {
+        holdGapPath = 'video'
+        holdGap.marked(videoPaintMark.mark(now))
+      }
+    } catch {
+      /* a worker gone mid-post: the record says the gap is open */
+    }
+    refreshDegraded()
+    console.info(
+      '[rc] FR-138: holding the session through the loss of its control socket', sid,
+      ws.status === 'connected' ? '(the device\'s dropped)' : '(this page\'s dropped)',
+    )
+  }
+
+  /** The hold's outcome: its record, `rc.resume`, and the chip. */
+  function onHoldEnd(s: RcHoldSummary) {
+    sessionHeld.value = false
+    const gap = holdGap?.read(performance.now()) ?? { gapMs: null, open: true }
+    holdGap = null
+    holdGapPath = null
+    resumeRecordUploader.send({
+      tenantId: expectedOrgTid(null, location.pathname) ?? lastConnectArgs?.orgId ?? null,
+      agentOrgId: lastConnectArgs?.orgId ?? null,
+      agentId: lastConnectArgs?.agentId ?? null,
+      sessionId: s.sessionId,
+      outcome: s.outcome,
+      reason: s.reason,
+      heldMs: s.heldMs,
+      wsDownMs: s.wsDownMs,
+      gapMs: gap.gapMs,
+      gapOpen: gap.open,
+      hidden: holdHiddenAtCut || (typeof document !== 'undefined' && document.visibilityState === 'hidden'),
+    })
+    refreshDegraded()
+    const line = `[rc] FR-138: held ${s.heldMs} ms, ${s.outcome}${s.reason ? ` (${s.reason})` : ''}`
+    if (s.outcome === 'resumed') console.info(line)
+    else console.warn(line)
+  }
+
+  /** End the hold in progress, if one runs, as `ended` with `reason`. */
+  function endHold(reason: string) {
+    const s = hold.end(reason)
+    if (s) onHoldEnd(s)
+  }
+
+  /** The chip now, rather than at the media watchdog's next tick. */
+  function refreshDegraded() {
+    if (phase.value !== 'connected') return
+    degraded.value = classifyDegraded({
+      pcState: pc?.connectionState ?? null,
+      wsConnected: ws.status === 'connected',
+      stallTicks,
+      held: hold.holding(),
+    })
+  }
+
+  /** FR-138 — a frame the `<video>` element presented (the view's frame
+   *  callback): that path's half of `rc.resume`'s `gap_ms`. */
+  function notePaint(nowMs: number = performance.now()) {
+    const closed = videoPaintMark.painted(nowMs)
+    if (closed && holdGapPath === 'video') holdGap?.closed(closed.gapMs)
+  }
+
+  /** FR-138 — one end per session: the server's `rc:terminate` and the
+   *  device's `rc:ended` may both say it, and the first one wins. */
+  let endedSessionId: string | null = null
+  function claimEnd(sid: string | null): boolean {
+    if (!sid) return true
+    if (endedSessionId === sid) return false
+    endedSessionId = sid
+    return true
+  }
+
+  /** FR-138 — `rc:ended` on the control channel: the session ended while the
+   *  server could not tell this page, and the device says so peer to peer. The
+   *  person at the device (Disconnect, the idle limit), or the server's end of
+   *  a session the device holds (a kick, the maximum length, a refused claim).
+   *  Classified as `rc:terminate` is: a retryable reason starts today's ladder,
+   *  and a final one closes with no ladder and the replay arguments dropped,
+   *  so a reload resumes nothing either. `fromPc`: the peer whose control
+   *  channel said it; a channel this session no longer owns ends nothing. */
+  function onDeviceEnded(reason: string, limit: string | null, fromPc: RTCPeerConnection | null) {
+    if (fromPc !== pc || phase.value === 'idle' || phase.value === 'closed' || phase.value === 'error' || phase.value === 'reconnecting') return
+    if (!claimEnd(sessionId.value)) return
+    endHold(reason)
+    const action = terminateAction({
+      phase: phase.value,
+      retryable: isRetryableTerminateReason(reason, limit),
+      canReplay: !!lastConnectArgs,
+    })
+    if (action === 'reconnect') {
+      console.info('[rc] FR-138: the device ended the session (rc:ended', reason, ') - auto-reconnecting')
+      scheduleReconnect({ notifyServer: false })
+      return
+    }
+    console.info('[rc] FR-138: the device ended the session (rc:ended', reason, ') - not reconnecting')
+    phase.value = 'closed'
+    if (endedByHost(reason)) endedBy.value = 'host'
+    cancelReconnect()
+    lastConnectArgs = null
+    replacesId = null
+    const friendly = friendlyEndReason(reason, limit, consentAsks.value)
+    if (friendly) error.value = friendly
+    teardown()
   }
 
   /** (Re-)arm the signalling stuck-detector for the CURRENT phase.
@@ -5439,7 +5760,7 @@ export function useRemoteControl(
       watchdogTimer = null
     }
     stallTicks = 0
-    lastMediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+    lastMediaProgress = { rtpBytes: 0, dcFrames: 0 }
     degraded.value = null
   }
 
@@ -5456,7 +5777,7 @@ export function useRemoteControl(
   function startMediaWatchdog() {
     if (watchdogTimer !== null) return
     stallTicks = 0
-    lastMediaProgress = { rtpBytes: statsPrevBytes, vp9Frames: 0, hevcFrames: 0 }
+    lastMediaProgress = { rtpBytes: statsPrevBytes, dcFrames: 0 }
     // FR-93 P5f — when the interval this tick counts began (see advanceEndsWait).
     let tickFromMs = Date.now()
     watchdogTimer = setInterval(() => {
@@ -5465,8 +5786,7 @@ export function useRemoteControl(
       if (phase.value !== 'connected') return
       const cur = {
         rtpBytes: statsPrevBytes,
-        vp9Frames: vp9_444FramesDecoded.value,
-        hevcFrames: hevcFramesDecoded.value,
+        dcFrames: dcFramesDecoded.value,
       }
       // No hasMedia special-case: a session that reached 'connected'
       // but never produced a track/frame is just as dead as one that
@@ -5506,6 +5826,7 @@ export function useRemoteControl(
         pcState: pc?.connectionState ?? null,
         wsConnected: ws.status === 'connected',
         stallTicks,
+        held: hold.holding(),
       })
       const action = nextStallAction(stallTicks)
       if (action === 'probe') {
@@ -5652,6 +5973,10 @@ export function useRemoteControl(
    *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
    *  until `rc:video-info` names the agent's real encoder. */
   const dcDecoderCodec = ref<string | null>(null)
+  /** FR-135 R0 (N2) — whether the browser says the active DataChannel decoder
+   *  is hardware (`rc-media-window.ts`), for the `rc.l4` record; `null` until
+   *  the worker knows. */
+  let dcDecoderHw: boolean | null = null
   /** P6 — the agent's InputArbiter state (participants, mode, floor
    *  holder). Null until the first `rc:control.state` broadcast; old
    *  agents never send it, so the multi-user UI self-hides. */
@@ -5808,8 +6133,8 @@ export function useRemoteControl(
   let sessionCellChroma: 'yuv420' | 'yuv444' = 'yuv420'
   /** FR-17 — true when THIS session negotiated per-chunk framing: the
    *  agent advertised `chunk-framing` in `AgentCaps.video` and we asked
-   *  for it in `rc:session.request`. Read by `startVp9_444Path` /
-   *  `startHevcPath` when they hand the worker its `init-canvas`, so the
+   *  for it in `rc:session.request`. Read by `startDcPath` when it hands
+   *  the worker its `init-canvas`, so the
    *  parse side can never be enabled without the request side having
    *  been sent — an unframed stream parsed as framed is garbage, not a
    *  degraded picture, so the two must move together. */
@@ -5825,15 +6150,41 @@ export function useRemoteControl(
   /** FR-130 P2 — true when THIS session's decoders are told the colour space
    *  the agent converted with (set S: BT.601 matrix, limited range;
    *  `workers/rc-decoder-config.ts`). Resolved beside `sessionChunkFraming`,
-   *  before any worker is started: the data-channel workers get it in their
+   *  before any worker is started: the data-channel worker gets it in its
    *  `init-canvas`, the RTP WebCodecs worker in its transform's options. */
   let sessionColorSpace = false
   /** FR-135 R1 — true when THIS session recovers a decode error in place
    *  (`workers/rc-decode-recovery.ts`), which is all of them unless this
    *  browser set `roomler-rc-decode-recover=0`. Resolved beside
-   *  `sessionChunkFraming`; the data-channel workers get it in `init-canvas`,
+   *  `sessionChunkFraming`; the data-channel worker gets it in `init-canvas`,
    *  and the media watchdog reads it for what counts as progress. */
   let sessionDecodeRecover = false
+  /** FR-135 R3 — true when THIS session tries to move its video channel into
+   *  the decode worker (`storedDcWorker`, `roomler-rc-dc-worker`). Resolved
+   *  beside `sessionChunkFraming`, before the path starts. */
+  let sessionDcWorker = false
+  /** #3566 — true when THIS session measures each decode worker's clock
+   *  against the page's (`storedClockCal`, `roomler-rc-clock-cal`), which is
+   *  every session unless this browser set `0`. Resolved beside
+   *  `sessionChunkFraming`, before any worker starts. */
+  let sessionClockCal = false
+  /** #3566 — the measurement of the data-channel worker's clock, and of the RTP
+   *  WebCodecs worker's (`startWorkerClockCal`). Null with no worker, or with
+   *  the switch off. */
+  let dcClockCal: ClockCalibration | null = null
+  let webcodecsClockCal: ClockCalibration | null = null
+  /** FR-135 R3 — true while the active path's channel is in the worker: the
+   *  browser took the transfer. False on the relay, the default. */
+  let dcChannelInWorker = false
+  /** FR-135 R3 — a move failed on this page, so every later session relays. */
+  let dcWorkerMoveFailed = false
+  /** FR-135 R3 — the page keeps no copy of a channel it moved, so until the
+   *  worker says `video-channel-attached` the move can still have failed
+   *  (`createChannelMoveWatch`, then `onVideoChannelMoveFailed`). */
+  const dcChannelMove = createChannelMoveWatch({
+    graceMs: DC_WORKER_ATTACH_GRACE_MS,
+    onFailed: (why) => onVideoChannelMoveFailed(why),
+  })
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -5943,14 +6294,13 @@ export function useRemoteControl(
   // actual backing size) for the stats pill ("· FSR") and the diag HUD.
   const sharpenMode = ref<SharpenMode>(storedSharpenMode())
   const renderInfo = ref<{ mode: string; w: number; h: number } | null>(null)
-  let vp9ViewportCleanup: (() => void) | null = null
-  let hevcViewportCleanup: (() => void) | null = null
+  let dcViewportCleanup: (() => void) | null = null
 
   function setSharpenMode(m: SharpenMode) {
     const mode = normalizeSharpenMode(m)
     sharpenMode.value = mode
     persistSharpenMode(mode)
-    const worker = hevcWorker ?? vp9_444Worker
+    const worker = dcWorker
     if (worker) {
       try {
         worker.postMessage({ type: 'render-mode', sharpen: mode })
@@ -5971,49 +6321,50 @@ export function useRemoteControl(
     }
   }
 
-  // Phase Y.3: VP9-444 over DataChannel pipeline. Independent of the
-  // RTCRtpScriptTransform path above Ã¢ÂÂ uses its OWN worker
-  // (rc-vp9-444-worker.ts) fed off `video-bytes` DC binary messages.
-  let vp9_444Worker: Worker | null = null
+  // FR-135 R3 — the one data-channel video path: `rc-dc-worker.ts`, fed off
+  // the `video-bytes` DataChannel, for every codec the agent sends there (VP9,
+  // AV1, H.264, HEVC). Independent of the RTCRtpScriptTransform path above.
+  // Only one DC video transport is active per session, so there is one worker,
+  // one canvas and one set of numbers (Phase Y.3 and rc.78 each had their own
+  // until R3).
+  let dcWorker: Worker | null = null
+  /** What the active path calls itself in the console, on `rc:decode-error`
+   *  (`path`) and in the bench record: `hevc` on the HEVC transport, `vp9-444`
+   *  on VP9, AV1 and H.264, the names the two workers had before R3, which
+   *  the agent and the L4 reads keep. Null with no path. */
+  let dcPathLabel: DcPathLabel | null = null
+  /** The transport the active path was started for, the one a decoder that
+   *  fails before its first frame bans for this page. */
+  let dcPathTransport: string | null = null
   /** `true` once the worker has been spun up and the DC opened. The
    *  view (Y.4) reads this to swap a `<canvas>` in for the `<video>`
    *  element, mirroring how `webcodecsActive` drives the WebCodecs
    *  path. Stays `false` when the user didn't opt in OR the agent
-   *  doesn't honour the transport (no DC ever arrives Ã¢ÂÂ flag never
+   *  doesn't honour the transport (no DC ever arrives, so the flag never
    *  flips). */
-  const vp9_444Active = ref(false)
-  /** Number of decoded VP9-444 frames so far. Surfaced to the view
-   *  for diagnostics and used by tests to assert end-to-end decode
-   *  succeeded. */
-  const vp9_444FramesDecoded = ref(0)
-  /** Rolling-window stats from the VP9-444 worker (rc.35). Bitrate is
+  const dcActive = ref(false)
+  /** Number of frames the data-channel worker decoded so far. Surfaced to the
+   *  view for diagnostics and read by the media watchdog. */
+  const dcFramesDecoded = ref(0)
+  /** Rolling-window stats from the data-channel worker (rc.35). Bitrate is
    *  delivered-bytes/sec at the SCTP-receive boundary (post-network,
    *  pre-decode), so it shows the actual link throughput including
    *  any AIMD-driven adjustments. width/height reflect the latest
    *  decoded VideoFrame dims. Updated every ~1 s by the worker;
    *  the view's HUD reads these directly. */
-  const vp9_444Stats = ref<{
+  const dcStats = ref<{
     bitrateBps: number
     fps: number
     width: number
     height: number
     bytesReceivedTotal: number
   }>({ bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 })
-  /** The visible `<canvas>` the view paints VP9-444 frames into. The
-   *  view writes this on mount; the composable picks it up and
-   *  posts `init-canvas` to the worker. Null until the view
-   *  provides a canvas Ã¢ÂÂ Y.3 ships without view-side wiring, so
-   *  bytes flow + decode happens against a synthetic OffscreenCanvas
-   *  instead. */
-  const vp9_444CanvasEl = ref<HTMLCanvasElement | null>(null)
+  /** The visible `<canvas>` the view paints the data-channel frames into.
+   *  The view writes this on mount; the composable picks it up and posts
+   *  `init-canvas` to the worker. Until then the worker decodes against a
+   *  synthetic OffscreenCanvas. */
+  const dcCanvasEl = ref<HTMLCanvasElement | null>(null)
 
-  // rc.78 Ã¢ÂÂ HEVC over DataChannel pipeline (Option B). Sibling to the
-  // VP9-444 pipeline above; shares the `video-bytes` DC label (the
-  // agent emits HEVC OR VP9-444 there based on negotiated_transport,
-  // never both). Independent worker because the codec string +
-  // decoder configure differ, and we want a clean failure isolation
-  // boundary if one path regresses.
-  let hevcWorker: Worker | null = null
   /** Whether HEVC decode is supported on this browser. Probe runs
    *  once on composable construction (and re-checks in connect()).
    *  HEVC has NO software fallback in WebCodecs Ã¢ÂÂ Linux Chromium
@@ -6049,26 +6400,6 @@ export function useRemoteControl(
   void isH264High444DecodeSupported().then((codec) => {
     h264High444Supported.value = codec !== null
   })
-  /** `true` once the HEVC worker has been spun up and the DC opened.
-   *  Same semantics as `vp9_444Active`. */
-  const hevcActive = ref(false)
-  /** Number of decoded HEVC frames so far. */
-  const hevcFramesDecoded = ref(0)
-  /** Rolling-window stats from the HEVC worker. Same shape as the
-   *  VP9-444 stats so the view's HUD code is shared. */
-  const hevcStats = ref<{
-    bitrateBps: number
-    fps: number
-    width: number
-    height: number
-    bytesReceivedTotal: number
-  }>({ bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 })
-  /** The visible `<canvas>` the view paints HEVC frames into. View
-   *  writes this on mount; composable posts `init-canvas` to the
-   *  worker. Null until view-side wiring lands (rc.79+); rc.78 ships
-   *  with synthetic OffscreenCanvas so bytes still flow + decode
-   *  happens for verification. */
-  const hevcCanvasEl = ref<HTMLCanvasElement | null>(null)
 
   /** P1 Ã¢ÂÂ latest per-hop diagnostics window from the active decode worker
    *  (null until the first stats window on a DC path). */
@@ -6847,42 +7178,41 @@ export function useRemoteControl(
   }
 
   // Reactive list of in-flight + recently-finished file transfers. The
-  // Transfers chip in RemoteControl.vue binds to this. Entries auto-prune
-  // after 10 s in a terminal state so the panel doesn't grow unboundedly
-  // over a long session.
-  type TransferStatus =
-    | 'queued'
-    | 'running'
-    /** rc.19: DC closed mid-upload but the agent has the resume cap;
-     *  the wrapper is waiting for the WebRTC peer to reconnect so
-     *  it can issue `files:resume`. Operator sees "Reconnecting N/6". */
-    | 'reconnecting'
-    | 'complete'
-    | 'error'
-    | 'cancelled'
-  interface Transfer {
-    id: string
-    kind: 'upload' | 'download'
-    name: string
-    bytes: number
-    total: number | null
-    status: TransferStatus
-    error?: string
-  }
-  const transfers = ref<Transfer[]>([])
-  function pushTransfer(t: Transfer) {
+  // Transfers chip in RemoteControl.vue binds to this. A row leaves 10 s
+  // after it settles, so the panel doesn't grow unboundedly over a long
+  // session.
+  const transfers = ref<TransferRow[]>([])
+  const transferPrune = new Map<string, ReturnType<typeof setTimeout>>()
+  function pushTransfer(t: TransferRow) {
     transfers.value = [...transfers.value, t]
   }
-  function patchTransfer(id: string, patch: Partial<Transfer>) {
-    transfers.value = transfers.value.map((t) => (t.id === id ? { ...t, ...patch } : t))
-    if (patch.status === 'complete' || patch.status === 'error' || patch.status === 'cancelled') {
-      // Auto-prune after 10 s in a terminal state. rc.19 'reconnecting'
-      // is explicitly NOT terminal Ã¢ÂÂ the wrapper transitions out of it
-      // either back to 'running' (resume accepted) or to 'error' (6
-      // attempts exhausted), at which point this branch fires again.
-      setTimeout(() => {
-        transfers.value = transfers.value.filter((t) => t.id !== id)
-      }, 10_000)
+  /** #3726 — every change to a row goes through `moveTransfer`, the one
+   *  place that knows a settled row is final and a running row's bytes
+   *  never move back. A move that does not apply changes nothing. */
+  function patchTransfer(id: string, move: TransferMove) {
+    const before = transfers.value.find((t) => t.id === id)
+    if (!before) return
+    const after = moveTransfer(before, move)
+    if (after === before) return
+    transfers.value = transfers.value.map((t) => (t.id === id ? after : t))
+    // A row leaves 10 s after it settles. rc.19 'reconnecting' is not
+    // settled: the wrapper moves it back to 'running' (resume accepted)
+    // or to 'error'. A failed row that the resume path runs again keeps
+    // its place.
+    const timer = transferPrune.get(id)
+    if (transferSettled(after.status)) {
+      if (timer === undefined) {
+        transferPrune.set(
+          id,
+          setTimeout(() => {
+            transferPrune.delete(id)
+            transfers.value = transfers.value.filter((t) => t.id !== id)
+          }, 10_000)
+        )
+      }
+    } else if (timer !== undefined) {
+      clearTimeout(timer)
+      transferPrune.delete(id)
     }
   }
 
@@ -6924,13 +7254,12 @@ export function useRemoteControl(
     }
   }
 
-  /** Post the current best offset to the active decode worker(s). Called
-   *  on every new best sample AND from each worker's start path (the
+  /** Post the current best offset to the data-channel decode worker. Called
+   *  on every new best sample AND from the worker's start path (the
    *  worker may be created after the offset is already known). */
   function pushClockOffset() {
     const msg = { type: 'clock-offset', offsetUs: clockBest?.offsetUs ?? null }
-    try { hevcWorker?.postMessage(msg) } catch { /* worker torn down */ }
-    try { vp9_444Worker?.postMessage(msg) } catch { /* worker torn down */ }
+    try { dcWorker?.postMessage(msg) } catch { /* worker torn down */ }
   }
 
   function handleClockEcho(t0: number, agentUs: number) {
@@ -6948,6 +7277,34 @@ export function useRemoteControl(
   function resetClockSync() {
     clockSamples = []
     clockBest = null
+  }
+
+  /** #3566 — measure a decode worker's clock against the page's, once, as the
+   *  page starts the worker (`createClockCalibration`). Each context fixes its
+   *  epoch when it starts, so a worker made after its page reads a constant
+   *  apart from it, and the worker reads the page's timestamps through what
+   *  this measures: `sentAt`, the offset above, a bench probe's send. Nothing
+   *  waits for it, and the console says what it measured or that it measured
+   *  nothing. Null with this session's switch off (`roomler-rc-clock-cal=0`). */
+  function startWorkerClockCal(worker: Worker, label: string): ClockCalibration | null {
+    if (!sessionClockCal) return null
+    const cal = createClockCalibration({
+      post: (msg) => worker.postMessage(msg),
+      done: (r) => {
+        if (r.ok) {
+          console.info(
+            `[rc] ${label} decode worker clock: ${Math.abs(r.skewMs).toFixed(2)} ms ${r.skewMs < 0 ? 'behind' : 'ahead of'} the page's (the fastest of ${r.samples} round trips, ${r.rttMs.toFixed(2)} ms) - the worker reads the page's timestamps through it (#3566)`,
+          )
+        } else {
+          const fastest = r.bestRttMs === null ? 'no answer' : `the fastest ${r.bestRttMs.toFixed(2)} ms`
+          console.info(
+            `[rc] ${label} decode worker clock: not measured - no round trip in ${r.rounds} rounds came back within ${CAL_MAX_RTT_MS} ms (${fastest}), so the worker reads the page's timestamps on its own clock, as before #3566`,
+          )
+        }
+      },
+    })
+    cal.start()
+    return cal
   }
 
   // Coalesce rapid mouse moves to one per animation frame (~60 Hz). Keys
@@ -7178,10 +7535,29 @@ export function useRemoteControl(
   }
 
   /** FR-16 L4 — a sampler read probe `seq` off a frame painted at
-   *  `paintedAt` (epoch ms). */
+   *  `paintedAt`, on the page's clock (a worker's comes through its skew, #3566). */
   function onBenchProbe(seq: unknown, paintedAt: unknown, path: BenchPath) {
     if (typeof seq !== 'number' || typeof paintedAt !== 'number') return
     benchProber?.onPainted(seq, paintedAt, path)
+  }
+
+  /** FR-135 R0 (N2) — what this session is, for the `rc.l4` record, as the
+   *  page knows it at the flush. A decode worker's renderer and decoder count
+   *  only while one paints. */
+  function benchJoin(): RcL4Join {
+    const vi = videoInfo.value
+    const video = benchSurface?.querySelector('video') as HTMLVideoElement | null
+    const dc = dcActive.value
+    return {
+      targetFps: vi?.fps ?? mediaPlan.value?.fps?.granted ?? null,
+      width: mediaIntrinsicW.value || video?.videoWidth || null,
+      height: mediaIntrinsicH.value || video?.videoHeight || null,
+      codec: vi?.codec || null,
+      chroma: vi?.chroma || null,
+      carrier: vi?.transport || null,
+      render: dc ? (renderInfo.value?.mode ?? null) : null,
+      decoderHw: dc ? dcDecoderHw : null,
+    }
   }
 
   /** FR-16 L4 — start probing: called when the input channel opens, and a
@@ -7198,8 +7574,7 @@ export function useRemoteControl(
       send: target ? sendBenchTargetMove : sendBenchProbe,
       maxSeq: target ? PROBE_TARGET.cells : undefined,
       arm: (seq) => {
-        hevcWorker?.postMessage({ type: 'bench-arm', seq })
-        vp9_444Worker?.postMessage({ type: 'bench-arm', seq })
+        dcWorker?.postMessage({ type: 'bench-arm', seq })
         webcodecsWorker?.postMessage({ type: 'bench-arm', seq })
         videoBench?.arm(seq)
       },
@@ -7210,6 +7585,7 @@ export function useRemoteControl(
           agentOrgId: lastConnectArgs?.orgId ?? null,
           agentId: lastConnectArgs?.agentId ?? null,
           sessionId: sessionId.value,
+          join: benchJoin(),
         })
       },
     })
@@ -7244,7 +7620,12 @@ export function useRemoteControl(
    *  0x08 = Meta/Win Ã¢ÂÂ matches `kbdCodeToHid` callers throughout
    *  the codebase. */
   function sendKey(code: number, down: boolean, mods: number = 0) {
-    sendInput({ t: 'key', code, down, mods })
+    sendInput({
+      t: 'key',
+      code,
+      down,
+      mods: translateModsForHost(mods, hostIsMac.value && ctrlAsCmd.value),
+    })
   }
 
   /**
@@ -7525,12 +7906,14 @@ export function useRemoteControl(
     probeRttMs?: number | null,
     link?: { rxBps: number; queueMs: number | null } | null,
     arrival?: { avgMs: number } | null,
+    media?: Partial<ViewerMediaWindow> | null,
+    queueArrMs?: number | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(
-        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival)),
+        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs)),
       )
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
@@ -7556,6 +7939,10 @@ export function useRemoteControl(
     /** FR-59 P3 — ms the transit queue grew this window; `null`/absent =
      *  fewer than two frames arrived, which is no-signal, not stability. */
     queueMs?: number | null
+    /** FR-135 R3 — the same growth read at arrival; `null`/absent the same way. */
+    queueArrMs?: number | null
+    /** FR-135 R0 — the worker's window for the agent (`rc-media-window.ts`). */
+    media?: Partial<ViewerMediaWindow> | null
   }) {
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
@@ -7588,6 +7975,12 @@ export function useRemoteControl(
     // FR-70 M0 — the age at arrival, present under the same conditions as
     // `age` (probe locked, frames painted).
     const arrival = age && m.arrival && m.arrival.n > 0 ? { avgMs: m.arrival.avgMs } : null
+    // FR-135 R0 — rides along as it came; `decodeStatWireMessage` keeps only
+    // what the worker counted. The decoder's form is kept for `rc.l4` (N2).
+    const media = m.media && typeof m.media === 'object' ? m.media : null
+    if (media && (typeof media.decoderHw === 'boolean' || media.decoderHw === null)) {
+      dcDecoderHw = media.decoderHw
+    }
     sendDecodeStat(
       typeof m.fps === 'number' ? m.fps : 0,
       struggleWindow.observe(bad),
@@ -7595,6 +7988,9 @@ export function useRemoteControl(
       clockBest?.rttMs ?? null,
       link,
       arrival,
+      media,
+      // FR-135 R3 — rides alone; `decodeStatWireMessage` sends it only when counted.
+      typeof m.queueArrMs === 'number' ? m.queueArrMs : null,
     )
   }
 
@@ -7728,7 +8124,7 @@ export function useRemoteControl(
   /** FR-135 R2 — the device's plan: keep the newest, and act on the one thing in it
    *  a page must not leave to the watchdog. */
   function onMediaPlan(plan: RcMediaPlan) {
-    const action = mediaPlanAction(plan, mediaPlanEpoch, vp9_444Active.value || hevcActive.value)
+    const action = mediaPlanAction(plan, mediaPlanEpoch, dcActive.value)
     if (!action) return
     mediaPlanEpoch = plan.epoch
     mediaPlan.value = plan
@@ -7737,8 +8133,7 @@ export function useRemoteControl(
     if (action.stop !== undefined) mediaStop.value = action.stop
     if (action.showTrack) {
       console.warn('[rc] media plan: the device is sending over WebRTC, not the data channel this page opened - showing <video>')
-      stopVp9_444Path()
-      stopHevcPath()
+      stopDcPath()
     }
   }
 
@@ -7936,11 +8331,23 @@ export function useRemoteControl(
       console.warn('[rc] worker construction failed', err)
       return false
     }
+    // #3566 — this worker's own measurement, so an answer from an older worker
+    // can never reach a newer one's.
+    let clockCal: ClockCalibration | null = null
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown>
       if (!msg || typeof msg.type !== 'string') return
+      if (clockCal?.onWorkerMessage(msg)) return
       if (msg.type === 'bench-probe') {
         onBenchProbe(msg.seq, msg.paintedAt, 'webcodecs')
+        return
+      }
+      // FR-138 — its answers to a hold's mark (`rc.resume`'s `gap_ms`).
+      if (msg.type === PAINT_GAP_MARKED || msg.type === PAINT_GAP_CLOSED) {
+        if (holdGapPath === 'webcodecs' && worker === webcodecsWorker) {
+          if (msg.type === PAINT_GAP_MARKED) holdGap?.marked(msg.sinceMs)
+          else holdGap?.closed(msg.gapMs)
+        }
         return
       }
       if (msg.type === 'request-keyframe') {
@@ -8010,6 +8417,9 @@ export function useRemoteControl(
     }
     webcodecsWorker = worker
     webcodecsActive.value = true
+    // #3566 — its bench paint stamps go back on the page's clock.
+    clockCal = startWorkerClockCal(worker, 'webcodecs')
+    webcodecsClockCal = clockCal
     // If the canvas is already mounted, attach it now; otherwise
     // the watcher picks it up when it lands.
     if (webcodecsCanvasEl.value) {
@@ -8075,59 +8485,44 @@ export function useRemoteControl(
 
   function stopWebCodecsPath() {
     webcodecsActive.value = false
+    webcodecsClockCal?.stop()
+    webcodecsClockCal = null
     if (!webcodecsWorker) return
     try { webcodecsWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { webcodecsWorker.terminate() } catch { /* ignore */ }
     webcodecsWorker = null
   }
 
-  /** Boot the VP9-444 worker, open the `video-bytes` DataChannel, and
-   *  forward incoming binary messages to the worker. Called from
-   *  `connect()` only when the browser opted in to
-   *  `data-channel-vp9-444` AND VP9 profile 1 decode is supported.
-   *  Idempotent Ã¢ÂÂ a second call while a worker exists is a no-op
-   *  (wraps the existing channel + worker pair).
-   *
-   *  The worker self-decodes against an `OffscreenCanvas`. For Y.3
-   *  the canvas is synthetic (created here, never displayed); Y.4
-   *  hooks the view's `<canvas>` element via
-   *  `vp9_444CanvasEl` + a `transferControlToOffscreen()` swap.
-   *  Bytes still flow + frames still decode in the synthetic case,
-   *  which is what e2e + integration tests assert against.
-   *
-   *  Returns the worker handle so tests can drive it directly.
-   *
-   *  rc.190 Ã¢ÂÂ `codecOverride` reuses this whole path for AV1-over-DC
-   *  (`AV1_CODEC_STRING`): identical 13-byte wire framing, identical DC
-   *  label, the worker's VideoDecoder just gets a different codec
-   *  string. Only one DC video transport is active per session, so the
-   *  shared worker/stats plumbing can't collide. */
   // Ã¢ÂÂÃ¢ÂÂ 2026-07-24 freeze triangulation (round 3) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
   // Field: 3-5 s video freezes with a SILENT console Ã¢ÂÂ the worker-side stall
   // detector needs chunks to arrive to run at all, so silence is ambiguous
   // between "bytes stopped arriving" (network/SCTP) and "the main thread was
   // blocked so nothing was forwarded" (jank). These two detectors split that:
 
-  /** Network-side delivery-gap detector. `dc.onmessage` runs on the main
-   *  thread as bytes come off SCTP; a multi-second silence here (logged once,
-   *  on resume) means bytes were NOT arriving Ã¢ÂÂ network/SCTP layer. */
-  let lastVideoDcMsgMs = 0
+  /** Network-side delivery-gap detector. On the relay `dc.onmessage` runs on
+   *  the main thread as bytes come off SCTP; a multi-second silence here
+   *  (logged once, on resume) means bytes were NOT arriving - network/SCTP
+   *  layer. With the channel in the worker (FR-135 R3) the worker keeps the
+   *  same clock (`createDeliveryGapClock`) and posts `video-channel-gap`, which
+   *  is logged with the same line. */
+  const videoDcGap = createDeliveryGapClock()
   function noteVideoDcDelivery() {
-    const now = performance.now()
-    if (lastVideoDcMsgMs > 0 && now - lastVideoDcMsgMs > 1500) {
-      console.warn(
-        '[rc] video DC delivery gap',
-        Math.round(now - lastVideoDcMsgMs),
-        'ms Ã¢ÂÂ no video bytes arrived from the network for this long',
-      )
-    }
-    lastVideoDcMsgMs = now
+    const gapMs = videoDcGap.note(performance.now())
+    if (gapMs !== null) warnVideoDcGap(gapMs)
+  }
+  function warnVideoDcGap(gapMs: number) {
+    console.warn(
+      '[rc] video DC delivery gap',
+      Math.round(gapMs),
+      'ms - no video bytes arrived from the network for this long',
+    )
   }
 
   /** Self-measuring main-thread jank detector. A 250 ms interval whose tick
-   *  arrives late by >1.5 s means the main thread (which also forwards DC
-   *  chunks to the worker) was blocked that long Ã¢ÂÂ the freeze is page jank,
-   *  not network and not the decoder. */
+   *  arrives late by >1.5 s means the main thread was blocked that long - the
+   *  freeze is page jank, not network and not the decoder. On the relay the
+   *  main thread also forwards the DC chunks to the worker, so they waited
+   *  too; with the channel in the worker (FR-135 R3) they did not. */
   let jankTimer: ReturnType<typeof setInterval> | null = null
   let jankLastTickMs = 0
   function startJankDetector() {
@@ -8140,7 +8535,9 @@ export function useRemoteControl(
         console.warn(
           '[rc] MAIN-THREAD STALL ~',
           Math.round(gap),
-          'ms Ã¢ÂÂ the page (and DCÃ¢ÂÂworker chunk forwarding) was blocked this long',
+          dcChannelInWorker
+            ? 'ms - the page was blocked this long (the video channel is in the decode worker, so its chunks were not)'
+            : 'ms - the page (and DC-to-worker chunk forwarding) was blocked this long',
         )
       }
       jankLastTickMs = now
@@ -8236,483 +8633,63 @@ export function useRemoteControl(
     }
   }
 
-  function startVp9_444Path(codecOverride?: string): Worker | null {
-    if (vp9_444Worker) return vp9_444Worker
-    if (!pc) return null
-    let worker: Worker
-    try {
-      worker = new Worker(
-        new URL('../workers/rc-vp9-444-worker.ts', import.meta.url),
-        { type: 'module' },
-      )
-    } catch (err) {
-      console.warn('[rc] vp9-444 worker construction failed', err)
-      return null
-    }
-    worker.onmessage = (ev) => {
-      const msg = ev.data as Record<string, unknown> | undefined
-      if (!msg || typeof msg.type !== 'string') return
-      if (msg.type === 'bench-probe') {
-        onBenchProbe(msg.seq, msg.paintedAt, 'vp9-444')
-        return
-      }
-      if (msg.type === 'viewer-hz') {
-        onViewerHz(msg.hz)
-        return
-      }
-      if (msg.type === 'request-keyframe') {
-        // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
-        // for a fresh IDR so it can resync.
-        requestKeyframe()
-        return
-      }
-      if (msg.type === 'first-frame'
-        && typeof msg.width === 'number'
-        && typeof msg.height === 'number') {
-        mediaIntrinsicW.value = msg.width
-        mediaIntrinsicH.value = msg.height
-        vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
-        markConnect('first_frame')
-        logConnectTiming('first-frame')
-        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
-        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height, '| decoded colour space', colorSpaceLabel(msg.colorSpace))
-      } else if (msg.type === 'colorspace-dropped') {
-        warnColorSpaceDropped('vp9-444', msg)
-      } else if (msg.type === 'decoder-configured') {
-        // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
-        // configure() Ã¢ÂÂ proves whether the roomler-rc-decode-pref A/B took.
-        // FR-80 — the worker's log prefix is a legacy name; `msg.codec` is
-        // the truth (this worker decodes VP9, AV1 and H.264). The pill reads
-        // it until the agent names its encoder.
-        dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
-        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
-      } else if (msg.type === 'decoder-error'
-        || msg.type === 'decoder-configure-error'
-        || msg.type === 'decode-error') {
-        // rc.43 Ã¢ÂÂ Chrome 148 field repro: VideoDecoder.configure() with
-        // vp09.01.10.08 (profile 1, 4:4:4 8-bit) reports success but the
-        // first real frame errors out with "Unsupported configuration"
-        // and the decoder closes; every subsequent frame logs
-        // "Cannot call 'decode' on a closed codec" indefinitely. Pre-
-        // rc.43 just logged the warn Ã¢ÂÂ the canvas stayed blank until the
-        // user disconnected. Tear down so the view re-mounts <video> and
-        // the standard RTP H.264 track (which the agent sends in parallel
-        // to the DC path) renders normally.
-        console.warn('[rc] vp9-444 worker', msg.type, msg.error, 'Ã¢ÂÂ auto-fallback to <video>')
-        // Same ban-and-renegotiate as the HEVC handler: a pre-first-frame
-        // failure means the probe lied (this worker serves the vp9-444,
-        // av1 AND h264 DC transports - ban whichever THIS session
-        // negotiated, `sessionDcTransport`). Post-first-frame errors stay
-        // transient and keep today's behaviour.
-        // FR-132 P1 — counted on the agent, before the teardown below.
-        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-        const vp9NeverDecoded = vp9_444FramesDecoded.value === 0
-        const failedTransport = sessionDcTransport
-        stopVp9_444Path()
-        if (vp9NeverDecoded && failedTransport && failedTransport !== 'auto' && failedTransport !== 'webrtc') {
-          failedDcTransports.add(failedTransport)
-          // FR-77 — remembered per device × cell across page loads.
-          const failedCodec = cellCodecOfTransport(failedTransport)
-          if (codecAgentId && failedCodec) {
-            rememberCellFailure(codecAgentId, failedCodec, sessionCellChroma, globalThis.navigator?.userAgent ?? '')
-          }
-          console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
-          if (lastConnectArgs) scheduleReconnect()
-        }
-      } else if (msg.type === 'decode-recovering') {
-        // FR-135 R1 — the worker replaced the decoder and waits for the key
-        // frame it asked for. The path stays up. The agent still counts it.
-        console.warn('[rc] vp9-444 decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
-        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-      } else if (msg.type === 'decode-recovered') {
-        console.info('[rc] vp9-444 decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
-      } else if (msg.type === 'frame-rejected') {
-        console.warn('[rc] vp9-444 frame rejected', msg)
-      } else if (msg.type === 'awaiting-keyframe') {
-        // Round 3 Ã¢ÂÂ parity with the HEVC handler: these worker messages were
-        // silently dropped on the VP9 path, hiding gate activity from the
-        // console during field freezes.
-        console.info('[rc] vp9-444 awaiting keyframe Ã¢ÂÂ dropped', msg.dropped, 'delta(s) while gated')
-      } else if (msg.type === 'keyframe-acquired') {
-        console.info('[rc] vp9-444 keyframe acquired (dropped', msg.droppedBefore, 'delta(s) before it)')
-      } else if (msg.type === 'backlog-drop') {
-        console.warn('[rc] vp9-444 backlog drop Ã¢ÂÂ decode queue', msg.queue, 'Ã¢ÂÂ gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
-      } else if (msg.type === 'decode-stall') {
-        // 2026-07-24 Ã¢ÂÂ frames are arriving but the decoder produced no
-        // output for gapMs with work queued: a decoder/GPU-process stall,
-        // NOT transport and NOT the resync gate. Field-diagnosis marker.
-        console.warn('[rc] vp9-444 DECODE STALL Ã¢ÂÂ no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
-      } else if (msg.type === 'decode-stall-recovered') {
-        console.warn('[rc] vp9-444 decode stall recovered after', msg.gapMs, 'ms')
-      } else if (msg.type === 'render-fallback') {
-        // P7 — GL unavailable/lost for good this session; the worker
-        // reverted to the byte-identical 2D paint path.
-        console.warn('[rc] vp9-444 FSR unavailable — 2D paint path:', msg.reason)
-      } else if (msg.type === 'frame-decoded') {
-        // Worker emits this for every decoded frame after the first.
-        // Driven by the worker's `output` callback, used by tests +
-        // view-side diagnostics.
-        vp9_444FramesDecoded.value++
-      } else if (msg.type === 'stats') {
-        // rc.35 Ã¢ÂÂ rolling-window bitrate / fps / resolution from the
-        // worker. Surfaces the actual DC-receive throughput so the
-        // operator can confirm rc.33's AIMD-driven bitrate target
-        // is pushing the link as expected.
-        const m = msg as {
-          bitrateBps?: number
-          fps?: number
-          width?: number
-          height?: number
-          bytesReceivedTotal?: number
-          framesDroppedBacklog?: number
-          decodeQueueSize?: number
-          backlogMs?: number
-          backlogMaxMs?: number
-          framesDecodedTotal?: number
-          paint?: HopWindow
-          fwd?: HopWindow
-          decode?: HopWindow
-          // FR-15 — end-to-end paint age window (null until the
-          // rc:clock probe locks); rides the decodestat to the agent.
-          age?: HopWindow | null
-          outGapMaxMs?: number
-          ctxMode?: string
-          render?: string
-          renderW?: number
-          renderH?: number
-        }
-        updateRenderInfo(m)
-        vp9_444Stats.value = {
-          bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
-          fps: typeof m.fps === 'number' ? m.fps : 0,
-          width: typeof m.width === 'number' ? m.width : 0,
-          height: typeof m.height === 'number' ? m.height : 0,
-          bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
-        }
-        if (vp9_444Stats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
-        // P1 Ã¢ÂÂ the per-frame `frame-decoded` message is off by default; keep
-        // the diagnostics counter monotonic from the 1 s window total.
-        if (typeof m.framesDecodedTotal === 'number') {
-          vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, m.framesDecodedTotal)
-        }
-        updateDecodeDiag(m)
-        // rc.188 Ã¢ÂÂ feed the agent this viewer's real decode rate so it caps fps.
-        handleDecoderStats(m)
-      }
-    }
-    // rc.61 Ã¢ÂÂ pick the codec string based on the agent's advertised
-    // chroma format. `'yuv420'` Ã¢ÂÂ VP9 profile 0 (`vp09.00.10.08`),
-    // `'yuv444'` (default + pre-rc.61 agents) Ã¢ÂÂ profile 1
-    // (`vp09.01.10.08`). Mismatch with the bitstream the agent
-    // actually sends would leave the canvas blank.
-    //
-    // rc.62 Ã¢ÂÂ the user's `vp9Chroma` ref OVERRIDES the agent's
-    // advertised default when it's not `'auto'`. The same value was
-    // sent as `chroma_pref` in `rc:session.request`, so the agent
-    // emits the format we picked.
+  /** rc.61, rc.62, rc.190 — the VP9 codec string for the worker: an explicit
+   *  override wins (the auto-rank's or the HEVC fallback's forced 4:2:0, and
+   *  the AV1 and H.264 transports' own strings); else the user's `vp9Chroma`
+   *  when it is not `auto` (it went to the agent as `chroma_pref` in
+   *  `rc:session.request`, so the agent emits that format); else the agent's
+   *  advertised default. `yuv420` is profile 0 (`vp09.00.10.08`), anything
+   *  else, pre-rc.61 agents included, profile 1 (`vp09.01.10.08`). A mismatch
+   *  with the bitstream the agent actually sends leaves the canvas blank. */
+  function vp9DcCodec(codecOverride?: string): string {
     let effectiveChroma: string | undefined
     if (vp9Chroma.value === 'yuv420' || vp9Chroma.value === 'yuv444') {
       effectiveChroma = vp9Chroma.value
     } else {
       effectiveChroma = agent?.value?.capabilities?.vp9_chroma
     }
-    // rc.190 Ã¢ÂÂ an explicit codec override (the AV1 path) wins over the
-    // VP9 chroma-derived string.
-    const workerCodec =
-      codecOverride ?? (effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08')
-
-    // Synthetic OffscreenCanvas Ã¢ÂÂ keeps the worker fully wired even
-    // without a view-side canvas. Y.4 swaps in the visible canvas
-    // via vp9_444CanvasEl watcher below.
-    try {
-      const synthetic = new OffscreenCanvas(2, 2)
-      worker.postMessage(
-        {
-          type: 'init-canvas',
-          canvas: synthetic,
-          codec: workerCodec,
-          decodePref: storedDecodePref(),
-          ctxMode: storedCtxMode(),
-          perFrameMsg: storedPerFrameMsg(),
-          maxBacklogMs: flowParams.maxBacklogMs,
-          // FR-17 — negotiated per session; see `sessionChunkFraming`.
-          chunkFraming: sessionChunkFraming,
-          // FR-16 L4 — resolved per session; see `sessionBench`.
-          bench: sessionBench,
-          // FR-130 P2 — resolved per session; see `sessionColorSpace`.
-          colorSpace: sessionColorSpace,
-          // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
-          decodeRecover: sessionDecodeRecover,
-          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
-          // P7 — FSR knobs (sticky across the visible-canvas re-init).
-          sharpen: sharpenMode.value,
-          sharpness: storedSharpness(),
-        },
-        [synthetic],
-      )
-    } catch (err) {
-      console.warn('[rc] vp9-444: synthetic OffscreenCanvas init failed', err)
-      try { worker.terminate() } catch { /* ignore */ }
-      return null
-    }
-    // Open the DC. Forward binary messages straight through to the
-    // worker as ArrayBuffer chunks (transferred, not copied).
-    let dc: RTCDataChannel
-    try {
-      // FR-17 stage B - unordered ONLY when this session negotiated
-      // framing; `videoDcOptions` enforces that pairing.
-      dc = pc.createDataChannel(
-        VP9_444_DC_LABEL,
-        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
-      )
-    } catch (err) {
-      console.warn('[rc] vp9-444 DC creation failed', err)
-      try { worker.terminate() } catch { /* ignore */ }
-      return null
-    }
-    dc.binaryType = 'arraybuffer'
-    lastVideoDcMsgMs = 0 // fresh path Ã¢ÂÂ don't count the setup silence as a gap
-    startJankDetector()
-    dc.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return
-      noteVideoDcDelivery()
-      try {
-        // P1 Ã¢ÂÂ sentAt stamps the mainÃ¢ÂÂworker forwarding hop (epoch-absolute).
-        worker.postMessage(
-          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
-          [ev.data],
-        )
-      } catch (err) {
-        console.warn('[rc] vp9-444 worker post failed', err)
-      }
-    }
-    dc.onopen = () => {
-      markConnect('dc_open')
-      console.info('[rc] vp9-444 DC opened')
-    }
-    dc.onclose = () => {
-      console.info('[rc] vp9-444 DC closed')
-    }
-    channels.videoBytes = dc
-    vp9_444Worker = worker
-    vp9_444Active.value = true
-    // FR-1 P7 — the clock offset may already be locked (probe started with
-    // the control DC); hand it to the fresh worker.
-    pushClockOffset()
-    return worker
+    return codecOverride ?? (effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08')
   }
 
-  function stopVp9_444Path() {
-    vp9_444Active.value = false
-    vp9_444FramesDecoded.value = 0
-    // P7 — drop the viewport reporter + render-path mirror with the path.
-    vp9ViewportCleanup?.()
-    vp9ViewportCleanup = null
-    renderInfo.value = null
-    if (!vp9_444Worker) return
-    try { vp9_444Worker.postMessage({ type: 'close' }) } catch { /* ignore */ }
-    try { vp9_444Worker.terminate() } catch { /* ignore */ }
-    vp9_444Worker = null
-  }
-
-  /** When the view mounts a real `<canvas>`, swap it in for the
-   *  synthetic OffscreenCanvas the worker started with. The worker
-   *  treats `init-canvas` as idempotent Ã¢ÂÂ second call replaces the
-   *  paint target. */
-  watch(vp9_444CanvasEl, (el) => {
-    vp9ViewportCleanup?.()
-    vp9ViewportCleanup = null
-    if (!el || !vp9_444Worker) return
-    try {
-      const off = el.transferControlToOffscreen()
-      vp9_444Worker.postMessage({ type: 'init-canvas', canvas: off }, [off])
-      // P7 — start reporting the element box for the FSR sizing policy.
-      vp9ViewportCleanup = startViewportReporter(el, vp9_444Worker)
-    } catch (err) {
-      console.warn('[rc] vp9-444: transferControlToOffscreen failed', err)
-    }
-  })
-
-  /** rc.78 Ã¢ÂÂ boot the HEVC worker, open the `video-bytes` DataChannel,
-   *  and forward incoming binary messages to the worker. Mirror of
-   *  `startVp9_444Path` for the HEVC transport. Called from
-   *  `connect()` only when the browser opted in to
-   *  `data-channel-hevc` AND `hevcSupported` resolved true.
+  /** FR-135 R3 — boot the one data-channel decode worker
+   *  (`rc-dc-worker.ts`), open the `video-bytes` DataChannel, and forward
+   *  incoming binary messages to the worker. Called from `connect()` when
+   *  this session asks for a data-channel transport (`transport`); `codec` is
+   *  the decoder's codec string for its cell, and `label` the name the path
+   *  goes by (`DcPathLabel`). Idempotent — a second call while a worker exists
+   *  is a no-op (wraps the existing channel + worker pair).
+   *
+   *  The worker self-decodes against an `OffscreenCanvas`: a synthetic one
+   *  (created here, never displayed) until the view mounts its `<canvas>`
+   *  and `dcCanvasEl`'s watcher swaps it in with `transferControlToOffscreen()`.
+   *  Bytes still flow + frames still decode in the synthetic case, which is
+   *  what e2e + integration tests assert against.
    *
    *  Returns the worker handle so tests can drive it directly. */
-  function startHevcPath(codecOverride?: string): Worker | null {
-    if (hevcWorker) return hevcWorker
+  function startDcPath(label: DcPathLabel, codec: string, transport: string): Worker | null {
+    if (dcWorker) return dcWorker
     if (!pc) return null
     let worker: Worker
     try {
       worker = new Worker(
-        new URL('../workers/rc-hevc-worker.ts', import.meta.url),
+        new URL('../workers/rc-dc-worker.ts', import.meta.url),
         { type: 'module' },
       )
     } catch (err) {
-      console.warn('[rc] hevc worker construction failed', err)
+      console.warn(`[rc] ${label} worker construction failed`, err)
       return null
     }
-    worker.onmessage = (ev) => {
-      const msg = ev.data as Record<string, unknown> | undefined
-      if (!msg || typeof msg.type !== 'string') return
-      if (msg.type === 'bench-probe') {
-        onBenchProbe(msg.seq, msg.paintedAt, 'hevc')
-        return
-      }
-      if (msg.type === 'viewer-hz') {
-        onViewerHz(msg.hz)
-        return
-      }
-      if (msg.type === 'request-keyframe') {
-        // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
-        // for a fresh IDR so it can resync.
-        requestKeyframe()
-        return
-      }
-      if (msg.type === 'first-frame'
-        && typeof msg.width === 'number'
-        && typeof msg.height === 'number') {
-        mediaIntrinsicW.value = msg.width
-        mediaIntrinsicH.value = msg.height
-        hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
-        markConnect('first_frame')
-        logConnectTiming('first-frame')
-        // rc.100 Ã¢ÂÂ the worker now reports the CODED size as width/height and
-        // forwards coded/display/visibleRect for field diagnosis. Logging the
-        // gap localises the NVDEC HEVC dim mismatch (DEVBOX: agent
-        // encodes 2560ÃÂ1600 but display came out 1280ÃÂ720).
-        console.info(
-          '[rc] hevc first frame', msg.width, 'x', msg.height,
-          '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
-          '| crop', msg.crop, 'rewrapped', msg.rewrapped,
-          // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
-          '| decoded colour space', colorSpaceLabel(msg.colorSpace),
-        )
-      } else if (msg.type === 'colorspace-dropped') {
-        warnColorSpaceDropped('hevc', msg)
-      } else if (msg.type === 'decoder-configured') {
-        // `pref` (round 3) Ã¢ÂÂ see the vp9-444 handler.
-        dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
-        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
-      } else if (msg.type === 'decoder-error'
-        || msg.type === 'decoder-configure-error'
-        || msg.type === 'decode-error') {
-        // Mid-session HEVC HW driver hiccup OR the decoder
-        // claimed support then rejected real bytes. Tear down so
-        // the view re-mounts <video> and the standard RTP path
-        // (which the agent sends in parallel) renders normally.
-        console.warn('[rc] hevc worker', msg.type, msg.error, 'Ã¢ÂÂ auto-fallback to <video>')
-        // A failure BEFORE the first decoded frame means the pre-connect
-        // probe was wrong for this browser, and it will be wrong again on
-        // the next rank (field: Edge, where MediaCapabilities says HEVC is
-        // hardware-smooth while WebCodecs refuses hev1) - ban the transport
-        // for this page and re-negotiate NOW instead of leaving a black
-        // canvas for the watchdog to find ~10 s later (a DC session's
-        // <video> has no parallel RTP samples, so this fallback renders
-        // nothing). A post-first-frame error is a transient (driver
-        // hiccup) - the same codec may work again on reconnect.
-        // FR-132 P1 — counted on the agent, before the teardown below.
-        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-        const hevcNeverDecoded = hevcFramesDecoded.value === 0
-        stopHevcPath()
-        if (hevcNeverDecoded) {
-          failedDcTransports.add('data-channel-hevc')
-          // FR-77 — remembered per device × cell (a Rext failure bans only
-          // the 4:4:4 cell; the 4:2:0 path is a different decoder profile).
-          if (codecAgentId) {
-            rememberCellFailure(codecAgentId, 'hevc', sessionCellChroma, globalThis.navigator?.userAgent ?? '')
-          }
-          console.warn('[rc] data-channel-hevc banned for this page (decoder failed before first frame) - reconnecting on the next-best transport')
-          if (lastConnectArgs) scheduleReconnect()
-        }
-      } else if (msg.type === 'decode-recovering') {
-        // FR-135 R1 — see the vp9-444 handler.
-        console.warn('[rc] hevc decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
-        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-      } else if (msg.type === 'decode-recovered') {
-        console.info('[rc] hevc decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
-      } else if (msg.type === 'frame-rejected') {
-        console.warn('[rc] hevc frame rejected', msg)
-      } else if (msg.type === 'awaiting-keyframe') {
-        // rc.103 Ã¢ÂÂ the leading-delta gate is dropping deltas while it waits
-        // for the first IDR (async-encoder DC-open race). Expected for a
-        // few frames right after "hevc DC opened"; a high/growing count
-        // means the agent isn't shipping an IDR (check encoder forced-idr).
-        console.info('[rc] hevc awaiting keyframe Ã¢ÂÂ dropped', msg.dropped, 'leading delta(s)')
-      } else if (msg.type === 'keyframe-acquired') {
-        console.info('[rc] hevc first keyframe acquired (dropped', msg.droppedBefore, 'leading delta(s))')
-      } else if (msg.type === 'backlog-drop') {
-        // Round 3 Ã¢ÂÂ was silently dropped; parity with the vp9-444 handler.
-        console.warn('[rc] hevc backlog drop Ã¢ÂÂ decode queue', msg.queue, 'Ã¢ÂÂ gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
-      } else if (msg.type === 'decode-stall') {
-        // 2026-07-24 Ã¢ÂÂ see the vp9-444 handler: decoder/GPU-process stall
-        // marker (frames arriving, work queued, no output for gapMs).
-        console.warn('[rc] hevc DECODE STALL Ã¢ÂÂ no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
-      } else if (msg.type === 'decode-stall-recovered') {
-        console.warn('[rc] hevc decode stall recovered after', msg.gapMs, 'ms')
-      } else if (msg.type === 'render-fallback') {
-        // P7 — GL unavailable/lost for good this session; the worker
-        // reverted to the byte-identical 2D paint path.
-        console.warn('[rc] hevc FSR unavailable — 2D paint path:', msg.reason)
-      } else if (msg.type === 'frame-decoded') {
-        hevcFramesDecoded.value++
-      } else if (msg.type === 'stats') {
-        const m = msg as {
-          bitrateBps?: number
-          fps?: number
-          width?: number
-          height?: number
-          bytesReceivedTotal?: number
-          framesDroppedBacklog?: number
-          decodeQueueSize?: number
-          backlogMs?: number
-          backlogMaxMs?: number
-          framesDecodedTotal?: number
-          paint?: HopWindow
-          fwd?: HopWindow
-          decode?: HopWindow
-          // FR-15 — end-to-end paint age window (null until the
-          // rc:clock probe locks); rides the decodestat to the agent.
-          age?: HopWindow | null
-          outGapMaxMs?: number
-          ctxMode?: string
-          render?: string
-          renderW?: number
-          renderH?: number
-        }
-        updateRenderInfo(m)
-        hevcStats.value = {
-          bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
-          fps: typeof m.fps === 'number' ? m.fps : 0,
-          width: typeof m.width === 'number' ? m.width : 0,
-          height: typeof m.height === 'number' ? m.height : 0,
-          bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
-        }
-        if (hevcStats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
-        // P1 Ã¢ÂÂ see the vp9-444 handler.
-        if (typeof m.framesDecodedTotal === 'number') {
-          hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, m.framesDecodedTotal)
-        }
-        updateDecodeDiag(m)
-        // rc.188 Ã¢ÂÂ feed the agent this viewer's real decode rate so it caps fps.
-        handleDecoderStats(m)
-      }
-    }
-    // Synthetic OffscreenCanvas Ã¢ÂÂ keeps the worker fully wired even
-    // without a view-side canvas. rc.79+ swaps in the visible canvas
-    // via hevcCanvasEl watcher below.
+    worker.onmessage = (ev) => onDcWorkerMessage(worker, label, ev)
+    // Synthetic OffscreenCanvas — keeps the worker fully wired even
+    // without a view-side canvas. Y.4 swaps in the visible canvas
+    // via the dcCanvasEl watcher below.
     try {
       const synthetic = new OffscreenCanvas(2, 2)
       worker.postMessage(
         {
           type: 'init-canvas',
           canvas: synthetic,
-          // P7 — Rext 4:4:4 sessions override the Main-profile default
-          // (hev1.4.10.L153.B0 vs hev1.1.6.L153.B0); undefined keeps it.
-          codec: codecOverride,
+          codec,
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
@@ -8733,14 +8710,15 @@ export function useRemoteControl(
         [synthetic],
       )
     } catch (err) {
-      console.warn('[rc] hevc: synthetic OffscreenCanvas init failed', err)
+      console.warn(`[rc] ${label}: synthetic OffscreenCanvas init failed`, err)
       try { worker.terminate() } catch { /* ignore */ }
       return null
     }
-    // Open the same `video-bytes` DC the VP9-444 path uses Ã¢ÂÂ the
-    // agent's `media_pump_hevc_dc` writes there based on the
-    // negotiated_transport. Browser opens unconditionally; the
-    // agent stays silent if it picked the WebRTC track instead.
+    // Open the DC. The browser opens it unconditionally; the agent pumps
+    // bytes through it only when its caps include the same transport, and
+    // stays silent if it picked the WebRTC track instead. Binary messages
+    // go straight through to the worker as ArrayBuffer chunks
+    // (transferred, not copied).
     let dc: RTCDataChannel
     try {
       // FR-17 stage B - unordered ONLY when this session negotiated
@@ -8750,66 +8728,317 @@ export function useRemoteControl(
         videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
       )
     } catch (err) {
-      console.warn('[rc] hevc DC creation failed', err)
+      console.warn(`[rc] ${label} DC creation failed`, err)
       try { worker.terminate() } catch { /* ignore */ }
       return null
     }
-    dc.binaryType = 'arraybuffer'
-    lastVideoDcMsgMs = 0 // fresh path Ã¢ÂÂ don't count the setup silence as a gap
+    // FR-135 R3 — the channel into the worker, in the task that made it (the
+    // only one in which a channel can move), where this browser can transfer
+    // one and this session asks. Refused, it is still the page's, untouched,
+    // and the relay below carries it as before.
+    const refused = sessionDcWorker ? moveVideoChannelToWorker(worker, dc) : 'off'
+    videoDcGap.reset() // fresh path - don't count the setup silence as a gap
     startJankDetector()
-    dc.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return
-      noteVideoDcDelivery()
-      try {
-        // P1 Ã¢ÂÂ sentAt stamps the mainÃ¢ÂÂworker forwarding hop (epoch-absolute).
-        worker.postMessage(
-          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
-          [ev.data],
-        )
-      } catch (err) {
-        console.warn('[rc] hevc worker post failed', err)
+    if (refused === null) {
+      // Its open, close and delivery gaps come back as worker messages
+      // (`onDcWorkerMessage`); the page's object is a closed husk now, so it
+      // stays out of `channels`, and the session's `pc.close()` closes the real one.
+      dcChannelInWorker = true
+      dcChannelMove.moved()
+      console.info(`[rc] ${label} video channel moved into the decode worker (roomler-rc-dc-worker)`)
+    } else {
+      dcChannelInWorker = false
+      if (sessionDcWorker) {
+        console.info(`[rc] ${label} video channel stays on the page, relayed to the worker: this browser refused to move it (${refused})`)
       }
+      dc.binaryType = 'arraybuffer'
+      dc.onmessage = (ev) => {
+        if (!(ev.data instanceof ArrayBuffer)) return
+        noteVideoDcDelivery()
+        try {
+          // P1 - sentAt stamps the main-to-worker forwarding hop (epoch-absolute).
+          worker.postMessage(
+            { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
+            [ev.data],
+          )
+        } catch (err) {
+          console.warn(`[rc] ${label} worker post failed`, err)
+        }
+      }
+      dc.onopen = () => {
+        markConnect('dc_open')
+        console.info(`[rc] ${label} DC opened`)
+      }
+      dc.onclose = () => {
+        console.info(`[rc] ${label} DC closed`)
+      }
+      channels.videoBytes = dc
     }
-    dc.onopen = () => {
-      markConnect('dc_open')
-      console.info('[rc] hevc DC opened')
-    }
-    dc.onclose = () => {
-      console.info('[rc] hevc DC closed')
-    }
-    channels.videoBytes = dc
-    hevcWorker = worker
-    hevcActive.value = true
+    dcWorker = worker
+    dcPathLabel = label
+    dcPathTransport = transport
+    dcActive.value = true
     // FR-1 P7 — the clock offset may already be locked (probe started with
     // the control DC); hand it to the fresh worker.
     pushClockOffset()
+    // #3566 — and measure the worker's clock against the page's, which that
+    // offset, `sentAt` and the bench's sends are on.
+    dcClockCal = startWorkerClockCal(worker, label)
     return worker
   }
 
-  function stopHevcPath() {
-    hevcActive.value = false
-    hevcFramesDecoded.value = 0
-    // P7 — drop the viewport reporter + render-path mirror with the path.
-    hevcViewportCleanup?.()
-    hevcViewportCleanup = null
-    renderInfo.value = null
-    if (!hevcWorker) return
-    try { hevcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
-    try { hevcWorker.terminate() } catch { /* ignore */ }
-    hevcWorker = null
+  /** FR-135 R3 — the data-channel worker's messages, one handler for every
+   *  codec. `label` is the name the path goes by in the console, on
+   *  `rc:decode-error` and in the bench record. A message from a worker that
+   *  is no longer the active one belongs to a stopped path, and is dropped. */
+  function onDcWorkerMessage(worker: Worker, label: DcPathLabel, ev: MessageEvent) {
+    if (worker !== dcWorker) return
+    const msg = ev.data as Record<string, unknown> | undefined
+    if (!msg || typeof msg.type !== 'string') return
+    // #3566 — first, so the clock's answer is stamped before anything else runs.
+    if (dcClockCal?.onWorkerMessage(msg)) return
+    if (msg.type === 'bench-probe') {
+      onBenchProbe(msg.seq, msg.paintedAt, label)
+      return
+    }
+    // FR-138 — its answers to a hold's mark (`rc.resume`'s `gap_ms`).
+    if (msg.type === PAINT_GAP_MARKED || msg.type === PAINT_GAP_CLOSED) {
+      if (holdGapPath === 'dc') {
+        if (msg.type === PAINT_GAP_MARKED) holdGap?.marked(msg.sinceMs)
+        else holdGap?.closed(msg.gapMs)
+      }
+      return
+    }
+    if (msg.type === 'viewer-hz') {
+      onViewerHz(msg.hz)
+      return
+    }
+    if (msg.type === 'request-keyframe') {
+      // rc.130 - worker dropped deltas on a decode backlog; ask the agent
+      // for a fresh IDR so it can resync.
+      requestKeyframe()
+      return
+    }
+    // FR-135 R3 — a moved channel's arrival, or its failure (`dcChannelMove`).
+    if (dcChannelMove.onWorkerMessage(msg.type)) return
+    if (msg.type === 'message-error') {
+      console.warn(`[rc] ${label} worker could not receive a message (messageerror)`)
+      return
+    }
+    // FR-135 R3 — the channel moved into the worker says what the page's own
+    // handlers say for a relayed one, with the same lines.
+    if (msg.type === 'video-channel-open') {
+      markConnect('dc_open')
+      console.info(`[rc] ${label} DC opened`)
+      return
+    }
+    if (msg.type === 'video-channel-closed') {
+      console.info(`[rc] ${label} DC closed`)
+      return
+    }
+    if (msg.type === 'video-channel-gap') {
+      if (typeof msg.gapMs === 'number') warnVideoDcGap(msg.gapMs)
+      return
+    }
+    if (msg.type === 'first-frame'
+      && typeof msg.width === 'number'
+      && typeof msg.height === 'number') {
+      mediaIntrinsicW.value = msg.width
+      mediaIntrinsicH.value = msg.height
+      dcFramesDecoded.value = Math.max(dcFramesDecoded.value, 1)
+      markConnect('first_frame')
+      logConnectTiming('first-frame')
+      // rc.100 - the worker reports the size it paints as width/height and
+      // forwards coded/display/visibleRect for field diagnosis. Logging the
+      // gap localises a decoder that misreports the geometry (DEVBOX: the
+      // agent encoded 2560x1600 HEVC and NVDEC's display came out 1280x720).
+      console.info(
+        `[rc] ${label} first frame`, msg.width, 'x', msg.height,
+        '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
+        '| crop', msg.crop, 'rewrapped', msg.rewrapped,
+        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+        '| decoded colour space', colorSpaceLabel(msg.colorSpace),
+      )
+    } else if (msg.type === 'colorspace-dropped') {
+      warnColorSpaceDropped(label, msg)
+    } else if (msg.type === 'decoder-configured') {
+      // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
+      // configure() - proves whether the roomler-rc-decode-pref A/B took.
+      // FR-80 — `msg.codec` is the truth (the label is a path name, and
+      // `vp9-444` decodes VP9, AV1 and H.264). The pill reads it until the
+      // agent names its encoder.
+      dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
+      // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
+      console.info(`[rc] ${label} decoder configured`, msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
+    } else if (msg.type === 'decoder-error'
+      || msg.type === 'decoder-configure-error'
+      || msg.type === 'decode-error') {
+      // The decoder claimed support then rejected real bytes (rc.43: Chrome
+      // 148 accepted vp09.01.10.08 at configure() and failed the first real
+      // frame with "Unsupported configuration"), or a mid-session driver
+      // hiccup outlasted R1's recovery. Stop the path either way.
+      console.warn(`[rc] ${label} worker`, msg.type, msg.error, '- auto-fallback to <video>')
+      // FR-132 P1 — counted on the agent, before the teardown below.
+      reportDecodeError(label, msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+      const neverDecoded = dcFramesDecoded.value === 0
+      const failedTransport = dcPathTransport
+      stopDcPath()
+      // A failure BEFORE the first decoded frame means the pre-connect probe
+      // was wrong for this browser, and it will be wrong again on the next
+      // rank (field: Edge, where MediaCapabilities says HEVC is
+      // hardware-smooth while WebCodecs refuses hev1) - ban the transport for
+      // this page and re-negotiate NOW instead of leaving a black canvas for
+      // the watchdog to find ~10 s later (a DC session's <video> has no
+      // parallel RTP samples, so the fallback renders nothing). A
+      // post-first-frame error is a transient (driver hiccup) - the same
+      // codec may work again on reconnect.
+      if (neverDecoded && failedTransport && failedTransport !== 'auto' && failedTransport !== 'webrtc') {
+        failedDcTransports.add(failedTransport)
+        // FR-77 — remembered per device × cell across page loads (a Rext
+        // failure bans only the 4:4:4 cell; 4:2:0 is a different profile).
+        const failedCodec = cellCodecOfTransport(failedTransport)
+        if (codecAgentId && failedCodec) {
+          rememberCellFailure(codecAgentId, failedCodec, sessionCellChroma, globalThis.navigator?.userAgent ?? '')
+        }
+        console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
+        if (lastConnectArgs) scheduleReconnect()
+      }
+    } else if (msg.type === 'decode-recovering') {
+      // FR-135 R1 — the worker replaced the decoder and waits for the key
+      // frame it asked for. The path stays up. The agent still counts it.
+      console.warn(`[rc] ${label} decoder failed:`, msg.error, '- recovering in place, attempt', msg.attempt)
+      reportDecodeError(label, msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+    } else if (msg.type === 'decode-recovered') {
+      console.info(`[rc] ${label} decode recovered in`, msg.ms, 'ms, attempts', msg.attempts)
+    } else if (msg.type === 'frame-rejected') {
+      console.warn(`[rc] ${label} frame rejected`, msg)
+    } else if (msg.type === 'awaiting-keyframe') {
+      // rc.103 - the leading-delta gate is dropping deltas while it waits
+      // for an IDR (the async-encoder DC-open race, a backlog drop, a chunk
+      // gap or a rebuilt decoder). Expected for a few frames; a high,
+      // growing count means the agent isn't shipping an IDR.
+      console.info(`[rc] ${label} awaiting keyframe - dropped`, msg.dropped, 'delta(s) while gated')
+    } else if (msg.type === 'keyframe-acquired') {
+      console.info(`[rc] ${label} keyframe acquired (dropped`, msg.droppedBefore, 'delta(s) before it)')
+    } else if (msg.type === 'backlog-drop') {
+      // FR-119 P2b-7 — the rule reads the backlog in ms; the queue is for context.
+      console.warn(`[rc] ${label} backlog drop - backlog`, msg.backlogMs, 'ms, decode queue', msg.queue, '- gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
+    } else if (msg.type === 'decode-stall') {
+      // 2026-07-24 - frames are arriving but the decoder produced no
+      // output for gapMs with work queued: a decoder/GPU-process stall,
+      // NOT transport and NOT the resync gate. Field-diagnosis marker.
+      console.warn(`[rc] ${label} DECODE STALL - no decoder output for`, msg.gapMs, 'ms; queue', msg.queue)
+    } else if (msg.type === 'decode-stall-recovered') {
+      console.warn(`[rc] ${label} decode stall recovered after`, msg.gapMs, 'ms')
+    } else if (msg.type === 'render-fallback') {
+      // P7 — GL unavailable/lost for good this session; the worker
+      // reverted to the byte-identical 2D paint path.
+      console.warn(`[rc] ${label} FSR unavailable — 2D paint path:`, msg.reason)
+    } else if (msg.type === 'frame-decoded') {
+      // The worker emits this for every decoded frame after the first, only
+      // under `roomler-rc-per-frame-msg` (P1).
+      dcFramesDecoded.value++
+    } else if (msg.type === 'stats') {
+      // rc.35 - rolling-window bitrate / fps / resolution from the
+      // worker. Surfaces the actual DC-receive throughput so the
+      // operator can confirm the agent's bitrate target is pushing the
+      // link as expected.
+      const m = msg as {
+        bitrateBps?: number
+        fps?: number
+        width?: number
+        height?: number
+        bytesReceivedTotal?: number
+        framesDroppedBacklog?: number
+        decodeQueueSize?: number
+        backlogMs?: number
+        backlogMaxMs?: number
+        framesDecodedTotal?: number
+        paint?: HopWindow
+        fwd?: HopWindow
+        decode?: HopWindow
+        // FR-15 — end-to-end paint age window (null until the
+        // rc:clock probe locks); rides the decodestat to the agent.
+        age?: HopWindow | null
+        outGapMaxMs?: number
+        ctxMode?: string
+        render?: string
+        renderW?: number
+        renderH?: number
+      }
+      updateRenderInfo(m)
+      dcStats.value = {
+        bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
+        fps: typeof m.fps === 'number' ? m.fps : 0,
+        width: typeof m.width === 'number' ? m.width : 0,
+        height: typeof m.height === 'number' ? m.height : 0,
+        bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
+      }
+      if (dcStats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
+      // P1 - the per-frame `frame-decoded` message is off by default; keep
+      // the diagnostics counter monotonic from the 1 s window total.
+      if (typeof m.framesDecodedTotal === 'number') {
+        dcFramesDecoded.value = Math.max(dcFramesDecoded.value, m.framesDecodedTotal)
+      }
+      updateDecodeDiag(m)
+      // rc.188 - feed the agent this viewer's real decode rate so it caps fps.
+      handleDecoderStats(m)
+    }
   }
 
-  watch(hevcCanvasEl, (el) => {
-    hevcViewportCleanup?.()
-    hevcViewportCleanup = null
-    if (!el || !hevcWorker) return
+  function stopDcPath() {
+    dcActive.value = false
+    dcFramesDecoded.value = 0
+    // FR-135 R3 — the pill and the size hints read these while a path is up;
+    // the next path, of any codec, starts from nothing rather than this one's.
+    dcStats.value = { bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 }
+    // P7 — drop the viewport reporter + render-path mirror with the path.
+    dcViewportCleanup?.()
+    dcViewportCleanup = null
+    renderInfo.value = null
+    dcPathLabel = null
+    dcPathTransport = null
+    // FR-135 R3 — a channel in the worker goes with it: terminating the worker
+    // stops it being read, as a relayed one stops being read once its worker
+    // is gone, and the session's `pc.close()` closes either.
+    dcChannelInWorker = false
+    dcChannelMove.stop()
+    dcClockCal?.stop()
+    dcClockCal = null
+    if (!dcWorker) return
+    try { dcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
+    try { dcWorker.terminate() } catch { /* ignore */ }
+    dcWorker = null
+  }
+
+  /** FR-135 R3 — the page moved the channel and the worker did not take it
+   *  (no `video-channel-attached` in time, or `messageerror`). The page kept no
+   *  copy, so this session has no picture: stop the path, relay on every later
+   *  session of this page, and reconnect now rather than at the watchdog. */
+  function onVideoChannelMoveFailed(why: string) {
+    if (!dcWorker || !dcChannelInWorker) return
+    const label = dcPathLabel ?? 'dc'
+    dcWorkerMoveFailed = true
+    console.warn(`[rc] ${label} video channel moved into the decode worker, but ${why} - relaying it on the page from now on, and reconnecting`)
+    stopDcPath()
+    if (lastConnectArgs) scheduleReconnect()
+  }
+
+  /** When the view mounts a real `<canvas>`, swap it in for the
+   *  synthetic OffscreenCanvas the worker started with. The worker
+   *  treats `init-canvas` as idempotent - second call replaces the
+   *  paint target. */
+  watch(dcCanvasEl, (el) => {
+    dcViewportCleanup?.()
+    dcViewportCleanup = null
+    if (!el || !dcWorker) return
     try {
       const off = el.transferControlToOffscreen()
-      hevcWorker.postMessage({ type: 'init-canvas', canvas: off }, [off])
+      dcWorker.postMessage({ type: 'init-canvas', canvas: off }, [off])
       // P7 — start reporting the element box for the FSR sizing policy.
-      hevcViewportCleanup = startViewportReporter(el, hevcWorker)
+      dcViewportCleanup = startViewportReporter(el, dcWorker)
     } catch (err) {
-      console.warn('[rc] hevc: transferControlToOffscreen failed', err)
+      console.warn(`[rc] ${dcPathLabel ?? 'dc'}: transferControlToOffscreen failed`, err)
     }
   })
 
@@ -8957,6 +9186,10 @@ export function useRemoteControl(
       }
       requestSent = false
       sessionId.value = msg.session_id
+      // FR-138 — the server calls this session resumable (`resume_secs`): it
+      // may be held. The request is answered, so nothing is left to replace.
+      hold.arm(msg.session_id, holdWindowFor(msg.resume_secs, externalMode))
+      replacesId = null
       // Multi-user P3: the server reports the EFFECTIVE grant, which the
       // single-INPUT-holder rule may have narrowed (another live session
       // already drives this host). Absent from pre-P3 servers = treat as
@@ -9252,11 +9485,30 @@ export function useRemoteControl(
         /* ignore Ã¢ÂÂ happens on stale candidates during teardown */
       }
     })
+    // FR-138 — the device's control socket dropped and the server keeps the
+    // session: hold it, and ask for it back once a second until the device
+    // has claimed it. An older viewer ignores this and redials as today.
+    on('rc:session.detached', (msg) => {
+      if (phase.value !== 'connected') return
+      if (typeof msg.session_id !== 'string' || msg.session_id !== sessionId.value) return
+      hold.detached(msg.session_id, msg.resume_by)
+    })
+    // FR-138 — the claim was accepted: the session goes on as it was.
+    on('rc:session.resumed', (msg) => {
+      if (typeof msg.session_id !== 'string' || msg.session_id !== sessionId.value) return
+      const s = hold.resumed(msg.session_id)
+      if (s) onHoldEnd(s)
+    })
     on('rc:terminate', (msg) => {
       // While the ladder timer is pending every terminate refers to a
       // session we already abandoned Ã¢ÂÂ ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // FR-138 — the device's `rc:ended` may have said this end first.
+      if (!claimEnd(typeof msg.session_id === 'string' && msg.session_id ? msg.session_id : sessionId.value)) return
+      // FR-138 — a held session's end, the answer to a rejoin included: the
+      // hold's record says why, and the rest is today's.
+      endHold(typeof msg.reason === 'string' ? msg.reason : 'terminate')
       // Involuntary endings (agent WS displacement Ã¢ÂÂ the classic
       // "host joined a VPN" symptom Ã¢ÂÂ or a transient agent error)
       // auto-re-create the session instead of dumping the operator
@@ -9339,6 +9591,17 @@ export function useRemoteControl(
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // FR-138 — while a session is held, the page sends nothing but its
+      // rejoins, so an error now is the server refusing one: it will not
+      // resume this session. Redial, naming what the redial replaces, rather
+      // than fail a session whose pixels may still flow.
+      if (hold.holding()) {
+        const code = typeof msg.code === 'string' ? msg.code : 'unknown'
+        console.warn('[rc] FR-138: rc:error (', code, ') while the session is held - redialing')
+        endHold(code)
+        scheduleReconnect({ notifyServer: false })
+        return
+      }
       // #2251 - and once the server has ENDED this session, an error scoped to
       // it is fallout of frames in flight, never news: the end said why.
       if (isFalloutOfEndedSession(phase.value, msg.session_id, sessionId.value)) {
@@ -9396,6 +9659,9 @@ export function useRemoteControl(
   }
 
   function failWith(message: string) {
+    // FR-138 — a hold this failure ends, and nothing left to replace.
+    endHold('error')
+    replacesId = null
     error.value = message
     phase.value = 'error'
     cancelReconnect()
@@ -9433,10 +9699,9 @@ export function useRemoteControl(
   /**
    * Schedule the next reconnect attempt according to
    * `RC_RECONNECT_LADDER_MS`. Cancels any prior schedule (no
-   * stacking). After `RC_RECONNECT_LADDER_MS.length` attempts have
-   * elapsed without a 'connected' transition resetting the counter,
-   * gives up and calls `failWith` so the operator sees the failure
-   * instead of a hung "reconnecting" UI.
+   * stacking). Past the ladder it retries every
+   * `RC_RECONNECT_STEADY_MS` (`nextReconnectDelayMs`) and never gives
+   * up on its own (rc.23); only a missing replay argument fails it.
    *
    * The PC is torn down at schedule time (not retry time) so any
    * lingering ICE / track listeners don't fire on the dead PC while
@@ -9476,19 +9741,34 @@ export function useRemoteControl(
     // session id is still known. A recorder that already painted is a
     // drop, reported at first paint; logConnectTiming just releases it.
     if (connectTiming) logConnectTiming('retried')
-    // Free the agent's session slot BEFORE retrying: the default
-    // max_simultaneous_sessions is 1, and the agent only notices a
+    // Free the agent's session slot BEFORE retrying: a device allows two
+    // sessions unless set to fewer (`rc_max_sessions`), and the agent only notices a
     // dead peer on its own timeout Ã¢ÂÂ without this hangup the fresh
     // request bounces off `agent_busy` for many seconds. Skipped
     // (notifyServer: false) when the trigger was the server ending
     // the session itself.
-    if (opts?.notifyServer !== false && sessionId.value) {
+    // FR-138 D5 = A — skipped too for a session the server has told this page
+    // is detached (`rc:session.detached`, not resumed since), this redial
+    // included when the hold's own deadline started it. Its device is away,
+    // so the session ended on the device's side, and the redial's `replaces`
+    // records that (`agent_disconnect`, inferred) and gives the org's slot
+    // back before the request's gate. A hangup would free nothing the device
+    // can hear, and wrote `controller_hangup` for a session nobody hung up
+    // (#3604, AC4 cell (d)). A person's Disconnect still says it (`disconnect`).
+    if (opts?.notifyServer !== false && sessionId.value && !hold.deviceDetached(sessionId.value)) {
       ws.sendRaw({
         t: 'rc:terminate',
         session_id: sessionId.value,
         reason: 'controller_hangup',
       })
     }
+    // FR-138 — a transport signal during a hold keeps today's meaning: the
+    // peer failed. A session the server may hold keeps its id, as the
+    // `replaces` of every request until one is answered: the hangup above
+    // goes nowhere while this page's socket is down, and is not sent for a
+    // detached session (spec §4.4, §4.5).
+    endHold('transport')
+    if (!externalMode && sessionId.value && hold.resumable(sessionId.value)) replacesId = sessionId.value
     sessionId.value = null
     const attemptIdx = reconnectAttempt.value
     // rc.23 Ã¢ÂÂ nextReconnectDelayMs always returns a positive delay
@@ -9576,6 +9856,85 @@ export function useRemoteControl(
   }
 
   /**
+   * #3582 - what a reload for a new build reads from this viewer and asks of
+   * it (`utils/staleBuildWatch.ts`; RemoteControl.vue registers it). The one
+   * thing it may take over is the redial: the session is already cut, so a
+   * reload that resumes it costs the person about the page's load time, and
+   * the host no consent the redial would not have asked for. `holdRedial`
+   * stops the pending retry so no request leaves a page that is unloading;
+   * `releaseRedial` re-arms the ladder, its backoff kept, if no reload came.
+   */
+  let redialHeldForReload = false
+  /** FR-138 — what a reload's resume replaces: the held session a redial
+   *  names, or the live session itself when the server may hold it. A page
+   *  that unloads cannot hang up, and the server may keep a resumable session
+   *  past its viewer's socket. */
+  function withReloadReplaces(args: RcResumeArgs): RcResumeArgs {
+    const replaces = sessionId.value && hold.resumable(sessionId.value) ? sessionId.value : replacesId
+    return replaces ? { ...args, replaces } : args
+  }
+  // When the session last ended (closed or failed): its notice is on the page.
+  let sessionEndedAt = Number.NEGATIVE_INFINITY
+  watch(phase, (p, prev) => {
+    if ((p === 'closed' || p === 'error') && p !== prev) sessionEndedAt = Date.now()
+  })
+  const reloadSurface: RcReloadSurface = {
+    state: () =>
+      rcReloadState({
+        phase: phase.value,
+        redialPending: reconnectTimer !== null || redialHeldForReload,
+        hasArgs: lastConnectArgs !== null,
+        external: externalMode,
+        // What lives only in this page's memory: a transfer the redial would
+        // resume (rc.19), a recording's download.
+        work:
+          transfers.value.some((t) => t.status === 'queued' || t.status === 'running' || t.status === 'reconnecting')
+          || recording.download.value?.status === 'active'
+          || recording.download.value?.status === 'paused',
+        endedRecently: Date.now() - sessionEndedAt < RC_ENDED_HOLD_MS,
+        asksConsent: consentAsks.value !== null,
+      }),
+    resumeArgs: () => (externalMode || !lastConnectArgs ? null : withReloadReplaces({ ...lastConnectArgs })),
+    userId: () => opts?.userId?.() ?? null,
+    holdRedial: (): RcResumeArgs | null => {
+      if (externalMode || phase.value !== 'reconnecting' || reconnectTimer === null || !lastConnectArgs) return null
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+      redialHeldForReload = true
+      return withReloadReplaces({ ...lastConnectArgs })
+    },
+    releaseRedial: () => {
+      if (!redialHeldForReload) return
+      redialHeldForReload = false
+      if (phase.value === 'reconnecting' && reconnectTimer === null && lastConnectArgs) scheduleReconnect({ notifyServer: false })
+    },
+  }
+
+  /**
+   * #3582 - the load after a reload for a new build resumes the session that
+   * reload took over, through the redial's own ladder and not as a first
+   * connect. A first connect starts the ladder at 0, and `rc:error` retries
+   * `agent_offline` / `agent_busy` only past it (`isRetryableRcErrorCode` in
+   * the `rc:error` handler): a tab that reloaded while its device restarted
+   * for an update would have stopped on the first `agent_offline`, where its
+   * redial keeps trying. The session worked until the reload, so its record
+   * is `after_drop`, out of FR-22's first-attempt numbers. Never external:
+   * none is ever handed over.
+   */
+  function resumeAfterReload(args: RcResumeArgs) {
+    if (externalMode) return
+    if (phase.value !== 'idle' && phase.value !== 'closed' && phase.value !== 'error') return
+    lastConnectArgs = { agentId: args.agentId, permissions: args.permissions, orgId: args.orgId }
+    // FR-138 — the session the reloaded page's redial replaced, if it did.
+    replacesId = typeof args.replaces === 'string' && /^[0-9a-f]{24}$/.test(args.replaces) ? args.replaces : null
+    endedBy.value = null
+    sessionEverPainted = true
+    reconnectAttempt.value = Math.max(reconnectAttempt.value, 1)
+    phase.value = 'reconnecting'
+    fireReconnectAttempt()
+  }
+
+  /**
    * Resolve true the moment the signalling socket reports 'connected',
    * or false after `timeoutMs`. Used by the rc pre-flight so the
    * session request never fires into a CONNECTING socket.
@@ -9619,7 +9978,25 @@ export function useRemoteControl(
     },
   )
 
+  // FR-138 — the page's own socket, for the hold: its loss while a resumable
+  // session is live starts one, and its return (`ws:reconnected`, the store's
+  // status first) asks the server for the session back at once. Synchronous,
+  // so the rejoin goes out on the socket that just opened, before anything else.
+  watch(
+    () => ws.status,
+    (s, prev) => {
+      if (s === 'connected' && prev !== 'connected') hold.socketUp()
+      else if (s !== 'connected' && prev === 'connected' && phase.value === 'connected') hold.socketDown()
+    },
+    { flush: 'sync' },
+  )
+
   function teardown() {
+    // FR-138 — whatever ends the session ends its hold, and the session is no
+    // longer one to hold.
+    endHold('teardown')
+    hold.disarm()
+    videoPaintMark.reset()
     // #1631 - invalidate any connect() still in its pre-flight (see
     // `connectGen`): the peer it would build belongs to a state that just
     // ended. Every teardown path - disconnect(), failWith(), a scoped
@@ -9638,8 +10015,7 @@ export function useRemoteControl(
     // FR-16 L4 — flush the last batch while the session id still names it.
     stopBench()
     stopWebCodecsPath()
-    stopVp9_444Path()
-    stopHevcPath()
+    stopDcPath()
     for (const ch of Object.values(channels)) {
       try { ch.close() } catch { /* ignore */ }
     }
@@ -9691,6 +10067,7 @@ export function useRemoteControl(
     inputReach.value = null
     idleEndsAt.value = null
     dcDecoderCodec.value = null
+    dcDecoderHw = null
     remoteLayout.value = null
     localClipboardBridge.value = null
     localClipboardBridgePort.value = null
@@ -9743,6 +10120,8 @@ export function useRemoteControl(
     // the right args from the original user click.
     if (!isReconnect) {
       lastConnectArgs = { agentId, permissions, orgId }
+      // FR-138 — a fresh request replaces nothing; only a redial does.
+      replacesId = null
       // FR-27 P10 - a fresh request is the operator's answer to "the person
       // at the device ended it"; the notice has done its job.
       endedBy.value = null
@@ -10057,6 +10436,10 @@ export function useRemoteControl(
 
     pc.onicecandidate = (ev) => {
       if (!sessionId.value) return
+      // FR-138 — nothing to trickle to while the session is held: no pod
+      // routes it until the rejoin is answered, and the error a pod would
+      // answer with is no news about this peer.
+      if (hold.holding()) return
       // Note: null candidate signals end-of-gather Ã¢ÂÂ skip it.
       if (!ev.candidate) return
       ws.sendRaw({
@@ -10075,6 +10458,9 @@ export function useRemoteControl(
       if (state === 'connected') {
         markConnect('pc_connected')
         phase.value = 'connected'
+        // FR-138 — a resumable session that goes live while this page's socket
+        // is down is held from here: its return asks for it back.
+        if (ws.status !== 'connected') hold.socketDown()
         // FR-93 P5j — a session that connects is a computer that woke.
         if (isKeptSleepNotice(mediaWaiting.value, Date.now())) mediaWaiting.value = null
         // Stand down the pending retry timer, but KEEP the attempt counters:
@@ -10262,7 +10648,7 @@ export function useRemoteControl(
       if (msg.t === 'files:complete') {
         const entry = settleEntry(id)
         if (entry?.kind === 'upload') {
-          patchTransfer(id, { status: 'complete', bytes: Number(msg.bytes ?? 0) })
+          patchTransfer(id, { t: 'complete', bytes: Number(msg.bytes ?? 0) })
           entry.resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
         }
       } else if (msg.t === 'files:error') {
@@ -10282,7 +10668,7 @@ export function useRemoteControl(
         // Errors can land for either an upload OR a download.
         const entry = settleEntry(id)
         if (!entry) return
-        patchTransfer(id, { status: 'error', error: errMsg })
+        patchTransfer(id, { t: 'fail', error: errMsg })
         if (entry.kind === 'upload') {
           entry.reject(new Error(errMsg))
         } else {
@@ -10295,15 +10681,19 @@ export function useRemoteControl(
           entry.reject(new Error(errMsg))
         }
       } else if (msg.t === 'files:progress') {
-        const bytes = Number(msg.bytes ?? 0)
-        patchTransfer(id, { status: 'running', bytes })
-        // rc.19: each progress envelope is a durable-bytes ack
-        // (agent calls sync_data per 1 MiB before emitting).
-        // Update the upload entry so a future resume request
-        // claims the right offset.
+        // #3726 — an upload's bar is what the device has written: its
+        // `files:progress` (every 256 KiB), the same count a resume asks
+        // to start from (rc.19). The send loop's own offset is no longer a
+        // second writer: it runs up to 4 MiB ahead (what sits in the
+        // channel's buffer), and between the two the bar went back and
+        // forth (field: 13 → 1 → 22 → 4 → 25 %). A download's progress is
+        // the device's send count, which the browser's own count
+        // (`appendDownloadChunk`) already says, so it moves nothing.
         const entry = filesRegistry.get(id)
         if (entry?.kind === 'upload') {
+          const bytes = Number(msg.bytes ?? 0)
           entry.bytesAcked = bytes
+          patchTransfer(id, { t: 'bytes', bytes })
         }
       } else if (msg.t === 'files:resumed') {
         // rc.19: agent Ã¢ÂÂ browser reply confirming the byte offset
@@ -10318,7 +10708,9 @@ export function useRemoteControl(
           waiter.resolve(Number(msg.accepted_offset ?? 0))
         }
       } else if (msg.t === 'files:accepted') {
-        patchTransfer(id, { status: 'running' })
+        // An accept that lands after the person's Cancel moves nothing:
+        // `moveTransfer` keeps a settled row where it is.
+        patchTransfer(id, { t: 'start' })
       } else if (msg.t === 'files:offer') {
         const entry = filesRegistry.get(id)
         if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
@@ -10327,7 +10719,7 @@ export function useRemoteControl(
         entry.mime = typeof msg.mime === 'string' ? msg.mime : undefined
         activeDownloadId = id
         patchTransfer(id, {
-          status: 'running',
+          t: 'start',
           name: entry.name,
           total: entry.expectedSize,
         })
@@ -10352,7 +10744,7 @@ export function useRemoteControl(
           () => {
             const settled = settleEntry(id)
             if (settled?.kind === 'download') {
-              patchTransfer(id, { status: 'complete', bytes: totalBytes })
+              patchTransfer(id, { t: 'complete', bytes: totalBytes })
               settled.resolve({ name: entry.name, bytes: totalBytes })
             }
           },
@@ -10360,7 +10752,7 @@ export function useRemoteControl(
             const settled = settleEntry(id)
             if (settled?.kind === 'download') {
               const errMsg = err instanceof Error ? err.message : String(err)
-              patchTransfer(id, { status: 'error', error: errMsg })
+              patchTransfer(id, { t: 'fail', error: errMsg })
               settled.reject(new Error(errMsg))
             }
           }
@@ -10394,12 +10786,12 @@ export function useRemoteControl(
           // `files:resume`. Transition to 'pending-resume' so a
           // late files:complete on a stale DC can't double-settle.
           entry.status = 'pending-resume'
-          patchTransfer(id, { status: 'reconnecting', error: 'waiting for reconnect' })
+          patchTransfer(id, { t: 'reconnect', detail: 'waiting for reconnect' })
           continue
         }
         const settled = settleEntry(id)
         if (!settled) continue
-        patchTransfer(id, { status: 'error', error: errMsg })
+        patchTransfer(id, { t: 'fail', error: errMsg })
         if (settled.kind === 'upload') {
           settled.reject(new Error(errMsg))
         } else if (settled.kind === 'download') {
@@ -10825,6 +11217,9 @@ export function useRemoteControl(
     // same parse-by-`t` switch. Unknown `t` values are dropped
     // silently; older agents emitted nothing here, so backward-
     // compat is automatic.
+    // FR-138 — the peer this channel belongs to: an `rc:ended` it says late
+    // must not end the session a redial opened since.
+    const controlPc = pc
     channels.control.onmessage = (ev) => {
       // rc.23 hotfix Ã¢ÂÂ trace every inbound control envelope to the
       // browser console so the field can see, via DevTools, exactly
@@ -10909,6 +11304,9 @@ export function useRemoteControl(
           hint: parsed.hint,
         }
         mediaWaitingSinceMs = Date.now()
+        // FR-135 R0c — the pumps send nothing while capture waits, so the
+        // decode worker must not count the gap across the hold as a freeze.
+        dcWorker?.postMessage({ type: 'media-hold' })
         console.info(
           `[rc] the host is waiting for the person at the screen (${parsed.for}), up to ${Math.round(parsed.waitsMs / 1000)} s`,
         )
@@ -10918,6 +11316,10 @@ export function useRemoteControl(
         deadAirStreak.value = 0
         reconnectAttempt.value = 0
         notice.value = null
+      } else if (parsed?.kind === 'ended') {
+        // FR-138 — the session ended while the server could not tell this
+        // page, and the device said so peer to peer, on this peer's channel.
+        onDeviceEnded(parsed.reason, parsed.limit, controlPc)
       } else if (parsed?.kind === 'idle') {
         // FR-101 P4b-2b — the device's idle limit: a countdown on this
         // browser's clock, or its withdrawal (there was activity).
@@ -11343,6 +11745,18 @@ export function useRemoteControl(
     if (!sessionDecodeRecover) {
       console.info('[rc] decode recovery: off this session (roomler-rc-decode-recover=0) - a decode error stops the path and the watchdog re-creates the session (FR-135 R1)')
     }
+    // FR-135 R3 — off unless this browser turned it on, until S11 decides, and
+    // off for the rest of the page once a move has failed on it.
+    sessionDcWorker = storedDcWorker() && !dcWorkerMoveFailed
+    if (dcWorkerMoveFailed && storedDcWorker()) {
+      console.info('[rc] video channel: relayed by the page this session - a move into the decode worker failed earlier on this page (roomler-rc-dc-worker)')
+    }
+    // #3566 — each decode worker's clock is measured against the page's on every
+    // session, and not under this browser's kill switch.
+    sessionClockCal = storedClockCal()
+    if (!sessionClockCal) {
+      console.info('[rc] decode worker clocks: not measured this session (roomler-rc-clock-cal=0) - each worker reads the page\'s timestamps on its own clock, as before #3566')
+    }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {
@@ -11361,27 +11775,29 @@ export function useRemoteControl(
     // the same transport. An older agent ignores the channel, and a session
     // it then sends over the RTP track is black until the watchdog gives up;
     // an agent with a plan says so, and `onMediaPlan` shows the track (FR-135 R2).
+    // FR-135 R3 — one worker for every DC transport; what differs is the
+    // codec string and the name the path goes by (`DcPathLabel`).
     if (preferredTransport === 'data-channel-vp9-444') {
-      // rc.190 Ã¢ÂÂ when the pick forced 4:2:0 (auto-rank / HEVC fallback),
+      // rc.190 - when the pick forced 4:2:0 (auto-rank / HEVC fallback),
       // configure the worker for profile 0 explicitly so the codec
       // string matches the bitstream the agent will emit, instead of
       // deriving from the user's chroma pref (which may say 4:4:4).
-      startVp9_444Path(chromaOverride === 'yuv420' ? 'vp09.00.10.08' : undefined)
+      startDcPath('vp9-444', vp9DcCodec(chromaOverride === 'yuv420' ? 'vp09.00.10.08' : undefined), preferredTransport)
     } else if (preferredTransport === 'data-channel-hevc') {
       // P7 — the Rext pick reconfigures the worker's VideoDecoder with the
       // Rext codec string (same Annex-B no-description contract; only the
       // profile fields differ).
-      startHevcPath(hevcRextPick ? HEVC_REXT_CODEC_STRING : undefined)
+      startDcPath('hevc', hevcRextPick ? HEVC_REXT_CODEC_STRING : HEVC_MAIN_CODEC_STRING, preferredTransport)
     } else if (preferredTransport === 'data-channel-av1') {
-      // rc.190 Ã¢ÂÂ AV1 rides the SAME wire format + worker as VP9-over-DC
+      // rc.190 - AV1 rides the SAME wire format + worker as VP9-over-DC
       // (13-byte length-prefix framing; the worker's VideoDecoder just
-      // gets the AV1 codec string). No separate worker file needed.
-      startVp9_444Path(AV1_CODEC_STRING)
+      // gets the AV1 codec string).
+      startDcPath('vp9-444', AV1_CODEC_STRING, preferredTransport)
     } else if (preferredTransport === 'data-channel-h264') {
-      // P2 Ã¢ÂÂ H.264 rides the same worker via the avc1 codec override
-      // (the AV1 precedent). The probe ladder already picked the codec
-      // string this browser accepts.
-      startVp9_444Path(h264DcCodec ?? H264_DC_CODEC_CANDIDATES[0])
+      // P2 - H.264 rides the same worker via the avc1 codec string (the AV1
+      // precedent). The probe ladder already picked the codec string this
+      // browser accepts.
+      startDcPath('vp9-444', h264DcCodec ?? H264_DC_CODEC_CANDIDATES[0], preferredTransport)
     }
 
     // Kick off the rc:* handshake. browser_caps lets the agent pick
@@ -11429,6 +11845,12 @@ export function useRemoteControl(
     // list alone (P3b). Never on an external session's frame (F4).
     if (!externalMode) {
       Object.assign(requestPayload, localRelayRequestFields(localRelays, localRelayFrom))
+    }
+    // FR-138 — a redial of a held session names it, so the server ends it
+    // before its capacity gate: a held session never costs its own viewer the
+    // slot. Absent on every other request, as before (spec §4.4).
+    if (!externalMode && replacesId && /^[0-9a-f]{24}$/.test(replacesId)) {
+      requestPayload.replaces = replacesId
     }
     sessionDcTransport = preferredTransport
     // FR-77 — which chroma cell this session runs in (mirrors the chroma_pref
@@ -11541,6 +11963,9 @@ export function useRemoteControl(
         ? (lastConnectArgs?.agentId ?? null)
         : null
     requestSent = false
+    // FR-138 — the person's own hangup ends a hold, and replaces nothing.
+    endHold('controller_hangup')
+    replacesId = null
     // Operator-initiated teardown must override any pending
     // reconnect timer; otherwise a reconnect could fire after the
     // user already dismissed the viewer, racing the WS rc:terminate
@@ -11676,26 +12101,25 @@ export function useRemoteControl(
       ev: PointerEvent | MouseEvent | WheelEvent,
     ): { x: number; y: number; insideVideo: boolean } {
       const video = findVideo()
-      // VP9-444 mode: the `<video>` is hidden + unfed (the agent's
+      // Data-channel mode: the `<video>` is hidden + unfed (the agent's
       // pump routed encoded frames to the `video-bytes` DC instead of
       // the WebRTC track), so `video.videoWidth` is 0. The visible
-      // surface is the `<canvas>` painted by rc-vp9-444-worker, and
+      // surface is the `<canvas>` painted by rc-dc-worker, and
       // its intrinsic dimensions (the agent's encode resolution) are
       // already cached in `mediaIntrinsicW/H` from the worker's
-      // `first-frame` message. Use that instead Ã¢ÂÂ without it the
+      // `first-frame` message. Use that instead - without it the
       // letterbox math hits divide-by-zero and every pointer event
       // gets mapped to NaN, dropping all clicks/moves silently.
       // Same shape applies to the WebCodecs render path (the canvas
       // there also reports via `first-frame`), but in that path the
       // `<video>` is also fed the RTP track so videoWidth is non-zero
-      // anyway Ã¢ÂÂ falling through to the canvas path is harmless.
-      // rc.95 Ã¢ÂÂ HEVC-over-DC is a canvas path too (rc-hevc-worker reports
-      // dims via `first-frame` Ã¢ÂÂ mediaIntrinsicW/H). It was MISSING here,
-      // so HEVC sessions mapped input against the now-hidden `<video>`'s
-      // videoWidth=0 (the sibling of the RemoteControl.vue `<video>`
-      // v-show omission that black-screened HEVC). Include it.
-      const useCanvasDims =
-        vp9_444Active.value || webcodecsActive.value || hevcActive.value
+      // anyway - falling through to the canvas path is harmless.
+      // rc.95 - HEVC-over-DC is a canvas path too; it was once MISSING
+      // here, so HEVC sessions mapped input against the now-hidden
+      // `<video>`'s videoWidth=0 (the sibling of the RemoteControl.vue
+      // `<video>` v-show omission that black-screened HEVC). Since FR-135
+      // R3 every data-channel codec is the one `dcActive`.
+      const useCanvasDims = dcActive.value || webcodecsActive.value
       const intrinsicW = useCanvasDims
         ? mediaIntrinsicW.value
         : (video?.videoWidth ?? 0)
@@ -11764,9 +12188,9 @@ export function useRemoteControl(
           mediaIntrinsicH: mediaIntrinsicH.value,
           intrinsicW,
           intrinsicH,
-          vp9_444Active: vp9_444Active.value,
+          dcActive: dcActive.value,
+          dcPath: dcPathLabel,
           webcodecsActive: webcodecsActive.value,
-          hevcActive: hevcActive.value,
           renderElTag: renderEl?.tagName ?? null,
           renderRectW: renderRect?.width ?? null,
           renderRectH: renderRect?.height ?? null,
@@ -12308,7 +12732,10 @@ export function useRemoteControl(
       const mods = pendingCtrlV.mods
       if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
-      for (const frame of deferredPasteFrames(mods)) sendInput(frame)
+      // #3046: with the person's Ctrl already up, the agent presses what `mods`
+      // names, so on a Mac host that has to say Cmd.
+      const hostMods = translateModsForHost(mods, hostIsMac.value && ctrlAsCmd.value)
+      for (const frame of deferredPasteFrames(hostMods)) sendInput(frame)
     }
 
     /** Schedule a 25 ms-delayed read of the host's clipboard + mirror
@@ -12952,8 +13379,10 @@ export function useRemoteControl(
       } catch {
         throw makeChannelClosedError(file, offset)
       }
+      // #3726 — no row write here: `offset` counts what was handed to the
+      // channel, up to 4 MiB of it still in the browser's buffer. The row
+      // reads the device's `files:progress` instead (one writer).
       offset = end
-      patchTransfer(id, { status: 'running', bytes: offset })
     }
     if (isCancelled()) return
     const ch = channels.files
@@ -13070,7 +13499,8 @@ export function useRemoteControl(
    * single fresh-begin attempt with the original fail-fast error.
    *
    * #2929 — every upload source (a files paste, a drop on the stage or
-   * on the drawer, the drawer's button, the folder picker) ends here,
+   * on the drawer, the toolbar's file picker, the drawer's Upload here;
+   * a folder arrives only by a drop) ends here,
    * so this is where uploads queue: a transfer shows in the panel at
    * once, as 'queued', and sends its `files:begin` only on its turn.
    */
@@ -13116,7 +13546,7 @@ export function useRemoteControl(
       const localFail = (err: Error) => {
         const settled = settleEntry(id)
         if (settled) {
-          patchTransfer(id, { status: 'error', error: err.message })
+          patchTransfer(id, { t: 'fail', error: err.message })
           settled.reject(err)
         }
       }
@@ -13218,14 +13648,11 @@ export function useRemoteControl(
           // 'pending-resume' if this is a fresh-id fallback after a
           // resume error).
           if (e.kind === 'upload') e.status = 'pending'
-          patchTransfer(id, { status: 'running' })
+          patchTransfer(id, { t: 'start' })
         } else {
           // Resume attempt. supportsResume is already guaranteed
           // true by the catch-block guard below.
-          patchTransfer(id, {
-            status: 'reconnecting',
-            error: `attempt ${attempt + 1}`,
-          })
+          patchTransfer(id, { t: 'reconnect', detail: `attempt ${attempt + 1}` })
           // Transition back to 'pending' so files:complete settles
           // through the normal path.
           if (e.kind === 'upload') e.status = 'pending'
@@ -13233,7 +13660,11 @@ export function useRemoteControl(
           const accepted = await sendResume(ch, requested)
           startOffset = accepted
           if (e.kind === 'upload') e.bytesAcked = accepted
-          patchTransfer(id, { status: 'running', bytes: startOffset })
+          // #3726 — the row reads the device's accepted offset, which may
+          // be below what it showed: that is where the device's copy ends.
+          // A Cancel during the handshake stays: `moveTransfer` keeps a
+          // cancelled row where it is, and the pump below sends nothing.
+          patchTransfer(id, { t: 'resume', offset: startOffset })
         }
         await innerPump(file, startOffset, id)
         // files:end is sent by innerPump on success; the listener
@@ -13255,10 +13686,7 @@ export function useRemoteControl(
             }
             // Channel closed mid-flight with resume cap Ã¢ÂÂ wait for
             // reconnect and retry.
-            patchTransfer(id, {
-              status: 'reconnecting',
-              error: `attempt ${attempt + 1}`,
-            })
+            patchTransfer(id, { t: 'reconnect', detail: `attempt ${attempt + 1}` })
             // rc.23 Ã¢ÂÂ wait forever for the peer to come back. The
             // resume loop is the operator's "DC stays open" promise;
             // legacy 30 s timeout could fire while the agent was
@@ -13361,8 +13789,9 @@ export function useRemoteControl(
   function appendDownloadChunk(entry: DownloadEntry, buf: ArrayBuffer) {
     if (entry.status === 'settled') return
     entry.bytesReceived += buf.byteLength
+    // #3726 — a download's ONE byte count: what has arrived here.
     patchTransfer(entry === filesRegistry.get(activeDownloadId ?? '') ? (activeDownloadId as string) : '', {
-      status: 'running',
+      t: 'bytes',
       bytes: entry.bytesReceived,
     })
     if (entry.saveMode === 'stream' && entry.writable) {
@@ -13386,7 +13815,7 @@ export function useRemoteControl(
           const settled = settleEntry(id)
           if (settled?.kind === 'download') {
             const msg = `download exceeds ${Math.round(DOWNLOAD_BLOB_HARD_CAP / (1024 * 1024 * 1024))} GiB browser-memory cap (use Chrome for streaming downloads)`
-            patchTransfer(id, { status: 'error', error: msg })
+            patchTransfer(id, { t: 'fail', error: msg })
             settled.reject(new Error(msg))
           }
           activeDownloadId = null
@@ -13514,7 +13943,7 @@ export function useRemoteControl(
         const settled = settleEntry(id)
         if (settled?.kind === 'download') {
           const msg = e instanceof Error ? e.message : String(e)
-          patchTransfer(id, { status: 'error', error: msg })
+          patchTransfer(id, { t: 'fail', error: msg })
           if (writable) void writable.abort(msg).catch(() => {})
           settled.reject(new Error(msg))
         }
@@ -13602,7 +14031,7 @@ export function useRemoteControl(
         const settled = settleEntry(id)
         if (settled?.kind === 'download') {
           const msg = e instanceof Error ? e.message : String(e)
-          patchTransfer(id, { status: 'error', error: msg })
+          patchTransfer(id, { t: 'fail', error: msg })
           if (writable) void writable.abort(msg).catch(() => {})
           settled.reject(new Error(msg))
         }
@@ -13610,28 +14039,43 @@ export function useRemoteControl(
     })
   }
 
-  /** Ask the agent to cancel an in-flight download. Best-effort: the
-   *  agent flips its AtomicBool and the next chunk-loop iteration
-   *  exits. The Promise rejects via the resulting `files:error`. */
+  /** Cancel a download (#3726). The row reads Cancelled at once, as an
+   *  upload's does, and the Promise rejects with a cancel. The device is
+   *  asked to stop (`files:cancel`); since #1730 it stops its pump and
+   *  answers nothing, so the viewer settles the transfer itself. It used
+   *  to wait for a `files:error` that never came: the row stayed running
+   *  and the save target stayed open. The save target is aborted, as for
+   *  a failed download, and a Blob download drops what it held. What the
+   *  device had already sent arrives after this and is dropped:
+   *  `activeDownloadId` no longer names the transfer, and its entry is
+   *  settled, so nothing writes to the aborted target. */
   function cancelDownload(id: string): void {
+    const entry = filesRegistry.get(id)
+    if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
+    const settled = settleEntry(id)
+    if (settled?.kind !== 'download') return
+    if (id === activeDownloadId) activeDownloadId = null
+    if (settled.writable) void settled.writable.abort('cancelled').catch(() => {})
+    settled.blobs = []
     const ch = channels.files
-    if (!ch || ch.readyState !== 'open') return
-    try {
-      ch.send(JSON.stringify({ t: 'files:cancel', id }))
-    } catch {
-      /* dropped */
+    if (ch && ch.readyState === 'open') {
+      try {
+        ch.send(JSON.stringify({ t: 'files:cancel', id }))
+      } catch {
+        /* dropped: the channel is closing, and its close stops the pump */
+      }
     }
+    patchTransfer(id, { t: 'cancel' })
+    settled.reject(transferCancelledError())
   }
 
-  /** Cancel an in-flight upload. Settles the registry entry locally
-   *  (rejects the Promise + flags the Transfer panel row as
-   *  cancelled). The browser-side `pump()` loop checks `readyState`
-   *  + the entry status before each chunk send, so by settling here
-   *  the next iteration short-circuits and stops sending bytes. The
-   *  agent will see the DC stay open with no more chunks; eventually
-   *  its existing short-transfer-on-end logic / DC-close cleanup
-   *  handles the half-uploaded file (left on disk under Downloads/
-   *  for the operator to delete or resume manually).
+  /** Cancel an upload (#3726). Settles the registry entry locally: the
+   *  row reads Cancelled and stays so, and `uploadFiles` reports a
+   *  cancel, not a failure. The pump checks the entry before each chunk,
+   *  so it sends no more. The device is not told (no `files:cancel`): it
+   *  still writes and acknowledges what was in flight, and those late
+   *  `files:progress` frames move nothing (`moveTransfer`); the partial
+   *  waits in staging for the agent's startup sweep (older than 24 h).
    *
    *  Symmetric with `cancelDownload` so the Transfers panel can
    *  render a single "Cancel" affordance regardless of direction. */
@@ -13640,8 +14084,8 @@ export function useRemoteControl(
     if (!entry || entry.kind !== 'upload' || entry.status === 'settled') return
     const settled = settleEntry(id)
     if (settled?.kind === 'upload') {
-      patchTransfer(id, { status: 'cancelled', error: 'cancelled by operator' })
-      settled.reject(new Error('cancelled by operator'))
+      patchTransfer(id, { t: 'cancel' })
+      settled.reject(transferCancelledError())
     }
   }
 
@@ -13722,16 +14166,15 @@ export function useRemoteControl(
    *  `uploadOne`; the queue continues on individual failures so a
    *  bad file doesn't sink the rest. Resolves with one result per
    *  input file (in order) carrying either the agent-reported path +
-   *  bytes (success) or an error message (failure).
+   *  bytes (success) or an error message (failure), `cancelled` when
+   *  the person cancelled it (#3726).
    *
    *  Accepts either bare `File` items (flat upload Ã¢ÂÂ file lands in
    *  Downloads/) or `{ file, relPath }` pairs (folder upload Ã¢ÂÂ agent
    *  recreates the directory structure under Downloads/<root>/).
    *  Mixing is allowed Ã¢ÂÂ useful when a drag&drop event has both
    *  individual files and one or more folders. */
-  type UploadResult =
-    | { ok: true; name: string; path: string; bytes: number }
-    | { ok: false; name: string; error: string }
+  type UploadResult = UploadOutcome
   // `relPath` carries the folder-upload structure (file-DC v2.1).
   // `destPath` is the path-targeted upload root (file-DC v2.2) Ã¢ÂÂ when
   // set, the file lands under `<destPath>/`. The two stack: a folder
@@ -13756,11 +14199,12 @@ export function useRemoteControl(
         const r = await uploadOne(f, relPath, destPath)
         results.push({ ok: true, name: reportName, path: r.path, bytes: r.bytes })
       } catch (e) {
-        results.push({
-          ok: false,
-          name: reportName,
-          error: e instanceof Error ? e.message : String(e),
-        })
+        // #3726 — a Cancel the person chose is reported as one.
+        results.push(
+          isTransferCancelled(e)
+            ? { ok: false, name: reportName, error: 'cancelled', cancelled: true }
+            : { ok: false, name: reportName, error: e instanceof Error ? e.message : String(e) },
+        )
       }
     }
     return results
@@ -13774,8 +14218,16 @@ export function useRemoteControl(
    *  walk at 5000 files / 32 levels of depth to refuse pathological
    *  inputs (huge `node_modules` etc.) before they swamp the queue.
    *
-   *  Returns `null` on entries that aren't directories (caller
-   *  should treat as a single file via `entry.file()`). */
+   *  Callers pass a dropped folder and its own name as `rootName`.
+   *
+   *  #3725 — each entry carries its OWN path: the dropped folder is
+   *  `rootName`, and a child is its parent's path plus its name, so a
+   *  file reads `<folder>/<file>` or `<folder>/<sub>/<file>`. The walk
+   *  used to seed the folder with its name as the parent's path and
+   *  then append its name again for its children, so every file
+   *  landed one level too deep (`<folder>/<folder>/<file>`), and the
+   *  device places exactly the `rel_path` it is given. An empty
+   *  subfolder adds nothing: no message makes a folder on the device. */
   type FolderWalkEntry = { file: File; relPath: string }
   async function walkFolderEntry(
     entry: FileSystemEntry,
@@ -13784,10 +14236,10 @@ export function useRemoteControl(
     const out: FolderWalkEntry[] = []
     const MAX_FILES = 5000
     const MAX_DEPTH = 32
-    type Pending = { entry: FileSystemEntry; relParent: string; depth: number }
-    const queue: Pending[] = [{ entry, relParent: rootName, depth: 0 }]
+    type Pending = { entry: FileSystemEntry; path: string; depth: number }
+    const queue: Pending[] = [{ entry, path: rootName, depth: 0 }]
     while (queue.length > 0) {
-      const { entry: cur, relParent, depth } = queue.shift() as Pending
+      const { entry: cur, path, depth } = queue.shift() as Pending
       if (depth > MAX_DEPTH) continue
       if (cur.name.startsWith('.')) continue // skip dotfiles / dotdirs
       if (cur.isFile) {
@@ -13795,7 +14247,7 @@ export function useRemoteControl(
         const f: File = await new Promise((resolve, reject) =>
           fileEntry.file(resolve, reject)
         )
-        out.push({ file: f, relPath: `${relParent}/${cur.name}` })
+        out.push({ file: f, relPath: path })
         if (out.length >= MAX_FILES) break
       } else if (cur.isDirectory) {
         const dirEntry = cur as FileSystemDirectoryEntry
@@ -13809,7 +14261,7 @@ export function useRemoteControl(
           for (const child of batch) {
             queue.push({
               entry: child,
-              relParent: `${relParent}/${cur.name}`,
+              path: `${path}/${child.name}`,
               depth: depth + 1,
             })
           }
@@ -13871,6 +14323,14 @@ export function useRemoteControl(
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    /** #3582 - what a reload for a new build reads from this viewer and asks of it. */
+    reloadSurface,
+    /** #3582 - the load after that reload resumes the session it took over, through the redial's ladder. */
+    resumeAfterReload,
+    /** FR-138 - the session rides out the loss of its control socket (spec §4.5). */
+    sessionHeld,
+    /** FR-138 - the view's `<video>` frame callback: a frame presented, for `rc.resume`'s `gap_ms`. */
+    notePaint,
     lastTtffMs,
     /**
      * S3 Ã¢ÂÂ sub-connected health. Non-null while `phase ===
@@ -14070,8 +14530,8 @@ export function useRemoteControl(
     resumeAudioPlayback,
     /** rc.62 Ã¢ÂÂ user's VP9 chroma preference ('auto' | 'yuv420' |
      *  'yuv444'). Drives the `chroma_pref` field of
-     *  `rc:session.request` AND the vp9-444 worker's codec string
-     *  selection. */
+     *  `rc:session.request` AND the VP9 codec string the data-channel
+     *  worker is given (`vp9DcCodec`). */
     vp9Chroma,
     setVp9Chroma,
     /** rc.199 Ã¢ÂÂ the viewer "Priority" dial + its setter (live; sent over the
@@ -14097,23 +14557,19 @@ export function useRemoteControl(
     setThisDevices,
     localRelayRefused,
     vp9_444Supported,
-    vp9_444Active,
-    vp9_444FramesDecoded,
-    vp9_444Stats,
-    vp9_444CanvasEl,
+    /** FR-135 R3 — the one data-channel path, whatever its codec: whether it
+     *  is up, its decoded frames, its 1 s stats, and the canvas it paints. */
+    dcActive,
+    dcFramesDecoded,
+    dcStats,
+    dcCanvasEl,
     /** P7 — whether this browser decodes HEVC Rext 4:4:4 (gates the
      *  "HEVC · crisp text (4:4:4)" picker entry with the agent's
      *  hevc_chroma caps). */
     hevcRextSupported,
     h264High444Supported,
-    /** rc.78 — HEVC over DataChannel (Option B). Same shape as the
-     *  VP9-444 fields above; view can branch on which is active to
-     *  decide which canvas/HUD to render. */
+    /** rc.78 — whether this browser decodes HEVC over the data channel. */
     hevcSupported,
-    hevcActive,
-    hevcFramesDecoded,
-    hevcStats,
-    hevcCanvasEl,
     /** P1 Ã¢ÂÂ per-hop pipeline diagnostics for the diag HUD
      *  (localStorage roomler-rc-diag-hud=1). */
     decodeDiag,
@@ -14673,6 +15129,13 @@ export function translateModifierForHost(
   return code
 }
 
+/** #3046: the same substitution for the `mods` bits of a chord that has no
+ * modifier key of its own for `translateModifierForHost` to rewrite: the soft
+ * keyboard's sticky Ctrl. */
+export function translateModsForHost(mods: number, enabled: boolean): number {
+  return enabled && mods & 0x01 ? (mods & ~0x01) | 0x08 : mods
+}
+
 /** The attribute that marks an editable element as a capture surface of the
  *  HOST's — the soft keyboard's off-screen textarea (`MobileKeyboard.vue`).
  *  `isViewerOwnInput` and `isSoftKeyboardTarget` both read it, so the two
@@ -15105,10 +15568,120 @@ export function createUploadQueue(): () => UploadPlace {
   }
 }
 
-/** One file's outcome from `uploadFiles`. */
+/** Where a row of the Transfers panel stands. */
+export type TransferStatus =
+  | 'queued'
+  | 'running'
+  /** rc.19: the channel closed mid-upload and the device can resume; the
+   *  upload waits for the peer to come back to send `files:resume`. The
+   *  panel reads "Reconnecting — attempt N". */
+  | 'reconnecting'
+  | 'complete'
+  | 'error'
+  | 'cancelled'
+
+/** A row of the Transfers panel (`transfers`). */
+export interface TransferRow {
+  id: string
+  kind: 'upload' | 'download'
+  name: string
+  bytes: number
+  total: number | null
+  status: TransferStatus
+  error?: string
+}
+
+/** What may move a Transfers row (#3726), each from one place:
+ *  - `start`: an upload's `files:begin` went out, the device accepted it
+ *    (`files:accepted`), or it offered a download (`files:offer`, with the
+ *    download's name and size);
+ *  - `bytes`: the transfer's ONE byte count. For an upload, what the device
+ *    has written (its `files:progress`), never the send loop's offset, which
+ *    runs up to 4 MiB ahead in the channel's buffer. For a download, what has
+ *    arrived in the browser, never the device's send count;
+ *  - `reconnect`: the channel dropped and the upload waits to resume;
+ *  - `resume`: the resume path runs it again from the device's accepted offset;
+ *  - `complete`, `fail`: the transfer ended, or failed;
+ *  - `cancel`: the person's Cancel. */
+export type TransferMove =
+  | { t: 'start'; name?: string; total?: number | null }
+  | { t: 'bytes'; bytes: number }
+  | { t: 'reconnect'; detail: string }
+  | { t: 'resume'; offset: number }
+  | { t: 'complete'; bytes: number }
+  | { t: 'fail'; error: string }
+  | { t: 'cancel' }
+
+/** A settled row leaves the panel 10 s later. */
+export function transferSettled(status: TransferStatus): boolean {
+  return status === 'complete' || status === 'error' || status === 'cancelled'
+}
+
+/** The one place a Transfers row moves (#3726). Returns `row` itself when
+ *  the move does not apply, so the caller can tell nothing changed.
+ *  - Complete and cancelled are final. The device still writes and
+ *    acknowledges what was in flight when the person pressed Cancel, and
+ *    those late frames put the row back to running (field: 0.4 s after a
+ *    Cancel the row read "20% — 99.8 MB" again, its Cancel button back). No
+ *    later progress, accept, error or resume moves it now.
+ *  - A failed row runs again only through the resume path (`resume`), never
+ *    on a late frame from the attempt that failed.
+ *  - While a transfer runs its bytes never move back. Its one writer only
+ *    grows; this holds the bar if a frame ever comes out of order. The one
+ *    step back is `resume`: the row then reads the device's accepted offset,
+ *    after it read Reconnecting, because the device's copy ends there and
+ *    the upload goes on from there. */
+export function moveTransfer(row: TransferRow, move: TransferMove): TransferRow {
+  if (row.status === 'complete' || row.status === 'cancelled') return row
+  if (row.status === 'error' && move.t !== 'resume') return row
+  switch (move.t) {
+    case 'start':
+      if (row.status === 'running' && move.name === undefined && move.total === undefined) return row
+      return {
+        ...row,
+        status: 'running',
+        error: undefined,
+        name: move.name ?? row.name,
+        total: move.total === undefined ? row.total : move.total,
+      }
+    case 'bytes':
+      return row.status === 'running' && move.bytes > row.bytes ? { ...row, bytes: move.bytes } : row
+    case 'reconnect':
+      return row.status === 'reconnecting' && row.error === move.detail
+        ? row
+        : { ...row, status: 'reconnecting', error: move.detail }
+    case 'resume':
+      return { ...row, status: 'running', bytes: move.offset, error: undefined }
+    case 'complete':
+      return { ...row, status: 'complete', bytes: move.bytes, error: undefined }
+    case 'fail':
+      return { ...row, status: 'error', error: move.error }
+    case 'cancel':
+      return { ...row, status: 'cancelled', error: undefined }
+  }
+}
+
+/** Marks the rejection of a transfer the person cancelled. */
+const TRANSFER_CANCELLED_TAG = '__rc_transfer_cancelled__'
+
+/** The rejection of a transfer the person cancelled (#3726), so that
+ *  `uploadFiles` and the view say "cancelled", never "failed". */
+export function transferCancelledError(): Error {
+  const err = new Error('Cancelled')
+  ;(err as Error & { [k: string]: unknown })[TRANSFER_CANCELLED_TAG] = true
+  return err
+}
+
+/** Whether `e` is a transfer the person cancelled (#3726). */
+export function isTransferCancelled(e: unknown): boolean {
+  return !!(e && typeof e === 'object' && (e as Record<string, unknown>)[TRANSFER_CANCELLED_TAG])
+}
+
+/** One file's outcome from `uploadFiles`. `cancelled`: the person cancelled
+ *  it (#3726), which is said as a cancel, never as a failure. */
 export type UploadOutcome =
   | { ok: true; name: string; path: string; bytes: number }
-  | { ok: false; name: string; error: string }
+  | { ok: false; name: string; error: string; cancelled?: boolean }
 
 /** A host path as compared: no Windows verbatim prefix (`\\?\`), forward
  *  slashes, no trailing slash, and case-folded when it is a Windows path (a
@@ -15135,42 +15708,56 @@ export function uploadLandedIn(path: string, destPath: string): boolean {
 
 /** The folder a file landed in, for a person to read: `path` without the
  *  `name` it was uploaded as (a folder upload's name is its relative path,
- *  so its whole tree comes off). */
+ *  so its whole tree comes off) and without a verbatim prefix: `\\?\C:\x`
+ *  reads `C:\x`, `\\?\UNC\srv\sh\x` reads `\\srv\sh\x`. A root keeps its
+ *  separator: `/`, `C:\`. */
 function uploadLandingFolder(path: string, name: string): string {
-  const shown = path.replace(/^(\\\\|\/\/)\?[\\/]/, '')
+  const shown = path.replace(/^(\\\\|\/\/)\?([\\/])UNC[\\/]/i, '$2$2').replace(/^(\\\\|\/\/)\?[\\/]/, '')
   let cut = shown.length
   for (let depth = name.split('/').filter(Boolean).length || 1; depth > 0; depth--) {
     const at = Math.max(shown.lastIndexOf('/', cut - 1), shown.lastIndexOf('\\', cut - 1))
     if (at < 0) return shown
-    cut = at === 0 ? 1 : at
+    cut = at === 0 || (at === 2 && shown[1] === ':') ? at + 1 : at
   }
   return shown.slice(0, cut)
 }
 
 /** What the viewer tells the person when `uploadFiles` returns. Before
  *  #2930 a file the host had put in Downloads, instead of the folder the
- *  person chose, was reported as a plain success. */
+ *  person chose, was reported as a plain success; before #3048 a success
+ *  did not say where the file landed; before #3726 a Cancel the person
+ *  chose read "Upload failed: cancelled by operator". A cancel is said as
+ *  one: on its own as `info`, beside other outcomes as "; N cancelled". */
 export function uploadOutcomeMessage(
   results: UploadOutcome[],
   requested: number,
   destPath?: string,
-): { level: 'success' | 'warning' | 'error'; text: string } {
+): { level: 'success' | 'warning' | 'error' | 'info'; text: string } {
   const ok = results.filter((r): r is Extract<UploadOutcome, { ok: true }> => r.ok)
-  const failed = results.filter((r): r is Extract<UploadOutcome, { ok: false }> => !r.ok)
+  const notOk = results.filter((r): r is Extract<UploadOutcome, { ok: false }> => !r.ok)
+  const cancelled = notOk.filter((r) => r.cancelled)
+  const failed = notOk.filter((r) => !r.cancelled)
+  const andCancelled = cancelled.length > 0 ? `; ${cancelled.length} cancelled` : ''
   if (failed.length > 0) {
     const first = failed[0]
     if (ok.length === 0) {
       return {
         level: 'error',
         text:
-          failed.length === 1
+          (failed.length === 1
             ? `Upload failed: ${first.error}`
-            : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`,
+            : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`) + andCancelled,
       }
     }
     return {
       level: 'error',
-      text: `Uploaded ${ok.length}/${requested} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`,
+      text: `Uploaded ${ok.length}/${requested} — ${failed.length} failed (e.g. ${first.name}: ${first.error})${andCancelled}`,
+    }
+  }
+  if (ok.length === 0 && cancelled.length > 0) {
+    return {
+      level: 'info',
+      text: cancelled.length === 1 ? `Upload cancelled: ${cancelled[0].name}` : `${cancelled.length} uploads cancelled`,
     }
   }
   const elsewhere = destPath ? ok.filter((r) => !uploadLandedIn(r.path, destPath)) : []
@@ -15182,11 +15769,17 @@ export function uploadOutcomeMessage(
         : elsewhere.length === ok.length
           ? `${ok.length} files to ${folder}`
           : `${ok.length} files, ${elsewhere.length} of them to ${folder}`
-    return { level: 'warning', text: `Uploaded ${what} instead: the host refused ${destPath}` }
+    return { level: 'warning', text: `Uploaded ${what} instead: the host refused ${destPath}${andCancelled}` }
   }
+  // #3048 — where it landed, by path. On a machine-wide Windows install that
+  // is the signed-in person's Downloads, which may be on a share.
+  const folders = ok.map((r) => uploadLandingFolder(r.path, r.name)).filter(Boolean)
+  const count = new Set(folders.map(comparableHostPath)).size
+  const where =
+    count === 0 ? '' : count === 1 ? ` to ${folders[0]}` : ` to ${count} folders (first: ${folders[0]})`
   return {
     level: 'success',
-    text: ok.length === 1 ? `Uploaded ${ok[0].name}` : `Uploaded ${ok.length} files`,
+    text: (ok.length === 1 ? `Uploaded ${ok[0].name}${where}` : `Uploaded ${ok.length} files${where}`) + andCancelled,
   }
 }
 

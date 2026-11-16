@@ -31,35 +31,10 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 
-/// The order the cascade runs in: session holders (`hive`, `remote`) release
-/// first, then lease holders (`network`), then the record owner (`fleet`);
-/// the collaboration modules and `saas` follow, in composition order.
-///
-/// FR-90 — `hive` leads: an agent session is the longest-lived thing a
-/// device holds for anyone, and ending it (the record, and the stop order to
-/// a device that is still connected) must happen while the device's row and
-/// socket are still there to address.
-///
-/// FR-90 P3 — `vault` follows it: its leases (P3-3) are held by sessions on
-/// devices, so they are revoked once the sessions have ended and while the
-/// device is still there to be told. P3-1 registers no hooks.
-///
-/// FR-90 P4 — `knowhow` comes last. It holds nothing a device or a member
-/// needs released, only a map of them: its mirror of a removed machine
-/// (P4-2a) is archived after every holder has let go, so a holder that fails,
-/// which stops the cascade, leaves the map still showing the device that is
-/// still there. Its own failure is logged, never the cascade's refusal.
-pub const HOOK_ORDER: &[&str] = &[
-    "hive",
-    "vault",
-    "remote",
-    "network",
-    "fleet",
-    "conference",
-    "chat",
-    "saas",
-    "knowhow",
-];
+/// The order the cascade runs in: session holders (`remote`) release first,
+/// then lease holders (`network`), then the record owner (`fleet`); the
+/// collaboration modules and `saas` follow, in composition order.
+pub const HOOK_ORDER: &[&str] = &["remote", "network", "fleet", "conference", "chat", "saas"];
 
 /// What a lease holder freed when an agent was removed — the one piece of
 /// hook output a caller reports back (the admin delete route answers with
@@ -107,11 +82,6 @@ pub trait TenantLifecycle: Send + Sync {
         let _ = (tenant_id, reason);
         Ok(TenantArchived::default())
     }
-
-    async fn member_removed(&self, tenant_id: ObjectId, user_id: ObjectId) -> anyhow::Result<()> {
-        let _ = (tenant_id, user_id);
-        Ok(())
-    }
 }
 
 /// Hooks `fleet` invokes on agent events. Implemented by the modules that hold
@@ -136,6 +106,27 @@ pub trait FleetLifecycle: Send + Sync {
         Ok(None)
     }
 
+    /// A REMOVED agent's machine is enrolling again, and its row is about to
+    /// come back as a new device (`AgentDao::revive`, #3627): drop whatever you hold
+    /// that names the removed device and would apply to the revived one,
+    /// because a new enrollment would not have it. `network` releases a
+    /// lease the removal did not, and takes the device out of the org's
+    /// tunnel policies.
+    ///
+    /// Runs BEFORE the row is revived, and a failing holder stops the
+    /// enrollment, so the row never turns live beside a grant that was meant
+    /// for the removed device. Idempotent: an enrollment that lost a race runs
+    /// it again.
+    async fn agent_revived(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        machine_id: &str,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, agent_id, machine_id);
+        Ok(())
+    }
+
     /// The agent's name changed. A holder of a derived label (the overlay
     /// node's MagicDNS name) propagates it and says what happened.
     async fn agent_renamed(
@@ -149,16 +140,6 @@ pub trait FleetLifecycle: Send + Sync {
     }
 
     async fn agent_offline(&self, tenant_id: ObjectId, agent_id: ObjectId) -> anyhow::Result<()> {
-        let _ = (tenant_id, agent_id);
-        Ok(())
-    }
-
-    /// FR-90 P2c-4 — something a holder decides from changed: the agent's
-    /// tags or its owner, now stored. `hive` decides again where the org's
-    /// sessions are copied: a tag taken off can make a device leave a
-    /// session's replicaset, an owner changed can take it out of another
-    /// person's. A failing holder is an error for the caller to report.
-    async fn agent_updated(&self, tenant_id: ObjectId, agent_id: ObjectId) -> anyhow::Result<()> {
         let _ = (tenant_id, agent_id);
         Ok(())
     }
@@ -195,51 +176,73 @@ pub trait FleetLifecycle: Send + Sync {
     }
 }
 
-/// FR-90 P3-2b — what a session's vault role is decided with: who asks, for
-/// which role, on which device, and why now. Plain data: core knows neither
-/// the agent row nor the session record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoleAsk {
-    pub tenant_id: ObjectId,
-    /// The person the decision is about: the starter, the person moving the
-    /// session, the person forking it.
-    pub user_id: ObjectId,
-    pub role: String,
-    pub session_id: ObjectId,
-    /// The device the session would run on, as its row holds it: `os` the
-    /// agent's `OsKind` spelling (`linux` · `macos` · `windows`), `tags` the
-    /// admin's labels, `owner` the device's owner.
-    pub device_id: ObjectId,
-    pub device_os: String,
-    pub device_tags: Vec<String>,
-    pub device_owner: ObjectId,
-    /// `start` | `promote` | `teleport` | `fork`.
-    pub purpose: &'static str,
-}
-
-/// The gate's answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoleVerdict {
-    pub allow: bool,
-    /// The policies that decided it, or why nothing could — for the audit
-    /// and the caller's refusal.
-    pub reason: String,
-}
-
-/// FR-90 P3-2b — the vault's gate on a session's role. `hive` owns the
-/// session and must never call the vault (`vault → hive` in the graph), so
-/// it asks through here, at every start that names a role and every move or
-/// fork of a session that holds one.
+/// Hooks the owner of a membership invokes when someone stops being a member.
 ///
-/// ⚠️ No gate registered (the vault not mounted) is a REFUSAL for any ask
-/// that names a role, never a pass: the caller sees `None` from
-/// [`HookRegistry::session_gate`] and refuses.
+/// The host owns org membership (`DELETE …/member/{user_id}`: removed by an
+/// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`)
+/// and the room itself (`DELETE …/room/{room_id}`, which ends every membership
+/// of the room at once). A module that admitted something on a membership
+/// withdraws it here: `network` the person's tunnel clients in the org, `fleet`
+/// the enrollment keys they minted there, `conference` the call seats they hold
+/// (`media:join` admitted them as a member) and the call of a deleted room,
+/// `chat` their room memberships.
+///
+/// Invoked AFTER the membership is gone, so nothing can be admitted on it
+/// again while a holder withdraws what it admitted. Idempotent, like every
+/// hook: a second call finds nothing left to withdraw.
 #[async_trait]
-pub trait SessionGate: Send + Sync {
-    /// May `ask.user_id` assume `ask.role` on that device for that session?
-    /// The gate records its decision before answering; an `Err` is the gate
-    /// failing to decide, and the caller refuses.
-    async fn role_assume(&self, ask: &RoleAsk) -> anyhow::Result<RoleVerdict>;
+pub trait MembershipLifecycle: Send + Sync {
+    /// `user_id` is no longer a member of the org `tenant_id`.
+    async fn org_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, user_id);
+        Ok(())
+    }
+
+    /// `user_id` is no longer a member of the room `room_id` of `tenant_id`.
+    async fn room_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, room_id, user_id);
+        Ok(())
+    }
+
+    /// The room `room_id` of `tenant_id` was deleted, and every membership of
+    /// it went with it. Called AFTER the delete by the room's owner (`chat`),
+    /// so nothing new is admitted on the room while a holder ends what the
+    /// room held. A join or a start already on its way when the room went can
+    /// still land, so a holder's admission looks again once it has built what
+    /// it admits. The members are gone by then, so a holder ends what it keeps
+    /// by the room: `conference` the call running in it, for everyone in it.
+    /// A holder trusts the caller's pairing of `tenant_id` and `room_id` (the
+    /// caller resolved the room within its org): what it ends may be keyed by
+    /// the room alone, as conference's media is. Unlike the other cascades, a
+    /// holder that answers an error does not stop the ones after it: the room
+    /// is gone either way ([`HookRegistry::room_removed`]). A holder that
+    /// panics does stop them: no unwind is caught.
+    async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        let _ = (tenant_id, room_id);
+        Ok(())
+    }
+
+    /// Who holds which role in the org `tenant_id` changed, or a role of it
+    /// was deleted: called AFTER the write, by every writer of a member's
+    /// roles (assign, unassign, delete, a member added with roles, an invite
+    /// redeemed). A holder that compiled role-scoped rules ahead of their use
+    /// recompiles them.
+    ///
+    /// ⚠️ It must return at once and cannot fail the write that already
+    /// happened: an implementation schedules its work (and coalesces a
+    /// burst), it never does it inline.
+    async fn org_roles_changed(&self, tenant_id: ObjectId) {
+        let _ = tenant_id;
+    }
 }
 
 /// What one module registers: the hook traits it implements.
@@ -247,8 +250,7 @@ pub trait SessionGate: Send + Sync {
 pub struct Hooks {
     pub tenant: Option<Arc<dyn TenantLifecycle>>,
     pub fleet: Option<Arc<dyn FleetLifecycle>>,
-    /// FR-90 P3-2b — the vault's [`SessionGate`]; no other module has one.
-    pub session: Option<Arc<dyn SessionGate>>,
+    pub membership: Option<Arc<dyn MembershipLifecycle>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -256,7 +258,7 @@ impl std::fmt::Debug for Hooks {
         f.debug_struct("Hooks")
             .field("tenant", &self.tenant.is_some())
             .field("fleet", &self.fleet.is_some())
-            .field("session", &self.session.is_some())
+            .field("membership", &self.membership.is_some())
             .finish()
     }
 }
@@ -327,17 +329,80 @@ impl HookRegistry {
             .collect()
     }
 
-    /// FR-90 P3-2b — the registered [`SessionGate`], the first in
-    /// [`HOOK_ORDER`] (only the vault registers one). `None` means no gate:
-    /// an ask that names a role is then refused by the caller.
-    pub fn session_gate(&self) -> Option<Arc<dyn SessionGate>> {
+    /// The registered [`MembershipLifecycle`] hooks, in [`HOOK_ORDER`].
+    pub fn membership_lifecycles(&self) -> Vec<(&'static str, Arc<dyn MembershipLifecycle>)> {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        HOOK_ORDER.iter().find_map(|id| {
-            inner
-                .iter()
-                .find(|(m, _)| m == id)
-                .and_then(|(_, h)| h.session.clone())
-        })
+        HOOK_ORDER
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .iter()
+                    .find(|(m, _)| m == id)
+                    .and_then(|(_, h)| h.membership.clone())
+                    .map(|h| (*id, h))
+            })
+            .collect()
+    }
+
+    /// Run every `org_member_removed` hook in order, once the membership is
+    /// gone. A failing holder stops the cascade, and the caller reports it.
+    pub async fn org_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.membership_lifecycles() {
+            hook.org_member_removed(tenant_id, user_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: org_member_removed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Tell every holder that who holds which role in `tenant_id` changed
+    /// ([`MembershipLifecycle::org_roles_changed`]), after the write. Each
+    /// holder only schedules its work, so this returns at once and never
+    /// fails the request that made the change.
+    pub async fn org_roles_changed(&self, tenant_id: ObjectId) {
+        for (_, hook) in self.membership_lifecycles() {
+            hook.org_roles_changed(tenant_id).await;
+        }
+    }
+
+    /// Run every `room_member_removed` hook in order, once the membership is
+    /// gone. A failing holder stops the cascade, and the caller reports it.
+    pub async fn room_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.membership_lifecycles() {
+            hook.room_member_removed(tenant_id, room_id, user_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: room_member_removed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Run every `room_removed` hook in order, once the room is gone. The room
+    /// is gone whatever a holder answers, so a holder that answers an error
+    /// does not stop the others: every holder runs, and the caller reports
+    /// what failed, the first failure first. A panic is not caught: it ends
+    /// the run where it happens (chat's room delete runs this in a task of its
+    /// own, and logs the panic).
+    pub async fn room_removed(&self, tenant_id: ObjectId, room_id: ObjectId) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        for (module, hook) in self.membership_lifecycles() {
+            if let Err(e) = hook.room_removed(tenant_id, room_id).await {
+                failed.push(format!("{module}: room_removed: {e}"));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(failed.join("; ")))
+        }
     }
 
     /// Run every `agent_removed` hook in order. The first lease a holder
@@ -364,6 +429,24 @@ impl HookRegistry {
         Ok(released)
     }
 
+    /// Run every `agent_revived` hook in order, before a removed agent's row
+    /// comes back for a new enrollment. A failing holder stops the cascade and
+    /// the enrollment: reviving the row beside a grant a holder could not drop
+    /// would hand the removed device's grant to the new one.
+    pub async fn agent_revived(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        machine_id: &str,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.fleet_lifecycles() {
+            hook.agent_revived(tenant_id, agent_id, machine_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: agent_revived: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Run every `agent_renamed` hook in order; the first holder that had a
     /// live record decides the outcome. A failing hook is an error for the
     /// caller to report — a rename that did not reach the mesh must not read
@@ -385,22 +468,6 @@ impl HookRegistry {
             }
         }
         Ok(outcome)
-    }
-
-    /// FR-90 P2c-4 — run every `agent_updated` hook in order. A failing hook
-    /// stops the run and is the caller's to report: a tag taken off that did
-    /// not reach placement must not read as done.
-    pub async fn agent_updated(
-        &self,
-        tenant_id: ObjectId,
-        agent_id: ObjectId,
-    ) -> anyhow::Result<()> {
-        for (module, hook) in self.fleet_lifecycles() {
-            hook.agent_updated(tenant_id, agent_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("{module}: agent_updated: {e}"))?;
-        }
-        Ok(())
     }
 
     /// The first holder that would lose work if the agent's socket were
@@ -429,25 +496,6 @@ impl HookRegistry {
             }
         }
         None
-    }
-
-    /// Run every `member_removed` hook in order (FR-90: `hive` ends the
-    /// member's agent sessions). Called BEFORE the membership row goes, the
-    /// agent cascade's order: a failing holder stops it and the caller
-    /// reports the error, so a removal never reads as clean while a pillar
-    /// still runs something for that member — and a retry still finds a
-    /// member to remove and holders to re-run.
-    pub async fn member_removed(
-        &self,
-        tenant_id: ObjectId,
-        user_id: ObjectId,
-    ) -> anyhow::Result<()> {
-        for (module, hook) in self.tenant_lifecycles() {
-            hook.member_removed(tenant_id, user_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("{module}: member_removed: {e}"))?;
-        }
-        Ok(())
     }
 
     /// Run every `tenant_archived` hook in order and sum what they did. A
@@ -491,7 +539,6 @@ mod tests {
     #[test]
     fn session_holders_run_before_lease_holders_before_the_record_owner() {
         let pos = |id: &str| HOOK_ORDER.iter().position(|m| *m == id).unwrap();
-        assert!(pos("hive") < pos("network"));
         assert!(pos("remote") < pos("network"));
         assert!(pos("network") < pos("fleet"));
     }
@@ -526,6 +573,71 @@ mod tests {
         ) -> anyhow::Result<Option<ReleasedLease>> {
             anyhow::bail!("lease still held")
         }
+
+        async fn agent_revived(
+            &self,
+            _tenant_id: ObjectId,
+            _agent_id: ObjectId,
+            _machine_id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("policy store unreachable")
+        }
+    }
+
+    /// Records which holders were asked to forget a revived agent, in order.
+    struct Forgets(&'static str, Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    #[async_trait]
+    impl FleetLifecycle for Forgets {
+        async fn agent_revived(
+            &self,
+            _tenant_id: ObjectId,
+            _agent_id: ObjectId,
+            _machine_id: &str,
+        ) -> anyhow::Result<()> {
+            self.1.lock().unwrap().push(self.0);
+            Ok(())
+        }
+    }
+
+    /// A revive asks every holder in hook order, and one that cannot drop
+    /// what it holds stops the enrollment (named in the error).
+    #[tokio::test]
+    async fn a_revive_asks_every_holder_and_a_failing_one_stops_it() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reg = HookRegistry::default();
+        reg.register(
+            "fleet",
+            Hooks {
+                fleet: Some(Arc::new(Forgets("fleet", asked.clone()))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(Forgets("network", asked.clone()))),
+                ..Default::default()
+            },
+        );
+        reg.agent_revived(ObjectId::new(), ObjectId::new(), "m")
+            .await
+            .unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec!["network", "fleet"]);
+
+        let failing = HookRegistry::default();
+        failing.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(Fails)),
+                ..Default::default()
+            },
+        );
+        let err = failing
+            .agent_revived(ObjectId::new(), ObjectId::new(), "m")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("network: agent_revived"));
     }
 
     #[tokio::test]
@@ -571,74 +683,6 @@ mod tests {
         assert!(err.to_string().contains("network: agent_removed"));
     }
 
-    /// Records the order `member_removed` reached each holder, and fails on
-    /// request.
-    struct Member {
-        id: &'static str,
-        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
-        fail: bool,
-    }
-
-    #[async_trait]
-    impl TenantLifecycle for Member {
-        async fn member_removed(
-            &self,
-            _tenant_id: ObjectId,
-            _user_id: ObjectId,
-        ) -> anyhow::Result<()> {
-            self.seen.lock().unwrap().push(self.id);
-            if self.fail {
-                anyhow::bail!("sessions still live");
-            }
-            Ok(())
-        }
-    }
-
-    /// FR-90 — `member_removed` runs in HOOK_ORDER (hive first), and a holder
-    /// that fails stops the cascade with its name, so the route can refuse
-    /// the removal instead of reporting a clean one.
-    #[tokio::test]
-    async fn member_removed_runs_in_hook_order_and_a_failure_stops_it() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let reg = HookRegistry::default();
-        for (id, fail) in [("chat", false), ("hive", false)] {
-            reg.register(
-                id,
-                Hooks {
-                    tenant: Some(Arc::new(Member {
-                        id,
-                        seen: seen.clone(),
-                        fail,
-                    })),
-                    ..Default::default()
-                },
-            );
-        }
-        reg.member_removed(ObjectId::new(), ObjectId::new())
-            .await
-            .unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec!["hive", "chat"]);
-
-        seen.lock().unwrap().clear();
-        reg.register(
-            "hive",
-            Hooks {
-                tenant: Some(Arc::new(Member {
-                    id: "hive",
-                    seen: seen.clone(),
-                    fail: true,
-                })),
-                ..Default::default()
-            },
-        );
-        let err = reg
-            .member_removed(ObjectId::new(), ObjectId::new())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("hive: member_removed"), "{err}");
-        assert_eq!(*seen.lock().unwrap(), vec!["hive"], "the cascade stopped");
-    }
-
     #[test]
     fn a_re_registration_replaces_the_first() {
         let reg = HookRegistry::default();
@@ -655,6 +699,9 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none());
+        reg.agent_revived(ObjectId::new(), ObjectId::new(), "m")
+            .await
+            .unwrap();
         assert_eq!(
             reg.agent_renamed(ObjectId::new(), ObjectId::new(), "n")
                 .await
@@ -666,6 +713,153 @@ mod tests {
                 .await,
             None,
             "FR-128: no holder means not measured"
+        );
+    }
+
+    /// Records what a membership holder was told.
+    #[derive(Default)]
+    struct Withdraws(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl MembershipLifecycle for Withdraws {
+        async fn org_member_removed(&self, t: ObjectId, u: ObjectId) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("org {t} {u}"));
+            Ok(())
+        }
+
+        async fn room_member_removed(
+            &self,
+            t: ObjectId,
+            r: ObjectId,
+            u: ObjectId,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("room {t} {r} {u}"));
+            Ok(())
+        }
+
+        async fn room_removed(&self, t: ObjectId, r: ObjectId) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("removed {t} {r}"));
+            Ok(())
+        }
+    }
+
+    struct FailsToWithdraw;
+
+    #[async_trait]
+    impl MembershipLifecycle for FailsToWithdraw {
+        async fn room_member_removed(
+            &self,
+            _t: ObjectId,
+            _r: ObjectId,
+            _u: ObjectId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("owner pod unreachable")
+        }
+    }
+
+    /// The membership cascade reaches the holder with the ids it needs, a
+    /// failing holder is named in the error, and a module that registers no
+    /// membership hook (here a bare `Hooks::default()`) is skipped.
+    #[tokio::test]
+    async fn a_lost_membership_reaches_its_holders() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        reg.register("fleet", Hooks::default());
+        let (t, r, u) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        reg.org_member_removed(t, u).await.unwrap();
+        reg.room_member_removed(t, r, u).await.unwrap();
+        assert_eq!(
+            *holder.0.lock().unwrap(),
+            vec![format!("org {t} {u}"), format!("room {t} {r} {u}")]
+        );
+
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(Arc::new(FailsToWithdraw)),
+                ..Default::default()
+            },
+        );
+        let err = reg.room_member_removed(t, r, u).await.unwrap_err();
+        assert!(err.to_string().contains("conference: room_member_removed"));
+        // The default body withdraws nothing and succeeds.
+        reg.org_member_removed(t, u).await.unwrap();
+        reg.room_removed(t, r).await.unwrap();
+    }
+
+    /// A deleted room reaches its holders with the org and the room, and a
+    /// module that registers no membership hook is skipped.
+    #[tokio::test]
+    async fn a_deleted_room_reaches_its_holders() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        reg.register("chat", Hooks::default());
+        let (t, r) = (ObjectId::new(), ObjectId::new());
+        reg.room_removed(t, r).await.unwrap();
+        assert_eq!(*holder.0.lock().unwrap(), vec![format!("removed {t} {r}")]);
+    }
+
+    struct FailsToEnd(&'static str);
+
+    #[async_trait]
+    impl MembershipLifecycle for FailsToEnd {
+        async fn room_removed(&self, _t: ObjectId, _r: ObjectId) -> anyhow::Result<()> {
+            anyhow::bail!("{}", self.0)
+        }
+    }
+
+    /// The room is gone whatever a holder answers, so a holder that fails to
+    /// end what the room held does not stop the holders after it: each runs,
+    /// and the error names every failure, the first first.
+    #[tokio::test]
+    async fn a_holder_that_fails_a_deleted_room_does_not_stop_the_others() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "network",
+            Hooks {
+                membership: Some(Arc::new(FailsToEnd("first"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(Arc::new(FailsToEnd("owner pod unreachable"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "chat",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        let (t, r) = (ObjectId::new(), ObjectId::new());
+        let err = reg.room_removed(t, r).await.unwrap_err().to_string();
+        assert_eq!(
+            *holder.0.lock().unwrap(),
+            vec![format!("removed {t} {r}")],
+            "the holder after the failing ones was not told"
+        );
+        assert_eq!(
+            err,
+            "network: room_removed: first; conference: room_removed: owner pod unreachable"
         );
     }
 
@@ -700,53 +894,5 @@ mod tests {
         );
         let ids = (ObjectId::new(), ObjectId::new(), ObjectId::new());
         assert_eq!(reg.far_turn_udp(ids.0, ids.1, &[ids.2]).await, Some(false));
-    }
-
-    struct Gate(bool);
-
-    #[async_trait]
-    impl SessionGate for Gate {
-        async fn role_assume(&self, ask: &RoleAsk) -> anyhow::Result<RoleVerdict> {
-            Ok(RoleVerdict {
-                allow: self.0,
-                reason: format!("{} for {}", ask.purpose, ask.role),
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn the_session_gate_is_the_vaults_and_absent_without_it() {
-        let reg = HookRegistry::default();
-        // No gate: the caller must refuse an ask that names a role.
-        assert!(reg.session_gate().is_none());
-        // Hooks without one leave it absent.
-        reg.register(
-            "hive",
-            Hooks {
-                fleet: Some(Arc::new(Releases("x"))),
-                ..Default::default()
-            },
-        );
-        assert!(reg.session_gate().is_none());
-        reg.register(
-            "vault",
-            Hooks {
-                session: Some(Arc::new(Gate(true))),
-                ..Default::default()
-            },
-        );
-        let ask = RoleAsk {
-            tenant_id: ObjectId::new(),
-            user_id: ObjectId::new(),
-            role: "dev".into(),
-            session_id: ObjectId::new(),
-            device_id: ObjectId::new(),
-            device_os: "linux".into(),
-            device_tags: Vec::new(),
-            device_owner: ObjectId::new(),
-            purpose: "start",
-        };
-        let v = reg.session_gate().unwrap().role_assume(&ask).await.unwrap();
-        assert_eq!((v.allow, v.reason.as_str()), (true, "start for dev"));
     }
 }

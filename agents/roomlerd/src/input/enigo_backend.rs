@@ -27,10 +27,41 @@ use tunnel_core::env::node_env;
 pub struct EnigoInjector {
     tx: std_mpsc::Sender<Job>,
     has_perm: bool,
+    /// #3918 — the virtual desktop generation whose X server this injector
+    /// connected to, when it is that desktop's (`x_follow::opened_under`).
+    #[cfg(target_os = "linux")]
+    x_generation: Option<u64>,
 }
 
 impl EnigoInjector {
     pub fn new() -> Result<Self> {
+        // #3787 — with no `DISPLAY`, x11rb answers `DisplayNotSet` before any
+        // I/O (`enigo_settings` names no display, so enigo reads `DISPLAY`),
+        // and x11rb is enigo's only backend here: such an open cannot succeed,
+        // and enigo logs it at ERROR twice. So it is not tried. The caller says
+        // why, once a session, at the level of what a look at the seat sees,
+        // or of this brief's kind when the look has no answer in time. An
+        // EMPTY `DISPLAY` counts as set: x11rb answers it `MalformedValue`, not
+        // `DisplayNotSet`, so that open still runs and its failure stays
+        // enigo's ERROR.
+        #[cfg(target_os = "linux")]
+        {
+            let brief = crate::desktop_brief::current_read();
+            let seat = brief
+                .as_ref()
+                .map(|(_, b)| (b.session.as_str(), b.kind.as_str()));
+            let display_set = std::env::var_os("DISPLAY").is_some();
+            if let Some(kind) = super::no_display::NoDisplay::of(display_set, seat) {
+                let read = brief.as_ref().map(|(read, _)| *read);
+                return Err(super::no_display::NoDisplayToOpen { kind, read }.into());
+            }
+        }
+        // #3918 — read BEFORE the connection: a server that comes back in
+        // between is then a newer generation than the one recorded, and the
+        // arbiter opens again for nothing, where the other order would keep
+        // a connection to a dead server as if it were the new one.
+        #[cfg(target_os = "linux")]
+        let x_generation = super::x_follow::opened_under();
         let (tx, rx) = std_mpsc::channel::<Job>();
         // Construct Enigo on the worker thread — we never want to move it
         // between threads. Use a ready-ack channel to surface init errors.
@@ -79,7 +110,12 @@ impl EnigoInjector {
         #[cfg(not(target_os = "macos"))]
         let has_perm = true;
 
-        Ok(Self { tx, has_perm })
+        Ok(Self {
+            tx,
+            has_perm,
+            #[cfg(target_os = "linux")]
+            x_generation,
+        })
     }
 }
 
@@ -92,6 +128,17 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
                 }
             }
             Job::Px(job) => run_px_job(&mut enigo, job),
+            #[cfg(target_os = "linux")]
+            Job::Gone => {
+                // #3918 — enigo's `Drop` releases every key it holds and
+                // unmaps every keycode it mapped, and on a dead connection
+                // each one fails with an ERROR of its own. They all went with
+                // the server: drop it with nothing listening on this thread.
+                // The arbiter has said why, once.
+                let quiet = tracing::Dispatch::none();
+                tracing::dispatcher::with_default(&quiet, move || drop(enigo));
+                return;
+            }
         }
     }
 }
@@ -218,13 +265,18 @@ fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
         InputMsg::Key {
             code,
             down,
-            mods: _,
+            mods: _, // #3046: the arbiter has already pressed what it names.
         } => {
             // rc.227 — exact layout sampling on key events (cheap: 2
             // syscalls + 1 atomic when unchanged). Catches the remote
             // user's own ALT+SHIFT within one event.
             #[cfg(target_os = "windows")]
             super::layout::sample_active_layout();
+            // #3047 — the next KeyText reads the target's CapsLock again.
+            #[cfg(target_os = "windows")]
+            if code == 0x39 {
+                super::win_text::caps_changed();
+            }
             let direction = if down {
                 Direction::Press
             } else {
@@ -692,6 +744,18 @@ impl InputInjector for EnigoInjector {
     fn buttons_held(&mut self) -> Result<bool> {
         super::px_round_trip(&self.tx, |reply| Job::Px(PxJob::Buttons(reply)))
     }
+
+    #[cfg(target_os = "linux")]
+    fn x_generation(&self) -> Option<u64> {
+        self.x_generation
+    }
+
+    #[cfg(target_os = "linux")]
+    fn server_gone(&mut self) {
+        // After every event queued before it; the arbiter drops this value
+        // next, and the thread ends on this job.
+        let _ = self.tx.send(Job::Gone);
+    }
 }
 
 /// What the input thread runs: a controller's event, or (FR-92) a
@@ -700,6 +764,9 @@ impl InputInjector for EnigoInjector {
 pub(super) enum Job {
     Input(InputMsg),
     Px(PxJob),
+    /// #3918 — the X server is gone: end the thread, asking it nothing.
+    #[cfg(target_os = "linux")]
+    Gone,
 }
 
 /// FR-92 — run one pixel-space job on the input thread. Shared with the
@@ -1096,6 +1163,31 @@ mod tests {
         }
     }
 
+    /// #3046 — a chord the arbiter tapped reaches the OS as plain keys in the
+    /// order it planned them, with nothing added for the letter's `mods`.
+    #[test]
+    fn a_tapped_chord_reaches_the_os_in_its_order() {
+        let mut r = Recorder::default();
+        for (code, down, mods) in [
+            (0xe0, true, 0),
+            (0x06, true, 1),
+            (0x06, false, 0),
+            (0xe0, false, 0),
+        ] {
+            dispatch(&mut r, InputMsg::Key { code, down, mods }).unwrap();
+        }
+        let (ctrl, c) = (hid_to_key(0xe0).unwrap(), hid_to_key(0x06).unwrap());
+        assert_eq!(
+            r.calls,
+            [
+                format!("key {ctrl:?} Press"),
+                format!("key {c:?} Press"),
+                format!("key {c:?} Release"),
+                format!("key {ctrl:?} Release"),
+            ]
+        );
+    }
+
     /// #1945 — the arbiter's release-all lets go where the pointer IS. A
     /// click moves first so it lands on its target; a release that did the
     /// same threw the cursor to (0,0), GNOME's Activities hot corner, every
@@ -1146,6 +1238,16 @@ mod tests {
             s.independent_of_keyboard_state,
             d.independent_of_keyboard_state
         );
+    }
+
+    /// #3787 — `EnigoInjector::new` skips the open when `DISPLAY` is unset,
+    /// which is right only while enigo reads `DISPLAY`, that is, while the
+    /// settings name no display of their own.
+    #[test]
+    fn enigo_settings_name_no_display_so_enigo_reads_display() {
+        let s = enigo_settings();
+        assert_eq!(s.x11_display, None);
+        assert_eq!(s.wayland_display, None);
     }
 
     /// FR-109 — relative motion is one relative move, by exactly the counts

@@ -19,7 +19,9 @@ nobody runs `down.sh`.
 - AWS CLI v2.32 or later, which has `aws login`. It gives the CLI short-lived credentials for the console
   session you pick in the browser, so no access keys are created:
   `aws login --profile <name> --region <the console's region>`. Start it in the region your console session
-  is in; a sign-in started in another region fails with "Something went wrong".
+  is in; a sign-in started in another region fails with "Something went wrong". The link it prints was good for
+  ten minutes when measured (2026-11-10): left longer, the command exits with `The pending authorization to
+  retrieve an SSO token has expired`, and the sign-in has to be started again.
 - `ssh`, `ssh-keygen`, `curl`. Git-Bash on Windows works (the scripts turn its path rewriting off).
 - Nothing defaults the account or the region. `AWS_PROFILE` and `AWS_REGION` are required on every call.
 
@@ -91,10 +93,24 @@ roomler ssh mars 'set -a; . ~/vmtest/.env; set +a; printf "%s\n" "$VMTEST_EPHEME
 An ephemeral device deletes its own row when the daemon stops, so `guest-roomlerd.sh stop`, or the box's
 termination, cleans the org too.
 
+**A release candidate, before its tag.** `install` takes the latest release, which then serves as the control.
+The candidate is the arm64 package of the rehearsal run (`release-agent.yml` with `publish_release=false`), put
+over it before the next `enroll`:
+
+```bash
+gh run download <run-id> -n linux-deb-arm64   # roomlerd-<version>-aarch64-unknown-linux-gnu.deb and its .sha256
+scripts/aws-testbox/ssh.sh 'cat > candidate.deb' < roomlerd-<version>-aarch64-unknown-linux-gnu.deb
+scripts/aws-testbox/ssh.sh 'sha256sum candidate.deb; dpkg-deb -f candidate.deb Version && sudo dpkg -i candidate.deb'
+```
+
+Stop the control first (`guest-roomlerd.sh stop`) and move its spent config aside, as for any second `enroll`.
+`enroll` writes `ROOMLERD_AUTO_UPDATE=0` into the unit's drop-in each time, and a candidate carries a version
+above the latest release, so nothing replaces it during the run.
+
 | Subcommand | Shows |
 |---|---|
 | `caps` | the daemon's `caps probe:` lines, including `child reported … hw_encoders=[…]`, the probe's matrix run again (`roomlerd caps-probe`), and the cache |
-| `smoke` | `encoder-smoke --encoder hardware`: an offline open of the hardware encoders, with no session |
+| `smoke [ARGS]` | `encoder-smoke ARGS`, by default `--encoder hardware`, with no session, and its exit code. It passes only on what it asked for ([#3652](https://github.com/gjovanov/roomler-ai/issues/3652)): for H.264 on Linux, `--encoder hardware` opens FFmpeg's H.264 cascade (`h264_nvenc` on the g5g), and a host where no hardware encoder opens fails with an `encoder smoke tried:` line naming each candidate and why. ⚠️ A release older than that fix passed on `openh264` whatever the GPU was. `smoke --codec hevc` opens `hevc_nvenc`; one FFmpeg encoder by name: `smoke --name h264_nvenc` |
 | `record hardware\|auto\|software` | a ten-second recording of a private Xvfb with `--system-audio` (a PulseAudio or PipeWire null sink). It prints the recorder's events (`started … "encoder":"h264_nvenc"`), the MP4's sample entries (`avc1`; `mp4a` and `esds` for AAC) and the sidecar, then deletes the file. `hardware` refuses on a host without a hardware H.264 encoder rather than recording in software |
 | `logs [REGEX] [N]` | the daemon's own log, filtered by regex: `encoder selected`, `media pump`, the DC pump heartbeat |
 
@@ -102,3 +118,15 @@ The viewer for a session is the vmtest remote-desktop spec (`ui/e2e/vmtest-remot
 Playwright container against the agent's exact name. `E2E_RC_CODEC=h264` makes the session request one cell
 (the codec picker's per-agent override), and `E2E_RC_EXPECT_ENCODER=h264_nvenc` fails the run unless the
 viewer's codec pill names that encoder.
+
+## What the first g5g run found (2026-11-10)
+
+The rig ran end to end on a `g5g.xlarge` with the NVIDIA image (FR-122 §8: 28 minutes of box time, nothing left
+behind). Four things cost a retry each:
+
+| What you see | Why | What to do |
+|---|---|---|
+| The first session has no picture: "This device cannot capture its screen", and the daemon log says `no primary display: connection refused` | a release up to 0.4.209 on the NVIDIA image: Xvfb aborts a few seconds after the daemon starts it ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643)). From 0.4.210 the daemon starts the server with Mesa's EGL vendor and supervises it, which was run on this image on 2026-11-11 ([`docs/linux-capture.md` §2.2](../../docs/linux-capture.md#22-the-desktop-is-supervised-3643)) | only when a run pins 0.4.209 or older (a control), before `enroll`: `printf '%s\n' '#!/bin/sh' 'export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json' 'exec /usr/bin/Xvfb "$@"' \| sudo tee /usr/local/bin/Xvfb && sudo chmod 755 /usr/local/bin/Xvfb`. Check with `pgrep -a Xvfb` half a minute after the start |
+| `enroll` a second time: `--ephemeral needs a fresh config, but one already exists` | `stop` deletes the ephemeral device's row and leaves its config on the box | `sudo mv /etc/roomler/config.toml /etc/roomler/config.toml.spent`, then `enroll` again |
+| While the region is still closed by the organisation's SCP, a poll that has run for ten minutes fails with `Unable to create or refresh login credentials … signin:CreateOAuth2Token` | `aws login` refreshes its credentials in the region the call names, and the SCP denies that region's sign-in endpoint as well | make one call in the console's own region first (`aws sts get-caller-identity --region <the console's region>`); the refreshed credentials then work everywhere |
+| A session steered to HEVC needs another viewer | headless Chromium decodes no HEVC | view from a browser with hardware HEVC decode. The lab org's account lives on mars only, so that means a second enrollment in an org the browser is signed in to, with a single-use token (`ENROLL_EPHEMERAL=0`), and deleting that row afterwards |

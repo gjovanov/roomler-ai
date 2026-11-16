@@ -113,6 +113,10 @@ pub async fn list_members(
         .find_member_facts(&user_ids)
         .await
         .unwrap_or_default();
+    // The roles each member holds as the org has them, read once for the
+    // page: the list shows the roles that count, never an id the org no
+    // longer has.
+    let org_roles = state.tenants.org_role_ids(tid).await?;
 
     let mut rows: Vec<MemberResponse> = members
         .into_iter()
@@ -124,7 +128,11 @@ pub async fn list_members(
                 nickname: m.nickname,
                 display_name: f.map(|f| f.display_name.clone()).unwrap_or_default(),
                 email: f.map(|f| f.email.clone()).unwrap_or_default(),
-                role_ids: m.role_ids.iter().map(|r| r.to_hex()).collect(),
+                role_ids: org_roles
+                    .live_among(m.role_ids)
+                    .iter()
+                    .map(|r| r.to_hex())
+                    .collect(),
                 joined_at: m.joined_at.try_to_rfc3339_string().unwrap_or_default(),
             }
         })
@@ -180,11 +188,11 @@ pub async fn list_members(
 ///
 /// First consumer of `KICK_MEMBERS`. The tenant OWNER cannot be removed
 /// (409 — ownership transfer is a different operation); removing YOURSELF is
-/// allowed and simply means leaving. Room-membership rows are left in place:
-/// tenant `is_member` is the access gate on every read/write path, so a
-/// removed user loses access structurally. What a pillar RUNS for the member
-/// is different — it would outlive the access check — so every holder's
-/// `member_removed` hook runs first (FR-90: their agent sessions end).
+/// allowed and simply means leaving. What the membership admitted ends with
+/// it, through the membership hook once the row is gone: the tunnel clients
+/// the person owns in the org (`network`), the enrollment keys they minted
+/// there (`fleet`), their seats in the org's calls (`conference`) and their
+/// room memberships (`chat`).
 pub async fn remove_member(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -218,22 +226,19 @@ pub async fn remove_member(
         ));
     }
 
-    // The holders first, in HOOK_ORDER — FR-90: `hive` ends the member's
-    // agent sessions on the org's devices. BEFORE the membership row goes, so
-    // a failure refuses the removal rather than leaving sessions running for
-    // someone a retry would then find already gone.
-    state
-        .core
-        .hooks
-        .member_removed(tid, target)
-        .await
-        .map_err(|e| ApiError::Internal(format!("member removal cascade: {e}")))?;
-
     let removed = state.tenants.remove_member(tid, target).await?;
     if !removed {
         return Err(ApiError::NotFound("Not a member".to_string()));
     }
     tracing::info!(admin = %auth.user_id, tenant = %tid, user = %target, "member removed");
+    // What the membership admitted ends with it, told once the row is gone:
+    // tunnel clients, enrollment keys, call seats and room memberships, in
+    // `HOOK_ORDER`. The
+    // removal has happened whatever the hooks say, so a failure there is
+    // logged, not answered.
+    if let Err(e) = state.core.hooks.org_member_removed(tid, target).await {
+        tracing::error!(tenant = %tid, user = %target, %e, "member removal: ending what the membership admitted failed");
+    }
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 

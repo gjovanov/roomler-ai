@@ -29,16 +29,16 @@
 #   2026-09-23  19 closed FRs /74 criteria   <- unobserved for three weeks
 
 # ── A. closed with NO recorded field evidence on the issue ───────────────────
-# The sharp five. Each criterion here was written down because someone judged
+# The sharp five, three left: A.1 FR-2 and A.5 FR-37 were read and ticked 2026-11-03.
+# Each criterion here was written down because someone judged
 # it necessary, and then the issue closed without it and without a Result.
-FR-2=1    # A.1 #770 no Result comment. The one criterion is the PROD field check (a stale pin => 409); never recorded.
 FR-10=1   # A.2 #783 no Result comment. The open criterion is the `relay_idr_thrift=0` ROLLBACK path — a kill switch never exercised.
 FR-11=8   # A.3 #784 no Result comment, and NOT ONE of its 8 criteria is ticked. The ledger calls it shipped + field-verified on prod 2026-08-27; nothing in the record supports that.
 FR-13=6   # A.4 #789 no Result comment. Includes "Field: verified on a real Windows-viewer -> macOS-host session" — a cross-OS keyboard path, exactly the class that regresses silently.
-FR-37=1   # A.5 #928 no Result comment. One nightly run settles it: does the nightly write its `LATEST` line from the new path.
 
 # ── B. deliberately not met, and the spec says so ────────────────────────────
 FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addressable by P1" (fps under sustained motion). Honest and intentional. Owed: a child FR or an in-spec waiver, so a later reader does not have to infer it.
+FR-56=2   # B.2 #1157 the spec WAIVES both, by the operator's decision of 2026-11-02. AC5, a native window listed and focused on wlroots: GNOME refuses enumeration (measured) and wlroots is unverifiable here, since no device reports one; follow-up #3311. AC9, launch with no Xwayland: refuted as written, because such a window can be neither listed nor focused. Owed: nothing until a wlroots host exists.
 
 # ── C. closed WITH field evidence on the issue: what the evidence did NOT reach ─
 # 2026-11-02: every criterion of this group was matched against its own evidence, one
@@ -63,6 +63,18 @@ FR-57=3   # C.12 #1161 the image RAN on a native aarch64 runner but no arm64 hos
 # ONLY debt is half-met lives here.
 FR-36=2   # D.1 #929 both `[~]` are ONE gap: 4K meets the latency bar and ~30 fps only via the production `Auto` downscale path (24.0 ms of 33); undownscaled 4K is 43.8 ms (~23 fps). The spec records it honestly; owed: tick with a stated waiver, or a child FR for native 4K.
 
+# ── E. closed NOT PLANNED: criteria for a fix that will not be built ─────────
+FR-31=7   # E.1 #897 closed 2026-11-08 not planned (triage): superseded by FR-35 #922. Its own A/B refuted both levers on 2026-08-29 (neither a post-open VBV nor `ldkfs` moves NVENC's opening keyframe), so these criteria describe a fix that will not be built. FR-35's criteria measure the opener now.
+FR-17=4   # E.2 #799 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. Stages A and B shipped inert behind an opt-in. The four open criteria (the relay cell, the storm bound, the direct cell, the RustDesk A/B) are FR-148's AC23, AC24, AC21 and AC27.
+FR-18=4   # E.3 #801 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. The age bound, the send-buffer cap and the counters are live. Three partial field reads and the `dropped_stale` criterion are FR-148's AC21, AC22 and AC23.
+FR-35=4   # E.4 #922 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. The two opening criteria are FR-148's AC20 and the 2 Mbit/s relay its AC18. The kill-switch criterion is dropped with the learner (FR-148 P5); its A/B of 2026-11-02 stands as the record. FR-31's opener rides along.
+FR-59=2   # E.5 #1163 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2 is FR-148's AC17 and AC5 its AC21.
+FR-63=6   # E.6 #1243 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC0b and AC4 are FR-148's AC17, AC2 its AC5 and AC28, AC3 its AC29, AC5 and AC7 its AC30.
+FR-64=1   # E.7 #1244 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2's p50 read is FR-148's AC26.
+FR-71=4   # E.8 #1362 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC3 and AC6 are FR-148's AC9, AC4 its AC21, AC5 its AC9 and AC30.
+FR-74=2   # E.9 #1442 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2 and AC4 are FR-148's AC15; P5 is its P3.
+FR-79=2   # E.10 #1524 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC8 is FR-148's AC6 and AC7, AC9 its AC9 and AC16. V5b (PR #3374) is the first step of its P1.
+
 # ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
 #
 # The rule (PR #1401, merged 2026-09-05T20:49:42Z) makes a docs criterion
@@ -80,10 +92,14 @@ FR-36=2   # D.1 #929 both `[~]` are ONE gap: 4K meets the latency bar and ~30 fp
 # added ticked in the same PR. Writing FR-7's also paid its one debt pin: the
 # Apple criterion had been field-verified on 2026-09-08 and never ticked.
 #
-# So this section is empty on purpose. A line appearing here means an FR bound
-# by the rule was written, or closed, without the criterion.
+# So this section was empty on purpose until FR-31, closed not planned on
+# 2026-11-08 with nothing built to document. A line appearing here means an FR
+# bound by the rule was written, or closed, without the criterion.
 #
 # ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
 #    reader-facing docs — the close the operator made the rule ABOUT — and its
 #    owed docs landed in #1401 itself. It is the reason the boundary is a
 #    timestamp and not a date.
+
+nodocs FR-31  # #897 closed 2026-11-08 not planned: nothing shipped under it to document (draft PR #900 closed unmerged); FR-35 #922 carries the work.
+nodocs FR-17  # #799 closed 2026-11-16 not planned: stages A and B are inert behind an opt-in and no reader-facing page describes them. The docs of the deadline-limited channel are FR-148's AC31.

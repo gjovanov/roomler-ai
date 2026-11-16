@@ -39,8 +39,9 @@ use std::time::{Duration, Instant};
 use super::stop_event::HostStopEvent;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_TOKEN, FALSE, GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_CTX_WINSTATION_NOT_FOUND, ERROR_NO_TOKEN, FALSE, GENERIC_READ, GetLastError,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SECURITY_ATTRIBUTES, SecurityImpersonation,
@@ -202,6 +203,27 @@ pub fn query_user_token(session_id: u32) -> Result<Option<OwnedHandle>> {
         // SAFETY: GetLastError is a thread-local read.
         let err = unsafe { GetLastError() };
         if err == ERROR_NO_TOKEN {
+            return Ok(None);
+        }
+        bail!("WTSQueryUserToken({session_id}) failed (err {err})");
+    }
+    Ok(OwnedHandle::new(token))
+}
+
+/// #3844 — [`query_user_token`] for a session named by a tray that ran in
+/// it, not by the console: `Ok(None)` also when the session is gone
+/// (`ERROR_CTX_WINSTATION_NOT_FOUND`), which is how a Remote Desktop session
+/// its person signed out of answers once it is torn down. Either way nobody
+/// is signed in there to start anything for.
+pub fn query_session_user_token(session_id: u32) -> Result<Option<OwnedHandle>> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: as in `query_user_token`: `token` is an out-pointer the API
+    // writes a HANDLE to, owned below.
+    let ok = unsafe { WTSQueryUserToken(session_id, &mut token) };
+    if ok == 0 {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_NO_TOKEN || err == ERROR_CTX_WINSTATION_NOT_FOUND {
             return Ok(None);
         }
         bail!("WTSQueryUserToken({session_id}) failed (err {err})");
@@ -741,11 +763,14 @@ pub enum SpawnDecision {
 ///   SystemContext while the controller is around.
 /// * `keep_stream_alive` — named for its M3 meaning, "a controller is
 ///   connected to *some* worker on this host". ⚠️ Since 0.3.0-rc.7 the
-///   supervisor loop passes `peer_presence_is_signaled()`, which is
-///   `ROOMLERD_ENABLE_SYSTEM_SWAP` and nothing else. So in production a
-///   SystemContext-mode host is SYSTEM from cold start, an attended host
-///   stays user-context, and the "swap" rows below never fire because a
-///   controller connected.
+///   supervisor loop passes `ROOMLERD_ENABLE_SYSTEM_SWAP`
+///   (`peer_presence_is_signaled()`), and since #3387 only while a SYSTEM
+///   worker runs or SYSTEM can open a machine enrollment
+///   ([`want_system_worker`]). So in production a SystemContext-mode host is
+///   SYSTEM from cold start once the machine is enrolled, runs the person's
+///   own enrollment as the person until then, and swaps up when the machine
+///   enrollment appears; an attended host stays user-context. The "swap"
+///   rows below never fire because a controller connected.
 /// * `last_active_session` — most recent `Some(active)` the
 ///   supervisor observed. Used only by the `(None, _) if
 ///   keep_stream_alive` branch as the target session id for the
@@ -918,6 +943,108 @@ fn system_swap_enabled() -> bool {
     }
 }
 
+/// #3387 — whether the worker should be the SYSTEM one: SystemContext mode is
+/// on (`sc_mode`), and a SYSTEM worker already runs or SYSTEM can open an
+/// enrollment a SystemContext worker runs (`opens`, [`sc_config_opens`]).
+///
+/// A SystemContext worker runs the machine's own enrollment and nothing else
+/// (`app.rs`, `pick_config_path`). Until the machine has one that SYSTEM can
+/// open, the signed-in person's own enrollment runs AS THAT PERSON, on the
+/// user-context arm the attended role uses, and the host swaps up at the
+/// first tick after one opens (`decide_spawn`'s swap-up row).
+///
+/// Asymmetric on purpose. A running SYSTEM worker is never swapped down by the
+/// check, and `opens` is not even called for it: a healthy device opens no file
+/// a tick, and a read that fails for a moment can never end a live session.
+/// With no worker, `opens` picks the arm.
+pub(crate) fn want_system_worker(
+    sc_mode: bool,
+    current_is_system_context: bool,
+    opens: impl FnOnce() -> bool,
+) -> bool {
+    sc_mode && (current_is_system_context || opens())
+}
+
+/// #3387 — SYSTEM can open, for reading, an enrollment a SystemContext worker
+/// runs: the machine config, or the SYSTEM profile's own. The two rungs the
+/// worker's ladder takes, through the same resolvers, read by the same account
+/// (this host is LocalSystem), so the host and the worker cannot disagree.
+/// #3702 — the profile rung only for a config in the service account's own
+/// profile as the system names it, the rule the worker's ladder keeps.
+fn sc_config_opens() -> bool {
+    use roomler_node_core::machine_tree::{MachineTree, Switches};
+    let profile = crate::config::default_config_path()
+        .ok()
+        .filter(|p| crate::appdirs::in_windows_folder(p, &crate::appdirs::system_profile()));
+    config_opens_in(&MachineTree::here(), Switches::from_env(), profile)
+}
+
+/// #3609 — the host's question over `tree`: does any rung open.
+pub(crate) fn config_opens_in(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
+    profile: Option<PathBuf>,
+) -> bool {
+    rung_opens(tree, switches, &tree.config())
+        || profile.is_some_and(|p| rung_opens(tree, switches, &p))
+}
+
+/// #3609 — one rung of the SystemContext ladder, the ONE function the host
+/// ([`sc_config_opens`]) and the worker's ladder (`app.rs`,
+/// `resolve_config_path`) read it with, so they cannot disagree. The machine
+/// config is taken only through `machine_tree::private_machine_config`: the
+/// chain repaired first, then checked. The SYSTEM profile's own config is a
+/// read open, as before: only SYSTEM and Administrators may write that profile.
+pub(crate) fn rung(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
+    path: &std::path::Path,
+) -> Result<(), roomler_node_core::machine_tree::Refusal> {
+    use roomler_node_core::machine_tree::{Refusal, private_machine_config};
+    if path == tree.config() {
+        private_machine_config(tree, switches)
+    } else if config_opens(std::iter::once(path.to_path_buf())) {
+        Ok(())
+    } else {
+        Err(Refusal::Absent)
+    }
+}
+
+/// [`rung`] as a yes or no.
+pub(crate) fn rung_opens(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
+    path: &std::path::Path,
+) -> bool {
+    rung(tree, switches, path).is_ok()
+}
+
+/// #3387 — any of `paths` opens for reading. An open, not `exists()`: a file in
+/// a folder that refuses SYSTEM (#3073) lists, and does not open.
+fn config_opens(paths: impl IntoIterator<Item = PathBuf>) -> bool {
+    paths.into_iter().any(|p| std::fs::File::open(&p).is_ok())
+}
+
+/// #3387 — whether the user-context arm spawns with the elevated linked token
+/// (rc.206, `ROOMLERD_ELEVATE_WORKER`). Not while SystemContext waits for a
+/// machine enrollment: that worker runs the person's own config, which their
+/// unelevated processes can write, so it runs with their standard rights.
+fn user_arm_elevates(elevation_requested: bool, waiting: bool) -> bool {
+    elevation_requested && !waiting
+}
+
+/// #3387 — the flag the host adds to a worker it starts on the user-context
+/// arm while SystemContext waits for a machine enrollment
+/// (`win_service::note_system_context_waiting` on the worker's side), and
+/// nothing otherwise.
+pub fn system_context_waiting_args(waiting: bool) -> Vec<String> {
+    if waiting {
+        vec!["--system-context-waiting".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// W4 — the exit code Windows session teardown delivers to processes in a
 /// dying session (`DBG_TERMINATE_PROCESS`, 0x40010004). Field 2026-08-14
 /// (winhost-a): logon-screen transitions and Check-Point-VPN session flaps
@@ -931,6 +1058,44 @@ fn system_swap_enabled() -> bool {
 /// sees it — 0x40010004 exits observed at the reap site are always
 /// external.
 pub const SESSION_TEARDOWN_EXIT_CODE: u32 = 0x4001_0004;
+
+/// #3289 — the word for a worker this host ended itself, after a session change.
+/// `terminate()` exits it with code 1, and only this host knows that was its doing.
+pub const ENDED_BY_HOST: &str = "ended-by-host";
+
+/// #3289 — the word this host hands the next worker (`--prior-end`) when a worker
+/// ended with `code` and that was not the worker failing, so that start does not
+/// count the last run as a crash. Only the worker keeps the crash count, and only
+/// this host sees how a worker ended: Windows ends a session's processes before
+/// the service hears of a restart, so the worker never gets to mark a clean stop.
+///
+/// A second table beside [`should_record_supervisor_crash`], on purpose. That one
+/// is about a sidecar in the fleet's crash metrics, and `STALL_EXIT_CODE` stays out
+/// of it only because the watchdog wrote its own. A stall is a failure of the build
+/// that ran, so it counts here, as does every code nobody named. The already-running
+/// exit says nothing either way: that worker never took the run from the last one.
+pub fn worker_end_is_no_crash(code: u32) -> Option<&'static str> {
+    if code == 0 {
+        Some("clean-exit")
+    } else if code == crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32 {
+        Some("restart-requested")
+    } else if code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32 {
+        Some("agent-deleted")
+    } else if code == SESSION_TEARDOWN_EXIT_CODE {
+        Some("session-teardown")
+    } else {
+        None
+    }
+}
+
+/// #3289 — the arguments that carry [`worker_end_is_no_crash`]'s word to the next
+/// worker, and nothing when there is no word.
+pub fn prior_end_args(prior_end: Option<&str>) -> Vec<String> {
+    match prior_end {
+        Some(word) => vec!["--prior-end".to_string(), word.to_string()],
+        None => Vec::new(),
+    }
+}
 
 /// Decide how to react to a worker exit. Returns the reaction plus
 /// the new value for `consecutive_failures`.
@@ -1281,6 +1446,9 @@ pub fn run(
     // `last_active_session` is a longer memory of "who was here
     // last".
     let mut last_active_session: Option<u32> = None;
+    // #3289 — how the last worker ended, when this host saw it and it was not the
+    // worker failing. The next spawn hands it over, however long after.
+    let mut prior_end: Option<&'static str> = None;
 
     // #2465 — a crash ends a host, not its worker. A worker an earlier host of
     // this service left running holds this config's single-instance lock, so
@@ -1413,6 +1581,7 @@ pub fn run(
                     };
                     let (reaction, next_failures) = decide_exit_reaction(code, prior);
                     consecutive_failures = next_failures;
+                    prior_end = worker_end_is_no_crash(code);
                     match reaction {
                         ExitReaction::Respawn => {
                             // 0 = a clean exit (an auto-update's, or FR-84
@@ -1591,8 +1760,30 @@ pub fn run(
         if let Some(s) = active {
             last_active_session = Some(s);
         }
-        let keep_stream_alive = peer_presence_is_signaled();
+        // #3387 — and a SystemContext-mode host runs the SYSTEM worker only
+        // while SYSTEM can open a machine enrollment: until then the person's
+        // own enrollment runs as that person (`want_system_worker`).
+        let current_is_system_context = current.as_ref().is_some_and(|w| w.is_system_context);
+        let sc_mode = peer_presence_is_signaled();
+        let keep_stream_alive =
+            want_system_worker(sc_mode, current_is_system_context, sc_config_opens);
+        let system_context_waiting = sc_mode && !keep_stream_alive;
         if last_logged_keep_stream_alive != Some(keep_stream_alive) {
+            if system_context_waiting {
+                tracing::warn!(
+                    "supervisor: SystemContext is on, but SYSTEM can open no machine enrollment: \
+                     the signed-in person's own enrollment runs as that person until one is \
+                     written (the setup wizard, or `roomlerd enroll --machine-global`)"
+                );
+            } else if sc_mode && last_logged_keep_stream_alive == Some(false) {
+                // A machine enrollment opens now. A backoff the person's worker
+                // earned (one with no enrollment of its own exits at once)
+                // says nothing about the SYSTEM worker, which starts now.
+                tracing::info!(
+                    "supervisor: SYSTEM can open a machine enrollment; the SYSTEM worker runs it"
+                );
+                respawn_at = None;
+            }
             // Log on transitions only — at info level so it shows up
             // in production logs without raising the bar to debug.
             // Carry the marker snapshot's metadata so a "no swap
@@ -1623,7 +1814,7 @@ pub fn run(
         let decision = decide_spawn(
             active,
             current.as_ref().map(|w| w.session),
-            current.as_ref().is_some_and(|w| w.is_system_context),
+            current_is_system_context,
             keep_stream_alive,
             last_active_session,
         );
@@ -1643,7 +1834,14 @@ pub fn run(
                         // (no regression). `elevated` (when Some) owns the
                         // duplicated primary token and MUST outlive the
                         // spawn call below — hence the outer binding.
-                        let elevated = if worker_elevation_requested() {
+                        //
+                        // #3387 — never while SystemContext waits for a
+                        // machine enrollment: this worker then runs the
+                        // person's own config with their standard rights.
+                        let elevated = if user_arm_elevates(
+                            worker_elevation_requested(),
+                            system_context_waiting,
+                        ) {
                             // SAFETY: `token.raw()` is a live user token
                             // from WTSQueryUserToken, valid for this scope.
                             match unsafe { elevated_primary_token(token.raw()) } {
@@ -1679,10 +1877,17 @@ pub fn run(
                         // as the person, renews for full GPU clocks above
                         // 60 fps; this (SYSTEM) host is what pins them.
                         let pin_args = super::gpu_pin_relay::worker_args();
+                        // #3289 — what this host saw of the last worker's end.
+                        let end_args = prior_end_args(prior_end);
+                        // #3387 — that this worker runs the person's own
+                        // enrollment while SystemContext waits.
+                        let wait_args = system_context_waiting_args(system_context_waiting);
                         let mut spawn_args: Vec<&str> = args_borrow.clone();
                         spawn_args.extend(ev_args.iter().map(String::as_str));
                         spawn_args.extend(sas_args.iter().map(String::as_str));
                         spawn_args.extend(pin_args.iter().map(String::as_str));
+                        spawn_args.extend(end_args.iter().map(String::as_str));
+                        spawn_args.extend(wait_args.iter().map(String::as_str));
                         // SAFETY: `spawn_handle` is a live primary/user
                         // token — either the WTSQueryUserToken result or
                         // its duplicated elevated linked token; both
@@ -1694,6 +1899,7 @@ pub fn run(
                                     pid = p.pid,
                                     session_id = sid,
                                     elevated = is_elevated,
+                                    system_context_waiting,
                                     "supervisor: spawned worker"
                                 );
                                 current = Some(ActiveWorker {
@@ -1703,6 +1909,7 @@ pub fn run(
                                     spawned_at: Instant::now(),
                                     stop_event: stop_ev,
                                 });
+                                prior_end = None;
                                 // rc.51: do NOT reset consecutive_failures
                                 // here — a successful SPAWN is not a healthy
                                 // RUN. The reset is now uptime-gated in the
@@ -1761,6 +1968,7 @@ pub fn run(
                         "supervisor: spawn target changed (session/context); terminating old worker"
                     );
                     old.process.terminate();
+                    prior_end = Some(ENDED_BY_HOST);
                     // Wait for reap so the next-iteration spawn doesn't
                     // race the instance lock — same rationale as the
                     // shutdown-path wait above.
@@ -1787,6 +1995,7 @@ pub fn run(
                         "supervisor: console session went idle (logout / lock screen); terminating worker"
                     );
                     old.process.terminate();
+                    prior_end = Some(ENDED_BY_HOST);
                     let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
             }
@@ -1831,10 +2040,13 @@ pub fn run(
                 let sas_args = super::sas_relay::worker_args();
                 // FR-119 P2b-16 — the same lease as the user-context arm.
                 let pin_args = super::gpu_pin_relay::worker_args();
+                // #3289 — the same word as the user-context arm.
+                let end_args = prior_end_args(prior_end);
                 let mut spawn_args: Vec<&str> = args_borrow.clone();
                 spawn_args.extend(ev_args.iter().map(String::as_str));
                 spawn_args.extend(sas_args.iter().map(String::as_str));
                 spawn_args.extend(pin_args.iter().map(String::as_str));
+                spawn_args.extend(end_args.iter().map(String::as_str));
                 let cmdline = winlogon_token::build_cmdline(&worker_exe, &spawn_args);
                 let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
                     let Some(pid) = winlogon_token::find_winlogon_pid_in_session(sid)
@@ -1865,6 +2077,7 @@ pub fn run(
                             spawned_at: Instant::now(),
                             stop_event: stop_ev,
                         });
+                        prior_end = None;
                         // rc.51: no consecutive_failures reset here —
                         // the reset is uptime-gated in the reap path.
                         respawn_at = None;
@@ -1912,6 +2125,7 @@ pub fn run(
                         "supervisor: swap to SYSTEM-context worker; terminating old worker"
                     );
                     old.process.terminate();
+                    prior_end = Some(ENDED_BY_HOST);
                     let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
             }
@@ -2317,6 +2531,44 @@ impl JobObject {
         self.0.raw()
     }
 
+    /// Put `process` in the job. Under the per-user Scheduled Task the process
+    /// is already in the task's job, and this job nests inside that one.
+    pub(crate) fn assign(&self, process: HANDLE) -> Result<()> {
+        // SAFETY: a live job handle we own; the caller keeps `process` alive
+        // across the call.
+        if unsafe { AssignProcessToJobObject(self.0.raw(), process) } == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("AssignProcessToJobObject failed (err {err})");
+        }
+        Ok(())
+    }
+
+    /// #3303 — close the job without ending what is in it: the kill-on-close
+    /// limit goes first, so the last handle closing leaves those processes
+    /// running, out of anyone's reach. On failure the limit stands and closing
+    /// the job ends them, which is what this job was made to do.
+    pub fn let_go(self) -> Result<()> {
+        // SAFETY: all-zero is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+        // no limit set.
+        let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` matches the class being set and outlives the call.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.0.raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("SetInformationJobObject(no limit) failed (err {err})");
+        }
+        Ok(())
+    }
+
     /// End every process in the job. Asynchronous, like `TerminateProcess`:
     /// wait on a process, or poll [`active_processes`](Self::active_processes),
     /// to see them gone.
@@ -2363,6 +2615,53 @@ impl JobObject {
         }
         Ok(inside != FALSE)
     }
+}
+
+/// #3303 — start a process that `CREATE_SUSPENDED` holds at its first
+/// instruction, knowing only its id: `tokio::process` keeps the thread handle
+/// `CreateProcess` returned to itself. A process with none of its threads
+/// resumed never runs, so `Err` means the caller must end it.
+pub fn resume_suspended_process(pid: u32) -> Result<()> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
+
+    // SAFETY: a documented call; the snapshot is owned below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("CreateToolhelp32Snapshot failed (err {err})");
+    }
+    let snapshot = OwnedHandle::new(snapshot)
+        .ok_or_else(|| anyhow!("CreateToolhelp32Snapshot returned no handle"))?;
+    // SAFETY: all-zero is valid for this struct, and it carries its own size,
+    // as the walk requires.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut resumed = 0u32;
+    // SAFETY: a live snapshot and a valid out-param, for each call of the walk.
+    let mut more = unsafe { Thread32First(snapshot.raw(), &mut entry) };
+    while more != 0 {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: a documented call; a thread gone since the snapshot
+            // answers null. The handle is owned by the wrapper.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID) };
+            if let Some(thread) = OwnedHandle::new(thread)
+                // SAFETY: the handle was opened with the right this needs.
+                && unsafe { ResumeThread(thread.raw()) } != u32::MAX
+            {
+                resumed += 1;
+            }
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot.raw(), &mut entry) };
+    }
+    if resumed == 0 {
+        bail!("no thread of process {pid} could be resumed");
+    }
+    Ok(())
 }
 
 /// Who a process started into a job runs as.
@@ -2805,6 +3104,146 @@ mod tests {
         }
     }
 
+    /// #3387 — SystemContext mode is the switch: off, the worker is never the
+    /// SYSTEM one, whatever runs and whatever opens.
+    #[test]
+    fn want_system_worker_is_off_without_system_context() {
+        for current in [false, true] {
+            for opens in [false, true] {
+                assert!(
+                    !want_system_worker(false, current, || opens),
+                    "current_is_system_context={current} opens={opens}"
+                );
+            }
+        }
+    }
+
+    /// #3387 — a running SYSTEM worker is never swapped down by the check, and
+    /// a healthy device opens no file for it: a read that fails for a moment
+    /// can never end a live session.
+    #[test]
+    fn want_system_worker_never_swaps_a_running_system_worker_down() {
+        let mut opened = false;
+        assert!(want_system_worker(true, true, || {
+            opened = true;
+            false
+        }));
+        assert!(!opened, "a running SYSTEM worker costs no file open a tick");
+    }
+
+    /// #3387 — with no SYSTEM worker running, SystemContext starts one only
+    /// while SYSTEM can open the machine's own enrollment. Until then the
+    /// person's own enrollment runs as that person, on the user-context arm.
+    #[test]
+    fn want_system_worker_runs_the_persons_enrollment_as_the_person_until_the_machine_has_one() {
+        assert!(!want_system_worker(true, false, || false));
+        assert!(want_system_worker(true, false, || true));
+    }
+
+    /// #3387 — the same decision as the loop takes it, through `decide_spawn`.
+    #[test]
+    fn want_system_worker_drives_decide_spawn() {
+        // A fresh machine-wide install, nothing the machine can open yet: the
+        // user-context arm, as the person.
+        let want = want_system_worker(true, false, || false);
+        assert_eq!(
+            decide_spawn(Some(2), None, false, want, Some(2)),
+            SpawnDecision::SpawnIn(2)
+        );
+        // The machine enrollment is written while the person's worker runs:
+        // swapped up at the next tick.
+        let want = want_system_worker(true, false, || true);
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), false, want, Some(2)),
+            SpawnDecision::SpawnSystemInSession(2)
+        );
+        // A SYSTEM worker whose config stops opening keeps running.
+        let want = want_system_worker(true, true, || false);
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), true, want, Some(2)),
+            SpawnDecision::KeepCurrent
+        );
+        // Nobody signed in, and no machine enrollment: nothing runs.
+        let want = want_system_worker(true, false, || false);
+        assert_eq!(
+            decide_spawn(None, None, false, want, Some(2)),
+            SpawnDecision::Idle
+        );
+    }
+
+    /// #3387 — `exists()` reads a file SYSTEM may not open as present, so a
+    /// machine config sealed against SYSTEM (#3073) would have the host start a
+    /// SYSTEM worker that cannot load it. The check opens the file, as the
+    /// worker will.
+    #[test]
+    fn sc_config_opens_reads_a_sealed_file_as_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sealed = dir.path().join("config.toml");
+        std::fs::write(&sealed, "x").expect("write");
+        let open = dir.path().join("open.toml");
+        std::fs::write(&open, "x").expect("write");
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
+                .arg(&sealed)
+                .args(args)
+                .output()
+                .expect("icacls runs");
+            assert!(out.status.success(), "icacls {args:?}: {out:?}");
+        };
+        // Everyone is refused the file's data. Its owner, this runner, keeps
+        // the right to give it back.
+        icacls(&["/deny", "*S-1-1-0:(RD)"]);
+        let lists = sealed.exists();
+        let opens = config_opens([sealed.clone()]);
+        let one_of_two = config_opens([sealed.clone(), open.clone()]);
+        let absent = config_opens([dir.path().join("absent.toml")]);
+        icacls(&["/reset"]);
+        assert!(lists, "the sealed file lists");
+        assert!(!opens, "and does not open");
+        assert!(one_of_two, "one enrollment that opens is enough");
+        assert!(!absent);
+    }
+
+    /// #3609 — a host with the service and no machine enrollment keeps the
+    /// machine folder as `%ProgramData%` hands it down, so the person's own
+    /// daemon may stage files there. A `config.toml` another account put in
+    /// it is not the machine's enrollment: the host never starts the SYSTEM
+    /// worker on it, and the folder is left as it was.
+    #[test]
+    fn a_config_another_account_put_in_an_open_machine_folder_is_not_taken() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        if !elevated_or_skip("a config in an open machine folder") {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let tree = waiting_tree(root.path());
+        let folder = sddl(tree.folder());
+        assert!(names(&folder, USERS), "the folder is open: {folder}");
+        std::fs::write(tree.config(), "agent_token = \"t\"\n").expect("the config");
+        let other = local_guest().unwrap_or_else(|| USERS.to_string());
+        assert!(icacls(&tree.config(), &["/setowner", &format!("*{other}")]));
+        assert!(!config_opens_in(&tree, Switches::ON, None));
+        assert!(!want_system_worker(true, false, || config_opens_in(
+            &tree,
+            Switches::ON,
+            None
+        )));
+        assert_eq!(sddl(tree.folder()), folder, "the folder is left as it was");
+    }
+
+    /// #3387 — the user-context arm runs a person-writable config, so while
+    /// SystemContext waits for a machine enrollment it runs it with the
+    /// person's own standard rights: never the elevated linked token that
+    /// rc.206 gives an attended administrator's worker.
+    #[test]
+    fn the_waiting_user_arm_spawns_with_the_filtered_token() {
+        assert!(!user_arm_elevates(true, true));
+        assert!(!user_arm_elevates(false, true));
+        assert!(user_arm_elevates(true, false), "attended: rc.206 unchanged");
+        assert!(!user_arm_elevates(false, false), "the kill switch");
+    }
+
     #[test]
     fn decide_spawn_idles_when_no_active_session_and_no_stream() {
         // last_active_session doesn't matter when keep_stream_alive=false;
@@ -3092,6 +3531,67 @@ mod tests {
         assert_eq!(
             decide_exit_reaction(1, 0),
             (ExitReaction::Backoff(Duration::from_secs(2)), 1)
+        );
+    }
+
+    // ─── #3289: what the next worker is told of the last one's end ───
+
+    /// The field read: `shutdown /r` ended the worker with this code 2.5 s after
+    /// it was asked, 3.5 s before the host heard of the restart, and the next
+    /// worker counted that as a crash.
+    #[test]
+    fn a_session_teardown_is_no_crash_of_the_worker() {
+        assert_eq!(
+            worker_end_is_no_crash(1_073_807_364),
+            Some("session-teardown")
+        );
+    }
+
+    #[test]
+    fn the_ends_that_were_not_the_worker_failing_each_have_a_word() {
+        assert_eq!(worker_end_is_no_crash(0), Some("clean-exit"));
+        assert_eq!(
+            worker_end_is_no_crash(crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32),
+            Some("restart-requested")
+        );
+        assert_eq!(
+            worker_end_is_no_crash(crate::watchdog::AGENT_DELETED_EXIT_CODE as u32),
+            Some("agent-deleted")
+        );
+    }
+
+    /// A real crash loop must still reach the rollback, so anything nobody named
+    /// counts: a kill from outside, an access violation, a stack overflow, a panic,
+    /// an abort, and a stall, which is the build's own failure even though the
+    /// sidecar table above leaves it out.
+    #[test]
+    fn everything_else_is_left_to_count_as_a_crash() {
+        for code in [
+            1,
+            2,
+            101,
+            134,
+            255,
+            0xC000_0005,
+            0xC000_00FD,
+            0xC000_0409,
+            crate::watchdog::STALL_EXIT_CODE as u32,
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32,
+        ] {
+            assert_eq!(worker_end_is_no_crash(code), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn the_word_travels_only_when_there_is_one() {
+        assert!(prior_end_args(None).is_empty());
+        assert_eq!(
+            prior_end_args(Some(ENDED_BY_HOST)),
+            ["--prior-end", "ended-by-host"]
+        );
+        assert_eq!(
+            prior_end_args(worker_end_is_no_crash(SESSION_TEARDOWN_EXIT_CODE)),
+            ["--prior-end", "session-teardown"]
         );
     }
 
@@ -3495,6 +3995,31 @@ mod tests {
             child.process.wait_for_exit(Duration::from_secs(10)),
             "closing the job's last handle must end its processes"
         );
+    }
+
+    /// #3303 — a job let go leaves what is in it running: the installer a
+    /// finished command left behind goes on.
+    #[test]
+    fn a_job_let_go_leaves_its_processes_running() {
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("ping -n 60 127.0.0.1 >NUL"),
+                None,
+                &[],
+                false,
+                &job,
+            )
+        }
+        .unwrap();
+        job.let_go().unwrap();
+        assert!(
+            !child.process.wait_for_exit(Duration::from_secs(2)),
+            "a job let go must not end its processes"
+        );
+        child.process.terminate();
     }
 
     /// #1908 — a console-user command holds no handle it was not given. The

@@ -12,10 +12,10 @@
 #
 #   Roles:
 #     daemon  — the roomlerd daemon ("be accessed"): Linux .deb / macOS .pkg,
-#               enrolls with an AGENT enrollment token (Admin → Agents),
+#               enrolls with an AGENT enrollment token (Devices → Enroll → Device),
 #               enables the packaged autostart (systemd user unit / LaunchAgent).
 #     tunnel  — the roomler CLI only ("reach others"): enrolls with a TUNNEL
-#               enrollment token (Admin → Tunnels).
+#               enrollment token (Devices → Enroll → Tunnel client).
 #
 #   --system          (daemon role, Linux only) install as a ROOT systemd
 #                     SYSTEM service instead of the per-user unit. Pick this
@@ -133,6 +133,9 @@ MACOS_DAEMON_MARKER="/etc/roomler/enable-daemon"
 # the .pkg put it there, the user one kickstarts what runs from it.
 MACOS_DAEMON_BIN="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
 DAEMON_TOKEN=""
+# FR-43 P3d — `--one-row`: the Mac's root half alone holds the enrollment (see
+# install_macos_one_row). Off by default, so a Mac installs as two rows.
+ONE_ROW=0
 NO_ENROLL=0
 # FR-27 — the Linux desktop companion. Empty = decide by probing for a
 # graphical session; --desktop / --no-desktop force it either way.
@@ -156,7 +159,7 @@ DIGEST_REQUIRED=0
 usage() {
     sed -n '2,51p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT | --pair [--pair-org SLUG]]"
-    echo "                  [--name NAME] [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    echo "                  [--name NAME] [--daemon-token JWT | --one-row] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
     echo "       install.sh --privileged-steps --role daemon [--system] [--config-from FILE]"
     echo "                  [--config-take KEYS] [--server URL] [--name NAME] [--desktop|--no-desktop]"
@@ -200,6 +203,15 @@ usage() {
     echo "                  device id, and the second connection displaces the first — so"
     echo "                  this takes a SECOND single-use enrollment token and the Mac"
     echo "                  appears as two devices."
+    echo
+    echo "  --one-row       macOS only, off by default. ONE token (or one --pair approval),"
+    echo "                  ONE device: the root LaunchDaemon holds the enrollment, runs the"
+    echo "                  overlay, and serves the screen through a worker it starts in the"
+    echo "                  login session, which holds none. The package, the root half's"
+    echo "                  enrollment, then the package again: its guard removes the per-user"
+    echo "                  LaunchAgent. Not with --daemon-token. On a Mac that is one row"
+    echo "                  already it only updates the package (no token needed). An enrolled"
+    echo "                  two-row Mac becomes one row with: sudo roomlerd one-row"
     exit 1
 }
 
@@ -212,6 +224,7 @@ while [ $# -gt 0 ]; do
         --pair-org) PAIR_ORG="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
         --daemon-token) DAEMON_TOKEN="$2"; shift 2 ;;
+        --one-row) ONE_ROW=1; shift ;;
         --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
@@ -265,6 +278,29 @@ fi
 if [ -n "$DAEMON_TOKEN" ] && { [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; }; then
     echo "error: --daemon-token applies to '--role daemon' on macOS only" >&2
     exit 1
+fi
+
+# FR-43 P3d — `--one-row`: one token, one device row. Refused here, before
+# anything is downloaded, wherever it cannot mean that. Whether the Mac needs a
+# token is install_macos_one_row's question: one that is one row already only
+# updates its package.
+if [ "$ONE_ROW" = 1 ]; then
+    if [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; then
+        echo "error: --one-row applies to '--role daemon' on macOS only: only a Mac has a root half and a person's half to make one row of" >&2
+        exit 1
+    fi
+    if [ -n "$DAEMON_TOKEN" ]; then
+        echo "error: --one-row enrolls ONE row from one token, and --daemon-token is the second token of a two-row install: pass one of them" >&2
+        exit 1
+    fi
+    if [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ]; then
+        echo "error: --one-row is this script's terminal install: the halves a GUI runs (--privileged-steps, --user-steps) have no one-row form yet" >&2
+        exit 1
+    fi
+    if [ "$NO_ENROLL" = 1 ]; then
+        echo "error: --one-row enrolls the root half as this Mac's one row; it cannot be combined with --no-enroll" >&2
+        exit 1
+    fi
 fi
 
 # ─── FR-129 A4: --pair ──────────────────────────────────────────────────────
@@ -526,7 +562,7 @@ repair_tarball_owners() {
 # ⚠️ Every branch here ends in a construct that returns 0: under `set -e` a
 # function whose last command fails would abort the whole install.
 enable_update_helper() {
-    if ! /usr/bin/roomlerd update-helper --capabilities 2>/dev/null | grep -qx 'step-aside'; then
+    if ! /usr/bin/roomlerd update-helper --capabilities </dev/null 2>/dev/null | grep -qx 'step-aside'; then
         say "NOTE: this release's daemon cannot hand its updates to the root helper yet, and a per-user daemon cannot install them itself (writing /usr needs root). Re-run this script after the next release, or use --system."
         return 0
     fi
@@ -580,23 +616,23 @@ helper_on() {
 restart_old_user_daemon() {
     pid="$1"; helper_changed="$2"
     case "$pid" in ''|0) return 0 ;; esac
-    installed="$(/usr/bin/roomlerd --version 2>/dev/null || true)"
+    installed="$(/usr/bin/roomlerd --version </dev/null 2>/dev/null || true)"
     if [ -z "$installed" ]; then
         warn "/usr/bin/roomlerd --version did not answer; leaving the running daemon (pid $pid) as it is"
         return 0
     fi
-    running="$("/proc/$pid/exe" --version 2>/dev/null || true)"
+    running="$("/proc/$pid/exe" --version </dev/null 2>/dev/null || true)"
     if [ "$running" = "$installed" ]; then
         if [ "$helper_changed" = 0 ]; then
-            say "the running daemon (pid $pid) already runs ${installed#roomlerd }: nothing to restart"
+            say "the running daemon (pid $pid) already runs $(printable_version "${installed#roomlerd }"): nothing to restart"
             return 0
         fi
         why="the root update helper was just turned on, and the daemon decides at its start who installs its updates"
-    elif "/proc/$pid/exe" update-helper --capabilities 2>/dev/null | grep -qx 'restart-on-replace'; then
-        say "the running daemon (pid $pid) restarts onto ${installed#roomlerd } by itself, once nothing it serves would be cut"
+    elif "/proc/$pid/exe" update-helper --capabilities </dev/null 2>/dev/null | grep -qx 'restart-on-replace'; then
+        say "the running daemon (pid $pid) restarts onto $(printable_version "${installed#roomlerd }") by itself, once nothing it serves would be cut"
         return 0
     else
-        rv="${running#roomlerd }"
+        rv="${running:+$(printable_version "${running#roomlerd }")}"
         why="it runs ${rv:-an unknown version}, which cannot restart onto a new binary by itself"
     fi
     say "restarting the running daemon (pid $pid): $why (a remote or SSH session to this device drops for a few seconds)"
@@ -638,6 +674,7 @@ install_daemon_linux() {
         digest="$(asset_field_for "$releases" "$pattern" digest)"
     fi
     [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest roomlerd release" >&2; exit 1; }
+    name_release "$releases" "$pattern"
     deb="$STAGE/roomlerd.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
@@ -777,14 +814,14 @@ user_steps_linux() {
 place_system_config() {
     target="$1"; daemon_bin="$2"
     grp=root; [ "$OS" = Darwin ] && grp=wheel
-    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help >/dev/null 2>&1; then
+    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help </dev/null >/dev/null 2>&1; then
         say "a config already exists at $target — folding the new enrollment into it (operator settings kept)"
         take_args=""
         if [ -n "$CONFIG_TAKE" ]; then
             for k in $(printf '%s' "$CONFIG_TAKE" | tr ',' ' '); do take_args="$take_args --take $k"; done
         fi
         # shellcheck disable=SC2086
-        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args; then
+        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args </dev/null; then
             return 0
         fi
         warn "the daemon could not fold the enrollment in — placing the new config instead, the old one kept as $target.prev"
@@ -807,6 +844,7 @@ install_daemon_macos() {
     url="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' browser_download_url)"
     digest="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' digest)"
     [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest roomlerd release" >&2; exit 1; }
+    name_release "$releases" 'aarch64-apple-darwin[^"]*\.pkg'
     pkg="$STAGE/roomlerd.pkg"
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
@@ -821,8 +859,20 @@ install_daemon_macos() {
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"
+        if [ "$ONE_ROW" = 1 ]; then
+            say "download-only: would run: sudo touch $MACOS_DAEMON_MARKER"
+            say "download-only: would run: sudo $daemon_bin --config $MACOS_DAEMON_CONFIG enroll --server $SERVER $(enroll_cred_hint) --name $NAME --overlay --one-row"
+            say "download-only: would run the package again: its guard removes the per-user LaunchAgent and starts the root half"
+            return 0
+        fi
         say "download-only: would run: $daemon_bin enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
         [ -n "$DAEMON_TOKEN" ] && say "download-only: would also enroll the privileged half at $MACOS_DAEMON_CONFIG"
+        return 0
+    fi
+
+    # FR-43 P3d — one token, one row: a sequence of its own.
+    if [ "$ONE_ROW" = 1 ]; then
+        install_macos_one_row "$pkg" "$daemon_bin"
         return 0
     fi
 
@@ -926,12 +976,116 @@ install_macos_privileged_half() {
         # root LaunchDaemon is the `system` scope.
         # shellcheck disable=SC2046
         as_root $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
-            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay
+            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay </dev/null
     fi
 
     say "starting the privileged half"
     as_root launchctl kickstart -k system/com.roomler.daemon 2>/dev/null \
         || warn "launchctl kickstart failed for the daemon — it will start at next boot"
+}
+
+# Whether the root half's config sets KEY = true, read the way the package's
+# postinstall guard reads it.
+root_config_says() {
+    as_root grep -qE "^[[:space:]]*$1[[:space:]]*=[[:space:]]*true" "$MACOS_DAEMON_CONFIG"
+}
+
+# FR-43 P3d — `--one-row`: one token, one device row. The root half alone holds
+# the enrollment and runs the overlay, and it serves the person's screen through
+# a worker it starts in their login session, which holds no enrollment
+# (`macos_one_row`). The order is what makes it one command:
+#   1. the package, run as a per-user install runs it, so the LaunchAgent comes
+#      up as it always has;
+#   2. the marker, and the root half enrolled with the overlay on and both
+#      switches (`enroll --one-row`);
+#   3. the package again. Its postinstall's guard (P2d) reads the switch from
+#      the root half's config, removes the LaunchAgent and its plist, and starts
+#      the root half, which then owns the worker.
+# The guard decides here as it does at every update after, so the installer and
+# the daemon cannot disagree about who owns the worker. The marker waits for
+# step 2: a release without `enroll --one-row` then stops the install with no
+# root half requested and the token unspent.
+install_macos_one_row() {
+    pkg="$1"; daemon_bin="$2"
+    # A Mac whose root half is enrolled already. One row: this run only updates
+    # the package. A row of its own: making it one row is the migration's (P3c),
+    # which says its plan, keeps a copy of each file it changes and can put the
+    # Mac back. Enrolling over it here would leave both rows.
+    one_row_already=0
+    if as_root test -f "$MACOS_DAEMON_CONFIG"; then
+        if root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then
+            one_row_already=1
+        else
+            echo "error: this Mac's root half is enrolled already ($MACOS_DAEMON_CONFIG), as a row of its own. --one-row installs a Mac that is not enrolled yet; to make this one one row, run: sudo roomlerd one-row (it says its plan and asks first, and --revert puts the Mac back). Nothing was changed, and the token is not spent." >&2
+            exit 1
+        fi
+    elif [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; then
+        echo "error: --one-row enrolls this Mac's root half as its one row: pass --token <enrollment-jwt> or --pair" >&2
+        exit 1
+    fi
+
+    if [ "$one_row_already" = 1 ]; then
+        say "this Mac is one row already: the package updates, and its enrollment stays${TOKEN:+ (the token is not used)}"
+        # The marker is part of the one row: without it the package would
+        # remove the root half and put the LaunchAgent back.
+        as_root mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+        as_root touch "$MACOS_DAEMON_MARKER"
+    fi
+    say "installing roomlerd (.pkg — sudo required)"
+    as_root installer -pkg "$pkg" -target /
+    [ -x "$daemon_bin" ] || {
+        echo "error: the package did not install $daemon_bin" >&2
+        exit 1
+    }
+    if [ "$one_row_already" = 1 ]; then
+        macos_permissions_notice
+        return 0
+    fi
+
+    # A release from before P3d refuses the flag. Asked before the marker and
+    # before the token is spent, so the Mac keeps only the package.
+    if ! "$daemon_bin" enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'; then
+        echo "error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
+        exit 1
+    fi
+
+    say "requesting the root half (root LaunchDaemon: it holds this Mac's one row and runs the overlay)"
+    as_root mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+    as_root touch "$MACOS_DAEMON_MARKER"
+
+    if [ "$PAIR" = 1 ]; then
+        say "pairing this Mac as '$NAME' with $SERVER, as its one row, overlay on — open the page below and type the code"
+        set -- --pair --server "$SERVER" --name "$NAME"
+        [ -z "$PAIR_ORG" ] || set -- "$@" --pair-org "$PAIR_ORG"
+    else
+        say "enrolling this Mac as '$NAME' against $SERVER, as its one row, overlay on (token is single-use, never echoed)"
+        set -- --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    fi
+    # stdin is /dev/null for the reason enroll_daemon gives: under `curl … | sh`
+    # it is the rest of this script. The trace's scope is `system`: the row is
+    # a root LaunchDaemon's.
+    # shellcheck disable=SC2046
+    if ! as_root $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
+        enroll "$@" --overlay --one-row </dev/null; then
+        echo "error: not enrolled (see above), so this Mac has no row yet. Run this again with a new token, or --pair, and --one-row." >&2
+        exit 1
+    fi
+
+    say "installing the package again: its guard reads the switch, removes the per-user LaunchAgent and starts the root half"
+    if ! as_root installer -pkg "$pkg" -target /; then
+        echo "error: the root half is enrolled as this Mac's one row, but the package did not run again, so the per-user LaunchAgent may still hold the screen. Run this again with --one-row and no token: the Mac is one row already, so it only installs the package." >&2
+        exit 1
+    fi
+
+    # A person's own enrollment from an earlier install: a one-row Mac ignores
+    # it, and nothing runs it any more.
+    person_config="$(home_of "$CONSOLE_USER")/Library/Application Support/live.roomler.roomler/config.toml"
+    if as_root grep -qE '^[[:space:]]*agent_id[[:space:]]*=[[:space:]]*"[^"]' "$person_config" 2>/dev/null; then
+        say "NOTE: '$CONSOLE_USER' also has an enrollment of their own here, from an earlier"
+        say "      install. A one-row Mac ignores it and nothing runs it any more, so its row"
+        say "      stays offline: delete that row in the dashboard (Devices)."
+    fi
+    macos_permissions_notice
 }
 
 # macOS grants these two by hand, per binary, and never errors when they are
@@ -954,7 +1108,13 @@ macos_permissions_notice() {
     say "remote keyboard and mouse do nothing. Neither reports an error. The 'Roomler'"
     say "entry is the menu-bar app, not roomlerd. macOS applies Screen Recording only"
     say "after roomlerd restarts:"
-    say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+    if [ "$ONE_ROW" = 1 ]; then
+        # FR-43 P3d — a one-row Mac has no LaunchAgent. The root half starts the
+        # worker, and a worker never outlives it, so its restart starts a fresh one.
+        say "  sudo launchctl kickstart -k system/com.roomler.daemon"
+    else
+        say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+    fi
 }
 
 # FR-102 — the install trace: tell the server HOW this install happened, so
@@ -1024,7 +1184,7 @@ enroll_daemon() {
     # env + two VAR=value words, binary + --config + path), none of which
     # contain whitespace.
     # shellcheck disable=SC2086
-    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME" </dev/null
 }
 
 # ─── tunnel role ────────────────────────────────────────────────────────────
@@ -1096,7 +1256,7 @@ install_tunnel_macos() {
 # for another architecture, or one missing a library, is on PATH too.
 tunnel_cli_runs() {
     cli="$(command -v roomler || true)"
-    [ -n "$cli" ] && "$cli" --version >/dev/null 2>&1
+    [ -n "$cli" ] && "$cli" --version </dev/null >/dev/null 2>&1
 }
 
 # #2472 — never say "done" with nothing installed.
@@ -1105,7 +1265,7 @@ require_tunnel_cli() {
         echo "error: the roomler CLI did not install: no working \`roomler\` on PATH" >&2
         exit 1
     fi
-    say "installed: $(roomler --version 2>/dev/null | head -n 1)"
+    say "installed: $(printable_version "$(roomler --version </dev/null 2>/dev/null | head -n 1)" 'roomler ')"
 }
 
 install_tunnel_tarball() {
@@ -1140,7 +1300,7 @@ enroll_tunnel() {
         return 0
     fi
     say "enrolling this tunnel client as '$NAME' against $SERVER (token is single-use, never echoed)"
-    "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME" </dev/null
 }
 
 # FR-93 P6d — the tool that installs a local .rpm and resolves its
@@ -1855,6 +2015,99 @@ uninstall_finish() {
     exit 0
 }
 
+# #3881 — the release the download came from, as the server's feed names it,
+# and the installed daemon's own --version: information for the person and for
+# the labs that read this output. The feed's tag and the binary's answer are
+# printed only when they fit a small alphabet and 64 characters, and in fixed
+# words otherwise, so neither can write terminal control. Nothing here changes
+# a command the script runs or its exit code.
+fits_alphabet() {
+    case "$1" in
+        '' | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+say_unreadable() {
+    say "$1: unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
+}
+
+# The release that holds the asset the download takes: asset_field_for takes
+# the first asset over the WHOLE feed whose name matches $2, so when the newest
+# release lacks this host's file, an older release's is downloaded and named.
+# The asset is found in the caller's locale, as asset_field_for finds it; the
+# climb to its release's line runs in the C locale (where no byte hides a line)
+# and passes over asset lines (a name, then a URL) only. A line that does not
+# start with "tag_name" and close its quote is unreadable, never another's tag.
+name_release() {
+    RELEASE_TAG=""
+    nr_tag=""
+    nr_line="$(tr '{' '\n' < "$1" \
+        | grep -n '"name":"[^"]*'"$2"'"' \
+        | grep '"browser_download_url":"[^"]*"' \
+        | head -n 1 | cut -d: -f1)" || nr_line=""
+    if [ -n "$nr_line" ] && [ "$nr_line" -gt 1 ]; then
+        nr_tag="$(LC_ALL=C; export LC_ALL; tr '{' '\n' < "$1" \
+            | head -n "$((nr_line - 1))" \
+            | grep -v '^"name":"[^"]*","browser_download_url":"' \
+            | tail -n 1 \
+            | sed -n 's/^"tag_name":"\([^"]*\)".*/\1/p')" || nr_tag=""
+    fi
+    if fits_alphabet "$nr_tag"; then
+        RELEASE_TAG="$nr_tag"
+        say "release named by the server's feed: $nr_tag"
+    else
+        say_unreadable "release named by the server's feed"
+    fi
+}
+
+# After an install, the installed daemon's own --version, with stdin from
+# /dev/null (in the one-liner, stdin is the rest of this script). Download-only
+# installs nothing; the tunnel role's CLI names itself (require_tunnel_cli).
+report_installed_version() {
+    if [ "$ROLE" != daemon ]; then
+        return 0
+    fi
+    if [ "$DOWNLOAD_ONLY" = 1 ]; then
+        say "installed daemon's own --version: none (download-only installs nothing)"
+        return 0
+    fi
+    riv_bin=/usr/bin/roomlerd
+    if [ "$OS" = Darwin ]; then
+        riv_bin="$MACOS_DAEMON_BIN"
+    fi
+    riv_rc=0
+    riv_out="$("$riv_bin" --version </dev/null 2>/dev/null)" || riv_rc=$?
+    if [ "$riv_rc" != 0 ]; then
+        say "installed daemon's own --version: no answer ($riv_bin --version exited $riv_rc)"
+    elif [ -z "$riv_out" ]; then
+        say "installed daemon's own --version: no answer ($riv_bin --version printed nothing)"
+    else
+        riv_ver="$(printf '%s\n' "$riv_out" | head -n 1)" || riv_ver=""
+        riv_ver="${riv_ver#roomlerd }"
+        if fits_alphabet "$riv_ver"; then
+            say "installed daemon's own --version: $riv_ver"
+            if [ -n "${RELEASE_TAG:-}" ] && [ "${RELEASE_TAG#agent-v}" != "$riv_ver" ]; then
+                say "NOTE: the installed daemon's $riv_ver differs from the release this script resolved, $RELEASE_TAG"
+            fi
+        else
+            say_unreadable "installed daemon's own --version"
+        fi
+    fi
+}
+
+# #3919 — a version a binary printed, for the lines that name one elsewhere (a
+# running per-user daemon's, the tunnel CLI's): as it came when it fits the
+# alphabet (once a leading $2, if given, is set aside), fixed words otherwise.
+# Only what is printed passes here: comparisons use the answers as they came.
+printable_version() {
+    if fits_alphabet "${1#"${2:-}"}"; then
+        printf '%s\n' "$1"
+    else
+        printf '%s\n' "a version that is unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
+    fi
+}
+
 # ─── main ───────────────────────────────────────────────────────────────────
 
 if [ "$UNINSTALL" = 1 ]; then
@@ -1901,4 +2154,5 @@ if [ "$PRIV_STEPS" = 1 ]; then
     fi
 fi
 
+report_installed_version
 say "done."

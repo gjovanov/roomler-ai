@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useAuthStore } from './auth'
 import { useRoomStore } from './rooms'
 import { useMessageStore } from './messages'
@@ -406,6 +406,28 @@ export const useWsStore = defineStore('ws', () => {
     })
   }
 
+  /**
+   * This socket's connection id, waiting up to `timeoutMs` for the `connected`
+   * frame that brings it. Null when none came in time. A redial clears the id
+   * and the next socket's frame brings a new one, which is the one returned.
+   */
+  function waitForConnectionId(timeoutMs: number): Promise<string | null> {
+    if (connectionId.value) return Promise.resolve(connectionId.value)
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const stop = watch(connectionId, (cid) => {
+        if (!cid) return
+        clearTimeout(timer)
+        stop()
+        resolve(cid)
+      })
+      timer = setTimeout(() => {
+        stop()
+        resolve(null)
+      }, timeoutMs)
+    })
+  }
+
   /** Register a persistent handler for a media message type. */
   function onMediaMessage(type: string, handler: MediaMessageHandler) {
     mediaHandlers.set(type, handler)
@@ -492,6 +514,7 @@ export const useWsStore = defineStore('ws', () => {
     sendRaw,
     sendTyping,
     waitForMessage,
+    waitForConnectionId,
     onMediaMessage,
     offMediaMessage,
     onRcMessage,

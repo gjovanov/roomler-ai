@@ -457,10 +457,10 @@ mod windows {
         let token = token?;
         // SAFETY: a live WTSQueryUserToken token, held for the call.
         let roaming = unsafe { companion_spawn::roaming_app_data_for_token(token.raw()) }?;
-        let path = roaming
-            .join("roomler")
-            .join("roomler")
-            .join("config")
+        // #3747: the tree the console user's own processes pick. A config read
+        // needs no local data folder: those decide only where neither tree
+        // holds a config folder, and then neither holds a `config.toml`.
+        let path = roomler_node_core::appdirs::config_dir_in_profile(&roaming, None, Path::exists)
             .join("config.toml");
         crate::config::read_if_present(&path)
     }

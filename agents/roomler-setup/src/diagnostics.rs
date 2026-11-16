@@ -315,15 +315,6 @@ pub fn cancel_requested() -> bool {
     crate::CANCEL_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Close the open diagnostics step as failed with `code` — or cancelled,
-/// when the cancel flag is what failed it — and hand the message back
-/// unchanged, so an orchestrator's error site reads `Err(failed(code, msg))`
-/// and its message to the operator is exactly what it was.
-pub fn failed(code: ErrorCode, message: String) -> String {
-    Diagnostics::global().fail(code, cancel_requested());
-    message
-}
-
 /// Which code an enroll error is: a failure to get an answer (a
 /// `reqwest::Error` anywhere in the chain — a refused connection, a
 /// timeout, a TLS failure, an unreadable answer) is `enroll_network`; a

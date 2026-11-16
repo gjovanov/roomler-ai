@@ -13,7 +13,7 @@ use roomler_ai_remote_control::models::{
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::{ClientMsg, TransferDirection, Transfers};
-use roomler_core::{AgentCtx, AgentMsgHandler};
+use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
 use tracing::{debug, warn};
 
 use crate::RemoteState;
@@ -50,6 +50,7 @@ impl AgentMsgHandler for RemoteAgentSocket {
                 transfers,
                 carrier,
                 decode_errors,
+                video,
             } => {
                 let sid = ObjectId::parse_str(&session_id).ok();
                 // FR-101 P3 — an audit, not a statistic: kept whether or not
@@ -80,10 +81,14 @@ impl AgentMsgHandler for RemoteAgentSocket {
                     let carrier = carrier
                         .as_deref()
                         .and_then(roomler_ai_remote_control::models::session_carrier_label);
+                    // FR-132 P1d — likewise: a reading that is not short
+                    // lowercase names is dropped, and the row keeps its last.
+                    let video =
+                        video.and_then(roomler_ai_remote_control::models::SessionVideo::checked);
                     if let Err(e) = self
                         .state
                         .remote_sessions
-                        .merge_live_stats(sid, ctx.agent_id, &stats, carrier)
+                        .merge_live_stats(sid, ctx.agent_id, &stats, carrier, video.as_ref())
                         .await
                     {
                         debug!(agent = %ctx.agent_id, %e, "session stats merge failed");
@@ -143,6 +148,36 @@ impl AgentMsgHandler for RemoteAgentSocket {
                     debug!(agent = %ctx.agent_id, %attempt_id, "extauth: outcome for no waiting step");
                 }
                 None
+            }
+            // FR-138 P1b-2 — the device's own end of a session no hub here
+            // holds, which this connection's registration ended without
+            // seeing its end (it ended at the device during the gap): its
+            // reason replaces the inferred one (`resume::device_end`).
+            // Anything else reaches the Hub's dispatch as before, and only a
+            // connection announced a window ever gets here.
+            ClientMsg::Terminate {
+                session_id,
+                reason,
+                limit,
+            } if ctx.resume.window_secs > 0
+                && self
+                    .state
+                    .fleet
+                    .rc_hub
+                    .session_snapshot(session_id)
+                    .is_none() =>
+            {
+                if crate::resume::device_end(&self.state, ctx, session_id, reason, limit.as_deref())
+                    .await
+                {
+                    None
+                } else {
+                    Some(ClientMsg::Terminate {
+                        session_id,
+                        reason,
+                        limit,
+                    })
+                }
             }
             other => Some(other),
         }
@@ -404,5 +439,32 @@ impl RemoteAgentSocket {
             // Best-effort, like every activity log: never gates the session.
             debug!(agent = %ctx.agent_id, %e, "transfer activity write failed");
         }
+    }
+}
+
+/// FR-138 — `remote`'s half of the agent socket's lifecycle: at the hello,
+/// before the socket's read loop starts, the device's claims on the sessions
+/// it kept and the registration read ([`crate::resume`]). Nothing for a
+/// connection announced no window.
+pub struct RemoteAgentLifecycle {
+    state: RemoteState,
+}
+
+impl RemoteAgentLifecycle {
+    pub fn new(state: RemoteState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentSocketLifecycle for RemoteAgentLifecycle {
+    async fn hello(&self, ctx: &AgentCtx) {
+        crate::resume::on_hello(&self.state, ctx).await;
+    }
+
+    /// P1b-2 — what this connection's registration ended is no longer its
+    /// to replace.
+    async fn closing(&self, ctx: &AgentCtx) {
+        crate::resume::forget_connection(&self.state, ctx);
     }
 }

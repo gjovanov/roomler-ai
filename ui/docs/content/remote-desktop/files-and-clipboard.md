@@ -26,17 +26,29 @@ follow you.
 
 ## File transfer
 
-Drag a file onto the session window to send it to the remote machine, or use the
-session toolbar's transfer panel to pull one back.
+Drag files or a whole folder onto the session window to send them to the remote
+machine, or open **Remote files** from the session toolbar to pull one back.
 
 :::badges
-- **Resumable** icon:download — a transfer that is interrupted picks up where it stopped rather than starting again.
+- **Resumable** icon:download — an upload that is interrupted picks up where it stopped rather than starting again.
 - **Direct** icon:network — bytes ride the same peer-to-peer channel as the video, so the server never holds the file.
 - **Both directions** icon:copy — send and retrieve within one session.
 :::
 
-Progress is shown per transfer, and a transfer continues while you keep working
-in the session.
+A folder arrives as itself. Drop `Reports`, which holds `q3.pdf` and a subfolder
+`old` with `q2.pdf`, and the remote machine gets `Reports/q3.pdf` and
+`Reports/old/q2.pdf`. An empty subfolder is not created there, and hidden files
+(names that start with a dot) stay behind.
+
+Each transfer has a row in the session toolbar's transfers list, and a transfer
+continues while you keep working in the session. A row's percentage counts what
+has reached the other end, so while a transfer runs it only moves forward. If an
+upload has to reconnect, it goes on from what the remote machine kept, and its
+row shows that point. **Cancel** on a row stops that transfer, in either
+direction, and the row reads **Cancelled**. A file you stop sending never shows
+up half-written in the folder: what arrived is kept aside in a hidden
+`.roomler-partial` folder, which Roomler clears of anything older than a day
+when it starts.
 
 ## What the far end sees
 
@@ -46,10 +58,20 @@ machine's screen**, unless its owner chose another folder (the desktop app's
 numbered copy instead of replacing it.
 
 :::tip Nobody at the screen
-On a machine whose agent runs as a system service, with nobody signed in at the
-screen, a file lands in the service's own folder instead. On Linux, a file sent
-while someone is signed in at the screen belongs to them, exactly as if they had
-saved it themselves.
+On a machine whose agent runs as a system service, on Windows or on Linux, file
+transfer acts as the person signed in at the screen: a file you send belongs to
+them, exactly as if they had saved it themselves, and you can pull back or
+browse only what they may open. With nobody signed in at the screen, pulling
+back and browsing are refused, and the session says why. On Windows sending is
+refused too; on Linux the file lands in the service's own Downloads folder,
+`/root/Downloads` (older agents used `/tmp`), where only the service may read
+it, never in a folder you chose or the one the machine's owner set. If the person at the screen signs out while you pull back a folder,
+the download stops and says why. If the machine cannot tell who is at the
+screen just then, the session says so: try again.
+
+On a Linux server where nobody signs in at the screen, its administrator can
+turn this off for that one machine. File transfer there then works with the
+service's own rights.
 :::
 
 ## When you want a file path rather than a session

@@ -12,8 +12,13 @@ use axum::{
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::models::{AccessPolicy, AgentStatus, InstallInfo, OsKind};
-use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_remote_control::models::{
+    AccessPolicy, Agent, AgentStatus, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind,
+    PeerRelayPolicy, SshPolicy,
+};
+use roomler_ai_services::auth::{AgentEnrollment, EnrollmentCredential, SpendPurpose};
+use roomler_ai_services::dao::base::{DaoError, PaginationParams};
+use roomler_ai_services::dao::tenant::TenantDao;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +31,7 @@ use crate::FleetState;
 pub(crate) const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 
 /// Require a `role::permissions` bit for `user_id` in `tenant_id`. Doubles as
-/// the membership check — `get_member_permissions` returns `Forbidden` for a
+/// the membership check — `get_member_permissions` answers `NotAMember` for a
 /// non-member. `owner` always passes via the `ADMINISTRATOR` bypass in `has`.
 ///
 /// `pub(crate)` so the sibling device-management surfaces in the same subsystem
@@ -86,6 +91,141 @@ impl EnrollmentTokenRequest {
     }
 }
 
+/// What an archived org answers at every door an enrollment comes through.
+pub const ARCHIVED_ORG_REFUSES_ENROLLMENT: &str =
+    "This organization is archived and accepts no device enrollments";
+
+/// An archived org accepts no devices — including back into an existing row,
+/// which is what makes archiving a throwaway org actually final
+/// (`routes::tenant::archive`). #3042: one check, for a daemon and a tunnel client
+/// alike, at the routes that enroll and the routes that mint a token for them.
+///
+/// A tenant that is gone answers as it always has: enrollment is what would
+/// surface that, and it has its own answer. A failed read refuses: an org that
+/// cannot be shown to be open enrolls nothing, and the token stays unspent.
+pub async fn org_accepts_enrollment(tenants: &TenantDao, tid: ObjectId) -> Result<(), ApiError> {
+    match tenants.base.find_by_id(tid).await {
+        Ok(t) if t.is_archived => Err(ApiError::Forbidden(
+            ARCHIVED_ORG_REFUSES_ENROLLMENT.to_string(),
+        )),
+        Ok(_) | Err(DaoError::NotFound) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// What the enroll and anchor routes answer for a single-use enrollment token
+/// whose issuer may no longer enroll devices in its org ([`issuer_may_enroll`]).
+pub const TOKEN_ISSUER_CANNOT_ENROLL: &str = "This enrollment token was issued by someone who no \
+     longer manages this organization's devices, so it cannot be used. Ask someone who manages \
+     the organization's devices for a new enrollment token.";
+
+/// What the enroll route answers for such an ephemeral enrollment key.
+pub const KEY_ISSUER_CANNOT_ENROLL: &str = "This enrollment key was minted by someone who no \
+     longer manages this organization's devices, so it enrolls nothing. Mint a new key from an \
+     account that manages the organization's devices.";
+
+/// Why a credential's issuer may no longer enroll devices in its org. It goes
+/// on the log line, never to the holder: one sentence answers both, so the
+/// credential tells whoever holds it nothing more about its issuer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssuerLost {
+    /// No longer a member of the org: removed, or left.
+    Membership,
+    /// Still a member, without `MANAGE_AGENTS`: a role taken away, or a
+    /// role's bits edited.
+    Permission,
+}
+
+impl IssuerLost {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            IssuerLost::Membership => "not_a_member",
+            IssuerLost::Permission => "no_permission",
+        }
+    }
+}
+
+/// An enrollment credential acts for the person who minted it (its `sub`):
+/// the device it enrolls is theirs, and an anchor records them. So each use
+/// asks again what its mint asked, whether that person may enroll devices in
+/// the org: [`require_permission`] with `MANAGE_AGENTS`, which the org's
+/// owner and an `ADMINISTRATOR` role pass, and which nobody passes outside the
+/// org.
+///
+/// `Ok(None)`: they may. `Ok(Some(why))`: they may not, and the caller
+/// refuses with a plain `Forbidden`, never `NotAMember` (the code a page
+/// leaves the org on: these doors are a device's), before it spends or
+/// claims anything. `Err`: the read failed, a 500 that spends nothing either,
+/// so the caller can retry.
+pub(crate) async fn issuer_may_enroll(
+    state: &FleetState,
+    tid: ObjectId,
+    issuer: ObjectId,
+) -> Result<Option<IssuerLost>, ApiError> {
+    match require_permission(
+        state,
+        tid,
+        issuer,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await
+    {
+        Ok(()) => Ok(None),
+        Err(ApiError::NotAMember) => Ok(Some(IssuerLost::Membership)),
+        Err(ApiError::Forbidden(_)) => Ok(Some(IssuerLost::Permission)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The refusal of an enrollment whose credential's issuer may no longer
+/// enroll devices in the org ([`issuer_may_enroll`]).
+///
+/// A key whose minter is no longer a member is also revoked here, the way the
+/// membership's end revokes their keys (`crate::membership`): this is a key
+/// that end did not reach (a removal from before the hook, or one whose write
+/// failed), and revoking it keeps a later re-add from bringing it back. A
+/// failed revoke is logged; the refusal stands either way. A key whose minter
+/// only lost the permission is not revoked: it works again if they regain it.
+async fn refuse_lost_issuer(
+    state: &FleetState,
+    tid: ObjectId,
+    issuer: ObjectId,
+    lost: IssuerLost,
+    credential: &EnrollmentCredential,
+) -> ApiError {
+    let jti = credential.claims().jti.as_str();
+    let EnrollmentCredential::EphemeralKey(_) = credential else {
+        tracing::info!(
+            tenant_id = %tid, %issuer, jti, reason = lost.as_str(),
+            "enroll: refused: the token's issuer may no longer enroll devices here"
+        );
+        return ApiError::Forbidden(TOKEN_ISSUER_CANNOT_ENROLL.to_string());
+    };
+    tracing::info!(
+        tenant_id = %tid, %issuer, jti, reason = lost.as_str(),
+        "fr-51: ephemeral enrollment key refused: its minter may no longer enroll devices here"
+    );
+    if lost == IssuerLost::Membership {
+        match state
+            .enrollment_keys
+            .revoke_minted_by(tid, issuer, Some(jti))
+            .await
+        {
+            Ok(0) => {}
+            Ok(_) => tracing::warn!(
+                tenant = %tid, user = %issuer, jti, reason = "minter_not_a_member",
+                "fr-51: ephemeral enrollment key revoked"
+            ),
+            Err(e) => tracing::error!(
+                tenant = %tid, user = %issuer, jti, %e, alert = crate::membership::ALERT,
+                "fr-51: could not revoke the key of a minter who is no longer a member"
+            ),
+        }
+    }
+    ApiError::Forbidden(KEY_ISSUER_CANNOT_ENROLL.to_string())
+}
+
 /// POST /api/tenant/{tenant_id}/agent/enroll-token — admin issues an enrollment
 /// token that a new agent binary exchanges (once, within 10 min) for a
 /// long-lived agent token.
@@ -107,6 +247,7 @@ pub async fn issue_enrollment_token(
         "MANAGE_AGENTS",
     )
     .await?;
+    org_accepts_enrollment(&state.tenants, tid).await?;
 
     let anchor = EnrollmentTokenRequest::from_body(&headers, &body)?.anchor;
     let (token, jti) =
@@ -174,6 +315,10 @@ pub struct EnrollResponse {
 /// enrollment token instead. Creates or rehydrates the Agent row and returns
 /// a long-lived agent JWT.
 ///
+/// The enrollment acts for the person who minted the credential: a new row is
+/// theirs. So it proceeds only while they may still enroll devices in the org
+/// ([`issuer_may_enroll`], 403 otherwise, before anything is spent).
+///
 /// FR-51 P2 — the SAME route also accepts an ephemeral enrollment KEY
 /// (`TokenType::EphemeralEnrollment`); which path runs is decided by the
 /// CREDENTIAL's audience, never by anything in the request body (a body that
@@ -183,40 +328,47 @@ pub async fn enroll_agent(
     State(state): State<FleetState>,
     Json(body): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, ApiError> {
-    let (claims, is_ephemeral) = state
+    let credential = state
         .auth
         .verify_enrollment_token_any(&body.enrollment_token)?;
+    let claims = credential.claims();
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
-    // An archived org accepts no devices — including back into an existing
-    // row, which is what makes archiving a throwaway org actually final
-    // (`routes::tenant::archive`). Checked before the single-use claim so a
-    // refused enrollment does not also burn the token.
-    if state
-        .tenants
-        .base
-        .find_by_id(tid)
-        .await
-        .map(|t| t.is_archived)
-        .unwrap_or(false)
-    {
-        return Err(ApiError::Forbidden(
-            "This organization is archived and accepts no device enrollments".to_string(),
-        ));
+    // Checked before the single-use claim so a refused enrollment does not also
+    // burn the token.
+    org_accepts_enrollment(&state.tenants, tid).await?;
+
+    // The credential acts for the person who minted it, so it enrolls only
+    // while they may still enroll devices in this org. Before the token's
+    // spend and the key's claim: a refusal costs the credential nothing.
+    //
+    // Nothing is asked again after the write. Devices a person enrolled stay
+    // theirs when they leave the org, so an enrollment that passed here just
+    // before a removal ends like one that finished before it; and the key's
+    // claim filter (`revoked_at: null`) arbitrates with the removal's revoke
+    // on the key row itself.
+    if let Some(lost) = issuer_may_enroll(&state, tid, admin_uid).await? {
+        return Err(refuse_lost_issuer(&state, tid, admin_uid, lost, &credential).await);
     }
 
-    if is_ephemeral {
-        return enroll_agent_ephemeral(&state, tid, admin_uid, &claims.jti, body).await;
-    }
+    // #3328 — a single-use token arrives UNSPENT: it reads claims and mints
+    // nothing until the spend below. An ephemeral key's row decides each of
+    // its uses instead.
+    let token = match credential {
+        EnrollmentCredential::SingleUse(token) => token,
+        EnrollmentCredential::EphemeralKey(claims) => {
+            return enroll_agent_ephemeral(&state, tid, admin_uid, &claims.jti, body).await;
+        }
+    };
 
-    // If a row already exists for (tenant_id, machine_id), rehydrate it —
-    // refresh name / os / agent_version, clear `deleted_at` if soft-deleted,
-    // and re-issue a token against the same _id. The unique index on
-    // (tenant_id, machine_id) covers soft-deleted rows too, so we must look
-    // them up *including* tombstones and revive in place rather than create.
+    // A row for (tenant_id, machine_id) is reused whatever its state: the
+    // unique index on the pair covers soft-deleted rows too, so the lookup
+    // takes tombstones and the row comes back in place rather than a second
+    // one being made. A LIVE row is refreshed and keeps everything; a REMOVED
+    // one comes back as a new device (`enroll_row`).
     let existing = state
         .agents
         .find_by_tenant_and_machine(tid, &body.machine_id)
@@ -244,64 +396,27 @@ pub async fn enroll_agent(
     }
 
     // Enrollment tokens are single-use BY DESIGN and were never enforced —
-    // field 2026-08-05 replayed one after a cap rejection. Claimed on BOTH
+    // field 2026-08-05 replayed one after a cap rejection. Spent on BOTH
     // branches: a replay against a KNOWN machine still mints a fresh agent
     // JWT, which is the credential worth protecting.
     //
-    // The claim fails CLOSED (see `UsedTokenDao::claim`), and the two failures
+    // The spend fails CLOSED (see `UsedTokenDao::claim`), and the two failures
     // are reported differently on purpose: "already used" sends an operator
     // looking for a replay, so a ledger that merely could not answer must not
     // borrow that phrasing. It gets a 503 the caller can retry — the token is
-    // still valid for the rest of its 10 minutes.
-    state
+    // still valid for the rest of its 10 minutes (`From<SpendRefusal>`).
+    let spent = state
         .used_tokens
-        .claim(&claims.jti, "agent-enroll")
-        .await
-        .map_err(|e| match e {
-            roomler_ai_services::dao::base::DaoError::Validation(_) => {
-                ApiError::Unauthorized("This enrollment token has already been used".into())
-            }
-            _ => ApiError::ServiceUnavailable(
-                "Could not verify this enrollment token is unused; please retry".into(),
-            ),
-        })?;
+        .spend(token, SpendPurpose::AgentEnroll)
+        .await?;
+    let claims = spent.claims();
 
     // FR-102 P3 — the request's install claim, clamped to the vocabulary. A
-    // known row keeps what it has unless this request says (a re-enroll by
-    // an older agent must not downgrade it); a new row records `unknown`
-    // when nothing was said.
+    // live row keeps what it has unless this request says (a re-enroll by an
+    // older agent must not downgrade it); a new or revived row records
+    // `unknown` when nothing was said.
     let install = body.install.as_ref().map(InstallInfo::clamped);
-    let agent = match existing {
-        Some(a) => {
-            let id =
-                a.id.ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
-            state
-                .agents
-                .rehydrate(
-                    id,
-                    &body.machine_name,
-                    body.os,
-                    &body.agent_version,
-                    install.as_ref(),
-                )
-                .await?
-        }
-        None => {
-            state
-                .agents
-                .create(
-                    tid,
-                    admin_uid,
-                    body.machine_name,
-                    body.machine_id,
-                    body.os,
-                    body.agent_version,
-                    String::new(), // agent_token_hash unused in JWT-only scheme
-                    install,
-                )
-                .await?
-        }
-    };
+    let agent = enroll_row(&state, tid, admin_uid, existing, &body, install).await?;
 
     let agent_id = agent
         .id
@@ -331,10 +446,11 @@ pub async fn enroll_agent(
     }
     // FR-103 — at the row's CURRENT generation. A row revived after a removal
     // has a higher one than before, so the token minted here is accepted and
-    // every token from before the removal is not.
+    // every token from before the removal is not. The mint takes the spent
+    // token itself (#3328): one spend, one credential.
     let agent_token = state.auth.issue_agent_token(
+        AgentEnrollment::Token(spent),
         agent_id,
-        tid,
         agent.token_gen,
         Some(state.settings.rc.agent_token_ttl_secs),
     )?;
@@ -345,6 +461,172 @@ pub async fn enroll_agent(
         agent_token,
         ephemeral: false,
     }))
+}
+
+/// How many times [`enroll_row`] reads a known machine's row again when it
+/// changed between the read and the write: a removal that landed meanwhile, or
+/// a second enrollment of the same machine id. Each round is a race of a few
+/// milliseconds between two admins acting on one machine; three is plenty.
+const ENROLL_ROUNDS: usize = 3;
+
+/// Create, refresh or revive the row for a single-use enrollment, by what the
+/// row IS when the write lands, not what it was when the route read it.
+///
+/// * No row: a new device ([`AgentDao::create`]). Only on the route's own
+///   read, the one the plan cap was checked against.
+/// * A live row: a device nobody removed enrolls again (a lost token, a
+///   reinstall). It is refreshed and keeps everything it was allowed
+///   ([`AgentDao::rehydrate`], live-only).
+/// * A removed row: the machine id of a device its org removed. It comes back
+///   as a NEW device ([`AgentDao::revive`], #3627): what the removed device was
+///   allowed stays with the removal. First the holders drop what they hold
+///   that names the removed device ([`HookRegistry::agent_revived`]: network
+///   takes it out of the org's tunnel policies and releases a lease the
+///   removal left), and a holder that cannot stops the enrollment.
+///
+/// A write that finds the row changed under it reads it again: a live
+/// refresh that meets a removal becomes a revive (#3328 closed the same race
+/// for tunnel clients), and a revive that meets a concurrent one refreshes the
+/// row that one made.
+///
+/// [`AgentDao::create`]: roomler_ai_services::dao::agent::AgentDao::create
+/// [`AgentDao::rehydrate`]: roomler_ai_services::dao::agent::AgentDao::rehydrate
+/// [`AgentDao::revive`]: roomler_ai_services::dao::agent::AgentDao::revive
+/// [`HookRegistry::agent_revived`]: roomler_core::hooks::HookRegistry::agent_revived
+async fn enroll_row(
+    state: &FleetState,
+    tid: ObjectId,
+    enroller: ObjectId,
+    existing: Option<Agent>,
+    body: &EnrollRequest,
+    install: Option<InstallInfo>,
+) -> Result<Agent, ApiError> {
+    let mut row = existing;
+    for round in 0..ENROLL_ROUNDS {
+        match row.take() {
+            None if round == 0 => {
+                return Ok(state
+                    .agents
+                    .create(
+                        tid,
+                        enroller,
+                        body.machine_name.clone(),
+                        body.machine_id.clone(),
+                        body.os,
+                        body.agent_version.clone(),
+                        String::new(), // agent_token_hash unused in JWT-only scheme
+                        install,
+                    )
+                    .await?);
+            }
+            // The row the route read is gone (only an ephemeral row is ever
+            // hard-deleted). A new one would skip the plan cap, so the device
+            // enrolls again from the start instead.
+            None => break,
+            Some(live) if live.deleted_at.is_none() => {
+                let id = live
+                    .id
+                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                match state
+                    .agents
+                    .rehydrate(
+                        id,
+                        &body.machine_name,
+                        body.os,
+                        &body.agent_version,
+                        install.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(agent) => return Ok(agent),
+                    // Removed after the read: decide again from the row as it is.
+                    Err(DaoError::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Some(removed) => {
+                let id = removed
+                    .id
+                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                if let Err(e) = state
+                    .hooks
+                    .agent_revived(tid, id, &removed.machine_id)
+                    .await
+                {
+                    tracing::error!(tenant = %tid, agent_id = %id, error = %e,
+                        "enroll: a removed device's grants could not be dropped; not reviving it");
+                    return Err(ApiError::ServiceUnavailable(
+                        "This device was removed and could not be enrolled again just now. \
+                         Retry with a new enrollment token."
+                            .to_string(),
+                    ));
+                }
+                if let Some(agent) = state
+                    .agents
+                    .revive(
+                        &removed,
+                        enroller,
+                        body.machine_name.clone(),
+                        body.os,
+                        body.agent_version.clone(),
+                        install.clone(),
+                    )
+                    .await?
+                {
+                    tracing::info!(
+                        tenant = %tid, agent_id = %id, removed_at = ?removed.deleted_at,
+                        previous_owner = %removed.owner_user_id, owner = %enroller,
+                        reset = ?grants_held(&removed),
+                        "enroll: a removed device enrolled again and starts from a new device's settings"
+                    );
+                    return Ok(agent);
+                }
+            }
+        }
+        row = state
+            .agents
+            .find_by_tenant_and_machine(tid, &body.machine_id)
+            .await?;
+    }
+    Err(ApiError::Conflict(
+        "This device's record changed while it enrolled (it was removed or enrolled again \
+         at the same moment). Enroll it again with a new enrollment token."
+            .to_string(),
+    ))
+}
+
+/// The grants a removed device still held, by name, for the line a revive
+/// logs: the trail of what the new device did NOT inherit. Informational only:
+/// [`AgentDao::revive`] replaces the whole row, so a grant this list misses is
+/// reset all the same. Names only, never a value (a connect code or an
+/// authorized key does not belong in a log).
+///
+/// [`AgentDao::revive`]: roomler_ai_services::dao::agent::AgentDao::revive
+fn grants_held(a: &Agent) -> Vec<&'static str> {
+    let access_default = serde_json::to_value(AccessPolicy::default()).ok();
+    [
+        ("ssh_policy", a.ssh_policy != SshPolicy::default()),
+        ("exec_policy", a.exec_policy != ExecPolicy::default()),
+        (
+            "access_policy",
+            serde_json::to_value(&a.access_policy).ok() != access_default,
+        ),
+        (
+            "peer_relay_policy",
+            a.peer_relay_policy != PeerRelayPolicy::default(),
+        ),
+        (
+            "external_access_policy",
+            a.external_access_policy != ExternalAccessPolicy::default(),
+        ),
+        ("connect_code", a.connect_code.is_some()),
+        ("desired_config", !a.desired_config.is_empty()),
+        ("routes", !a.routes.is_empty()),
+        ("key_rotation", a.key_rotation.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, held)| held.then_some(name))
+    .collect()
 }
 
 /// FR-51 P2 — the ephemeral-key enrollment path. Differs from the standard
@@ -393,8 +675,9 @@ async fn enroll_agent_ephemeral(
 
     // The atomic use-claim: not revoked, not expired, ceiling not reached,
     // counter bumped — one operation, so racing replicas cannot overshoot
-    // and a revocation lands on the very next use.
-    let Some(key) = state.enrollment_keys.claim_use(tid, jti).await? else {
+    // and a revocation lands on the very next use. It is this branch's
+    // redemption, and what the agent mint below takes (#3328).
+    let Some(used) = state.enrollment_keys.claim_use(tid, jti).await? else {
         let reason = state
             .enrollment_keys
             .refusal_reason(tid, jti)
@@ -407,6 +690,7 @@ async fn enroll_agent_ephemeral(
             reason.as_str()
         )));
     };
+    let key = used.key();
     let key_id = key
         .id
         .ok_or_else(|| ApiError::Internal("enrollment key missing _id".to_string()))?;
@@ -461,8 +745,8 @@ async fn enroll_agent_ephemeral(
     // FR-103 — at the row's generation. An ephemeral row is always new
     // (never rehydrated), so that is 0; reading it keeps the rule in one place.
     let agent_token = state.auth.issue_agent_token(
+        AgentEnrollment::EphemeralKey(used),
         agent_id,
-        tid,
         agent.token_gen,
         Some(state.settings.rc.agent_token_ttl_secs),
     )?;
@@ -507,7 +791,7 @@ pub async fn self_renew(
     }
     let agent = crate::auth_agent::authenticate_for_renewal(&state, &headers).await?;
     let ttl = state.settings.rc.agent_token_ttl_secs;
-    let agent_token = state.auth.issue_agent_token(
+    let agent_token = state.auth.renew_agent_token(
         agent.agent_id,
         agent.tenant_id,
         agent.agent.token_gen,
@@ -761,6 +1045,11 @@ pub struct KeyRotationView {
     pub request_id: String,
     pub requested_at: String,
     pub requested_by: String,
+    /// FR-40 P2 — set when the SERVER placed the order (`key_retired`: the
+    /// device presented a retired key at its join); `requested_by` is then
+    /// the zero id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
     /// P1c — the key the device held when the order was placed; the grid's
@@ -853,6 +1142,7 @@ fn key_rotation_view(
         request_id: req.request_id,
         requested_at: fmt_dt(req.requested_at),
         requested_by: req.requested_by.to_hex(),
+        trigger: req.trigger,
         delivered_at: req.delivered_at.map(fmt_dt),
         public_key_before: req.public_key_before,
         report: report.map(|r| KeyRotationReportView {
@@ -995,6 +1285,10 @@ pub struct DesiredConfigView {
     /// clear the device's key. Absent = not managed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zero_copy_deny: Option<String>,
+    /// FR-135 §7.1 — the media paths sent back to their old code, as pushed;
+    /// `""` is a request to clear the device's key. Absent = not managed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rc_media_legacy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1022,6 +1316,7 @@ impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigVie
             fps_deny: d.fps_deny,
             color_description: d.color_description,
             zero_copy_deny: d.zero_copy_deny,
+            rc_media_legacy: d.rc_media_legacy,
             updated_by: d.updated_by.map(|i| i.to_hex()),
             updated_at: d.updated_at.map(fmt_dt),
         }
@@ -1226,9 +1521,20 @@ pub async fn update_agent(
     // device is a 404 here, like a bogus id. The setters filter on the live
     // row as well, so a removal between this read and those writes cannot
     // land one on the tombstone either.
-    state.agents.find_live_in_tenant(tid, aid).await?;
-    // FR-90 P2c-4 — placement reads a device's tags and its owner.
-    let placement_inputs = body.owner_user_id.is_some() || body.tags.is_some();
+    let current = state.agents.find_live_in_tenant(tid, aid).await?;
+
+    // The access policy's role allow-list names roles of this org only. Checked
+    // before anything below writes, so a refused body changes nothing; an id
+    // the stored policy already names is accepted back (`require_org_roles`).
+    if let Some(policy) = &body.access_policy {
+        roomler_core::guards::require_org_roles(
+            &state,
+            tid,
+            &policy.allowed_role_ids,
+            &current.access_policy.allowed_role_ids,
+        )
+        .await?;
+    }
 
     if let Some(owner) = body.owner_user_id {
         let owner_id = ObjectId::parse_str(&owner)
@@ -1281,16 +1587,6 @@ pub async fn update_agent(
     if let Some(routes) = body.routes {
         let normalized = normalize_routes(routes)?;
         state.agents.update_routes(tid, aid, &normalized).await?;
-    }
-    // FR-90 P2c-4 — and where the org's sessions are copied is decided again,
-    // through the core hooks (hive's). Stored first, decided after: a failure
-    // is the caller's to see, and a retry decides again from what is stored.
-    if placement_inputs {
-        state
-            .hooks
-            .agent_updated(tid, aid)
-            .await
-            .map_err(|e| ApiError::Internal(format!("placement was not decided again: {e}")))?;
     }
 
     // Hand back the refreshed row so the UI can patch without a refetch —
@@ -1887,6 +2183,7 @@ mod key_rotation_state_tests {
             request_id: "r1".into(),
             requested_by: ObjectId::new(),
             requested_at: at,
+            trigger: None,
             delivered_at: delivered.then_some(at),
             public_key_before: before.map(str::to_string),
         }

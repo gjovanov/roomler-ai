@@ -152,7 +152,12 @@ export const SESSION_SUPPORTS_444: Record<CellCodec, boolean> = {
 }
 
 /** Map the two dropdowns onto the stored choice (the persisted, per-agent
- *  value the connect path already understands). Total: every pair maps. */
+ *  value the connect path already understands). Total, and every pair keeps
+ *  its chroma, except on AV1, which has one chroma in a session (#3651: HEVC
+ *  and H.264 with "Standard (4:2:0)" once collapsed into their plain value,
+ *  which follows the dial). The switches here and in `pickerFromChoice` have
+ *  no `default` on purpose: a codec or a choice added to its list without a
+ *  case fails the type check. */
 export function choiceFromPicker(codec: PickerCodec, chroma: PickerChroma): RcCodecChoice {
   switch (codec) {
     case 'auto':
@@ -160,18 +165,19 @@ export function choiceFromPicker(codec: PickerCodec, chroma: PickerChroma): RcCo
     case 'av1':
       return 'av1'
     case 'hevc':
-      return chroma === 'yuv444' ? 'hevc-444' : 'hevc'
+      return chroma === 'yuv444' ? 'hevc-444' : chroma === 'yuv420' ? 'hevc-420' : 'hevc'
     case 'vp9':
       return chroma === 'yuv444' ? 'vp9-444' : chroma === 'yuv420' ? 'vp9-420' : 'vp9'
     case 'h264':
-    default:
-      return chroma === 'yuv444' ? 'h264-444' : 'h264'
+      return chroma === 'yuv444' ? 'h264-444' : chroma === 'yuv420' ? 'h264-420' : 'h264'
   }
 }
 
 /** Reverse of `choiceFromPicker`: what the two dropdowns show for a stored
- *  choice. `hevc` / `av1` / `h264` read as chroma "auto" (they never carried
- *  one); `vp9-420` / `vp9-444` keep their explicit chroma. */
+ *  choice. A `-420` / `-444` choice keeps its explicit chroma. A plain codec
+ *  (`hevc`, `vp9`, `h264`, `auto`) reads as chroma "auto": it follows the
+ *  Priority dial, which is also what a plain `hevc` or `h264` stored before
+ *  #3651 still means. `av1` reads as "auto" because AV1 has one chroma. */
 export function pickerFromChoice(choice: RcCodecChoice): { codec: PickerCodec; chroma: PickerChroma } {
   switch (choice) {
     case 'av1':
@@ -180,6 +186,8 @@ export function pickerFromChoice(choice: RcCodecChoice): { codec: PickerCodec; c
       return { codec: 'hevc', chroma: 'auto' }
     case 'hevc-444':
       return { codec: 'hevc', chroma: 'yuv444' }
+    case 'hevc-420':
+      return { codec: 'hevc', chroma: 'yuv420' }
     case 'vp9':
       return { codec: 'vp9', chroma: 'auto' }
     case 'vp9-444':
@@ -190,12 +198,13 @@ export function pickerFromChoice(choice: RcCodecChoice): { codec: PickerCodec; c
       return { codec: 'h264', chroma: 'auto' }
     case 'h264-444':
       return { codec: 'h264', chroma: 'yuv444' }
+    case 'h264-420':
+      return { codec: 'h264', chroma: 'yuv420' }
     case 'auto-444':
       return { codec: 'auto', chroma: 'yuv444' }
     case 'auto-420':
       return { codec: 'auto', chroma: 'yuv420' }
     case 'auto':
-    default:
       return { codec: 'auto', chroma: 'auto' }
   }
 }

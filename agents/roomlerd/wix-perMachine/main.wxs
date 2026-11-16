@@ -388,11 +388,13 @@
           perMachine MSI over a prior perUser install, this CA shells
           out to the freshly-laid EXE to scrub the perUser flavour's
           stale Scheduled Task + user-data dirs. Runs deferred + non-
-          impersonated (SYSTEM) so it can: (a) delete a per-user task
-          via `schtasks /Delete /TN RoomlerAgent /F` (SYSTEM has the
-          rights), (b) reach into the active-session user's
-          %LOCALAPPDATA% / %APPDATA% via the WTSQueryUserToken-backed
-          `active_user_profile_root()` (system-context feature). On
+          impersonated (SYSTEM) so it can: (a) delete the per-user tasks
+          of the account signed in to its session and of no other
+          account (#3801: that account's Roomler-SID task, and a task
+          under a shared name only when its principal is that account),
+          (b) reach into the active-session user's
+          %LOCALAPPDATA% / %APPDATA% in the profile Windows records for
+          that person's SID (FR-145; system-context feature). On
           headless installs with no logged-in user the helper logs a
           skip and returns 0. Return="ignore" so a cleanup glitch
           doesn't sink the install. Same-flavour invocations exit 0
@@ -510,7 +512,84 @@
             Impersonate='no'
             Return='ignore' />
 
+        <!--
+          #3375: carry the service's Environment across a major upgrade.
+          The old product's removal runs ITS UnregisterService, which deletes
+          the service, and the Environment value goes with the key. The new
+          RegisterService then creates an entry with none, and up to 0.4.199
+          only the SystemContext switch came back (the action after it writes
+          that one). Every other entry `roomlerd set-service-env-var` wrote
+          lapsed at the next release, the documented kill switch
+          ROOMLERD_SFTP_AS_USER=0 among them.
+
+          Nothing of a new release runs before that removal except its
+          immediate actions, and of those only a DLL can hand a value on:
+          AppSearch reads a REG_MULTI_SZ as a value that begins with a null,
+          an EXE action cannot set a property, and before InstallFiles a
+          FileKey one would run the OLD roomlerd.exe.
+          (agents/roomler-msi-ca/src/lib.rs has the reasoning.)
+
+          - CaptureServiceEnvironment (immediate, before InstallInitialize, on
+            an upgrade) reads the old service's Environment into the private
+            property RoomlerServiceEnvironment. A private name cannot be set
+            from the command line.
+          - SetRestoreServiceEnvironment hands it on as the restore's
+            CustomActionData. The values never reach a command line.
+          - RestoreServiceEnvironment (deferred, LocalSystem, after
+            RegisterService) writes every carried entry back as it was,
+            except the SystemContext switch: the action after it decides that
+            one, and each of those actions restarts the service, so what was
+            carried is in effect from the first start.
+
+          Both are Return="ignore", and both return success after logging a
+          miss: a failing action here would stop this device's updates, and a
+          systematic one every device's. Their log lines name entries, never
+          values, and both properties are Hidden, the restore's under the
+          action's own name, which is how CustomActionData is logged.
+
+          ROOMLER_TEST_CA_FAIL (capture | restore) fails one of the two on
+          purpose, so installer-smoke can prove an upgrade survives it. Its
+          only effect is that nothing is carried, which is what every upgrade
+          did before #3375.
+
+          The DLL is built with +crt-static (release-agent.yml,
+          installer-smoke.yml) because msiexec loads it from the Binary table
+          on machines with no VC++ redistributable. One that cannot load just
+          carries nothing: under Return="ignore" the upgrade still completes.
+        -->
+        <Binary Id='RoomlerMsiCa' SourceFile='target\release\roomler_msi_ca.dll' />
+        <Property Id='RoomlerServiceEnvironment' Hidden='yes' />
+        <Property Id='RestoreServiceEnvironment' Hidden='yes' />
+        <Property Id='ROOMLER_TEST_CA_FAIL' Secure='yes' />
+        <CustomAction
+            Id='CaptureServiceEnvironment'
+            BinaryKey='RoomlerMsiCa'
+            DllEntry='CaptureServiceEnvironment'
+            Execute='immediate'
+            Return='ignore' />
+        <CustomAction
+            Id='SetRestoreServiceEnvironment'
+            Property='RestoreServiceEnvironment'
+            Value='[RoomlerServiceEnvironment]'
+            HideTarget='yes' />
+        <CustomAction
+            Id='RestoreServiceEnvironment'
+            BinaryKey='RoomlerMsiCa'
+            DllEntry='RestoreServiceEnvironment'
+            Execute='deferred'
+            Impersonate='no'
+            HideTarget='yes'
+            Return='ignore' />
+
         <InstallExecuteSequence>
+            <!--
+              #3375: before InstallInitialize, so before the old product's
+              removal (MajorUpgrade is afterInstallInitialize), which deletes
+              the service and its Environment.
+            -->
+            <Custom Action='CaptureServiceEnvironment' Before='InstallInitialize'>
+                WIX_UPGRADE_DETECTED AND NOT (REMOVE="ALL")
+            </Custom>
             <Custom Action='RegisterService' After='InstallFiles'>
                 NOT (REMOVE="ALL")
             </Custom>
@@ -518,14 +597,14 @@
               rc.18: scrub stale artefacts AFTER the new EXE lands
               (so we can shell out to it). NB both this and
               RegisterService are After='InstallFiles'; WiX v3 breaks
-              the tie in DOCUMENT order, so RegisterService actually
-              runs FIRST (an earlier comment here claimed the
-              opposite). Ordering is immaterial: the helper's
-              CA-reachable step only sweeps the vacated pre-rename
-              install dir (P4b), and its cross-flavour arms — which
-              touch the other flavour's task/service namespace — are
-              never reached from the CA (same-flavour fast path; see
-              install_cleanup.rs module docs). Skip during uninstall.
+              the tie by action NAME, not document order, so this runs
+              FIRST (4001, RegisterService 4002; #3640). Ordering is
+              immaterial: the helper's CA-reachable step only sweeps
+              the vacated pre-rename install dir (P4b), and its
+              cross-flavour arms — which touch the other flavour's
+              task/service namespace — are never reached from the CA
+              (same-flavour fast path; see install_cleanup.rs module
+              docs). Skip during uninstall.
             -->
             <Custom Action='CleanupLegacyPerUser' After='InstallFiles'>
                 NOT (REMOVE="ALL")
@@ -535,19 +614,28 @@
               Rollback CA MUST be scheduled IMMEDIATELY BEFORE its
               forward partner (EnableSystemContext) so the rollback
               stack registers the revert action before any state
-              mutation. Both fire after RegisterService since the
-              service must exist before we can restart it.
+              mutation. All of them fire after RegisterService since the
+              service must exist before we can restart it, and (#3375)
+              after RestoreServiceEnvironment: each restarts the service,
+              which then starts with what was carried, and each decides
+              the switch, which the restore leaves to it.
             -->
-            <Custom Action='RollbackSystemContext' After='RegisterService'>
+            <Custom Action='SetRestoreServiceEnvironment' After='RegisterService'>
+                RoomlerServiceEnvironment AND NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='RestoreServiceEnvironment' After='SetRestoreServiceEnvironment'>
+                RoomlerServiceEnvironment AND NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='RollbackSystemContext' After='RestoreServiceEnvironment'>
                 ENABLE_SYSTEM_CONTEXT="1" AND NOT (REMOVE="ALL")
             </Custom>
             <Custom Action='EnableSystemContext' After='RollbackSystemContext'>
                 ENABLE_SYSTEM_CONTEXT="1" AND NOT (REMOVE="ALL")
             </Custom>
-            <Custom Action='DisableSystemContext' After='RegisterService'>
+            <Custom Action='DisableSystemContext' After='RestoreServiceEnvironment'>
                 ENABLE_SYSTEM_CONTEXT="0" AND NOT (REMOVE="ALL")
             </Custom>
-            <Custom Action='KeepSystemContext' After='RegisterService'>
+            <Custom Action='KeepSystemContext' After='RestoreServiceEnvironment'>
                 NOT ENABLE_SYSTEM_CONTEXT AND NOT (REMOVE="ALL")
             </Custom>
             <Custom Action='UnregisterService' Before='RemoveFiles'>

@@ -15,6 +15,12 @@
 #     silently un-do the patch.
 #   - this Cargo.toml: header rewritten with patch notes (was the
 #     cargo-normalized header for the registry upload).
+#   - src/data_channel/mod.rs (#3716): `send`/`send_text` no longer hold the
+#     channel's slot lock across the SCTP write, so a write parked in flow
+#     control on a dead path cannot hold the channel's (and the peer
+#     connection's) close behind it. They take turns on a `send_lock` of
+#     their own instead, which `close()` and `buffered_amount()` never take:
+#     the slot lock was the only thing ordering a channel's writes.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only

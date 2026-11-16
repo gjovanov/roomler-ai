@@ -205,8 +205,9 @@ pub fn system_config_path() -> PathBuf {
 
 /// The per-user daemon's config: the user unit's `roomlerd run` and the
 /// LaunchAgent's `roomlerd run` both resolve it from the person's profile.
-pub fn per_user_config_path() -> Result<PathBuf, String> {
-    roomlerd::config::default_config_path().map_err(|e| format!("resolve config path: {e}"))
+pub fn per_user_config_path() -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    roomlerd::config::default_config_path().context("resolve config path")
 }
 
 /// The folders the per-user daemon's unit needs before it can start: the
@@ -224,9 +225,9 @@ pub fn per_user_config_path() -> Result<PathBuf, String> {
 ///
 /// Both folders come from the same `appdirs` resolution as the config path,
 /// never a fixed `~/.local/share/roomler`. On a pre-rename host that keeps
-/// its legacy tree, a new-segment folder made beside it would turn the
-/// daemon's new-then-old resolution away from its enrolled config.
-pub fn unit_folders(dirs: &directories::ProjectDirs) -> [PathBuf; 2] {
+/// its legacy tree, a new-segment config folder made beside it would turn the
+/// daemon away from its enrolled config: a new config folder decides the tree.
+pub fn unit_folders(dirs: &roomlerd::appdirs::AppDirs) -> [PathBuf; 2] {
     [
         dirs.config_dir().to_path_buf(),
         dirs.data_local_dir().to_path_buf(),
@@ -600,25 +601,27 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Create the directory and write the script into it.
-    pub fn create() -> Result<Scratch, String> {
+    /// Create the directory and write the script into it. #3432: a failure
+    /// keeps its `io::Error`, so the wizard says it was a local file's.
+    pub fn create() -> anyhow::Result<Scratch> {
+        use anyhow::Context as _;
         let dir = tempfile::Builder::new()
             .prefix("roomler-setup-")
             .tempdir()
-            .map_err(|e| format!("could not create a private temporary directory: {e}"))?;
+            .context("could not create a private temporary directory")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(dir.path())
-                .map_err(|e| format!("stat {}: {e}", dir.path().display()))?
+                .with_context(|| format!("stat {}", dir.path().display()))?
                 .permissions();
             perms.set_mode(0o700);
             std::fs::set_permissions(dir.path(), perms)
-                .map_err(|e| format!("chmod {}: {e}", dir.path().display()))?;
+                .with_context(|| format!("chmod {}", dir.path().display()))?;
         }
         let script = dir.path().join(SCRIPT_NAME);
         write_private(&script, INSTALL_SH.as_bytes())
-            .map_err(|e| format!("could not write {}: {e}", script.display()))?;
+            .with_context(|| format!("could not write {}", script.display()))?;
         Ok(Scratch { dir, script })
     }
 
@@ -1325,7 +1328,7 @@ mod tests {
             .home_dir()
             .to_path_buf();
         let dirs = directories::ProjectDirs::from("live", "roomler", "roomler").expect("a home");
-        let folders = unit_folders(&dirs);
+        let folders = unit_folders(&roomlerd::appdirs::AppDirs::from(&dirs));
         for rel in required {
             assert!(
                 folders.contains(&home.join(rel)),

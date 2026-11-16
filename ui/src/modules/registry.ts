@@ -20,23 +20,23 @@
  */
 
 /**
- * The server modules, in the graph's order (`roomler_core::graph::MODULES`).
- * `hive` (FR-90, agent sessions) is the one a server switches OFF by default,
- * so `/api/capabilities` names it only where an operator turned it on.
+ * The server modules the SPA has pages for, in the graph's order
+ * (`roomler_core::graph::MODULES`).
  */
-export const ALL_MODULES = ['saas', 'chat', 'conference', 'fleet', 'remote', 'network', 'hive'] as const
+export const ALL_MODULES = ['saas', 'chat', 'conference', 'fleet', 'remote', 'network'] as const
 
 export type ModuleId = (typeof ALL_MODULES)[number]
 
 /**
- * The modules a server mounts only when an operator switches them ON — the
- * SPA's mirror of `ModulesSettings::DEFAULT_OFF`. These fail CLOSED while
+ * The modules a server mounts only when an operator switches them ON. None
+ * since FR-137 parked FR-90's `hive`, but the mechanism stays for the next
+ * one, mirroring the server's switch defaults. These fail CLOSED while
  * `/api/capabilities` is unknown, where every other module fails open: for a
  * switch that is usually off, "unknown" most likely means "absent", and
  * failing open would show every user on every server a link to a feature
  * their server does not run.
  */
-export const DEFAULT_OFF: readonly ModuleId[] = ['hive']
+export const DEFAULT_OFF: readonly ModuleId[] = []
 
 export function isModuleId(value: string): value is ModuleId {
   return (ALL_MODULES as readonly string[]).includes(value)
@@ -73,8 +73,7 @@ export const BUILT_MODULES: readonly ModuleId[] = parseBuiltModules(
 
 /**
  * The module → dependency edges the server's graph declares
- * (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`,
- * `hive → chat`). A server never
+ * (`conference → chat`, `remote → fleet`, `network → fleet`). A server never
  * mounts a module without its dependency, so the UI does not need to reason
  * about it — this exists so a build-time prune cannot produce a bundle whose
  * routes assume a parent the prune removed.
@@ -86,7 +85,6 @@ export const MODULE_DEPS: Readonly<Record<ModuleId, readonly ModuleId[]>> = {
   fleet: [],
   remote: ['fleet'],
   network: ['fleet'],
-  hive: ['chat', 'fleet'],
 }
 
 /** Close a module set over `MODULE_DEPS`. */

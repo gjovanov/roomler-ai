@@ -17,15 +17,17 @@
 //!
 //!   1. Preflight: probe registry, surface cross-flavour warnings
 //!   2. Resolve installer metadata via the roomler.ai proxy (rc.27)
-//!   3. Stream MSI bytes to `%TEMP%` with progress emits
-//!   4. Verify SHA256
-//!   5. Spawn msiexec via `roomlerd::updater::
-//!      spawn_installer_for_flavour_with_properties` (perMachine gets
-//!      UAC via ShellExecuteExW + verb=runas)
-//!   6. Attach `MsiRunner` to the spawned PID + wait for exit (caller's
-//!      Tauri-future cancel propagates through 250 ms-slice polling)
+//!   3. Stream MSI bytes to the run's staging folder with progress emits
+//!   4. Verify the digest and the publisher, and hold the file
+//!   5. Start the install: [`package_step::start_install`] (#3246). A limited
+//!      perMachine run prompts once, for this EXE's elevated step
+//!   6. Wait for its exit through `MsiRunner` (caller's Tauri-future cancel
+//!      propagates through 250 ms-slice polling)
 //!   7. Enroll the agent against the configured server, persist
-//!      `config.toml`. Emits `EnrollOk` then `Done`.
+//!      `config.toml`. Emits `EnrollOk` then `Done`. The background-service
+//!      role's machine config is written by an administrator's process only:
+//!      this one when elevated, else the step that ran the MSI (#3609,
+//!      [`crate::machine_write`]).
 //!
 //! ## Cancel + force-kill
 //!
@@ -45,24 +47,31 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
-use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
-use roomlerd::updater::{WindowsInstallFlavour, spawn_installer_for_flavour_with_properties};
+use roomler_ai_remote_control::setup_diagnostics::ErrorCode;
+use roomlerd::install_detect::{ExistingInstall, InstallInfo, detect_existing_install};
+use roomlerd::updater::WindowsInstallFlavour;
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
-use wizard_shared::msi_runner::{MsiExitDecoded, MsiRunner};
+use wizard_shared::msi_runner::MsiExitDecoded;
+#[cfg(target_os = "windows")]
+use wizard_shared::msi_runner::MsiRunner;
 use wizard_shared::progress::{ProgressEvent, replay_log};
 
 use crate::commands::DoneReport;
-use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
+use anyhow::Context as _;
+
+use crate::diagnostics::{Diagnostics, enroll_error_code};
+use crate::failure::{Failure, Said};
+use crate::package_step;
 use crate::role::Role;
+use crate::steps::{OrFail, StepId, Steps};
 
 /// S2 — optional advanced daemon options from the wizard's collapsed
 /// "Advanced options" section, written into the enrolled config.toml
 /// right where the orchestrator saves it. `None`/empty fields keep the
 /// agent's defaults; route lists are validated BEFORE the MSI runs so a
 /// typo can't burn the single-use enrollment token.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AdvancedOptions {
     pub overlay_enabled: Option<bool>,
@@ -189,7 +198,7 @@ pub async fn run_install(
     device_name: String,
     advanced: AdvancedOptions,
     on_event: Channel<ProgressEvent>,
-) -> Result<DoneReport, String> {
+) -> Result<DoneReport, Failure> {
     // Reset state for a fresh run. CANCEL_REQUESTED stays cleared
     // unless the operator hits Cancel mid-flow.
     crate::INSTALL_IN_PROGRESS.store(true, Ordering::SeqCst);
@@ -202,9 +211,19 @@ pub async fn run_install(
     // (the same TLS rule, `enrollment::normalize_server_url`'s), so the
     // pages' buffered boundaries flush now and every step below reports
     // as it ends. Nothing is sent unless the Welcome box was ticked.
-    let diag = Diagnostics::global();
-    diag.server_known(&diagnostics_server(&server));
-    diag.pipeline_started();
+    Diagnostics::global().server_known(&diagnostics_server(&server));
+    // #3590: the steps every run takes; a reinstall's restart, the companion and the anchor get their rows when they begin.
+    Steps::global().started(
+        &[
+            StepId::Preflight,
+            StepId::Resolve,
+            StepId::Download,
+            StepId::Verify,
+            StepId::Package,
+            StepId::Enroll,
+        ],
+        Some(crate::steps::to_page(&on_event)),
+    );
 
     // Outer Result so we can always clear INSTALL_IN_PROGRESS on
     // any exit path.
@@ -213,24 +232,12 @@ pub async fn run_install(
     crate::INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
     crate::ACTIVE_MSI_PID.store(0, Ordering::SeqCst);
 
-    match outcome {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            // A step every error site closes itself; this catches one that
-            // did not, so the run's last step is never left unrecorded.
-            diag.abandon(ErrorCode::Other, cancel_requested());
-            // Echo terminal failures into both the channel + the
-            // replay log so a late-attached SPA listener sees them.
-            emit(
-                &on_event,
-                ProgressEvent::Error {
-                    step: "install".to_string(),
-                    message: e.clone(),
-                },
-            );
-            Err(e)
-        }
+    // #3432 — the terminal event names the step that failed, to the page,
+    // the replay log (a late-attached listener sees it) and the wizard's log.
+    if let Err(failure) = &outcome {
+        crate::failure::conclude(&on_event, failure);
     }
+    outcome
 }
 
 /// FR-102 P3b — the origin the diagnostics are posted to: the server as the
@@ -250,14 +257,14 @@ async fn run_install_inner(
     device_name: String,
     advanced: AdvancedOptions,
     on_event: &Channel<ProgressEvent>,
-) -> Result<DoneReport, String> {
+) -> Result<DoneReport, Failure> {
     emit(on_event, ProgressEvent::Started);
-    let diag = Diagnostics::global();
+    let steps = Steps::global();
 
     // --- Step 1: preflight -----------------------------------------------
     // (P3b: the step opens before the checks below, so a CIDR typo or a
     // cancel before any IO is a preflight outcome, not an unrecorded one.)
-    diag.begin(Step::Preflight);
+    steps.begin(StepId::Preflight);
     check_cancel()?;
 
     // S2 — validate the advanced route lists FIRST: a CIDR typo must
@@ -265,20 +272,22 @@ async fn run_install_inner(
     // enrollment token is burned.
     advanced
         .validate()
-        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
+        .map_err(Said)
+        .or_fail(ErrorCode::AdvancedOptions)?;
 
     // --- Role → flavour (was: parse_flavour on the SPA string) ----------
     let flavour_str = role
         .msi_flavour()
         .ok_or_else(|| {
-            failed(
-                ErrorCode::UnsupportedPlatform,
-                format!("role {role:?} has no MSI flavour — not a daemon role"),
-            )
-        })?
+            Said(format!(
+                "role {role:?} has no MSI flavour — not a daemon role"
+            ))
+        })
+        .or_fail(ErrorCode::UnsupportedPlatform)?
         .to_string();
-    let (wfx, is_system_context) =
-        flavour_parts(role).map_err(|e| failed(ErrorCode::UnsupportedPlatform, e))?;
+    let (wfx, is_system_context) = flavour_parts(role)
+        .map_err(Said)
+        .or_fail(ErrorCode::UnsupportedPlatform)?;
 
     // #3116 — SystemContext keeps its config in the machine-global directory,
     // which the daemon hardens to SYSTEM and Administrators (#3073). A wizard
@@ -288,19 +297,19 @@ async fn run_install_inner(
     // before anything is downloaded, installed or spent. (The Welcome page
     // asks first; this is the gate that holds.)
     if is_system_context && system_context_needs_elevation() {
-        return Err(failed(ErrorCode::Preflight, needs_elevation()));
+        return Err(steps.fail(ErrorCode::Preflight, Said(needs_elevation())));
     }
 
     emit(on_event, ProgressEvent::PreflightStarted);
     let detected = detect_existing_install();
-    let existing_label = label_existing(&detected);
+    let existing_label = label_existing(&detected, &flavour_str);
     emit(
         on_event,
         ProgressEvent::PreflightOk {
             existing: existing_label.clone(),
         },
     );
-    diag.ok();
+    steps.ok();
 
     // Surface cross-flavour switch as a warning. The SPA gates the
     // Continue button on an operator-acknowledgement checkbox per
@@ -328,7 +337,7 @@ async fn run_install_inner(
     // perMachine+SC: ENABLE_SYSTEM_CONTEXT=1.
 
     // --- Step 2: resolve installer ---------------------------------------
-    diag.begin(Step::Resolve);
+    steps.begin(StepId::Resolve);
     check_cancel()?;
     let flavour_for_proxy = match wfx {
         WindowsInstallFlavour::PerUser => "peruser",
@@ -347,7 +356,7 @@ async fn run_install_inner(
         crate::proxy::USER_AGENT,
     )
     .await
-    .map_err(|e| failed(ErrorCode::Resolve, format!("resolve installer: {e}")))?;
+    .or_fail(ErrorCode::Resolve)?;
     emit(
         on_event,
         ProgressEvent::AssetResolved {
@@ -356,10 +365,10 @@ async fn run_install_inner(
             digest: health.digest.clone(),
         },
     );
-    diag.ok();
+    steps.ok();
 
     // --- Step 3: download ------------------------------------------------
-    diag.begin(Step::Download);
+    steps.begin(StepId::Download);
     check_cancel()?;
     emit(
         on_event,
@@ -367,10 +376,21 @@ async fn run_install_inner(
             total_bytes: health.size,
         },
     );
-    let staged = std::env::temp_dir()
-        .join("roomler-setup")
-        .join(&health.tag)
-        .join(&health.filename);
+    // #3246 — a name from the server becomes a path only if it is one plain name,
+    // and on an elevated run only under a folder of its own.
+    let mut staging = package_step::Staging::for_this_run()
+        .context("making the staging folder")
+        .or_fail(ErrorCode::Download)?;
+    let staged = staging
+        .path_for(&health.tag, &health.filename)
+        .and_then(|path| {
+            if health.filename.to_ascii_lowercase().ends_with(".msi") {
+                Ok(path)
+            } else {
+                Err(package_step::Refusal::BadName(health.filename.clone()))
+            }
+        })
+        .map_err(package_step::Refusal::fail)?;
     let url = format!(
         "{}{}",
         crate::proxy::origin_of(&crate::proxy::agent_base()),
@@ -392,86 +412,106 @@ async fn run_install_inner(
         });
     })
     .await
-    .map_err(|e| failed(ErrorCode::Download, format!("download installer: {e}")))?;
-    diag.ok();
+    .or_fail(ErrorCode::Download)?;
+    steps.ok();
 
-    // --- Step 4: verify SHA256 ------------------------------------------
-    diag.begin(Step::Verify);
-    check_cancel()?;
-    let sha256_match = match health.digest.as_deref() {
-        Some(digest) => asset_resolver::verify_sha256(&staged, digest)
-            .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?,
-        None => {
-            // Pre-Oct-2024 releases lack the digest field. Accept
-            // the download as-is but flag it loudly.
-            tracing::warn!(
-                tag = %health.tag,
-                "installer asset lacks sha256 digest — skipping verification"
-            );
-            true
-        }
-    };
-    emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
-    if !sha256_match {
-        let _ = std::fs::remove_file(&staged);
-        return Err(failed(
-            ErrorCode::Sha256Mismatch,
-            format!(
-                "SHA256 mismatch for {} — staged file deleted; please retry",
-                staged.display()
-            ),
-        ));
-    }
-    diag.ok();
-
-    // --- Step 5: spawn msiexec ------------------------------------------
+    // --- Step 4: verify the digest and the publisher ---------------------
     //
-    // Pass the OPERATOR-SELECTED flavour (mapped from the role picked
-    // on the SPA's Welcome cards) explicitly. DO NOT delegate to
-    // `spawn_installer_inner` — that classifies the wizard EXE's own
-    // location via `current_install_flavour`, which always resolves
-    // to PerUser inside the wizard (the EXE runs from wherever the
-    // operator double-clicked, never `\Program Files\`). A perMachine
-    // MSI launched on the perUser branch (`/qn`, no ShellExecuteExW
-    // runas) gets rejected by Windows Installer with exit code 1625
-    // ERROR_INSTALL_PACKAGE_REJECTED. Field repro 2026-05-15 on a
-    // Windows field-test host; BLOCKER B6 from the rc.27/rc.28 master
-    // plan.
-    diag.begin(Step::Msi);
+    // #3246 — the digest comes from the same origin as the URL, so it says the
+    // bytes came through intact. The publisher says whose they are, and it
+    // decides with or without a digest. Whatever passes stays held open until
+    // the install is over.
+    steps.begin(StepId::Verify);
     check_cancel()?;
-    // rc.44: build the property table from the parsed flavour.
-    //   peruser              → no property (wix/main.wxs doesn't declare it)
-    //   permachine plain     → ENABLE_SYSTEM_CONTEXT=0 (explicit, so the
-    //                          WiX DisableSystemContext CA fires on a
-    //                          downgrade from a SC-on host)
-    //   permachine+SC        → ENABLE_SYSTEM_CONTEXT=1
-    let properties: Vec<(&str, &str)> = match wfx {
-        WindowsInstallFlavour::PerUser => Vec::new(),
-        WindowsInstallFlavour::PerMachine => {
-            vec![(
-                "ENABLE_SYSTEM_CONTEXT",
-                if is_system_context { "1" } else { "0" },
-            )]
+    if health.digest.is_none() {
+        tracing::warn!(
+            tag = %health.tag,
+            "installer asset lacks sha256 digest — the publisher check alone decides"
+        );
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: format!(
+                    "Release {} published no checksum for this installer, so only its signature \
+                     can be checked.",
+                    health.tag
+                ),
+            },
+        );
+    }
+    let checked = match package_step::check_held(&staged, health.digest.as_deref()) {
+        Ok(checked) => checked,
+        Err(refusal) => {
+            if matches!(refusal, package_step::Refusal::DigestMismatch) {
+                emit(
+                    on_event,
+                    ProgressEvent::DownloadVerified {
+                        sha256_match: false,
+                    },
+                );
+            }
+            let _ = std::fs::remove_file(&staged);
+            return Err(refusal.fail());
         }
     };
-    let pid = spawn_installer_for_flavour_with_properties(&staged, wfx, &properties)
-        .map_err(|e| failed(ErrorCode::MsiSpawn, format!("spawn msiexec: {e}")))?;
+    if health.digest.is_some() {
+        emit(
+            on_event,
+            ProgressEvent::DownloadVerified { sha256_match: true },
+        );
+    }
+    emit(
+        on_event,
+        ProgressEvent::PublisherVerified {
+            signer: checked.signer.clone(),
+        },
+    );
+    steps.ok();
+
+    // --- Step 5: start the install ---------------------------------------
+    steps.begin(StepId::Package);
+    check_cancel()?;
+    let mut started = package_step::start_install(
+        &staged,
+        health.digest.as_deref(),
+        wfx,
+        is_system_context,
+        &staging,
+    )
+    .await?;
+    let pid = started.runner.pid();
     crate::ACTIVE_MSI_PID.store(pid, Ordering::SeqCst);
     emit(on_event, ProgressEvent::MsiSpawned { pid });
 
-    // --- Step 6: attach + wait + decode ----------------------------------
-    let runner = MsiRunner::attach(pid)
-        .map_err(|e| failed(ErrorCode::MsiWait, format!("attach msiexec: {e}")))?;
-    // 15-min budget covers slow corporate disks + Defender scans.
-    let outcome = runner
-        .wait_for_exit(Duration::from_secs(15 * 60))
-        .await
-        .map_err(|e| failed(ErrorCode::MsiWait, format!("wait for msiexec: {e}")))?;
+    // --- Step 6: wait + decode --------------------------------------------
+    // 15-min budget covers slow corporate disks + Defender scans. #3609: on a
+    // limited wizard's background-service install the step says the installer
+    // ran on its channel, and stays to write the machine enrollment (step 7).
+    let (outcome, step_link) =
+        package_step::wait_for_install(&mut started, Duration::from_secs(15 * 60))
+            .await
+            .context("wait for msiexec")
+            .or_fail(ErrorCode::MsiWait)?;
+    drop(checked);
+    let code = msi_exit_code(&outcome);
+    // The elevated step's own verdict: no installer ran, so there is no outcome
+    // of one to report.
+    if let Some(refusal) = package_step::Refusal::from_step_exit(code) {
+        return Err(refusal.fail());
+    }
+    // #3609 — the installer ran, and the step could not write the machine
+    // enrollment: nothing was enrolled yet.
+    if let Some(words) = package_step::not_written(code) {
+        return Err(steps.fail(ErrorCode::ConfigWrite, Said(words.to_string())));
+    }
+    if package_step::keeps_log(code) {
+        staging.keep_log_of(&staged);
+    }
     let outcome_str = format!("{outcome:?}");
     emit(
         on_event,
         ProgressEvent::MsiCompleted {
-            code: msi_exit_code(&outcome),
+            code,
             decoded: outcome_str.clone(),
         },
     );
@@ -482,34 +522,23 @@ async fn run_install_inner(
             // agent's first start can pick up the new install state
             // after the OS reboots; enrollment is just an HTTP call
             // that doesn't depend on the agent binary running.
-            diag.ok();
+            steps.ok();
         }
         MsiExitDecoded::UserCancel => {
-            // rc.44: branch on is_system_context. SystemContext mode
-            // REQUIRES perMachine + admin (SCM Environment write +
-            // service restart), so "pick perUser mode" advice doesn't
-            // apply — the operator must either get admin rights or
-            // back off to plain perMachine.
-            let msg = if is_system_context {
-                "Installation cancelled (you clicked No on the UAC prompt). \
-                 SystemContext mode requires admin rights — it writes to the \
-                 service's Environment block and restarts the service. Try \
-                 again and approve the UAC prompt, or pick plain perMachine \
-                 mode (without SystemContext) if you only need user-context \
-                 remote control."
-            } else {
-                "Installation cancelled (you clicked No on the UAC prompt). \
-                 Try again or pick perUser mode if you can't get admin rights."
-            };
-            return Err(failed(ErrorCode::MsiUserCancel, msg.to_string()));
+            return Err(steps.fail(
+                ErrorCode::MsiUserCancel,
+                Said(package_step::declined_words(is_system_context).to_string()),
+            ));
         }
         MsiExitDecoded::AnotherInstall => {
-            return Err(failed(
+            return Err(steps.fail(
                 ErrorCode::MsiAnotherInstall,
-                "Another Windows Installer operation is already running on this \
-                 host. Wait for it to finish (check Get-Process msiexec), \
-                 then click Retry."
-                    .to_string(),
+                Said(
+                    "Another Windows Installer operation is already running on this \
+                     host. Wait for it to finish (check Get-Process msiexec), \
+                     then click Retry."
+                        .to_string(),
+                ),
             ));
         }
         MsiExitDecoded::FatalError => {
@@ -529,22 +558,27 @@ async fn run_install_inner(
                     },
                 );
             }
-            return Err(failed(
+            return Err(steps.fail(
                 ErrorCode::MsiFatal,
-                "MSI installer failed (exit 1603). Check the MSI log at %TEMP%\\MSI*.LOG for details."
-                    .to_string(),
+                Said(format!(
+                    "MSI installer failed (exit 1603). {}",
+                    started.where_the_log_is()
+                )),
             ));
         }
         MsiExitDecoded::Other(code) => {
-            return Err(failed(
+            return Err(steps.fail(
                 ErrorCode::MsiOther,
-                format!("MSI installer exited with unexpected code {code}"),
+                Said(format!(
+                    "MSI installer exited with unexpected code {code}. {}",
+                    started.where_the_log_is()
+                )),
             ));
         }
     }
 
     // --- Step 7: enroll --------------------------------------------------
-    diag.begin(Step::Enroll);
+    steps.begin(StepId::Enroll);
     check_cancel()?;
     emit(on_event, ProgressEvent::EnrollStarted);
     // rc.52: the SystemContext flavour writes its config to the
@@ -569,36 +603,28 @@ async fn run_install_inner(
         }
         #[cfg(not(target_os = "windows"))]
         {
-            return Err(failed(
+            return Err(steps.fail(
                 ErrorCode::UnsupportedPlatform,
-                "SystemContext flavour is Windows-only".to_string(),
+                Said("SystemContext flavour is Windows-only".to_string()),
             ));
         }
     } else {
         roomlerd::config::default_config_path()
-            .map_err(|e| failed(ErrorCode::ConfigWrite, format!("resolve config path: {e}")))?
+            .context("resolve config path")
+            .or_fail(ErrorCode::ConfigWrite)?
     };
-    // rc.52: for the SystemContext flavour, lock down
-    // %PROGRAMDATA%\roomler\ with an inheritable SYSTEM+Administrators
-    // DACL BEFORE the config (carrying the Agent JWT) is written —
-    // %PROGRAMDATA% is world-readable by default. The orchestrator
-    // runs inside the wizard's already-elevated context so `icacls`
-    // has the rights. Best-effort: a failure is logged + surfaced but
-    // doesn't abort the install (the config still lands; the operator
-    // can re-tighten). See harden_machine_global_dir.
-    #[cfg(target_os = "windows")]
-    if is_system_context && let Err(e) = harden_machine_global_dir(&config_path) {
-        emit(
-            on_event,
-            ProgressEvent::PreflightWarning {
-                message: format!(
-                    "could not restrict permissions on the machine-global \
-                     config directory ({e}); the daemon's token file may be \
-                     readable by non-admin users until corrected"
-                ),
-            },
-        );
-    }
+    // #3609 — who writes it. The background-service role's config is the
+    // machine's, which an administrator's process writes and nothing else: this
+    // one when it is elevated, otherwise the step that ran the installer, which
+    // stayed for it (`machine_write`). Every other role writes the person's own
+    // config here.
+    let mut writer = crate::machine_write::ConfigWriter::new(
+        step_link,
+        &config_path,
+        is_system_context,
+        elevated_here(),
+    )
+    .map_err(crate::machine_write::Failure::fail)?;
     // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
     // scope its role installs (`Role::install_scope`). A daemon role always
     // has one; the `None` arm is the tunnel role, which never reaches here.
@@ -610,9 +636,9 @@ async fn run_install_inner(
         role.install_scope()
             .unwrap_or(roomlerd::enrollment::InstallScope::Unknown),
     );
-    install.run = diag.run_id();
+    install.run = Diagnostics::global().run_id();
     // #2338 — a config already at the path is the base: the fresh identity
-    // is folded into it (`crate::enroll_step`), as `roomlerd enroll` does,
+    // is folded into it (`machine_write::write`), as `roomlerd enroll` does,
     // so a reinstall keeps the mesh, the routes and every other
     // operator-owned key. FR-99 decision 3's `lock_on_end = auto` and the
     // flavour's overlay default (FR-84 S2) apply to a FRESH config only; the
@@ -621,76 +647,71 @@ async fn run_install_inner(
     // recovered from its last good copy when it can be, and kept aside —
     // never read as absent and silently written over.
     //
-    // #3116 — a config this process may not read, or a path it may not write,
-    // stops the install HERE: the enroll below spends the token, and the save
-    // after it would fail. Before this a limited wizard enrolled, then failed
-    // on "creating parent dir", and first read the access-denied as a damaged
-    // config whose settings were lost.
+    // #3116 — a config the writer may not read, or a path it may not write,
+    // stops the install HERE (`writer.prepare`): the enroll below spends the
+    // token, and the save after it would fail. Before this a limited wizard
+    // enrolled, then failed on "creating parent dir", and first read the
+    // access-denied as a damaged config whose settings were lost.
     //
     // #3116 — and on a perMachine reinstall the config is read only once the
     // daemon the MSI restarted onto it answers on its LocalAPI, which it serves
     // after its startup writes. Up to 0.4.187 one of those wrote the copy it
     // had loaded back over this wizard's, a second after it.
     let settled = settle_daemon(wfx, &config_path).await;
-    let existing = crate::enroll_step::read_existing(&config_path).map_err(|said| {
-        failed(
-            ErrorCode::ConfigWrite,
-            format!("{said} {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}"),
-        )
-    })?;
-    if let Err(e) = roomlerd::config::probe_writable(&config_path) {
-        return Err(failed(
-            ErrorCode::ConfigWrite,
-            config_unwritable(&config_path, &e),
-        ));
-    }
-    if let Some(message) = existing.warning {
+    let prepared = writer
+        .prepare()
+        .await
+        .map_err(crate::machine_write::Failure::fail)?;
+    for message in prepared.warnings {
         emit(on_event, ProgressEvent::PreflightWarning { message });
+    }
+    // rc.52: for the SystemContext flavour, lock down %PROGRAMDATA%\roomler\
+    // with an inheritable SYSTEM+Administrators DACL before the config is
+    // written, here when this process writes it (the step does the same). #3609:
+    // the parent is taken for Administrators by handle first, so the seal,
+    // which names it by path, finds a plain folder that is Administrators' (a
+    // person's daemon may have made it). #3666: only once the config was read
+    // as found (`writer.prepare`): sealed first, a parent another account made
+    // would read as the machine's, and a sealed folder moved into it would be
+    // folded. Best-effort: a failure is said, and the install goes on.
+    #[cfg(target_os = "windows")]
+    if is_system_context && writer.is_local() {
+        for message in crate::machine_write::seal_parent(&config_path) {
+            emit(on_event, ProgressEvent::PreflightWarning { message });
+        }
     }
     // #3116 — a config was already here: a reinstall, whose MSI restarted the
     // service onto it before the write below (step 7a).
-    let had_config = existing.cfg.is_some();
-    let crate::enroll_step::Enrolled {
-        mut cfg,
-        outcome,
-        previous_row,
-    } = crate::enroll_step::enroll_folded(
-        &config_path,
-        existing.cfg,
-        &server,
-        &token,
-        &device_name,
-        install,
-    )
-    .await
-    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
-    // F3: the machine id was read back from the config, so the server reuses
-    // the row — unless it no longer can; then the old key is retired and said.
-    if let Some(row) = &previous_row {
-        emit(
-            on_event,
-            ProgressEvent::PreflightWarning {
-                message: roomlerd::enrollment::describe_previous_row(row, &cfg.agent_id),
-            },
-        );
-    }
-    let note = crate::enroll_step::finish(
-        &mut cfg,
-        &outcome,
-        is_system_context,
-        &advanced,
-        overlay_enabled_default(None, wfx),
-    )
-    .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
-    if let Some(message) = note {
+    let had_config = prepared.had_config;
+    // The existing config's machine id, so the server reuses its row; else the
+    // one derived from the path, as `roomlerd enroll` does.
+    let machine_id = match prepared.machine_id {
+        Some(id) => {
+            tracing::info!(machine_id = %id, "existing config found — reusing its machine fingerprint");
+            id
+        }
+        None => roomlerd::machine::derive_machine_id(&config_path),
+    };
+    let issued =
+        crate::enroll_step::enroll_issued(&machine_id, &server, &token, &device_name, install)
+            .await
+            .map_err(|e| steps.fail(enroll_error_code(&e), e))?;
+    // The fold, a fresh install's defaults and the boxes, the machine folder
+    // taken for Administrators on the background-service role, and the save:
+    // here, or in the step.
+    let crate::machine_write::Written {
+        agent_id,
+        tenant_id,
+        added_org,
+        warnings,
+    } = writer
+        .write(issued, &advanced, wfx)
+        .await
+        .map_err(crate::machine_write::Failure::fail)?;
+    drop(writer);
+    for message in warnings {
         emit(on_event, ProgressEvent::PreflightWarning { message });
     }
-    // The device this install enrolled: on an org added beside the primary,
-    // that org's row, never the primary's (the config's top-level ids).
-    let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
-    let added_org = roomlerd::enrollment::is_added_org(&outcome);
-    roomlerd::config::save(&config_path, &cfg)
-        .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
     let written_at_ms = unix_now_ms();
     emit(
         on_event,
@@ -700,7 +721,7 @@ async fn run_install_inner(
             tenant_id: tenant_id.clone(),
         },
     );
-    diag.ok();
+    steps.ok();
 
     // --- Step 7a: the daemon onto the new enrollment (#3116) -------------
     // A reinstall's MSI restarted the service BEFORE the write above, so the
@@ -713,8 +734,24 @@ async fn run_install_inner(
     // for the OS stop that unenrolls it. A fresh install has no daemon on an
     // older config. Best-effort, like the steps after it: the config is
     // written either way.
+    //
+    // #3387 — a fresh machine-wide install restarts nothing either, and
+    // confirms instead: the service ran the signed-in person's own enrollment
+    // (if any) as that person until this write, and swaps to the SYSTEM worker
+    // on its own. Done then says whether the service runs what it shows.
     if had_config {
-        restart_onto_new_enrollment(&config_path, written_at_ms, settled, on_event).await;
+        steps.begin(StepId::Restart);
+        restart_onto_new_enrollment(
+            &config_path,
+            is_system_context,
+            written_at_ms,
+            settled,
+            on_event,
+        )
+        .await;
+        steps.ok();
+    } else if is_system_context {
+        confirm_fresh_service(&config_path, on_event).await;
     }
 
     // --- Step 7b: place the roomler-desktop GUI companion (GAP-A / P6) ---
@@ -725,16 +762,16 @@ async fn run_install_inner(
     // install; the operator can always grab it later.
     // (P3b: recorded as its own step — `ok`, or `failed: companion` — and
     // not at all where it does not apply.)
-    diag.begin(Step::Companion);
-    let desktop_installed = place_desktop_companion(wfx, on_event).await;
-    best_effort_outcome(diag, desktop_installed, ErrorCode::Companion);
+    steps.begin(StepId::Companion);
+    let desktop_installed = place_desktop_companion(wfx, staging.root(), on_event).await;
+    steps.best_effort(desktop_installed, ErrorCode::Companion);
 
     // --- Step 7b': anchor the device for SYSTEM exec (FR-104) -----------
     // Only for a token the admin minted to anchor, on a machine-wide install
     // (the only flavours with a SYSTEM service). Best-effort, like the
     // companion step: a declined prompt or a failure leaves an enrolled
     // install, and the Done page carries the manual command.
-    diag.begin(Step::Anchor);
+    steps.begin(StepId::Anchor);
     let anchored = if added_org {
         // Not the step at all, so the Done page offers no manual command for
         // it: that command would move the machine's anchor to this org.
@@ -746,7 +783,7 @@ async fn run_install_inner(
     } else {
         anchor_device(role, wfx, &server, &token, &agent_id, on_event).await
     };
-    best_effort_outcome(diag, anchored, ErrorCode::Anchor);
+    steps.best_effort(anchored, ErrorCode::Anchor);
 
     // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
     // The perUser MSI registers the Scheduled Task for the NEXT logon only,
@@ -762,7 +799,7 @@ async fn run_install_inner(
 
     // --- Step 8: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
-    diag.done();
+    steps.done();
 
     // P4b (role→action composition): the MSI carries the `roomler`
     // CLI, so a daemon install subsumes the tunnel client. Existence-
@@ -772,6 +809,7 @@ async fn run_install_inner(
     let (cli_binary_path, cli_included, cli_path_updated) = cli_done_surface(wfx);
 
     Ok(DoneReport {
+        warnings: Steps::global().warnings(),
         principal_kind: "agent".to_string(),
         principal_id: agent_id,
         tenant_id,
@@ -790,17 +828,6 @@ async fn run_install_inner(
     })
 }
 
-/// FR-102 P3b — a best-effort step's diagnostics outcome from its report:
-/// `Some(true)` passed, `Some(false)` failed with `code` (the install
-/// stands either way), `None` did not apply, so no record at all.
-fn best_effort_outcome(diag: &Diagnostics, report: Option<bool>, code: ErrorCode) {
-    match report {
-        Some(true) => diag.ok(),
-        Some(false) => diag.fail(code, false),
-        None => diag.discard(),
-    }
-}
-
 /// FR-104 — does an install of `role` have a SYSTEM service an anchor is
 /// for? The two machine-wide Windows roles; a per-user install has none.
 pub fn role_anchors(role: Role) -> bool {
@@ -809,8 +836,9 @@ pub fn role_anchors(role: Role) -> bool {
 
 /// FR-104 on an install whose enrollment was ADDED beside the machine's
 /// primary one (another org): the step does not run. The anchor is one per
-/// machine (`exec_service.rs`: one `anchor.json`, and only the anchored
-/// device's connection advertises `exec-system`), so anchoring this org's row
+/// machine (`exec_service.rs`: one anchor, in `HKLM\SOFTWARE\Roomler\ExecService`
+/// since #3737, and only the anchored device's connection advertises
+/// `exec-system`), so anchoring this org's row
 /// would take SYSTEM exec away from the primary organization on another
 /// organization's token, the rule peer relays keep too (primary-org only).
 /// `Some(reason)` when the token asked for an anchor, so the person is told;
@@ -965,6 +993,7 @@ async fn settle_daemon(
 #[cfg(target_os = "windows")]
 async fn restart_onto_new_enrollment(
     config_path: &std::path::Path,
+    is_system_context: bool,
     written_at_ms: u64,
     settled: Option<bool>,
     on_event: &Channel<ProgressEvent>,
@@ -985,7 +1014,7 @@ async fn restart_onto_new_enrollment(
     };
     let Some(status) = daemon_status(budget).await else {
         match settled {
-            Some(false) if cancel_requested() => {
+            Some(false) if crate::diagnostics::cancel_requested() => {
                 skipped("the wait for the Roomler service was cancelled".to_string())
             }
             Some(false) => skipped(format!(
@@ -999,8 +1028,10 @@ async fn restart_onto_new_enrollment(
     };
     match needs_restart(
         status.config_path.as_deref(),
+        status.privileged,
         status.started_at_ms,
         config_path,
+        is_system_context,
         written_at_ms,
     ) {
         Err(why) => return skipped(why),
@@ -1089,6 +1120,7 @@ async fn daemon_status(budget: Duration) -> Option<roomler_localapi::NodeStatus>
 #[cfg(not(target_os = "windows"))]
 async fn restart_onto_new_enrollment(
     _config_path: &std::path::Path,
+    _is_system_context: bool,
     _written_at_ms: u64,
     _settled: Option<bool>,
     _on_event: &Channel<ProgressEvent>,
@@ -1096,21 +1128,31 @@ async fn restart_onto_new_enrollment(
 }
 
 /// #3116 — does the daemon that answered need a restart to run the enrollment
-/// written to `ours` at `written_at_ms`? `Err` when it runs another config
-/// (a plain perMachine worker signed in as someone other than the person
-/// running Setup): restarting it would not load this one. `Ok(false)` when it
-/// started after the write, so it loaded this one. A daemon that does not say
-/// when it started is restarted; one restart too many costs a few seconds.
+/// written to `ours` at `written_at_ms`? `Ok(false)` when it started after the
+/// write, so it loaded this one. A daemon that does not say when it started is
+/// restarted; one restart too many costs a few seconds.
+///
+/// One that runs another config: on a machine-wide install (`ours_is_machine`,
+/// `ours` the machine config) a SYSTEM worker (`privileged`) takes the
+/// machine's own enrollment at its next start, so it is restarted (#3387).
+/// Any other is `Err` (a plain perMachine worker signed in as someone other
+/// than the person running Setup, the person's own worker): restarting it
+/// would not load this one.
 #[cfg(any(target_os = "windows", test))]
 fn needs_restart(
     theirs: Option<&str>,
+    privileged: Option<bool>,
     started_at_ms: Option<u64>,
     ours: &std::path::Path,
+    ours_is_machine: bool,
     written_at_ms: u64,
 ) -> Result<bool, String> {
     if let Some(theirs) = theirs
         && !same_config_path(theirs, ours)
     {
+        if ours_is_machine && privileged == Some(true) {
+            return Ok(true);
+        }
         return Err(format!(
             "the running daemon uses {theirs}, not {}, so restarting it would not load this \
              enrollment",
@@ -1131,12 +1173,108 @@ fn same_config_path(theirs: &str, ours: &std::path::Path) -> bool {
     norm(theirs) == norm(&ours.display().to_string())
 }
 
+/// #3387 — what a machine-wide service's answer says about the enrollment a
+/// fresh install wrote to `ours`, the machine config.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceAnswer {
+    /// The person's own worker, which the service runs until the machine has
+    /// an enrollment SYSTEM can open, and swaps for the SYSTEM worker at the
+    /// next tick after the write: asked again.
+    Waiting,
+    /// A SYSTEM worker on the machine config: the service runs what Setup
+    /// wrote.
+    Runs,
+    /// A SYSTEM worker on another config, or one that does not say which:
+    /// asking again would not change it. The reason, for Done.
+    Other(String),
+}
+
+/// #3387 — [`ServiceAnswer`] for a status's `privileged` and `config_path`.
+#[cfg(any(target_os = "windows", test))]
+fn fresh_service_answer(
+    privileged: Option<bool>,
+    theirs: Option<&str>,
+    ours: &std::path::Path,
+) -> ServiceAnswer {
+    if privileged == Some(false) {
+        return ServiceAnswer::Waiting;
+    }
+    match theirs {
+        Some(theirs) if same_config_path(theirs, ours) => ServiceAnswer::Runs,
+        Some(theirs) => ServiceAnswer::Other(format!(
+            "the Roomler service runs {theirs}, not {}",
+            ours.display()
+        )),
+        None => ServiceAnswer::Other(
+            "the Roomler service does not say which enrollment it runs".to_string(),
+        ),
+    }
+}
+
+/// #3387 — on a fresh machine-wide install, confirm that the service runs the
+/// enrollment just written to `config_path`, the machine config. Nothing is
+/// restarted. Until the machine had an enrollment, the service ran the
+/// signed-in person's own (when there was one) as that person, and it swaps to
+/// the SYSTEM worker at the next tick after the write. So the answers are read
+/// for one from a SYSTEM worker on the machine config within
+/// [`DAEMON_ANSWER_BUDGET`], passing over the person's worker while the service
+/// swaps, and Done says whether the service runs the device it shows.
+#[cfg(target_os = "windows")]
+async fn confirm_fresh_service(config_path: &std::path::Path, on_event: &Channel<ProgressEvent>) {
+    let skipped = |why: String| {
+        let reason = format!(
+            "{why}. The new enrollment is written, and the service runs it from its next \
+             start: restart the Roomler service, or the computer"
+        );
+        tracing::warn!(%reason, "#3387: the service was not seen running the new enrollment");
+        emit(on_event, ProgressEvent::DaemonRestartSkipped { reason });
+    };
+    let begun = std::time::Instant::now();
+    loop {
+        let ask = async {
+            let mut client = roomler_localapi::connect().await.ok()?;
+            client.status().await.ok()
+        };
+        if let Ok(Some(status)) = tokio::time::timeout(LOCALAPI_EXCHANGE, ask).await {
+            match fresh_service_answer(
+                status.privileged,
+                status.config_path.as_deref(),
+                config_path,
+            ) {
+                ServiceAnswer::Runs => {
+                    emit(on_event, ProgressEvent::DaemonRestartOk { pid: status.pid });
+                    return;
+                }
+                ServiceAnswer::Other(why) => return skipped(why),
+                ServiceAnswer::Waiting => {}
+            }
+        }
+        if crate::diagnostics::cancel_requested() {
+            return skipped("the wait for the Roomler service was cancelled".to_string());
+        }
+        if begun.elapsed() >= DAEMON_ANSWER_BUDGET {
+            return skipped(format!(
+                "the Roomler service did not answer with the new enrollment within {} s",
+                DAEMON_ANSWER_BUDGET.as_secs()
+            ));
+        }
+        tokio::time::sleep(roomler_localapi::RESTART_POLL).await;
+    }
+}
+
+/// The daemon roles exist only on Windows.
+#[cfg(not(target_os = "windows"))]
+async fn confirm_fresh_service(_config_path: &std::path::Path, _on_event: &Channel<ProgressEvent>) {
+}
+
 /// #3116 — what to do about an install that needs an elevated wizard.
-const RUN_AS_ADMINISTRATOR: &str =
+pub(crate) const RUN_AS_ADMINISTRATOR: &str =
     "Close Roomler Setup, then right-click it and choose Run as administrator.";
 
 /// #3116 — said by every refusal that comes before the enroll.
-const NOTHING_SPENT: &str = "Nothing was enrolled, and the enrollment token is still unused.";
+pub(crate) const NOTHING_SPENT: &str =
+    "Nothing was enrolled, and the enrollment token is still unused.";
 
 /// #3116 — the SystemContext preflight's refusal.
 pub(crate) fn needs_elevation() -> String {
@@ -1148,12 +1286,12 @@ pub(crate) fn needs_elevation() -> String {
 }
 
 /// #3116 — must a SystemContext install run from an elevated wizard on this
-/// machine? Only when the wizard could not write the machine-global config.
-/// An elevated wizard always can. A limited one can on a machine where the
-/// folder was never hardened: on a fresh install the MSI makes it, the wizard
-/// writes into it (its own `icacls` fails, and says so), and the daemon
-/// hardens it after its first healthy run. Once hardened (#3073), which is
-/// what a reinstall finds, only SYSTEM and Administrators may open it.
+/// machine? Only when the wizard could not read the config it folds into. An
+/// elevated wizard always can. A limited one can on a fresh machine, where
+/// there is none: the step that runs the MSI behind the one prompt then writes
+/// the machine enrollment too (#3609, `machine_write`), owned by
+/// Administrators. Once a machine config is there (#3073), which is what a
+/// reinstall finds, only SYSTEM and Administrators may open it.
 pub(crate) fn system_context_needs_elevation() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -1193,7 +1331,7 @@ fn config_open_to_this_process(path: &std::path::Path) -> bool {
 }
 
 /// #3116 — the refusal for a config path the write probe could not write.
-fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
+pub(crate) fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         format!(
             "{} may not be written by this process ({e}). {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}",
@@ -1211,6 +1349,19 @@ fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
 #[cfg(target_os = "windows")]
 fn wizard_is_elevated() -> bool {
     roomlerd::win_identity::process_is_elevated()
+}
+
+/// [`wizard_is_elevated`] wherever the wizard runs: off Windows there is no
+/// administrator's step, and no role whose config is the machine's.
+fn elevated_here() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wizard_is_elevated()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 /// Wall-clock milliseconds, the unit a daemon reports its start in.
@@ -1233,21 +1384,95 @@ async fn anchor_device(
     None
 }
 
-/// Fetch + place the `roomler-desktop` GUI companion beside the daemon
-/// (GAP-A / P6). The GUI EXE ships as a standalone release asset
-/// (`roomler-desktop-*-x86_64-pc-windows-msvc*.exe`), not inside the
-/// MSI, so a daemon install needs this extra step to land all three
-/// binaries. Best-effort: `Some(true)` placed, `Some(false)` on any
-/// failure or a server with no desktop asset, `None` on non-Windows.
-/// Never errors the install — mirrors the terminal `install.ps1`
-/// `Install-Desktop` try/catch.
+/// The `roomler-desktop` GUI companion beside the daemon (GAP-A / P6). The GUI
+/// EXE ships as a standalone release asset
+/// (`roomler-desktop-*-x86_64-pc-windows-msvc*.exe`), not inside the MSI, so a
+/// daemon install needs this extra step to land all three binaries.
+/// Reports what is installed, not what this step did (#3174), as the Linux and
+/// macOS path does: `Some(present)` after the step, whoever placed the EXE, and
+/// `None` on non-Windows. Best-effort: never errors the install — mirrors the
+/// terminal `install.ps1` `Install-Desktop` try/catch.
 #[cfg(target_os = "windows")]
 async fn place_desktop_companion(
     flavour: WindowsInstallFlavour,
+    staging: &std::path::Path,
     on_event: &Channel<ProgressEvent>,
 ) -> Option<bool> {
     let dir =
         roomlerd::updater::install_dir_with_name(flavour, roomlerd::updater::INSTALL_FOLDER_NAME)?;
+    let target = dir.join("roomler-desktop.exe");
+    if service_places_companion(flavour, wizard_is_elevated()) {
+        if !target.exists() {
+            emit(on_event, ProgressEvent::CompanionWaiting);
+            wait_for_file(&target, COMPANION_WAIT, COMPANION_POLL).await;
+        }
+    } else {
+        fetch_and_place_companion(&dir, &target, staging, on_event).await;
+    }
+    let present = target.exists();
+    if present {
+        emit(on_event, ProgressEvent::CompanionPresent);
+    } else {
+        emit(
+            on_event,
+            ProgressEvent::CompanionAbsent {
+                message: COMPANION_COMES_LATER.to_string(),
+            },
+        );
+    }
+    Some(present)
+}
+
+/// #3174 — how long a limited wizard waits for the service to place the
+/// companion. The refresh starts with the service, so this covers one download
+/// on the person's network; past it the checklist says the EXE comes later.
+#[cfg(target_os = "windows")]
+const COMPANION_WAIT: Duration = Duration::from_secs(60);
+
+#[cfg(target_os = "windows")]
+const COMPANION_POLL: Duration = Duration::from_secs(1);
+
+/// #3174 — what the person reads when the EXE is still absent after the step.
+/// `companion::refresh_periodically` retries every `updater::CHECK_INTERVAL`.
+#[cfg(target_os = "windows")]
+const COMPANION_COMES_LATER: &str = "Roomler adds it at its next start, or within 4 hours, with \
+     nothing for you to do. The rest of the install is complete.";
+
+/// #3174 — is the companion the service's to place? Only administrators can
+/// write under `%ProgramFiles%`, so a limited wizard can neither rename the EXE
+/// aside nor copy over it, and failed with Access denied on every machine-wide
+/// install. Every machine-wide role runs the SCM host, whose
+/// `companion::refresh_if_stale` places the EXE at its start and retries.
+#[cfg(any(target_os = "windows", test))]
+fn service_places_companion(flavour: WindowsInstallFlavour, elevated: bool) -> bool {
+    flavour == WindowsInstallFlavour::PerMachine && !elevated
+}
+
+/// #3174 — wait for `path` to appear: true as soon as it does, false after
+/// `budget` or on a cancel.
+#[cfg(any(target_os = "windows", test))]
+async fn wait_for_file(path: &std::path::Path, budget: Duration, poll: Duration) -> bool {
+    let end = std::time::Instant::now() + budget;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= end || crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Fetch the companion and swap it in. Failures only log: the caller reports
+/// whether the EXE is there afterwards, and an older one still counts.
+#[cfg(target_os = "windows")]
+async fn fetch_and_place_companion(
+    dir: &std::path::Path,
+    target: &std::path::Path,
+    staging: &std::path::Path,
+    on_event: &Channel<ProgressEvent>,
+) {
     emit(
         on_event,
         ProgressEvent::AssetResolving {
@@ -1270,16 +1495,22 @@ async fn place_desktop_companion(
             tracing::warn!(
                 "no roomler-desktop asset in the latest agent release — companion skipped"
             );
-            return Some(false);
+            return;
         }
         Err(e) => {
             tracing::warn!(error = %e, "resolving roomler-desktop failed — companion skipped");
-            return Some(false);
+            return;
         }
     };
-    let staged = std::env::temp_dir()
-        .join("roomler-setup")
-        .join(&asset.filename);
+    // #3246 — the name comes from the server, and on an elevated run the copy
+    // below lands in Program Files, so it is checked like the installer.
+    let staged = match asset_resolver::plain_name(&asset.filename) {
+        Ok(name) => staging.join(name),
+        Err(e) => {
+            tracing::warn!(error = %e, "roomler-desktop's name is refused — companion skipped");
+            return;
+        }
+    };
     let spec = asset_resolver::DownloadSpec {
         url: &asset.url,
         dest: &staged,
@@ -1288,19 +1519,16 @@ async fn place_desktop_companion(
     };
     if let Err(e) = asset_resolver::download(&spec, &crate::CANCEL_REQUESTED, |_| {}).await {
         tracing::warn!(error = %e, "downloading roomler-desktop failed — companion skipped");
-        return Some(false);
+        return;
     }
-    if let Some(digest) = asset.digest.as_deref() {
-        match asset_resolver::verify_sha256(&staged, digest) {
-            Ok(true) => {}
-            _ => {
-                tracing::warn!("roomler-desktop sha256 mismatch — companion skipped");
-                let _ = std::fs::remove_file(&staged);
-                return Some(false);
-            }
+    let checked = match package_step::check_held(&staged, asset.digest.as_deref()) {
+        Ok(checked) => checked,
+        Err(refusal) => {
+            tracing::warn!(error = %refusal.words(), "roomler-desktop refused — companion skipped");
+            let _ = std::fs::remove_file(&staged);
+            return;
         }
-    }
-    let target = dir.join("roomler-desktop.exe");
+    };
     // FR-84 D6 — the companion may already be RUNNING from `target`: the
     // service's own refresh can place it during the MSI, and its post-install
     // launch opens it as soon as the enrollment above lands. Windows refuses
@@ -1310,24 +1538,31 @@ async fn place_desktop_companion(
     // new one.
     let old = dir.join("roomler-desktop.exe.old");
     let _ = std::fs::remove_file(&old);
-    if target.exists()
-        && let Err(e) = std::fs::rename(&target, &old)
-    {
-        tracing::warn!(error = %e, path = %target.display(), "could not move the old roomler-desktop aside");
-    }
-    match std::fs::copy(&staged, &target) {
+    // #3174 — not a failure by itself: an `.old` still backing an open window
+    // refuses the rename, and the copy then goes through. The copy decides.
+    let moved_aside = if target.exists() {
+        std::fs::rename(target, &old)
+    } else {
+        Ok(())
+    };
+    let copied = std::fs::copy(&staged, target);
+    drop(checked);
+    match copied {
         Ok(_) => {
             // Best-effort: still locked while the window it backs is open.
             let _ = std::fs::remove_file(&old);
-            Some(true)
         }
         Err(e) => {
             // Never leave the host with NO companion.
             if !target.exists() && old.exists() {
-                let _ = std::fs::rename(&old, &target);
+                let _ = std::fs::rename(&old, target);
             }
-            tracing::warn!(error = %e, path = %target.display(), "placing roomler-desktop failed");
-            Some(false)
+            tracing::warn!(
+                error = %e,
+                moved_aside = ?moved_aside.err(),
+                path = %target.display(),
+                "placing roomler-desktop failed"
+            );
         }
     }
 }
@@ -1354,6 +1589,7 @@ fn start_user_task() {}
 #[cfg(not(target_os = "windows"))]
 async fn place_desktop_companion(
     _flavour: WindowsInstallFlavour,
+    _staging: &std::path::Path,
     _on_event: &Channel<ProgressEvent>,
 ) -> Option<bool> {
     None
@@ -1430,7 +1666,10 @@ pub fn force_kill_msi() -> Result<(), String> {
 /// is left UNTOUCHED there — the agent's own default (off) — rather than
 /// written as a promise the daemon cannot keep. An explicit choice always
 /// wins: the box the operator saw is the box that lands in config.toml.
-fn overlay_enabled_default(explicit: Option<bool>, flavour: WindowsInstallFlavour) -> Option<bool> {
+pub(crate) fn overlay_enabled_default(
+    explicit: Option<bool>,
+    flavour: WindowsInstallFlavour,
+) -> Option<bool> {
     explicit.or(match flavour {
         WindowsInstallFlavour::PerMachine => Some(true),
         WindowsInstallFlavour::PerUser => None,
@@ -1474,7 +1713,7 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
 /// Administrators.
 #[cfg(target_os = "windows")]
-fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
         .parent() // …\roomler\<segment>
         .and_then(|p| p.parent()) // …\roomler
@@ -1486,6 +1725,15 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
         })?;
     std::fs::create_dir_all(roomler_dir)
         .map_err(|e| format!("create {}: {e}", roomler_dir.display()))?;
+    // #3609 — `icacls` names the folder by path, and would follow a junction
+    // or a symbolic link there to whatever it leads to: such a parent is left
+    // for the service's check to refuse.
+    if is_a_link(roomler_dir) {
+        return Err(format!(
+            "{} is a link (a junction or a symbolic link), not a plain folder",
+            roomler_dir.display()
+        ));
+    }
     // #3073 — the owner first. Only the owner keeps WRITE_DAC once
     // `/inheritance:r` has removed every ACE, so a directory someone else
     // owns (the daemon hardening it later runs as SYSTEM) must belong to
@@ -1528,6 +1776,17 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
         ));
     }
     Ok(())
+}
+
+/// Is `path` itself a reparse point (a junction, a symbolic link)? Read without
+/// following it. One that cannot be read is not called a link: what follows
+/// fails on it by itself.
+#[cfg(target_os = "windows")]
+fn is_a_link(path: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_attributes() & REPARSE_POINT != 0)
 }
 
 /// Projection of [`roomlerd::win_service::system_context_attempt::Attempt`]
@@ -1599,38 +1858,55 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     // effort (Tauri 2 returns Err only when the receiver has been
     // closed, which means the SPA already moved on).
     replay_log().push(event.clone());
+    // #3590: the checklist hears it (a warning gets its row, a step its words).
+    Steps::global().saw(&event);
     let _ = channel.send(event);
 }
 
-fn check_cancel() -> Result<(), String> {
+fn check_cancel() -> Result<(), Failure> {
     if crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
         // P3b — the step that was about to run (opened just before this
         // check) ends `cancelled`.
-        Diagnostics::global().cancelled();
-        Err("install cancelled by operator".to_string())
+        Err(Steps::global().cancelled())
     } else {
         Ok(())
     }
 }
 
-fn label_existing(detected: &ExistingInstall) -> String {
+/// The preflight row's words: what is installed here already and what this
+/// install does to it, as a person reads them, never a flavour's name.
+/// `requested` is the flavour from [`Role::msi_flavour`]: an install of the
+/// same kind is replaced, and a switch to the other kind is
+/// [`cross_flavour_warning`]'s to say.
+pub(crate) fn label_existing(detected: &ExistingInstall, requested: &str) -> String {
+    let version = |info: &InstallInfo| match info.version.as_deref() {
+        Some(v) => format!("version {v}"),
+        None => "version unknown".to_string(),
+    };
+    let replaced = ": this install replaces it";
     match detected {
-        ExistingInstall::Clean => "clean".to_string(),
+        ExistingInstall::Clean => "Roomler is not installed here yet".to_string(),
         ExistingInstall::PerUser(info) => format!(
-            "perUser {}",
-            info.version.as_deref().unwrap_or("(unknown version)")
+            "Roomler is installed for this user only ({}){}",
+            version(info),
+            if requested == "peruser" { replaced } else { "" }
         ),
         ExistingInstall::PerMachine(info) => format!(
-            "perMachine {}",
-            info.version.as_deref().unwrap_or("(unknown version)")
+            "Roomler is installed for the whole computer ({}){}",
+            version(info),
+            if requested.starts_with("permachine") {
+                replaced
+            } else {
+                ""
+            }
         ),
         ExistingInstall::Ambiguous {
             peruser,
             permachine,
         } => format!(
-            "ambiguous (perUser {} + perMachine {})",
-            peruser.version.as_deref().unwrap_or("?"),
-            permachine.version.as_deref().unwrap_or("?"),
+            "Roomler is installed twice: for this user only ({}) and for the whole computer ({})",
+            version(peruser),
+            version(permachine),
         ),
     }
 }
@@ -1643,15 +1919,15 @@ pub fn cross_flavour_warning(detected: &ExistingInstall, requested: &str) -> Opt
     let requested_is_peruser = requested == "peruser";
     match detected {
         ExistingInstall::PerUser(_) if requested_is_permachine => Some(
-            "Switching from perUser → perMachine. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
+            "Switching from an install for this user only to one for the whole computer. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
                 .to_string(),
         ),
         ExistingInstall::PerMachine(_) if requested_is_peruser => Some(
-            "Switching from perMachine → perUser. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
+            "Switching from an install for the whole computer to one for this user only. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
                 .to_string(),
         ),
         ExistingInstall::Ambiguous { .. } => Some(
-            "Both perUser and perMachine installs detected. The MSI's cleanup custom action will remove the one not selected."
+            "Roomler is installed twice here, for this user only and for the whole computer. The install removes the one you did not pick."
                 .to_string(),
         ),
         _ => None,
@@ -1683,6 +1959,36 @@ mod tests {
         }
     }
 
+    // #3174 — the one case the wizard cannot write: everywhere else it places
+    // the companion itself.
+    #[test]
+    fn only_a_limited_wizard_on_a_machine_install_leaves_the_companion_to_the_service() {
+        use WindowsInstallFlavour::{PerMachine, PerUser};
+        assert!(service_places_companion(PerMachine, false));
+        assert!(!service_places_companion(PerMachine, true));
+        assert!(!service_places_companion(PerUser, false));
+        assert!(!service_places_companion(PerUser, true));
+    }
+
+    #[test]
+    fn waiting_for_the_companion_ends_when_it_appears_or_the_budget_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("roomler-desktop.exe");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let poll = Duration::from_millis(5);
+        assert!(!rt.block_on(wait_for_file(&exe, Duration::from_millis(30), poll)));
+        std::fs::write(&exe, b"x").unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(rt.block_on(wait_for_file(&exe, Duration::from_secs(60), poll)));
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "must not wait out the budget"
+        );
+    }
+
     #[test]
     fn flavour_parts_maps_daemon_roles() {
         assert_eq!(
@@ -1709,8 +2015,13 @@ mod tests {
         let w = cross_flavour_warning(&ExistingInstall::PerUser(info("0.3.0-rc.26")), "permachine");
         assert!(w.is_some());
         let msg = w.unwrap();
-        assert!(msg.contains("perUser"));
-        assert!(msg.contains("perMachine"));
+        // #3247: a person's words, not the MSI's.
+        assert!(msg.contains("for this user only"));
+        assert!(msg.contains("for the whole computer"));
+        assert!(
+            !msg.contains("perUser") && !msg.contains("perMachine"),
+            "{msg}"
+        );
         assert!(msg.contains("fresh enrollment token"));
     }
 
@@ -1748,27 +2059,42 @@ mod tests {
             "permachine",
         );
         assert!(w.is_some());
-        assert!(w.unwrap().contains("Both"));
+        assert!(w.unwrap().contains("installed twice"));
     }
 
+    /// The preflight row says what is here and what the install does to it.
     #[test]
-    fn label_existing_renders_each_variant() {
-        assert_eq!(label_existing(&ExistingInstall::Clean), "clean");
+    fn label_existing_says_what_is_here_and_what_happens_to_it() {
         assert_eq!(
-            label_existing(&ExistingInstall::PerUser(info("0.3.0-rc.26"))),
-            "perUser 0.3.0-rc.26"
+            label_existing(&ExistingInstall::Clean, "permachine"),
+            "Roomler is not installed here yet"
         );
         assert_eq!(
-            label_existing(&ExistingInstall::PerMachine(info("0.3.0-rc.26"))),
-            "perMachine 0.3.0-rc.26"
+            label_existing(&ExistingInstall::PerUser(info("0.4.207")), "peruser"),
+            "Roomler is installed for this user only (version 0.4.207): this install replaces it"
         );
-    }
-
-    #[test]
-    fn label_existing_handles_missing_version() {
         assert_eq!(
-            label_existing(&ExistingInstall::PerUser(InstallInfo::default())),
-            "perUser (unknown version)"
+            label_existing(
+                &ExistingInstall::PerMachine(info("0.4.207")),
+                "permachine-systemcontext"
+            ),
+            "Roomler is installed for the whole computer (version 0.4.207): this install replaces it"
+        );
+        // A switch to the other kind: the warning row says what happens.
+        assert_eq!(
+            label_existing(&ExistingInstall::PerUser(info("0.4.207")), "permachine"),
+            "Roomler is installed for this user only (version 0.4.207)"
+        );
+        assert_eq!(
+            label_existing(
+                &ExistingInstall::Ambiguous {
+                    peruser: info("0.4.1"),
+                    permachine: InstallInfo::default(),
+                },
+                "peruser"
+            ),
+            "Roomler is installed twice: for this user only (version 0.4.1) and for the whole \
+             computer (version unknown)"
         );
     }
 
@@ -1985,8 +2311,10 @@ mod tests {
         assert_eq!(
             needs_restart(
                 Some(r"C:\ProgramData\roomler\roomler\config.toml"),
+                Some(true),
                 Some(written - 1),
                 ours,
+                true,
                 written
             ),
             Ok(true),
@@ -1995,22 +2323,26 @@ mod tests {
         assert_eq!(
             needs_restart(
                 Some(r"c:/programdata/Roomler/roomler/CONFIG.toml"),
+                Some(true),
                 Some(written),
                 ours,
+                true,
                 written
             ),
             Ok(false),
             "started at or after the write: it loaded the new one (case and separators aside)"
         );
         assert_eq!(
-            needs_restart(None, None, ours, written),
+            needs_restart(None, None, None, ours, true, written),
             Ok(true),
             "an older daemon says neither: restarted, the cheap mistake"
         );
         let other = needs_restart(
             Some(r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml"),
+            Some(false),
             Some(written - 1),
             ours,
+            true,
             written,
         )
         .expect_err("another config");
@@ -2018,6 +2350,84 @@ mod tests {
         assert!(same_config_path(
             r"\\?\C:\ProgramData\roomler\roomler\config.toml",
             ours
+        ));
+    }
+
+    /// #3387 — a machine-wide service whose SYSTEM worker runs another config
+    /// takes the machine's own at its next start, so a reinstall restarts it
+    /// onto the enrollment it wrote. A daemon running as a person, or one on a
+    /// per-user install, is still left alone and said.
+    #[test]
+    fn needs_restart_accepts_a_system_worker_on_another_path_when_ours_is_machine() {
+        let machine = std::path::Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let persons = r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml";
+        let written = 1_000_000;
+        assert_eq!(
+            needs_restart(
+                Some(persons),
+                Some(true),
+                Some(written - 1),
+                machine,
+                true,
+                written
+            ),
+            Ok(true)
+        );
+        assert!(
+            needs_restart(
+                Some(persons),
+                Some(false),
+                Some(written - 1),
+                machine,
+                true,
+                written
+            )
+            .is_err(),
+            "the person's own daemon"
+        );
+        let per_user = std::path::Path::new(persons);
+        assert!(
+            needs_restart(
+                Some(r"C:\Users\other\AppData\Roaming\roomler\roomler\config.toml"),
+                Some(true),
+                Some(written - 1),
+                per_user,
+                false,
+                written
+            )
+            .is_err(),
+            "not a machine-wide install"
+        );
+    }
+
+    /// #3387 — on a fresh machine-wide install Setup confirms that the service
+    /// runs the enrollment it wrote. The person's own worker, which runs until
+    /// the machine has an enrollment, is passed over while the service swaps;
+    /// a SYSTEM worker on the machine config is the answer; one on any other
+    /// config is said.
+    #[test]
+    fn fresh_system_context_confirms_on_the_machine_path() {
+        let machine = std::path::Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let persons = r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml";
+        assert_eq!(
+            fresh_service_answer(Some(false), Some(persons), machine),
+            ServiceAnswer::Waiting
+        );
+        assert_eq!(
+            fresh_service_answer(
+                Some(true),
+                Some(r"c:/programdata/roomler/roomler/config.toml"),
+                machine
+            ),
+            ServiceAnswer::Runs
+        );
+        match fresh_service_answer(Some(true), Some(persons), machine) {
+            ServiceAnswer::Other(why) => assert!(why.contains(persons), "{why}"),
+            other => panic!("a SYSTEM worker on another config: {other:?}"),
+        }
+        assert!(matches!(
+            fresh_service_answer(Some(true), None, machine),
+            ServiceAnswer::Other(_)
         ));
     }
 

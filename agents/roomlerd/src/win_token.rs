@@ -135,7 +135,20 @@ pub(crate) fn sid_string(sid: PSID) -> String {
 
 /// This process's user, as a SID string.
 pub fn own_user_sid() -> Option<String> {
-    let t = own_token(TOKEN_QUERY)?;
+    // SAFETY: the pseudo-handle of this process, valid for its whole life.
+    user_sid_of(unsafe { GetCurrentProcess() })
+}
+
+/// #3885 — the user of the process behind `process` (a handle with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`), as a SID string, from its token.
+/// `None` when its token cannot be opened or read.
+pub(crate) fn user_sid_of(process: HANDLE) -> Option<String> {
+    let mut t: HANDLE = std::ptr::null_mut();
+    // SAFETY: a process handle the caller holds and a valid out-param.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut t) } == 0 {
+        return None;
+    }
+    let t = Owned::new(t)?;
     let buf = token_info(t.raw(), TokenUser)?;
     // SAFETY: a TOKEN_USER whose SID points into `buf`.
     Some(sid_string(unsafe {
@@ -296,7 +309,12 @@ pub fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<[u8; MAX_SID], String
 }
 
 fn set_medium_integrity(token: HANDLE) -> Result<(), String> {
-    let mut sid = well_known_sid(WinMediumLabelSid)?;
+    set_integrity(token, WinMediumLabelSid, "medium")
+}
+
+/// Lower `token`'s integrity to the level `label` names.
+fn set_integrity(token: HANDLE, label: WELL_KNOWN_SID_TYPE, level: &str) -> Result<(), String> {
+    let mut sid = well_known_sid(label)?;
     let label = TOKEN_MANDATORY_LABEL {
         Label: SID_AND_ATTRIBUTES {
             Sid: sid.as_mut_ptr().cast(),
@@ -315,9 +333,43 @@ fn set_medium_integrity(token: HANDLE) -> Result<(), String> {
         )
     };
     if ok == 0 {
-        return Err(last_error("lowering the token to medium integrity"));
+        return Err(last_error(&format!(
+            "lowering the token to {level} integrity"
+        )));
     }
     Ok(())
+}
+
+/// #3048 — an impersonation copy of this process's own token at LOW
+/// integrity: the same user, writing only where low integrity may. The file
+/// tests stand it in for the person a SYSTEM worker writes as: a folder this
+/// process can write and the copy cannot is one the "person" may not write.
+#[cfg(test)]
+pub fn low_integrity_copy() -> Result<Owned, String> {
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenImpersonation, WinLowLabelSid,
+    };
+    let own =
+        own_token(TOKEN_DUPLICATE | TOKEN_QUERY).ok_or_else(|| last_error("OpenProcessToken"))?;
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: a live token opened for duplication; null attributes take the
+    // default descriptor; the out-handle is checked below.
+    let ok = unsafe {
+        DuplicateTokenEx(
+            own.raw(),
+            TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ADJUST_DEFAULT | TOKEN_DUPLICATE,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut out,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("DuplicateTokenEx"));
+    }
+    let token = Owned::new(out).ok_or_else(|| "DuplicateTokenEx returned no token".to_string())?;
+    set_integrity(token.raw(), WinLowLabelSid, "low")?;
+    Ok(token)
 }
 
 /// The DACL of objects the recorder creates without inheriting one — its

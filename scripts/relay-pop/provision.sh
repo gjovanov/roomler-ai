@@ -90,7 +90,20 @@ else
   COTURN_CONF_CHANGED=1
 fi
 envsubst '${REGION} ${COTURN_HOST} ${DERP_HOST}' \
-  < "$POP/nginx-pop.conf.tpl" > "$POP/nginx-pop.conf"
+  < "$POP/nginx-pop.conf.tpl" > "$POP/nginx-pop.conf.new"
+# Copied over IN PLACE, never renamed: compose bind-mounts this one file, and
+# a single-file mount keeps the inode it started with, so a renamed-in copy
+# would never reach the running nginx.
+if cmp -s "$POP/nginx-pop.conf.new" "$POP/nginx-pop.conf" 2>/dev/null; then
+  rm -f "$POP/nginx-pop.conf.new"
+else
+  # A first render needs no reload: `up -d` below starts nginx on it.
+  if [ -f "$POP/nginx-pop.conf" ]; then
+    NGINX_CONF_CHANGED=1
+  fi
+  cat "$POP/nginx-pop.conf.new" > "$POP/nginx-pop.conf"
+  rm -f "$POP/nginx-pop.conf.new"
+fi
 
 # ── start / refresh the stack ────────────────────────────────────────────────
 cd "$POP"
@@ -99,6 +112,18 @@ docker compose -f docker-compose.pop.yml up -d
 # explicitly, but only when the rendered config actually changed.
 if [ -n "${COTURN_CONF_CHANGED:-}" ]; then
   docker compose -f docker-compose.pop.yml restart coturn
+fi
+# Nor nginx (#3656: a template change sat unapplied until nginx next
+# restarted). A reload, not a restart: new workers take the new config and the
+# old ones finish their live DERP sockets and TURN-over-TLS splices. A config
+# nginx refuses leaves the old one serving.
+if [ -n "${NGINX_CONF_CHANGED:-}" ]; then
+  if docker compose -f docker-compose.pop.yml exec -T nginx nginx -t \
+    && docker compose -f docker-compose.pop.yml exec -T nginx nginx -s reload; then
+    echo "nginx: reloaded with the new config"
+  else
+    echo "WARN: nginx did not take the new config; see 'nginx -t' above" >&2
+  fi
 fi
 docker compose -f docker-compose.pop.yml ps
 

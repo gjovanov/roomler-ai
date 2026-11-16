@@ -10,7 +10,19 @@
             {{ $t('auth.register') }}
           </v-card-title>
 
-          <v-form ref="formRef" @submit.prevent="handleRegister">
+          <!-- FR-129 A2: on production the account needs its email
+               activated before it can sign in; while a pairing waits, say
+               so here rather than leaving for the dashboard, and say that
+               signing in afterwards leads back to the pairing. #3247: the
+               note takes the form's place, so it is the first thing on the
+               page and not below the fold, and its words are in the body
+               colour, not pale green on pale green. -->
+          <v-alert v-if="pairingAwaitsActivation" type="success" variant="tonal" class="mb-4" data-test="register-activation">
+            <div class="text-high-emphasis">{{ pairingAwaitsActivation }}</div>
+            <div class="mt-2 text-high-emphasis">{{ $t('auth.pairAfterActivation') }}</div>
+          </v-alert>
+
+          <v-form v-else ref="formRef" @submit.prevent="handleRegister">
             <v-text-field
               v-model="email"
               :label="$t('auth.email')"
@@ -103,17 +115,7 @@
               {{ auth.error }}
             </v-alert>
 
-            <!-- FR-129 A2: on production the account needs its email
-                 activated before it can sign in; while a pairing waits, say
-                 so here rather than leaving for the dashboard, and say that
-                 signing in afterwards leads back to the pairing. -->
-            <v-alert v-if="pairingAwaitsActivation" type="success" variant="tonal" class="mb-4" data-test="register-activation">
-              <div>{{ pairingAwaitsActivation }}</div>
-              <div class="mt-2">{{ $t('auth.pairAfterActivation') }}</div>
-            </v-alert>
-
             <v-btn
-              v-if="!pairingAwaitsActivation"
               type="submit"
               color="primary"
               block
@@ -124,9 +126,9 @@
             </v-btn>
           </v-form>
 
-          <v-divider class="my-4" />
-          <div class="text-center text-body-2 mb-2">{{ $t('auth.orRegisterWith') }}</div>
-          <div class="d-flex flex-wrap justify-center ga-2 mb-4">
+          <v-divider v-if="!pairingAwaitsActivation" class="my-4" />
+          <div v-if="!pairingAwaitsActivation" class="text-center text-body-2 mb-2">{{ $t('auth.orRegisterWith') }}</div>
+          <div v-if="!pairingAwaitsActivation" class="d-flex flex-wrap justify-center ga-2 mb-4">
             <v-btn
               v-for="p in oauthProviders"
               :key="p.name"

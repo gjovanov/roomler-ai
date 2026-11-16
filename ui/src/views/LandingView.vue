@@ -125,6 +125,14 @@
               >
                 Roomler Setup
               </v-btn>
+              <!-- #3202: what the wizard needs before it can run. -->
+              <p v-if="os.wizardUrl && os.wizardHint" class="text-caption landing-muted mt-n2 mb-4">
+                {{ os.wizardHint }}
+              </p>
+              <!-- #3247 item 13: the same wizard for another CPU. -->
+              <p v-if="os.wizardUrl && os.wizardAlt" class="text-caption mt-n2 mb-4">
+                <a :href="os.wizardAlt.url">{{ os.wizardAlt.label }}</a>
+              </p>
               <p class="text-body-2 landing-muted mb-1">
                 {{ os.wizardUrl ? 'Or from a terminal:' : 'From a terminal:' }}
               </p>

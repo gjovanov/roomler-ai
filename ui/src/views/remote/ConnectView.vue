@@ -8,7 +8,8 @@
         <p class="mb-4">
           Enter the connect code and the password the device's owner gave you. The device
           checks the password itself — this server never sees it — and whoever is at the
-          device may still be asked to approve.
+          device may still be asked to approve. They see your name, with your verified email
+          address or a note that your account has none.
         </p>
         <v-form @submit.prevent="submit">
           <v-text-field

@@ -124,6 +124,31 @@ pub struct LiveSession {
     /// member of the org alone. The device binds the login; this only tells the
     /// Hub's own sessions apart.
     pub external: bool,
+
+    /// FR-138 — the row's fencing number (`RemoteSession::attach_seq`) as this
+    /// hub holds it: 0 for a session created here, the committed number for
+    /// one a claim resumed here. Every write the hub decides on its own (a
+    /// detach, an end it decides) carries it and applies only while the row
+    /// is still at it, so a hub that no longer holds the session cannot detach
+    /// or end one another pod resumed.
+    pub attach_seq: u32,
+
+    /// FR-138 — the window this session's viewer was told it may hold the
+    /// session for (`rc:session.created`'s `resume_secs`): set when the
+    /// session is created while the device's connection holds a window, and
+    /// on a session a device's claim rebuilt. `None` = never held: its
+    /// viewer's socket loss ends it, as before FR-138.
+    pub resume_secs: Option<u32>,
+
+    /// FR-138 — counts the viewer's comings and goings on a session it may
+    /// hold: bumped when its socket goes and when it rejoins. The timer a
+    /// departure arms ends the session only if nothing moved since.
+    pub controller_gen: u32,
+
+    /// FR-138 — when the hold for the viewer ends unless it rejoins: set
+    /// when its socket goes and when a device's claim rebuilds the session.
+    /// A rejoin the gate could not decide is told it (`rc:session.detached`).
+    pub held_until: Option<DateTime>,
 }
 
 impl LiveSession {
@@ -163,6 +188,10 @@ impl LiveSession {
             max_duration: None,
             idle_secs: None,
             external: false,
+            attach_seq: 0,
+            resume_secs: None,
+            controller_gen: 0,
+            held_until: None,
         };
         (s, waiter)
     }
@@ -214,6 +243,55 @@ impl LiveSession {
         }
         self.offer_seen = true;
         Ok(())
+    }
+
+    /// FR-138 — a session a claim resumed on this hub, rebuilt from its row:
+    /// live since `started_at`, its consent given and its offer answered long
+    /// ago, so neither can happen again (no consent slot, `offer_seen`), at
+    /// the fencing number the claim committed. It has no controller until its
+    /// viewer rejoins, and the hub that rebuilds it sets the window its
+    /// viewer may take to rejoin (`resume_secs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resumed(
+        id: ObjectId,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        controller_user_id: ObjectId,
+        permissions: Permissions,
+        created_at: DateTime,
+        started_at: DateTime,
+        attach_seq: u32,
+    ) -> Self {
+        Self {
+            id,
+            agent_id,
+            tenant_id,
+            controller_user_id,
+            permissions,
+            phase: SessionPhase::Active,
+            created_at,
+            started_at: Some(started_at),
+            stats: SessionStats::default(),
+            consent_slot: None,
+            consent_mode: ConsentMode::Prompt,
+            watchers: HashMap::new(),
+            controller_tx: None,
+            local_relays: Vec::new(),
+            rc_overlay: RcOverlayMode::Off,
+            relay_region: None,
+            offer_seen: true,
+            pending_request: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: Default::default(),
+            max_duration: None,
+            idle_secs: None,
+            external: false,
+            attach_seq,
+            resume_secs: None,
+            controller_gen: 0,
+            held_until: None,
+        }
     }
 }
 

@@ -306,6 +306,311 @@ The same investigation found the control channel owning itself: its `on_message`
 closure held a strong clone of the channel it is stored in, so a session's control
 channel, and everything its handler captures, was never freed. It now holds a `Weak`.
 
+### ⚠️ The same trap, a fourth time: a close that never reaches the ICE agent (#3716)
+
+Fixed in the vendored `webrtc`, `webrtc-sctp` and `webrtc-ice`, with a net in the agent
+([#3716](https://github.com/gjovanov/roomler-ai/issues/3716)). Here the peer **was**
+`close()`d, but the close stopped partway and was then dropped. Everything it had not
+reached yet stayed alive until the daemon exited.
+
+The agent waits for a peer's close at most `PEER_CLOSE_BUDGET` (5 s,
+`agents/roomlerd/src/signaling.rs:207`), through `close_within_budget`
+(`signaling.rs:314`, #1738). `RTCPeerConnection::close` marks the peer closed at its first
+step, so a later close returns at once. Before #3716 a close that overran was dropped
+where it stood: the ICE agent, every socket and the SCTP association it had not reached
+lived on.
+
+**Field:** 17 UDP sockets per ended session on a Linux system install after a 15 s network
+drop, on every build back to 0.4.213. On Windows, a UDP socket and four TCP sockets (one per
+TURNS relay) after the viewer's tab closed on a `tcp-turn` session. In both cases the
+association went on retransmitting into the dead link once a minute
+(`failed to write packets on net_conn … SCTP retransmits (N in this run)`).
+
+**The stall:** a session's video rides a data channel, written by a send task of its own. When
+the path dies, no SACK comes back, SCTP's 128 KiB send queue fills, and the send task parks in
+flow control. The peer's close then waited behind it, before the SCTP stop
+(`crates/vendored/webrtc/src/peer_connection/mod.rs:1969-1977`), and never got any further.
+
+```mermaid
+sequenceDiagram
+    participant W as video send task
+    participant D as RTCDataChannel
+    participant Q as SCTP pending queue
+    participant C as RTCPeerConnection::close
+
+    Note over W,Q: the path dies: no SACK, the 128 KiB queue fills
+    W->>D: send(): took the slot lock for the whole write
+    D->>Q: append(): holds semaphore_lock, waits for permits forever
+    C->>D: step 3, close(): waits for the slot lock (this channel)
+    C->>Q: or Stream::shutdown → push(EOS): waits for semaphore_lock (any channel)
+    Note over C: never reaches step 4 (SCTP stop), so nothing lets the writer go
+    Note over C: budget: dropped. ICE agent, sockets, association: alive for good
+```
+
+Three links had to break, one in each place that owned it:
+
+| Where | Change | Anchor |
+|---|---|---|
+| `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write. They take turns on a `send_lock` of their own, which `close()` and `buffered_amount()` never take: the slot lock was the only thing ordering a channel's writes, and two at once shared a stream sequence number or split a message | `crates/vendored/webrtc/src/data_channel/mod.rs:378`, `:89` |
+| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:551`, `:291`, `queue/pending_queue.rs:193` |
+| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:264`, `queue/pending_queue.rs:186` |
+
+#1856's comment expected a transport that is really gone to fail the association's `recv`.
+Nothing below SCTP ever fails it on a dead path, because the ICE agent's conn ends only when
+the agent is closed. So it is the peer's close that ends the association, and that close
+can no longer stall before it.
+
+**The Mac's stall point** is a different one. A supervised Mac overran about 1 close in 15 to 26
+plain sessions on a healthy network, on every build. Its DTLS stop was reached, and it waited
+in the ICE agent's candidate sweep. That was not reproduced here. Its two suspects are closed
+off in `crates/vendored/webrtc-ice/src/agent/agent_internal.rs`:
+
+- `add_candidate` closed a late or duplicate candidate while holding `local_candidates`, the
+  lock the sweep takes (`:585`).
+- `delete_all_candidates` closed the local candidates one at a time under that lock, so one
+  close that waits on the network (a relay's TURN client) held the agent's close, and every
+  other socket with it (`:709`).
+
+Now no candidate is closed under the lock. Each local candidate closes on a task of its own,
+and one still closing after 5 s is named in a `closing candidate … is taking over 5s` warning.
+That line names the ICE role and the candidate, not the session, which the ICE agent never
+learns. A remote-desktop session logs each of its local candidates with the session
+(`ICE: gathered local candidate`, `agents/roomlerd/src/peer.rs:903`), and the candidate's
+address and port join the two lines.
+
+**The net under the rest:** `AgentPeer::close` and `TunnelPeer::close` run `pc.close()` through
+`agents/roomlerd/src/peer_close.rs:32`, on a task of its own, bounded by
+`PEER_CLOSE_CEILING` (60 s, `:26`). The caller still waits at most the 5 s budget. A close
+past the budget now goes on to its end, and logs `peer close finished in the background, past
+its budget` (or, at the ceiling, `peer close did not finish within its ceiling`). The overrun
+line now reads `peer close overran its budget — it goes on in the background (#3716)`. A close
+that panicked logs `peer close panicked` with its session and the panic from its own task, so
+the line comes even after the caller stopped waiting, and a caller still waiting gets an error,
+not a clean close.
+
+**Tests** (`agents/roomlerd/src/peer_close_tests.rs`, two plain webrtc-rs peers on a vnet,
+black-box: close time, the parked writer, packets on the wire, the agent's tasks alive on a
+runtime of its own, what the receiver gets):
+
+| Test | Holds | Before the fix |
+|---|---|---|
+| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:353`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, leaves no task, and from 250 ms after it (`IN_FLIGHT`, `:77`) sends nothing for 2 s | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
+| `a_healthy_close_still_takes_milliseconds` (`:421`) | the same close with the path alive | passes, 1 ms here |
+| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:462`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
+| `many_writers_share_one_ordered_channel` (`:578`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
+
+The stand-in viewer runs on a runtime of its own (`on_viewer`, `:95`), so the agent's runtime
+counts the agent's tasks alone. The viewer's peer, the one that offers, now and then keeps two
+tasks alive after its close: in 6 runs of 60 with the agent closing first, and 3 of 30 with the
+viewer first. On a runtime both peers shared, the healthy-close test read them as the agent's
+and failed (`3 tasks alive after both closes, 1 before the peers`). The agent's runtime never
+kept a task past its baseline in those 90 runs.
+
+**How the dead-path test reads the wire.** The vnet router counts a packet on a task of its own,
+after the send that queued it has returned. On a loaded CI runner that task started late, and
+the close's own DTLS close_notify, sent before `close()` returned, was counted inside the 2 s
+window: `the closed peer still put 1 packets on the wire in 2 s`, about one run in three on
+Linux and Windows alike, with nothing sent after the close. So the test reads the wire through
+a probe:
+
+| Piece | What it does |
+|---|---|
+| `ROUTER_LAG` (`:64`) | the test's router holds every packet 20 ms, so the counting lag is there on every run, not one run in three: without the probe the test fails 12 runs of 12 |
+| `Wire::sent_by_agent` (`:138`) | a third host on the wire (`PROBE_IP`, `:47`) sends a marker; the router's queue is first in, first out, so once the marker is counted, so is everything the agent sent before it |
+| `IN_FLIGHT` (`:77`) | the count starts 250 ms after the close. After `close()` the ICE agent's conn refuses every write, so only the ICE connectivity loop can still send: it sees the close between two passes, and a pass under way still sends its STUN check, within 1 ms of the close (3 runs of 120 that closed while the keepalive checks ran) |
+
+The task count is asserted before the wire. When packets went out, it says whether the close
+left something running (a leak) or a last send landed late.
+
+The reset's order has a unit test of its own, on one thread:
+`test_stream_reset_waits_for_a_write_turn`
+(`crates/vendored/webrtc-sctp/src/stream/stream_test.rs:240`). While a write holds its turn,
+the shutdown returns at once and queues nothing. Once the write has queued its message and let
+go of the turn, the reset follows it. Without the reset task's wait for the turn, the queue
+ends [reset, data]. CI runs the vendored crate's tests in the `vendored-sctp` job, beside its
+drift check; how to run them by hand is in [the next section](#%EF%B8%8F-a-send-cut-short-leaves-its-stream-whole-3755).
+
+**Not covered:** a TURNS/TCP leg that is dead but never reset. Its writes block until the OS
+gives the connection up (`crates/tcp-turn-conn/src/lib.rs:257`), with the TURN client's lock
+held across them. Its read side does report a reset or EOF, to the TURN client's read loop
+only: that loop exits, and nothing above it hears. Every field case had the link reset
+(`os error 10054`, `Broken pipe`), so its writes failed fast.
+
+Nor the viewer's two tasks: they were not named, since tokio's task dump runs on Linux only.
+The agent answers in these tests, as it does a browser, and its peer never kept them. As a
+tunnel client the daemon offers too (`crates/tunnel-core/src/driver.rs:1172`), a role these
+tests do not give it.
+
+### ⚠️ A send cut short leaves its stream whole (#3755)
+
+Fixed in the vendored `webrtc-sctp`
+([#3755](https://github.com/gjovanov/roomler-ai/issues/3755)), in agent 0.4.222. It was found
+by reading the code. A lab guest then showed it on 0.4.221 and not on 0.4.222
+([what the lab showed](#what-the-lab-showed-3755)). The tests below are its reproduction in
+the crate.
+
+Every data-channel send ends in `Stream::write_sctp`
+(`crates/vendored/webrtc-sctp/src/stream/mod.rs:291`), which can wait twice before its
+chunks are queued: for the pending queue's lock, and for room in the queue (128 KiB, shared
+by every stream of the association). Upstream spent the write's stream sequence number (SSN)
+and added its bytes to `buffered_amount` in `packetize`, **before** those waits. A caller that
+dropped the write while it waited (a timeout, a `select!` arm, a task abort) kept both
+changes and lost the message. The receiver of an ordered stream delivers SSN *n*+1 only
+after *n* (RFC 4960 §6.6), so it waited for the lost number forever, and every later message
+on that stream waited behind it. The receiver is a browser's SCTP stack, so the fix is on the
+sending side only.
+
+```mermaid
+sequenceDiagram
+    participant C as caller with a timeout
+    participant S as Stream::write_sctp
+    participant Q as pending queue, full
+    participant R as browser, ordered stream
+
+    Note over C,R: before: the commit came first
+    C->>S: notice A
+    S->>S: packetize: SSN n spent, buffered_amount + len
+    S->>Q: append: waits for room
+    C--xS: the timeout drops the write
+    C->>S: notice B
+    S->>Q: queued with SSN n+1
+    Q->>R: B
+    Note over R: holds B until SSN n comes: never
+    Note over C,R: after: the commit comes with the push
+    C->>S: notice A
+    S->>Q: append: waits for room, nothing spent
+    C--xS: the timeout drops the write, nothing of it is left
+    C->>S: notice B
+    S->>Q: room: SSN n spent and B pushed, no await between
+    Q->>R: B with SSN n, delivered
+```
+
+The agent drops send futures on purpose. On the control channel, `send_control_notice`
+(`agents/roomlerd/src/peer.rs:6251`) bounds each attempt with a timeout and retries, and the
+idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
+(`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
+session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
+write on a `tunnel-N` channel, and the eight channels are shared by every flow of the tunnel,
+round-robin (`crates/tunnel-core/src/driver.rs:628`), so one cut flow stalled the flows that
+shared its channel. Each of those cuts loses a message only while the queue is full, which is
+what a congested or dying path makes.
+
+**The class** is a future that changes shared protocol state before its last await. Every
+layer above (`RTCDataChannel::send`, `webrtc-data`, `PollStream`) ends in this one write, so
+the fix is there and no caller changed:
+
+| Where | Change | Anchor |
+|---|---|---|
+| `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:362`, `:384`, `:523` |
+| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:260`, `:283` |
+| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:546`, `:554`, `:487` |
+| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:295` |
+
+**What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:276`):
+
+- dropped at any await before its first chunk is queued, a write leaves no trace: the SSN and
+  `buffered_amount` are as if it had never been called, nothing of it is sent, and the next
+  write is delivered;
+- a write that returned `Ok` was queued whole, in order;
+- a write of 87,381 bytes or more, dropped after its first chunk was queued, is delivered
+  whole, once, in its place. A caller that retries it may deliver it twice.
+
+⚠️ **The product reaches only the first two.** The agent's associations keep the default
+maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
+(`crates/vendored/webrtc/src/sctp_transport/mod.rs:162`), which means the default
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:105`,
+`association/mod.rs:61`), and `prepare_write` refuses a larger write before it waits
+(`stream/mod.rs:317`). So every agent and tunnel send is below the large threshold and is all
+or nothing: a cut send was never sent. `send_control_notice`'s retry therefore sends its notice
+once, and a tunnel write (at most 65,535 bytes, `crates/tunnel-core/src/forward.rs:68`) is the
+same. The begun-message path and its overdraft are reached only by the tests. The drop records
+the debt before it reads the room, so a `pop` on another worker thread that decides what it
+pays after that pays the debt instead of freeing room. One race is left: a `pop` decides what it
+pays, then gives the rest of its chunk back as room, in two steps, and one that decided before
+the debt was recorded gives its room back after the drop read the room. So **one chunk of room
+can be free per racing drop** while the rest is owed; a large message that begins on it and is
+cut while the debt is owed adds its own rest, **one rest per race**, so **at most (1 + races)
+times the largest message is owed**. On one thread no `pop` runs during a drop, and nothing is
+free while anything is owed. **At rest the accounting is exact**: room + queued bytes −
+overdraft = the queue's size.
+
+**On the success path** nothing was added that a send pays for: no lock, allocation or task.
+The same two atomic updates run later, the first try for room is a `try_acquire_many` (cheaper
+than building the semaphore's wait when there is room), the commit is a closure call, and a
+`pop` makes one more atomic load while nothing is owed.
+
+**Tests** (`crates/vendored/webrtc-sctp/src/`; the association tests run a pair over the
+crate's in-memory bridge, with a queue of a few KiB, and close the pair at the end):
+
+| Test | Holds | On master's code |
+|---|---|---|
+| `test_assoc_a_write_cut_by_its_timeout_leaves_no_gap` (`association/association_test.rs:2866`) | video fills the queue while the link holds every packet; a timeout cuts a notice on the ordered control stream; once the link moves, the next notice is read, and `buffered_amount` is what it was before the cut, then 0 | `the next notice never arrived: the peer waits for the cut notice's stream sequence number`; `buffered_amount` 1,500 once everything was acknowledged |
+| `test_assoc_a_large_write_cut_part_way_is_never_read_in_part` (`:3002`) | a 20,000-byte write cut after its first chunks: the peer reads it whole, once, then the next message | the next message never arrived; `buffered_amount` 12,800 at rest |
+| `test_assoc_writes_cut_at_any_wait_keep_the_stream_whole` (`:3532`) | seeded: writers share one ordered stream, each write awaited or cut at a random wait (turn, lock, room, a later chunk's room): only whole messages, each writer's in order, none twice, every `Ok` write read; every task's end is read, so a panic in the write path fails the round; no large message begins while anything is owed, and the overdraft stays under the largest message | seed `0x3755`: 37 of the 47 writes that returned `Ok` were never read |
+| `test_assoc_writes_cut_on_two_threads_keep_the_queue_accounting` (`:3561`) | the same on two worker threads, and the queue's accounting exact once drained; at every sample while the writers run, the overdraft is at most (1 + the large messages that began while something was owed, as the queue counts them) times the largest message | uses the fix's accessors |
+| `test_assoc_a_message_larger_than_the_queue_goes_out_on_a_quiet_association` (`:3134`) | the wake: a message larger than the free room, on an idle association, goes out | `the write never finished: its first chunks were never sent` |
+| `test_stream_a_write_dropped_at_any_await_leaves_no_trace` (`stream/stream_test.rs:354`) | the stream's SSN, `buffered_amount` and queue after a drop at each await | each drop spent an SSN and the write's bytes |
+| `test_stream_a_write_refused_before_the_association_is_up_leaves_no_trace` and `test_stream_an_empty_write_spends_no_sequence_number` (`:566`, `:613`) | a write refused before the association is established, and an empty write, leave the SSN, `buffered_amount` and queue as they were; the next write takes the number | (SSN, `buffered_amount`, chunks) after the refused write (1, 5, 0), after the empty one (1, 0, 0), not (0, 0, 0) |
+| `test_pending_queue_an_append_cut_before_it_has_room_leaves_no_trace` and the four `test_pending_queue_a_begun_message_dropped_*` (`queue/queue_test.rs:517`, `:543`, `:618`, `:667`, `:706`) | the queue alone: a cut append leaves no trace; a begun message's drop queues its rest, owes the room and wakes the write loop, queues nothing once the queue is closed (what a `pop` paid meanwhile is room again), and works outside any runtime and while unwinding | uses the fix's accessors |
+| `test_pending_queue_pops_during_a_drop_pay_its_debt_first` (`:750`) | a stand-in for the write loop on another thread pops 0 to 3 whole chunks at each step of a begun message's drop, every one after the debt was recorded: those pops pay the debt before they give room, so none of their room is left free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
+| `test_pending_queue_a_pop_split_around_a_drop_frees_at_most_its_chunk` (`:820`) | the race that is left: a `pop` on another thread, held between what it pays and the room it gives back while a drop records its debt and reads the room, leaves at most its own chunk free while the rest is owed; a large message that begins on it and is cut adds one rest, within (1 + races) times the largest message; every later `pop` pays first; the queue drains whole, in order, to rest | uses the fix's accessors |
+
+**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3111`), which is not
+yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
+other `cargo test` builds it. The job seeds the fork's standalone build with the workspace's
+`Cargo.lock`, so the tests run against the tokio the agent ships, and skips the two
+`fuzz_artifact_test` tests, which fail on any checkout: the crates.io tarball ships no
+`fuzz/` tree. By hand:
+
+```bash
+cp Cargo.lock crates/vendored/webrtc-sctp/Cargo.lock
+cargo test --manifest-path crates/vendored/webrtc-sctp/Cargo.toml --lib -- --skip fuzz_artifact_test
+rm crates/vendored/webrtc-sctp/Cargo.lock   # before a revendor --regen or --check, which would read it as drift
+```
+
+The fork's deltas, #3755's among them, are listed in its `Cargo.toml` header, and
+`crates/vendored/webrtc-sctp.patch` is the ledger `scripts/revendor-webrtc-sctp.sh` checks.
+
+#### What the lab showed (#3755)
+
+A Linux lab guest (GNOME on Wayland, the agent as a root service) and a browser viewer on a
+second machine: direct path, VP9 4:4:4 over the data channel. A step script on the guest
+dropped every DTLS record of the session in both directions for a few seconds, twice a run,
+and locked the session 2.3 s into each cut, while a window of changing content kept the video
+writer busy. The rule was written before the counted runs, and it and every run are on
+[the issue](https://github.com/gjovanov/roomler-ai/issues/3755).
+
+| Agent | Cut | DTLS dropped, outgoing | "Host locked" on the stream that was live at the lock | Then |
+|---|---|---|---|---|
+| 0.4.221, one run | 6.4 s | 325,401 B | never | "video stalled", then a new connection 15.5 s after the lock |
+| 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
+
+**What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10829`) was lost, and nothing the agent
+sent on the control channel after it was read. On this guest a locked session sends no video.
+The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
+(`ui/src/composables/useRemoteControl.ts:5819`), and no such word could arrive. So it asked
+for a keyframe 6 s after the last picture and built a new connection at 10 s (`:320-322`,
+`:681-683`): 15.5 s after the lock. The new connection showed "Host locked".
+
+**The defect needs three things at once**, which is why it was rare, and why a one-way test
+never shows it:
+
+| Condition | Why | Anchor |
+|---|---|---|
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4328`, `:5273`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2353` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11458`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1510`, `:6251`, `agents/roomlerd/src/lock_state.rs:333` |
+
+A real path failure cuts both directions. The second row is read from the source: two runs on
+0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every
+notice, and the runs do not show the send turn directly. For the third row, one two-way run
+on 0.4.221 with a 5.4 s cut delivered its notice, so the counted runs used 6.4 s.
+
+**Not covered:** the unlock direction (a locked session sends no video on this guest, so
+nothing fills the queue), a relayed path, a Windows or macOS host. The change is in the SCTP
+layer all of them share.
+
 ### ⚠️ Every client path that ends a session must tell the exit agent (#1754)
 
 The leaks above are the *client* failing to free its own sockets. This one is the
@@ -514,7 +819,7 @@ Where it fires:
 | End | Trigger | Where |
 |---|---|---|
 | exit | `AgentTunnelPeer::close` — the one method every real teardown reaches: the `rc:tunnel.terminate` arm, the #1754 reap, and the WS-disconnect sweep (`close_all_tunnel_peers`) | [`peer.rs:347`](../agents/roomlerd/src/tunnel/peer.rs), the handle passed to the flow at [`acceptor.rs:186`](../agents/roomlerd/src/tunnel/acceptor.rs) |
-| client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:495`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1327` |
+| client | the DC carrier being dropped (`kill_flow`, the session dying, a re-upgrade drain reaching zero, the standalone CLI's session end) — a `CancelOnDrop` in `Plane::Dc` fires it from `Drop` | [`driver.rs:486`](../crates/tunnel-core/src/driver.rs) · installed at `driver.rs:1269` |
 
 ⚠️ **The exclusion is `close`, not the loop exit.** The cancel is tied to
 `AgentTunnelPeer::close`, so a peer that is **kept** — never closed, e.g. one
@@ -555,7 +860,7 @@ exit's own log:
 | Exit time (UTC) | Event |
 |---|---|
 | 18:32:39.9 · 18:33:00.2 · 18:33:20.5 · 18:33:40.8 | `agent QUIC peer ready` (QUIC-over-TURN) for four sessions — **exactly 20.3 s apart, strictly serial** |
-| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:286`) |
+| 18:33:40.76 | `agent QUIC-over-DERP peer ready` for a session the client opened at **18:33:02** and abandoned at **18:33:32** — the quic-derp branch is synchronous and instant, and still answered 38 s late, past the client's 30 s `QUIC_READY_TIMEOUT` (`crates/tunnel-core/src/driver.rs:285`) |
 | 18:33:40.77–.80 | the WebRTC fallbacks' SDP answers, in the same burst, also late |
 | 18:32:09 | `torn down agent QUIC tunnel peers on ws disconnect count=4` — the exit's control WS had dropped mid-backlog, its keepalives unanswered |
 
@@ -587,19 +892,19 @@ sequenceDiagram
     S->>C: relayed
 ```
 
-The channel (`signaling.rs:672`) has the #1754 reap channel's shape: created in
+The channel (`signaling.rs:800`) has the #1754 reap channel's shape: created in
 `signaling::run` **per org loop** — a process-global sender would land a secondary
 org's peer in the primary's maps — borrowed into every `connect_once`, a sender
 retained for the loop's life so the receiver never closes. The in-flight
 bookkeeping is `PendingQuicSetups` (`agents/roomlerd/src/tunnel/quic_setup.rs`),
-fresh per connection (`signaling.rs:1481`) like the session maps, and free of I/O
+fresh per connection (`signaling.rs:1707`) like the session maps, and free of I/O
 so tests drive it directly:
 
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
-| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `signaling.rs:3882`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:4093`, `quic_setup.rs:258` |
-| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `signaling.rs:2105` |
+| `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `signaling.rs:4380`, `quic_setup.rs:243` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:5726`, `quic_setup.rs:258` |
+| the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `signaling.rs:3194` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
 | the control WS ends | the entry map dies with the connection (one log line names how many were in flight); the results reach the next connection and are closed there. The #1754 teardown and R3 parking of the **maps** are unchanged | `quic_setup.rs:335` |
@@ -652,12 +957,12 @@ established beside the first, promoted, the first drained.
 
 | Piece | What it is | Where |
 |---|---|---|
-| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:986`](../crates/tunnel-core/src/driver.rs) |
-| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:454`](../crates/tunnel-core/src/driver.rs) · `carry` `:615` · `dead` `:801` |
-| `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:172` · `offer` `:219` |
+| `establish_tunnel_session` | everything a session did up to (not including) its bind — hello/open, the transport handshake, the DC pool open or the QUIC connection authenticated, the dispatcher task, the keepalive, the #1754 terminate guard — returning `Establishment::Established(carrier)`, or the same `QuicSetupFailed` soft-fall the ladder always keyed on | [`driver.rs:955`](../crates/tunnel-core/src/driver.rs) |
+| `Carrier` | **one type for both transports** — they differ only in the plane they pump on, everything else (sink, session id, target, reply registry, the P7 backstop, the dispatcher, the guard) is the same object. `carry(tcp, peer_addr)` spawns exactly the per-connection task the accept loop used to; `active()` counts connections in flight; `dead()` is the accept loop's old exit arms (the dispatcher exited · the P7 backstop tripped · QUIC `conn.closed()`), sending the same `io_error` terminate the loops sent; **dropping it is the old end of the session function** — dispatcher aborted, peer closed, terminate sent | [`driver.rs:445`](../crates/tunnel-core/src/driver.rs) · `carry` `:606` · `dead` `:770` |
+| `FlowListener` | the flow's port: bound **once**, an accept task hands each connection to the current carrier — or **holds** it while there is none — under one lock, so "no carrier ⇒ hold" and "install ⇒ drain the hold" cannot interleave to strand one, and (#1816) the hand-off itself — `carry`, which counts the connection — runs under that lock too, so it cannot interleave with a promotion's swap | [`flow_listener.rs:90`](../crates/tunnel-core/src/flow_listener.rs) · `install` `:150` · `offer` `:197` |
 | `HoldPolicy` | the hold's bounds: at most **64** connections, each for at most **30 s**; past either bound the connection is **closed** (the client sees EOF), never refused | [`flow_listener.rs:67`](../crates/tunnel-core/src/flow_listener.rs) |
-| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1294`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1459` `run_flow_cycle` |
-| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:924`](../crates/tunnel-core/src/driver.rs) |
+| the daemon's flow | binds once when its supervisor starts (a failed bind retries on the same ladder a failed session did), runs the transport ladder to a carrier, installs it, waits for `dead()`, clears, backs off — the port bound throughout | [`client_mgr.rs:1202`](../agents/roomlerd/src/tunnel/client_mgr.rs) `run_flow_supervisor` · `:1364` `run_flow_cycle` |
+| the standalone CLI | `run_tunnel_session` composes establish + a private accept loop with a per-session bind, so `roomler forward` / `socks5` behave exactly as before | [`driver.rs:893`](../crates/tunnel-core/src/driver.rs) |
 
 ```mermaid
 sequenceDiagram
@@ -680,7 +985,7 @@ sequenceDiagram
 
 ⚠️ **`Up` still means "it serves", not "it is bound".** The flow's port is bound
 before any session exists, so #1685's rule had to move one step: `FlowLive::mark_listening`
-([`client_mgr.rs:210`](../agents/roomlerd/src/tunnel/client_mgr.rs)) now fires when a
+([`client_mgr.rs:195`](../agents/roomlerd/src/tunnel/client_mgr.rs)) now fires when a
 carrier is **installed** — the same call that hands it the held connections — not from a
 bind hook. A route to an offline node reads `backoff` exactly as before; a held connection
 is not a serving route. (`SessionParams::on_listening` stays for `run_tunnel_session`'s
@@ -698,7 +1003,7 @@ open's 15 s and the ready's 30 s are caps a healthy exit cuts to 1–5 s) and is
 client timeout worth waiting out. Both are constants in P1, not config.
 
 ⚠️ **Nothing about #1754 moved.** The terminate guard is created at the same point
-([`driver.rs:1100`](../crates/tunnel-core/src/driver.rs), the moment the session id is
+([`driver.rs:1056`](../crates/tunnel-core/src/driver.rs), the moment the session id is
 known) and *moves into the carrier*, so an early `?`, a `QuicSetupFailed` soft-fall, the
 carrier's drop and the `kill_flow` abort all still tell the exit, and `kill_flow`'s
 synchronous fast path is unchanged. A killed flow drops its listener — the accept task is
@@ -756,7 +1061,7 @@ sequenceDiagram
 ```
 
 The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_mgr.rs) ·
-[`client_mgr.rs:870`], mapped to deadlines by [`ProbeTimer`] `:907`), reset on a netwatch
+[`client_mgr.rs:778`], mapped to deadlines by [`ProbeTimer`] `:815`), reset on a netwatch
 **Major** and after a **promotion**, at most **one candidate per flow** in flight:
 
 | Failed probes | Next probe after |
@@ -769,15 +1074,15 @@ The schedule (a pure [`ReupgradeBackoff`](../agents/roomlerd/src/tunnel/client_m
 
 | Piece | What it is | Where |
 |---|---|---|
-| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:950`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:970` |
-| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1166`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1203` · `CandidateGuard` `:1130` |
-| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1459`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
-| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1093`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:1064` · `spawn_drain` `:1121` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:595` |
+| the probe gate | `auto` flow **and** kill switch on (`reupgrade_active`); a pinned transport never probes | [`client_mgr.rs:858`](../agents/roomlerd/src/tunnel/client_mgr.rs) · ranking `better_transports` `:878` |
+| the candidate | a background task that runs the restricted ladder — only transports **better** than the active one, best first — over the shared agent WS, into a throwaway `FlowLive` so a failed/aborted probe never touches the live route's demux | [`spawn_candidate` `:1074`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `establish_candidate` `:1111` · `CandidateGuard` `:1038` |
+| promotion | `listener.install(candidate)` (new connections → candidate, atomically) + `FlowLive.transport`/`session_id` updated + one info line; the old carrier becomes draining | [`run_flow_cycle` `:1364`](../agents/roomlerd/src/tunnel/client_mgr.rs) |
+| the drain | the old carrier keeps its established connections until `active()` hits 0 (or it dies), then is dropped → terminate → the exit frees its peer, and its demux entry is reaped — both from a guard, so an aborted reaper ends the same way | [`drain_carrier` `:1001`](../agents/roomlerd/src/tunnel/client_mgr.rs) · `DrainGuard` `:972` · `spawn_drain` `:1029` · [`Carrier::drained`](../crates/tunnel-core/src/driver.rs) `driver.rs:586` |
 
 ⚠️ **A draining connection is NEVER cut, and there is no maximum drain time.** An RDP
 session that lives for hours keeps its old carrier for hours. The old carrier is dropped
 only when its own `active()` reaches 0 — signalled by a `Notify` the RAII in-flight
-counter fires on the last decrement ([`Carrier::drained`], `driver.rs:595`), not by any
+counter fires on the last decrement ([`Carrier::drained`], `driver.rs:586`), not by any
 timer. Cutting it would defeat the whole point.
 
 ⚠️ **A draining carrier's end runs on every exit of its reaper — abort included**
@@ -848,254 +1153,172 @@ Locked by lib tests, each shown red with a one-line negative control:
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
-   as *subject* (user / tunnel client / agent / an agent session, below) ×
-   *target* (agent) × *destination* (`host:port`, protocol). Managed in the
-   admin UI; every decision lands in `tunnel_audit` (90 d).
+   as *subject* (user / role / tunnel client / agent / all users) ×
+   *target* (agent) × *destination* (`host:port`, protocol), the originator
+   matched as [below](#who-a-forward-is-matched-as-3635). Read and written
+   only by holders of `MANAGE_AGENTS` (the org's owner and admins), on the
+   **Network → ACL** page's Tunnel ACL tab, as the overlay ACL is; every route, the
+   list included, refuses a member without it 403 `forbidden`
+   ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
+   The forward itself reads no permission bit: the policy is the grant, made to let
+   people who hold no management bit reach what a holder named them for
+   (`crates/modules/network/src/tunnel.rs:1114`). Every decision lands in
+   `tunnel_audit` (90 d). A device the org
+   removed is refused as a target while it is removed; if its machine enrolls
+   again, the device is taken out of every live policy's subjects and targets
+   before its row comes back, because it comes back as a new device (#3627). A
+   policy left naming nobody grants nothing and stays in the list to edit.
 2. **Agent-local `forward_acl`** (config.toml): the exit machine's own last word —
    it survives a compromised server. Empty-but-enabled means "trust the server".
 
-### An agent session's grant (FR-90 P3-7-2a)
+### Who a forward is matched as (#3635)
 
-A Hive agent session ([hive.md](hive.md)) reaches a private subnet, or the
-internet from a chosen place, through these same tunnels, but never as its
-device. It asks the vault, which decides by policy and answers with a
-**grant** ([vault.md](vault.md) §21): a token signed under its own `net_grant`
-audience. The grant names the session, its owner, the device it runs on (the
-origin), the exit, a forward's one destination, and an end at most 900 s away.
-The device presents it on `rc:tunnel.open`, over its own agent WS. The server
-binds it to that tunnel, and every flow the tunnel carries is then the
-**session's**, never the device's. No device presents one before P3-7-3.
+A forward is matched in the org whose policies decide it, the target device's
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1108`); a forward from
+another org is refused `cross_tenant` whatever those policies say. In that org the
+originator is matched as the person it acts for, its `owner_user_id`:
 
-```mermaid
-sequenceDiagram
-    participant D as roomlerd (the session's device)
-    participant S as network module
-    participant E as exit
-    D->>S: rc:tunnel.open {agent_id: exit, open_nonce, net_grant}
-    S->>S: verify_net_grant: signature, audience, kind, destination, life
-    S->>S: an agent's own WS? its organization? origin = this device? exit = agent_id?
-    alt the grant holds
-        S-->>D: rc:tunnel.opened {session_id, open_nonce, net_grant_id}
-        D->>S: rc:tunnel.tcp.request {session_id, flow_id, dst}
-        S->>S: the grant first: TCP, before its end, a forward's one destination
-        S->>S: then tunnel_policies, for Principal::Session
-        S-->>D: rc:tunnel.tcp.reject {kind: acl_denied}, until a policy names sessions
-        S-->>E: rc:tunnel.tcp.forward, once one does (decision 20, P3-7-2b)
-    else it does not
-        S-->>D: rc:error {code: net_grant_refused, message, open_nonce}
-    end
-```
+| Originator | `UserId` | `RoleId` | `TunnelClientId` / `AgentId` | `AllUsers` |
+|---|---|---|---|---|
+| A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
+| A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
 
-| At the open, in order | Refused `net_grant_refused`, with the message |
-|---|---|
-| it came on an agent's own WS, not a tunnel client's | `a session's grant rides only its own device's connection` |
-| it verifies as a grant: this server's signature, the `net_grant` audience, a kind this build names, a forward's host canonical, every id it names an id, a life of at most 900 s, and before its end, with no leeway | `not a grant this server signed, or it has ended` |
-| its organization is this connection's | `a grant for another organization` |
-| its origin is this connection's device | `a grant for another device` |
-| its exit is the open's `agent_id` | `a grant for another exit` |
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`),
+through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:757`),
+the same read every gate that matches a role makes
+([permissions.md](permissions.md#which-roles-count-the-orgs-own-read-where-they-are-used)):
 
-| At each flow, before any policy is read | Rejected `acl_denied`, with the reason |
-|---|---|
-| TCP: a session's listener serves CONNECT only | `a session's grant carries TCP only` |
-| before the grant's end | `the session's grant has ended` |
-| a forward: toward the grant's one destination, its host compared in `canonical_net_host`'s one spelling | `outside the session's grant` |
-
-- ⚠️ **A grant that does not hold refuses the open.** It never falls back to
-  the device's own principal, which would hand the session whatever its device
-  may reach.
-- ⚠️ **A session matches no subject yet.** `subject_matches` answers `false`
-  for `Principal::Session` before it reads a subject: `AllUsers`, the owner's
-  `UserId` and the device's `AgentId` included. Which subjects match a session
-  is the operator's decision 20 (FR-90 §6), built in P3-7-2b. Until then a
-  session's flow passes its grant and every policy refuses it, so no policy
-  written before P3-7 opens anything to a session.
-- ⚠️ **The grant's end refuses new flows; it does not cut open ones.** A flow
-  admitted before the end runs until either side closes it. Ending it with
-  the grant is the device's job: its listener goes at the grant's end and its
-  flows with it, both halves (#2129, P3-7-3). The grant's life is at most
-  900 s.
-- ⚠️ **An older server ignores the grant** (an unknown field) and opens the
-  tunnel as the device's own. `net_grant_id` on `rc:tunnel.opened` is the
-  device's proof that its grant was bound: a device that presented one carries
-  no session flow over a tunnel opened without it (P3-7-3).
-- **The audit names the session.** Every `tunnel_audit` row of such a tunnel
-  carries `session_id` and `grant_id`; its `user_id` is the session's owner,
-  and `origin_agent_id` stays the device.
-
-| Piece | Where |
-|---|---|
-| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2206`](../crates/remote_control/src/signaling.rs#L2206)), `net_grant_id` on `rc:tunnel.opened` ([`:4020`](../crates/remote_control/src/signaling.rs#L4020)) |
-| the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
-| each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
-| the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
-| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:5040`](../crates/remote_control/src/models.rs#L5040)) |
-| tests | `tunnel::tests` in the network module (3), `policy::tests::a_session_matches_no_subject_yet`, `signaling::tests::tunnel_open_carries_a_grant_and_opened_echoes_its_id`, and end to end [`tunnel_grant_tests.rs`](../crates/tests/src/tunnel_grant_tests.rs) (3) |
-
-#### The device's half: asking, and opening under the grant (P3-7-3a)
-
-The session's device asks the vault (`rc:vault.net`) and opens its tunnel
-under the answer. The tools `net_socks` and `net_forward` call it (P3-7-3c,
-below), and the listeners they serve are P3-7-3b's.
+- **On every forward request**, never at enrollment or when the socket connects. A
+  role given counts from the person's next forward, on a tunnel that is already open
+  too; a role taken back, or the person's removal from the org, refuses the next one
+  (`acl_denied`).
+- **Only roles that org has count**: a role of another org, or one this org no longer
+  has, satisfies no policy here.
+- **Only when a live policy names a role.** Otherwise no role list could change the
+  decision, and nothing is read.
+- **A read that fails gives no roles**, with a WARN naming the origin
+  (`tunnel forward: roles unreadable; role subjects will not match this forward`).
+  Role subjects then match nobody on that forward, every other subject kind evaluates
+  as before, and it never becomes an allow.
+- **A device acts for its owner**, so it matches its owner's roles, and stops matching
+  them once the owner is no longer a member of the org: they hold no role there. The
+  device itself stays, because removing one is a device manager's decision.
+- **A role is a group of people here.** The forward reads which roles the person
+  holds, never a role's permission bits: the policy is the grant (item 1).
 
 ```mermaid
-sequenceDiagram
-    participant T as the session's tool (P3-7-3c)
-    participant V as the daemon's vault client
-    participant H as the daemon's tunnel client hub
-    participant S as server
-    T->>V: net(session, fence, exit, dst?)
-    V->>S: rc:vault.net
-    S-->>V: rc:vault.net.granted {grant_id, grant, expires_at_ms, host?, port?}
-    V->>V: does it grant what was asked? else NotAsked
-    V-->>T: NetGrant, its end on this clock, never past 900 s
-    T->>H: a flow under the grant
-    H->>S: rc:tunnel.open {net_grant}, at every open of the flow
-    S-->>H: rc:tunnel.opened {net_grant_id}
-    H->>H: is the echo the grant's id? else NotBound, and the exit is told
+flowchart TD
+    REQ["rc:tunnel.tcp.request / rc:tunnel.udp.request"] --> POL["read the live policies<br/>of the target device's org"]
+    POL --> ANY{"does a live policy<br/>name a role?"}
+    ANY -- no --> NONE["no roles, nothing read"]
+    ANY -- yes --> READ["read the roles the owner holds in that org,<br/>keeping roles the org has"]
+    READ -- read --> ROLES["those roles"]
+    READ -- failed --> WARN["no roles + WARN"]
+    NONE --> EVAL["evaluate: first match wins, default deny"]
+    ROLES --> EVAL
+    WARN --> EVAL
+    EVAL -- allow --> FWD["relay the forward to the device"]
+    EVAL -- deny --> REJ["reject: acl_denied"]
 ```
 
-| On the device | Ends with | Why |
-|---|---|---|
-| the vault's answer grants another destination, another port, a destination for SOCKS, or no token | `LeaseError::NotAsked` | a grant is used for exactly what the session asked, or not at all |
-| the server refuses the open (`net_grant_refused`) | `GrantError::Refused`, in the server's words | the grant does not hold, and another open would present the same grant |
-| `rc:tunnel.opened` does not echo the grant's id | `GrantError::NotBound` | a server from before P3-7-2a ignored the grant and opened the tunnel as the device's own |
-
-- ⚠️ **Both `GrantError`s end the flow for good** (`permanent_session_error`,
-  by the error's type). A daemon flow otherwise retries forever, and this one
-  would present the same grant to the same server. The session asks again.
-- ⚠️ **The echo is checked after the terminate guard is armed**, so a tunnel
-  that ends `NotBound` still tells the exit to drop its peer (#1754).
-- ⚠️ **The token is never logged.** `SessionGrantRef` and `NetGrant` print the
-  grant's id alone, and `rc:vault.net.granted` has an arm of its own in the
-  daemon's signalling: the catch-all logs every frame it is handed.
-
-| Piece | Where |
+| Test | What it locks |
 |---|---|
-| asking | `vault::net` ([`vault.rs:884`](../agents/roomlerd/src/vault.rs#L884)) and its answer `on_net_granted` ([`:1049`](../agents/roomlerd/src/vault.rs#L1049)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6613`](../agents/roomlerd/src/signaling.rs#L6613)) |
-| presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
-| the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1737`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1737)) |
-| the code | `NET_GRANT_REFUSED` ([`vault.rs:575`](../crates/remote_control/src/vault.rs#L575)), shared by the server and the device |
-| tests | `driver::tests` (4), `tunnel::client_mgr::tests::a_refused_or_unbound_grant_ends_the_flow`, `vault::tests::client` (2): 7, and 13 negative controls |
+| `tunnel_role_subject_tests::a_role_subject_forwards_for_a_member_who_holds_the_role_and_for_no_one_else` (`crates/tests/src/tunnel_role_subject_tests.rs:297`) | a holder of the role forwards; a member without it is refused `acl_denied` |
+| `…::the_role_is_read_on_every_forward_so_losing_it_or_the_org_stops_the_next_one` (`:342`) | on one open session: the role taken back refuses, given back allows, the person removed from the org refuses |
+| `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:398`) | a device forwards on its owner's role, and is refused once the owner left the org |
+| `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:455`) | a role of another org, and a role the org deleted, grant nothing here; the rule naming the other org's role is a stored one, because a policy write takes only the org's roles |
+| `…::the_other_subject_kinds_forward_as_before` (`:539`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2188`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
-#### The device's listeners (P3-7-3b)
+### A retired agent-session grant is refused (FR-137)
 
-A session's flow serves on loopback, to the session's account alone.
-P3-7-3c's tools create them (below).
+Parked FR-90 let an agent session open a tunnel under a grant its vault signed,
+presented as `net_grant` on `rc:tunnel.open`. That code is off master, but a
+0.4.199 device still sends the field, and `ClientMsg` ignores a field it does not
+know. Dropped from the wire, such an open would parse as the device's own and
+reach whatever the device may reach. So:
 
-```mermaid
-flowchart LR
-    APP["a process of the session's account"] -->|"127.0.0.1, a port the system picked"| L["the flow's listener"]
-    OTHER["another account's process"] -.->|"refused: closed, never held"| L
-    L --> SOCKS{"SOCKS5?"}
-    SOCKS -->|"RFC 1929: the listener's credential, CONNECT alone"| T["the tunnel, under the grant"]
-    SOCKS -->|"a forward: its one destination"| T
-    T -->|"the grant's end"| END["listener closed; every connection ended, both halves"]
-```
+- `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
+  (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
+- the server refuses any open that carries one, at step 3c
+  (`crates/modules/network/src/tunnel.rs:698`), before a tunnel session exists
+  (step 4, `:780`), with `rc:error {code: net_grant_refused}`
+  (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
+  end of its grant, never as a reason to retry.
 
-| What | How |
+`a_tunnel_open_with_a_net_grant_is_refused`
+(`crates/tests/src/parked_wire_tests.rs:89`) locks it. The field may go once no
+agent at 0.4.199 or older is left (FR-137 D8). The other surfaces FR-90 left
+reserved are listed in
+[retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
+
+## What ends a tunnel client
+
+A tunnel client acts for the person whose enrollment token enrolled it, its
+`owner_user_id`: the gate above matches it as that person (`AllUsers`, their
+`UserId` grants, and the roles they hold in the org for `RoleId` grants), and its
+overlay node is a peer of the org's mesh. For a paired client that person is
+whoever approved the pairing, so an admin who mints the token for someone else's
+laptop, or approves its pairing, owns that client.
+
+Three things end one, all through one removal (`end_tunnel_client`,
+`crates/modules/network/src/routes/tunnel.rs`): the row is tombstoned and its
+`token_gen` advanced, THEN its overlay node is released, so the peers hear
+`removes` and the address goes back to the pool. Tombstone first, because from there
+a join on the socket the client still holds takes no address, and the release
+cannot be followed by a lease nothing would release.
+
+| What ends it | Where |
 |---|---|
-| the port | `127.0.0.1`, one the system picks, bound before the flow is handed back, so the address a tool answers with already serves |
-| the account | every connection is first asked of an admit hook on the flow's listener (`FlowListener::bind_admitting`), before it is held or carried. The hook makes the check `vault_connect`'s endpoints make (`connection_is`): the connection table and the process's token on Windows, `/proc/net/tcp` on Linux, the descriptors each process holds on macOS. Where the system cannot say, nothing is served |
-| SOCKS5 | RFC 1929 alone, with the listener's own credential (the session's id, and a capability made for the listener), compared in constant time; CONNECT alone (`Target::SessionSocks5`). Every other listener keeps its no-auth |
-| its end | the grant's: the flow is killed, its listener closes, what it held is released, and every live connection ends with the carrier, both halves (#2129) |
+| A device manager removes it: `DELETE …/tunnel-client/{cid}` (`MANAGE_AGENTS`) | `delete_tunnel_client` |
+| Its owner stops being a member of the org: an admin removes them, or they leave | `network`'s `MembershipLifecycle` hook, `crates/modules/network/src/membership.rs` |
+| The org is archived (#3042) | `network`'s `TenantLifecycle` hook, `crates/modules/network/src/hooks.rs` |
 
-- ⚠️ **The account is checked before the hold.** A connection from another
-  account is never queued for a carrier, so it cannot wait out a reconnect and
-  be carried later.
-- ⚠️ **RFC 1929 is the second lock, not the first.** Two sessions can run as
-  one account, and the account check cannot tell them apart; the capability
-  keeps one session off the other's SOCKS listener. It guards against a
-  mistake between them, not against each other: an account's processes can
-  read what its sessions keep, the transcript that carries the capability
-  included (P3-7-3c, below).
+From the tombstone on, a reconnect is told `rc:tunnel.revoked` and stops, a renewal
+and the agent roster answer 401, and the client takes no address. Its open socket
+closes at the next 60 s revocation poll, on whichever pod holds it; until then it can
+still open forwards, the window a `DELETE` has always had. A grant through a role has
+no such window: the forward reads the owner's roles in the org on every request, and
+a person who is no longer a member holds none there, so their next forward through a
+`RoleId` grant is refused `acl_denied`
+([above](#who-a-forward-is-matched-as-3635)).
 
-| Piece | Where |
-|---|---|
-| the hook | `Admit` ([`flow_listener.rs:122`](../crates/tunnel-core/src/flow_listener.rs#L122)), `FlowListener::bind_admitting` ([`:133`](../crates/tunnel-core/src/flow_listener.rs#L133)), asked before the hold ([`:304`](../crates/tunnel-core/src/flow_listener.rs#L304)) |
-| the account | `connection_is` ([`vault_connect.rs:2485`](../agents/roomlerd/src/hive/vault_connect.rs#L2485)), the session listener's hook `session_admit` ([`:2548`](../agents/roomlerd/src/hive/vault_connect.rs#L2548)) |
-| RFC 1929 | `Socks5Credential` ([`socks5.rs:95`](../crates/tunnel-core/src/socks5.rs#L95)), `accept_connect_authenticated` ([`:122`](../crates/tunnel-core/src/socks5.rs#L122)); `Target::SessionSocks5` ([`driver.rs:376`](../crates/tunnel-core/src/driver.rs#L376)), served in the carrier ([`:676`](../crates/tunnel-core/src/driver.rs#L676)) |
-| the flow | `create_session_flow` ([`client_mgr.rs:462`](../agents/roomlerd/src/tunnel/client_mgr.rs#L462)), ended at the grant's end ([`:495`](../agents/roomlerd/src/tunnel/client_mgr.rs#L495)) |
-| tests | `socks5::tests` (2), `flow_listener::tests` (1), `driver::tests::a_session_carrier_forwards_its_credentials_connections_alone`, `tunnel::client_mgr::tests::a_session_flow_serves_whom_it_admits_and_ends_with_its_grant`, `hive::vault_connect::tests::a_session_listener_admits_its_account_alone`: 6, and 11 negative controls |
-
-#### The tools: `net_socks` and `net_forward` (P3-7-3c)
-
-A session asks for its own egress on its toolbelt, the `roomler` MCP server
-([hive.md](hive.md) §4). Each call is a grant of its own, served on a
-listener of its own.
-
-```mermaid
-sequenceDiagram
-    participant C as Claude Code (the session)
-    participant P as a driver
-    participant B as the toolbelt
-    participant V as the vault
-    participant H as the tunnel client hub
-    C->>P: may it call net_socks {exit, ttl_s}?
-    P-->>C: yes
-    C->>B: tools/call net_socks {exit, ttl_s}
-    B->>B: under the run's 8 listeners? can this system say who connects?
-    B->>V: rc:vault.net {session, fence, exit, ttl}
-    V-->>B: the grant, or why not
-    B->>H: create_session_flow: SOCKS5 with the session's id and a new capability, under the grant, until its end, for the session's account
-    H-->>B: the flow, at 127.0.0.1:port
-    B-->>C: {proxy: socks5h://session:capability@127.0.0.1:port, expires_in_secs}
-    Note over B,H: at the grant's end, or the run's end here, the listener ends, and every connection
-```
-
-| Tool | Asks | Answers |
-|---|---|---|
-| `net_socks` | `exit`, the id of the device of the organization the flows leave from; `ttl_s`, 300 unless named, which the vault holds to 30–900 | `proxy`, `socks5h://<session id>:<capability>@127.0.0.1:<port>`, for `curl -x` or `ALL_PROXY`; `host`, `port`, `expires_in_secs` |
-| `net_forward` | `exit`, `host`, `port`, `ttl_s` | `address`, `127.0.0.1:<port>`; `host`, `port`; `destination`, in the vault's one spelling; `expires_in_secs` |
-
-Four parties each say yes, and each for itself:
-
-| Gate | Whose | How |
-|---|---|---|
-| `hive_net`, default off, never pushable, and only beside `vault_enabled` | the device's owner | the toolbelt offers the tools only then; elsewhere they are unknown tools |
-| the call | a driver of the session | the session's settings `ask` for both, beside the vault's uses: Claude Code asks before every call, whatever a repository's own settings allow |
-| the grant | the organization's vault policies, `net:socks` and `net:forward` | `rc:vault.net` ([vault.md](vault.md) §21) |
-| each flow | the organization's tunnel policies | the network module, at the flow ([above](#an-agent-sessions-grant-fr-90-p3-7-2a)) |
-
-- ⚠️ **Until decision 20 a session's flow reaches nothing.** The tools are
-  offered, the vault grants, the listener serves and the tunnel opens under
-  the grant; then every flow is rejected `acl_denied`, because no tunnel
-  policy matches a session yet (P3-7-2b).
-- ⚠️ **The capability lands in the transcript.** The proxy URL carries it,
-  and the model reads the URL. It is the session's own: only the session's
-  account is admitted to the listener, and it ends with the listener. Nothing
-  on the device keeps two sessions of one account apart, so between them it
-  stops a mistake, not a session that reads the other's transcript. The
-  grant's token stays in the daemon; no answer carries it.
-- ⚠️ **The run's end ends them.** A run that ends here, at its end or at a
-  move, kills every flow its tools opened, listener and connections, whatever
-  is left of their grants (`drop_run`).
-- **A run holds at most 8 listeners** (`MAX_FLOWS`), counting the calls
-  still asking for one: each holds its place from before the vault is asked.
-  One more is refused before the vault is asked, and a listener that ended,
-  or a call that ended without one (refused, or cancelled by the harness),
-  gives its place back. A listener made after its run ended here is ended at
-  once.
-- **The primary enrollment's hub serves them**, as the primary connection
-  carries the vault's leases (`TunnelClientHub::set_primary`). They are the
-  hub's flows like any other: the LocalAPI's `Flows` lists them, without
-  their credential, and `KillFlow` ends one.
-
-| Piece | Where |
-|---|---|
-| the tools | `net_tools` ([`toolbelt.rs:1331`](../agents/roomlerd/src/hive/toolbelt.rs#L1331)), offered in `tools/list` ([`:1885`](../agents/roomlerd/src/hive/toolbelt.rs#L1885)) and answered in `ask_vault` ([`:1730`](../agents/roomlerd/src/hive/toolbelt.rs#L1730)); their names in the settings, `NET_TOOLS` ([`:625`](../agents/roomlerd/src/hive/toolbelt.rs#L625)) |
-| a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:336`](../agents/roomlerd/src/hive/net_tools.rs#L336)), called as the run's leases go ([`supervisor.rs:4048`](../agents/roomlerd/src/hive/supervisor.rs#L4048)) |
-| the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1565`](../agents/roomlerd/src/hive/supervisor.rs#L1565)); the settings' `ask`, `vault_use_tools` ([`:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055)) |
-| the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4564`](../agents/roomlerd/src/app.rs#L4564)) |
-| tests | `hive::toolbelt::tests` (6), `hive::net_tools::tests` (6: the call's arguments, its capability, the place it holds, a listener made after its run ended), `hive::supervisor::tests` (2: the settings' `ask`, `net_hub`), `hive::gates::tests::hive_net_is_the_owners_word`, `config_surface::tests::hive_net_defaults_off_and_clears_off`: 16, and 17 negative controls |
+- **The membership hook never stops the removal's cascade.** It tries every client,
+  and logs one it could not finish at ERROR with `alert = membership_tunnel_end`: a
+  tunnel-client write that failed must not keep the person in a live call or on the
+  org's rooms, the holders after it in `HOOK_ORDER`. It also releases a lease one of
+  the person's already removed clients still holds, so a second run finishes a first
+  one that failed half-way.
+- **An enrollment token acts for the person it was minted for**, so once they are no
+  longer a member it enrolls nothing: 403, before the token is spent, nothing written.
+  A pairing's token is the approver's and is refused the same way. The enrollment asks
+  again after its write, so one that raced the removal leaves no row behind.
+- **Clients whose owner is no longer a member**, left by a removal before this or by
+  one the hook could not finish, are ended by
+  [`POST /api/admin/tunnel-clients/prune`](api.md#platform-admin-platform_admins-objectid-allowlist-404-on-miss),
+  an operator step that runs the removal's own cascade per (org, person).
+- **Devices the person enrolled are not removed with them.** A device is not a tunnel
+  client, and removing one stays a device manager's decision. Tunnel policies naming
+  the person are left in place for an admin to edit. A device the person owns stops
+  matching `RoleId` grants at once, because the forward reads its owner's roles in
+  the org on every request and its owner holds none there any more.
 
 ## LocalAPI
 
 The on-host control surface — how `roomler`, `roomler-desktop`, and scripts talk
 to a running `roomlerd` without any token:
 
-- **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins +
-  Interactive Users, no-write-up); Unix socket `$XDG_RUNTIME_DIR/roomler.sock`
-  (0600).
+- **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins + the
+  daemon's own account in full; Interactive Users read and write data only,
+  never a new instance; no-write-up); Unix socket `/var/run/roomler/roomler.sock`
+  for a system daemon, else `$XDG_RUNTIME_DIR/roomler.sock` (the per-user temp
+  folder's `roomler/roomler.sock` on macOS), 0600, and only in a directory
+  private to the daemon's account.
+- **Who a client keeps** (#3736): an endpoint served by its own account, root
+  or SYSTEM (on Windows, a pipe owned by SYSTEM, the Administrators group or
+  its own account). Any other is refused by name, and on Unix the client goes
+  on to the system socket. The pipe client opens with read and write data
+  only, at identification level. Detail: [security-baseline.md](security-baseline.md).
 - **Protocol**: newline-delimited JSON, `{"t": "<verb>", "d": {…}}`.
 
 | Verbs | Purpose |
@@ -1104,12 +1327,11 @@ to a running `roomlerd` without any token:
 | `Ping {target, timeout_ms, prefer_v6}` | Overlay reachability probe |
 | `CreateForward` · `CreateSocks5` · `KillFlow` | Imperative flow control |
 | `RouteList` · `RouteAdd` · `RouteUpdate` · `RouteRemove` · `RouteSetEnabled` | Declared-route management (`RouteDescriptor` is one type for wire + disk). `RouteUpdate` replaces a route in one save; an invalid replacement leaves the old route running. A row's `state` is the port's truth (#1685): `active` = the local listener is bound; a flow whose tunnel session is retrying reads `backoff` **with** `flow_id`, `attempts` and `last_error` (additive fields — the tag set is unchanged so an older reader still parses it), `pending` with `flow_id` while its first attempt is in flight |
-| `ConsentPending` · `ConsentDecide` | Remote-desktop consent prompts (how the tray approves sessions under a SYSTEM service) |
+| `ConsentPending` · `ConsentDecide` | Remote-desktop consent prompts (how the tray approves sessions under a SYSTEM service). An answer, like the banner's `RcDisconnect`, is taken only from the person at the screen the daemon shows, SYSTEM or an elevated administrator ([desktop-companion.md](desktop-companion.md) §12.4) |
 | `SetDeviceName` | Rename the node |
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
 | `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
-| `Connect` · `ConnectStatus` | `roomler connect`'s endpoint and where it stands, held for the connection that opened it. Only root or SYSTEM, an elevated administrator, or the daemon's own account may ask, and never on the person socket (FR-90 P3-9-2b, [vault.md](vault.md) §23) |
 
 ⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
 default 4; `1` is the pre-FR-84 single instance). With one instance, a client that
@@ -1136,9 +1358,21 @@ cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) 
 | `restart` | Restart the daemon through its supervisor — refused when it has none it can prove (FR-84) |
 | `kill <flow-id>` · `rename <name>` · `logs` · `config ls/set/clear` | Node management |
 | `exec` | Run a command on a fleet device — four default-deny gates, full audit ([fleet-rpc.md](fleet-rpc.md)) |
-| `connect <handle>` | A vault secret's upstream through a local endpoint the daemon serves, signed in as the secret's user, held in the foreground (FR-90 P3-9-2b, [vault.md](vault.md) §23) |
 | `diag host` / `diag pair` | Diagnostic evidence bundles (CLI-side, so new probes don't need a fleet rollout) |
 | `self-update` | Tunnel-only hosts update in place; on daemon hosts the MSI/.deb owns the binaries and the shim refuses |
+
+**`enroll` spends its token once** (#3328). A tunnel enrollment token enrolls one
+client; a second use answers 401 `This enrollment token has already been used`, and
+a retryable 503 means the server could not check, with the token still good. The
+client's `machine_id` is a hash of `--name`, the host name, the OS and the
+architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1228`), so running
+`enroll` again with the same name re-enrolls the same client. That takes a fresh token
+minted by the client's owner while the client is live, or by a holder of
+`MANAGE_AGENTS`, the only way a removed client comes back (as the holder's own: the
+token acts for them). Anyone else's token is
+refused 409 with a sentence the CLI prints, nothing is written, and that token still
+enrolls the machine under a different `--name` as a new client. The server side is in
+[api.md](api.md#authentication) and [security-baseline.md](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328).
 
 ## Corporate-network behaviour
 

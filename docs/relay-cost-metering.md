@@ -173,7 +173,7 @@ sequenceDiagram
 
 coturn publishes each allocation's totals when it ends, through its statistics database
 (`--redis-statsdb`), under the username the server issued. A credential issued for an org
-names it (`<expiry>:<principal>:org-<hex>`, `crates/remote_control/src/turn_creds.rs:388`),
+names it (`<expiry>:<principal>:org-<hex>`, `crates/remote_control/src/turn_creds.rs:387`),
 so its bytes go to that org's `turn_bytes`, counted as what coturn **sent**: toward the
 client plus toward the peer.
 

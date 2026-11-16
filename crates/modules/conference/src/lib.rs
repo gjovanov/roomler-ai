@@ -13,9 +13,10 @@
 //! # Shape
 //!
 //! [`ConferenceState`] = [`Core`] + what conference owns: the two DAOs (rooms
-//! for call state, recordings), the [`RoomManager`] over the worker pool, and
-//! the two cluster maps (`media_claim_tokens`, `remote_media_conns`) the C-4
-//! claim-or-route placement keeps per pod. It derefs to `Core`, so the moved
+//! for call state, recordings), the [`RoomManager`] over the worker pool, the
+//! two cluster maps (`media_claim_tokens`, `remote_media_conns`) the C-4
+//! claim-or-route placement keeps per pod, and the per-socket limit on
+//! `media:*` frames ([`frame_limit`]). It derefs to `Core`, so the moved
 //! handlers read `state.ws_storage`, `state.stats`, `state.cluster_bus` as
 //! they did on the host's `AppState`.
 //!
@@ -32,9 +33,14 @@
 //!   (a zero-length ownerless window on a deploy) moved out of the host's
 //!   `shutdown_cleanup`.
 //!
-//! The bus handlers (`media.cmd`, `media.leave_user`, …) and the 10 s claim
-//! heartbeat are wired in [`Module::init`] — they need only this state, so the
-//! "registered on the built AppState" step the host used to run is gone.
+//! And [`Module::hooks`]: when someone's membership of an org or a room ends,
+//! core tells this module, which ends the call seats that membership admitted
+//! (`revoke`); when a room is deleted, its call ends for everyone in it.
+//!
+//! The bus handlers (`media.cmd`, `media.leave_user`, …), the 10 s claim
+//! heartbeat and the 10 s reconcile that ends a deleted room's call (each a
+//! loop of its own) are wired in [`Module::init`] — they need only this state,
+//! so the "registered on the built AppState" step the host used to run is gone.
 
 use std::sync::Arc;
 
@@ -55,13 +61,16 @@ use roomler_core::{
 use crate::media::{room_manager::RoomManager, worker_pool::WorkerPool};
 
 pub mod call;
+pub mod frame_limit;
 pub mod guards;
 pub mod maintenance;
 pub mod media;
 pub mod media_cluster;
+mod media_gate;
 pub mod media_stats;
 pub mod meeting_cap;
 pub mod recording;
+mod revoke;
 pub mod ws_media;
 
 /// The module's state: the core plus what conference owns.
@@ -78,6 +87,16 @@ pub struct ConferenceState {
     /// (`connection_id → room_id`), so the socket close can tell the owner
     /// to drop the transports.
     pub remote_media_conns: Arc<DashMap<String, ObjectId>>,
+    /// The per-socket limit on `media:*` frames, for the sockets this pod
+    /// holds ([`frame_limit`]).
+    pub media_frames: Arc<frame_limit::MediaFrameLimiter>,
+    /// How many reconcile reads in a row found no document for a room whose
+    /// media this pod serves (`media_cluster::rooms_gone`). Locked only for
+    /// the verdict, never across an await.
+    pub(crate) media_room_misses: Arc<std::sync::Mutex<std::collections::HashMap<ObjectId, u8>>>,
+    /// How many reconcile reads of the rooms failed in a row
+    /// (`media_cluster::end_calls_of_rooms_gone`); reset by one that succeeds.
+    pub(crate) media_reconcile_failed_reads: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::ops::Deref for ConferenceState {
@@ -161,10 +180,18 @@ impl Module for ConferenceState {
             room_manager,
             media_claim_tokens: Arc::new(DashMap::new()),
             remote_media_conns: Arc::new(DashMap::new()),
+            media_frames: Arc::new(frame_limit::MediaFrameLimiter::from_settings(
+                &settings.meetings,
+            )),
+            media_room_misses: Arc::default(),
+            media_reconcile_failed_reads: Arc::default(),
             core,
         };
-        // C-4 — the owner-side bus handlers + the 10 s claim heartbeat.
+        // C-4 — the owner-side bus handlers + the 10 s claim heartbeat, and
+        // the 10 s reconcile that ends a deleted room's call.
         media_cluster::wire_media_cluster(&state);
+        // #3839 — the 10 s check of this pod's own seats (off by its switch).
+        seat_check::spawn(&state);
         // Stats PR-1 — the per-pod media sampler (no-op unless stats are on).
         media_stats::spawn_media_sampler(state.clone());
         // FR-115 P5 — the meeting-length cap's sweep (every pod; its writes
@@ -245,6 +272,13 @@ impl Module for ConferenceState {
         ]
     }
 
+    /// The inverse edge: a call seat ends with the membership that admitted
+    /// it — the person removed from the org or leaving it, or leaving the
+    /// room — and a deleted room's call ends for everyone in it ([`revoke`]).
+    fn hooks(&self) -> roomler_core::Hooks {
+        revoke::hooks(self)
+    }
+
     /// The stale-call reset: no call can be active at server startup, so
     /// every `in_progress` room is ended and its orphaned sessions closed.
     /// Leader-gated — the host runs it under its startup lease, exactly where
@@ -264,3 +298,6 @@ impl Module for ConferenceState {
         async move { media_cluster::release_all_claims(&state).await }
     }
 }
+
+// #3839 — declared last so the lines above keep the numbers the docs cite.
+pub mod seat_check;

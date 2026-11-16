@@ -29,6 +29,11 @@ pub static MEDIA_FOLD_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// each one accepted the split-brain risk for the outage window (C-4).
 /// Bumped by the `conference` module; read by the cluster status snapshot.
 pub static MEDIA_BELT_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// `media:*` frames refused because their socket was over its limit
+/// (`[meetings] media_frame_burst` / `media_frame_rate`). Bumped by the
+/// `conference` module; read by the cluster status snapshot. Growth with no
+/// flood behind it means the limit is cutting into real meetings.
+pub static MEDIA_FRAMES_RATE_LIMITED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// DERP sockets closed for cluster convergence (C-5).
 pub static DERP_REHOME_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// FR-19 — total bytes this pod has relayed over `/derp` (peer-to-peer WG

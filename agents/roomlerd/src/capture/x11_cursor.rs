@@ -364,9 +364,11 @@ mod tests {
     }
 }
 
-/// Against a REAL X server. `ROOMLERD_TEST_X11=1` makes a missing server a
-/// failure rather than a skip, so the CI lane that runs this under Xvfb
-/// cannot pass by running nothing.
+/// Against a REAL X server. It sets the root window's cursor and moves the
+/// pointer, so it runs only under `ROOMLERD_TEST_X11=1`, which CI's Xvfb
+/// step sets for a server nobody sits at (#3813: before, it ran on whatever
+/// display it reached, a person's own included). There a missing server is a
+/// failure, so the step cannot pass by running nothing.
 #[cfg(test)]
 mod x11_tests {
     use super::*;
@@ -418,11 +420,14 @@ mod x11_tests {
 
     #[test]
     fn the_pointer_reaches_the_slot_with_its_shape_place_and_name() {
-        let Ok((conn, screen)) = x11rb::connect(None) else {
-            assert!(!required(), "ROOMLERD_TEST_X11=1 but there is no X server");
-            eprintln!("no X server — skipping (ROOMLERD_TEST_X11=1 makes this a failure)");
+        if !required() {
+            eprintln!(
+                "ROOMLERD_TEST_X11 unset — skipping: this test sets the root cursor and moves the pointer"
+            );
             return;
-        };
+        }
+        let (conn, screen) =
+            x11rb::connect(None).expect("ROOMLERD_TEST_X11=1 but there is no X server");
         let root = conn.setup().roots[screen].root;
         conn.xfixes_query_version(5, 0).unwrap().reply().unwrap();
         // XC_xterm is glyph 152 of the cursor font.

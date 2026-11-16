@@ -122,7 +122,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `headline` | sign-ups, orgs created, devices enrolled, active orgs (a value event: a remote session that reached Active and lasted ≥ 30 s, or a call with ≥ 2 participants), coverage (`{purestat_signup_goals, server_signups}`; a ratio only at n ≥ 30) | all of the below | P1d; coverage with a purestat key |
 | `signups` | provider, campaign key, landing path, referrer host, self-reported — **never the address, username or name**; at most 20 rows, else aggregated by source | `users` | P1d |
 | `orgs_devices` | orgs created; devices enrolled by OS (tombstones count); orgs that enrolled their **first** device; the day's devices by install method | `tenants`, `agents` | P1d; by install method P3 |
-| `usage` | remote-desktop sessions started and session-minutes (each session's overlap with the window — a session spanning midnight counts only its part), calls and participant-minutes, active orgs, the top 10 orgs by remote-desktop minutes | `remote_sessions`, `call_sessions` | P1d |
+| `usage` | remote-desktop sessions started and session-minutes (each session's overlap with the window — a session spanning midnight counts only its part; one whose end nobody saw, FR-138's `end_source`, counts up to that inferred end, a proven lower bound, as `growth_org_daily` counts it), calls and participant-minutes, active orgs, the top 10 orgs by remote-desktop minutes | `remote_sessions`, `call_sessions` | P1d |
 | `website` | visitors, visits, pageviews; the day's visitors by organic channel; top 10 referrers and paths | purestat | with a key |
 | `blog` | per post viewed that day: visitors, pageviews, reads, median read time (top 20); top sources | purestat | with a key |
 | `campaigns` | per `(source, medium, campaign)`: visitors, pageviews, the four goals (`signup`, `subscribe`, `install-copy`, `github-outbound`), joined in code with the server's own sign-ups by the same normalised key | purestat + `users` | with a key |
@@ -424,7 +424,7 @@ flowchart TD
 | Rule | Where |
 |---|---|
 | The setting: comma-separated CIDRs (`203.0.113.0/24`, `2001:db8::/32`) or bare addresses (their own `/32` / `/128`). A CIDR with host bits set, or a prefix shorter than /8 (IPv4) or /16 (IPv6), is refused, never widened. An IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) is compared as the IPv4 it carries | `InternalNetworks::parse` / `contains` ([`growth.rs:171`](../crates/core/src/growth.rs), [`:221`](../crates/core/src/growth.rs)) |
-| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:199`](../crates/modules/fleet/src/lib.rs)) |
+| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:214`](../crates/modules/fleet/src/lib.rs)) |
 | **One client-address rule.** The `X-Forwarded-For` entry just left of our trusted hops' own (`app.rate_limit_trusted_hops`, 1 in production), the client the edge recorded, else the socket peer; `X-Real-IP` is never read. It moved from the api crate to core so `fleet` reads it exactly as the per-IP governor and the credential gate do. A client that seeds `X-Forwarded-For` with a lab address moves nobody: that entry sits left of the one our hop recorded | `client_ip_or_peer` ([`client_ip.rs:67`](../crates/core/src/client_ip.rs)); the handlers take `PeerAddr` ([`:90`](../crates/core/src/client_ip.rs)), an extractor that never refuses |
 | The class becomes `internal`; the asset and OS stay. The updater rule comes first, so a `roomlerd/` fetch from the lab still writes nothing | `fetch_dims` ([`install_trace.rs:188`](../crates/modules/fleet/src/install_trace.rs)), `count_fetch` ([`:211`](../crates/modules/fleet/src/install_trace.rs)) |
 | **Still no IP, anywhere.** The address is compared in memory and dropped; the row stays three enum-like dimensions and a count. The integration test scans every row for each address it used (the lab's, the outsider's, our hop's, the peer's) | `install_trace_tests::fetches_from_internal_networks_count_as_internal_and_store_no_address` |
@@ -499,7 +499,7 @@ not what the trace records. The token is minted at delivery by the admin route's
 `pairing::deliver` mints with `issue_enrollment_token_with` and writes
 `enroll_tokens.record_issued(jti, tenant_id, approver, now)`
 (`crates/modules/fleet/src/pairing.rs:992-1011`), the same call `POST …/agent/enroll-token`
-makes (`agent.rs:115-126`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
+makes (`agent.rs:256-267`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
 approver>, issued_at, kind: standard}`, one per half, and "tokens issued → redeemed" counts a
 paired token like any other. The tunnel kind writes no ledger row, as the tunnel route never
 has. The enroll is the ordinary one, so `agents.install` says who installed: `method: wizard`
@@ -548,7 +548,7 @@ sequenceDiagram
   · `enroll` · `companion` · `anchor` (the two best-effort steps, recorded only where they
   apply) · `done`; `outcome` is `ok` · `failed` · `cancelled`; `error_code` is a **code from a
   fixed vocabulary** (`advanced_options`, `unsupported_platform`, `preflight`, `resolve`,
-  `download`, `sha256_mismatch`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
+  `download`, `sha256_mismatch`, `signature_refused`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
   `msi_another_install`, `msi_fatal`, `msi_other`, `extract`, `integrate`, `enroll_rejected`,
   `enroll_network`, `config_write`, `companion`, `anchor`, `other`) — never the error text, a
   path, a hostname or a user name; `os` is the family; `wizard_version` the crate's version.
@@ -1047,7 +1047,7 @@ A digest stored before P7 reads both halves as `arrives_with: P7`.
 
 | Setting | Env | Default | Effect |
 |---|---|---|---|
-| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:902`](../crates/config/src/settings.rs)) |
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:862`](../crates/config/src/settings.rs#L862)) |
 | `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
 | `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
 
@@ -1467,7 +1467,7 @@ with its reason on hover, a rate appears only with n ≥ 30, subjects are render
 
 **In the digest**, the `newsletter` section gains `delivery` — the day's (and 7/28 days')
 delivered, bounced (hard), dropped, spam reports and addresses suppressed, by each event's own
-time ([`delivery_figures`, digest.rs:1860](../crates/api/src/growth/digest.rs)), `not_measured`
+time ([`delivery_figures`, digest.rs:1875](../crates/api/src/growth/digest.rs)), `not_measured`
 on a server without the webhook — `unsubscribed_via_issue`, and per issue sent that day its
 delivery so far and its unsubscribes, by the same reads and the same three cells as the table.
 
@@ -1640,7 +1640,7 @@ current month.
 
 > [!NOTE]
 > **"Nothing on record" states what the backfill did, as its ledger row says**
-> ([`no_billing_record`, digest.rs:2050](../crates/api/src/growth/digest.rs)). The panel's `billed` and
+> ([`no_billing_record`, digest.rs:2065](../crates/api/src/growth/digest.rs)). The panel's `billed` and
 > the digest's share one reason, and it reads three ways:
 >
 > - *the backfill has not run*;
@@ -1660,9 +1660,9 @@ current month.
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
   the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
   cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2051](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  ([`billed_figures`, digest.rs:2089](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2143](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2184](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel
@@ -1910,7 +1910,7 @@ flowchart LR
 
 | Rule | As built |
 |---|---|
-| **Which day a session belongs to** | the day it was **requested** (`created_at`). It *reached Active* when `started_at` is set (ended or still running); it *never reached Active* when it ended without one — a refusal (`user_denied`, `consent_timeout`, `no_prompt_surface`), a connect failure (`error`, `agent_disconnect`) or a controller that gave up waiting (`controller_hangup` before Active); it is *pending* when the freeze saw it neither started nor ended. `by_end_reason` keeps the two apart (`reached_active: true/false`); a session not ended reads `open` (`quality::session_quality`) |
+| **Which day a session belongs to** | the day it was **requested** (`created_at`). It *reached Active* when `started_at` is set (ended or still running); it *never reached Active* when it ended without one — a refusal (`user_denied`, `consent_timeout`, `no_prompt_surface`), a connect failure (`error`, `agent_disconnect`) or a controller that gave up waiting (`controller_hangup` before Active); it is *pending* when the freeze saw it neither started nor ended. `by_end_reason` keeps the two apart (`reached_active: true/false`); a session not ended reads `open` (`quality::session_quality`). An end nobody saw (FR-138: the row carries `end_source`, from the registration read, the sweep, a redial's `replaces` of a detached session or the dead-row close) reads `inferred`, never a failure, and adds no duration: its `ended_at` is only the row's own last clock |
 | **Duration, frame rate, RTT** | Active sessions that ended: `ended_at − started_at`; `stats.peak_fps` and `stats.avg_rtt_ms` of the Active sessions whose device reported one above 0 (`stats` is `$max`-merged live by the device's samples, so a session that never reached Active has none) |
 | **Time to first frame** | the `ttff_ms` of `first_frame` records from a **foreground tab** (`hidden: false`), on a **first attempt** (`attempt: 1`, `after_drop: false`) — FR-22's own mining filter. A hidden tab's paint timing is invalid by the standing rule and a retry measures the retry, so both are counted as *set aside* (`hidden`, `later_attempts`), and every foreground record is counted by `outcome` (`first_frame` · `abandoned` · `closed` · `retried`). A record filed under one org's page for another org's device (FR-52, `agent_org_id`) follows both exclusions (`quality::ttff_quality`) |
 | **When TTFF is measured** | only while **every** record of the day still exists: `day_start + 7 d > now` (`quality::logs_complete`). A day whose first rows have started to expire would give a sample biased to its late hours, so it is frozen **without** TTFF — not measured, never 0. At the nightly tick that is yesterday and the two days before; a first fill or a backfill measures the last six closed days and no more |
@@ -1994,8 +1994,10 @@ field, or ended before the observation landed — is `unknown`, **never read as 
 
 ### Field verification (owed after the promote)
 
-For one closed day, by hand from `mongodb-0`, read-only, exclusions as the digest's footer counts
-them — the frozen `*` row (`growth_quality_daily`, scope `external`) and the Quality tab must equal:
+For one closed day, by hand through `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` (its client
+runs outside `mongodb-0`, and `db` is already open: [production-mongo-reads.md](production-mongo-reads.md)),
+read-only, exclusions as the digest's footer counts them — the frozen `*` row
+(`growth_quality_daily`, scope `external`) and the Quality tab must equal:
 
 ```js
 // Sessions requested that day, by outcome (D = the day's 00:00Z, E = the next):
@@ -2028,7 +2030,7 @@ addresses.
 ⚠️ **An overlay pair needs the device to allow it.** #1882's `access_policy.rc_overlay` is off unless
 the device opts in, and with it off the agent drops every overlay candidate. With it on, an agent
 whose overlay interface is named `roomler*` still never gathers on it: the interface-name rule
-(`is_overlay_iface`, [`peer.rs:13316`](../agents/roomlerd/src/peer.rs)) applies whatever
+(`is_overlay_iface`, [`peer.rs:14010`](../agents/roomlerd/src/peer.rs)) applies whatever
 `rc_overlay` says. So an overlay carrier comes from `rc_overlay` on AND either a macOS agent, whose
 `utunN` the name rule cannot see, or a controller whose route to the agent runs through the mesh.
 Measured on 2026-10-19 (FR-102 §8): a controller on the vmtest org's mesh viewing a Linux agent

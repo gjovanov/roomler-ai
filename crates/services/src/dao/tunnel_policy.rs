@@ -101,9 +101,7 @@ impl TunnelPolicyDao {
         tenant_id: ObjectId,
         policy_id: ObjectId,
     ) -> DaoResult<TunnelPolicy> {
-        self.base
-            .find_live_by_id_in_tenant(tenant_id, policy_id)
-            .await
+        self.base.find_by_id_in_tenant(tenant_id, policy_id).await
     }
 
     /// The per-policy lookup that also returns a TOMBSTONE. No caller today:
@@ -114,12 +112,18 @@ impl TunnelPolicyDao {
     /// [`Self::list_active_for_tenant`]. It exists so that a future reader
     /// that genuinely needs the tombstone chooses it BY NAME, with a reason at
     /// the call site, rather than reaching through `base`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an audit or decision log names a removed policy by id and must still show what it said"
+    )]
     pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         policy_id: ObjectId,
     ) -> DaoResult<TunnelPolicy> {
-        self.base.find_by_id_in_tenant(tenant_id, policy_id).await
+        self.base
+            .find_any_by_id_in_tenant(tenant_id, policy_id)
+            .await
     }
 
     /// The filter every write below goes through: this row, in this tenant,
@@ -185,6 +189,38 @@ impl TunnelPolicyDao {
             .update_one(
                 Self::live_row(tenant_id, policy_id),
                 doc! { "$set": { "deleted_at": DateTime::now() } },
+            )
+            .await
+    }
+
+    /// Take one device out of every live policy of its org: the `agent_id`
+    /// entries naming it as a subject (what it may originate) and as a target
+    /// (who may tunnel through it). Called before a REMOVED device's row comes
+    /// back for a new enrollment of its machine id, which keeps the row's id: a
+    /// new device is named by no policy, so the revived one must not be either
+    /// (#3627). Answers how many policies changed.
+    ///
+    /// Every other subject and target stays. A policy that named only this
+    /// device is left with an empty list and grants nothing (`subject_matches`
+    /// and `target_matches` are `any` over the list); it stays in the admin's
+    /// list to edit or delete. Removed policies are history and are left as
+    /// they are.
+    pub async fn forget_agent(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<u64> {
+        // `{kind, id}` is the stored shape of both `PolicySubject::AgentId` and
+        // `PolicyTarget::AgentId`; `$elemMatch` and `$pull` match an element
+        // by these two fields, in either order.
+        let names_it = doc! { "kind": "agent_id", "id": agent_id };
+        self.base
+            .update_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    "$or": [
+                        { "subjects": { "$elemMatch": names_it.clone() } },
+                        { "targets": { "$elemMatch": names_it.clone() } },
+                    ],
+                },
+                doc! { "$pull": { "subjects": names_it.clone(), "targets": names_it } },
             )
             .await
     }

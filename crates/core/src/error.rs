@@ -139,6 +139,25 @@ impl From<AuthError> for ApiError {
     }
 }
 
+/// #3328 — what every enrollment door answers when the token's one use cannot
+/// be spent, in one place so the doors cannot drift apart. The two stay
+/// different answers on purpose: "already used" sends a person looking for
+/// whoever used the token, and a ledger that could not answer must not borrow
+/// those words. Its 503 is retryable, and the token is still valid.
+impl From<roomler_ai_services::auth::SpendRefusal> for ApiError {
+    fn from(refusal: roomler_ai_services::auth::SpendRefusal) -> Self {
+        use roomler_ai_services::auth::SpendRefusal;
+        match refusal {
+            SpendRefusal::AlreadyUsed => {
+                ApiError::Unauthorized("This enrollment token has already been used".to_string())
+            }
+            SpendRefusal::LedgerUnavailable => ApiError::ServiceUnavailable(
+                "Could not verify this enrollment token is unused; please retry".to_string(),
+            ),
+        }
+    }
+}
+
 impl From<roomler_ai_services::oauth::OAuthError> for ApiError {
     fn from(err: roomler_ai_services::oauth::OAuthError) -> Self {
         match err {
@@ -182,6 +201,27 @@ index: email_1 dup key: { email: \"victim@corp.example\" }";
             conflict_text(DaoError::DuplicateKey(wrapped)),
             DUPLICATE_KEY_ANSWER
         );
+    }
+
+    /// #3328 — every enrollment door answers a refused spend in these two
+    /// sentences, and they stay two: 401 for a token used before, a retryable
+    /// 503 for a ledger that could not answer.
+    #[test]
+    fn a_refused_spend_keeps_already_used_apart_from_retry() {
+        use roomler_ai_services::auth::SpendRefusal;
+        match ApiError::from(SpendRefusal::AlreadyUsed) {
+            ApiError::Unauthorized(msg) => {
+                assert_eq!(msg, "This enrollment token has already been used")
+            }
+            other => panic!("expected a 401, got {other}"),
+        }
+        match ApiError::from(SpendRefusal::LedgerUnavailable) {
+            ApiError::ServiceUnavailable(msg) => assert_eq!(
+                msg,
+                "Could not verify this enrollment token is unused; please retry"
+            ),
+            other => panic!("expected a 503, got {other}"),
+        }
     }
 
     #[test]

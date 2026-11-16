@@ -9,6 +9,10 @@ use crate::candidate::candidate_base::CandidateBaseConfig;
 use crate::candidate::candidate_peer_reflexive::CandidatePeerReflexiveConfig;
 use crate::util::*;
 
+/// VENDOR PATCH (#3716): a local candidate's close still running after this
+/// long is named in a warning (see `delete_all_candidates`).
+const SLOW_CANDIDATE_CLOSE: Duration = Duration::from_secs(5);
+
 pub type ChanCandidateTx =
     Arc<Mutex<Option<mpsc::Sender<Option<Arc<dyn Candidate + Send + Sync>>>>>>;
 
@@ -599,7 +603,11 @@ impl AgentInternal {
             // takes, after close() raised the flag, so a candidate lands either
             // before the sweep (which closes it) or here.
             let closed = *self.closed.borrow();
+            // VENDOR PATCH (#3716): a candidate turned away is closed after the
+            // lock is let go. A close can wait on the network (a relay's TURN
+            // client), and close()'s sweep waited on this lock behind it.
             if closed {
+                drop(local_candidates);
                 if let Err(err) = c.close().await {
                     log::warn!(
                         "[{}]: Failed to close a candidate gathered after close: {}",
@@ -609,20 +617,20 @@ impl AgentInternal {
                 }
                 return Ok(());
             }
-            if let Some(cands) = local_candidates.get(&network_type) {
-                for cand in cands {
-                    if cand.equal(&**c) {
-                        if let Err(err) = c.close().await {
-                            log::warn!(
-                                "[{}]: Failed to close duplicate candidate: {}",
-                                self.get_name(),
-                                err
-                            );
-                        }
-                        //TODO: why return?
-                        return Ok(());
-                    }
+            let duplicate = local_candidates
+                .get(&network_type)
+                .is_some_and(|cands| cands.iter().any(|cand| cand.equal(&**c)));
+            if duplicate {
+                drop(local_candidates);
+                if let Err(err) = c.close().await {
+                    log::warn!(
+                        "[{}]: Failed to close duplicate candidate: {}",
+                        self.get_name(),
+                        err
+                    );
                 }
+                //TODO: why return?
+                return Ok(());
             }
 
             if let Some(cands) = local_candidates.get_mut(&network_type) {
@@ -699,38 +707,46 @@ impl AgentInternal {
     ///
     /// This is used for restarts, failures and on close.
     pub(crate) async fn delete_all_candidates(&self) {
-        {
-            let mut local_candidates = self.local_candidates.lock().await;
-            for cs in local_candidates.values_mut() {
-                for c in cs {
-                    if let Err(err) = c.close().await {
+        // VENDOR PATCH (#3716): the lists are taken out under their locks and
+        // closed after, each local candidate (its socket, its TURN client) on a
+        // task of its own. A candidate's close can wait on the network, and the
+        // sweep closed them one at a time under `local_candidates`: one slow
+        // close held the agent's close, and with it every socket the agent
+        // owned. A close still slow after `SLOW_CANDIDATE_CLOSE` says which.
+        let local_candidates = std::mem::take(&mut *self.local_candidates.lock().await);
+        for c in local_candidates.into_values().flatten() {
+            let name = self.get_name().to_owned();
+            tokio::spawn(async move {
+                let close = c.close();
+                tokio::pin!(close);
+                let result = tokio::select! {
+                    result = &mut close => result,
+                    _ = tokio::time::sleep(SLOW_CANDIDATE_CLOSE) => {
                         log::warn!(
-                            "[{}]: Failed to close candidate {}: {}",
-                            self.get_name(),
+                            "[{}]: closing candidate {} is taking over {:?}",
+                            name,
                             c,
-                            err
+                            SLOW_CANDIDATE_CLOSE
                         );
+                        close.await
                     }
+                };
+                if let Err(err) = result {
+                    log::warn!("[{}]: Failed to close candidate {}: {}", name, c, err);
                 }
-            }
-            local_candidates.clear();
+            });
         }
 
-        {
-            let mut remote_candidates = self.remote_candidates.lock().await;
-            for cs in remote_candidates.values_mut() {
-                for c in cs {
-                    if let Err(err) = c.close().await {
-                        log::warn!(
-                            "[{}]: Failed to close candidate {}: {}",
-                            self.get_name(),
-                            c,
-                            err
-                        );
-                    }
-                }
+        let remote_candidates = std::mem::take(&mut *self.remote_candidates.lock().await);
+        for c in remote_candidates.into_values().flatten() {
+            if let Err(err) = c.close().await {
+                log::warn!(
+                    "[{}]: Failed to close candidate {}: {}",
+                    self.get_name(),
+                    c,
+                    err
+                );
             }
-            remote_candidates.clear();
         }
     }
 

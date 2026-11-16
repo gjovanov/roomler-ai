@@ -7,8 +7,8 @@ blocked in both directions. *As of 0.3.0-rc.381.*
 ```mermaid
 flowchart TB
     subgraph endpoints["wss endpoints"]
-        WS["/ws?token=…&role=…"]
-        DERP["/derp?token=…"]
+        WS["/ws?role=…&tid=…"]
+        DERP["/derp?role=agent&tid=…"]
     end
 
     U["Browser (user)"] -->|"no role / role=user<br/>Access JWT"| WS
@@ -26,6 +26,69 @@ Each role is validated against its own JWT audience — a user token cannot open
 agent socket and vice-versa. An optional `tid=<tenant-hex>` query parameter lets the
 front load balancer hash tenant-affine connections onto one pod; tokens must match
 the claimed tenant (membership-checked for users).
+
+### Where a native client's credential travels (#3656)
+
+The agent and tunnel-client roles and `/derp` take the device's JWT as
+`Authorization: Bearer <jwt>`, as the daemon's HTTP routes always have: a request
+line is what access logs and URL-logging proxies record, and a request header is
+not. `role` and `tid` stay in the query, because the load balancer hashes on `tid`.
+The daemon and the CLI move to the header in 0.4.210; every earlier one sends the
+JWT in the query (`token=`), and that keeps working. The browser role reads no
+header: it takes the session cookie, or a query token from an older bundle.
+
+| Dial carries | Judged on |
+|---|---|
+| `Authorization: Bearer <jwt>` | the header |
+| `?token=<jwt>` only | the query, as before |
+| both | the header; the query is not read, so a refused header is not rescued by a good query |
+| `Authorization` with another scheme (Basic, NTLM, Negotiate) | the query, as if no header came |
+| neither | refused |
+
+Every check after that is the same for both forms: the audience, the `tid` claim,
+the device's row (`refusal_reason`, deletion first) and its token generation. A
+refusal of these upgrades is a `401` with `WWW-Authenticate: Bearer
+realm="roomler"`, and `error="invalid_token"` when a credential arrived in either
+form. A client tries the query form only on a refusal without that `error`: one
+from a server older than the header, or one whose header was dropped on the way.
+The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
+
+#### How the daemon and the CLI dial (#3656)
+
+From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
+header whose value is marked sensitive: the daemon's control socket
+(`agents/roomlerd/src/signaling.rs:1842`), its central and regional DERP sockets
+(`agents/roomlerd/src/derp.rs:381`) and the CLI's tunnel-client socket. The URL
+names the role and the tenant only. The rule is one function in each client
+(`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
+
+| The header-only dial hears | The client |
+|---|---|
+| `101` | is connected |
+| `401` with `error="invalid_token"` (a server that read the credential and refused it) | stops: the daemon's FR-103 recovery and auth ladder take it from there, the CLI reports it |
+| a bare `401` (a server older than the header) or a bare `400` (a regional relay older than it) | dials ONCE more with the credential in the query: `token=`, or `ticket=` for a relay |
+| `401` with a challenge and no `error` (our server saw no credential: the header was dropped on the way) | dials once more in the query, the same way |
+| `403`, `5xx`, a timeout or anything else | handles it as before, with no second dial |
+
+A redial that upgrades notes its endpoint (the URL before its `?`), and the
+client's dials there take the query form for 6 h (`QUERY_FORM_FOR`,
+`crates/remote_control/src/upgrade_auth.rs:158`): a server or relay older than the
+header costs one refused dial per endpoint every six hours, and one updated
+meanwhile hears the header again the same day. The note is in memory, per
+process. A redial refused too notes nothing, so a refused credential is offered in
+the header first again next time. Each dial has its own 30 s limit
+(`WS_CONNECT_TIMEOUT`, `DERP_CONNECT_TIMEOUT`, and the CLI's `WS_DIAL_TIMEOUT`,
+new: the CLI's dial had none), so a dial that falls back can take two.
+
+tungstenite writes a client's whole upgrade request at TRACE, the `Authorization`
+line included, and marking the value sensitive does not reach that line. The
+daemon's and the CLI's subscribers drop those lines whatever `RUST_LOG` asks
+(`upgrade_auth::may_log`, `crates/remote_control/src/upgrade_auth.rs:243`), with a
+global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:403`,
+`agents/roomler-cli/src/cli.rs:829`). Not a directive, on purpose: a fixed
+`tungstenite=debug` would raise those crates above the default `warn`, and any
+target directive loses to a span-scoped one such as `[org]=trace`, which
+`EnvFilter` lets win.
 
 Delivery across pods: WS sessions are pod-local; chat, presence, and notification
 events fan out through Redis pub/sub so every pod pushes to its own sockets.
@@ -46,8 +109,6 @@ JSON messages, `{"type": "...", ...}`.
 | `media:view` | FR-127 P1 — the viewer's WHOLE rendered set, `{ room_id, seq, video: [{ producer_id, w, h }] }`: the server resumes those video consumers and pauses the viewer's others; no reply |
 | `media:play_audio` / `media:stop_audio` | Bot/audio playback control |
 | `presence:update` | Presence state |
-| `hive:view.open` / `offer` / `ice` / `renew` / `close` | FR-90 — read an agent session over a viewer peer (module `hive`) |
-| `hive:search.open` | FR-90 P2i-2 — search, over a peer of its own, the copies an archive replica holds of the sessions the asker may read; the peer then takes `hive:view.offer` / `ice` / `renew` / `close`, by its grant |
 | `ping` | Keepalive |
 
 **Server → client** (consumed by `ui/src/stores/ws.ts`)
@@ -56,13 +117,11 @@ JSON messages, `{"type": "...", ...}`.
 |---|---|
 | `message:create` / `update` / `delete` / `reaction` | Live chat |
 | `call:message:create` | In-call chat |
-| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list. A `call_ended` the plan's meeting-length cap caused carries `reason: "plan_limit"`, `max_minutes` and `plan` |
+| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list. A `call_ended` the plan's meeting-length cap caused carries `reason: "plan_limit"`, `max_minutes` and `plan`. One sent because a person's membership ended carries `reason: "not_a_member"` and goes to each of their connections whose seat closed; one sent because the room was deleted carries `reason: "room_deleted"` and goes to each connection seated in the call's media, since the room's member list went with it ([below](#a-room-deleted-mid-call-ends-its-call)) |
 | `room:call_ending_soon` | FR-115 P5 — the plan's meeting-length cap (Free: 60 minutes) warns the room's members five minutes before it ends the meeting: `ends_at` (epoch ms), `max_minutes`, `plan`. Shown only to those in that call |
 | `typing:start` | Typing indicators |
 | `notification:new` / `notification:unread_count` | Notification bell |
 | `task:update` | Background-task progress |
-| `hive:view.ready` / `refused` / `answer` / `ice` / `renewed` / `closed` | FR-90 — the viewer peer's handshake, addressed to the ONE connection that opened it |
-| `hive:search.ready` / `refused` | FR-90 P2i-2 — a search's grant confirmed by its archive replica (with how many sessions it names), or refused; the rest of its handshake is the view's above |
 
 The mediasoup signalling (`media:*`) carries router RTP capabilities, transport
 parameters, and producer/consumer ids — the SFU forwards RTP between participants
@@ -76,6 +135,470 @@ read, so two pods warn and end a meeting once
 pod that started the call and died with it on a rolling deploy. The design, its guards
 and its one known gap are in
 [FR-115 *Meetings, as built*](fr/FR-115-pricing-reshape.md#meetings-as-built-p5).
+
+### The call session: join, leave, socket close, sweep (#3416)
+
+A call is kept in two places. The room holds `conference_status` and `participant_count`,
+the number of **people** in the call. Each person's `room_members` row holds `sessions[]`,
+one entry per join, open while its `left_at` is null. A session carries the
+`connection_id` of the page's socket, so one person can be in a call from several devices
+and one device's leave closes only its own session. The count rises when a person's first
+open session opens, falls when their last one closes, and the call ends at 0.
+
+```mermaid
+sequenceDiagram
+    participant P as Call page
+    participant S as Server (conference module)
+    participant M as room_members.sessions
+    P->>S: WebSocket upgrade
+    Note over P: Join clicked: callConnectionId() waits for the id, up to 10 s
+    S-->>P: connected {connection_id: C}
+    P->>S: POST call/start, then POST call/join {connection_id: C}
+    S->>M: push {connection_id: C, left_at: null}, the person's first: count +1
+    P->>S: media:join on socket C
+    alt the person leaves
+        P->>S: POST call/leave {connection_id: C}
+    else the tab closes
+        Note over S: on_closed(C): the room from C's media, else from M by C
+    end
+    S->>M: close C's open session, or, if C never held one, the person's sessions with no id
+    S-->>P: room:call_updated, or room:call_ended when the count reaches 0
+```
+
+| Moment | Where | What happens |
+|---|---|---|
+| Join | `ConferenceView.vue:607`, `stores/rooms.ts:194` `callConnectionId`, `:200` `joinCall`; server `call.rs:152`, `dao/room.rs:749` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:184`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:209` `leaveCall`, `call.rs:225`, `finalize_call_leave_db` (`call.rs:302`), `leave_participant` (`dao/room.rs:951`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Socket close | `ws_media.rs:83` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:134`), and the same leave runs naming the socket (`:141`) |
+| A miss | `dao/room.rs:960`, the close itself `close_sessions` (`:1028`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
+| Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
+| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:288`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+| Room deleted | `crates/modules/chat/src/room.rs:364`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
+
+What a leave naming connection C may close:
+
+| The open session | Closed? |
+|---|---|
+| the person's, connection C | yes |
+| the person's, no connection id | only when C never held a session in that room |
+| the person's, another connection | never: that is their other device |
+| another person's | never: the update is keyed by the leaver's own `user_id` |
+
+**Why a miss closes every session with no id, not only the oldest.** Such a session names
+no device. On a miss the leaver's own session is among them, if it has one, and nothing
+says which. Closing only the oldest would leave the leaver listed whenever an older dead
+one sits beside it, which is the bug itself. Closing them all always takes the leaver out.
+
+**What it does not heal.** Since #3416 the page never sends a join without the id, so
+sessions with no id come only from older cached bundles, and these three cases last only
+while those are in use:
+
+1. A dead session with no id beside a later session of the same person that has one: that
+   later session's leave closes only its own. The boot reset clears it at the next roll.
+   An older bundle leaves exactly this when its first `media:join` finds the socket not
+   open yet. The store's retry (`stores/conference.ts:172`) joins again on the open socket,
+   this time with the id, so the person holds both sessions, and the page's leave closes
+   the scoped one.
+2. Two devices of one person that both joined without an id (both older bundles, both
+   raced): a miss from one closes both, so the other drops off the list while still in the
+   call, and a call the person was alone in ends.
+3. A page whose socket redialled mid-call holds nothing under its new id, because the old
+   socket's close took its session. Its Leave is a miss, and closes the person's sessions
+   with no id in that room: an older bundle's, on another of their devices.
+
+The disconnect cleanup reaches a session only through the socket's media or its own id,
+so a socket that was never in the call, such as another tab of the same person, closes
+nothing.
+
+**Tests.** The #3416 block in `crates/tests/src/conference_tests.rs:2084`: a join with no
+body, then a leave or a socket close; two devices; another person's session; a device that
+already left, leaving again; a repeated leave; a socket never in the call. `ui/src/__tests__/stores/rooms.spec.ts:259`: the wait
+and the refusal. `ui/e2e/conference-fast-join.spec.ts` holds back the socket's frames until after
+the click, against a real API, and reads the outcome from the server's participant list.
+
+### Who may use `media:*`: the participants of the call
+
+The socket path admits only someone the REST path admitted. A connection may send a
+`media:*` command for a room only while it is a participant of that room's call, and the
+participation gate (`crates/modules/conference/src/media_gate.rs`) decides before any
+handler runs.
+
+```mermaid
+flowchart LR
+    F["media:* frame naming a room"] --> K{"which command"}
+    K -->|media:join| J["admit_join: the room's tenant, its visibility, a call session for this socket"]
+    J -->|admitted| P["placement: this pod, or forward to the owner"]
+    P --> O["the owner admits again and seats the connection"]
+    K -->|any other| S["placement"]
+    S --> T["seat check on the pod that holds the seats"]
+    J -->|refused| X["media:error Not a participant of this call"]
+    T -->|no seat| X
+```
+
+| Command | Requires | Checked |
+|---|---|---|
+| `media:join` | What `call/join` checks: a member of the **room's** tenant (read from the room, never from the frame), the room's visibility, and an open call session for **this** connection, or one with no connection id (an older client). A session opened for another socket of the same person does not count | `media_gate.rs:114` `admit_join`, the session by `dao/room.rs:1108` `has_open_call_session`. Before placement (`ws_media.rs:166`), so a refused join claims no room and builds no router, and again on the pod that seats the connection, the owner of a forwarded join (`media_cluster.rs:982`) |
+| every other `media:*` | This connection's seat in the room's media, as this user: a participant entry that only an admitted join creates | `media_gate.rs:151` `seat`, by `room_manager.rs:1086` `holds_seat`, in `dispatch_media_local` (`ws_media.rs:247`) on the pod that runs the command, so a forwarded command is checked at the owner, where the seats are |
+
+- The handlers take the gate's proof, a `JoinPass` or a `Seat`, never a bare room, user or
+  connection id (`dispatch_seated`, `ws_media.rs:265`). A new handler has nothing else to
+  act on.
+- A refusal says the same for every reason, `Not a participant of this call`
+  (`media_gate.rs:35`). Only join, produce and consume answer at all, as they answered
+  their failures before; the reason goes to the log.
+- `media:play_audio` plays only a live file of the call's own room, in the room's tenant,
+  and each playback carries its own `playback_id` (`ws_media.rs:1026`).
+- `GET /api/cluster/status`, which lists every live meeting room on a pod, is for platform
+  admins only (`crates/api/src/routes/cluster.rs:23`).
+
+**Tests.** `crates/tests/src/conference_gate_tests.rs`: an account of another org, a member
+outside a Private room and a member not in the call each get nothing from any `media:*`
+command, and nothing of theirs reaches the call; the participant path end to end; a
+playback of another room's file, or of a removed one.
+`cluster_tests::cluster_status_is_for_platform_admins_only`.
+
+### A seat ends with the membership that admitted it
+
+The gate checks membership once, at `media:join`. The seat it admits lasts only as long as
+that membership: when someone is removed from the org or leaves it, or leaves the room, any
+seat they hold in a call of that org or room goes at once, on whichever pod serves the call.
+When no word of it reaches that pod, the pod finds it by its own seat check, within 30 s
+([below](#the-pod-serving-a-call-checks-its-own-seats)).
+The membership's owner tells `conference` through core's `MembershipLifecycle` hook
+(`crates/core/src/hooks.rs:194`), after the membership row is gone, so nothing can be
+admitted on it again while the seats are withdrawn. A room deleted mid-call ends every
+membership of it at once, and so its whole call
+([below](#a-room-deleted-mid-call-ends-its-call)).
+
+```mermaid
+sequenceDiagram
+    participant R as member route (host) or room leave (chat)
+    participant H as core.hooks
+    participant C as conference (revoke.rs), the pod that served R
+    participant O as the call's owner pod
+    participant M as the person's sockets
+    participant P as everyone else in the call
+    R->>R: delete the membership row
+    R->>H: org_member_removed / room_member_removed
+    H->>C: MembershipLifecycle
+    C->>O: media.withdraw_seats (or locally, when this pod serves the call)
+    O->>O: close the person's transports, producers, consumers
+    O->>M: room:call_ended, reason not_a_member
+    O->>P: media:peer_left for each closed connection
+    C->>C: close their call sessions: the count drops, a call they were last in ends
+```
+
+| Trigger | Told by | What ends |
+|---|---|---|
+| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:251`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
+| Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:239`, `room_member_removed` | their seats in that room's call (`revoke.rs:223`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:331` `settle_call_after_departure`) |
+| The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:384`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
+
+- The seats close on the pod that holds them (`revoke.rs:355` `withdraw_seats_here`), reached
+  over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:316`,
+  `media_cluster.rs:882`). A withdrawal that does not reach that pod (no answer within the
+  bus deadline, or no bus on this pod) is not taken to mean the pod is gone: it may be alive
+  and serving the call. It is a warning with the org, the room, the person and the pod
+  (`alert = membership_seat_unreached`), conference's hook still answers `Ok` so the hooks
+  after it run, and the pod serving the call ends the seat by its own check
+  ([below](#the-pod-serving-a-call-checks-its-own-seats)).
+- `room:call_ended` is what the web client already reads as "this call is over for you"
+  (`ui/src/stores/ws.ts:349`): it tears the call down, with no client change.
+- A join already on its way when the membership ends asks the gate again once its seat
+  exists (`ws_media.rs:457`): either the withdrawal sees that seat, or the seat sees the
+  membership gone and closes itself before the client hears anything.
+- The routes answer the membership change whatever the hook says, since it has happened; a
+  hook that fails (a database read or write of the call's books) is logged as an error with
+  the org, room and person. A pod the withdrawal did not reach is no failure of the hook.
+- Before the seats, `network` (first in `HOOK_ORDER`) removes the tunnel clients the person
+  owns in the org ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)). It never stops the
+  cascade, so a failure there cannot keep a seat or a room membership alive.
+- After the seats, `chat` (the record owner, later in `HOOK_ORDER`) drops the person's room
+  memberships of the org they left (`crates/modules/chat/src/membership.rs`). Every room
+  fan-out (messages, reactions, pins, typing, mentions) is addressed to those rows, so the
+  org's rooms stop reaching the person with the org membership. Rows of people no longer in
+  the org are ended by `POST /api/admin/room-members/prune`, an operator step (a dry run
+  by default, bounded, idempotent).
+
+**Tests.** `conference_gate_tests`: a member removed from the org, one who leaves it and one
+who leaves the room each lose the seat at once (their client hears the call ended, the host
+sees them leave, their transports, producers and consumers close, the host's consumer of
+their camera closes, they are off the participant list and the count, and their socket gets
+nothing more); `the_last_participant_leaving_the_room_ends_its_call`.
+`cluster_tests::an_org_removal_on_one_pod_withdraws_the_seat_the_other_pod_holds` and
+`a_room_leave_on_one_pod_withdraws_the_seat_the_other_pod_holds`.
+
+### The pod serving a call checks its own seats
+
+A withdrawal reaches only a pod that answers. When the bus request is lost or late, when
+the pod that took the membership's end has no bus, when the pod serving the call runs an
+older image during a roll, or when a membership goes by a path that never calls the hook,
+no word reaches the seat, and the pod serving the call is not gone: the person would keep
+hearing and being heard in a meeting of an org or a room they no longer belong to. So that
+pod checks its own seats (`crates/modules/conference/src/seat_check.rs`), and a seat whose
+admission reads as gone twice in a row, a pass apart, ends there.
+
+```mermaid
+sequenceDiagram
+    participant R as membership's end, on the pod the request reached
+    participant O as the pod serving the call (seat_check.rs)
+    participant DB as MongoDB primary
+    participant M as the person's sockets
+    participant P as everyone else in the call
+    R--xO: media.withdraw_seats lost, late, no bus, or an older image
+    R->>R: warn alert=membership_seat_unreached, the hook answers Ok, chat's hook runs
+    loop every SEAT_CHECK_SECS = 10 s
+        O->>O: read its own seats into owned values, the person in the room and their connections
+        O->>DB: rooms by _id, tenant_members, room_members of members-only rooms, within 5 s
+        DB-->>O: one complete read, or a failed one that changes nothing
+        O->>O: seats_to_end, a second miss in a row ends the seat
+    end
+    O->>O: close the connections seated before the deciding read
+    O->>M: room:call_ended, reason not_a_member
+    O->>P: media:peer_left for each closed connection
+    O->>DB: close their open call sessions, settle the call
+    O->>O: warn seat check ended a call seat whose admission is gone, alert=seat_check_ended
+```
+
+- **The loop.** Every pod runs it in a task of its own (`seat_check::spawn`,
+  `seat_check.rs:195`, started at `crates/modules/conference/src/lib.rs:194`), every
+  `SEAT_CHECK_SECS` = 10 s (`seat_check.rs:74`), the room reconcile's cadence. A pass first
+  reads the pod's seats out of the room manager into owned values (`seats_here`, `:217`), so
+  no guard of it is held across a read.
+- **What it re-reads.** Two of the three checks `media:join` passed (`media_gate.rs:114`),
+  with the room guard's own rule: membership of the room's org (the `tenant_id` the room
+  records), and, in a room whose visibility `requires_membership()` (Private, Secret), a room
+  membership. Each counts as `is_member` counts it: `{tenant_id, user_id}` for the org,
+  `{tenant_id, room_id, user_id}` for the room. The third, an open call session for the
+  connection, is not re-read: a person's other tab, or a call whose sessions a sweep closed,
+  would lose a seat they are entitled to.
+- **One read a pass, three queries, from the primary** (`read_admissions_unbounded`, `:337`):
+  the rooms by `_id`; `tenant_members` by `$in` lists of orgs and people, on its unique
+  `(tenant_id, user_id)` index (`crates/db/src/indexes.rs:155`); and, for the members-only
+  rooms only, `room_members` by `$in` lists of rooms and people, on its unique
+  `(room_id, user_id)` index (`crates/modules/chat/src/lib.rs:224`). Each has a projection
+  and reads the primary whatever the connection string says (`:440`), so a person added a
+  moment ago reads as a member, as the join's own gate read them; all three together within
+  `READ_TIMEOUT` = 5 s (`:82`). A pod with 300 seats in 20 rooms makes three indexed queries
+  every 10 s, with `$in` lists of at most 20 rooms, their orgs and the seated people, and
+  reads back at most about 620 small documents; a pod with no seats reads nothing.
+- **The verdict** (`seats_to_end`, `:153`, a pure function), counted by the person in the
+  room. A seat ends on the `MISSES_TO_END` = 2nd complete read in a row that finds its
+  admission gone (`:78`). A read that fails, breaks off, does not decode or is late changes
+  nothing, not even what it forgets. A person found admitted, or seated in a room the read
+  found no document for (the reconcile's case,
+  [below](#a-room-deleted-mid-call-ends-its-call)), starts again from zero, and a seat no
+  longer held is forgotten. From the `FAILED_READS_TO_WARN` = 3rd failed read in a row,
+  each one warns (`:86`).
+- **One teardown, counted once.** A seat ends as a withdrawal that reached it ends
+  (`revoke::withdraw_these_seats_here`, `revoke.rs:372`): only the connections seated before
+  the deciding read close, so a person added back who joins again keeps the new seat; they
+  hear `room:call_ended` with `reason: "not_a_member"`, and everyone left hears
+  `media:peer_left`. Then the call's books, as a hang-up keeps them (`seat_check.rs:287`):
+  the person's open call sessions in the room close and the count drops
+  (`finalize_call_leave_db`, which finds nothing where the membership's hook closed them
+  already), and the call is settled (`settle_call_after_departure`), so a call they were the
+  last one in ends on the pod where its media is. A room row deleted by a raw write took its
+  call sessions with it; the count it leaves is the stale sweep's, not the check's.
+- **The bound.** On a pod whose reads succeed, a seat whose admission is gone ends within
+  two passes and their reads after the membership's end:
+  `2 × (SEAT_CHECK_SECS + READ_TIMEOUT)` = 30 s.
+- **Doubt keeps the seat.** The check's reading agrees with the room guard in every cell of
+  room visibility, room row, org membership and role: wherever the guard admits, it reads
+  admitted. A room that still has a document, a tombstone included, is judged by its
+  memberships, as the reconcile reads "no document" literally; the guard would answer 404
+  there, and the check keeps the seat.
+- **Who holds a seat.** Every participant entry is made by `RoomManager::create_transports`
+  (`media/room_manager.rs:333`), whose one caller, `handle_media_join` (`ws_media.rs:442`),
+  takes a `JoinPass` that only `admit_join` mints (`media_gate.rs:138`). A recording is no
+  seat (a member uploads it over REST), and the room manager's RTP taps are kept apart from
+  its participants. ⚠️ A seat made any other way (a recorder, a bot, a pipe between pods or
+  workers: anything no membership admits by design) must be skipped by the check, or the
+  check ends it.
+- **The switch.** `ROOMLER__CONFERENCE__SEAT_CHECK` set to `false`, `0`, `off` or `no` turns
+  the check off on a pod (`seat_check.rs:89`). It is read once, as the pod starts: turning
+  it off takes a pod restart with the variable set, not a new image. As it starts, a pod logs
+  `seat check: on this pod` or `seat check: off on this pod` at info; with it off, a seat no
+  withdrawal reached keeps its call.
+- **The log, read by hand.** Each seat the check ends is one warning,
+  `seat check: ended a call seat whose admission is gone` (`seat_check.rs:92`), with the
+  org, the room, the person, how many connections closed and what each of the two reads
+  found, `alert = seat_check_ended`. A withdrawal that did not reach the pod serving the
+  call is one warning on the pod that took the membership's end,
+  `call seat withdrawal did not reach the pod serving the call; its seat check ends the seat`,
+  with the org, the room, the person and the pod, `alert = membership_seat_unreached`
+  (`revoke.rs:316`). The two `alert` fields are handles for a person reading the pod logs:
+  nothing files or pages on them. `membership_seat_unreached` is expected once per room with
+  a remote claim when a removal lands in a roll's mixed minute; outside a roll it means a bus
+  that did not answer. `seat check: the admissions read keeps failing` is a pod that ends no
+  seat until it reads again.
+- **Mixed versions.** The check runs where the seat lives and adds no message:
+  `media.withdraw_seats` and its reply are unchanged, so pods on either image ask and answer
+  each other as before. A pod on the previous image runs no check; a seat it serves that no
+  withdrawal reached lasts until that pod is replaced.
+
+**Tests.** `seat_check::tests`: a seat ends on its second miss in a row and not before; a
+failed read changes nothing; one miss then found starts again from zero; no room document
+and no reading give no verdict; only the seat whose admission is gone ends; the switch; a
+room document decodes with the model's visibility default. `cluster_tests`:
+`an_org_removal_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` and
+`a_private_room_leave_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` (the pod
+serving the call cannot be reached: the removal answers, chat's hook runs, and the seat ends
+within the bound with `not_a_member`, the call going on for the host, counted once; both
+fail without the check), `the_seat_checks_reading_agrees_with_the_room_guard_in_every_cell`,
+`an_entitled_member_keeps_the_seat_across_seat_checks`,
+`a_person_the_rooms_visibility_admits_without_a_room_row_keeps_the_seat` and
+`the_seat_check_ends_only_the_seat_whose_admission_is_gone_and_once` (the same person's seat
+in another room of the org and in a room of another org stays, a call they were the last one
+in ends, and passes after the closes end nothing).
+
+### A room deleted mid-call ends its call
+
+Deleting a room (`DELETE /api/tenant/{tenant_id}/room/{room_id}`, `MANAGE_CHANNELS`) ends
+every membership of it at once: `cascade_delete` (`dao/room.rs:348`) removes the room's
+document and its `room_members` rows, and the call sessions those rows held go with them.
+The call running in the room ends with them, for everyone in it, on whichever pod serves
+it. `chat` tells `conference` through `MembershipLifecycle::room_removed`
+(`crates/core/src/hooks.rs:229`) once the room is gone
+(`crates/modules/chat/src/room.rs:384`).
+
+```mermaid
+sequenceDiagram
+    participant D as room delete (chat), on the pod the request reached
+    participant H as core.hooks
+    participant C as conference (revoke.rs)
+    participant O as the pod serving the call
+    participant P as each connection seated in the call
+    D->>D: cascade_delete: the room, its memberships, their call sessions
+    D->>H: room_removed
+    H->>C: MembershipLifecycle
+    C->>O: media.close_room, reason room_deleted (or locally, when this pod serves the call)
+    O->>O: close every seat's transports, producers, consumers, the router, release the claim
+    O->>P: room:call_ended, reason room_deleted
+    O->>O: close the call's stats record, by the room
+    Note over O: no word of the delete reached it: two reconcile reads in a row find no room document, and the same teardown runs
+```
+
+- **The order: the delete first, then the hook.** Every admission reads the room's document
+  (`media_gate.rs:127`), so once it is gone nothing new is admitted while the call ends. A
+  join or a start already on its way when the room went looks again once it has built its
+  seat or its router (`ws_media.rs:466`, `call.rs:62`), and a room that is gone takes an
+  empty router with it.
+- **One teardown.** Whatever finds a deleted room's call ends it in `close_room_here`
+  (`media_cluster.rs:475`), the way `call/end` ends a call: every seat's transports,
+  producers and consumers close, the router goes and the claim is released. The release
+  waits at most `CLAIM_RELEASE_BOUND`, 2 s: a Redis link lost without a reset parks a
+  command with no answer, and the people are told all the same, while the record's own
+  30 s TTL ends the claim. Each connection
+  that was seated hears `room:call_ended` with `reason: "room_deleted"` (`revoke.rs:170`
+  `deleted_rooms_call_ended`), and the call's stats record closes by the room
+  (`dao/stats.rs:462`), because the room's `current_call_id` went with its document. The
+  member list went too, so the connections to tell come from the call's media, and they are
+  told wherever their sockets are (`send_to_connection_routed`).
+- **The other pod.** A delete that reaches the pod not serving the call asks the one serving
+  it over the bus: `media.close_room` with `reason: "room_deleted"` (`media_cluster.rs:397`
+  `close_room_everywhere`, handled at `:898`). The hook awaits one directory read, at most
+  one request whose reply waits at most `RPC_DEADLINE`, 2 s
+  (`crates/core/src/cluster/bus.rs:41`), a second read and a release when no reply comes,
+  and one update of the stats record.
+- **The delete waits a bounded time.** The hook runs in a task of its own, and the delete
+  waits for it at most `ROOM_REMOVED_BOUND`, 5 s (`crates/modules/chat/src/room.rs:342`),
+  well above the slowest healthy teardown. Past the bound (a Redis or Mongo node lost
+  without a reset hangs a read without end), or when the client hangs up, the delete
+  answers and the teardown goes on: it is never cut off between a router removed and its
+  people told. The task itself logs how the teardown ended, so a failure past the bound is
+  still seen: an error names each holder that failed, and a teardown that ends after the
+  delete answered says how long it took.
+- **The pod serving the call ends it on its own** when no word of the delete reached it: the
+  hook failed, its request was lost, or a pod whose code ends no call served the delete. Its
+  reconcile (`end_calls_of_rooms_gone`, `media_cluster.rs:704`), a loop of its own every
+  `MEDIA_REFRESH_SECS` = 10 s (`:934`), apart from the claim heartbeat so that neither
+  waits for the other, reads the documents of the rooms it serves media for, and a room
+  with no document in `MISSES_TO_END` = 2 reads in a row (`:680`) is gone: its call ends
+  through the same teardown, within about 20 s. Only a read that completes counts: one that
+  fails, breaks off or takes longer than 5 s (`:684`) changes nothing, and from the third
+  failed read in a row (`FAILED_READS_TO_WARN`, `:688`) each one is a warning, so a
+  reconcile that cannot read shows in the log. "No document" is literal: a legacy room that
+  still carries `deleted_at` has a document, and its call is left alone. The reconcile runs
+  on every pod, whether or not it has a cluster directory.
+- **The delete answers 200 whatever the hook says**, since the room is gone. When the pod
+  serving the call could not be reached (`RoomClose::NotReached`, `media_cluster.rs:377`),
+  the hook fails, the delete logs it as an error with the org and the room, and that pod
+  ends the call itself as above. When no reply comes in time, the claim is read again
+  (`media_cluster.rs:434`): a claim gone with the media means that pod closed the call and
+  answered late, and nothing failed (`RoomClose::Owner` with no seats); a claim that still
+  names it, as a crashed pod's does until its record runs out, is pruned and stays a
+  failure. Every holder of `room_removed` runs even when one before it fails
+  (`crates/core/src/hooks.rs:394`), and the error names each failure. A stats record that
+  does not close behind the reconcile or a guard of a join or a start is closed by the stats
+  rollup's orphan sweep as `stale_reset` within 15 minutes (`maintenance.rs:63`
+  `close_orphaned_call_state`, each cycle at `crates/api/src/stats_rollup.rs:633`).
+- **It is idempotent.** A call that already ended, or a second `room_removed`, finds no
+  media and no open record: nothing closes and nobody hears anything.
+- **During a roll**, a pod on the previous image that serves the call takes the request as
+  an ended call: its seats, router and claim go, but its people hear nothing until that pod
+  is replaced. A request with no `reason`, as the previous image sends, closes the room as
+  an ended call, as before.
+- The web client reads `room:call_ended` as "this call is over for you" whatever its reason
+  (`ui/src/stores/ws.ts:349`), so a deleted room needs no client change.
+
+**Tests.** `conference_gate_tests`: `deleting_a_room_mid_call_ends_its_call_for_everyone_in_it`,
+`deleting_a_room_leaves_a_call_in_another_room_alone` (the deleted room has no call, and
+the call's people are members of it),
+`removing_a_room_whose_call_ended_or_a_second_time_tells_no_one`,
+`a_room_removed_again_after_its_call_ended_ends_nothing_twice`,
+`a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it`,
+`a_router_left_for_a_room_already_gone_is_reaped` and
+`a_room_delete_answers_at_its_bound_and_its_teardown_runs_on` (a holder that outlasts the
+bound: the delete answers at the bound and the holder still runs to its end; it fails both
+with the hook awaited inline and with a plain timeout around it). `cluster_tests`:
+`a_room_deleted_on_the_pod_serving_its_call_ends_the_call_on_both_pods`,
+`a_room_deleted_on_the_other_pod_ends_its_call_on_the_pod_serving_it`,
+`a_call_whose_room_is_gone_is_ended_by_the_pod_serving_it_across_pods`,
+`the_pod_serving_a_deleted_rooms_call_tells_its_own_people`,
+`a_room_deleted_while_the_pod_serving_its_call_cannot_be_reached_ends_it_afterwards` (the
+delete answers within the bound, and the reconcile ends the call) and
+`a_close_answered_too_late_after_its_claim_went_is_no_failure`. The two-miss rule and the
+close request's reason are unit tests in `media_cluster::tests`, and every holder running
+past a failing one is `hooks::tests::a_holder_that_fails_a_deleted_room_does_not_stop_the_others`.
+The guards of a join and a start that raced the delete have no test of their own: reaching
+either needs the room to go between two reads inside one request, which no test can time
+without a seam in production code. What they miss, the reconcile reaps within two passes
+(`a_router_left_for_a_room_already_gone_is_reaped`).
+
+### A socket's `media:*` frames are limited
+
+Each socket has a token bucket for its `media:*` frames: `[meetings] media_frame_burst`
+frames at once (400), refilled at `media_frame_rate` a second (20)
+(`crates/config/src/settings.rs:280`, `:285`; env `ROOMLER__MEETINGS__MEDIA_FRAME_BURST` and
+`…_RATE`; `0` turns the limit off). A frame is counted on the pod that holds the socket, as it
+arrives and before anything is looked up for it (`ws_media.rs:56`), so a frame forwarded to
+the call's owner pod is counted once, where it came in.
+
+| A frame over the limit | Where |
+|---|---|
+| is not run, and the socket hears `media:error` with `code: "rate_limited"`, `retry_after_ms` (the time until the bucket holds a frame again) and a `message` | `crates/modules/conference/src/frame_limit.rs:48` `refused` |
+| leaves the socket open: a client that overruns loses that frame, never its socket or its call | the same |
+| counts in `media_frames_rate_limited_total` on `GET /api/cluster/status` | `crates/core/src/cluster/metrics.rs:36`, `crates/api/src/cluster/metrics.rs:63` |
+| is logged: the socket's first refusal at warn, and its total at info when it closes | `frame_limit.rs:48`, `:85` `socket_closed` |
+
+**How deep, measured.** The deepest burst a real client sends is a join into a large
+meeting: the join, one `media:consume` for every producer already in the call, back to back
+as fast as the answers come (`consumeChain`, `ui/src/stores/conference.ts`), both
+transports' connects, its own camera and microphone, and the view reports its tiles trigger.
+`conference_rate_tests` builds Business's largest meeting, 100 people with a camera and a
+microphone each, and joins it that way: **212 frames** (1 join, 198 consumes, 2 connects,
+2 produces, 9 view reports) in about 1 s, at most 211 in any one second. The default holds
+that join on the bucket's depth alone, with room for screen shares, people on two devices and
+a rejoin a second later. The refill is twice the fastest steady sender the client has, the
+view report (debounced to 10 a second while the grid scrolls), and holds a flood to 20 frames
+a second after its first 400.
+
+**Tests.** `conference_rate_tests`: the 100-person join passes the shipped limit whole, and a
+flood of 1000 frames on the same socket right after it is refused frame by frame (791
+refused, 209 run, measured), the socket answers a ping and gets on with the call once the
+bucket refills; a refusal's wire and that the frame never reaches the participation gate; a
+zero burst turns the limit off. Unit: the bucket's arithmetic (`frame_limit.rs` `tests`).
 
 ### A meeting receives what is visible (FR-127 P1)
 
@@ -108,9 +631,9 @@ sequenceDiagram
 
 | Message | Change | Where |
 |---|---|---|
-| `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:313` |
-| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:459`, `meeting_levers` at `:735` |
-| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:196`, the handler at `:752`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
+| `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:434` |
+| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:604`, `meeting_levers` at `:813` |
+| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:287`, the handler at `:830`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
 
 It is dispatched where `media:consume` is — through the C-4 placement gate — so a viewer
 whose socket is on the other pod reaches the owner's participant state over `media.cmd`
@@ -166,7 +689,7 @@ it was rolled back. Two nets now catch it, and neither catches everything:
   it: `consume` holding an `Option<RefMut>` across its awaits passed clippy. Read what the
   await needs into owned values first, and `rooms_ref()` is crate-private so every caller
   is behind the same gate.
-- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1492`). A burst of
+- **Tests on two worker threads** (`room_manager.rs`'s `tests`, `room_manager.rs:1528`). A burst of
   joins, publishes, consumes and view reports in one room, behind a watchdog: on the old
   code both threads park in dashmap's lock and the test fails at 60 s, and the review's
   `Option<RefMut>` variant froze it too. Fixed, the conference unit suite finishes in under
@@ -196,7 +719,7 @@ reaches every viewer whatever their view says. Locked against a real worker by
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
 unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
-call page hands it to the store (`ConferenceView.vue:427`), and the store keeps the tiles on
+call page hands it to the store (`ConferenceView.vue:435`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
 (`ui/src/stores/conference.ts:428`) and sends one `media:view` at most every 100 ms
 (`:672-734`) — and again every 15 s while in the call and when the tab returns to the
@@ -239,22 +762,11 @@ more packets than one worker carries without it.
 
 **Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
 consumers held back by their viewers' views, never the owner's FR-30 pause
-(`crates/api/src/cluster/metrics.rs:86`, from `MediaGauges::video_paused_total`,
-`crates/modules/conference/src/lib.rs:109`) — and each row of `media_rooms_detail` its
+(`crates/api/src/cluster/metrics.rs:88`, from `MediaGauges::video_paused_total`,
+`crates/modules/conference/src/lib.rs:128`) — and each row of `media_rooms_detail` its
 `video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
 two that follow it (simulcast, a room piped across workers), are in the FR's §3.0.
-
-The viewer peer's signalling (`hive:view.*`, FR-90) is a view grant and the SDP
-and ICE of a **data-only** WebRTC peer between the browser and the device that
-holds the session. The server tells the browser `ready` only after the device has
-confirmed the grant (FR-83), relays the handshake to and from the one connection
-that holds the grant, and never sees the transcript that then flows over the
-peer. A search (`hive:search.open`, P2i-2) is a grant of the same kind toward an
-archive replica, naming the sessions the asker may read whose copy it holds; its
-query and what it finds travel only over its peer. The server's half is
-[`crates/modules/hive/src/view.rs`](../crates/modules/hive/src/view.rs), the
-device's `agents/roomlerd/src/hive/view.rs`.
 
 ## The `rc:*` plane (agents, tunnel clients, controllers)
 
@@ -267,10 +779,11 @@ tag is a deliberate wire break.
 |---|---|---|
 | Agent lifecycle | `rc:agent.hello` · `rc:agent.heartbeat` · `rc:agent.sleeping` · `rc:agent.update` · `rc:agent.join_org` · `rc:goodbye` | Hello carries caps (codecs, transports, rpc), displays, advertised routes; heartbeat every 30 s, with the device's power posture (`power`, FR-55 P4); `rc:agent.sleeping {power}` is the device's goodbye just before the OS sleeps it, which the server records and answers with the ordinary teardown, so the device reads **asleep** instead of **offline** ([power.md](power.md) §3); `goodbye` carries a close reason (deleted / replaced / policy) |
 | Remote-desktop session | `rc:session.request` · `rc:session.created` · `rc:request` · `rc:ready` · `rc:terminate` · `rc:session.stats` · `rc:error` | Session state machine between controller, server, agent |
+| Session resume ([FR-138](fr/FR-138-the-session-outlives-its-control-socket.md), wire only) | `rc:agent.resume_window {secs}` · `rc:session.resumed {session_id}` · `rc:session.detached {session_id, resume_by}` · `rc:session.rejoin {session_id}`, and the fields `kept_sessions` on `rc:agent.hello`, `replaces` on `rc:session.request`, `resume_secs` on `rc:session.created`, with the `rc-resume` verb in `AgentCaps.rpc` | A live session outlives its device's control socket: the device keeps its peer and claims it back in its next hello, the viewer holds and rejoins, and the server decides each claim. **Inert at window 0**, as P1a shipped it: every field is absent unless set, nothing sends the four messages, nothing reads `kept_sessions` or `replaces`, and a rejoin is dropped unanswered, as a server before it drops it. The window (`ROOMLER__RC__SESSION_RESUME_SECS`, default 0) and the platform admin's resume scope (`/api/admin/rc-resume-scope`) gate it. `resume_by` is unix ms on the server's clock. `rc:agent.resume_window` is never sent to an agent without the verb |
 | SDP / ICE | `rc:sdp.offer` · `rc:sdp.answer` · `rc:ice` | WebRTC negotiation relayed through the server |
 | Consent | `rc:consent` | Owner consent decision (pairs with the HTTP capability URLs) |
 | Keepalive | `rc:ping` / `rc:pong` | Application-level liveness |
-| Tunnel session | `rc:tunnel.hello` · `.open` · `.opened` · `.terminate` · `.revoked` | Client ⇄ agent tunnel establishment (`open_nonce` correlates concurrent opens; an agent session's `net_grant` rides `.open` from its own device, and `.opened` echoes its id as `net_grant_id`: [tunnels.md](tunnels.md#an-agent-sessions-grant-fr-90-p3-7-2a)) |
+| Tunnel session | `rc:tunnel.hello` · `.open` · `.opened` · `.terminate` · `.revoked` | Client ⇄ agent tunnel establishment (`open_nonce` correlates concurrent opens) |
 | Tunnel TCP flows | `rc:tunnel.tcp.request` → `.forward` → `.accept`/`.reject` · `.half_close` · `.closed` | Per-flow lifecycle |
 | Tunnel UDP flows | `rc:tunnel.udp.request` → `.forward` → `.accept`/`.reject` · `.closed` | SOCKS5 UDP ASSOCIATE flows |
 | Tunnel carriers | `rc:tunnel.sdp.offer`/`.answer` · `.ice` · `.quic.setup`/`.ready`/`.candidate` | WebRTC-DC and QUIC data-plane negotiation |
@@ -278,6 +791,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1186`), `RETIRED_RC_TAG_FAMILIES` (`:1215`), `RETIRED_USER_WS_NAMESPACES` (`:1220`) and `RETIRED_MODULE_IDS` (`:1224`), locked by `retired_rpc_verbs_are_never_reused` (`:8324`), `retired_wire_families_and_module_ids_are_never_reused` (`:8393`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5308`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -357,21 +871,25 @@ sequenceDiagram
 
 ## DERP
 
-`GET /derp?token=<agent-jwt>` upgrades to a minimal frame relay for overlay pairs
-where **both** sides are UDP-blocked:
+`GET /derp?role=agent&tid=<tenant>` with `Authorization: Bearer <agent-jwt>` (or,
+from a daemon older than 0.4.210, `?token=<agent-jwt>`; [above](#where-a-native-clients-credential-travels-3656))
+upgrades to a minimal frame relay for overlay pairs where **both** sides are
+UDP-blocked:
 
 - Frames are `[dst_pubkey(32) || payload]` client→server, rewritten to
   `[src_pubkey(32) || payload]` on delivery.
 - Hard tenant/network isolation; the payload is WireGuard ciphertext the relay
   cannot read.
 - Standalone regional PoPs (`crates/derp-relay`) run the same protocol DB-free,
-  authenticated by Ed25519 tickets minted over `rc:relay.derp_ticket_request`.
+  authenticated by Ed25519 tickets minted over `rc:relay.derp_ticket_request`. A
+  ticket travels like the JWT: `Authorization: Bearer <ticket>`, or `?ticket=` from
+  an older daemon, with the same precedence and the same challenge
+  ([scripts/relay-pop/README.md](../scripts/relay-pop/README.md#the-admission-ticket-and-the-access-log-3656)).
 
 ## Connection hygiene
 
 - Agents keep one outbound WSS control link: WS ping every 25 s,
-  `rc:agent.heartbeat` every 30 s, exponential reconnect capped at 60 s; a 401 on
-  upgrade is fatal (re-enroll).
+  `rc:agent.heartbeat` every 30 s, exponential reconnect capped at 60 s.
   - The ladder restarts at 1 s when a connection that sent its hello lived ≥ 30 s
     and then dropped (#2221). Before that, a successful reconnect kept the
     ladder where the outage left it, so the next ordinary drop waited out the
@@ -379,8 +897,129 @@ where **both** sides are UDP-blocked:
   - A server that accepts and drops at once still climbs the ladder. That 30 s
     bar is what keeps a flapping server from drawing a fleet-wide reconnect
     every second.
+- A `401` on upgrade (after [the one query-form redial](#how-the-daemon-and-the-cli-dial-3656)
+  where that applies) is not fatal. It closes the sessions the agent kept, and
+  FR-103 looks for a newer token in the config file, else renews this one, and
+  retries once (`agents/roomlerd/src/signaling.rs:1311`). Otherwise the agent
+  waits 30 s, 60 s, 5 min, then an hour between tries
+  (`agents/roomlerd/src/signaling.rs:1639`), and the third refusal in a row raises
+  the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
   alive.
 - `rc:goodbye` close reasons distinguish *replaced by newer connection* (benign
   restart) from *deleted / policy-rejected* (stop retrying).
+
+### How an agent socket ended (#3517)
+
+Every end of a registered agent socket leaves one line on the pod that held it, at the
+end of its teardown (`crates/modules/fleet/src/socket.rs:1083-1095`), and its `cause`
+says how the socket ended:
+
+```
+INFO roomler_ai_mod_fleet::socket: remote-control agent WS disconnected agent_id=… cause=error kind=eof error="…"
+```
+
+Each exit of the read loop (`socket.rs:534`) breaks with a `SocketEnd`
+(`crates/modules/fleet/src/socket_end.rs:25`), so an exit added later does not compile
+until it names its cause. `cause` is always on the line. Every other field appears only
+with the cause it belongs to, so the line never carries a field that means nothing for
+its end. Before #3517 the line carried the agent id alone, and a close frame or a reset
+showed on no line at all.
+
+```mermaid
+flowchart LR
+    RL["read loop<br/>(biased select!)"]
+    RL -->|"the Hub's cancel"| C["cancelled · by"]
+    RL -->|"no frame past the deadline"| L["liveness_deadline · elapsed_s"]
+    RL -->|"rc:agent.sleeping"| S["sleep"]
+    RL -->|"a close frame"| CL["close · code · reason<br/>or close_no_frame"]
+    RL -->|"a failed read"| E["error · kind · error"]
+    RL -->|"the stream ended"| SE["stream_end"]
+    C & L & S & CL & E & SE --> T["teardown:<br/>unregister, Offline"]
+    T --> D["remote-control agent WS disconnected<br/>cause=…"]
+```
+
+| `cause` | its fields | what ended the socket |
+|---|---|---|
+| `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2336`) |
+| `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
+| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
+| `cancelled` | `by` | the Hub cancelled the loop; `by` below |
+| `sleep` | — | the device said it is going to sleep (FR-55 P4). Its daemon sends a close frame next, which the loop never reads |
+| `stream_end` | — | the stream ended with neither a frame nor an error. tokio-tungstenite ends it that way only after a close or an error, and the loop leaves on both first, so this is not expected |
+
+`by`, for `cause=cancelled`. Each trigger records itself just before its notify
+(`AgentCancel`, `crates/modules/fleet/src/hub.rs:217`), with the notify call itself
+unchanged. The cancel arm's own line, `agent connection cancelled by Hub; exiting
+read-loop`, carries the same `by`.
+
+| `by` | the trigger |
+|---|---|
+| `replaced` | a newer connection for the same agent registered (`Hub::register_agent`, `hub.rs:1103`): a reconnect that beat the old socket's teardown, or two daemons on one identity |
+| `idle_nudge` | the idle nudge cycled an idle agent, so its reconnect re-hashes through the LB (`Hub::nudge_agent_if_idle`, `hub.rs:1332`) |
+| `renumber` | an overlay renumber (`Hub::cycle_agent_ws`, `hub.rs:1360`) |
+| `shutdown` | this pod's graceful shutdown (`Hub::cancel_all_agents`, `hub.rs:1375`) |
+| `unknown` | a cancel with no trigger recorded. Nothing fires one today |
+
+`kind`, for `cause=error` (`error_kind`, `socket_end.rs:138`):
+
+| `kind` | what the transport under the socket said |
+|---|---|
+| `eof` | the TCP leg ended with no close frame |
+| `reset` | the TCP leg was reset |
+| `aborted` · `timeout` · `broken_pipe` · `io` | the other I/O errors; `io` is any not named |
+| `protocol` | a frame RFC 6455 forbids, invalid UTF-8 in a text frame among them |
+| `capacity` | a frame over `MAX_WS_MESSAGE_BYTES` |
+| `other` | an error that is not tungstenite's |
+
+⚠️ **The pod sees the hop in front of it, not the device.** The binary's peer is the
+pod's nginx ([deployment.md § Topology](deployment.md#topology)), so a device whose
+process died or whose network dropped mid-stream usually reads `kind=eof` once the
+proxies close their legs, whatever the device's own TCP stack sent. `eof` means *no
+close frame*, not *a clean FIN at the device*.
+
+⚠️ **`kind=other` on every error means the tungstenite pin drifted.** `error_kind`
+downcasts axum's error to the tungstenite that `crates/modules/fleet/Cargo.toml`
+pins. If axum moves to another one, every error reads `other`, and the loopback test
+`socket::tests::a_dropped_tcp_leg_reads_eof` fails first.
+
+**Before the hello.** A socket that ends before its `rc:agent.hello` registered nothing,
+so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1295`) says
+how it ended on its own warn line, `agent opened WS without rc:agent.hello — closing`,
+with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
+`other=None` for every end.
+
+**The grep.** Pod logs are ANSI-coloured, so strip the codes first. Tenant affinity pins
+each socket to one pod, so read every pod. Select the pods by their label. A name match
+such as `grep roomler2-` also catches the `roomler2-prepull-*` pods of FR-28's pre-pull
+DaemonSet (`.github/workflows/promote.yml:46`), which carry `app=roomler2-prepull` and
+run no `roomler2` container.
+
+```bash
+for p in $(kubectl -n roomler-ai get pods -l app=roomler2 -o name); do
+  echo "== $p"
+  kubectl -n roomler-ai logs "$p" | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep 'remote-control agent WS disconnected' \
+    | grep -oE 'cause=[a-z_]+( kind=[a-z_]+| by=[a-z_]+)?' | sort | uniq -c | sort -rn
+done
+```
+
+For one device's history, replace the last `grep -oE …` with `grep 'agent_id=<hex>'`.
+
+⚠️ **`kubectl logs` reads only the pod's current log file.** The kubelet rotates that
+file at its size cap, which under daytime traffic has been every 10 to 15 minutes, so an
+empty grep can be the file's boundary rather than the absence of a disconnect. For an
+older window, read the rotated files through the kubelet's log proxy. The newest rotated
+file is plain text and the older ones are gzipped, and each line there carries the CRI
+prefix `<ts> stdout F`:
+
+```bash
+P=roomler2-…   # the pod's name, without the pod/ prefix
+N=$(kubectl -n roomler-ai get pod "$P" -o jsonpath='{.spec.nodeName}')
+U=$(kubectl -n roomler-ai get pod "$P" -o jsonpath='{.metadata.uid}')
+D="/api/v1/nodes/$N/proxy/logs/pods/roomler-ai_${P}_${U}/roomler2"
+kubectl get --raw "$D/"                  # lists 0.log, 0.log.<ts> and the *.gz files
+kubectl get --raw "$D/0.log.<ts>" | sed -E 's/\x1b\[[0-9;]*m//g' | grep 'remote-control agent WS disconnected'
+```

@@ -19,17 +19,18 @@
  * green — and ZERO media arrived, for weeks, with nothing logged. So this spec
  * asserts DECODED FRAMES ADVANCING ON BOTH SIDES and fails if they do not.
  *
- * The oracle is the `<video>` element itself — `getVideoPlaybackQuality()
- * .totalVideoFrames` — not `getStats`. Two reasons: mediasoup-client owns the
- * RTCPeerConnections and the app exposes no debug hook for them, and a frame
- * counted by the element is a frame the compositor could actually paint, which
- * is the product claim. `currentTime` advancing is the corroborating signal.
+ * The oracle is the `<video>` element that holds the REMOTE track —
+ * `getVideoPlaybackQuality().totalVideoFrames` — because a frame counted by the
+ * element is a frame the compositor could actually paint, which is the product
+ * claim. ⚠️ Remote elements only, and frames only (`fixtures/call-media.ts`): the
+ * self-view advances with no network at all, and this spec read it until #3287,
+ * so a call with no media could pass.
  *
  * Env: E2E_BASE_URL, E2E_API_URL (both required; the spec skips otherwise).
  * Skips itself against a server that does not mount `conference`, so it is
  * inert on `remote`/`mesh`/`access` rather than falsely red.
  */
-import { test, expect, type BrowserContext, type Page } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 import {
   uniqueUser,
   registerUserViaApi,
@@ -41,6 +42,7 @@ import {
   sendMessageViaApi,
   loginViaUi,
 } from './fixtures/test-helpers'
+import { trackLocalCaptures, remoteVideoTracks, remoteVideoProgress } from './fixtures/call-media'
 
 const API_URL = process.env.E2E_API_URL || ''
 const BASE_URL = process.env.E2E_BASE_URL || ''
@@ -50,71 +52,6 @@ async function serverModules(): Promise<string[]> {
   const resp = await fetch(`${API_URL}/api/capabilities`)
   if (!resp.ok) throw new Error(`capabilities: ${resp.status}`)
   return ((await resp.json()) as { modules: string[] }).modules
-}
-
-/**
- * Decoded-frame progress across every `<video>` on the page that is actually
- * playing something. Returns the best (max) counter, because the local
- * self-view is also a `<video>` and we care that SOME video is decoding — the
- * remote-tile-count assertion below is what makes it the peer's.
- */
-async function videoProgress(page: Page): Promise<{ frames: number; time: number; videos: number }> {
-  return await page.evaluate(() => {
-    let frames = 0
-    let time = 0
-    let videos = 0
-    for (const v of Array.from(document.querySelectorAll('video'))) {
-      const el = v as HTMLVideoElement & {
-        getVideoPlaybackQuality?: () => { totalVideoFrames: number }
-        webkitDecodedFrameCount?: number
-      }
-      if (!el.srcObject) continue
-      videos++
-      const q = el.getVideoPlaybackQuality?.()
-      const f = q ? q.totalVideoFrames : (el.webkitDecodedFrameCount ?? 0)
-      if (f > frames) frames = f
-      if (el.currentTime > time) time = el.currentTime
-    }
-    return { frames, time, videos }
-  })
-}
-
-/**
- * A REMOTE track is arriving: at least one `<video>` whose MediaStream carries
- * a live video track that this page did not produce. `muted` is the tell the
- * app sets on its own self-view; rather than rely on that styling choice, count
- * streams whose track ids differ from every locally-captured track.
- */
-async function remoteVideoTracks(page: Page): Promise<number> {
-  return await page.evaluate(() => {
-    const w = window as unknown as { __selfhost_local_track_ids?: string[] }
-    const local = new Set(w.__selfhost_local_track_ids ?? [])
-    let n = 0
-    for (const v of Array.from(document.querySelectorAll('video'))) {
-      const s = (v as HTMLVideoElement).srcObject as MediaStream | null
-      if (!s) continue
-      for (const t of s.getVideoTracks()) {
-        if (t.readyState === 'live' && !local.has(t.id)) n++
-      }
-    }
-    return n
-  })
-}
-
-/** Record the ids of tracks this page captured, so remote ones are tellable. */
-async function trackLocalCaptures(context: BrowserContext): Promise<void> {
-  await context.addInitScript(() => {
-    const w = window as unknown as { __selfhost_local_track_ids: string[] }
-    w.__selfhost_local_track_ids = []
-    const md = navigator.mediaDevices
-    if (!md?.getUserMedia) return
-    const orig = md.getUserMedia.bind(md)
-    md.getUserMedia = async (c?: MediaStreamConstraints) => {
-      const s = await orig(c)
-      for (const t of s.getTracks()) w.__selfhost_local_track_ids.push(t.id)
-      return s
-    }
-  })
 }
 
 /** Join the call in the UI and wait for the local tile to render. */
@@ -233,9 +170,9 @@ test.describe('FR-75 collab pillar — chat and a call that carries media', () =
       // ── and those frames must ADVANCE, not merely exist ──────────────────
       // One painted frame proves a keyframe arrived; a stream is a stream only
       // if the counter keeps moving.
-      const before = await Promise.all([videoProgress(page1), videoProgress(page2)])
+      const before = await Promise.all([remoteVideoProgress(page1), remoteVideoProgress(page2)])
       await page1.waitForTimeout(5_000)
-      const after = await Promise.all([videoProgress(page1), videoProgress(page2)])
+      const after = await Promise.all([remoteVideoProgress(page1), remoteVideoProgress(page2)])
 
       for (const [i, tag] of [
         [0, 'owner'],
@@ -244,11 +181,11 @@ test.describe('FR-75 collab pillar — chat and a call that carries media', () =
         const b = before[i]
         const a = after[i]
         expect(
-          a.frames > b.frames || a.time > b.time,
-          `${tag}: video did not advance over 5s (frames ${b.frames} → ${a.frames}, ` +
-            `currentTime ${b.time.toFixed(2)} → ${a.time.toFixed(2)}, ${a.videos} video elements) — ` +
+          a.frames - b.frames,
+          `${tag}: remote video did not advance over 5s (frames ${b.frames} → ${a.frames}, ` +
+            `${a.videos} remote video elements) — ` +
             `mediasoup signalling can be perfect while no RTP arrives; check ANNOUNCED_IP and the RTC port range`,
-        ).toBe(true)
+        ).toBeGreaterThanOrEqual(5)
       }
 
       if (trouble.length) {

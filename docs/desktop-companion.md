@@ -39,11 +39,17 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2040`): any person
-logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
+and the daemon's own account** in full and **Interactive Users** reading and writing data
+only, at medium integrity (`crates/localapi/src/lib.rs:4270-4271`): any person logged in at
+the machine can call it, but only the first three add an instance of the pipe, and a
+sandboxed low-integrity process cannot call it. Everything
 below that lets the companion *change* something is therefore something any interactive user
-can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
-on the Devices page) are enforced in the daemon and on the server, never in the page.
+can reach, and the daemon decides who may — which is why the device-side rules (the
+`files_dir` SYSTEM rule, the visibility rule on the Devices page) are enforced in the daemon
+and on the server, never in the page. A consent answer and the banner's Disconnect are taken
+only from the person at the screen the daemon shows, SYSTEM or an elevated administrator
+(§12.4). The console person's own settings, recording, keep busy and external-access password
+follow the same screen on Windows (§12.4).
 
 ## 2. The pages
 
@@ -110,13 +116,13 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2133`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4370`)
    binds the first instance (retrying while another process holds the name), then runs a
-   pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
+   pool of accept tasks (`accept_pipe`, `:4484`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
-   (`DEFAULT_PIPE_POOL`, `:1725`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
+   (`DEFAULT_PIPE_POOL`, `:4223`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
    switch** and reproduces the old single-instance behaviour.
-3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:2299`) retries a
+3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:5467`) retries a
    busy pipe at 5, 10, 20, 40, 80, 160 ms (≤ 315 ms in total); any other error (the daemon
    is not running) returns at once.
 
@@ -160,7 +166,7 @@ state word it does not know (a newer daemon) as that word, never as an error
 ## 5. Settings, grouped
 
 The config surface (`crates/agent-core/src/config_surface.rs`) is one table of
-`KeyMeta { key, kind, group, tier, live, description }` (`:181`) — adding a key without
+`KeyMeta { key, kind, group, tier, live, description }` (`:268`) — adding a key without
 saying which group and tier it belongs to, and whether the daemon applies it live, does not
 compile.
 
@@ -179,37 +185,62 @@ compile.
   per-user GUI worker, whose `config.toml` is its own: FR-43 keeps the worker enrolled
   through P2. Meanwhile the Overview's network lines are the root half's (§6), so the two
   pages described different daemons and nothing said so: a person switching `ssh_enabled`
-  on here changed a file the mesh node never reads (measured on 0.4.169). The card now
-  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`)
-  naming the file it edits and the root half's (`/etc/roomler/config.toml`), with the
-  administrator's command for the root half's switches: `sudo roomler config set <key>
-  <value>`. It is shown only when the reached daemon says it runs unprivileged AND a root
-  daemon of another identity answers `Status` over the person socket (`two_halves`,
-  `:687`) — one daemon behind both sockets, a root daemon's legacy per-user bind, is not
-  two halves. ⚠️ The banner reads the root half's **status** and nothing else: the person
-  socket refuses every config verb (`localapi::person_may`), so the root half's
-  device-owned gates stay root's to set. Admitting them is the decision open on #2871.
-- **A Linux system install, and a Mac with a root half alone (#2891).** There the daemon the
-  page reaches runs as root and this app does not: `connect()`'s first candidate on Linux,
-  `$XDG_RUNTIME_DIR/roomler.sock`, IS the root daemon's person socket (§12), which serves
-  `Status` and refuses every config verb. Until #2891 the page took that refusal for a daemon
-  that was down, fell back to the per-user config file — a path a system install does not
-  have — and showed "Could not load the configuration" with a Retry that never helped; with a
-  stale per-user file left by an earlier per-user install it would have read, and
-  `cmd_config_set` written, a file no daemon reads (#2871's failure, on Linux). Now
-  `cmd_config_target` (`agents/roomler-desktop/src/commands.rs:828`) reports `root_only`
-  (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`, pure: the reached daemon
-  says it runs as root, this process does not, and the OS is not Windows, whose pipe admits
-  interactive users to those verbs) and the card shows the daemon, its file
-  (`Status.config_path`: `/etc/roomler/config.toml`) and the administrator's commands —
-  `sudo roomler config ls`, `sudo roomler config set <key> <value>` — in place of rows. A
-  refusal from a root daemon is final for `cmd_config_entries`, `cmd_config_set` and
-  `cmd_set_device_name`: none falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:783`). ⚠️ No new authorization path: `person_may`
-  is unchanged, and #2879's test still pins `ConfigSet` of the gate keys as refused there.
+  on here changed a file the mesh node never reads (measured on 0.4.169). **Design A
+  (#2871, the operator, 2026-10-25):** the root half's person socket now serves the
+  configuration — the listing, with every key it will not set marked
+  `read_only = "root_only"`, and `ConfigSet` of exactly the keys that are the console
+  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3365`;
+  the device-owned gates are not among them) — and the page shows the Mac as one device:
+  each row comes from, and a change goes to, the half that READS the key. The split is the
+  key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`):
+
+  | Owner | Groups | On a two-half Mac | Examples |
+  |---|---|---|---|
+  | **session** — the per-user half, which serves the remote-desktop session | Remote desktop · Capture & input · Video encoding · Video rate · Files | the worker's row, edited on the worker as before | `rc_clipboard`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, `encoder_preference` |
+  | **machine** — the root half, the device `roomler ssh` / `roomler exec` reach | Access & consent · Private network · Carriers · Routing · Tunnels · Roomler SSH · Device & service | the root half's row, over its person socket: editable where that socket sets the key (`external_*`), otherwise read-only with the administrator's command | `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `overlay_enabled`, `auto_grant_session`, `auto_update`, `external_access_enabled` |
+
+  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:636`) builds the rows —
+  machine-side keys from the root half's listing, in the worker's order — and
+  `cmd_config_set` (`:828`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:753`), whose answer is final: the worker's copy of
+  such a key is a file the Mac's device never reads, so it is not written. The worker's
+  own copies of machine keys stay reachable with `roomler config …` in a terminal, and
+  the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
+  the root half forwards its own value of a few session knobs to the worker as a floor
+  (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
+  halves' configs, so the worker's copy — the one this edits — can only tighten the
+  root's. The banner (`cmd_config_target`, `:1187`; `two_halves_note`, `:1007`) names both
+  halves' files and says which rows change here. It is shown only when the reached daemon
+  says it runs unprivileged AND a root daemon of another identity answers `Status` over the
+  person socket (`two_halves`, `:990`) — one daemon behind both sockets, a root daemon's
+  legacy per-user bind, is not two halves. A root half older than design A still refuses
+  the listing; the rows are then the worker's alone and the banner carries the #2879 words
+  (`two_halves_legacy_note`, `:1028`): the root half's switches are
+  `sudo roomler config set <key> <value>`.
+- **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
+  daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
+  on Linux, `$XDG_RUNTIME_DIR/roomler.sock`, IS the root daemon's person socket (§12). Until
+  #2891 the page took that socket's refusal of `ConfigGet` for a daemon that was down, fell
+  back to the per-user config file — a path a system install does not have — and showed
+  "Could not load the configuration" with a Retry that never helped; with a stale per-user
+  file left by an earlier per-user install it would have read, and `cmd_config_set`
+  written, a file no daemon reads (#2871's failure, on Linux). #2891 made a root daemon's
+  refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
+  falls back to the file (`refused_by_root_daemon`,
+  `agents/roomler-desktop/src/commands.rs:1143`). Since design A the same socket serves the
+  listing, marked: `cmd_config_target` (`:1187`) reports `root_only` (`root_daemon_only`,
+  `:1053`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
+  are editable, and the rest — the device-owned gates, the network, SSH, the updater, the
+  recordings folder — show the root daemon's value with "administrator's" and
+  `sudo roomler config set <key> <value>`
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1080`). From a daemon older than
+  design A the card still shows the daemon, its file (`Status.config_path`:
+  `/etc/roomler/config.toml`) and the administrator's commands in place of rows
+  (`root_only_legacy_note`, `:1102`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:2954`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:3447`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
@@ -244,7 +275,7 @@ flowchart TD
 ```
 
 - **The same code decides both.** `shape_full_netmap`
-  (`crates/modules/network/src/overlay.rs:2492`) was extracted from the overlay join and is
+  (`crates/modules/network/src/overlay.rs:2810`) was extracted from the overlay join and is
   what the join itself now calls, so the list can never show a peer the netmap withholds:
   ACL `off` / `warn` list every live node, `enforce` only the shaped set.
 - ⚠️ **The device's node is found before any ACL read.** Loading the ACL can create the
@@ -338,7 +369,7 @@ sequenceDiagram
     direct or relayed and over what, round trip) without any endpoint;
   - `Status` with its own name, version and server link, plus the root half's overlay
     addresses, exit status and MagicDNS (`person_socket::with_machine_network`) — and, since
-    #2892, **`network_from`** (`crates/localapi/src/lib.rs:201`): the root half's node id and
+    #2892, **`network_from`** (`crates/localapi/src/lib.rs:197`): the root half's node id and
     name, set only when those fields were lent. Nothing on the wire said so before, and `roomler status` as the console user
     printed the root half's address as this half's, right above this half's own "overlay OFF"
     enrollments. The CLI now marks `overlay ip` / `overlay ip6` "(the root daemon's)", adds a
@@ -349,11 +380,13 @@ sequenceDiagram
 
   A root half that is slow to answer (1.5 s) leaves the half's own answer on screen for that
   poll.
-- **What the per-user half does NOT borrow: configuration (#2871).** `ConfigGet` /
-  `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
-  file — and says so (§5). The same socket does tell the companion, and the CLI's
-  `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4627`), that a root half exists: `/var/run/roomler` is
+- **What the per-user half does NOT borrow: configuration (#2871).** The per-user half
+  never forwards a config verb to the root half. Since design A the COMPANION asks the root
+  half's person socket itself for the machine-side rows and sends their changes there
+  (§5), so the person always knows which daemon answered; the per-user half's own
+  `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
+  the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
+  `crates/localapi/src/lib.rs:5354`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -364,7 +397,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1428`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1746`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -378,7 +411,7 @@ unsupervised `roomlerd run` would take the device offline for good:
 | the macOS supervisor (FR-43) | the worker's `--supervised` flag | `9` | the supervisor |
 | anything else | — | **refused** | — |
 
-`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:199`); it is outside
+`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:210`); it is outside
 systemd's `RestartPreventExitStatus=7 8`, and the SCM host maps it to *respawn* as well.
 
 ```mermaid
@@ -399,7 +432,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1814`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2261`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -410,8 +443,14 @@ sequenceDiagram
   the tree is spawned into its own process group, and teardown unions the group members with
   the parent-link closure of the daemon's direct children (which reaches a setsid'd
   grandchild, since `setsid` changes the session and group but never the parent), SIGTERMs,
-  waits a 2 s grace, then SIGKILLs the remainder. systemd then finds an empty cgroup and
-  relaunches after `RestartSec` (~5 s). ⚠️ It SIGKILLs **as root**, so it never signals a
+  waits a 2 s grace, then SIGKILLs the remainder. A parent link reaches such a grandchild
+  only while its parent lives, and an app that exits, or an X server whose death ends its
+  clients, takes the link with it. So since #3665 the window manager and the apps are the
+  children of **the desktop's keeper** (`roomlerd vd-keeper`), a subreaper in the desktop's
+  group that adopts what they leave behind and ends the whole desktop when the daemon's end
+  of its input closes, which a daemon that dies closes too
+  ([`linux-capture.md` §2.3](linux-capture.md#23-the-desktops-keeper-3665)). systemd then
+  finds an empty cgroup and relaunches after `RestartSec` (~5 s). ⚠️ It SIGKILLs **as root**, so it never signals a
   recycled pid: the daemon's own children are reaped only **after the last signal** (an
   unreaped zombie keeps its pid — and, for Xvfb, the desktop's pgid — reserved), and any
   other pid is signalled only after its `/proc` **starttime** is re-read and matches the
@@ -468,12 +507,26 @@ the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), de
 struck through, and how long the probe took.
 
 - It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
-  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:68`). The capability probe runs in
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:194`). The capability probe runs in
   child processes (vendor driver code) at the first server hello; a control-surface poll
   must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
 - Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the
   card polls every 5 s while the Overview is visible, then stops), `unsupported` (a build
   with no video encoder). An older service gets a one-line "update the service" instead.
+- **A Linux system install** (#3831). The companion runs as the person and reaches the root
+  daemon over its person socket (§12), which serves `EncoderCaps` as well (`person_may`,
+  `crates/localapi/src/lib.rs:3611`): the answer is the cached summary
+  (`caps::summarize_cached`, `agents/roomlerd/src/encode/caps.rs:298`), so the verb starts no
+  probe and changes nothing on the host. Up to 0.4.222 the socket refused it, and the card read
+  **Error**. On such a daemon a newer companion reads **Unavailable**: "The encoders are shown
+  to this device's administrator." (`root_only`). Only an *answer* that refuses reads that way,
+  and only from a root daemon that this unprivileged app reached, which one `Status` on the
+  same connection confirms (`refused_by_root_daemon`,
+  `agents/roomler-desktop/src/commands.rs:1143`, the test the config verbs use, #2891; the
+  decision is `encoder_caps_view`, `:1349`). No answer at all (a failed write or read, a closed
+  connection) stays **Error**, with its stage. Windows serves the verb to every interactive
+  user (the pipe's `IU` ace), and a Mac's companion asks its per-user half, which answers from
+  its own probe.
 - `denied` is the effective `encoder_cells_deny` list (env, config or built-in), shown
   because a denied cell is never opened by the probe or a session, so it could not appear in
   the matrix otherwise. The resolved `encoder_preference` is shown under it.
@@ -486,7 +539,10 @@ struck through, and how long the probe took.
 The Overview's **Incoming files** card shows where a file a controller drops onto this
 screen will land **right now**, with **Open folder**, **Change…** (the native folder picker,
 which can create a folder) and **Use default**. The setting is `files_dir`; unset, the ladder
-is the active user's Downloads, then the service's own fallback. It is **live**: every
+is the active user's Downloads, then the service's own fallback (a Windows background service
+with nobody signed in refuses the file instead, §9.2; on Linux the service's own folder is never
+one another account can write, §9.5; a Mac's system daemon transfers no file itself, and a
+session no GUI worker serves is told why, §9.6). It is **live**: every
 transfer reads the current value, so a change needs no restart.
 
 ⚠️ `files_dir` is a security control, because the daemon writing the file can be SYSTEM or
@@ -507,11 +563,14 @@ root and the LocalAPI admits any interactive user. The rules
   shows verbatim) **and when used** (`download_dir()` re-validates per transfer and falls back
   to the default ladder with a warning — the check that holds even if `config.toml` was
   edited by hand).
-- Only the **console user** may change it through the LocalAPI: an RDP user on the same
-  machine must not choose where the console user's incoming files land. A SYSTEM shell
+- Only the **console user** may change it through the LocalAPI, on Windows the person at the
+  screen the daemon shows (§12.4): another signed-in account on the same machine must not
+  choose where that person's incoming files land. A SYSTEM shell
   (`roomler exec`, SSH) can still edit the config file; the use-time check applies.
 - The Status the companion shows is refreshed off the request path, so a Downloads folder
-  redirected to an offline share cannot stall the 2 s poll.
+  redirected to an offline share cannot stall the 2 s poll. On a Linux system install the refresh
+  also waits 1.5 s at most for who is at the screen, and shows the folder as pending until a
+  lookup answers (#3796, §9.4).
 
 ### 9.1 A Linux system install writes the file as the person at the screen (FR-97 P3d)
 
@@ -522,9 +581,13 @@ and is **born theirs**:
 
 ```mermaid
 flowchart TD
-    B["files:begin"] --> Q{"root on Linux,<br/>and a person at seat0?"}
-    Q -- "yes" --> P["FsAs::Person<br/>(companion::seat0_user, uid 0 refused)"]
-    Q -- "no, or ROOMLERD_FILES_AS_SEAT_USER=0" --> D["FsAs::Daemon<br/>files_dir, or the ladder"]
+    B["files:begin"] --> Q{"root on Linux, and<br/>ROOMLERD_FILES_AS_SEAT_USER on?"}
+    Q -- "no" --> D["FsAs::Daemon<br/>files_dir, or the ladder"]
+    Q -- "yes" --> W{"who is at seat0?<br/>asked off the async worker, 1.5 s at most"}
+    W -- "root" --> D
+    W -- "nobody, or the lookup failed" --> A["FsAs::DaemonAlone<br/>root's own Downloads, 0600 (§9.4)"]
+    W -- "no answer in time" --> C["FsAs::CannotTell: refused,<br/>saying it could not tell (§9.4)"]
+    W -- "a person" --> P["FsAs::Person<br/>(companion::seat0_account, uid 0 refused)"]
     P --> F["their files_dir (inside THEIR home),<br/>else XDG_DOWNLOAD_DIR, else ~/Downloads, else ~"]
     F --> S["every path step on a blocking thread<br/>under their fsuid, fsgid and groups"]
     S --> R["staging, data file, final rename,<br/>resume, cancel, orphan sweep"]
@@ -532,10 +595,10 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who writes | `FsAs` (`:223-294`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:556-559`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
+| Who writes | `FsAs` (`:282-809`), chosen once in `begin` (`FsAs::for_write`, `:499`, off the async worker since #3711, §9.4) and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:1496-1499`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
 | How | `FsAs::run` → `crate::fs_identity::FsIdentity` (FR-85's guard, moved out of `recording`) | Linux checks every open, create and unlink against the thread's fsuid, fsgid and groups; root's bypass capabilities leave with the fsuid |
-| Their folder | `person_downloads` / `xdg_download_dir` (`:310-343`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
-| The staging | `create_dir` and `create_new`, never reuse (`begin_as`) | a folder or a link planted where the staging goes refuses the begin |
+| Their folder | `person_downloads` / `xdg_download_dir` (`:1088-1121`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
+| The staging | `stage_held` (`files.rs:5080`) → `staging::stage` (`agents/roomlerd/src/files/staging.rs:746`): `mkdirat` for its folders, `openat` with `O_CREAT`, `O_EXCL` and `O_NOFOLLOW` for its files | an upload's own folder (`<id>`) is never reused, and a link or a folder planted where it goes refuses the begin; the stager's own `.roomler-partial` is reused once it is made 0700, and a folder that keeps no modes stages privately (§9.5) |
 
 ⚠️ **Never as root followed by a `chown`.** In a folder the person owns, a link they planted
 would be followed with root's rights, and the staging folder's `meta.json`, which a resume reads
@@ -544,9 +607,515 @@ and whose `dest_dir` the final rename trusts, is theirs to edit. Under their ide
 (`seat_user_tests::as_root`, run under `sudo` in CI) plants a link into a `0700 root` folder and
 shows the begin refused, with a control proving root's own rights go straight through it.
 
-⚠️ "The person" is seat0's (`companion::seat0_user`, FR-97 P5a), never whoever asked: an xrdp
-session sits on no seat. With nobody at seat0, the daemon's own ladder applies, as before.
-Downloads and browsing (the host → viewer direction) still read as the daemon.
+⚠️ "The person" is seat0's (`companion::seat0_account`, FR-97 P5a), never whoever asked: an xrdp
+session sits on no seat. With nobody at seat0, the daemon's own ladder applies, but never a folder
+a controller chose, nor the configured one, and that ladder ends in root's own Downloads (#3688,
+§9.5). Since #3688 downloads and browsing (the host → viewer
+direction) take the same person (§9.4).
+
+### 9.2 A Windows background-service install writes the file as the person at the screen (#3048)
+
+The background service's worker (SystemContext) is LocalSystem in the session it serves. It used to
+write a received file as LocalSystem: into a Downloads built from the person's user name, or, when
+that Downloads was out of its reach (redirected to a share), into the machine's own `uploads` folder.
+Either way the file was not the person's. It is now written the way §9.1 writes it on Linux: every
+path step on the person's side runs as the person signed in to that session, so the file is born
+theirs.
+
+```mermaid
+flowchart TD
+    B["files:begin"] --> L{"LocalSystem worker?"}
+    L -- "no, or ROOMLERD_FILES_AS_SEAT_USER=0" --> D["FsAs::Daemon<br/>files_dir, or the ladder"]
+    L -- "yes" --> S{"someone signed in<br/>to this session?"}
+    S -- "no" --> N["FsAs::Nobody: refused,<br/>'Nobody is signed in to this computer<br/>to receive the file'"]
+    S -- "yes" --> P["FsAs::Person<br/>SID, profile, Downloads from their token"]
+    P --> F["their files_dir (inside THEIR profile),<br/>else their Downloads known folder, else their profile"]
+    F --> T["staging in the service's own folder,<br/>as the service"]
+    T --> E["files:end: the data opened as the service;<br/>as the person, a new file made and filled;<br/>the staging removed as the service"]
+```
+
+| What | Where | Why |
+|---|---|---|
+| Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:282-332`), chosen by `fs_as_for` (`:418`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
+| How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:381`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
+| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:817`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:8337`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:10894`): never the machine-global folder |
+| The staging | `stager_for` (`:2377`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
+| The end | `place_across` (`:2931`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
+| A resume | `resume_incoming_as` (`:3182`), `PartialMeta::person_sid` (`:1541`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
+
+- **A locked screen keeps its user**, so a file sent then lands in their Downloads.
+- **Nobody signed in** (before sign-in, after sign-out): the upload is refused with the reason
+  above, which the viewer shows. File transfer never writes as LocalSystem.
+- **The viewer says where the file landed**, by path, local or on a share: "Uploaded report.pdf
+  to `\\server\share\…\Downloads`" ([`remote-control.md`](remote-control.md) §18.2).
+- `files_dir` and a folder the viewer chose keep FR-84 D4's rule (inside the person's profile), and
+  are checked and written as the person.
+- `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the service's own identity, as on Linux.
+- Per-user and attended installs are unchanged: their daemon already is the person.
+
+### 9.3 A Windows background-service install reads as the person at the screen too (#3669)
+
+The other direction, host → viewer, is three verbs: a download (`files:get`), a folder download
+(`files:get-folder`, one zip) and the drawer's listing (`files:dir`). On a background-service
+install they used to run as the worker, LocalSystem. They now run as the person a write takes
+(§9.2), chosen by the same function, through the same impersonation:
+
+```mermaid
+flowchart TD
+    R["files:get · files:get-folder · files:dir"] --> L{"LocalSystem worker?"}
+    L -- "no, or ROOMLERD_FILES_AS_SEAT_USER=0" --> D["FsAs::Daemon, as before"]
+    L -- "yes" --> S{"someone signed in<br/>to this session?"}
+    S -- "no" --> N["FsAs::Nobody: refused<br/>before anything is touched"]
+    S -- "yes" --> P["FsAs::Person: each step on a<br/>blocking thread, as them"]
+    P --> F["a file: resolved, checked<br/>and opened as them; the<br/>pump reads that handle"]
+    P --> Z["a folder: each folder listed<br/>and each file opened as them"]
+    P --> G["a listing: resolved, opened<br/>and read as them"]
+```
+
+| What | Where (`agents/roomlerd/src/files.rs`) | Why |
+|---|---|---|
+| Who reads | `FsAs::for_read` (`:478`), one function with `FsAs::now` (`session_or_daemon`, `:538`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`) |
+| A download | `begin_outgoing_as` (`:3542`), `open_to_send` (`:3660`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
+| A folder | `begin_outgoing_zip_as` (`:4252`), `walk_and_zip` (`:4333`), `zip_folder_entries` (`:4527`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
+| A listing | `list_dir_as` (`:4026`), `list_canonical` (`:4044`) | resolved and opened as them inside the 3 s timeout, then the entries read through that handle |
+
+- **Nobody signed in**: a download or a folder download is refused with "Nobody is signed in to
+  this computer to send the file"; the drawer, its drive list included, with "Nobody is signed in
+  to this computer to browse its files". The viewer shows either.
+- **A file or folder Windows refuses to open for the person** (their own rights, or a filter
+  such as an EDR or DLP product, which answers with the same code) is refused, as a download or a
+  listing, with "`<path>`: Windows refused to open it for the person signed in to this computer".
+  Inside a folder download, an entry they may not open is left out of the zip, not refused, as an
+  unreadable file always was; only a folder they may not list at all is refused.
+- **A locked screen keeps its user**, so reads run as them, as writes do.
+- **Another person signs in** (switch user): the console moves to their session and the service
+  replaces the worker with one there, so a read takes them from then on, as a write does. A
+  transfer under way ends with the old worker, and every step checks the SID it began with.
+- **A Downloads folder redirected to a share** is listed and downloaded with the person's own
+  logon, which the folder grants, where the computer's own account is refused. Like the write in
+  §9.2, the share is a lab read, not a unit test. Its path is the one the upload message names.
+- **The service's own folders** (the drawer's **Upload staging folder** button, `<staging>`,
+  and the service's logs and crash dumps) are SYSTEM's and the Administrators' alone once
+  sealed ([installation.md](installation.md)). A standard user may not list them, nor may an
+  administrator while UAC is on (the session holds an administrator's filtered token), so the
+  drawer shows the refusal. An administrator fetches those files with `roomler exec`.
+- **The denylists stay**, as a second line: the registry-hive and kernel-namespace refusals of
+  `validate_outgoing_path` and `is_agent_secret` run on the path the person resolved.
+- `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the service's own identity for reads too: one switch, both
+  directions.
+- **A worker that cannot read its own token** is taken for LocalSystem (`fs_as_for`,
+  `agents/roomlerd/src/files.rs:418`; the token is read once, `win_identity::own_token_is_local_system`,
+  `agents/roomlerd/src/win_identity.rs:62`): reads and writes then take the person, or nobody, never
+  the worker itself.
+- **The entry points are tested with the person**, not only their steps: a test stands the
+  low-integrity person in for what `FsAs::for_read` answers (`files::stand_in`), and drives
+  `files:get` (`begin_outgoing`), `files:dir` (`list_dir`) and `files:get-folder` through the task
+  the viewer's request runs (`peer::outgoing_zip`). A person who signs out partway through a folder
+  ends it with `files:error`, never `files:eof`.
+- Per-user and attended installs and macOS are unchanged; a Linux system install takes the person at
+  seat0 since #3688 (§9.4). Three small changes reach every
+  install, each a unit test in `files::tests`: a folder that cannot be listed is refused when its
+  download begins (`an_unlistable_folder_is_refused_when_its_download_begins`; it used to arrive
+  as an empty zip), a download opens its file before its offer and checks the handle it sends, so
+  one that will not open is refused at once
+  (`a_file_that_will_not_open_is_refused_before_its_offer`), and a listing resolves its path off
+  the async worker, inside its 3 s timeout (`a_listing_resolves_its_path_off_the_async_worker`).
+
+### 9.4 A Linux system install reads as the person at the screen too (#3688)
+
+On a Linux system install the daemon is root. A download (`files:get`), a folder download
+(`files:get-folder`) and the drawer's listing (`files:dir`) used to run as root, while a received
+file was already written as the person at seat0 (§9.1). They now take that same person, by the
+same rule, and each read step also gives up the thread's capabilities:
+
+```mermaid
+flowchart TD
+    R["files:get · files:get-folder · files:dir"] --> Q{"root on Linux, and<br/>ROOMLERD_FILES_AS_SEAT_USER on?"}
+    Q -- "no" --> D["FsAs::Daemon, as before"]
+    Q -- "yes" --> S{"who is at seat0?<br/>asked off the async worker, one lookup<br/>in flight, 1.5 s at most"}
+    S -- "root" --> D
+    S -- "nobody: an empty seat, the login<br/>screen, a host with no logind" --> N["FsAs::Nobody: refused<br/>before anything is touched"]
+    S -- "no answer in time,<br/>or the lookup failed" --> C["FsAs::CannotTell: refused,<br/>saying it could not tell"]
+    S -- "a person" --> P["FsAs::Person: each step on a blocking thread<br/>with their fsuid, fsgid and groups,<br/>and no capability"]
+    P --> H["every handle, a file's or a folder's,<br/>held to what was asked,<br/>off the kernel's own file systems"]
+    H --> F["a file: the pump reads that handle"]
+    H --> Z["a folder download: before each folder and<br/>each file, still their uid at seat0? Each folder<br/>listed through its handle, each file opened as them"]
+    H --> G["a listing: resolved as them,<br/>listed through its handle"]
+```
+
+| What | Where (`agents/roomlerd/src/files.rs`) | Why |
+|---|---|---|
+| Who reads | `FsAs::for_read` (`:478`) → `linux_fs_as` (`:949`), the function `FsAs::now` (`:447`) asks for a write | a read and a write cannot take different people. The person is seat0's (`seat_now`, `:856`, through `companion::seat0_account`, `agents/roomlerd/src/companion.rs:4061`, FR-97 P5a's rule), fixed when the request arrives. A name that resolves to another uid than the one logind recorded for the session is nobody (`seat_of`, `files.rs:872`): that account's rights are not the person's |
+| The lookup | `seat_within` (`:1059`), `SEAT_LOOKUP_WAIT` (`:1028`), `FsAs::CannotTell` (`:331`), `linux_fs_as_within` (`:1001`), one lookup in flight `SEAT0` (`:1037`, `OneInFlight`, `agents/roomlerd/src/one_in_flight.rs:72`) | logind and the account database are other processes: the lookup runs on a thread of its own, never a stalled async worker, and each caller waits for it 1.5 s. #3796 — one lookup at a time, on a thread named `seat0-lookup`: a caller who asks while one runs waits on it, within its own 1.5 s, and starts none of its own, so retries during a hang hold one thread, not one each. A caller takes only the answer of a lookup that began at or after it asked (the list below says why). A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:4182`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:4097`), or systemd did not boot the host (`loginctl_failed`, `:4113`). Any other lookup that fails cannot tell who is there (`Seat::CannotTell`), and one that runs out of time does not know yet (`Seat::OutOfTime`, `files.rs:850`): the read is refused with its own text either way, logged |
+| A received file's lookup (#3711) | `FsAs::for_write` (`:499`), from `FilesHandler::begin` (`:2421`), `FilesHandler::resume_incoming` (`:3188`) and `sweep_orphans` (`:1760`) | the same path as a read's, with the same wait. These three asked inline on the async worker, with no time limit, so a slow account database (SSSD or LDAP refreshing a large group list) stalled that worker for as long as the lookup took, and the startup sweep, which signalling waits for, held the daemon's start as long. What a received file takes with each answer is in the list below |
+| A files folder's set (#3769) | `FilesDirSet` (`files.rs:1371`): `check` (`:1385`), `saved` (`:1415`), `refresh_status` (`:1425`), from `config_set` (`agents/roomlerd/src/localapi_state.rs:1374`) | a `ConfigSet` of `files_dir` asks who a drop would be written as once, as a received file asks it, and runs §9's set-time check for and as that person before it takes the config write lock (`:1394`, the lock `:1401`). Under the lock are only the load, the change, the save and the live folder. The status answer is recomputed for the same person after the lock (`:1475`), and published only while what the set saved is still the configured value (`publish_effective`, `files.rs:1270`), so an earlier set's late answer never shows after a later set. Both checks used to ask under the lock with no time limit, so a slow logind or account database held every other config read and write behind it. What a set answers is in the list below |
+| The person socket's check (#3796) | `person_socket::at_the_seat_now` (`agents/roomlerd/src/person_socket.rs:450`), its own lookup in flight `PERSON_AT_SEAT0` (`:463`), from the dispatch (`crates/localapi/src/lib.rs:3991`) | before it applies a `ConfigSet`, the person-at-the-device socket asks again whether its caller is still the person at seat0 (#2871's review). That is logind's answer, so it is asked as a received file's is: one lookup in flight (`seat0-person`), 1.5 s at most. It used to wait as long as logind took, a blocking thread for each request. With no answer in time the set is refused with "Could not tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`, `crates/localapi/src/lib.rs:3733`), the text a read or a received file gets then, never "the seat changed". #3845 — the socket's 5 s poll, which moves it to whoever is at the seat, now asks through the same lookup in flight, 5 s at most. A look that cannot tell keeps the socket where it is, and a consent answer is checked as a set is (§12.3) |
+| The status answer (#3796) | `spawn_effective_refresh` (`files.rs:1311`), `refresh_effective_files_dir_as` (`:1252`), `FsAs::now` (`:447`), the read `effective_files_dir` (`:1221`) | the card's folder comes from one background refresh at a time, which asks who a drop would be written as. It asked seat0 inline, with no time limit: while a lookup hung the refresh never finished, and the card kept the folder it showed before, perhaps for a person who had left. It now asks through `SEAT0`, 1.5 s at most. With no answer in time it publishes the folder as pending (no folder, not fresh: #3769's shape), and the next status read starts another refresh, which waits on the same lookup. The status read itself answers from its cache and never waits for a lookup |
+| How | `FsIdentity::begin_reading` (`agents/roomlerd/src/fs_identity.rs:233`), from `run_here` (`files.rs:739`) | §9.1's fsuid, fsgid and groups, and the thread's effective capabilities emptied for the step. An fsuid that is not 0 takes away only the file-system capabilities, and the rest would still answer for root wherever a check asks for one. The drop gives the capabilities back first (the groups' restore needs `CAP_SETGID`), then the identity, then the capabilities again, and checks all of it: a thread it cannot restore aborts the daemon |
+| Exec and SSH as `console_user` (#3822) | `exec::console_account` (`agents/roomlerd/src/exec.rs:919`), `exec::console_person` (`agents/roomlerd/src/exec.rs:972`), through `ask_seat0` (`agents/roomlerd/src/files.rs:1046`) | Fleet RPC's exec, SSH's exec and shell, and SFTP find the person at the screen through the same lookup in flight, `SEAT0`, 1.5 s at most, awaited from their own task. They used to run `loginctl` inline on the async worker, with no time limit. Only `Seat::Person` is an account. No answer in time, or a lookup that failed, refuses with the try-again text; nobody and root at the screen refuse. Nothing else stands in for the person. Details: `docs/roomler-ssh.md` § `console_user` on Linux and macOS |
+| The handles | `held_to_the_person` (`:4611`), `folder_held_to_the_person` (`:4623`), `folder_listing` (`:4503`), `KERNEL_FILE_SYSTEMS` (`:4585`) | inside the step, before a handle leaves it or anything is listed through it: never on one of the kernel's own file systems (procfs, sysfs, debugfs, tracefs, securityfs, efivarfs, bpf, pstore, configfs, cgroup, …: `fstatfs` on the handle, a file's or a folder's), and the kernel's own path for the handle must be the path asked for. A folder is opened first, checked so, and listed through that handle (`/proc/self/fd/N`), never through its path again. Some kernel files answer by who reads at `read()`, which the pump does as root, so the person's rights to them say nothing; and a link swapped in after the path was resolved is followed by the open, through a `/proc/<pid>/fd` link even onto a file or folder the daemon holds open |
+| A folder download, the person leaves | `FsAs::still_at_the_screen` (`:688`), `seat0_active_uid` (`:904`), `walk_and_zip` (`:4347`) | before each folder is listed and before each file is opened, seat0's active uid (`ACTIVE_UID=` in `/run/systemd/seats/seat0`, logind's own record of the seat, as `sd-login` reads it) must still be the person's. Once it is not, or it does not read, the walk ends with `files:error`, never `files:eof` (§9.3's rule) |
+| A received file, nobody at seat0 | `FsAs::DaemonAlone` (`:296`), `resolve_dest_path_as` (`:3796`), `FsAs::writer` (`:770`), `new_file` (`:1687`) | written as the daemon, as before, but neither a folder the controller chose nor the configured one (`files_dir`) is taken: the first is refused before it is touched, and the second is checked with no active home, so its `~` never resolves in root's. The upload lands in the default folder: FR-84 D4's rule for a privileged writer with nobody signed in (§9). Its partial and the partial's notes are created 0600 from the first byte, so the file is root's only (`root:root`, 0600), in root's own Downloads (§9.5). Nothing changes the mode after |
+
+- **Nobody at seat0** (an empty seat, the login screen, a server or a cluster node with no session
+  at all): a download or a folder download is refused with "Nobody is signed in at this computer's
+  screen to send the file"; the drawer, its roots view included, with "Nobody is signed in at this
+  computer's screen to browse its files". The viewer shows either. Uploads still work, into
+  root's own `/root/Downloads` (§9.5), as files only root may read. The rule is the screen, not a
+  sign-in: someone signed in over SSH is not at it.
+- **A host with no logind at all** (no `loginctl`, or a host systemd did not boot: a container, WSL
+  without systemd, a minimal VM) has no seat0, so nobody is at its screen: its reads get the texts
+  above, never "Try again", and the switch below gives them back.
+- **Who is at seat0 could not be told** (logind did not answer, on a host that has it; the account
+  database did not answer; or the lookup took longer than 1.5 s): every read is refused
+  with "Could not tell who is signed in at this computer's screen. Try again." A retry asks again.
+  A lookup that ran out of time keeps going on its own thread, so the account database's own
+  caches (SSSD's, nscd's) usually hold its answer by then. #3796 — that thread is the only one: a
+  retry, a read or the status refresh that asks while it runs waits on it, within its own 1.5 s, and
+  starts no lookup of its own. When it ends, its answer, late, is no one's, and the next caller asks
+  afresh. A caller takes only the answer of a lookup that began at or after it asked: one that
+  began earlier may answer for a moment that has passed. A stopped logind's D-Bus call fails after
+  about 25 s, and a failed lookup leaves a received file to the daemon alone, so a caller who took
+  that failure would get a write as root where its own lookup gives "Try again". An account lookup
+  that stalls after logind has answered could name a person who has since left. So a caller waits
+  such a lookup out, then asks a fresh one. The cost: with a slow lookup that still works, taking
+  `d`, a caller who asks `e` after one began waits `(d - e) + d`. Up to `d` = 0.75 s every caller is
+  answered. At `d` = 1 s a caller who asks within 0.5 s of a lookup's start gets "Try again" where
+  its own lookup would have answered (`one_in_flight::tests::the_cost_a_caller_just_after_a_slow_lookup_began_waits_for_two`).
+  A normal lookup takes tens of milliseconds. A received file takes one of two answers
+  (#3711):
+  - **No answer in 1.5 s**: the upload is refused with the same text before anything is touched,
+    and the viewer shows it on the upload's row. The lookup is still running and a retry usually
+    finds the person, so the file is not written for anyone else in the meantime. A resume whose
+    partial the daemon still holds needs no answer and goes on; one it does not hold is refused, and
+    the viewer starts that upload again. The startup sweep sweeps nothing that start.
+  - **The lookup failed outright** (logind or the account database answered with an error): the
+    file is the daemon's alone, as with nobody there, in root's own Downloads, 0600. Reads and
+    writes differ here on purpose. A write has a safe place to go: no controller chose it, and only
+    root reads what lands there, so a host whose lookup always fails (its logind masked, say) keeps
+    its uploads. A read has no such place: read as root, it would send whatever root may read, so a
+    read whose lookup failed is refused, as above.
+- **Setting the files folder while who is at seat0 is not known** (#3769):
+  - **No answer in 1.5 s**: a folder (the card's **Change…**, or `roomler config set files_dir`) is
+    refused with "Could not tell who is signed in at this computer's screen. Try again." before
+    anything is saved or made, and the card shows that text. **Use default** needs no one and goes
+    through. Until a lookup answers, the status names no folder, so the card shows the default with
+    its folder pending (`…`), never the folder just cleared. The next status read asks again, and
+    the next file asks for itself.
+  - **The lookup failed outright**: today's answers. The daemon writes alone with no one's profile,
+    so the placement rule refuses a folder ("… no active user profile is known right now, so
+    files_dir cannot be honoured"), and **Use default** shows root's own default folder (§9.5).
+  - Either way nothing else waits for the lookup: a `ConfigGet`, a set of another key and the status
+    answer at once.
+  - Off Linux the answers are today's: a Windows service asks for the person signed in to its
+    session (its token, with no time limit) on a blocking thread, now before the lock; a Mac's
+    daemon asks for no one.
+- **The status card while who is at seat0 is not known** (#3796): a status read (the companion's
+  2 s poll, `roomler status`) answers at once, from its cache. Within 1.5 s of the refresh asking,
+  the card shows the default with its folder pending (`…`), never the folder it showed before; once
+  a lookup answers, the folder is back.
+- **The person's own settings while who is at seat0 is not known** (#3796): a `ConfigSet` over the
+  person-at-the-device socket (the companion's settings, or `roomler config set` as the person) is
+  refused within 1.5 s with "Could not tell who is signed in at this computer's screen. Try
+  again.", and nothing is saved. On a Mac the check is a look at `/dev/console`, which has no wait.
+- **A person who leaves seat0 during a folder download** (signs out, or the login screen or another
+  person takes seat0) ends it before its next file or folder with `files:error`, "the person this
+  began for is no longer signed in", never `files:eof`, as on Windows (§9.3). The file being zipped
+  when they left still goes.
+- **A file or folder Linux refuses to open for the person** (their own rights, or an LSM such as
+  AppArmor or SELinux, which answers with the same code) is refused, as a download or a listing,
+  with "`<path>`: Linux refused to open it for the person signed in at this computer's screen".
+  The switch covers file permissions only: SELinux and AppArmor still judge the daemon's own
+  domain, so a refusal of theirs is the daemon's, which the text cannot tell from the person's.
+  Inside a folder download, an entry they may not open is left out of the zip, as an unreadable
+  file always was; only a folder they may not list at all is refused.
+- **A kernel file system** is refused with "`<path>`: procfs is a kernel file system, which file
+  transfer does not read for the person signed in at this computer's screen" (sysfs and the others
+  alike), a handle that is not the file asked with "`<path>`: what opened is not the file asked
+  for, so file transfer does not send it", and one that is not the folder asked with "`<path>`:
+  what opened is not the folder asked for, so file transfer does not list it". Inside a folder
+  download each is left out without a word: the zip ends `files:eof` without that entry.
+- **A locked screen keeps its person**: GNOME and KDE lock inside the session, and seat0 still shows
+  it (`companion::console_tests::a_locked_screen_keeps_its_person`). LightDM's light-locker switches
+  seat0 to a greeter, which is nobody, for reads as for writes.
+- **seat0's active session only**: someone signed in over SSH or xrdp, or on another seat, is never
+  the one a read takes. After a user switch, a read takes whoever seat0 shows then, and nobody while
+  the greeter is between them.
+- **root itself at seat0** reads as the daemon: that person is root.
+- **The denylists stay**, as a second line, on the path the person resolved: `validate_outgoing_path`
+  and `is_agent_secret`. The agent's config is `0600 root`, so the person is refused it anyway.
+- **A cost**: on a case-insensitive mount, a path asked in another case than the one it is listed in
+  is refused, since the kernel names the handle as listed. Inside a folder download such an entry
+  is left out without a word.
+- **Writes with a person at seat0 are §9.1's, unchanged**: their steps keep the thread's
+  capabilities, which the placement rule already holds to the person's own folders.
+- Per-user installs (the daemon already is the person), macOS and Windows are unchanged.
+- **Tested as root in CI**: `files::seat_user_tests::as_root` runs under `sudo` in the
+  `rust-recorder` job with `ROOMLERD_TEST_REQUIRE_ROOT=1`, so a skip is a failure. It drives a
+  download, a folder download and a listing through their entry points with the person stood in at
+  seat0 (`files::stand_in::seat`), so `FsAs::for_read` itself decides who reads. It shows a read
+  step holding no capability and leaving the thread as it found it (after a panic too), and
+  refuses the kernel file systems to the person while the daemon reads them (the control). It
+  refuses a folder swapped for a link after it resolved, whether the link leads to the daemon's own
+  handle or to procfs, at the listing, a folder download's root and a folder of its walk
+  (`a_folder_swapped_for_a_link_to_the_daemons_own_handle_is_not_listed`,
+  `a_folder_swapped_for_a_link_to_a_kernel_file_system_is_not_listed`). It ends a folder download
+  whose person leaves seat0 with `files:error`, at the next folder
+  (`a_person_who_leaves_the_screen_mid_folder_ends_it_with_an_error_not_eof`) and at the next file
+  (`a_person_who_leaves_the_screen_between_two_files_ends_it_at_the_next_file`), and receives a file
+  with nobody at seat0 as root's, 0600, its partial included
+  (`nobody_at_the_screen_receives_a_file_only_root_may_read`). It asks who a received file is written
+  as at `files:begin`, `files:resume` and the startup sweep with a stood-in lookup that gives no
+  answer in time, on a current-thread runtime, and sees each refused inside the wait, nothing
+  touched, and the lookup on another thread than the runtime's own
+  (`a_lookup_past_its_time_refuses_a_received_file_at_every_entry_point`); a lookup that answers in
+  time still gives the file to the person (`a_lookup_in_time_still_receives_the_file_as_the_person`).
+  It sets the files folder through a `ConfigSet` with a stood-in lookup that gives no answer in
+  time, and sees the set refused inside the wait, nothing saved or made, and a `ConfigGet` asked
+  meanwhile answered at once (`a_files_folder_set_whose_lookup_is_late_holds_no_config_read`); with
+  a lookup in time, the folder saved and made as the person
+  (`a_files_folder_set_whose_lookup_answers_in_time_is_checked_as_the_person`); with one that failed
+  outright, the placement rule's refusal (`a_files_folder_set_whose_lookup_failed_keeps_todays_refusal`).
+  #3796 — with a stood-in lookup held the way a stopped logind holds it, it asks three times in a
+  row and four at once, and sees one lookup between them and each caller refused inside its wait
+  (`retries_while_a_seat0_lookup_hangs_share_one_lookup`). It sends `ConfigSet`s over the person
+  socket and sees each refused with the try-again text inside the wait, nothing saved and one
+  lookup; after the release, the person's set is saved and someone else's refused in today's words
+  (`the_person_sockets_seat_check_answers_within_its_wait_while_seat0_hangs`). It reads the status
+  while the refresh's lookup hangs, and sees each read answered at once and the folder pending
+  within the wait, never the folder from before (`a_status_read_shows_the_folder_pending_while_seat0_hangs`).
+  It asks `FsAs::now()` and the set-time check from a thread of their own, and sees both told not
+  known yet, never the daemon alone (`every_blocking_asker_is_told_not_known_yet_while_seat0_hangs`).
+  How one lookup in flight is shared is a unit test on every OS (`one_in_flight::tests`: one lookup
+  however many ask, an answer from before the question not taken, the cost, a panic that holds
+  nothing), and the person socket's refusal one in `crates/localapi`
+  (`a_seat_not_known_in_time_refuses_a_person_socket_set_with_try_again`).
+  The decision itself (`reads_take_whom_writes_take`, `a_seat0_name_that_resolves_to_another_uid_is_nobody`),
+  a lookup that cannot tell (`a_seat_that_cannot_be_told_is_not_nobody`, a received file's two
+  answers included), a write's lookup past its time
+  (`a_seat0_lookup_past_its_time_refuses_a_write_as_it_refuses_a_read`), a host with no logind
+  (`a_host_with_no_logind_has_nobody_at_the_screen`, in `companion` too) and the lookup's wait
+  (`a_listing_waits_for_the_seat_inside_the_drawers_timer`), nobody's texts, seat0's own record
+  (`seat0s_active_uid_is_logind_s_own_record`), the handle checks, and the default folder with nobody
+  at seat0 (`nobody_at_the_screen_takes_no_folder_a_controller_chose`,
+  `nobody_at_the_screen_takes_no_configured_folder_either`), and a files folder's set with no one
+  known (`a_files_folder_set_with_no_one_known_is_refused_and_a_clear_shows_pending`) are unit tests
+  on every Linux run. An earlier set's late status answer
+  (`an_earlier_files_folder_sets_late_answer_is_never_published`) is one on every OS.
+
+**A server where nobody signs in at the screen** (most servers, cluster nodes, containers, WSL)
+loses the drawer and downloads to this rule. Its administrator gives them back on that one machine
+with a drop-in for the service:
+
+```bash
+sudo mkdir -p /etc/systemd/system/roomlerd.service.d
+printf '[Service]\nEnvironment=ROOMLERD_FILES_AS_SEAT_USER=0\n' \
+  | sudo tee /etc/systemd/system/roomlerd.service.d/files-as-the-service.conf
+sudo systemctl daemon-reload
+sudo systemctl restart roomlerd.service   # ends the sessions under way
+```
+
+- **What it sets**: `ROOMLERD_FILES_AS_SEAT_USER=0` in the daemon's environment.
+- **Who may write it**: root alone. The drop-in folder is root's, and remote config cannot set the
+  switch: the daemon reads it from its environment and nowhere else.
+- **What it gives back**: the daemon's own identity for file transfer on that machine, both
+  directions. Every controller allowed file transfer there then browses, downloads and receives
+  files as root.
+- **To undo it**: remove the file, `sudo systemctl daemon-reload`, and restart the service.
+- **A host systemd did not boot** (a container, WSL without systemd) has no service to drop it
+  into: the same variable goes into the daemon's environment wherever root starts it.
+
+### 9.5 A received file stays off folders another account can write (#3688)
+
+On Linux, a received file is staged beside the folder it lands in, as
+`<folder>/.roomler-partial/<id>/{meta.json,data}`, and renamed into place at its end. Where the
+daemon's own files land (§9.4: nobody at seat0, root at it, the switch off, a per-user daemon) and
+everything in that staging is now its writer's own, made so and checked so, and a transfer holds
+its folders from its begin to its end. A folder on a file system that keeps no Unix owners or modes
+(a FAT or exFAT disk, NTFS without permissions, WSL's drive mounts without metadata, a share mounted
+with fixed modes) cannot hold a staging folder of its writer's own. An upload into it, the
+person's included, stages in its writer's own private folder instead, and its end copies the file
+across:
+
+```mermaid
+flowchart TD
+    B["files:begin, as the daemon itself"] --> X{"its XDG Downloads<br/>exists and passes?"}
+    X -- "yes" --> T["that folder"]
+    X -- "no" --> I{"it opened and failed,<br/>and it is ~/Downloads itself?"}
+    I -- "no" --> D{"~/Downloads"}
+    D -- "missing" --> M["made 0700"] --> T
+    D -- "passes" --> T
+    D -- "fails, or no home" --> R["refused, saying why:<br/>&lt;folder&gt; cannot receive files: …"]
+    I -- "yes: refused once,<br/>no fallback (#3734)" --> R
+    T --> H["the folder opened (links followed)<br/>and checked on that handle, then held"]
+    H --> K{"does its file system<br/>keep Unix modes?"}
+    K -- "yes" --> S[".roomler-partial: made 0700, or the writer's own<br/>(made 0700 again when others could write it);<br/>a link or another account's: refused"]
+    K -- "no" --> Q{"root writing, and another account<br/>can write the folder?"}
+    Q -- "yes" --> R
+    Q -- "no" --> V["the writer's own private folder, made 0700:<br/>~/.local/state/roomler/staging,<br/>root's /var/lib/roomler/staging (in a<br/>/var/lib/roomler only root may write)"]
+    S --> P["&lt;id&gt; 0700, meta.json 0600, data 0600 or 0644,<br/>each new, none through a link"]
+    V --> P
+    P --> E["files:end: renamed from the held &lt;id&gt;<br/>into the held folder; from a private folder,<br/>copied into a new file there"]
+```
+
+| What | Where (`agents/roomlerd/src/files.rs`, `agents/roomlerd/src/files/staging.rs`) | Why |
+|---|---|---|
+| The daemon's own default folder | `default_download_dir` (`files.rs:4986`), `own_home_and_downloads` (`:5299`), `account_home` (`:5155`), `may_receive` (`staging.rs:201`), `same_folder` (`:380`) | the XDG Downloads folder when it exists and passes, else `~/Downloads`, made 0700 when a file arrives (looking, for the status card, the sweep or a resume, makes nothing), else a refusal the viewer shows. An XDG folder that fails and is `~/Downloads` itself (the same device and inode, on the same mount, so a link to it counts) is that refusal at once, in the fallback's words, with no line saying `~/Downloads` is being tried: the fallback could only refuse it again for the same reason (#3734). Each is opened following its links, and the folder it leads to must be the writer's own and never the temp dir; for root, one no other account may write; for a per-user daemon, one not every account may (Ubuntu's private-group umask makes `~/Downloads` 0775), unless its file system keeps no owners or modes, where it need only be one the daemon can write into. Root's home is the one its account names (`getpwuid`), never `HOME`, and must pass root's rule itself; its `user-dirs.dirs` counts only when it is root's own plain file that nobody else may write, and only for a folder inside that home. It was the temp dir, which for root on a server is `/tmp`. The person at seat0 keeps their own folder (§9.1) |
+| The folder held | `stage_held` (`files.rs:5080`), called from `begin_as` (`:2584`) with what `drop_folder_for` (`:4843`) resolved | begin opens the target folder once and holds it; whenever begin resolved the daemon's default folder, that very handle is checked again by the rule above |
+| The staging, made | `open_staging` (`staging.rs:541`), `stage` (`:746`) | every folder and file with an explicit mode, whatever the umask: a per-user daemon on Ubuntu runs under 0002, and its staging still passes its own checks. A `.roomler-partial` that is a link, or another account's, is refused with a reason and left as it is; the writer's own, open to others, is made 0700 again through its handle. Another upload's end removes an empty `.roomler-partial`, and one gone between its open and the making of `<id>` in it is made and opened again. `data` is 0600 for the daemon alone (§9.4), 0644 otherwise, and is the received file itself after the rename |
+| A folder that keeps no modes | `keeps_modes` (`staging.rs:296`), `writable` (`:244`), `stage_privately` (`:789`), `private_staging_root` (`files.rs:5121`), from `stage_held` (`:5110`) | whether a folder made in the target 0700, under a random name, reads back its writer's own (after one `fchmod`, made only on a folder that reads as the writer's), or exactly like the target (the same owner and permission bits: no modes kept). Anything else is no answer, and the target's owner and modes still count. A definite answer is kept per mount, file system type and writer, and nothing the probe makes stays: the startup sweep removes an empty probe folder a crash left (`sweep_probes`). Where it does not, the upload stages in its writer's own private folder, on a file system that keeps modes: `~/.local/state/roomler/staging` in the person's home, or a per-user daemon's (under `$XDG_STATE_HOME` when that is set), `/var/lib/roomler/staging` for root, in a `/var/lib/roomler` opened without following a link that is root's and no other account may write (made 0755 when absent), else that staging is refused; made 0700 and checked as `.roomler-partial` is. There a folder's owner and modes say nothing (a VirtualBox shared folder reads `root:vboxsf`, a share mounted with a fixed owner that owner), so a per-user daemon's default folder needs only to be one it can write into, as the kernel answers for it (`writable`), and receives by copy. A root writer still places only in a folder no other account may write |
+| The staging, trusted | `reopen` (`staging.rs:819`), `read_notes` (`:875`), `reopen_data` (`:895`), `FilesHandler::resume_held` (`files.rs:3405`) | a resume walks the partial again from its notes' path: the folder it sits beside (links followed: that folder's own rule) or the writer's private folder, then each step below it without following a link (and without waiting on a FIFO), and trusts it only when its folder, `meta.json` and `data` are its stager's own and nobody else may write them. Anything else is "no partial state for id …", and the viewer starts that upload over. `data` is opened once and truncated on that handle |
+| A root writer's resume and end | `root_may_place_in` (`files.rs:5200`), `FsAs::writes_as_root` (`:663`), from `resume_held` (`:3462`, `:3477`) and `end` (`:2826`) | the folder a partial's notes record must be one the rule gives it now, under a bare name: the default folder, its handle passing the rule; for root at the screen or the switch off, also the configured folder or a folder a controller may choose now. A partial beside a folder must record that very folder; one in root's private folder places only in a folder no other account may write. The person's partial, and a per-user daemon's, are placed where their notes say, as them (§9.1) |
+| The end | `place` (`staging.rs:937`), `copy_across` (`:1009`), `discard` (`:1040`), from `end` (`files.rs:2839`) | renamed from the held `<id>` into the held folder, under a name nothing there has yet, a link counted; a folder upload's subfolders are made and opened one by one from it, and for a root writer a link among them refuses. From a private folder, or across file systems, copied through handles into a new file (`O_CREAT`, `O_EXCL`, `O_NOFOLLOW`) with the staged file's mode. A folder moved aside mid-upload, with another put in its place, changes nothing |
+| Cancel and the sweep | `cancel_incoming` (`files.rs:3071`), `sweep_orphans` (`:1760`), `sweep_orphans_dir_here` (`:1905`), `sweep` (`staging.rs:1140`) | a cancel removes through the handles the transfer holds, or walks again with the same checks and removes only what passes. The startup sweep walks each drop folder's `.roomler-partial` and the writer's private folder. It registers only a partial that passes in full; removes one whose notes are missing or corrupt, and, once over a day old, the stager's own that fails the checks; and leaves a link, or anything another account owns, as it is |
+| A resume's lookup | `drop_folder_without_creating` (`files.rs:5062`), from `resume_incoming_as` (`:3237`) | with nothing registered, a resume looks in the writer's private folder, then beside the folder a file would land in now, and makes nothing while it looks |
+
+What a user notices:
+
+- **With nobody at the screen, uploads land in `/root/Downloads`** (made 0700, root's), where they
+  used to land in `/tmp`; each file is 0600, root's only (§9.4).
+- **With the switch off (§9.4's drop-in) and a person at the screen**, received files sit in root's
+  own 0700 folder too, out of that person's reach; before, they landed in `/tmp`, 0644.
+- **A headless per-user install with no `user-dirs.dirs`** makes `~/Downloads` (0700) and receives
+  there; before, it used `/tmp`.
+- **A folder on a disk that keeps no Unix modes** (a FAT USB stick, a Windows drive under WSL, a
+  share mounted with fixed modes) receives files: the upload stages in its writer's own private
+  folder (`~/.local/state/roomler/staging`, or `/var/lib/roomler/staging` for root), and its end
+  copies the file across, so the whole file must also fit where that private folder is. The sandboxed
+  per-user unit may write only `~/.local/state/roomler`, so with `XDG_STATE_HOME` set elsewhere that
+  staging is refused (read-only). A per-user daemon's Downloads there is not refused for reading
+  world-writable; root still refuses a folder another account can write.
+  Nor for reading another account's (a VirtualBox shared folder, a share mounted with a fixed owner), as
+  long as the daemon can write into it ("… cannot receive files: file transfer cannot write into it").
+- **A root writer's `files:end` can be refused** when its folder no longer passes the rule:
+  "`<folder>` is not a folder this computer receives files into now (…), so the file is not placed
+  there". The partial stays, and a resume completes the upload once the folder passes again.
+- **A daemon running as root takes its home from its account**, not from `HOME`: one started by hand
+  with another account's `HOME` (as `sudo -E` keeps it) receives into root's own Downloads.
+  A configured folder, or one a controller chose, must then sit inside root's own home as well.
+- **A default folder that cannot receive files says so**: "`<folder>` cannot receive files: another
+  account can write to it" (or "it belongs to another account", "every account can write to it",
+  "it is not a folder", "it could not be made (…)"). The sandboxed per-user unit
+  (`ProtectHome=read-only`) can make no `~/Downloads` and says so; it could not write `/tmp` either.
+- **A per-user daemon's partials from before this change** (made under umask 0002, so its group
+  could write them) are refused once on resume, and that upload starts over; the sweep removes them
+  after a day. Its `.roomler-partial` is made 0700 again.
+- **A received file on a per-user daemon is 0644** where umask 0002 made it 0664.
+- **A host whose XDG Downloads folder is configured but missing** receives into `~/Downloads`;
+  before, the first upload made the XDG folder.
+- **A host whose XDG Downloads folder is `~/Downloads` itself and cannot receive files** logs one
+  line for a refused upload, the refusal (#3734). Before, a line first said the fallback was trying
+  `~/Downloads`, the folder just refused. The viewer's message is the same as before. An XDG folder
+  elsewhere still falls back to `~/Downloads` and says so.
+- **A root writer's folder upload into a subfolder that is a link is refused**: "`<path>` is not a
+  folder, so file transfer does not place the file there". The person's, and a per-user daemon's,
+  still follow their own links with their own rights.
+- macOS and Windows are unchanged: macOS's default is always `~/Downloads`, and a Windows service
+  stages in the machine's own folder (§9.2).
+
+**Tested**: `files::seat_user_tests::own_staging`, on every Linux run and again as root in the
+`rust-recorder` job's sudo step (`ROOMLERD_TEST_REQUIRE_ROOT=1`). Each stands in the daemon's own
+home (`stand_in::own_home`, carried by `FsAs::run` to the step's thread), so none touches a real
+home, `/root/Downloads` or `/tmp`: the temp dir is never the folder
+(`the_temp_dir_is_never_a_writers_folder`), the fallback is made 0700 and its writer's
+(`the_fallback_folder_is_made_0700_and_owned_by_its_writer`), each writer's check on its folder
+and through a link (`a_downloads_folder_is_checked_by_its_writer`), an XDG Downloads that is
+`~/Downloads` itself refused once, a link to it included, while one elsewhere still falls back
+(`an_xdg_downloads_that_is_downloads_itself_is_refused_once`,
+`an_xdg_downloads_that_links_to_downloads_is_refused_once`,
+`an_xdg_downloads_elsewhere_that_cannot_receive_still_falls_back`), the modes under any umask
+(`a_partial_is_made_its_stagers_own_whatever_the_umask`), the writer's own open staging folder made
+0700 (`the_writers_own_open_staging_folder_is_tightened_not_refused`), a staging folder that is a
+link or another account's refused at begin and by the sweep
+(`a_staging_folder_that_is_a_link_is_refused_at_begin_and_by_the_sweep`,
+`a_staging_folder_another_account_owns_is_refused_at_begin_and_by_the_sweep`, root), a link at
+`data` or `meta.json` and a partial others may write refused on resume
+(`a_link_at_data_or_meta_json_is_refused_on_resume`,
+`a_resume_of_a_partial_another_account_can_write_is_refused`), the sweep's choices
+(`the_sweep_trusts_only_partials_that_are_their_stagers_own`), a root writer's resume held to the
+rule's folder (`a_resume_whose_recorded_folder_is_not_the_rules_folder_is_refused`), a staging
+folder moved aside mid-upload (`a_staging_folder_swapped_mid_upload_is_not_followed`) and a root
+writer's folder upload through a link (`a_folder_upload_follows_no_link_for_root`). With file
+systems standing in as keeping no modes (`stand_in::modes_kept`): a per-user daemon's upload
+(`a_per_user_daemons_folder_that_keeps_no_modes_receives_by_copy`), the person's
+(`a_persons_folder_that_keeps_no_modes_receives_by_copy`, root) and root's, which stays strict
+(`root_stays_strict_where_modes_are_not_kept`, root), each staged privately, copied across, resumed
+after a restart and swept; a per-user daemon's Downloads leading to a folder another account owns,
+which it can write into, taken and filled by copy, and another account's it cannot write into passed
+over (`a_per_user_daemons_folder_of_another_owner_keeping_no_modes_receives_by_copy`; as root, the
+same folder refused). Then root's home taken from its account, never `HOME`
+(`a_root_daemon_takes_its_home_from_its_account_not_its_environment`, root, with
+`stand_in::env_home`), and FR-84's rule for a configured or a chosen folder judged against that home
+(`a_root_daemons_configured_or_chosen_folder_is_judged_against_its_accounts_home`, root), a probe
+that does not open as made answering nothing (`a_probe_that_does_not_open_as_it_was_made_answers_nothing`),
+root's private staging only in root's own `/var/lib/roomler`
+(`roots_private_staging_sits_only_in_roots_own_var_lib_roomler`, root), a probe folder left behind
+swept (`the_sweep_removes_a_probe_folder_left_behind`), a failed copy across keeping its partial
+(`a_copy_across_that_fails_keeps_its_partial`), a private partial resumed past 256 KiB
+(`a_private_partial_resumes_past_256_kib`), a
+`.roomler-partial` removed before the upload's own folder is made in it
+(`a_begin_whose_staging_folder_goes_before_its_id_is_made_makes_it_again`), a default folder swapped
+before its staging opens it (`a_default_folder_swapped_before_its_staging_is_held_to_its_rule`), a
+daemon that is root placing in the configured or a chosen folder
+(`a_root_daemon_places_in_the_configured_or_a_chosen_folder`, root), and an end the rule refuses,
+whose partial survives it (`an_end_the_rule_refuses_keeps_its_partial_for_a_resume`). The umask
+test runs again in a child process of its own under umask 0002.
+
+### 9.6 A Mac's system install transfers files only in the person's session (#3757)
+
+On a Mac with a system install, the root daemon holds the enrollment and hands each remote-control
+session to the GUI worker it runs in the session of the person signed in at the screen (FR-43 P2b,
+[remote-control.md §11.16.1](remote-control.md#11161-a-supervised-macs-delegated-sessions-fr-138-p2b)).
+The session's peer, and with it every data channel, then lives in the worker, which runs as that
+person: a file a viewer sends lands in their folder and is theirs, and a download or the drawer reads
+with their rights, as on a per-user install. A session no worker serves has its peer in the root
+daemon instead: nobody is signed in at the screen yet, or the Mac has two rows and this is its
+`-daemon` row, which supervises no worker, or it is a secondary organization's session on a Mac that
+is not one row (only the primary's sessions cross there). Until #3757 the root daemon served that
+session's `files` channel itself, both ways. It now declines it:
+
+```mermaid
+flowchart TD
+    O["rc:sdp.offer reaches the root daemon"] --> W{"a GUI worker takes it?<br/>DelegateHost::send_to_worker"}
+    W -- "yes" --> P["the worker builds the peer,<br/>running as the person at the screen"]
+    P --> S["files channel served as before,<br/>with that person's rights"]
+    W -- "no worker serves it" --> D["the root daemon builds the peer"]
+    D --> G{"the files channel opens:<br/>a Mac, effective uid 0?<br/>files_channel"}
+    G -- "yes" --> X["declined: each request answered with the reason,<br/>files:dir-error in the drawer, files:error on a transfer;<br/>nothing read or written, the session goes on"]
+    G -- "no" --> S
+```
+
+| What | Where (`agents/roomlerd/src/peer.rs`) | Why |
+|---|---|---|
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:13024`), asked as the channel opens (`files_channel_here`, `:13033`, from the `"files"` arm, `:1331`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3944`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4883`) |
+| Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
+| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:13059`), `attach_files_declined` (`:13082`), `declined_reply` (`:13113`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12992`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
+| What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4482`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
+
+What a viewer notices:
+
+- **Before anyone signs in at the Mac's screen**, a session shows no screen, and Files shows the
+  reason in the drawer and on every transfer. The session stays up. Reconnect once someone is signed
+  in: the next session is the worker's.
+- **On a two-row Mac's `-daemon` row** the same, whoever is signed in: the person's own row serves
+  the screen and files.
+- **A session that began before the person signed in** keeps its declined channel until it ends.
+- **The no-screen sentence** that daemon sends (`no_display`, `agents/roomlerd/src/capture/mod.rs:774`)
+  ends "Remote shell works here.", where it said file transfer worked there too.
+- Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
+
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17115`), on every lane's lib
+tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
+the router over an in-process peer pair, both peers closed after each test, a declined channel that
+answers each request with the reason, leaves the folder asked about as it was and stays up
+(`a_declined_channel_answers_each_request_with_the_reason_and_stays_up`), a served one that lists the
+folder (`a_served_channel_keeps_the_file_transfer_handler`), and a grant without FILES that keeps its
+own words (`a_session_without_files_keeps_the_not_granted_channel`). The row's offer:
+`encode::caps::tests::a_macs_root_half_still_offers_file_transfer`. In the macOS job the module runs as
+the runner's user and again under sudo with `ROOMLERD_TEST_REQUIRE_ROOT=1`, where the Mac's own
+effective uid declines (`as_root::a_root_process_on_a_mac_declines_the_files_channel`); the step fails
+unless that test ran.
 
 ## 10. Starting after install, and the Welcome flow
 
@@ -566,12 +1135,13 @@ opens". The rules that matter here:
   cannot bind its port for two minutes now logs who holds it.
 - **Per-machine Windows launches from the service host, with the console user's own,
   non-elevated token** — never from a worker that may run elevated.
-- **The companion decides what to show** (`agents/roomler-desktop/src/first_run.rs:63`):
+- **The companion decides what to show** (`agents/roomler-desktop/src/first_run.rs:75`):
   it reads its own arguments on the first launch too (`--first-run`, `--autostart`,
-  `--view=<name>`) and a per-user `desktop-state.json` (`first_run_done`, the start-at-login
-  opt-out; `crates/agent-core/src/desktop_state.rs`). A missing or unreadable file is a
-  first run. Until the tour is finished or skipped it shows at every start; afterwards a
-  login start stays in the tray.
+  `--for-prompt`, `--view=<name>`) and a per-user `desktop-state.json` (`first_run_done`, the
+  start-at-login opt-out; `crates/agent-core/src/desktop_state.rs`). A missing or unreadable
+  file is a first run. Until the tour is finished or skipped it shows at every start but the
+  daemon's start for a consent question or a banner, which keeps it for the person's own
+  start (#3887, §10.6); afterwards a login start stays in the tray.
 
 **The Welcome** (`front/welcome.js`) is six steps — this device · the private network ·
 who may view this screen · files you receive · start at login · done:
@@ -640,6 +1210,432 @@ flowchart LR
   package: it matches the daemon's `.deb` and `.tar.gz` only. From FR-117 the updater moves an
   INSTALLED companion package to the daemon's version through a picker of its own (§13).
 
+### 10.2 The tray's start for a prompt on Linux, off the async worker (#3855)
+
+The tray is the surface a "Prompt on host" device asks through when the daemon draws no panel of
+its own (a root daemon has no display), so a consent prompt starts it when it is not running
+(`ensure_running`, [`companion.rs:1158`](../agents/roomlerd/src/companion.rs#L1158)). On Linux that
+start asks four other processes: logind for the graphical session (`loginctl`), the process list
+for the person's tray (`pgrep -u`), the person's user manager for the session's environment (a
+root daemon reads it as them, which looks their account up in the account database), and
+systemd-run. Until #3855 the start was an async function that never awaited, so every step ran
+on the async worker that polled it, for as long as the step took, and the callers' 3 s timeout
+(`COMPANION_START_BUDGET`, [`signaling.rs:341`](../agents/roomlerd/src/signaling.rs#L341)) could
+not fire: a future that never yields is never timed out. A stopped logind or a stalled SSSD held
+that worker, and every socket and timer on it, the shape #3830 measured.
+
+```mermaid
+flowchart TD
+    P([a prompt with no native panel]) --> E["ensure_running: a verdict that still stands,<br/>20 s, or 2 s after a failure (#3884), or a start"]
+    E --> A{a start in flight?}
+    A -->|one began before this ask| W[wait it out, its answer is<br/>not this ask's]
+    W --> A
+    A -->|none, or one begun since| S[join it, or start one<br/>on the tray-start thread]
+    S --> T[path, then logind, then pgrep,<br/>then the session's environment,<br/>then systemd-run]
+    S --> K{answered within 2.5 s?}
+    K -->|yes| V[its outcome: Started only<br/>when systemd-run exited 0]
+    K -->|no| F[an error naming the step<br/>the start was still waiting on]
+    F --> N[could not start the desktop companion:<br/>no surface, then the notification]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the start, off the worker | `ensure_running_inner`, [`companion.rs:1750`](../agents/roomlerd/src/companion.rs#L1750) (one for Linux, Windows and macOS since #3858, §10.4); `TrayStarts::start`, [`:2131`](../agents/roomlerd/src/companion.rs#L2131) | the prompt's task awaits the start; it never runs a step itself |
+| one start in flight | `TRAY_STARTS`, [`companion.rs:2105`](../agents/roomlerd/src/companion.rs#L2105), a `one_in_flight::OneInFlight` on a thread named `tray-start` | while a step hangs, every prompt that asks waits on that one start and starts none of its own, so a hang holds one thread however often a viewer asks. A start that began before an ask is waited out, and the ask then starts afresh: the person at the screen may have changed meanwhile |
+| the steps | `TraySteps`, [`companion.rs:2216`](../agents/roomlerd/src/companion.rs#L2216); `start_tray`, [`:2264`](../agents/roomlerd/src/companion.rs#L2264) | in the order the start always took them, each recorded as it begins (`TrayStep`, [`:2150`](../agents/roomlerd/src/companion.rs#L2150)). Who the tray is for (logind's active graphical session, `pgrep -u` per uid), the user manager for a per-user daemon and the system manager as the person for a root one, #2713's environment and #2729's `KillMode=process` are as before. Since #3887 the companion's argv carries `--for-prompt` (§10.6) |
+| the bound | `TRAY_START_WAIT`, [`companion.rs:2324`](../agents/roomlerd/src/companion.rs#L2324): 2.5 s | under the callers' 3 s, so the start's own reason lands before their fallback fires (with equal timers the hub's fallback fired first, FR-27). A start that works takes tens to a few hundred milliseconds, under half the wait, which one start in flight needs to answer an ask that comes just after another began |
+| the failure | `started_in_time`, [`companion.rs:2188`](../agents/roomlerd/src/companion.rs#L2188) | a start's own failure keeps its words (`finding a graphical login session: …`, `systemd-run failed: …`); no answer in time is `the tray's start did not finish within 2.5s: it was still waiting on logind (…)`, naming the step. `ensure_running` logs either as `could not start the desktop companion` and the prompt has no surface, as for any failed start. The start goes on on its thread: if it later brings the tray up, the tray reads the `.pending` marker and shows the question. Since #3884 that verdict stands 2 s, not 20 s, so the next prompt asks again (§10.5) |
+
+The session's environment is read as the person through `exec::drop_to_std`, whose account lookup
+is bounded too (1.5 s, `docs/roomler-ssh.md`, "The blocking callers"); a lookup that does not answer
+starts the tray with logind's four variables, as any failed read always did. The environment's own
+read keeps its 5 s (`stdout_bounded`), so a wedged user manager fails the prompt's wait and the
+start goes on without it.
+
+- Every caller gets the bound: the remote-control prompt on the WS loop (started there and
+  waited for by the session's consent task since #3888, §10.5), the exec prompt, a
+  recording's and an SSH session's `Companion::up`, and the "being viewed" banner (FR-93 P6g),
+  two of which had no timeout at all.
+- After a failed start the remote-control prompt tries FR-93 P6f's notification, whose
+  session lookup (the portal helper's `loginctl` walk) this did not bound: with logind
+  stopped, the WS loop waited out `loginctl`'s own D-Bus timeout (~25 s) there. #3857 takes
+  the notification off the loop and bounds the walk (§10.3).
+- Tested with the steps stood in for each test's own tasks (`tray_start_tests`,
+  [`companion.rs:2378`](../agents/roomlerd/src/companion.rs#L2378); rust-agent's "Test agent under
+  vp9-444"): with logind, the environment or systemd-run held, a start fails within 2.5 s naming
+  the step; a 10 ms timer on a two-worker runtime stays on time while prompts ask; asks at once
+  and in a row share one start; and a start in time does what it always did, the argv included.
+  Field cells: a paused logind during a prompt, the start after it resumes, and the control.
+
+### 10.3 The notification fallback on Linux, off the WS loop (#3857)
+
+Where neither the native panel nor the tray can show a remote-control question (no tray
+installed, its start failed, or no marker for it to read), FR-93 P6f puts it up as a desktop
+notification (`docs/remote-control.md`, "Prompt surfaces"). The session helper that posts it
+runs as the person at the screen, so its start asks logind for the graphical session
+(`loginctl list-sessions`, then `show-session` for each), the account database for the
+person's account, and the person's session bus. Until #3857 the org's WS loop waited for all
+of that inline, and the session walk had no bound: with logind stopped, every `loginctl` waits
+out its D-Bus timeout, about 25 s. No async worker was held (the show ran on the blocking
+pool), but that org's control channel read no frame meanwhile: another viewer's request, a live
+session's ICE, a `Terminate` for this very question and Fleet RPC all waited behind it. And the
+agent's `no_prompt_surface` came after the hub's own timer (5 s past the window,
+`CONSENT_VERDICT_GRACE`), so the controller was told "nobody answered".
+
+```mermaid
+sequenceDiagram
+    participant L as WS loop
+    participant T as consent task
+    participant S as the show, on the blocking pool
+    participant W as session-walk, one in flight
+    L->>L: no native panel: the tray's start, started and not awaited
+    L->>T: spawn it, with the start's handle
+    Note over L: reads its next frame
+    T->>T: the tray's verdict (2.5 s at most)
+    T->>S: where the tray cannot show it: start the notification, not awaited
+    S->>W: the graphical session, 1.5 s at most
+    W-->>S: a session, or logind's nobody, or not known in time
+    S->>S: the account (1.5 s), the helper, its first line (5 s)
+    S-->>T: up, or why not
+    T->>T: the marker says Notification, the surface line is logged
+    T->>T: the prompt's window starts
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the start | `notification_for_rc`, [`signaling.rs:7612`](../agents/roomlerd/src/signaling.rs#L7612); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:287`](../agents/roomlerd/src/indicator/mod.rs#L287) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
+| the consent task | `rc_surfaces_up`, [`signaling.rs:7559`](../agents/roomlerd/src/signaling.rs#L7559); `notification_shown`, [`:7627`](../agents/roomlerd/src/signaling.rs#L7627) | waits for the show's verdict before it first looks at the prompt, so the window still starts after the show. Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
+| the session walk | `graphical_session_within`, [`companion.rs:7910`](../agents/roomlerd/src/companion.rs#L7910); `SESSION_WALKS`, [`:7938`](../agents/roomlerd/src/companion.rs#L7938) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:7894`](../agents/roomlerd/src/companion.rs#L7894)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:7951`](../agents/roomlerd/src/companion.rs#L7951)), never "nobody at the screen" |
+| a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:351`](../agents/roomlerd/src/indicator/notify.rs#L351); `launch`, [`:492`](../agents/roomlerd/src/indicator/notify.rs#L492) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
+
+Every caller of the portal's session helper takes the walk through `helper_session`
+([`capture/portal/mod.rs:1330`](../agents/roomlerd/src/capture/portal/mod.rs#L1330)), all on
+blocking threads: the capture, the portal probe, the audio, keep busy, FR-95's notification
+probe, the notification prompt and the being-viewed notice (FR-93 P6g). So does the recorder's
+launch (`session_of`,
+[`recording/launch.rs:1827`](../agents/roomlerd/src/recording/launch.rs#L1827)). A walk out of
+time is `SpawnError::Other` with the reason for the helper's callers (so the capture says the
+session is not known, the audio is a `backend_error`, keep busy a spawn error), and an error
+naming the uid for the recorder. logind's own answer keeps its words and its kind
+(`NoSession`).
+
+- **The bounds on the consent path**, with logind stopped: the tray's start gives up at 2.5 s
+  (§10.2) and the walk at 1.5 s, so the consent task hears "not up" about 4 s after the request.
+  The window starts then, and the agent's `no_prompt_surface` reaches the controller about a
+  second ahead of the hub's own timer. With logind answering and the session bus wedged, the
+  helper's own 5 s (`SHOW_BUDGET`) still applies: the verdict comes then, as before, and the
+  helper is let go, its stdin closed, and killed 1 s later if it is still there (#3886, below).
+- **A late prompt: nothing comes up late.** A walk out of time starts no helper (its late
+  answer reaches no one, and the next ask waits for it or walks afresh); a helper that has not
+  posted within 5 s is let go and then killed, and takes down a notification it did post
+  (#3886); a question that ended on the way gets none. The viewer waits out
+  the window and is told `no_prompt_surface`, unless someone answers on another surface (the
+  CLI). The log has `no notification prompt (FR-93 P6f)` with the session and the reason, then
+  `consent prompt surface … notified=false have_surface=false`.
+- **Fork safety** is unchanged: the session and the account are resolved in the parent, before
+  the fork, and nothing new runs in `pre_exec`.
+- **Unchanged:** which surface is chosen and when, the question's words, and the tray's start
+  (§10.2). While logind hangs, the tray's start holds its `tray-start` thread and the
+  notification's walk its `session-walk` thread, one each however many prompts ask.
+- **Tested** in rust-agent's "Test agent under vp9-444" (`portal-capture`):
+  `signaling::notification_off_the_loop_tests` (a frame sent while logind holds the
+  notification is handled at once, and the verdict comes within the walk's wait; a request that
+  ends while its notification comes up drops it, with nothing up and one verdict; a socket that
+  closes meanwhile drops it at once; prompts asking again and again delay no 10 ms timer and
+  share one walk; the control keeps P6f's order), `companion::session_walk_tests` (asks at once
+  and in a row share one walk, and after logind answers the next ask walks afresh; the
+  control) and `capture::portal::helper::tests` (a held walk refuses the helper within its wait,
+  root and per-user; the control). The recorder's in rust-recorder's "Test the recorder
+  (FR-85)": `recording::launch::unix::tests` (a held walk refuses the recorder's session within
+  its wait, naming the uid; the control). Field cells: a paused logind while a viewer asks, the
+  next prompt after it resumes, and the control.
+
+#### 10.3.1 A helper given up on takes its notification down (#3886)
+
+The helper says its notification is up with one marked line, the reply to its `Notify` turned
+into words. On a slow session bus, the case `SHOW_BUDGET` exists for, the notification can be
+up on screen while that line is still on its way. Until #3886 the daemon killed the helper at
+5 s with `SIGKILL`. A helper killed that way never closes its notification, so it stayed up,
+and its Approve and Deny reached no one: the person saw a question while the viewer was told
+nobody could be asked.
+
+A helper given up on is now let go the way the daemon takes any notification down. Its stdin
+closes, and it takes down a notification it did post, then exits. It is killed only if it is
+still there 1 s later. The verdict, "not up", still comes at 5 s.
+
+In that 1 s an answer the helper reports still counts: its reader passes it on
+([`:576`](../agents/roomlerd/src/indicator/notify.rs#L576)), and the question is still being
+asked. The helper reports a press it heard of before the daemon's close. On the close it takes
+the notification down ([`:1200`](../agents/roomlerd/src/indicator/notify.rs#L1200)), so a press
+it hears of after that reaches no one (#3942). On a slow session bus, the case the give-up is
+for, that is every press: a press's `ActionInvoked` comes after the server's reply to `Notify`,
+and that reply came after the close.
+
+```mermaid
+sequenceDiagram
+    participant T as consent task
+    participant S as the show, on the blocking pool
+    participant H as session helper
+    participant N as notification server
+    participant G as notify-let-go
+    T->>S: start the notification
+    S->>H: start it, and write the question to its stdin
+    H->>N: Notify, on a slow session bus
+    Note over S: no up line within 5 s
+    S->>H: close its stdin, the daemon's take-it-down
+    S->>G: kill it if it is still there 1 s later
+    S-->>T: not up, at 5 s as before
+    N-->>H: the late reply, the notification is up
+    H->>N: CloseNotification, as its stdin closed
+    H->>H: exits, and its reader marks it ended, then reaps it
+    G->>G: marked within 1 s, so nothing is killed
+    Note over G: still unmarked at 1 s - SIGKILL, under the lock
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the give-up | `put_up`, [`indicator/notify.rs:528`](../agents/roomlerd/src/indicator/notify.rs#L528); the stdin's drop, [`:599`](../agents/roomlerd/src/indicator/notify.rs#L599) | no "up" line within `SHOW_BUDGET`: the helper's stdin is dropped, which is what takes any of its notifications down, and the verdict is returned at once, as before: `the session helper did not post it within 5 s` |
+| the kill, 1 s later | `let_go`, [`:648`](../agents/roomlerd/src/indicator/notify.rs#L648); `Ended`, [`:615`](../agents/roomlerd/src/indicator/notify.rs#L615); `GIVE_UP_GRACE`, [`:312`](../agents/roomlerd/src/indicator/notify.rs#L312) | a thread named `notify-let-go` waits up to 1 s for the helper's stdout to close, and sends `SIGKILL` only if it has not. The reader marks that close under a lock before it reaps the helper ([`:581`](../agents/roomlerd/src/indicator/notify.rs#L581)), and the kill is sent under the same lock only while unmarked: it reaches our own unreaped child, never a process that took its pid. With no thread for the wait, the kill comes at once, as before |
+| the helper's side | `helper::run`, [`:1085`](../agents/roomlerd/src/indicator/notify.rs#L1085), [`:1153`](../agents/roomlerd/src/indicator/notify.rs#L1153) | the helper listens for its stdin's close from its start. A close that comes while it is still reaching the session bus posts nothing, and its stderr says `the daemon took it down before it was posted; nothing posted`. After its `Notify` has answered, the close takes the notification down, as for any question that ends |
+| the expiry | `expire_timeout`, [`:1252`](../agents/roomlerd/src/indicator/notify.rs#L1252); the question's end, [`:1078`](../agents/roomlerd/src/indicator/notify.rs#L1078) | the question is posted to expire at its end: what is left of `lifetime_ms`, counted from the request's arrival, and never 0, which is "never expires". A server that keeps the spec's `expire_timeout` then takes down a notification whose helper was killed with its `Notify` still in flight |
+
+- **The bounds:** the verdict comes at 5 s, as before, so the viewer's `no_prompt_surface` keeps
+  its timing against the hub's timer (5 s past the window). The 1 s runs on its own thread, after
+  the verdict: no async worker and no caller waits for it. A helper given up on is gone 6 s after
+  its start at the latest, and reaped by its reader.
+- **What is left:** a `Notify` the server has still not answered 1 s after the give-up. The
+  helper is killed with it in flight, and the server may still put the question up. It expires
+  at the question's end on a server that keeps `expire_timeout`. A server that ignores it keeps
+  the question until the person closes it, and a press on it reaches no one.
+- **GNOME may ignore `expire_timeout`.** On GNOME a question can then stay up until its helper
+  closes it at its end, and a notification whose helper was killed (above) until the person
+  closes it. Read on 0.4.223 with GNOME's own server (#3886): an unanswered question stayed up
+  until its helper closed it when its lifetime ended.
+- **The being-viewed notice** (FR-93 P6g) has the same helper and the same give-up. It expires
+  after its day (`lifetime_ms`, 24 h), when its helper closes it anyway.
+- **Tested** in rust-agent's "Test agent under vp9-444" (`portal-capture`), with `sh` standing in
+  for the helper and a file for its notification: `indicator::notify::parent::given_up_tests`
+  ([`:803`](../agents/roomlerd/src/indicator/notify.rs#L803)). A helper that posts and answers
+  only after the give-up gets the verdict "not up" at the give-up, then takes its notification
+  down and is gone. It was red before #3886: killed at the give-up, with its notification left
+  up. The controls: a helper that ignores its stdin is still killed within the bound, and one
+  that answers in time stays up past the grace until its stdin is dropped.
+  `indicator::notify::helper::tests::the_notification_expires_with_its_question` pins the
+  expiry: never 0, and capped at `i32::MAX`, never wrapped.
+- **Field cells:** a Linux system install with no companion and a session bus slowed so that the
+  helper answers after 5 s: after the viewer is told `no_prompt_surface`, no consent
+  notification stays on screen. The control is the same cell on 0.4.222.
+
+### 10.4 The tray's start for a prompt on Windows and macOS (#3858)
+
+The same start runs off the async worker on Windows and macOS. Until #3858 their
+`ensure_running_inner` was what §10.2 describes on Linux before #3855: an async function that never
+awaited, so the process list, `CreateProcessAsUserW`, `pgrep`, `stat`, `id -u` and `launchctl` ran
+on the worker that polled it, and the callers' 3 s budget could not fire. There is now one
+`ensure_running_inner` for the three OSes ([`companion.rs:1750`](../agents/roomlerd/src/companion.rs#L1750)), over §10.2's start in flight (`TRAY_STARTS`,
+a thread named `tray-start`), its 2.5 s wait (`TRAY_START_WAIT`) and its failure
+(`started_in_time`: `the tray's start did not finish within 2.5s: it was still waiting on <step>`).
+Each OS has only its own steps: `TrayStep` (what a refusal names), `TraySteps` (the seams a test
+stands in, `TraySteps::real` the daemon's) and `start_tray` (the steps in the order the start always
+took them, each recorded as it begins).
+
+```mermaid
+flowchart LR
+    P(["a prompt: ensure_running_inner,<br/>one for the three OSes"]) --> F["TRAY_STARTS: one start in flight<br/>on the tray-start thread, a 2.5 s wait"]
+    F --> W["Windows: the tray check, the install path,<br/>the daemon's own token, start_desktop"]
+    F --> M["macOS: the app, pgrep, stat /dev/console,<br/>id -u, launchctl kickstart"]
+    F --> L["Linux: §10.2's steps"]
+    F -->|"no answer in 2.5 s"| E["an error naming the step<br/>the start was still waiting on"]
+```
+
+| OS | Step, in order | What runs | A refusal out of time names |
+|---|---|---|---|
+| Windows: `start_tray`, [`companion.rs:1848`](../agents/roomlerd/src/companion.rs#L1848); `TrayStep`, [`:1765`](../agents/roomlerd/src/companion.rs#L1765) | the tray check | `desktop_running`: `win_service::companion_procs::find`, a process snapshot, then each candidate's loaded image (#1686) | `the process list (…)` |
+| | the install path | `installed_desktop`: the companion beside the daemon | `the companion's install path` |
+| | the daemon's own token | `respawn_context_for_self`: is this the SYSTEM service? | `the daemon's own token (…)` |
+| | the start | `start_desktop`, #3848's, with its session choice: the SYSTEM service starts the tray in the console session as its person (`WTSQueryUserToken`, `CreateEnvironmentBlock`, `CreateProcessAsUserW`), the person's own daemon a plain `CreateProcessW` in its session; since #3887 with `--for-prompt` (§10.6) | `the start in the console session (…)`, or `the start in the daemon's own session (…)` |
+| macOS: `start_tray`, [`companion.rs:2005`](../agents/roomlerd/src/companion.rs#L2005); `TrayStep`, [`:1922`](../agents/roomlerd/src/companion.rs#L1922) | the app | `/Applications/Roomler.app` exists | `the companion's app bundle (…)` |
+| | the tray check | `pgrep -x roomler-desktop` | `the process list (pgrep)` |
+| | the console's owner | `console_user_name`: `stat -f %Su /dev/console`, the way the pkg's postinstall reads it | `the console's owner (stat /dev/console)` |
+| | the uid | `account_uid`: `id -u <user>`, from the account database | `the account database (id -u, …)` |
+| | the start | `launchctl kickstart -k gui/<uid>/com.roomler.desktop`: launchd starts the LaunchAgent in the console user's GUI domain, with no argument (the companion asks why it came, §10.6) | `launchd (launchctl kickstart)` |
+
+- **`Started` only when the process was created.** On Windows `started_outcome` (#3824) reads
+  `start_desktop`'s answer: nobody signed in, or a refused `CreateProcessAsUserW`, is an error in its
+  own words. On macOS only a `launchctl` that exited 0 is a start.
+- A start's own failure keeps its words as before (`locating own exe: …`,
+  `nobody is signed in at this computer's screen`, `resolving the console user: …`,
+  `launchctl kickstart gui/<uid>/com.roomler.desktop failed: …`). `ensure_running` logs either kind
+  as `could not start the desktop companion`, and the prompt has no surface. FR-93 P6f's
+  notification (§10.3) is Linux's alone; on Windows and macOS the next surface is the CLI.
+- Unchanged: who the tray is started for (the console session's person on Windows, the console's
+  owner on macOS), #3848's start and session choice, the launchctl domain, the callers and their
+  3 s budget, and the 20 s verdict (`ENSURE_COOLDOWN`; since #3884 a failed start's verdict
+  stands 2 s, §10.5).
+- `one_in_flight` compiles on Windows for this; its per-key lookups (`OneInFlightPerKey`) stay
+  Unix-only.
+- Tested in `tray_start_tests` ([`companion.rs:2378`](../agents/roomlerd/src/companion.rs#L2378)), now one module for the three OSes: a shared harness
+  and three tests that run on each OS against its own stood-in steps (`on_linux`, `on_windows`,
+  `on_mac`): a held step fails the start within 2.5 s naming it, a 10 ms timer on a two-worker
+  runtime stays on time while prompts ask, and asks at once and in a row share one start. Each OS
+  keeps its control, `a_start_in_time_works_as_today` (the systemd-run argv, the start's context,
+  path and arguments, the launchctl argv). Linux's tests keep their names. They run in "Windows
+  agent unit tests" (the whole `--lib` suite), in the macOS job's "cargo check + test the agent's
+  Mac-only units" (`companion::tray_start_tests::`), and on Linux as in §10.2. Field cells: the
+  control on a per-Machine Windows lab guest and a lab Mac, and a start held there (a thread frozen
+  at `CreateProcessAsUserW`, a stopped `opendirectoryd`).
+
+### 10.5 The prompt's start: asked again after a failure, and off the WS loop (#3884, #3888)
+
+Two things about the tray's start for a remote-control prompt (§10.2, §10.4) changed together.
+
+**A failure stands 2 s, not 20 s (#3884).** `ensure_running`
+([`companion.rs:1158`](../agents/roomlerd/src/companion.rs#L1158)) keeps its verdict so that a burst of
+prompts does not become a burst of starts. Until #3884 every verdict stood 20 s, a failure
+included. But a start that ran out of its 2.5 s goes on on its thread and may bring the tray up a
+moment later, and a person may sign in at the screen meanwhile. The prompt the refusal invited was
+answered "no surface" from the cache, with no look, for up to 20 s. Now each verdict stands for as
+long as it can stay true (`EnsureVerdicts`, [`companion.rs:1213`](../agents/roomlerd/src/companion.rs#L1213)):
+
+| Verdict | Stands | Why |
+|---|---|---|
+| the tray is up (`AlreadyRunning`, `Started`) | 20 s, `ENSURE_COOLDOWN` ([`companion.rs:1196`](../agents/roomlerd/src/companion.rs#L1196)) | a tray that started is visible within a second |
+| no companion on this host (`Unsupported`) | 20 s | it changes only with an install, so no prompt in those 20 s starts anything |
+| the start failed, or ran out of its wait | 2 s, `ENSURE_RETRY_AFTER_ERROR` ([`companion.rs:1207`](../agents/roomlerd/src/companion.rs#L1207)) | it can change at once: a late tray, a person who signed in. Still a rate limit: the prompts in those 2 s are answered from it with no start of their own, and one that asks while a start still hangs joins that start (`TRAY_STARTS`, one in flight), never a second |
+
+A start that ran out of time answers 2.5 s after its prompt, and its verdict stands until 4.5 s,
+so a prompt 5 s after that one asks afresh. A short hold was chosen over a look at whether the
+tray runs before answering from the cache: on these hosts that look is logind and `pgrep`
+(Linux) or the process snapshot (Windows), the very steps that hang, and it would not see a person
+who signed in meanwhile, whose tray nobody has started yet. A failure's log line says when the
+next prompt asks again: `could not start the desktop companion … asks_again_in=2s`.
+
+**The start is off the WS loop (#3888).** The org's WS loop awaited the start inline, up to 3 s
+(`COMPANION_START_BUDGET`, [`signaling.rs:341`](../agents/roomlerd/src/signaling.rs#L341)), and read
+no other frame meanwhile: another viewer's request, a hangup, a live session's ICE. One person's
+start held everyone else's signalling. The start now goes the way of the notification (§10.3):
+
+```mermaid
+sequenceDiagram
+    participant L as WS loop
+    participant S as the tray's start, a task
+    participant T as consent task
+    participant N as the notification's show (Linux)
+    L->>L: arm the question, no native panel, write the marker
+    L->>S: start_for_prompt: start it, not awaited (3 s at most)
+    L->>T: spawn it, with the start's handle
+    Note over L: reads its next frame
+    S-->>T: the tray is up, or not (it failed, or ran out of time)
+    T->>T: is the question still on the broker's books?
+    T->>N: where the tray cannot show it: start the notification
+    N-->>T: up, or why not
+    T->>T: have_surface, and the surface line is logged
+    T->>T: the prompt's window starts
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the loop's side | `start_for_prompt`, [`companion.rs:1270`](../agents/roomlerd/src/companion.rs#L1270); the hand-off, [`signaling.rs:4550`](../agents/roomlerd/src/signaling.rs#L4550) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1288`](../agents/roomlerd/src/companion.rs#L1288)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7533`](../agents/roomlerd/src/signaling.rs#L7533)) |
+| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7559`](../agents/roomlerd/src/signaling.rs#L7559), called at [`:4632`](../agents/roomlerd/src/signaling.rs#L4632) | waits for the start's verdict, then for the notification where the tray cannot show the question, before its first look at the prompt starts the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
+| a question that ends while the start runs | `ConsentBroker::is_asking`, [`consent.rs:853`](../agents/roomlerd/src/consent.rs#L853) | a `Terminate` the loop reads meanwhile takes the question off the broker's books and finds no notification to take down. The consent task starts none for a question off the books, or whose socket closed, and takes down one started just as it was withdrawn |
+
+- **The bound is as before:** the start's 2.5 s and the 3 s budget, on the start's own task and
+  the `tray-start` thread, never on an async worker. The question is still armed on the loop before
+  anything shows it (#1632, #3442), and the window still starts after the surfaces are up.
+- **The log:** `consent prompt surface` carries `companion` (`Some(true)`, `Some(false)`, or
+  `None` when a native panel was up and no start was asked for) beside `native`, `notified` and
+  `have_surface`.
+- **Unchanged:** which surface is chosen and when, the question's words, the exec prompt (which
+  never waited on the start), and a recording's and an SSH session's `Companion::up`, which keep
+  their own bounded wait. Each benefits from the 2 s verdict all the same.
+- **Tested** in `companion::tray_start_tests`
+  ([`companion.rs:2378`](../agents/roomlerd/src/companion.rs#L2378)) against each OS's stood-in
+  host (`Host`, [`:2662`](../agents/roomlerd/src/companion.rs#L2662), and `host_steps` in
+  `on_linux`, `on_windows`, `on_mac`): a prompt a few seconds after a start that ran out of time
+  finds the tray that start brought up
+  ([`:2708`](../agents/roomlerd/src/companion.rs#L2708)); a failed start is asked again 2 s on,
+  not per prompt, and finds a person who signed in
+  ([`:2756`](../agents/roomlerd/src/companion.rs#L2756)); no companion, and a tray that is up,
+  stand with no start per prompt (the control,
+  [`:2785`](../agents/roomlerd/src/companion.rs#L2785)); while the start is held the loop handles a
+  frame within 0.5 s ([`:2838`](../agents/roomlerd/src/companion.rs#L2838)); a start that failed
+  or ran out of time is still `no_prompt_surface`, and one that worked is the person's timeout
+  ([`:2906`](../agents/roomlerd/src/companion.rs#L2906)); and on Linux a question withdrawn while
+  the start is held gets no notification
+  ([`:2966`](../agents/roomlerd/src/companion.rs#L2966)). They run in rust-agent's "Test agent
+  under vp9-444", in "Agent unit tests on Windows (the whole --lib suite)" and in the macOS job's
+  "cargo check + test the agent's Mac-only units" (`companion::tray_start_tests::`).
+- **Field cells:** a Linux system install whose tray start is held by a paused logind, where the
+  first ask is `no_prompt_surface` and an ask 5 s later shows the question; two viewers asking at
+  once while the start is held, the second request handled at once; and both on the release
+  before, as the control.
+
+### 10.6 A start for a prompt keeps the Welcome tour for the person (#3887)
+
+The daemon starts the companion to show a consent question or a being-viewed banner (§10.2,
+§10.4, §10.5). Until #3887 the companion could not tell that start from any other, and for a
+person who had not finished or skipped the Welcome tour it opened the tour too: `decide_startup`
+showed it "however this started". On a person's first remote session, the usual case, the tour
+came up together with the question, and the question is the one with a deadline.
+
+Now the start says what it is for, and the tour waits for the person's own start:
+
+| The start | Made by | Its argument | The tour, while it is not done |
+|---|---|---|---|
+| for a question or a banner, Windows and Linux | the daemon's `start_tray`: Windows [`companion.rs:1867`](../agents/roomlerd/src/companion.rs#L1867), Linux [`:2291`](../agents/roomlerd/src/companion.rs#L2291) | `--for-prompt` (`FOR_PROMPT_ARG`, `crates/agent-core/src/companion_autostart.rs:36`) | held back: the companion stays in the tray, and the question's or the banner's own window shows as before |
+| for a question, macOS | the daemon's `launchctl kickstart` ([`companion.rs:2005`](../agents/roomlerd/src/companion.rs#L2005)) | none: launchd's start carries none | the companion asks the daemon why it came (below), and holds the tour back when there is a question |
+| at login | the `Run` value, the XDG entry, the LaunchAgent | `--autostart` (macOS: none) | shows |
+| after install | `launch_once` | `--first-run` | shows |
+| a person's own | a double-click, the Start or applications menu, Finder | none | shows |
+| after an update; a tray the refresh lost (§13.3) | the daemon's update swap; its restart | none; `--autostart` | shows, as before |
+
+```mermaid
+flowchart TD
+    S([the companion starts]) --> V{"--view=…?"}
+    V -->|yes| SV[that view]
+    V -->|no| P{"--for-prompt?<br/>(macOS: a bare start whose<br/>tour is not done asks the daemon)"}
+    P -->|yes| T["the tray; the tour, not done,<br/>is held for the person"]
+    P -->|no| D{tour done?}
+    D -->|no| W[the Welcome tour]
+    D -->|yes| R["as before: the tray, the Overview<br/>after install, or leave (login start, opted out)"]
+    T --> O{"the person opens the window:<br/>a double-click, the tray icon,<br/>Device status"}
+    O --> W2[the Welcome tour, once]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the decision | `decide_startup`, `agents/roomler-desktop/src/first_run.rs:75` | an explicit `--view=` first, then a start for a prompt stays in the tray, the tour done or not. It never leaves either: `Exit` stays for `--autostart` with the login-start switch off |
+| the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:87` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called at `tray.rs:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
+| macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:83`; `daemon_has_something_to_show`, `:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, read as the consent watch reads them, 300 ms for all of it: a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac |
+
+- **Old and new together.** An older companion started with `--for-prompt` ignores it, as it
+  ignores any argument it does not know, and shows the tour as before. A newer companion that
+  an older daemon starts on Windows or Linux gets no argument and behaves as before. On macOS a
+  newer companion asks an older daemon with verbs that daemon has, so its question keeps the
+  tour back too.
+- **Unchanged:** the start's 2.5 s and the callers' 3 s, the verdicts (§10.5), who the tray is
+  started for, the post-install `--first-run`, the login starts, the update swap's restart and
+  the `--autostart` restart of a tray the refresh lost, and the restart of a companion a Linux
+  package update stopped (`companion/package_sync.rs`).
+- **Every caller of the start is a question or a banner:** the remote-control prompt
+  (`start_for_prompt`, `companion.rs:1270`, from `signaling.rs:4550`), the exec prompt
+  (`signaling.rs:6098`), a recording's and an SSH session's question (`Companion::up`,
+  `companion.rs:1332`), and Linux's being-viewed banner (`indicator/notify.rs:710`). The other
+  callers are `tray_start_tests`' own.
+- **Tested:** the companion's `first_run::tests` (`startup_table`, the forwarded launches, the
+  held tour offered once, `--for-prompt` read by equality, which starts ask on a Mac and what
+  the answer means) in "Rust unit tests (server + crates)", step "Test the desktop companion
+  (roomler-desktop)"; the three start arguments distinct, none a prefix of another
+  (`companion_autostart::tests`), in its "Run the remaining crates' unit tests"; and the
+  daemon's argv in `a_start_in_time_works_as_today` (Linux's systemd-run argv, the Windows
+  start's arguments), in rust-agent's "Test agent under vp9-444" and in "Agent unit tests on
+  Windows (the whole --lib suite)".
+- **Field cells:** a Windows per-machine install, a Linux system install, a one-row and a
+  two-row Mac: a fresh install whose person has not seen the tour, with the companion not
+  running. A remote session's consent start shows the question and no Welcome window; the
+  person's own start, the tray icon and the next sign-in then show the tour. The control is the
+  release before, where the tour opens together with the question.
+
 ## 11. Testing it
 
 - **Unit:** `cargo test -p roomler-desktop` (the Rust side), `cargo test -p roomler-localapi
@@ -672,16 +1668,28 @@ banner, no Disconnect, and on Wayland no companion consent prompt (measured 2026
 at the person's own `/run/user/<uid>/roomler.sock`, which is the path the companion already
 tries first:
 - it is theirs, mode 0600, and only they or root may connect (`SO_PEERCRED`);
-- it follows the active graphical session's user;
+- it follows the person signed in at the machine's own screen: logind's active session on
+  `seat0`, when that session is a person's (`companion::seat0_uid`). Never a remote login,
+  which sits on no seat although logind calls it active (#2871's review: the first active
+  graphical session anywhere, which the socket followed before, could be an xrdp user's).
+  Before it applies a config change, and since #3845 before it takes a consent answer, it
+  asks again whether that person is still at the seat ([security baseline](security-baseline.md)
+  §4). A look that cannot tell who is there keeps the socket where it is (§12.3);
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
   or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`);
-  and since FR-85 P2e, recording: the Recordings view's start, stop, list and delete, and the
-  **Stop recording** on the banner and the tray.
+  since FR-85 P2e, recording: the Recordings view's start, stop, list and delete, and the
+  **Stop recording** on the banner and the tray; and since #2871 (design A) the
+  configuration — the listing, with every key the socket will not set marked `read_only`,
+  and `ConfigSet` of exactly the keys that are the person's own call
+  (`localapi::CONSOLE_PERSON_KEYS`, §5), never the device-owned gates; and since #3831 what
+  this device can encode, the Overview's card (§8): the probe's cached summary, read-only.
 
-Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
-views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
+Everything else on it — a config key that is not the person's own included, refused by name
+with the `sudo` command — is refused with a pointer to `sudo roomler …`, so the companion's
+other views show that refusal on a system install. The kill switch is
+`ROOMLERD_PERSON_SOCKET=0`.
 
 A Mac's root half serves its console user one as well (FR-97 P2g), at
 `/var/run/roomler-person/<uid>.sock` in a directory only root writes: there the per-user half
@@ -707,10 +1715,10 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5749`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5880`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
-screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
+`crates/localapi/src/lib.rs:1370`), and the banner comes up only for a session that sees the
+screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:343`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
 
@@ -728,7 +1736,7 @@ also keeps a system install's Wayland capture opt-in.
 | Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:127`, `:416` |
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
-| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:380` |
+| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:382` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
 | Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:513` |
 
@@ -775,7 +1783,9 @@ consent like any new session. Before P10 the viewer read the closed peer as an o
 drop and was back within ~3 s of being sent away (measured on this banner, 0.4.119,
 2026-10-08). The mechanism, the ordering it relies on and the version matrix are in
 `docs/remote-control.md` §11.5; the companion itself did not change — the fix is in the
-daemon's arm that every Disconnect surface reaches, so the Windows badge gets it too.
+daemon's arm that every Disconnect surface reaches, so the Windows badge gets it too. Over the
+daemon's own endpoint the Disconnect is taken only from the person at the screen the daemon
+shows, SYSTEM or an elevated administrator (§12.4); the badge's never crosses the pipe.
 
 On a supervised Mac the session lives in the GUI worker (FR-43), and so does the
 Disconnect: the worker's `host_disconnect` rides the delegation link to the daemon's
@@ -830,6 +1840,186 @@ Measured on Fedora Asahi Remix 42 (an Apple M2 Pro Mac mini), 2026-10-16:
 The kill switch is `ROOMLER_DESKTOP_BANNER_PIN=0`. It loads no KWin script, and on GNOME the
 companion stays on native Wayland.
 
+### 12.3 Who is at the seat: not known is not nobody (#3845)
+
+On a Linux system install, who is at the seat is logind's answer. logind is another process,
+and its answer may not come: a paused logind is one case, and `loginctl`'s D-Bus call gives
+up after about 25 s. The person socket's poll used to read a look that failed as "nobody". It
+closed the person's socket (`person socket: nobody at the seat now; closing`), and the
+person's own `roomler` commands then fell through to the root-only socket:
+`Permission denied (os error 13)`. Measured on 0.4.220 with logind paused for 45 s, the close
+came 26.3 s into the pause. A look now has three answers (`person_socket::Look`,
+`agents/roomlerd/src/person_socket.rs:135`, from `look_of`, `:426`):
+
+| The look found | When | The poll (`step`, `:151`) | A change or a consent answer over the socket |
+|---|---|---|---|
+| a person | seat0's active session is a person's (`companion::seat0_uid`) | starts, keeps or moves the socket to them | taken from that person, refused in words from anyone else |
+| nobody | the seat itself says so: an empty seat, the login screen, a session that is not a person's, a host with no logind (`companion::is_nobody_at_the_screen`, the rule a received file follows, §9.4); root at the seat; no person logged in at all | closes the socket, as before: `person socket: nobody at the seat now; closing` | refused in words |
+| not known | any other failure: logind or the bus did not answer, `loginctl` failed, no answer within the look's wait, a lookup that panicked | keeps what it serves, with no close, start or move. It says so once a run, `person socket: who is at the seat is not known (<why>); serving as before`, and once as the run ends, `person socket: who is at the seat is known again` | refused with "Could not tell who is signed in at this computer's screen. Try again." (`AtTheSeat::NotKnownYet`) |
+
+```mermaid
+flowchart TD
+    P["the poll, every 5 s"] --> L{"look at seat0<br/>one lookup in flight, 5 s at most"}
+    L -- "a person" --> F["start, keep or move<br/>the socket to them"]
+    L -- "nobody: the seat says so,<br/>or root" --> S["close the socket"]
+    L -- "not known: no answer in time,<br/>loginctl failed" --> K["keep what is served<br/>(said once a run)"]
+    C["a ConfigSet or a ConsentDecide<br/>over the socket"] --> Q{"at_the_seat_now<br/>1.5 s at most"}
+    Q -- "this person" --> Y["applied"]
+    Q -- "someone else, nobody" --> N["refused in words"]
+    Q -- "not known" --> T["refused: try again"]
+```
+
+- **Failing closed stays.** Nothing changes through the socket while it is not known. Every
+  `ConfigSet` and every `ConsentDecide` asks the seat again first (`at_the_seat_now`, `:450`,
+  1.5 s at most), and a look that cannot tell refuses with the try-again text, however it came
+  about (`seat_for`, `:504`). A failed lookup used to read "the seat changed". The person now
+  gets the try-again text instead of a closed socket, and the banner, its Disconnect and keep
+  busy keep working.
+- **The poll's look** goes through the lookup in flight the checks already share,
+  `PERSON_AT_SEAT0` on a thread named `seat0-person` (`:463`, `look_at_the_seat`, `:470`), and
+  waits 5 s at most (`LOOK_WAIT`, `:93`, the time between looks). It used to wait on a blocking
+  thread for as long as `loginctl` took. A hung logind now holds that one thread, however
+  often the poll and the checks ask. The wait is longer than a check's 1.5 s on purpose. A
+  look cut short is not known and keeps the socket where it is, so the poll waits long enough
+  to follow a slow logind that still answers.
+- **A consent answer comes from whoever is at the seat now.** A consent answer lets someone
+  see and control this screen. So the socket asks the seat again before it takes one, an
+  approval or a denial, as it does before a change (`crates/localapi/src/lib.rs:4009`). It
+  used to take the answer from whoever held the socket. A person who had switched away could
+  answer for the next person's screen until the next look, up to 5 s, and while who was at the
+  seat was not known, for as long as that lasted. Root, and the daemon's own socket, are not
+  asked: that socket takes an answer only from the person at the screen the daemon shows,
+  SYSTEM or an elevated administrator (§12.4).
+- **What still rides on the poll.** A recording's start has its own identity rule (#3830): the
+  recorder's console lookup (`recording::launch::decide`) refuses with the same try-again text
+  when it cannot tell, and the recorder runs as the person at the screen. Disconnect
+  (`RcDisconnect`) and keep busy only end a session or keep the screen awake. They stay with
+  the person the socket was made for until the poll moves it.
+- **A seat that changes hands while not known** moves only once logind answers, in one move and
+  never by way of "nobody". It is logind that switches the seat, so a switch it has not answered
+  for is rare.
+
+The tests: `person_socket::following_the_seat_tests` drives the real poll, a real person socket
+and the real check, with who is at the seat stood in (`:1032`, Linux, as the runner in CI's
+agent lane). `person_socket::tests::a_look_that_cannot_tell_keeps_what_is_served` and
+`only_the_seats_own_answer_is_nobody` hold the pure rules, and `crates/localapi`'s
+`a_consent_answer_over_the_person_socket_comes_from_whoever_is_at_the_seat_now` holds the
+dispatcher's (both on every OS).
+
+### 12.4 Who answers over the daemon's own endpoint
+
+A consent answer, an approval or a denial, decides whether someone sees and controls this
+screen, and a Disconnect ends what they see. Both are the call of the person at that screen.
+The person socket asks the seat (§12.3). The daemon's own endpoint, the Windows pipe that
+admits every interactive user (§1) or a Unix daemon's owner-only socket, takes `ConsentDecide`
+and `RcDisconnect` only from these callers, as the OS read them when they connected:
+
+| Caller | Read from | Answer |
+|---|---|---|
+| a process in the session whose screen the daemon shows | the client's session, read at accept (`pipe_client_peer`) | taken |
+| SYSTEM (`S-1-5-18`) | the client's token | taken |
+| an administrator who elevated | the client's token (its elevation) | taken |
+| a Unix daemon's own account, or root | the kernel (`SO_PEERCRED`, `getpeereid`) | taken |
+| another signed-in account; LocalService or NetworkService; a peer whose session and account could not be read | — | refused in words, with a warn line; nothing reaches the daemon |
+
+On Windows the screen's session depends on what serves the pipe (`screen_session`,
+`crates/localapi/src/lib.rs:2614`):
+
+| The daemon serving the pipe | The screen's session |
+|---|---|
+| a worker, which the service host starts in the active console session | its own session, the console's |
+| a per-user daemon, which runs where its person signed in, over RDP too | its own session. The person at the console is someone else, and is refused |
+| a daemon in session 0, the service host | the console session (`WTSGetActiveConsoleSessionId`) |
+| its own session unreadable, or session 0 with no console session | none: only SYSTEM and an elevated administrator are taken |
+
+```mermaid
+flowchart TD
+    R["ConsentDecide or RcDisconnect<br/>on the daemon's own endpoint"] --> S{"SYSTEM, or elevated?<br/>the client's token"}
+    S -- yes --> Y["taken"]
+    S -- no --> W{"a Windows session<br/>was read?"}
+    W -- yes --> Q{"the screen's session?<br/>screen_session"}
+    Q -- yes --> Y
+    Q -- no --> N["refused in words<br/>nothing decided"]
+    W -- no --> U{"the daemon's own uid,<br/>or root?"}
+    U -- yes --> Y
+    U -- no --> N
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the decision | `peer_may_decide_for_the_screen`, `crates/localapi/src/lib.rs:2641` | pure: the peer, the console session, the daemon's own session and uid. SYSTEM is named by its SID, because `ClientPeer::is_root` reads a uid, which a pipe client never has |
+| the daemon's own session | `own_session_id`, `:2658` | `ProcessIdToSessionId` of this process; `None` off Windows |
+| the dispatch | `:4028` (consent), `:4033` (Disconnect) | after the person socket's seat check (`:4009`), on every scope but the person socket's, so a new scope starts refused |
+| the refusals | `not_the_screens_person`, `:3785` | "The answer was not taken: …" and "The session was not ended: …", which the tray and the CLI show as they arrive |
+
+Who calls them, and how each is read:
+
+| Caller | Runs | Taken as |
+|---|---|---|
+| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2545`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2615`) | as the person, in their session | the screen's session |
+| `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2507`; `rc_cmd`, `:2404`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
+| the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
+
+The tests, in `crates/localapi`: `the_screen_decision_table` (every row above, a per-user daemon
+in an RDP session among them) and
+`a_consent_answer_or_a_disconnect_on_the_daemons_own_endpoint_comes_from_the_screens_person`
+(the dispatch: approve, deny and Disconnect, nothing reaching the daemon when refused, and the
+person socket unchanged) run on every OS. On Windows,
+`a_client_at_the_screen_answers_and_ends_a_session_over_a_real_pipe` reads a client from the OS
+over a real pipe, as the tray and the CLI are read.
+
+#### The console person's gates follow the same screen
+
+The daemon's own endpoint keeps a second set of gates, for the console person: a console
+person's `ConfigSet` key (`CONSOLE_PERSON_KEYS`: `rc_clipboard`, `files_dir`, `lock_on_end`, the
+`record_*` and `external_*` keys and the rest), the recording verbs, keep busy on, and the
+external-access password's set and clear. On Windows each takes the person in the session whose
+screen the daemon shows (`screen_session`, above), read at accept as a consent answer's caller
+is. Each gate's other conditions are as they were:
+
+| Gate | Where | Taken on Windows | Also, as before |
+|---|---|---|---|
+| the external-access password's set and clear (`is_console_user`) | `peer_is_console_user`, `crates/localapi/src/lib.rs:2539`; the dispatch `:4038` | a peer in the screen's session | Unix: the daemon's own uid, or root |
+| a console person's key | `peer_may_set_console_key`, `:2582`; the dispatch `:3981` | the same | the person socket: its person, and the seat asked again (§12.3) |
+| the recording verbs: start, stop, delete | `peer_may_record`, `:2516`; the dispatch `:4081` | the same | the person socket: its person |
+| keep busy on | `peer_may_start_keep_busy`, `:2483`; the dispatch `:4077` | a peer in the screen's session whose token reads as a person's account | never root, SYSTEM, LocalService, NetworkService or an account that could not be read; stopping is open to every peer |
+
+| The daemon serving the pipe | Who passes these gates on Windows |
+|---|---|
+| a worker of a machine-wide install, in the active console session | the person at the console: the screen's session is the console session, so these gates decide as they always did |
+| a per-user daemon in an RDP session | the person in that RDP session; the person at the console is refused |
+| a daemon in session 0 | the person at the console |
+| its own session unreadable, or session 0 with no console session | no Windows peer |
+
+Unlike a consent answer, these gates take no SYSTEM or elevated caller from outside the screen's
+session, as before, and Unix reads no session, so there each gate decides by the uid.
+
+Each refusal names the person these gates take (#3907): "only the person at this device's screen
+can …", in its gate's own words (`not_the_console_user`, `not_the_console_user_for_external_access`
+and `not_the_person_for_keep_busy`, `crates/localapi/src/lib.rs:3237-3265`, and each
+`CONSOLE_PERSON_KEYS` entry's `refusal`). On a machine-wide install the screen is the console's,
+so they read as before. On a per-user install used over Remote Desktop the person at the console
+is the one refused, whom the words of 0.4.222 and earlier ("only the person at this device's
+console …") named.
+
+The tests, in `crates/localapi`, run on every OS:
+`the_console_persons_gates_follow_the_screens_session` (a table per gate: a per-user daemon in
+an RDP session, a worker in the console session, a daemon in session 0 and nothing known, with
+each gate's other conditions and Unix's uid rows),
+`on_a_machine_wide_install_the_console_persons_gates_decide_as_before` (a worker in the console
+session, or a daemon in session 0, decides as the console-session rule did, for every peer and
+both scopes) and `the_console_persons_verbs_follow_the_screen_the_daemon_shows` (the dispatcher,
+with the two session reads pinned for the test's thread: every verb from the screen's person
+reaches the daemon, from any other session none does, and stopping keep busy stays open). On
+Windows, `a_client_at_the_screen_sets_a_console_persons_key_over_a_real_pipe` reads a client from
+the OS over a real pipe, as the tray is read. One test a gate pins its refusal's words, asked as
+the person at the console of a per-user daemon in an RDP session:
+`a_recording_verbs_refusal_names_the_person_at_the_screen`,
+`a_keep_busy_starts_refusal_names_the_person_at_the_screen`,
+`the_external_access_passwords_refusal_names_the_person_at_the_screen` and
+`a_console_persons_keys_refusal_names_the_person_at_the_screen` (every `CONSOLE_PERSON_KEYS`
+entry).
+
 ## 13. One version: the companion follows the daemon (FR-117)
 
 After an update a device runs one version: the daemon (`roomlerd`), the CLI (`roomler`) and the
@@ -838,12 +2028,28 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1162`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:4258`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:93`), within minutes while the tray is too old to connect (§13.2), and within a minute while a tray it stopped is not running again (§13.3). It goes by the EXE's own version when the marker does not name the daemon's (§13.4), and starts the tray again in each session it stopped one in (§13.5) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
 The CLI needs nothing of its own: it ships inside every daemon package (the MSI's `roomler.exe`
 shim, the `.pkg`, the `.deb`, and the tarball, where `usr/bin/roomler` is a required member).
+
+**Where the release is looked up (#3818).** Windows and Linux both move the companion to the
+daemon's OWN release, `agent-v<own>`. Both look that release up in the update feed on roomler.ai:
+`GET /api/agent/latest-release`, or `ROOMLERD_UPDATE_URL`, the list the daemon's update check
+reads. They take the exact tag from that list (`fetch_release_by_tag`,
+[`agents/roomlerd/src/updater.rs:1695`](../agents/roomlerd/src/updater.rs#L1695); where each
+lookup asks is `release_sources`, `:1674`). They never ask GitHub's API. Until #3818 they asked it
+by tag, unauthenticated, from every device at every release. Behind a corporate network's shared
+egress address, GitHub's per-address limit answered `403 Forbidden` during the agent-v0.4.218 push,
+and the tray stayed a release behind until its next try, 4 h later.
+
+| Case | What happens |
+|---|---|
+| the feed lists the tag | the companion's asset comes from that release. Its bytes come from the asset's URL in the list, through `download_asset`'s checks, as the daemon's own update does |
+| roomler.ai cannot answer (unreachable, a 5xx, a 429) | the refresh logs `desktop companion refresh skipped` with the feed's error, and the retry tries again (§13.2). The Linux sync tries again at the updater's next tick. Neither asks GitHub |
+| the feed lacks the tag | the same skip, logged as `release agent-v<own> is not in the update feed …`. The feed carries GitHub's newest page of releases (48 agent releases on 2026-11-13), so the cause is a daemon further behind than that, or a build that was never released |
 
 **Why Linux needed it.** The companion's package is installed once, by `install.sh` or the wizard,
 from a release asset. There is no apt or dnf repository, so nothing ever upgraded it. **Update
@@ -860,7 +2066,7 @@ flowchart TD
     Q -->|yes| V{its version vs<br/>this daemon's}
     V -->|equal| N2[nothing]
     V -->|newer| N3[logged once, never a downgrade]
-    V -->|older| F[release agent-v OWN: the companion<br/>for this arch, .deb for dpkg, .rpm for rpm]
+    V -->|older| F[release agent-v OWN, from the update feed:<br/>the companion for this arch,<br/>.deb for dpkg, .rpm for rpm]
     F --> D[download_asset: digest, the pinned key,<br/>the version binding]
     D --> I[the host's package manager,<br/>needrestart suspended]
     I --> P[stop the companions on the replaced<br/>image; start one in the session<br/>where one was stopped]
@@ -870,7 +2076,7 @@ flowchart TD
   a password. That is a system install's root daemon, or a per-user install's root update
   helper (FR-96). A per-user daemon that sees the skew wakes its helper. Mechanics:
   [linux-self-update.md](linux-self-update.md#the-desktop-companion-follows-the-daemon-fr-117).
-- **What it reads:** `installed_package` (`companion.rs:367`) asks dpkg, then rpm. ⚠️ dpkg's
+- **What it reads:** `installed_package` (`companion.rs:1474`) asks dpkg, then rpm. ⚠️ dpkg's
   answer counts only for an INSTALLED package (`dpkg_installed_version`,
   `companion/package_sync.rs:56`). `dpkg-query -W` also answers, with a version, for one that was
   removed with its config kept, and a companion a person removed must stay removed.
@@ -886,9 +2092,9 @@ flowchart TD
   graphical session where one was stopped, through FR-27's `systemd_run_command`, as the Windows
   swap does (#1686). A companion that was not running stays stopped.
 - **The grid catches up at once:** the sync drops `installed_version`'s 10-minute cache
-  (`forget_installed_version`, `companion.rs:322`).
+  (`forget_installed_version`, `companion.rs:1411`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
-  the Windows retry. Windows' refresh at start is older and stays.
+  the Windows retry (§13.2's faster one with it). Windows' refresh at start is older and stays.
 
 ### 13.1 Checking for updates: one click from the tray (#2936)
 
@@ -913,16 +2119,302 @@ sequenceDiagram
 
 | Piece | Where | Why |
 |---|---|---|
-| the tray's half | `check_updates`, `src/tray.rs:588` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
-| the event and the flag | `tray_check_update_js`, `src/tray.rs:574` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
+| the tray's half | `check_updates`, `src/tray.rs:591` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
+| the event and the flag | `tray_check_update_js`, `src/tray.rs:577` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
 | one check | `runUpdateCheck`, `src/front/overview.js:184` | the card's button and the tray share it: a stale "Install update" is hidden first, the button is disabled while it runs, and a failure lands in the card |
 | a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:173` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
 | into view | `scrollToUpdates`, `src/front/overview.js:214`; `revealUpdates`, `:234` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
 | the ring | `flashUpdates`, `src/front/overview.js:220`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
-| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:1611` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
+| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:2083` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
 **Install update** queues the root update helper (FR-27).
+
+### 13.2 A tray too old for its daemon (Windows, #3781)
+
+From `agent-v0.4.217` the LocalAPI pipe gives an interactive user only the open a tray makes from
+`agent-v0.4.216` on: reading and writing data, and nothing that adds an instance of the pipe
+(#3742, #3760; the DACL is §1's trust-boundary note). A tray from before 0.4.216 opens the pipe
+with `GENERIC_WRITE`. Every connect it makes is refused, and none of its pages reach the daemon.
+That holds where the daemon runs elevated or as SYSTEM: a machine-wide install, unless its worker
+runs as a person without administrator rights. A daemon that runs as the person owns its pipe (a
+per-user install, or such a worker), so that person's old tray still connects, through the
+owner's entry.
+
+The refresh (§13's table) normally replaces the tray within seconds of the daemon's update. On
+2026-11-12 every online Windows device had its tray refreshed within seconds of its 0.4.216 update.
+This section is for a device whose refresh keeps failing, such as a corporate laptop whose
+endpoint protection blocks the swap. Before #3760 that device kept a stale tray that still worked;
+now it keeps one that cannot connect. So while the tray is that old, the daemon retries the
+refresh within minutes, and `roomler status` says what is wrong.
+
+```mermaid
+flowchart TD
+    W([the retry loop:<br/>one plan per wait]) --> K{ROOMLERD_COMPANION_SYNC=0?}
+    K -->|yes| N[4 h, no refresh, no line]
+    K -->|no| M{the tray's version: its marker,<br/>or the EXE's own when the marker<br/>does not name this daemon's, §13.4}
+    M -->|0.4.216 or later| R[4 h]
+    M -->|older, or no version<br/>either can name| F[2, 5, 10, 15, 15, 15 min,<br/>then 4 h]
+    F --> L[one warn line before the wait:<br/>installed, needs, next_try_in_min]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the floor | `MIN_COMPANION_VERSION`, `agents/roomlerd/src/companion.rs:148`; `predates_min_companion`, `:154` | `0.4.216`, the first release whose tray opens the pipe exactly (`agent-v0.4.215` was cut before #3742). It moves only with the pipe's DACL or the client's open. A marker that is missing, unreadable or names no version counts as older, unless the EXE's own version resource names one (#3850, §13.4): nothing else vouches for the open such a tray makes |
+| the schedule | `next_refresh_wait`, `companion.rs:491`; `FAST_REFRESH_WAITS`, `:122`; `RefreshSchedule::next`, `:463` | keyed on the version marker. While it reads too old the waits are 2, 5, 10 and 15 minutes, then 15 to the end of the first hour, so the tries land 2, 7, 17, 32, 47 and 62 minutes after the loop starts; after that the updater's 4 h. A marker that reads current starts them over. While a tray the refresh stopped is not running again, the waits are 1, 5 and 15 minutes when those are shorter (§13.3) |
+| the loop | `retry_refresh`, `companion.rs:513` | one plan per wait, so one line per wait while the tray is too old: `desktop companion is too old to connect to this daemon; its refresh is retried`, with `installed`, `needs` and `next_try_in_min`. It runs in the one refresher per install (#1686): on a machine-wide install the service host, whose log is `roomler logs --source service`. The version it plans from is read off the async worker (`sibling_version`, §13.4) |
+| what status is told | `too_old_to_connect`, `companion.rs:570`; `too_old_here`, `:663`; `too_old_beside`, `:694` | `NodeStatus.companion_too_old` (`crates/localapi/src/lib.rs:496`), read fresh on every answer, because the service host, another process, may have just refreshed the tray. The tray's version is the one the refresh goes by (§13.4, #3908): the marker when it names the daemon's, else the EXE's own. Absent means fine or not applicable, never unknown: a tray whose version neither names is reported without one, and a token or a file the daemon cannot read counts as reportable |
+| the log the hint names | `newest_service_log`, `crates/agent-core/src/logging.rs:992` | `--source service` reads the service host's `roomlerd-service.log` alone, the newest of its daily files (#3814). It used to take whichever was newer of that and the SystemContext worker's `roomlerd.log` in the same `service-logs` folder. The busier worker's nearly always was, so the hint's own command showed none of the warn lines. The worker's log is `--source daemon`, since the worker answers the verb |
+| whether the retry is off | `retry_off_where_it_runs`, `companion.rs:600`; `sync_enabled_in`, `:623`; `service_sync_enabled`, `:641` | `companion_too_old.retry_off` (#3814): `ROOMLERD_COMPANION_SYNC=0` is set where the retry runs. A daemon that runs the retry itself reads its own environment. So does the SystemContext worker: the service host starts it with the host's own environment. A worker the host starts as the person gets the person's environment, which leaves the service's `Environment` value out, so it reads that value: once a process, because a restart of the service starts a new worker. A value it cannot read, or one that does not name the switch, leaves the retry on |
+| what status says | `tray_lines`, `agents/roomler-cli/src/localclient.rs:2499` | the lines below |
+
+`roomler status` on a machine-wide install whose tray is 0.4.212:
+
+```
+  tray        OUT OF DATE: 0.4.212 cannot connect to this daemon, which needs 0.4.216 or later
+              Roomler replaces it by itself, retrying every few minutes for an hour after a start, then every 4 h
+              To retry now: Restart-Service Roomler (as an administrator)
+              Why it failed: roomler logs --source service --grep "desktop companion"
+```
+
+- A tray whose marker is missing, or names no version, reads `version UNKNOWN (no version
+  marker): one older than 0.4.216 cannot connect to this daemon`.
+- A daemon that refreshes the tray itself, not the service (an elevated `roomlerd run`), names
+  `restart roomlerd` and its own log instead.
+- With `ROOMLERD_COMPANION_SYNC=0` set where the refresh runs, the second line reads
+  `Roomler replaces it only at a start: its automatic retry is off (ROOMLERD_COMPANION_SYNC=0)`
+  (#3814). The refresh at a start stays on with the switch, so the other three lines stand.
+- A worker that runs as the person reads the switch from the service's `Environment` value,
+  where it is documented to go. A machine-wide system variable `ROOMLERD_COMPANION_SYNC=0` also
+  turns the host's retry off, but such a worker's hint keeps the retry's wording: the safe
+  direction.
+- The fields are additive: an older daemon sends none, an older CLI ignores them, and
+  `status --json` carries them as `companion_too_old`, with `retry_off` only when it is true.
+- **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster one with it,
+  and `status` says so.
+
+### 13.3 The tray is stopped last, and a tray the refresh lost comes back (Windows, #3824)
+
+The refresh replaces `roomler-desktop.exe` beside the daemon, and the person's tray usually runs
+from it. Until #3824 the refresh stopped the tray first and only then renamed the EXE aside. In the
+agent-v0.4.218 release lab that rename was refused (a deny for SYSTEM on the EXE; in the field a
+scanner or endpoint protection can refuse it the same way). The start of the old tray then failed
+as well, and the person had no tray while the log said `respawned it: true`. A later refresh that
+did swap the EXE started no tray, because none was running.
+
+From `agent-v0.4.221` the tray is stopped last, once the new EXE is in place:
+
+```mermaid
+flowchart TD
+    S([a refresh pass whose marker is stale]) --> G[stage: copy the downloaded tray<br/>in as .exe.new]
+    G --> A[rename the installed EXE aside,<br/>to .exe.old or the first free .exe.old.N,<br/>while the tray still runs from it]
+    A --> P[rename .exe.new into place]
+    P --> R[stop the running trays,<br/>found by the path they started from]
+    R --> V{did every one stop?}
+    V -->|no| B[the old EXE back over the new one,<br/>start what stopped, marker unchanged:<br/>the retry tries again]
+    V -->|yes| W[write the marker, start what stopped,<br/>remove the copies moved aside]
+    G -.->|fails| K[put back what moved:<br/>nothing stopped, the tray runs on,<br/>the retry tries again]
+    A -.->|fails| K
+    P -.->|fails| K
+```
+
+| Piece | Where | Why |
+|---|---|---|
+| the order | `swap`, `agents/roomlerd/src/companion.rs:4596`, over `SwapOps`, `:4461`; on disk `FsSwap`, `:4994` | NTFS renames a running image aside, while it refuses a delete of that file or a replace onto it (`a_running_program_is_found_by_its_started_from_path_and_stopped_by_pid`, `agents/roomlerd/src/win_service/companion_procs.rs:496`). So the rename aside and the promote both run while the tray runs, and the tray is stopped only after both worked. What refuses the rename is an ACL, a handle opened without `FILE_SHARE_DELETE` (a scanner's, #3005's err 32) or endpoint protection: each now leaves the tray running, and the retry tries again |
+| a tray that would not stop | `swap`'s branch, `companion.rs:4631` | it keeps the single-instance lock, so a new tray could not take over. The old EXE goes back over the new one, which nothing runs, what was stopped is started again, and the marker stays as it was, so the retry tries again |
+| a name for the copy | `free_aside_name`, `companion.rs:4966`; `ASIDE_NAMES`, `:4958`; the sweep, `FsSwap::remove_old`, `:5075`, with `is_aside_name`, `:4982` | a copy an earlier swap left that is still mapped (a tray that would not stop) or held (a scanner) refuses a delete and a replace onto it alike, and used to fail the next swap's rename. The copy now takes the first free name of `.exe.old`, `.exe.old.1` … `.exe.old.8`, and a swap that lands removes every one it can. The sweep takes nothing else: never the marker (`.exe.version`) or the staged `.exe.new` |
+| the line | `refresh_line`, `companion.rs:4832`, logged by `log_refresh`, `:4374` | one renderer, tested: "respawned" only after a start that worked, and a start that failed is a warning with its error. The prefixes are the ones the lab kits read |
+| the consent prompt's start | `started_outcome`, `companion.rs:1893` | FR-27's `ensure_running` was told the tray started even when its start had failed, so the prompt waited out its window for nobody. It now reports `no_prompt_surface` then |
+
+The refresh's lines, message first, then its fields:
+
+```
+INFO desktop companion refreshed version="0.4.221" stopped=[4120] tray=respawned (pid 5236, session 1)
+INFO desktop companion refreshed version="0.4.221" stopped=[] tray=none was running
+WARN desktop companion refreshed, but the tray could not be started again version="0.4.221" stopped=[4120] error=CreateProcessAsUserW(…\roomler-desktop.exe) failed (err 5)
+WARN desktop companion refresh skipped error=moving the old companion aside failed: renaming the desktop EXE aside: Access is denied. (os error 5) (no tray was stopped)
+```
+
+From `agent-v0.4.223` (#3844) the `tray=` and `error=` say what came of the start in each session,
+`session 1: CreateProcessAsUserW(…) failed (err 5)` for a failed one (§13.5).
+
+**A tray the refresh lost.** A tray this process's refresh stopped and could not start again is
+marked lost, in the session it ran in (#3844): its start there failed, or, for a tray whose session
+could not be read, nobody was signed in at the console to start it for. A session whose person
+signed out since lost nothing. Only while a tray is lost does a refresh start one that is not
+running. A tray the person quit, or one that never ran, stays as it is; on a first run the
+post-install launcher owns the first launch (§10).
+
+```mermaid
+flowchart TD
+    E([after a refresh pass]) --> S{did this pass stop a tray?}
+    S -->|yes| N1[nothing more: its own start<br/>brought the tray back or marked it lost]
+    S -->|no| L{is a tray marked lost?}
+    L -->|no| N2[nothing: a tray the person quit stays quit]
+    L -->|yes, in a session| U{in that session: its person<br/>signed in, no tray, the Run value?}
+    U -->|a tray runs there| C[forget the loss]
+    U -->|its person signed out| C
+    U -->|all three| T["start it there with --autostart"]
+    T -->|it started| C
+    T -->|it did not| W[a warn line, then debug lines:<br/>tried again after 1, 5 and 15 min,<br/>then at the next refresh]
+    U -->|no Run value| W
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the flag | `TrayLost`, `companion.rs:4753`, one per process (`TRAY_LOST`, `:4812`), set and cleared by `start_stopped`, `:4656` | set when a swap stopped the tray and its start did not bring it back; cleared when a start works or a tray is seen running. In memory only: after a restart the sign-in start owns the tray |
+| when it is tried | `refresh_if_stale`, `companion.rs:4258`; `bring_back_lost_tray`, `:4397`; `restore_lost_tray`, `:4906` | after every pass that stopped no tray: nothing to swap (the marker reads current, the case after a swap whose start failed), a swap with none running, one that gave up before any stop, or a failed download. A pass that stopped a tray has tried its own start already |
+| how it is started | `start_lost_tray`, `companion.rs:5295`; `signed_in_session`, `:5329`; `set_to_start_at_sign_in`, `:5346` | in the session it was lost in, while its person is signed in there (#3844), or, for a tray whose session was not known, where someone is signed in (the console session's person, for the service); no tray runs in that session, and the tray is set to start at sign-in: the `Roomler Desktop` Run value, in `HKLM` for a machine-wide install (present while the device's switch is on) or in `HKCU` for a per-user one (gone once its person opted out). With `--autostart`, the sign-in start's argument, so a person who switched that off sees nothing (`decide_startup` exits) |
+| the retry | `LOST_TRAY_WAITS`, `companion.rs:135`; `RefreshSchedule::next`, `:463` | a lost tray is tried again within a minute, then at 5 and 15 min, then at the next refresh or sign-in. While it is lost the loop waits 1, 5 and 15 minutes (§13.2's wait when that is shorter), then its usual period, and each refresh tries the start |
+| the lines | `bring_back_lost_tray`, `companion.rs:4397` | `desktop companion is back after a refresh stopped it`, with `session=` and `how=` (INFO); `desktop companion is still not running after a refresh stopped it; it is tried again`, with `session=` and `why=`: WARN for the first try that did not bring it back, DEBUG for the rest; `desktop companion is not started again after a refresh stopped it: nobody is signed in to that session any more …` (INFO, #3844) |
+
+- While a lost tray is being retried, a tray the person quits within those minutes can be started
+  once more.
+- **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns this retry off with the rest. A lost tray then
+  waits for the next sign-in, or for the next start of the process that refreshes it.
+- Each place is tried on its own (#3844, §13.5): the session the tray was lost in, or, for a tray
+  whose session could not be read, the console session as before. One verdict per pass: its first
+  try that did not bring a tray back is the WARN.
+- The tests (`swap_tests`, `companion.rs:5367`) drive the order through a fake swap and start that
+  fail on cue: a refused rename or promote stops nothing, a tray that would not stop gets the old
+  EXE back, a start that failed is never "respawned" and marks the tray lost, the next pass starts
+  it, and a tray the person quit, or a first run, gets none.
+
+### 13.4 The version check: the marker, then the EXE's own version (Windows, #3850)
+
+The refresh decides whether to swap from the version marker beside the EXE
+(`roomler-desktop.exe.version`), which a swap writes once the new EXE is in place. Until #3850 a
+write that failed (a read-only marker, a deny, a scanner holding it) was a warning only, and every
+later pass read the old marker and swapped again: it downloaded the same release, moved the EXE
+aside, put the same version back, and stopped and started the person's tray, at every start of the
+service and every 4 h. A marker that was missing or unreadable also counted as too old to connect
+(§13.2), so those swaps came every few minutes in the first hour after a start.
+
+From `agent-v0.4.223` the marker stays the fast path, and the EXE's own version resource is the
+second source:
+
+```mermaid
+flowchart TD
+    P([a refresh pass]) --> E{the EXE there?}
+    E -->|no| S[swap: the refresh puts one in place]
+    E -->|yes| M{the marker names<br/>this daemon's version?}
+    M -->|yes| N[nothing to do:<br/>one small file read]
+    M -->|missing, unreadable,<br/>another version| V{the EXE's own<br/>version resource}
+    V -->|this daemon's version| W[no swap: the marker<br/>is written again, once a pass]
+    V -->|another version, none,<br/>or a malformed resource| S
+    W -->|the write fails| L[one WARN for the process,<br/>then DEBUG]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the decision | `installed_state`, [`agents/roomlerd/src/companion.rs:216`](../agents/roomlerd/src/companion.rs#L216); read by `look_beside`, [`:957`](../agents/roomlerd/src/companion.rs#L957), on a blocking thread, `LOOK_WAIT` (10 s) at most | the marker first; only when it does not name the daemon's version, the EXE's. An EXE at the daemon's version is current: no download, no swap, no stop of the tray. A version that cannot be read is not known, which is stale, as before: the refresh swaps |
+| the EXE's version | `exe_version`, [`:886`](../agents/roomlerd/src/companion.rs#L886); `version_resource_version`, [`:305`](../agents/roomlerd/src/companion.rs#L305) | the EXE is mapped as data and as an image resource only (`LoadLibraryExW`), so nothing in it runs, and it is freed on every path. Its `VS_VERSIONINFO` gives `ProductVersion`, else `FileVersion`. Through kernel32, which the daemon already imports: `GetFileVersionInfoW` would add `version.dll` to what the SYSTEM service loads. Every offset and length is checked against its block, and a malformed resource is not known. The release's companion carries the workspace version there, as its marker does: the 0.4.221 tray reads `0.4.221` |
+| the marker written again | `look_beside`; `MarkerWrites`, [`:252`](../agents/roomlerd/src/companion.rs#L252), one per process (`MARKER_WRITES`, [`:295`](../agents/roomlerd/src/companion.rs#L295)); `log_marker_line`, [`:987`](../agents/roomlerd/src/companion.rs#L987) | a marker that does not name the version of an EXE that does is written again, once a pass. The swap's own write and the passes after it share one latch: the first failure in a process is a WARN, the rest DEBUG, and a write that works after one that did not is an INFO |
+| the fast waits | `known_version`, [`:181`](../agents/roomlerd/src/companion.rs#L181); `sibling_version`, [`:745`](../agents/roomlerd/src/companion.rs#L745) | §13.2's "too old" reads the same version, off the async worker: the marker when it names the daemon's, else the EXE's, else the marker's own words. An EXE of a known version from 0.4.216 on is not too old, whatever its marker reads |
+
+The lines, message first:
+
+```
+INFO desktop companion is already this version by its own version resource; its version marker is written again, and nothing is replaced version="0.4.223" recorded="0.4.222"
+WARN could not write desktop version marker; the refresh goes by the companion EXE's own version until it can, and does not replace that EXE again error=Access is denied. (os error 5) marker=C:\Program Files\Roomler\roomler-desktop.exe.version version="0.4.223"
+INFO desktop version marker written again marker=C:\Program Files\Roomler\roomler-desktop.exe.version version="0.4.223"
+INFO desktop companion is stale/missing — refreshing own="0.4.223" recorded="0.4.222" installed="0.4.222" present=true
+```
+
+- A wizard-placed EXE with no marker that is already the daemon's version gets its marker without a
+  swap. Before, the first start downloaded the same release and restarted the tray.
+- From `agent-v0.4.223`, `roomler status` (`too_old_here`, §13.2) and the heartbeat's
+  `companion_version` (`installed_version`) read the tray's version by the same rule, through
+  `known_version` and the same read of the EXE (#3908, below). Before, both read the marker alone:
+  with a marker that cannot be written beside a current EXE, status called the tray too old to
+  connect, and the device list showed the version the marker names.
+- Tests, in `swap_tests` ([`companion.rs:5367`](../agents/roomlerd/src/companion.rs#L5367)):
+  `a_marker_that_cannot_be_written_is_no_reason_to_swap_again` (no second swap, one WARN, no fast
+  waits) and its control `the_version_check_swaps_what_it_always_did`; in `version_resource_tests`
+  ([`:6374`](../agents/roomlerd/src/companion.rs#L6374)) a good
+  resource, a truncated, garbage or lying one, and on Windows a real EXE's read, freed afterwards.
+
+#### Status and the heartbeat (#3908)
+
+`roomler status` answers on the LocalAPI, and the heartbeat goes out on a timer, so neither may wait
+on the EXE. Their read of it runs on a thread of its own, and its answer is kept for the process:
+
+```mermaid
+flowchart TD
+    A([roomler status, a heartbeat]) --> M{the marker names<br/>this daemon's version?}
+    M -->|yes| K[the marker's version:<br/>one small file read]
+    M -->|no| C{an answer read for the files there now?<br/>the marker's last write,<br/>the EXE's last write and size}
+    C -->|yes| V[the EXE's version,<br/>else the marker's words]
+    C -->|no| R[the marker's words for now,<br/>and the read starts on a thread of its own,<br/>one at a time, waited for by nobody]
+    R -.->|it lands, milliseconds later| C
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the readers | `too_old_beside`, [`:694`](../agents/roomlerd/src/companion.rs#L694); `installed_beside`, [`:1436`](../agents/roomlerd/src/companion.rs#L1436); both through `known_beside`, [`:866`](../agents/roomlerd/src/companion.rs#L866) | status's and the heartbeat's cores, over the folder beside the daemon: the marker, then `known_version` with the EXE's answer for the files there now. With no EXE there is no tray to refuse or report, and nothing is read |
+| the read and its answer | `ExeVersions`, [`:770`](../agents/roomlerd/src/companion.rs#L770), one for the process (`EXE_VERSIONS`, [`:761`](../agents/roomlerd/src/companion.rs#L761)); `Stamp`, [`:830`](../agents/roomlerd/src/companion.rs#L830) | `exe_version` on a thread of its own, through `OneInFlight::start_unless_running` ([`one_in_flight.rs:222`](../agents/roomlerd/src/one_in_flight.rs#L222)): one read at a time, so a read that a filter driver holds keeps one thread however often status is asked. Its answer stands while the marker's last write and the EXE's last write and size are what they were when it was read. The EXE's part covers a swap whose marker write failed, which changes the EXE and not the marker |
+| a cold read | `known_beside`; `BesideNow`, [`:854`](../agents/roomlerd/src/companion.rs#L854) | no answer yet for the files there now (a daemon that just started, or a swap since the last read): the marker's words, not settled, and the read starts. The next ask has the EXE's answer |
+| the heartbeat's cache | `kept_version`, [`:1385`](../agents/roomlerd/src/companion.rs#L1385) | `installed_version` keeps an answer for 10 minutes, and only a settled one: an answer from the marker while the read runs goes out once, and the next heartbeat, 30 s later, reads again. The first heartbeat after a connect starts the read, so a `roomler status` a minute after a start has the EXE's answer |
+
+- On a machine-wide install the worker answers status and sends the heartbeat, so the two share one
+  answer. The refresh runs in the service host and reads the EXE itself (`sibling_version`,
+  `look_beside`), uncached.
+- Tests, in `beside_version_tests` ([`companion.rs:6627`](../agents/roomlerd/src/companion.rs#L6627)),
+  each on a real EXE in a folder of its own (a copy of the test's own executable, given a version
+  resource with `UpdateResourceW`): the issue's case, a read-only old marker beside a current EXE,
+  read as the EXE (`a_read_only_old_marker_beside_a_current_exe_reads_as_the_exe`); a marker naming
+  the daemon's version, and no EXE, as before, the EXE not read; a malformed resource, by the marker
+  as before; a cold read that answers from the marker while the read is held, one read however
+  often asked; and an EXE swapped under a marker that cannot be written, read again. In
+  `version_tests`, `the_heartbeat_keeps_only_a_settled_answer`
+  ([`:1554`](../agents/roomlerd/src/companion.rs#L1554)).
+
+### 13.5 The tray starts again in each session it was stopped in (Windows, #3844)
+
+On a system install the swap stops every tray started from the installed EXE, in every session
+(`companion_procs::find`, each with its Terminal Services session). Until #3844 it then started one
+tray, in the active console session, for whoever was signed in there. On a host with Remote Desktop
+beside the console, fast user switching, or a server, a person whose tray ran in another session lost
+it, at most one of several came back, and with nobody at the console none did.
+
+From `agent-v0.4.223`:
+
+```mermaid
+flowchart TD
+    S([the swap stopped trays]) --> P[the sessions they ran in,<br/>each once, in order]
+    P --> T{that session's person<br/>still signed in?}
+    T -->|yes| C[a start with that session's<br/>own token, 10 s at most]
+    T -->|no token, or<br/>the session is gone| O[none started:<br/>the line says so, nothing lost]
+    C -->|it started| B[respawned, in the line]
+    C -->|it failed, or<br/>gave no answer| L[lost in that session:<br/>tried again there, §13.3]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the plan | `restart_plan`, [`companion.rs:4684`](../agents/roomlerd/src/companion.rs#L4684), over `swap`'s stopped trays, [`:4596`](../agents/roomlerd/src/companion.rs#L4596) | for the service, once in each session a stopped tray ran in, in order, and nowhere else. A tray whose session could not be read starts where the start has always gone, the console session's person. A per-user install's daemon starts one, in its own session, as before. None stopped, none started |
+| the start | `start_desktop_in_session`, [`:5198`](../agents/roomlerd/src/companion.rs#L5198); `query_session_user_token`, [`win_service/supervisor.rs:218`](../agents/roomlerd/src/win_service/supervisor.rs#L218) | that session's own person's token (`WTSQueryUserToken`), its environment, and `CreateProcessAsUserW` on `winsta0\default`, as the console start does. No token (`ERROR_NO_TOKEN`), or no such session any more (`ERROR_CTX_WINSTATION_NOT_FOUND`), is a person who signed out: nothing is created. A disconnected Remote Desktop session still has its person, so the tray starts there and waits for them |
+| the bound | `start_again`, [`:5253`](../agents/roomlerd/src/companion.rs#L5253); `start_within`, [`:5273`](../agents/roomlerd/src/companion.rs#L5273); `RESPAWN_WAIT`, [`:5241`](../agents/roomlerd/src/companion.rs#L5241) | each start runs on the thread of the one start in flight for its session (`RESPAWNS`, threads named `tray-respawn`, `one_in_flight`'s rules), and the refresh waits 10 s at most for it. A start that hangs fails in time, saying so, holds that session alone, and the next session's start goes ahead. Never on the async worker: the swap and the lost-tray retry run on the blocking pool |
+| the line | `refresh_line`, [`:4832`](../agents/roomlerd/src/companion.rs#L4832); `TrayRestart`, [`:4506`](../agents/roomlerd/src/companion.rs#L4506) | one part per session, `; ` between them: `respawned (pid …, session …)`, `session 3: nobody is signed in to that session any more, so none was started`, or `session 3: ` and why the start failed. INFO when every session got its tray back or has nobody to get one; WARN `…could not be started again` when a start failed |
+| a tray lost | `TrayLost`, [`:4753`](../agents/roomlerd/src/companion.rs#L4753); `start_lost_tray`, [`:5295`](../agents/roomlerd/src/companion.rs#L5295) | per session: §13.3's retry goes to the session the tray was lost in, while its person is signed in there, never to the console, whose person may be someone else. A session signed out of since is forgotten, with an INFO line |
+| unchanged | `start_desktop`, [`:5154`](../agents/roomlerd/src/companion.rs#L5154) | the console start of the consent prompt (§10.4) when no tray runs, and a per-user daemon's start in its own session |
+
+The lines, message first:
+
+```
+INFO desktop companion refreshed version="0.4.223" stopped=[4120, 6044] tray=respawned (pid 5236, session 1); respawned (pid 7310, session 3)
+INFO desktop companion refreshed version="0.4.223" stopped=[4120, 6044] tray=respawned (pid 5236, session 1); session 3: nobody is signed in to that session any more, so none was started
+WARN desktop companion refreshed, but the tray could not be started again version="0.4.223" stopped=[4120, 6044] error=respawned (pid 5236, session 1); session 3: CreateProcessAsUserW(…\roomler-desktop.exe) failed (err 5)
+INFO desktop companion is not started again after a refresh stopped it: nobody is signed in to that session any more, and the sign-in start owns their next tray session=3
+```
+
+- Tests, in `swap_tests`: `trays_stopped_in_two_sessions_start_again_in_those_two`,
+  `a_session_signed_out_of_since_gets_no_start_and_the_line_says_so`,
+  `where_no_session_is_known_the_start_goes_where_it_always_went` and
+  `a_lost_tray_is_tried_again_in_the_session_it_was_lost_in`; in `start_within_tests`
+  ([`:6999`](../agents/roomlerd/src/companion.rs#L6999))
+  `a_start_that_hangs_holds_its_session_alone`. They run in the Windows agent unit lane
+  (`windows-agent-sessions`, step "Agent unit tests on Windows (the whole --lib suite)") and in the
+  Linux lanes that run the agent's whole `--lib` suite.
 
 ## 14. Opening links: View screen and Open Roomler (#2713)
 
@@ -966,7 +2458,7 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not: FR-27's consent launch, FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
-first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:724`). For a
+first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:3685`). For a
 root daemon that is a transient **system** unit, which inherits nothing of the desktop; its
 environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`,
 `WAYLAND_DISPLAY`) and nothing else.
@@ -974,8 +2466,8 @@ environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DI
 Since #2713 a root daemon reads the session user's systemd manager environment, the store the
 desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
 privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
-`companion.rs:804`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:752`;
-parsing in `session_env_pairs`, `companion.rs:778`):
+`companion.rs:3765`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:3713`;
+parsing in `session_env_pairs`, `companion.rs:3739`):
 
 - ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
   runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
@@ -1068,7 +2560,7 @@ kills everything left in its cgroup. Quitting the companion, a crash, and FR-117
 crashed with them (the field check below).
 
 Since #2729 the daemon starts the companion with `--property=KillMode=process`
-(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:889`), in a root daemon's system
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:3850`), in a root daemon's system
 unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
 Its own helpers end with it regardless, since WebKit's web and network processes exit when their
 UI process's connection closes.

@@ -28,6 +28,13 @@
 # caller) instead of being copied, so VideoToolbox can take the surface as a
 # `CVPixelBuffer` with no copy into memory.
 #
+# #3671 binds `xcb_connection_has_error` on the X11 `Server` (`has_error`) and
+# exposes it as the X11 `Capturer::connection_lost()`. Upstream's `frame` hands
+# back whatever its shared memory last held once the server has gone, for ever,
+# so a capture of an X server that exited read as a screen that stopped
+# changing: a frozen picture at full rate. The capture worker asks after each
+# grab and stops there.
+#
 # The build script declares `rerun-if-changed=build.rs` (FR-6 wave 29). With
 # no `rerun-if` line at all, cargo fingerprints a path crate's build script by
 # the crate's NEWEST file mtime. A fresh checkout therefore re-ran it and
