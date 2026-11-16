@@ -129,7 +129,7 @@
     WireGuard rekey timeouts and the failed make-before-break probe beside it belong to the
     overlay. The pump sees the overlay only through the carrier this recheck asks for.
   - 🔑 **On this cell the encoder never picks an IDR by itself, so each of the three was
-    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2392`).
+    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2399`).
     NVENC opens with a 64,800-frame GOP (`:51`, set at `:1905`), over half an hour at this
     session's 31 fps, and with `rc-lookahead=0` and `bf=0` (`:366`–`:367`). Its scene-cut
     I-frames need the lookahead, so they are off. A key frame therefore comes from a force
@@ -177,7 +177,7 @@
   - **Bytes per frame ran at p50 0.063, max 0.491, of the cap.** An idle desktop, no overshoot.
   - 🔑 **The encoder's maxrate is not always the rung.** It held the 3,677,739 it opened with:
     `set_bitrate` compares the two values' rungs and returns when they match
-    (`encode/ffmpeg/encoder.rs:3018`), so the opening value stands until the first rung crossing.
+    (`encode/ffmpeg/encoder.rs:3025`), so the opening value stands until the first rung crossing.
     The read's denominator follows it.
   - **Not run:** the positive controls and the motion. A scripted timeline (one keyframe request,
     one resize and back, a window drag, dial moves) was refused by the automation's permission
@@ -191,7 +191,7 @@
     `InPlaceVbr` for every `*_nvenc` whatever `encoder_inplace_rate` says, and
     `NVENC_RECONFIG_FORCES_IDR` (`:893`) has been `false` since patch 0001 shipped
     (0.4.51). On NVENC the flag only sizes the VBV window that a move writes
-    (`inplace_rate_bufsize`, `encode/mod.rs:363`). So a constrained NVENC session needs
+    (`inplace_rate_bufsize`, `encode/mod.rs:365`). So a constrained NVENC session needs
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
@@ -226,7 +226,7 @@
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
     - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
       it opened with until the first rung crossing, then at that target's nearest rung
-      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3017`).
+      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3024`).
       So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
@@ -373,7 +373,7 @@ the only route by which `global_quality` stops being inert.
 
 ## Goal
 
-A remote-desktop encoder follows the rate controller's target **without an IDR and without a rebuild**. Today `FfmpegEncoder::set_bitrate` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3006–3136`) costs an IDR on every move: NVENC through FFmpeg's `reconfig_encoder` (n8.1.2 sets `resetEncoder=1; forceIDR=1` on a bitrate-only change), QSV/AMF/VideoToolbox through a full encoder rebuild under a comment that predates FFmpeg 6.0's runtime `update_bitrate()`. Nine of the 34 rate/quality heuristics in `encode/` exist only to ration that cost (coarsen ladder, deferred applies, 15-s thrift, background swap, settle-KF thrift, refine-vs-cap fight, opener grace, FlipTracker and kf_gate cooldowns); on LAN pairs the AIMD crosses a rung nearly every window — 44 swap IDRs in one day on one host (2026-09-02).
+A remote-desktop encoder follows the rate controller's target **without an IDR and without a rebuild**. Today `FfmpegEncoder::set_bitrate` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3013–3143`) costs an IDR on every move: NVENC through FFmpeg's `reconfig_encoder` (n8.1.2 sets `resetEncoder=1; forceIDR=1` on a bitrate-only change), QSV/AMF/VideoToolbox through a full encoder rebuild under a comment that predates FFmpeg 6.0's runtime `update_bitrate()`. Nine of the 34 rate/quality heuristics in `encode/` exist only to ration that cost (coarsen ladder, deferred applies, 15-s thrift, background swap, settle-KF thrift, refine-vs-cap fight, opener grace, FlipTracker and kf_gate cooldowns); on LAN pairs the AIMD crosses a rung nearly every window — 44 swap IDRs in one day on one host (2026-09-02).
 
 Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`select_rc_mode` tests `rc_max_rate == bit_rate` first and we set both to the cap), which is why every 0.4.49 frame on CORPLAP-1 was exactly `target ÷ fps ÷ 8` bytes; and the existing NVENC in-place write sizes `rc_buffer_size = target` while the open used `maxrate × hrd_pct` — every move silently resizes the HRD window.
 

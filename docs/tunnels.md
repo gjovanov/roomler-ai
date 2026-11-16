@@ -444,8 +444,10 @@ tests do not give it.
 ### ⚠️ A send cut short leaves its stream whole (#3755)
 
 Fixed in the vendored `webrtc-sctp`
-([#3755](https://github.com/gjovanov/roomler-ai/issues/3755)). It was found by reading the
-code and has not been seen in the field; the tests below are its reproduction.
+([#3755](https://github.com/gjovanov/roomler-ai/issues/3755)), in agent 0.4.222. It was found
+by reading the code. A lab guest then showed it on 0.4.221 and not on 0.4.222
+([what the lab showed](#what-the-lab-showed-3755)). The tests below are its reproduction in
+the crate.
 
 Every data-channel send ends in `Stream::write_sctp`
 (`crates/vendored/webrtc-sctp/src/stream/mod.rs:291`), which can wait twice before its
@@ -484,7 +486,7 @@ sequenceDiagram
 ```
 
 The agent drops send futures on purpose. On the control channel, `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6225`) bounds each attempt with a timeout and retries, and the
+(`agents/roomlerd/src/peer.rs:6251`) bounds each attempt with a timeout and retries, and the
 idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
 (`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
 session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
@@ -553,7 +555,7 @@ crate's in-memory bridge, with a queue of a few KiB, and close the pair at the e
 | `test_pending_queue_pops_during_a_drop_pay_its_debt_first` (`:750`) | a stand-in for the write loop on another thread pops 0 to 3 whole chunks at each step of a begun message's drop, every one after the debt was recorded: those pops pay the debt before they give room, so none of their room is left free while anything is owed, the accounting holds, and the rest goes out whole, in order | uses the fix's accessors |
 | `test_pending_queue_a_pop_split_around_a_drop_frees_at_most_its_chunk` (`:820`) | the race that is left: a `pop` on another thread, held between what it pays and the room it gives back while a drop records its debt and reads the room, leaves at most its own chunk free while the rest is owed; a large message that begins on it and is cut adds one rest, within (1 + races) times the largest message; every later `pop` pays first; the queue drains whole, in order, to rest | uses the fix's accessors |
 
-**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:2981`), which is not
+**CI** runs these in the `vendored-sctp` job (`.github/workflows/ci.yml:3111`), which is not
 yet one of the checks the `rust` aggregator needs. The fork is not a workspace member, so no
 other `cargo test` builds it. The job seeds the fork's standalone build with the workspace's
 `Cargo.lock`, so the tests run against the tokio the agent ships, and skips the two
@@ -568,6 +570,46 @@ rm crates/vendored/webrtc-sctp/Cargo.lock   # before a revendor --regen or --che
 
 The fork's deltas, #3755's among them, are listed in its `Cargo.toml` header, and
 `crates/vendored/webrtc-sctp.patch` is the ledger `scripts/revendor-webrtc-sctp.sh` checks.
+
+#### What the lab showed (#3755)
+
+A Linux lab guest (GNOME on Wayland, the agent as a root service) and a browser viewer on a
+second machine: direct path, VP9 4:4:4 over the data channel. A step script on the guest
+dropped every DTLS record of the session in both directions for a few seconds, twice a run,
+and locked the session 2.3 s into each cut, while a window of changing content kept the video
+writer busy. The rule was written before the counted runs, and it and every run are on
+[the issue](https://github.com/gjovanov/roomler-ai/issues/3755).
+
+| Agent | Cut | DTLS dropped, outgoing | "Host locked" on the stream that was live at the lock | Then |
+|---|---|---|---|---|
+| 0.4.221, one run | 6.4 s | 325,401 B | never | "video stalled", then a new connection 15.5 s after the lock |
+| 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
+
+**What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10829`) was lost, and nothing the agent
+sent on the control channel after it was read. On this guest a locked session sends no video.
+The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
+(`ui/src/composables/useRemoteControl.ts:5819`), and no such word could arrive. So it asked
+for a keyframe 6 s after the last picture and built a new connection at 10 s (`:320-322`,
+`:681-683`): 15.5 s after the lock. The new connection showed "Host locked".
+
+**The defect needs three things at once**, which is why it was rare, and why a one-way test
+never shows it:
+
+| Condition | Why | Anchor |
+|---|---|---|
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4328`, `:5273`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2353` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11458`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1510`, `:6251`, `agents/roomlerd/src/lock_state.rs:333` |
+
+A real path failure cuts both directions. The second row is read from the source: two runs on
+0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every
+notice, and the runs do not show the send turn directly. For the third row, one two-way run
+on 0.4.221 with a 5.4 s cut delivered its notice, so the counted runs used 6.4 s.
+
+**Not covered:** the unlock direction (a locked session sends no video on this guest, so
+nothing fills the queue), a relayed path, a Windows or macOS host. The change is in the SCTP
+layer all of them share.
 
 ### ⚠️ Every client path that ends a session must tell the exit agent (#1754)
 
@@ -861,7 +903,7 @@ so tests drive it directly:
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
 | `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `signaling.rs:4380`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:4612`, `quic_setup.rs:258` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:5726`, `quic_setup.rs:258` |
 | the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `signaling.rs:3194` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
@@ -1285,7 +1327,7 @@ to a running `roomlerd` without any token:
 | `Ping {target, timeout_ms, prefer_v6}` | Overlay reachability probe |
 | `CreateForward` · `CreateSocks5` · `KillFlow` | Imperative flow control |
 | `RouteList` · `RouteAdd` · `RouteUpdate` · `RouteRemove` · `RouteSetEnabled` | Declared-route management (`RouteDescriptor` is one type for wire + disk). `RouteUpdate` replaces a route in one save; an invalid replacement leaves the old route running. A row's `state` is the port's truth (#1685): `active` = the local listener is bound; a flow whose tunnel session is retrying reads `backoff` **with** `flow_id`, `attempts` and `last_error` (additive fields — the tag set is unchanged so an older reader still parses it), `pending` with `flow_id` while its first attempt is in flight |
-| `ConsentPending` · `ConsentDecide` | Remote-desktop consent prompts (how the tray approves sessions under a SYSTEM service) |
+| `ConsentPending` · `ConsentDecide` | Remote-desktop consent prompts (how the tray approves sessions under a SYSTEM service). An answer, like the banner's `RcDisconnect`, is taken only from the person at the screen the daemon shows, SYSTEM or an elevated administrator ([desktop-companion.md](desktop-companion.md) §12.4) |
 | `SetDeviceName` | Rename the node |
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |

@@ -71,7 +71,7 @@ them:
 | the per-user half as the console user | `scripts/install.sh:202-222` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
 | the macOS second enrollment | `scripts/install.sh:606-636` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
 | the FR-96 update helper | `scripts/install.sh:360-378` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
-| the desktop companion | `scripts/install.sh:891`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
+| the desktop companion | `scripts/install.sh:893`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
 | digest verification | `scripts/install.sh:232-241` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
 
 ## The mechanism, in the code (master `b4e72ff0d`)
@@ -325,7 +325,7 @@ flowchart TB
 
 1. **The seam is decided by a spike (B0), then recorded here before B1.** The candidates:
    - **(i)** Run the whole script elevated. This breaks the per-user Linux path, which runs
-     `systemctl --user` as the invoking user (`install.sh:772`); under `pkexec` that is root's
+     `systemctl --user` as the invoking user (`install.sh:773`); under `pkexec` that is root's
      user manager.
    - **(ii)** Give `install.sh` a privileged-steps entry point and a user-steps entry point.
      The terminal path calls both in order and does not change; the wizard elevates only the
@@ -933,7 +933,7 @@ sequenceDiagram
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
   per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:159`), and `spawn_elevated`
-  refuses anything else (`agents/roomlerd/src/updater.rs:2722`).
+  refuses anything else (`agents/roomlerd/src/updater.rs:2727`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated

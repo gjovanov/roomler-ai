@@ -106,6 +106,16 @@ pub fn register(session: ObjectId, control_dc: ControlDc) -> Registration {
     Registration(id)
 }
 
+/// #3671 — every live session and its control channel, as registered now.
+pub fn sessions() -> Vec<(ObjectId, ControlDc)> {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .cloned()
+        .collect()
+}
+
 /// How many sessions would be told right now.
 pub fn live() -> usize {
     registry().lock().unwrap_or_else(|p| p.into_inner()).len()

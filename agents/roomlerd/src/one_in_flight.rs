@@ -139,7 +139,7 @@ impl<T: Clone> Flight<T> {
     }
 
     /// [`Self::ended_by`] on a blocking thread.
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
     fn ended_by_blocking(&self, deadline: Instant) -> Option<Result<T, String>> {
         let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
@@ -211,8 +211,14 @@ impl<T: Clone + Send + 'static> OneInFlight<T> {
     /// #3830 — `lookup`, started unless a lookup is running, and waited for
     /// by nobody: a refresh for the callers that may not wait at all
     /// ([`Remembered::now`]). Whoever asks meanwhile takes its answer by this
-    /// module's rules.
-    #[cfg(any(all(target_os = "linux", feature = "recording"), test))]
+    /// module's rules. #3908: on Windows, the read of the companion EXE's
+    /// version for `roomler status` and the heartbeat
+    /// (`companion::ExeVersions`).
+    #[cfg(any(
+        all(target_os = "linux", feature = "recording"),
+        target_os = "windows",
+        test
+    ))]
     pub(crate) fn start_unless_running<F>(&self, lookup: F)
     where
         F: FnOnce() -> T + Send + 'static,
@@ -394,9 +400,10 @@ impl<T: Clone + Send + 'static> Remembered<T> {
 /// [`Self::ask_blocking`]: an ask from a blocking thread and one from a task
 /// share the account's lookup.
 ///
-/// Unix only: Windows has no account lookup of this kind (the module compiles
-/// there for the tray's start, #3858).
-#[cfg(any(unix, test))]
+/// Windows has no account lookup of this kind. There it holds the tray's
+/// start again in each session a refresh stopped one in (#3844), one start
+/// in flight per session.
+#[cfg(any(unix, target_os = "windows", test))]
 pub(crate) struct OneInFlightPerKey<K, T> {
     /// What each lookup's thread is called.
     thread_name: &'static str,
@@ -404,7 +411,7 @@ pub(crate) struct OneInFlightPerKey<K, T> {
     running: Mutex<std::collections::BTreeMap<K, Arc<Flight<T>>>>,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, target_os = "windows", test))]
 impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerKey<K, T> {
     pub(crate) const fn new(thread_name: &'static str) -> Self {
         Self {
@@ -414,7 +421,9 @@ impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerK
     }
 
     /// The answer of a lookup for `key` that began at or after this call,
-    /// within `wait`: [`OneInFlight::ask`]'s rules, for `key` alone.
+    /// within `wait`: [`OneInFlight::ask`]'s rules, for `key` alone. Not on
+    /// Windows, which asks from a blocking thread alone.
+    #[cfg(any(unix, test))]
     pub(crate) async fn ask<F>(&'static self, key: K, wait: Duration, lookup: F) -> Asked<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -437,8 +446,9 @@ impl<K: Ord + Clone + Send + 'static, T: Clone + Send + 'static> OneInFlightPerK
 
     /// #3855 — [`Self::ask`] from a blocking thread, by the same rules and
     /// through the same lookups: an ask for `key` from a blocking thread and
-    /// one from a task share its lookup.
-    #[cfg(any(target_os = "linux", test))]
+    /// one from a task share its lookup. #3844: on Windows, the tray's start
+    /// again in a session, from the refresh's blocking thread.
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
     pub(crate) fn ask_blocking<F>(&'static self, key: K, wait: Duration, lookup: F) -> Asked<T>
     where
         F: FnOnce() -> T + Send + 'static,

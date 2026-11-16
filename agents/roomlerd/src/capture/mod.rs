@@ -648,6 +648,26 @@ impl CaptureArm {
     pub fn attended(self) -> bool {
         matches!(self, Self::Portal)
     }
+
+    /// #3918 — the arm a wire spelling names: [`Self::wire`] read back, in
+    /// this one place. `None` for a spelling this build does not know, which
+    /// every reader takes as an arm it knows nothing of.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        [Self::Drm, Self::Mutter, Self::Portal, Self::X11]
+            .into_iter()
+            .find(|arm| arm.wire() == s)
+    }
+
+    /// #3918 — whether this arm's capture is a client of an X server, which
+    /// on a device with the virtual desktop is the desktop's, and dies with it
+    /// (`media_share::try_join`). No wildcard: a new arm does not compile
+    /// until someone decides it here.
+    pub fn reads_an_x_server(self) -> bool {
+        match self {
+            Self::X11 => true,
+            Self::Drm | Self::Mutter | Self::Portal => false,
+        }
+    }
 }
 
 /// P8a — re-project tracked damage through a downscale. Per-EDGE
@@ -1483,6 +1503,42 @@ pub(crate) fn planned_input_route(f: &ArmFacts) -> Option<crate::input::reach::R
         CaptureArm::Portal => f.portal_input.then_some(RouteKind::Portal),
         CaptureArm::Drm | CaptureArm::X11 => None,
     }
+}
+
+/// #3671 — the facts say a session on this device captures its virtual
+/// desktop: the arm [`planned_arm`] gives with the desktop counted as up is
+/// X11. It is asked as the desktop goes down, when [`arm_facts`] counts it as
+/// gone. One decision for the device, which misses one session: one whose
+/// explicit `drm_capture` or `portal_capture` arm failed at its open and fell
+/// through to the desktop's X11. That session is not told; it shows its last
+/// picture until the person reconnects (`docs/linux-capture.md` §2.2), and
+/// its shared pipeline is not retired. The supervisor marks it all the same,
+/// as every session open at the exit (#3918): it has no input of the new
+/// desktop, and its pipeline takes no joiner (`media_share::try_join`), so a
+/// later viewer of its profile runs a capture of its own, where the marks are
+/// kept and read (`input::has_no_picture`). The exact per-session rule is
+/// FR-135's pipeline record to carry (#3293).
+#[cfg(target_os = "linux")]
+pub(crate) fn plans_the_virtual_desktop(facts: ArmFacts) -> bool {
+    planned_arm(&ArmFacts {
+        virtual_desktop: true,
+        ..facts
+    }) == Some(CaptureArm::X11)
+}
+
+/// #3671 — a session open on this device now captures the daemon's virtual
+/// desktop ([`plans_the_virtual_desktop`] on this device's facts). Read by
+/// the desktop's supervisor, on its own thread, when the desktop goes down
+/// and once it is back: with the desktop requested, both automatic plans
+/// answer at once (`wayland_plan`, `system_plan`), so this asks no bus.
+#[cfg(target_os = "linux")]
+pub(crate) fn sessions_capture_the_virtual_desktop() -> bool {
+    if !crate::virtual_desktop::requested() {
+        return false;
+    }
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    plans_the_virtual_desktop(arm_facts(None, uid == 0, uid, false))
 }
 
 /// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`
@@ -2519,6 +2575,12 @@ pub struct CaptureUnavailable {
     pub code: CaptureUnavailableCode,
     /// The backend's own words, capped. A quote, never a paraphrase.
     pub detail: String,
+    /// #3918 — the reason is this daemon's own virtual desktop: it is down,
+    /// or its X server is gone. A fact for the daemon, never on the wire: the
+    /// notice's payload carries the code, the detail and the hint only. A
+    /// session told this is marked: no input of the desktop while its input
+    /// would reach the desktop's X server (`input::told_no_picture`).
+    virtual_desktop_down: bool,
 }
 
 impl CaptureUnavailable {
@@ -2533,7 +2595,29 @@ impl CaptureUnavailable {
         } else {
             detail
         };
-        Self { code, detail }
+        Self {
+            code,
+            detail,
+            virtual_desktop_down: false,
+        }
+    }
+
+    /// #3643, #3918 — the reason a session has no picture of this daemon's
+    /// own virtual desktop while it is down, or after its X server went:
+    /// `backend_error` with `detail` (the down sentence). Made where the
+    /// sessions are told: the supervisor's tell, and a session's open refused
+    /// while the desktop is down.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn virtual_desktop_down(detail: impl Into<String>) -> Self {
+        Self {
+            virtual_desktop_down: true,
+            ..Self::new(CaptureUnavailableCode::BackendError, detail)
+        }
+    }
+
+    /// #3918 — whether this is [`Self::virtual_desktop_down`]'s reason.
+    pub(crate) fn is_the_virtual_desktop_down(&self) -> bool {
+        self.virtual_desktop_down
     }
 }
 
@@ -3418,7 +3502,7 @@ fn open_with(
     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
     if let Some(detail) = crate::virtual_desktop::down_detail() {
         tracing::warn!(%detail, "capture: the virtual desktop is down — nothing to capture until it is back");
-        let reason = CaptureUnavailable::new(CaptureUnavailableCode::BackendError, detail);
+        let reason = CaptureUnavailable::virtual_desktop_down(detail);
         return Box::new(NoopCapture::unavailable(reason));
     }
 

@@ -429,19 +429,26 @@ enum Command {
     /// parser runs: see `daemon_main`.
     #[command(hide = true, name = "update-helper")]
     UpdateHelper,
-    /// Smoke-test the encoder cascade: open the preferred encoder at
-    /// a small resolution, feed 10 synthetic frames, assert at least
-    /// one IDR output. Exits non-zero if no encoder could be opened or
-    /// no keyframe was produced. Used in the release CI smoke check
-    /// to catch regressions in the MF init path before shipping.
+    /// Smoke-test one encoder cell: open it as a session would, encode 10
+    /// synthetic frames, and pass only if what opened is what was asked for.
+    ///
+    /// Judged by the FR-16 L1 bench's verdict (#3652): it exits non-zero
+    /// when hardware was asked for and software answered, when another codec
+    /// answered, when nothing opened, or when no keyframe came out, and then
+    /// says what it tried on this OS and build. The release lane's Windows
+    /// smoke runs it as `--name h264_mf`.
     EncoderSmoke {
-        /// Encoder preference for the test. Defaults to `hardware` so
-        /// the CI exercise actually verifies the MF path.
+        /// Encoder preference: `hardware` (the default), `auto` or
+        /// `software`. `hardware` passes only on a hardware encoder, so on a
+        /// host with none the software smoke is `--encoder software`.
         #[arg(long, default_value = "hardware")]
         encoder: String,
-        /// Codec to smoke-test. `h264` (default) or `h265` — HEVC
-        /// goes through `open_for_codec` and the MF HEVC cascade.
-        /// Accepts `hevc` as an alias.
+        /// Codec to smoke-test: `h264` (default), `h265` (alias `hevc`) or
+        /// `av1`, through the RTP track's opener (`open_for_codec`: FFmpeg's
+        /// HEVC cascade, then Media Foundation's). `--encoder hardware` on a
+        /// build without the track's Media Foundation opens the DataChannel's
+        /// FFmpeg cascade instead. Anything else is refused: VP9 is the
+        /// DataChannel's (`--bench --bench-cells dc:vp9:444`).
         #[arg(long, default_value = "h264")]
         codec: String,
         /// FR-62 A0 — instead of the 10-frame smoke, open once and sweep the
@@ -450,13 +457,16 @@ enum Command {
         /// and how closely the encoder tracked the target. Measures, on real
         /// silicon, the cost the whole rate-control patch-work exists to
         /// ration. Best with `--codec hevc`/`av1` and `--encoder hardware`.
+        /// It measures only a cell the plain smoke would pass.
         #[arg(long)]
         reconfigure_sweep: bool,
         /// FR-78 P2 — open exactly this FFmpeg encoder name (`hevc_d3d12va`,
         /// `av1_vulkan`, `h264_vaapi`, …) instead of the cascade, so a
         /// backend the vendor SDK outranks on this host can be driven with
-        /// real bytes (and swept, with `--reconfigure-sweep`). `--encoder`
-        /// and `--codec` are ignored when set.
+        /// real bytes (and swept, with `--reconfigure-sweep`). A Media
+        /// Foundation cell's name (`h264_mf`, `hevc_mf`, `av1_mf`) opens that
+        /// MF cascade alone, on either MFT. `--encoder` and `--codec` are
+        /// ignored when set.
         #[arg(long)]
         name: Option<String>,
         /// FR-78 P3 — write every packet's bytes, back to back, to this file:
@@ -1309,7 +1319,7 @@ pub fn main() -> Result<()> {
             shut_down_runtime(rt);
             purge_after_daemon();
             if let Err(e) = res {
-                tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
+                roomlerd::daemon_error::say(&e);
                 std::process::exit(1);
             }
             // FR-84 D3 — a requested restart leaves with its own code (launchd
@@ -1362,6 +1372,14 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    // #3665 — the virtual desktop's keeper is this binary, re-run by the
+    // daemon with one hidden argument. It must not become a second daemon.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(code) = roomlerd::virtual_desktop::answer_keeper() {
+            std::process::exit(code);
+        }
+    }
     // #3702 — on the service account, the process's folder variables are the
     // machine's and the service account's own, before this process has a
     // second thread: the runtime below starts its workers.
@@ -3951,8 +3969,8 @@ async fn run_cmd(
     if unenrolled && !config_path.exists() {
         let name = roomlerd::machine::hostname().unwrap_or_default();
         let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
-        // #3802 — the reason names the folder and who owns it. On the macOS release build
-        // the AppKit `main` logs it through tracing and exits 1: nothing reaches stderr.
+        // #3802 — the reason names the folder and who owns it. The macOS release build's
+        // AppKit `main` writes it on stderr as std would (`daemon_error::say`), then exits 1.
         config::save(config_path, &blank).with_context(|| {
             format!(
                 "writing the person's config {}{}",
@@ -4727,26 +4745,26 @@ async fn run_cmd(
     // signaling loop prompts on; its live `pending` set gates LocalAPI consent
     // decisions (a decision is honoured only for an actively-prompting session).
     let consent_mode = roomlerd::consent::Mode::from_config(cfg.auto_grant_session);
-    let consent_dir =
-        roomlerd::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
-            std::env::temp_dir().join("roomlerd-consent")
-        });
-    let consent_broker = roomlerd::consent::ConsentBroker::new(consent_mode, consent_dir)
-        .unwrap_or_else(|e| {
-            // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
-            // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
-            // dir doesn't match the tray's simply times out → deny (safe), instead
-            // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
-            tracing::error!(error = %e, ?consent_mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
-            roomlerd::consent::ConsentBroker::new(consent_mode, std::env::temp_dir())
-                .expect("consent broker init cannot fail with temp_dir")
-        });
-    tracing::info!(
-        mode = ?consent_broker.mode(),
-        sentinel_dir = %consent_broker.sentinel_dir().display(),
-        "operator-consent broker ready"
-    );
+    // #3939 — the broker's folder, where an answer can also be a file
+    // (`<session>.approve` or `.deny`: the file channel), is the daemon's own:
+    // `default_sentinel_dir`, in this account's data folder, made as before.
+    // When it cannot be resolved or set up, no other folder stands in for it,
+    // neither one under the temporary folder nor that folder itself, and the
+    // file channel is off. The broker then keeps each question's `.pending`
+    // marker and each answer in memory, under the lock of its books: the
+    // tray, `roomlerd consent` and a native panel answer as before, and a
+    // question nobody answers times out as before. On Unix a folder that
+    // another account owns is not its own either.
+    //
+    // It keeps the CONFIGURED mode whatever its folder: prompt mode fails
+    // closed, never downgraded to AutoGrant (the pre-P2b fail-OPEN granted
+    // every session on a glitch). `for_daemon` says once that the file channel
+    // is off, and why; its `operator-consent broker ready` line names the
+    // folder or says that the file channel is off. A console-run agent and a
+    // `roomlerd consent` that cannot reach the device service still meet in
+    // that folder, in the profile both run in (`consent_cmd`). Pinned by the
+    // tests in `consent::tests::own_folder` and `localapi_state::tests`.
+    let consent_broker = roomlerd::consent::ConsentBroker::for_daemon(consent_mode);
     let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (overlay_view_tx, overlay_view_rx) =
         tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -6478,18 +6496,18 @@ async fn restart_daemon_beside_self_update(exe: Option<&std::path::Path>, latest
     }
 }
 
-/// Open the preferred encoder, feed it 10 synthetic BGRA frames, and
-/// assert at least one keyframe comes out. Used in CI to catch MF init
-/// regressions before shipping an MSI. Exits with a non-zero code on
-/// any failure so a failed smoke check fails the release build.
+/// Open the cell the flags ask for, feed it 10 synthetic BGRA frames, and
+/// pass only when what opened is what was asked for and a keyframe came out
+/// (`encode::smoke`). Any failure is an `Err`, so the process exits non-zero
+/// and a failed smoke check fails the release build.
 async fn encoder_smoke_cmd(
     pref_raw: &str,
     codec_raw: &str,
     name: Option<&str>,
     dump: Option<&str>,
 ) -> Result<()> {
-    use roomlerd::encode::{open_default, open_for_codec};
-    use std::io::Write as _;
+    use roomlerd::encode::bench::{BuildCaps, SessionOpener};
+    use roomlerd::encode::smoke;
 
     // FR-78 P3 — the raw bitstream, for an offline decode (see the flag's doc).
     let mut dump_file = match dump {
@@ -6521,100 +6539,22 @@ async fn encoder_smoke_cmd(
 
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
-    let w = 640u32;
-    let h = 480u32;
-    let codec = codec_raw.to_ascii_lowercase();
-    tracing::info!(width = w, height = h, ?pref, codec = %codec, "encoder smoke: opening encoder");
-
-    // For H.264 keep the historical `open_default` path (preserves
-    // logging + behaviour that CI smoke output is pinned to). For any
-    // other codec, go through `open_for_codec` which runs the codec-
-    // specific cascade and reports whether a demotion happened.
-    let (mut enc, actual_codec) = if let Some(name) = name {
-        // FR-78 P2 — a named backend, past every cascade: the same open the
-        // capability probe runs, so what the probe advertised opens here.
-        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-            )
-        })?;
-        (e, actual.to_string())
-    } else if codec == "h264" {
-        (open_default(w, h, pref), "h264".to_string())
-    } else {
-        let (e, actual) = open_for_codec(&codec, w, h, pref);
-        (e, actual.to_string())
+    // #3652 — the cell the request asks for, opened the way a session opens
+    // it (the FR-16 L1 bench's opener), and judged in `encode::smoke`.
+    let req = smoke::Request {
+        pref,
+        codec: codec_raw,
+        name,
     };
-    let backend = enc.name();
-    tracing::info!(backend, actual_codec = %actual_codec, "encoder smoke: backend selected");
-    if codec != "h264" && actual_codec != codec {
-        tracing::warn!(
-            requested = %codec,
-            actual = %actual_codec,
-            "encoder smoke: demoted from requested codec"
-        );
-    }
-
-    let mut keyframes = 0usize;
-    let mut total_bytes = 0usize;
-    for i in 0..10 {
-        let mut data = vec![0u8; (w * h * 4) as usize];
-        // Alternate solid colours so the encoder has content to encode.
-        let (b, g, r) = match i % 3 {
-            0 => (255, 0, 0),
-            1 => (0, 255, 0),
-            _ => (0, 0, 255),
-        };
-        for px in data.chunks_exact_mut(4) {
-            px[0] = b;
-            px[1] = g;
-            px[2] = r;
-            px[3] = 255;
-        }
-        let frame = std::sync::Arc::new(roomlerd::capture::Frame {
-            width: w,
-            height: h,
-            stride: w * 4,
-            pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data: data.into(),
-            monotonic_us: (i as u64) * 33_333,
-            monitor: 0,
-            damage: roomlerd::capture::Damage::Unknown,
-            source: None,
-        });
-        if i == 5 {
-            enc.request_keyframe();
-        }
-        let packets = enc.encode(frame).await?;
-        for p in &packets {
-            total_bytes += p.data.len();
-            if p.is_keyframe {
-                keyframes += 1;
-            }
-            if let Some(f) = dump_file.as_mut() {
-                f.write_all(&p.data)
-                    .context("encoder smoke: --dump write failed")?;
-            }
-        }
-    }
-    if let Some(mut f) = dump_file.take() {
-        f.flush().context("encoder smoke: --dump flush failed")?;
-        tracing::info!(
-            path = dump.unwrap_or(""),
-            total_bytes,
-            "encoder smoke: bitstream dumped"
-        );
-    }
-    tracing::info!(backend, keyframes, total_bytes, "encoder smoke: done");
-    if backend == "noop" {
-        bail!("encoder smoke: fell through to NoopEncoder — HW and SW backends both failed");
-    }
-    if keyframes == 0 {
-        bail!("encoder smoke: no keyframes produced (backend={backend})");
-    }
-    println!(
-        "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
-    );
+    let build = BuildCaps::this_build();
+    let plan = smoke::plan(&req, smoke::WIDTH, smoke::HEIGHT, build)?;
+    let mut opener = SessionOpener { pref };
+    let dump = match (dump, dump_file.as_mut()) {
+        (Some(path), Some(file)) => Some(smoke::Dump { path, file }),
+        _ => None,
+    };
+    let mut stdout = std::io::stdout();
+    smoke::run(&plan, &req, build, &mut opener, &mut stdout, dump).await?;
     Ok(())
 }
 
@@ -6639,32 +6579,35 @@ async fn encoder_reconfigure_sweep_cmd(
     constrained: bool,
     json: bool,
 ) -> Result<()> {
-    use roomlerd::encode::{open_default, open_for_codec};
+    use roomlerd::encode::bench::{BuildCaps, CellPath, SessionOpener};
+    use roomlerd::encode::smoke;
     use std::time::Instant;
 
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
-    let codec = codec_raw.to_ascii_lowercase();
     if constrained {
         tracing::info!(
             "reconfigure-sweep: --constrained noted; A0 opens the encoder's default HRD window \
              (the IDR-on-reconfigure question is independent of HRD %; burst sizes may differ)"
         );
     }
-    let (mut enc, actual_codec) = if let Some(name) = name {
-        // FR-78 P2 — a named backend, past every cascade: the same open the
-        // capability probe runs, so what the probe advertised opens here.
-        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
-            )
-        })?;
-        (e, actual.to_string())
-    } else if codec == "h264" {
-        (open_default(w, h, pref), "h264".to_string())
+    // #3652 — the plain smoke's request → cell → verdict, so a fallback, a
+    // demotion or nothing opening measures nothing. `--name` (FR-78 P2) is a
+    // named backend past every cascade: the open the capability probe runs.
+    let req = smoke::Request {
+        pref,
+        codec: codec_raw,
+        name,
+    };
+    let build = BuildCaps::this_build();
+    let plan = smoke::plan(&req, w, h, build)?;
+    let (mut enc, opened) =
+        smoke::open(&plan, pref, build, &mut SessionOpener { pref }).into_ok(&plan, &req)?;
+    // The A0 JSON's `codec` stays a named encoder's wire name.
+    let actual_codec = if plan.cell.path == CellPath::Named && opened.codec == "h265" {
+        "hevc"
     } else {
-        let (e, actual) = open_for_codec(&codec, w, h, pref);
-        (e, actual.to_string())
+        opened.codec
     };
     let backend = enc.name();
     tracing::info!(
@@ -6673,9 +6616,6 @@ async fn encoder_reconfigure_sweep_cmd(
         width = w, height = h, frames_per_rung,
         "reconfigure-sweep: backend selected"
     );
-    if backend == "noop" {
-        bail!("reconfigure-sweep: fell through to NoopEncoder — no HW/SW backend on this host");
-    }
 
     // Deterministic moving-block-over-stripes frame. `n` advances the block.
     let make_frame = |n: u32| -> std::sync::Arc<roomlerd::capture::Frame> {
@@ -8041,16 +7981,20 @@ mod tests {
         assert!(service_env_var_lifetime("X_ROOMLERD_ENABLE_SYSTEM_SWAP").contains("stays"));
     }
 
-    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --encoder hardware` on
-    /// every freshly built EXE. The bench is opt-in: that line, and the bare
-    /// command, still parse to the plain 10-frame smoke with every flag where
-    /// it was before the bench existed.
+    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --name h264_mf` on
+    /// every freshly built EXE (#3652): Media Foundation's H.264 on either MFT,
+    /// since the runner has no GPU. The bench is opt-in: that line, and the
+    /// bare command (`--encoder hardware`), still parse to the plain 10-frame
+    /// smoke with every other flag where it was before the bench existed.
     #[test]
     fn the_release_lanes_encoder_smoke_is_still_the_plain_smoke() {
         use roomlerd::encode::bench::{SmokeMode, smoke_mode};
-        for argv in [
-            &["roomlerd", "encoder-smoke", "--encoder", "hardware"][..],
-            &["roomlerd", "encoder-smoke"][..],
+        for (argv, lane_name) in [
+            (
+                &["roomlerd", "encoder-smoke", "--name", "h264_mf"][..],
+                Some("h264_mf"),
+            ),
+            (&["roomlerd", "encoder-smoke"][..], None),
         ] {
             let cli = Cli::try_parse_from(argv).unwrap();
             match cli.command {
@@ -8069,7 +8013,7 @@ mod tests {
                 }) => {
                     assert_eq!((encoder.as_str(), codec.as_str()), ("hardware", "h264"));
                     assert!(!reconfigure_sweep && !constrained && !json);
-                    assert_eq!((name, dump), (None, None));
+                    assert_eq!((name.as_deref(), dump), (lane_name, None));
                     assert_eq!((width, height, frames_per_rung), (1280, 800, 30));
                     assert!(!bench.bench && !bench.bench_full && !bench.bench_paced);
                     assert!(bench.bench_cells.is_empty() && bench.bench_sizes.is_empty());
@@ -8949,7 +8893,7 @@ mod one_row_enroll_tests {
     fn install_sh_asks_for_the_flag_this_binary_prints() {
         use clap::CommandFactory;
         let script = include_str!("../../../scripts/install.sh");
-        assert!(script.contains("enroll --help 2>/dev/null | grep -q -- '--one-row'"));
+        assert!(script.contains("enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'"));
         assert!(script.contains("enroll \"$@\" --overlay --one-row"));
         let mut cli = Cli::command();
         let help = cli
@@ -8958,5 +8902,139 @@ mod one_row_enroll_tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("--one-row"), "{help}");
+    }
+}
+
+/// #3652 — the plain smoke, real code, on a build whose only encoder is
+/// OpenH264: no Media Foundation, no FFmpeg, so nothing here touches a GPU.
+/// Hardware asked for and software answering is not a pass. The recorder lane
+/// runs these (`ci.yml`, its OpenH264 `--lib` line), the one lane that builds
+/// OpenH264 without an FFmpeg; a build with hardware backends would prove
+/// nothing here, so it does not compile them.
+#[cfg(all(
+    test,
+    feature = "openh264-encoder",
+    not(all(target_os = "windows", feature = "mf-encoder")),
+    not(feature = "ffmpeg-encoder")
+))]
+mod smoke_openh264_tests {
+    use super::*;
+    use roomlerd::encode::bench::{Backend, Reach, Verdict};
+    use roomlerd::encode::smoke::Failed;
+
+    fn failed(e: &anyhow::Error) -> &Failed {
+        e.downcast_ref::<Failed>()
+            .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"))
+    }
+
+    #[tokio::test]
+    async fn hardware_answered_by_openh264_is_not_a_pass() {
+        let smoke = encoder_smoke_cmd("hardware", "h264", None, None).await;
+        assert!(
+            smoke.is_err(),
+            "hardware was asked for, OpenH264 answered, and the smoke passed"
+        );
+        let e = smoke.unwrap_err();
+        let f = failed(&e);
+        assert_eq!(f.verdict, Verdict::SwOnly, "{e:#}");
+        assert_eq!(f.opened.map(|o| o.name), Some("openh264"), "{e:#}");
+    }
+
+    /// The `.deb` lanes' call (`scripts/deb-bare-check.sh`).
+    #[tokio::test]
+    async fn software_h264_still_passes() {
+        encoder_smoke_cmd("software", "h264", None, None)
+            .await
+            .expect("the software smoke passes on OpenH264");
+    }
+
+    /// This build has no HEVC encoder at all, so the failure has to say that,
+    /// not that a hardware and a software backend both failed.
+    #[tokio::test]
+    async fn hevc_fails_and_names_what_this_build_has() {
+        let e = encoder_smoke_cmd("hardware", "hevc", None, None)
+            .await
+            .expect_err("no HEVC encoder in this build");
+        assert!(!format!("{e:#}").contains("HW and SW"), "{e:#}");
+        let f = failed(&e);
+        assert_eq!(f.verdict, Verdict::None, "{e:#}");
+        let media_foundation = if cfg!(target_os = "windows") {
+            Reach::NotCompiled
+        } else {
+            Reach::WindowsOnly
+        };
+        assert_eq!(
+            f.tried.backends,
+            [
+                (Backend::Ffmpeg, Reach::NotCompiled),
+                (Backend::MediaFoundation, media_foundation),
+            ],
+            "{e:#}"
+        );
+    }
+}
+
+/// #3652 — on a host with no hardware encoder, a hardware smoke fails and
+/// names each FFmpeg candidate it tried and why, and nothing this build does
+/// not carry. CI's `ffmpeg-encoder` job runs it (its plain `--lib` step), on a
+/// GPU-less runner with the vendored FFmpeg. Anywhere else a GPU could
+/// answer, and a local run would open it, so outside GitHub Actions it skips.
+#[cfg(all(test, target_os = "linux", feature = "ffmpeg-encoder"))]
+mod smoke_ffmpeg_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::VideoCodec;
+    use roomlerd::encode::bench::{Backend, Reach, Verdict};
+    use roomlerd::encode::ffmpeg::{FfmpegEncoder, USE_FFMPEG_LOCK};
+    use roomlerd::encode::smoke::Failed;
+
+    // `encode::ffmpeg`'s own tests switch `ROOMLERD_USE_FFMPEG` off in this
+    // process, and this run needs FFmpeg on from its first read of the switch
+    // to its last open: it holds their lock across its awaits on purpose, and
+    // nothing it awaits takes that lock.
+    #[allow(clippy::await_holding_lock)]
+    async fn fails_naming_what_it_tried(codec_raw: &str, codec: VideoCodec) {
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            eprintln!("skipped: a GPU-less CI runner only; here a GPU could answer");
+            return;
+        }
+        let _use_ffmpeg = USE_FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let e = encoder_smoke_cmd("hardware", codec_raw, None, None)
+            .await
+            .expect_err("a GPU-less runner has no hardware encoder to pass on");
+        let f = e
+            .downcast_ref::<Failed>()
+            .unwrap_or_else(|| panic!("not the smoke's verdict: {e:#}"));
+        assert_eq!(f.verdict, Verdict::None, "{e:#}");
+        assert!(
+            f.tried
+                .backends
+                .contains(&(Backend::Ffmpeg, Reach::InBuild)),
+            "{e:#}"
+        );
+        // The dispatch locks pin the names the vendored build carries, and
+        // every one of them fails here: the value names them, with a reason.
+        assert!(!f.tried.failed.is_empty(), "{e:#}");
+        for (name, why) in &f.tried.failed {
+            assert!(
+                FfmpegEncoder::cascade_names(codec).contains(&name.as_str()),
+                "{name} is not in the {codec_raw} cascade: {e:#}"
+            );
+            assert!(FfmpegEncoder::carried(name), "{name} is not carried: {e:#}");
+            assert!(!why.is_empty(), "{name} failed without a reason: {e:#}");
+        }
+        assert!(!format!("{e:#}").contains("HW and SW"), "{e:#}");
+    }
+
+    /// The RTP track's HEVC: FFmpeg's cascade, then Media Foundation.
+    #[tokio::test]
+    async fn hardware_hevc_names_each_candidate_it_tried() {
+        fails_naming_what_it_tried("hevc", VideoCodec::Hevc).await;
+    }
+
+    /// D1 A: no Media Foundation in this build, so hardware H.264 is the
+    /// DataChannel's FFmpeg cascade, and OpenH264 never answers it.
+    #[tokio::test]
+    async fn hardware_h264_names_each_candidate_it_tried() {
+        fails_naming_what_it_tried("h264", VideoCodec::H264).await;
     }
 }

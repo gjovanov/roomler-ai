@@ -296,7 +296,8 @@ describe('companion Recordings view (FR-85 P2b)', () => {
 
   it('says why a start was refused', async () => {
     const invoke = vi.fn(async (name: string) => {
-      if (name === 'cmd_record_start') throw 'only the person at this device’s console can start a recording'
+      if (name === 'cmd_record_start')
+        throw 'only the person at this device’s screen can start, stop or delete a recording, or change where recordings are saved'
       return view()
     })
     const api = mount(invoke)
@@ -304,7 +305,7 @@ describe('companion Recordings view (FR-85 P2b)', () => {
     $('rec-start').click()
     await settle()
     expect($('rec-error').hidden).toBe(false)
-    expect($('rec-error').textContent).toContain('console')
+    expect($('rec-error').textContent).toContain('the person at this device’s screen')
   })
 
   it('deletes only on the second click', async () => {

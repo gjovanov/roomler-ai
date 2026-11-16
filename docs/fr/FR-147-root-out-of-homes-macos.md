@@ -1,7 +1,7 @@
 # FR-147: On a Mac, a root step of ours does nothing inside a person's home — what changes there is done by a process of that person
 
-**Issue:** [#3834](https://github.com/gjovanov/roomler-ai/issues/3834) · **Status:** claimed 2026-11-13; spec only, nothing built. D1–D7 carry recommendations and await the operator
-**Builds on:** [FR-43](FR-43-macos-single-enrollment.md) P3c (`sudo roomlerd one-row`, released in 0.4.200), #3825 (a root command's folders come from its own account; the screen worker's give-up prints a line the person runs)
+**Issue:** [#3834](https://github.com/gjovanov/roomler-ai/issues/3834) · **Status:** claimed 2026-11-13. P1's first half, the person's child `roomlerd one-row-home <verb>`, landed as #3838 (`0a6fd3f95`, 2026-11-15): inert, nothing calls it until root's side does. Root's side is not started and waits for the operator's decisions D1–D8. P2 cannot work as designed (a person cannot rename a folder root owns), so P2, C16 and AC6 are blocked on D8
+**Builds on:** [FR-43](FR-43-macos-single-enrollment.md) P3c (`sudo roomlerd one-row`, released in 0.4.200), #3825 (a root command's folders come from its own account), #3846 (the screen worker's give-up names an administrator's `sudo` command, where #3825's line had the person run `mv`)
 **Related:** #3802 (its first criterion), #3763, #3702
 
 ## Goal
@@ -25,8 +25,9 @@ until the supervisor gave up. After this FR:
   included, is read by the person's process and reported to root as bounded, parsed data.
 - **`sudo roomlerd one-row --revert` puts back a Mac converted by any release**, including those converted by
   0.4.200 to 0.4.219, whose copies sit in the person's folder.
-- **A folder that root made comes back without a pasted command** (P2), and the other root writes under a home are
-  each moved to the person's process or removed (P3).
+- **A folder that root made** is put back today by an administrator's command (#3846); whether it comes back without
+  one is D8, because P2 as designed cannot work. The other root writes under a home are each moved to the person's
+  process or removed (P3).
 
 ## Evidence
 
@@ -64,6 +65,16 @@ the two. What it cannot do:
   before the first worker starts.
 - **Leave the home to the person.** It is built from root's `lstat` of the person's folder
   (`person_folder_not_theirs`, `:850-857`).
+
+**Corrected on 2026-11-15: that line could not work at all.** On macOS a person can never rename or move a
+directory that another account owns, in any parent, even a parent of their own: renaming a directory needs write
+permission on the directory itself. It was read in the release lab on macOS 15.7 with the 0.4.220 candidate, where
+the person's `mv` of a root-made `<F>` answered `Permission denied` and moved nothing. #3846 replaced the line. Read
+on master `3b7c98323` (its merge), the give-up names an administrator's `sudo mv` of the folder aside, then a
+restart of the daemon (`move_aside`, `macos_supervisor.rs:616-741`). That command is printed only under the
+package's rule: the console person is an administrator of this Mac, the folder is a real folder of root's, and the
+account name is plain (`:568-615`). Elsewhere it gives no command, says that only an administrator can move the
+folder aside (`:653-654`), and names the docs section. P2 below was built on the same rename (D8).
 
 ### What #3802's first criterion still lacks
 
@@ -110,8 +121,8 @@ working two-row.
 | Keep | writes root's records, in root's tree only | nothing: no `.pre-one-row` in a home |
 | LaunchAgent | `launchctl bootout gui/<uid>/com.roomler.agent`, by label, as today (`:1395-1407`) | the plist is removed by `convert` |
 | Root's file | `config::save` of `/etc/roomler/config.toml`, as today | nothing |
-| People's files | nothing | `convert`: removes `<P>` and saves its config with the enrollments taken out (`without_enrollments`, `:265-277`) through its own `config::save`, each only over the bytes root kept. The files are born the person's |
-| Restart, verify, report | as today (`:731-739`, `:797-892`) | nothing |
+| People's files | nothing | `convert`: removes `<P>` and writes its config with the enrollments taken out (`without_enrollments`, `:265-277`), each only over the bytes root kept. The new config is made from the bytes it checked (`config::serialise_over`, which keeps the keys this build does not know), and those bytes are kept as the config's `.prev`, 0600, as a save keeps the outgoing file; it reads no file again by path. The files are born the person's |
+| Restart, verify, report | as today (`:728-736`, `:797-892`) | nothing |
 | Undo | its file back from its kept copy; its records removed after the restart answers | `put-back` of both files from root's records, then the bootstrap (D6) |
 | `--revert` | its file back from its kept copy; its records removed after the restart answers | `put-back`, or `put-back-legacy` on a Mac converted by 0.4.200 to 0.4.219 |
 
@@ -144,11 +155,11 @@ sequenceDiagram
 |---|---|---|
 | Program | `/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`, the package's binary (`scripts/install.sh:134`), never `current_exe()`. Started only when `lstat` reads a regular file of uid 0 that group and others cannot write | the binary of root's own tree, whatever path the command was typed by |
 | Arguments | `one-row-home <verb> --uid <uid> --gid <pw_gid> --version <its version> [the verb's]` | the child checks itself against them |
-| Dispatch | read from the raw argv as the first statement of both `main`s (`agents/roomlerd/src/app.rs:1283`, `:1364`), before `answer_stall_watch_cost` (`:1284`, `:1370`), any runtime and AppKit (`:1299-1333`). Synchronous: no tokio, no `logging::init` (`:1588`), no legacy-tree migration (`:1549`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
+| Dispatch | read from the raw argv as the first statement of the binary's `main` (`agents/roomlerd/src/bin/roomlerd.rs:20`), before it calls `app::main` (`agents/roomlerd/src/app.rs:1293`, `:1374`) and so before `answer_stall_watch_cost` (`:1294`, `:1388`), any runtime and AppKit (`:1309-1343`). Synchronous: no tokio, no `logging::init` (`:1606`), no legacy-tree migration (`:1567`) | the Mac build's `main` is the AppKit one (`release-agent.yml:2915` builds `viewer-indicator-macos`), and the child starts no daemon, no log file and no window. Its stderr is its log |
 | Credentials | set by our own `pre_exec` hook, not by `Command::uid` and `Command::gid` | std empties the group list, and macOS turns an empty list into `[0]`: the child would keep group 0 |
 | Environment | `env_clear()` | the child reads no `HOME` and no knob. Its home is `appdirs::own_home()` (`appdirs.rs:862`), the account database's home for its own uid |
 | Working directory | `/` | a folder of root's, whatever the caller's was |
-| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:216-228`) | the child holds none of root's open files |
+| Descriptors | the three pipes only (`tunnel_core::child::inherit_only_stdio`, `crates/tunnel-core/src/child.rs:367-379`) | the child holds none of root's open files |
 | Session, umask | `setsid()`, `umask(0o077)` | no controlling terminal; files born private |
 
 The hook allocates nothing and runs, each call checked (a failure is `spawn`'s error, and nothing runs): `setsid()`,
@@ -191,9 +202,9 @@ with "nothing has changed" (exit 1).
 | # | State, from the child's `read` | What is printed |
 |---|---|---|
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
-| R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3825's person-run line, built from the child's report (`folder_not_theirs`, `macos_supervisor.rs:1039`). P2 replaces it |
+| R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:616-741`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1039`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
-| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2. Without R4 the worker's first save (`app.rs:3956`) fails after the restart, and the conversion undoes itself |
+| R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:3974`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
 
 **A command for an administrator is printed only for the console administrator's own home**, when all of these
@@ -217,7 +228,7 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:2532`; P1 adds one-row's row to it.
+That section is `docs/installation.md:2570`; P1 adds one-row's row to it.
 
 ### Root's records
 
@@ -249,35 +260,36 @@ Today root's own kept copy is written in place, at its final name (`one_row.rs:1
   `--revert`: each uid's folder, then `root.json`, then root's kept copy last, so a stop part-way leaves what the
   next `--revert` needs.
 - The records hold tokens and WireGuard keys, the same class as root's own file beside them. The uninstall's
-  `remove_paths /etc/roomler` (`scripts/install.sh:1990`) takes them along (D4).
+  `remove_paths /etc/roomler` (`scripts/install.sh:1992`) takes them along (D4).
 
 ### Root and the person's child
 
-Every reply is one JSON object with `"v":1`, `version`, `uid`, `gid` and `groups`, plus the verb's fields. It is
-parsed with unknown fields refused.
+Every reply is one JSON object with `"v":1`, `version`, `uid`, `gid` and `groups`, and the verb's answer under the
+verb's own name (`"read": {…}`). It is parsed with unknown fields refused.
 
 | Verb | stdin | Reply | Exit |
 |---|---|---|---|
-| `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path, and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and for the last two whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode; `legacy`: which old copies exist | 0 |
-| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the new config's sha256; whether the plist was removed | 0; 3 when either live file is not the expected bytes (it checks both before it changes either) |
+| `read` | none | `home`: kind, uid and mode of `pw_dir`, whether it is an absolute path (it starts with `/` and does not end with one), and its device and inode; `library`, `agents_dir`, `folder`: kind (`dir`, `file`, `link`, `other`, `absent`), uid, mode, and, for each of the three, whether the person can write it; `segment`; `config`, `plist`: absent, or the bytes with uid and mode, or an error (`eacces`, `too_large`, `not_regular`, `other`) with uid and mode, where anything but a regular file (a link, a socket, a device) reads as `not_regular`; `legacy`: each name an old copy is kept under, reported as a folder is: kind, uid, mode and whether the person can write it (`other` with no uid and no mode when it could not be looked at) | 0 |
+| `convert --expect-config <hex\|none> --expect-plist <hex\|none>` | none | the sha256 of the config it wrote; whether the plist was removed | 0; 3 when either live file is not the expected bytes, or is no longer a regular file (it checks both before it changes either) |
 | `put-back` | the kept bytes and modes of both files | the sha256 of each file written | 0; 4 when `<L>` is not writable |
-| `put-back-legacy` | none | which old copies it moved | 0; 4 as in `--revert` below |
+| `put-back-legacy` | none | which old copies it moved | 0; 3 when anything but a file is at an old copy's name (a folder, a link, a socket); 4, naming `<F>`, when an old copy's name could not be looked at (`<F>` does not let the person through); either way before anything is renamed; 4 as in `--revert` below |
 | all | | | 2: usage, a failed identity check or another version; 4: not writable (stderr: path, owner, mode); 1: any other error |
 
 - **Bounds.** A config of 256 KiB and a plist of 64 KiB; larger is exit 1. Root sends at most 1 MiB, reads at most
   1 MiB of stdout, and keeps 16 KiB of stderr while draining the rest.
 - **Transport.** `tunnel_core::child::output_bounded_fed(cmd, stdin, deadline, cap)`, new beside `output_bounded`
-  (`child.rs:75-95`, whose stdin is `/dev/null` and whose cap is 16 MiB, `:46`). stdin is written from its own
+  (`child.rs:86-111`, whose stdin is `/dev/null` and whose cap is 16 MiB, `:48`). stdin is written from its own
   thread, then closed, and a broken pipe fails the step. The deadline is 30 s and the cap 1 MiB; at the deadline the
   child is killed and reaped.
 - **The child's reads** open with `O_NONBLOCK`, check that the file is a regular one, and read at most the bound
   plus one byte: a FIFO, a device or a huge file is an error, not a wait. Its writes are a temporary file in the same
   folder, `fsync`, `rename`, as `config::save` does. `put-back` makes the plist with its recorded mode less group
   and other write (0644 when none was recorded), and `<L>` 0755 when it is missing: launchd ignores a plist that
-  group or others can write, and the package sets 644 (`postinstall:335-336`).
+  group or others can write, and the package sets 644 (`postinstall:335-336`). It writes the config with its
+  recorded owner bits, 0600 when none was recorded: the file holds a token and a key.
 - **Root's side.** Config bytes go through `config::parse_text(raw, origin)`, split out of `try_load`
-  (`crates/agent-core/src/config.rs:3880-3900`): the same rules, no path, unknown keys noted from the text
-  (`note_unknown_keys` reads by path, `:4231-4234`), and no `.prev` repair, which belongs to the person's own agent
+  (`crates/agent-core/src/config.rs:3882-3921`): the same rules, no path, unknown keys noted from the text
+  (`note_unknown_keys` reads by path, `:4292-4295`), and no `.prev` repair, which belongs to the person's own agent
   (`:3505-3517`). A config that does not parse stops Read, as today (`one_row.rs:1240-1242`). Root never parses the
   plist's bytes.
 - **Failure.** A non-zero exit, a death by signal, a reply that does not parse, exceeds its bound or carries another
@@ -371,6 +383,11 @@ For `one-row`, the first maker of the person's folder is always the person's own
 
 ### P2: the folder comes back without a pasted line
 
+**P2 cannot work as designed, and waits on D8.** Its verb has the person's child rename `<F>`, a folder that root
+owns, and on macOS a person can never rename or move a directory another account owns (Evidence, the correction
+under #3825). Only an administrator can, which is the command #3846 prints. The design below is kept as it was
+written. It is not a plan until D8 is decided: drop the automatic reclaim, or have root do it another way.
+
 The verb `reclaim-folder`, which the root daemon's supervisor runs through `spawn_person` when the console person's
 folder is not theirs: before it starts the screen worker, not after five fast exits.
 
@@ -384,7 +401,8 @@ folder is not theirs: before it starts the screen worker, not after five fast ex
 - The supervisor's own `lstat` of the folder (`person_folder_not_theirs`, `macos_supervisor.rs:1174-1181`) moves into
   the verb's checks, so root reads nothing in the home.
 - P2 replaces the printed line, not the give-up's cause text, and it ships behind a switch whose off state is today's
-  give-up with the printed line. It needs supervisor wiring and lab cells of its own.
+  give-up with the printed line (since #3846, the administrator's command). It needs supervisor wiring and lab cells
+  of its own.
 
 ### P3: the other root writes under a home
 
@@ -394,15 +412,24 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | Where | What | Kind |
 |---|---|---|
 | `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
-| `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run` | write |
-| `agents/roomlerd/src/service.rs:2398-2430` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2428-2430`): under `sudo`, a root-owned `<L>` and plist, the #3763 state | write |
-| `scripts/install.sh:1952-1973` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1519-1527`) | remove |
-| `scripts/install.sh:1986-1993` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1567`) as root | remove |
-| `scripts/install.sh:1081` | `as_root grep` of the console person's `config.toml` | read |
+| `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:100-104`, held by `flock`, `unix_acquire`, `:217-249`), so the second daemon is not refused as a second instance | write |
+| `agents/roomlerd/src/service.rs:2410-2442` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2440-2442`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
+| `scripts/install.sh:1954-1975` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1521-1529`) | remove |
+| `scripts/install.sh:1988-1995` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1569`) as root | remove |
+| `scripts/install.sh:1083` | `as_root grep` of the console person's `config.toml` | read |
 | `postinstall:145-163`, `:401`, `:486` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
 | `postinstall:262-265`, `:301` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
 | `macos_supervisor.rs:1174-1181` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
-| `agents/roomlerd/src/files.rs:235`, `:5250-5254`, `:5331-5335`, `:7498`; `agents/roomlerd/src/recording/folder.rs:161-162` | `BaseDirs` and `UserDirs`, from `$HOME`: whether a root command reaches them is not read yet | not determined |
+| `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
+| `agents/roomlerd/src/files.rs:5244-5254` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
+| `agents/roomlerd/src/recording/folder.rs:160-164` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:250`) | write |
+| `agents/roomler-cli/src/config.rs:83-90` (`default_config_path`) | `ProjectDirs`, from `$HOME`: `sudo roomler enroll`, `forward` and `socks5` without `--config` (and without `--daemon`) run as root and read AND SAVE the caller's tunnel config, `config.toml` in the tunnel CLI's own config folder in the caller's home (the roomler CLI's `default_config_path` defines that path, `agents/roomler-cli/src/config.rs:83-90`; `enroll`: `cli.rs:1220`; `forward` and `socks5` renew a token that is due, `cli.rs:910-912`, `:928-930`, through `save_renewed_token`, `credential.rs:135`, `config.rs:198`). Not established: whether that save leaves the person's file owned by root | write |
+
+The source gate (`crates/agent-core/src/folder_gate.rs:291-357`) holds six of these reads as tracked by this FR on
+macOS builds: `process_home`, `default_download_dir`, `unix_lock_path`, `plist_path`, the `roomler` CLI's
+`default_config_path` and `default_choice`. Each is entered by a command typed with `sudo`, which on macOS keeps the
+caller's `HOME`. AC10 asks that none is left. Of the reads an earlier row of this table left undetermined,
+`files.rs:5331-5335` is Linux's `own_home_and_downloads` and `:7498` is a test.
 
 Not swept: `agents/roomler-setup/src/unix_daemon.rs`, the self-updater, `cleanup-legacy-install`, and fleet exec as
 root.
@@ -450,34 +477,36 @@ where macOS does not. Cell C8 reads it.
 | C13 the bootstrap form (D6) | `launchctl asuser <uid> /usr/bin/sudo -n -u '#<uid>' -- /bin/launchctl bootstrap gui/<uid> <P>`, sent by root, loads the job (`launchctl print`); `fs_usage` during it shows which process opens `<P>` |
 | C14 the child and AppKit | each child's run time in `one-row.log` is under 1 s, and `log show --predicate 'process == "roomlerd"'` over the run has no AppKit or WindowServer line of a child's pid |
 | C15 what only a Mac shows | `read`'s writable answer for `<L>` against a real write under `~/Library`'s ACLs; whether `put-back`'s new plist raises a "Background Items Added" notice where today's rename did not |
-| C16 (P2) a Mac in the #3802 state, P2's candidate | the root daemon reclaims `<F>` before the first worker: `<F>` the person's, `<F>.made-by-root-<stamp>` beside it, `gui_worker attached: true`, the row's permissions not `["no-gui-session"]`, C7's read clean; with P2's switch off, today's give-up and line |
+| C16 (P2, waits on D8) a Mac in the #3802 state, P2's candidate | as written it cannot pass, because the person's child cannot rename `<F>`; it is written again once D8 is decided. As written: the root daemon reclaims `<F>` before the first worker: `<F>` the person's, `<F>.made-by-root-<stamp>` beside it, `gui_worker attached: true`, the row's permissions not `["no-gui-session"]`, C7's read clean; with P2's switch off, today's give-up and #3846's administrator's command |
 
 ## Phases
 
 | phase | what | kill switch, or back-out | status |
 |---|---|---|---|
-| P1 | the conversion, its undo and its revert through the person's child: `one_row_home.rs` (the verbs, the identity checks, the dispatch in both `main`s), `output_bounded_fed`, `config::parse_text`, `appdirs::account_entry`, then `spawn_person` with its hook, root's records, the new `Host` types, the refusals and their lines, `put-back-legacy`, and the tests above. Two pull requests (the child, inert until called; then root's side), shipped in ONE release | none: `one-row` is a one-shot command an administrator runs. A conversion that fails undoes itself, and a converted Mac goes back with `--revert`. A back-out is a later release whose `one-row` refuses to convert and keeps P1's `--revert`, never an older binary, which does not read root's records | not started |
-| P2 | `reclaim-folder`, run by the root daemon before the screen worker, in place of #3825's printed line | a switch whose off state is today's give-up with the printed line, named in its pull request | not started |
+| P1 | the conversion, its undo and its revert through the person's child: `one_row_home.rs` (the verbs, the identity checks, the dispatch as the first statement of the binary's `main`, `agents/roomlerd/src/bin/roomlerd.rs:20`), `output_bounded_fed`, `config::parse_text`, `appdirs::account_entry`, then `spawn_person` with its hook, root's records, the new `Host` types, the refusals and their lines, `put-back-legacy`, and the tests above. Two pull requests (the child, inert until called; then root's side), shipped in ONE release | none: `one-row` is a one-shot command an administrator runs. A conversion that fails undoes itself, and a converted Mac goes back with `--revert`. A back-out is a later release whose `one-row` refuses to convert and keeps P1's `--revert`, never an older binary, which does not read root's records | the child: landed as #3838 (`0a6fd3f95`, 2026-11-15), inert until root's side calls it. Root's side: not started, waits for D1–D8 |
+| P2 | `reclaim-folder`, run by the root daemon before the screen worker, in place of the printed line. As designed it cannot work: the person's child cannot rename a folder root owns | a switch whose off state is today's give-up with #3846's administrator's command, named in its pull request | blocked on D8 |
 | P3 | the other root writes and removals under a home (P3's table), one issue and pull request each; the rows not determined are read first | each pull request names its own. The uninstall is a one-shot script with no switch: its change is backed out by reverting it | not started |
 | P4 | the field read: C1 to C15 with P1's candidate (C13 decides D6), C16 with P2's, each P3 change's own read, then AC8 on a released build | read only | not started |
 | Docs | the docs below, each in the pull request of the phase it describes | none | not started |
 
 - **P1 leaves working by itself**: `one-row` and `--revert` on new Macs and on Macs converted by 0.4.200 to 0.4.219,
-  with no root write in a home. The #3802 state is refused at Read with #3825's line until P2. The child and root's
+  with no root write in a home. The #3802 state is refused at Read with #3846's administrator's command where it
+  fits (R2, R4), else its words. The child and root's
   side ship in one release: a release with root's side and no revert of older copies could not revert those Macs.
   Acceptance: AC1 to AC5.
-- **P2 leaves working**: a folder root made comes back without a pasted command, on P1's child. Acceptance: AC6.
+- **P2 leaves working**: as designed, nothing. The person's child cannot rename a folder root made, so what P2
+  leaves is D8's to say. Acceptance: AC6, written again with D8.
 - **P3 leaves working**: each row on its own. Acceptance: AC7.
 - **P4** reads each phase on a Mac, and AC8 on a released build.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2313`, its flow at `:2325`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:2351`, its flow at `:2363`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
-- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2529`): one-row's row, and
-  P2's.
-- `docs/installation.md`, where the give-up's line is described (`:2592-2615`): P2's verb in its place.
+- `docs/installation.md`, "Which account each step of the package's script writes as" (`:2570`): one-row's row, and
+  what D8 decides.
+- `docs/installation.md`, where the give-up's line is described (`:2641-2664`): what D8 decides, in its place.
 - `docs/fr/FR-43-macos-single-enrollment.md`: the P3c row (`:76`) points here.
 - The module docs: `one_row.rs:1-27` (the step table) and the new `one_row_home.rs`.
 - `docs/README.md`: the `installation.md` row names the rule.
@@ -493,30 +522,36 @@ The docs:
   from a roomlerd process with effective uid 0 over C1 to C5.
 - [ ] **AC4** (the child's credentials): C8 (a) and (c) pass, and (b) where `eslogger` runs.
 - [ ] **AC5** (D6): C13's read is in the field log, and P1 ships the bootstrap form it supports.
-- [ ] **AC6** (P2): C16 passes: a Mac in the #3802 state gets its screen back with no pasted command, and with the
-  switch off it behaves as today.
+- [ ] **AC6** (P2, waits on D8): as written it cannot pass, because the person's child cannot rename a folder root
+  owns; it is written again once D8 is decided. As written: C16 passes, a Mac in the #3802 state gets its screen
+  back with no pasted command, and with the switch off it behaves as today. Until then such a Mac gets its screen
+  back by #3846's administrator's command.
 - [ ] **AC7** (P3): every write and removal in P3's table is done by the person's process or gone, and every row not
   determined is read and cleared or fixed, each in its own issue with a C7-style read of its own step.
 - [ ] **AC8** (field, a released build): C1, C2, C6 and C8 pass again on a Mac guest, and #3802's first criterion is
   ticked for `one-row`.
 - [ ] **AC9** — Docs updated in house style (tables, the conversion as a mermaid sequence, `file:line` anchors):
   `docs/installation.md`'s three sections above, FR-43's P3c row and the module docs, linked from `docs/README.md`.
+- [ ] **AC10** (the source gate): no row of the source gate (`crates/agent-core/src/folder_gate.rs`) that is tracked
+  by this FR is left. Today six rows name #3834 on macOS builds (`folder_gate.rs:291-357`), each in P3's table with
+  its entry point.
 
 ## Open decisions
 
-Each carries its recommendation and awaits the operator.
+D1–D7 each carry a recommendation and await the operator. D8 carries none.
 
 - **D1. How the child becomes the person.** Recommended: a direct spawn with our own hook (`setsid`,
   `setgroups(1, [pw_gid])`, `setgid`, `setuid`, `umask`), the child's check of itself and root's check of each
   reply; C8 reads it. Fallback: `sudo -n -u '#<uid>'`, the package's form, only if an enrollment's token and key
   passing through `sudo`'s input and output logging were accepted. Not recommended.
 - **D2. A home a root step changed before** (#3763, #3802). Recommended: refuse at Read; print an administrator's
-  line only under the four conditions; for `<F>`, #3825's person-run line until P2 repairs it; `<L>` is #3763's to
-  repair. Until P2 ships: the printed lines and the docs section.
+  line only under the four conditions; for `<F>`, #3846's administrator's command under the package's rule, else
+  its words and the docs section, since no line the person runs can move a folder root owns; `<L>` is #3763's to
+  repair. Whether `<F>` ever comes back without a command is D8.
 - **D3. A folder whose owner has no account.** Recommended: left alone, and said; the child has no home to find.
   Fallback: migrate it as root, which breaks the rule.
 - **D4. Where root's records live.** Recommended: `/etc/roomler/one-row/`, beside root's kept copy; the uninstall
-  removes it with `/etc/roomler` (`scripts/install.sh:1990`). Fallback: `/var/db/roomler/one-row/`, which would keep
+  removes it with `/etc/roomler` (`scripts/install.sh:1992`). Fallback: `/var/db/roomler/one-row/`, which would keep
   tokens after an uninstall.
 - **D5. A revert with one failing person.** Recommended: go on, restart, exit 1, and resume on the next run.
   Fallback: stop at the first failure, as today.
@@ -527,6 +562,10 @@ Each carries its recommendation and awaits the operator.
   Switching is one function, `bootstrap_argv`.
 - **D7. A uid given to a new account.** Recommended: the account's UUID decides, and the name is for display.
   Fallback: the uid alone.
+- **D8. P2 cannot work as designed.** Its verb has the person's child rename `<F>`, and on macOS a person can never
+  rename or move a directory another account owns (Evidence, the correction under #3825). Drop the automatic
+  reclaim, or have root do it another way. Open, with no recommendation. The rule above bears on the second. Until
+  it is decided, P2, C16 and AC6 wait, and the #3802 state is repaired by #3846's administrator's command.
 
 ## Out of scope
 
@@ -535,9 +574,11 @@ Each carries its recommendation and awaits the operator.
 - The running two-row worker saving the person's config during the conversion, as today.
 - Repairing a `~/Library/LaunchAgents` that an earlier package made (#3763).
 - The person's `config.toml.prev` after a conversion still holds the enrollment that moved to root (a save keeps the
-  previous file), and the person's agent's `.prev` repair (`config.rs:3505-3517`) could bring it back: its own issue.
-- Linux and Windows: their root steps take their folders from the system already (#3702). The uninstall's Linux arm
-  (`scripts/install.sh:1885-1894`) removes people's folders as root the same way, and is not in this FR.
+  previous file), and the person's agent's `.prev` repair (`config.rs:3507-3519`) could bring it back: its own issue.
+- Linux and Windows: their root steps take their folders from the system already (#3702). On Linux that holds for
+  the daemons systemd starts; a root command typed through a `sudo` that keeps the caller's `HOME` is #3866's (the
+  source gate's Linux rows). The uninstall's Linux arm
+  (`scripts/install.sh:1887-1896`) removes people's folders as root the same way, and is not in this FR.
 
 ## Field log
 

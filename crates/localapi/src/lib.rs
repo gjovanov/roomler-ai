@@ -1443,12 +1443,21 @@ pub enum Request {
     /// Remote-control sessions awaiting an operator consent decision.
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
+    /// Mutating, and the endpoint's ACL is NOT the whole boundary: an approval
+    /// lets someone see and control this screen, so it is the answer of the
+    /// person at that screen. On the daemon's own endpoint the dispatcher takes
+    /// it only from that person, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]); on the person socket only from
+    /// whoever is at the seat now (#3845). Anyone else is refused in words.
     ConsentDecide { session_id: String, allow: bool },
     /// FR-27 — remote-control sessions currently LIVE on this device.
     RcSessions,
     /// FR-27 — end a live remote-control session from the device side. This is
-    /// the Disconnect the "Being viewed by …" banner offers; mutating, and the
-    /// pipe/socket ACL is the trust boundary, like [`Self::ConsentDecide`].
+    /// the Disconnect the "Being viewed by …" banner offers. Mutating, and
+    /// gated like [`Self::ConsentDecide`] on the daemon's own endpoint: the
+    /// person at the screen, SYSTEM or an elevated administrator
+    /// ([`peer_may_decide_for_the_screen`]). The person socket serves it to
+    /// the person it was made for.
     RcDisconnect { session_id: String },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
@@ -1463,9 +1472,9 @@ pub enum Request {
     },
     /// Create a daemon-driven static forward: the daemon opens a tunnel to
     /// `node` (a hex agent id) over its own agent WS and listens on `local`,
-    /// dialing `remote` (`host:port`) from the target. Mutating — like
-    /// [`Request::ConsentDecide`], the pipe/socket ACL is the trust boundary
-    /// (P3b-2). Returns [`Response::FlowCreated`] with the assigned flow id.
+    /// dialing `remote` (`host:port`) from the target. Mutating — the
+    /// pipe/socket ACL is the trust boundary (P3b-2). Returns
+    /// [`Response::FlowCreated`] with the assigned flow id.
     CreateForward {
         node: String,
         local: u16,
@@ -1648,8 +1657,9 @@ pub enum Request {
     /// FR-85 — start a LOCAL screen recording (the daemon spawns
     /// `roomlerd record`). Mutating, and the endpoint ACL is NOT the whole
     /// boundary: the caller must be the console user
-    /// ([`ClientPeer::is_console_user`]) — an RDP guest must not record the
-    /// console user's desktop. Returns [`Response::Recording`].
+    /// ([`ClientPeer::is_console_user`]), on Windows the person at the screen
+    /// this daemon shows — another signed-in account must not record that
+    /// person's desktop. Returns [`Response::Recording`].
     RecordStart {
         #[serde(default)]
         opts: RecordStartOpts,
@@ -2327,10 +2337,12 @@ pub struct RecordingsListing {
 ///
 /// The pipe ACL admits every Interactive User — RDP sessions included — and
 /// the unix socket every process of its uid. That is the right boundary for
-/// reading status, and the wrong one for starting a screen recording: a guest
-/// in an RDP session must not be able to record the CONSOLE user's desktop.
-/// The recording verbs, and a `ConfigSet` of any `record_*` key, therefore
-/// require [`ClientPeer::is_console_user`].
+/// reading status, and the wrong one for starting a screen recording: another
+/// signed-in account must not be able to record the desktop this daemon
+/// shows. The recording verbs, and a `ConfigSet` of any `record_*` key,
+/// therefore require [`ClientPeer::is_console_user`]; a consent answer and a
+/// Disconnect require [`ClientPeer::may_decide_for_the_screen`]. On Windows
+/// both take the session whose screen this daemon shows ([`screen_session`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientPeer {
     /// Windows: the client process's session id.
@@ -2363,18 +2375,26 @@ impl ClientPeer {
         elevated: None,
     };
 
-    /// Is this peer the person at the console? Windows: its session is the
-    /// active CONSOLE session. Unix: it is this daemon's own uid (a per-user
-    /// daemon, whose socket is 0600 anyway), or root.
+    /// Is this peer the console person, the person at the screen this daemon
+    /// shows? Windows: its session is that screen's session
+    /// ([`screen_session`]): the daemon's own, or the active console session
+    /// for a daemon in session 0. Unix: it is this daemon's own uid (a
+    /// per-user daemon, whose socket is 0600 anyway), or root.
     pub fn is_console_user(&self) -> bool {
-        peer_is_console_user(self, console_session_id(), own_uid())
+        peer_is_console_user(self, console_session_id(), own_session_id(), own_uid())
     }
 
     /// #2871 — may this peer set a key that is the console person's call
     /// ([`CONSOLE_PERSON_KEYS`]), on `scope`'s endpoint?
     /// [`peer_may_set_console_key`].
     pub fn may_set_console_key(&self, scope: Scope) -> bool {
-        peer_may_set_console_key(self, scope, console_session_id(), own_uid())
+        peer_may_set_console_key(
+            self,
+            scope,
+            console_session_id(),
+            own_session_id(),
+            own_uid(),
+        )
     }
 
     /// Is this peer root (Unix)? Root is root on every endpoint, so the
@@ -2384,16 +2404,35 @@ impl ClientPeer {
         self.uid == Some(0)
     }
 
-    /// FR-92 P10 — may this peer turn keep busy ON? Only the person at the
-    /// console, on `scope`'s endpoint ([`peer_may_start_keep_busy`]).
+    /// FR-92 P10 — may this peer turn keep busy ON? Only the console person,
+    /// at the screen this daemon shows, on `scope`'s endpoint
+    /// ([`peer_may_start_keep_busy`]).
     pub fn may_start_keep_busy(&self, scope: Scope) -> bool {
-        peer_may_start_keep_busy(self, scope, console_session_id(), own_uid())
+        peer_may_start_keep_busy(
+            self,
+            scope,
+            console_session_id(),
+            own_session_id(),
+            own_uid(),
+        )
     }
 
     /// FR-85 P2e — may this peer start, stop or delete a recording, on
     /// `scope`'s endpoint? [`peer_may_record`].
     pub fn may_record(&self, scope: Scope) -> bool {
-        peer_may_record(self, scope, console_session_id(), own_uid())
+        peer_may_record(
+            self,
+            scope,
+            console_session_id(),
+            own_session_id(),
+            own_uid(),
+        )
+    }
+
+    /// May this peer answer a consent prompt or end a live session over the
+    /// daemon's own endpoint? [`peer_may_decide_for_the_screen`].
+    pub fn may_decide_for_the_screen(&self) -> bool {
+        peer_may_decide_for_the_screen(self, console_session_id(), own_session_id(), own_uid())
     }
 }
 
@@ -2404,9 +2443,12 @@ impl ClientPeer {
 /// `roomler exec` arrives there — so with it, a plain
 /// `roomler exec <host> -- roomler keep-busy on` would start synthetic input
 /// under the person's name.
-/// - **Windows**: the active console session, never session 0 (services),
-///   and (P10b) **never a service account** — SYSTEM, LocalService or
-///   NetworkService — nor a peer whose account could not be read.
+/// - **Windows**: the session whose screen this daemon shows
+///   ([`screen_session`]: its own, or the active console session for a
+///   daemon in session 0), never session 0 (services), and (P10b) **never a
+///   service account** — SYSTEM, LocalService or NetworkService — nor a peer
+///   whose account could not be read. With no screen's session known, no
+///   Windows peer.
 /// - **A per-user daemon's own socket** (macOS GUI worker, Linux user
 ///   daemon): its owner, who is the person.
 /// - **The person socket of a Linux system install** ([`Scope::Person`]):
@@ -2442,15 +2484,19 @@ pub fn peer_may_start_keep_busy(
     peer: &ClientPeer,
     scope: Scope,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
     if peer.uid == Some(0) {
         return false;
     }
-    if let (Some(p), Some(c)) = (peer.session_id, console_session) {
+    if let (Some(p), Some(s)) = (
+        peer.session_id,
+        screen_session(own_session, console_session),
+    ) {
         // P10b — `Some(false)` only: SYSTEM and its kin never, and an
         // account that could not be read never either (fail closed).
-        return p == c && p != 0 && peer.system_account == Some(false);
+        return p == s && p != 0 && peer.system_account == Some(false);
     }
     match scope {
         Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
@@ -2471,23 +2517,36 @@ pub fn peer_may_record(
     peer: &ClientPeer,
     scope: Scope,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
     match scope {
         Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
-        Scope::Full => peer_is_console_user(peer, console_session, own_uid),
+        Scope::Full => peer_is_console_user(peer, console_session, own_session, own_uid),
     }
 }
 
 /// The pure decision behind [`ClientPeer::is_console_user`], testable
 /// without an OS.
+///
+/// On Windows the console person is the person at the screen this daemon
+/// shows, as for a consent answer: a peer in [`screen_session`]'s session,
+/// the daemon's own non-zero session or, for a daemon in session 0, the
+/// console session. With neither known, no Windows peer passes. A worker,
+/// which the service host starts in the console session, takes the console
+/// session's person. On Unix no session is read: the daemon's own uid, or
+/// root.
 pub fn peer_is_console_user(
     peer: &ClientPeer,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
-    if let (Some(p), Some(c)) = (peer.session_id, console_session) {
-        return p == c;
+    if let (Some(p), Some(s)) = (
+        peer.session_id,
+        screen_session(own_session, console_session),
+    ) {
+        return p == s;
     }
     match (peer.uid, own_uid) {
         (Some(p), Some(o)) => p == o || p == 0,
@@ -2500,9 +2559,9 @@ pub fn peer_is_console_user(
 /// by the endpoint the request came in on.
 ///
 /// - **The daemon's own endpoint** ([`Scope::Full`]): the console person as
-///   [`peer_is_console_user`] reads them — the active console session on
-///   Windows (the pipe admits every interactive user, RDP guests included), the
-///   daemon's own uid or root on Unix.
+///   [`peer_is_console_user`] reads them — on Windows the session whose screen
+///   this daemon shows ([`screen_session`]; the pipe admits every interactive
+///   user, RDP sessions included), the daemon's own uid or root on Unix.
 /// - **The person-at-the-device socket** ([`Scope::Person`]): its person. On a
 ///   root daemon `peer_is_console_user` reduces to "root" (the daemon's own uid
 ///   IS 0), so through that gate alone the person at the seat of a Linux system
@@ -2524,17 +2583,114 @@ pub fn peer_may_set_console_key(
     peer: &ClientPeer,
     scope: Scope,
     console_session: Option<u32>,
+    own_session: Option<u32>,
     own_uid: Option<u32>,
 ) -> bool {
     match scope {
-        Scope::Full => peer_is_console_user(peer, console_session, own_uid),
+        Scope::Full => peer_is_console_user(peer, console_session, own_session, own_uid),
         Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
     }
+}
+
+/// The session whose screen this daemon shows, on Windows: the one whose
+/// person a consent prompt asks, and whose session a Disconnect ends. Its
+/// person is also the console person whose gates the daemon's own endpoint
+/// keeps: a console person's keys, the recording verbs, keep busy on and the
+/// external-access password ([`peer_is_console_user`],
+/// [`peer_may_start_keep_busy`]).
+///
+/// - **Its own session**, when that is not session 0: a worker, which the
+///   service host starts in the active console session, or a per-user
+///   daemon, which runs where its person signed in, over RDP too. The person
+///   at the console is someone else then, and is not the one asked.
+/// - **The console session** (`WTSGetActiveConsoleSessionId`) for a daemon
+///   in session 0, the service host.
+/// - **None** when its own session cannot be read, or it runs in session 0
+///   and there is no console session: no person's screen, so only SYSTEM
+///   and an elevated administrator decide ([`peer_may_decide_for_the_screen`]),
+///   and no Windows peer passes a console person's gate.
+///
+/// Never session 0: no person sits there.
+pub fn screen_session(own_session: Option<u32>, console_session: Option<u32>) -> Option<u32> {
+    match own_session? {
+        0 => console_session.filter(|&s| s != 0),
+        own => Some(own),
+    }
+}
+
+/// Who may answer a consent prompt (approve or deny) or end a live session
+/// (a Disconnect) over the daemon's own endpoint ([`Scope::Full`]).
+///
+/// Both decide what happens to a screen, and an approval lets someone see
+/// and control it, so they are the answer of the person at that screen, as
+/// on the person socket, where the seat is asked (#3845). The Windows pipe
+/// admits every interactive user (its `IU` ace), so here the peer the OS
+/// read at accept decides, never anything the client says:
+/// - **SYSTEM** (`S-1-5-18`, read from the client's token; LocalService and
+///   NetworkService are not SYSTEM) and **an administrator who elevated**:
+///   either can change the daemon itself.
+/// - **Windows**: a peer in the session whose screen this daemon shows
+///   ([`screen_session`]).
+/// - **Unix**: this daemon's own account, or root: who its owner-only socket
+///   admits, so nothing changes there.
+/// - Anything unknown: no. A peer the endpoint could not read is refused.
+///
+/// [`ClientPeer::is_root`] reads a uid, which a pipe client never has: on
+/// Windows it is false for every peer, SYSTEM's included, so SYSTEM is
+/// named here by its SID.
+pub fn peer_may_decide_for_the_screen(
+    peer: &ClientPeer,
+    console_session: Option<u32>,
+    own_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    if peer.sid.as_deref() == Some(SYSTEM_SID) || peer.elevated == Some(true) {
+        return true;
+    }
+    if let Some(session) = peer.session_id {
+        return screen_session(own_session, console_session) == Some(session);
+    }
+    matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o || p == 0)
+}
+
+/// The session this process runs in (Windows), `None` when it cannot be read
+/// or on other platforms.
+fn own_session_id() -> Option<u32> {
+    #[cfg(test)]
+    {
+        if let Some((own, _)) = PINNED_SESSIONS.get() {
+            return own;
+        }
+    }
+    #[cfg(windows)]
+    {
+        process_session(std::process::id())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: what this thread reads as the daemon's own session and the
+    /// console session ([`own_session_id`], [`console_session_id`]), on every
+    /// OS, while a test holds them pinned. A dispatch test can then stand
+    /// where a daemon in another session stands, an RDP session or session 0.
+    static PINNED_SESSIONS: std::cell::Cell<Option<(Option<u32>, Option<u32>)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The active console session (Windows), `None` when there is none or on
 /// other platforms.
 fn console_session_id() -> Option<u32> {
+    #[cfg(test)]
+    {
+        if let Some((_, console)) = PINNED_SESSIONS.get() {
+            return console;
+        }
+    }
     #[cfg(windows)]
     {
         // SAFETY: no arguments, no preconditions.
@@ -3078,30 +3234,30 @@ pub trait LocalApiState: Send + Sync {
     }
 }
 
-/// FR-85 — the refusal a non-console caller gets for a recording verb.
+/// FR-85 — a recording verb's refusal, which names the screen's person (#3907).
 fn not_the_console_user() -> Response {
     Response::Error {
-        message: "only the person at this device's console can start, stop or delete a \
+        message: "only the person at this device's screen can start, stop or delete a \
                   recording, or change where recordings are saved"
             .into(),
     }
 }
 
-/// FR-52 — the answer to anyone but the person at the console who tries to
-/// open this device to people outside its organization, or change how.
+/// FR-52 — the answer to anyone but the person at this device's screen who
+/// tries to open it to people outside its organization, or change how.
 fn not_the_console_user_for_external_access() -> Response {
     Response::Error {
-        message: "only the person at this device's console can open it to people outside \
+        message: "only the person at this device's screen can open it to people outside \
                   the organization, or change how"
             .into(),
     }
 }
 
 /// FR-92 P10 — the answer to a keep-busy start from anyone but the person at
-/// the console.
+/// this device's screen.
 fn not_the_person_for_keep_busy() -> Response {
     Response::Error {
-        message: "only the person at this device's console can turn keep busy on here — \
+        message: "only the person at this device's screen can turn keep busy on here — \
                   not root or SYSTEM, not a background service, not another session \
                   (anyone may stop it)"
             .into(),
@@ -3216,7 +3372,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Prefix("record_"),
         fr: "FR-85",
-        refusal: "only the person at this device's console can start, stop or delete a \
+        refusal: "only the person at this device's screen can start, stop or delete a \
                   recording, or change where recordings are saved",
         person_socket: &["record_remote_enabled", "record_remote_audio"],
         why_not_person_socket: "`record_dir` is where every recording on the device is saved: on \
@@ -3231,7 +3387,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("files_dir"),
         fr: "FR-84 D4",
-        refusal: "only the person at this device's console can change where incoming files \
+        refusal: "only the person at this device's screen can change where incoming files \
                   land",
         person_socket: &["files_dir"],
         why_not_person_socket: "",
@@ -3241,7 +3397,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("keep_busy_enabled"),
         fr: "FR-92",
-        refusal: "only the person at this device's console can change whether keep busy is \
+        refusal: "only the person at this device's screen can change whether keep busy is \
                   allowed here",
         person_socket: &["keep_busy_enabled"],
         why_not_person_socket: "",
@@ -3251,7 +3407,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("privacy_mode_allowed"),
         fr: "FR-99",
-        refusal: "only the person at this device's console can change whether privacy mode \
+        refusal: "only the person at this device's screen can change whether privacy mode \
                   is allowed here",
         person_socket: &["privacy_mode_allowed"],
         why_not_person_socket: "",
@@ -3261,7 +3417,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("lock_on_end"),
         fr: "FR-99 P3",
-        refusal: "only the person at this device's console can change whether this computer \
+        refusal: "only the person at this device's screen can change whether this computer \
                   locks when a remote session ends",
         person_socket: &["lock_on_end"],
         why_not_person_socket: "",
@@ -3272,7 +3428,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("display_match"),
         fr: "FR-108",
-        refusal: "only the person at this device's console can change whether a remote \
+        refusal: "only the person at this device's screen can change whether a remote \
                   session may switch this display",
         person_socket: &["display_match"],
         why_not_person_socket: "",
@@ -3283,7 +3439,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("peer_auth"),
         fr: "FR-100 P1c",
-        refusal: "only the person at this device's console can change whether this device \
+        refusal: "only the person at this device's screen can change whether this device \
                   checks the browsers that connect to it",
         person_socket: &["peer_auth"],
         why_not_person_socket: "",
@@ -3293,7 +3449,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("rc_clipboard"),
         fr: "FR-101 P2b",
-        refusal: "only the person at this device's console can change what a remote session \
+        refusal: "only the person at this device's screen can change what a remote session \
                   may use here (clipboard, files, audio)",
         person_socket: &["rc_clipboard"],
         why_not_person_socket: "",
@@ -3301,7 +3457,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("rc_files"),
         fr: "FR-101 P2b",
-        refusal: "only the person at this device's console can change what a remote session \
+        refusal: "only the person at this device's screen can change what a remote session \
                   may use here (clipboard, files, audio)",
         person_socket: &["rc_files"],
         why_not_person_socket: "",
@@ -3309,7 +3465,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("rc_audio"),
         fr: "FR-101 P2b",
-        refusal: "only the person at this device's console can change what a remote session \
+        refusal: "only the person at this device's screen can change what a remote session \
                   may use here (clipboard, files, audio)",
         person_socket: &["rc_audio"],
         why_not_person_socket: "",
@@ -3323,7 +3479,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Exact("allow_plaintext_server"),
         fr: "FR-101 P1b",
-        refusal: "only the person at this device's console can let it reach its server \
+        refusal: "only the person at this device's screen can let it reach its server \
                   without TLS",
         person_socket: &[],
         why_not_person_socket: "the device's server link, not the person's screen or session: \
@@ -3338,7 +3494,7 @@ pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     ConsoleKey {
         keys: KeyMatch::Prefix("external_"),
         fr: "FR-52",
-        refusal: "only the person at this device's console can open it to people outside \
+        refusal: "only the person at this device's screen can open it to people outside \
                   the organization, or change how",
         person_socket: &[
             "external_access_enabled",
@@ -3622,6 +3778,34 @@ fn not_at_the_seat_to_answer() -> Response {
     }
 }
 
+/// The answer to a consent answer (`ending` false) or a Disconnect (`ending`
+/// true) on the daemon's own endpoint from a peer
+/// [`peer_may_decide_for_the_screen`] does not admit. Nothing is decided,
+/// and the refusal is on the record.
+fn not_the_screens_person(peer: &ClientPeer, ending: bool) -> Response {
+    tracing::warn!(
+        peer_session = ?peer.session_id,
+        peer_uid = ?peer.uid,
+        peer_elevated = ?peer.elevated,
+        screen_session = ?screen_session(own_session_id(), console_session_id()),
+        verb = if ending { "rc_disconnect" } else { "consent_decide" },
+        "localapi: refused, from a caller that is not the person at this device's screen, \
+         SYSTEM or an elevated administrator"
+    );
+    let message = if ending {
+        "The session was not ended: only the person signed in at this device's screen ends a \
+         session on it from here, or SYSTEM, or an administrator from an elevated prompt. This \
+         caller is none of those."
+    } else {
+        "The answer was not taken: only the person signed in at this device's screen answers a \
+         request to see or control it, or SYSTEM, or an administrator from an elevated prompt. \
+         This caller is none of those."
+    };
+    Response::Error {
+        message: message.into(),
+    }
+}
+
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
 /// No I/O — the pipe listener (P1-cont) reads a JSON line, deserialises a
 /// [`Request`], calls this, and writes the [`Response`] back.
@@ -3703,7 +3887,8 @@ where
 
 /// [`serve_connection`] with the peer the listener identified at accept time.
 /// FR-85: the recording verbs and a `ConfigSet` of any `record_*` key require
-/// [`ClientPeer::is_console_user`]; an unknown peer fails that check.
+/// [`ClientPeer::is_console_user`]; a consent answer and a Disconnect require
+/// [`ClientPeer::may_decide_for_the_screen`]. An unknown peer fails both.
 pub async fn serve_connection_as<S>(
     stream: S,
     state: &dyn LocalApiState,
@@ -3789,9 +3974,10 @@ where
                 // session may use (FR-101 P2b), the TLS escape (FR-101 P1b),
                 // external access (FR-52) — are ONE table, `CONSOLE_PERSON_KEYS`
                 // (#2871), each refused in its own words to anyone but that
-                // person: on the daemon's own endpoint the console session or
-                // the daemon's uid (the pipe admits RDP guests too), on the
-                // person socket its person (`may_set_console_key`).
+                // person: on the daemon's own endpoint the session whose screen
+                // the daemon shows (`screen_session`) or the daemon's uid (the
+                // pipe admits every interactive user), on the person socket its
+                // person (`may_set_console_key`).
                 Ok(Request::ConfigSet { key, .. })
                     if console_person_key(&key).is_some() && !peer.may_set_console_key(scope) =>
                 {
@@ -3832,6 +4018,22 @@ where
                             message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
                         },
                     }
+                }
+                // And on the daemon's own endpoint a consent answer and a
+                // Disconnect come from the person at the screen this daemon
+                // shows, SYSTEM or an elevated administrator, as the OS read
+                // the peer at accept: the Windows pipe admits every interactive
+                // user. A peer it could not read is refused. Any scope but the
+                // person socket's, so a new one starts refused.
+                Ok(Request::ConsentDecide { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, false)
+                }
+                Ok(Request::RcDisconnect { .. })
+                    if !scope.is_person() && !peer.may_decide_for_the_screen() =>
+                {
+                    not_the_screens_person(&peer, true)
                 }
                 Ok(Request::ExternalPasswordSet { .. } | Request::ExternalPasswordClear)
                     if !peer.is_console_user() =>
@@ -8301,27 +8503,677 @@ mod tests {
             system_account: None,
             ..ClientPeer::UNKNOWN
         };
-        // Windows: the peer's session must be the active console session.
-        assert!(peer_is_console_user(&win(1), Some(1), None));
+        // Windows, a worker in the console session (1): the peer's session
+        // must be that session.
+        assert!(peer_is_console_user(&win(1), Some(1), Some(1), None));
         assert!(
-            !peer_is_console_user(&win(2), Some(1), None),
+            !peer_is_console_user(&win(2), Some(1), Some(1), None),
             "an RDP session"
         );
         assert!(
-            !peer_is_console_user(&win(1), None, None),
+            !peer_is_console_user(&win(1), None, Some(0), None),
             "no console session at all"
         );
         // Unix: the daemon's own uid, or root.
-        assert!(peer_is_console_user(&unix(1000), None, Some(1000)));
-        assert!(peer_is_console_user(&unix(0), None, Some(1000)));
-        assert!(!peer_is_console_user(&unix(1001), None, Some(1000)));
+        assert!(peer_is_console_user(&unix(1000), None, None, Some(1000)));
+        assert!(peer_is_console_user(&unix(0), None, None, Some(1000)));
+        assert!(!peer_is_console_user(&unix(1001), None, None, Some(1000)));
         // Fail-closed on anything unknown.
         assert!(!peer_is_console_user(
             &ClientPeer::UNKNOWN,
             Some(1),
+            Some(1),
             Some(1000)
         ));
         assert!(!ClientPeer::UNKNOWN.is_console_user());
+    }
+
+    /// A Windows person's process, as the pipe reads it at accept: its
+    /// session, and from its token a person's account, not elevated.
+    fn person_in_session(s: u32) -> ClientPeer {
+        ClientPeer {
+            session_id: Some(s),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1001".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        }
+    }
+
+    /// One console person's gate on the daemon's own endpoint, as a function
+    /// of the peer, the console session and the daemon's own session.
+    type ScreenGate = fn(&ClientPeer, Option<u32>, Option<u32>) -> bool;
+
+    /// The console person's gates on the daemon's own endpoint: a console
+    /// person's `ConfigSet` key, the recording verbs, keep busy on, and
+    /// `is_console_user`, the external-access password's gate.
+    const CONSOLE_PERSON_GATES: [(&str, ScreenGate); 4] = [
+        (
+            "is_console_user (the external-access password)",
+            |p, c, o| peer_is_console_user(p, c, o, None),
+        ),
+        ("a console person's key", |p, c, o| {
+            peer_may_set_console_key(p, Scope::Full, c, o, None)
+        }),
+        ("the recording verbs", |p, c, o| {
+            peer_may_record(p, Scope::Full, c, o, None)
+        }),
+        ("keep busy on", |p, c, o| {
+            peer_may_start_keep_busy(p, Scope::Full, c, o, None)
+        }),
+    ];
+
+    /// On Windows the console person's gates take the person at the screen
+    /// this daemon shows ([`screen_session`]), as a consent answer does: a
+    /// per-user daemon in an RDP session takes that session's person and
+    /// refuses the console's; a worker in the console session and a daemon in
+    /// session 0 take the console's; with neither session known nobody passes
+    /// by session. A table per gate; every wrong row is named.
+    #[test]
+    fn the_console_persons_gates_follow_the_screens_session() {
+        // (the daemon, the console session, its own session, the one taken)
+        let rows = [
+            (
+                "a per-user daemon in RDP session 3",
+                Some(1),
+                Some(3),
+                Some(3),
+            ),
+            (
+                "a per-user daemon in RDP session 3, no console session",
+                None,
+                Some(3),
+                Some(3),
+            ),
+            ("a worker in the console session", Some(1), Some(1), Some(1)),
+            ("a worker in console session 2", Some(2), Some(2), Some(2)),
+            ("a daemon in session 0", Some(1), Some(0), Some(1)),
+            (
+                "a daemon in session 0, no console session",
+                None,
+                Some(0),
+                None,
+            ),
+            (
+                "a daemon whose own session is unreadable",
+                Some(1),
+                None,
+                None,
+            ),
+            ("no session known", None, None, None),
+        ];
+        let mut wrong = Vec::new();
+        for (gate, may) in CONSOLE_PERSON_GATES {
+            for (daemon, console, own, taken) in rows {
+                for s in 0..=4 {
+                    let want = Some(s) == taken;
+                    if may(&person_in_session(s), console, own) != want {
+                        wrong.push(format!(
+                            "{gate}: {daemon}: the person in session {s} must be {}",
+                            if want { "taken" } else { "refused" }
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} rows wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+
+        // Each gate's other conditions stay as they were, in the screen's
+        // session too: keep busy on takes a person's account only, never
+        // SYSTEM nor an account that could not be read, and elevation is no
+        // pass to any of these gates.
+        let (console, own) = (Some(1), Some(3));
+        let system = ClientPeer {
+            system_account: Some(true),
+            sid: Some(SYSTEM_SID.into()),
+            elevated: Some(true),
+            ..person_in_session(3)
+        };
+        let unread = ClientPeer {
+            system_account: None,
+            sid: None,
+            elevated: None,
+            ..person_in_session(3)
+        };
+        assert!(!peer_may_start_keep_busy(
+            &system,
+            Scope::Full,
+            console,
+            own,
+            None
+        ));
+        assert!(!peer_may_start_keep_busy(
+            &unread,
+            Scope::Full,
+            console,
+            own,
+            None
+        ));
+        assert!(
+            peer_is_console_user(&system, console, own, None),
+            "the gate keep busy tightens"
+        );
+        let elevated_at_the_console = ClientPeer {
+            sid: Some("S-1-5-21-1-2-3-500".into()),
+            elevated: Some(true),
+            ..person_in_session(1)
+        };
+        for (gate, may) in CONSOLE_PERSON_GATES {
+            assert!(!may(&elevated_at_the_console, console, own), "{gate}");
+        }
+
+        // Unix reads no session (both `None`), so each gate decides by the
+        // uid, as it always has: a per-user daemon's own uid or root, and
+        // keep busy never root.
+        for (uid, console_person, keep_busy) in
+            [(501, true, true), (0, true, false), (502, false, false)]
+        {
+            let peer = ClientPeer {
+                uid: Some(uid),
+                gid: Some(uid),
+                ..ClientPeer::UNKNOWN
+            };
+            let full = Scope::Full;
+            assert_eq!(
+                peer_is_console_user(&peer, None, None, Some(501)),
+                console_person,
+                "{uid}"
+            );
+            assert_eq!(
+                peer_may_set_console_key(&peer, full, None, None, Some(501)),
+                console_person,
+                "{uid}"
+            );
+            assert_eq!(
+                peer_may_record(&peer, full, None, None, Some(501)),
+                console_person,
+                "{uid}"
+            );
+            assert_eq!(
+                peer_may_start_keep_busy(&peer, full, None, None, Some(501)),
+                keep_busy,
+                "{uid}"
+            );
+        }
+    }
+
+    /// A machine-wide install: the service host starts its worker in the
+    /// active console session, so the screen's session is the console
+    /// session, and a daemon in session 0 goes by the console session. There
+    /// every console person's gate decides exactly as the console-session
+    /// rule did, for every peer, on both scopes. That rule is written out
+    /// here.
+    #[test]
+    fn on_a_machine_wide_install_the_console_persons_gates_decide_as_before() {
+        let console_user_was = |p: &ClientPeer, console: Option<u32>, uid: Option<u32>| match (
+            p.session_id,
+            console,
+        ) {
+            (Some(s), Some(c)) => s == c,
+            _ => matches!((p.uid, uid), (Some(a), Some(o)) if a == o || a == 0),
+        };
+        let keep_busy_was =
+            |p: &ClientPeer, scope: Scope, console: Option<u32>, uid: Option<u32>| {
+                if p.uid == Some(0) {
+                    return false;
+                }
+                match (p.session_id, console) {
+                    (Some(s), Some(c)) => s == c && s != 0 && p.system_account == Some(false),
+                    _ => match scope {
+                        Scope::Person { owner_uid } => person_peer_ok(p, owner_uid),
+                        Scope::Full => matches!((p.uid, uid), (Some(a), Some(o)) if a == o),
+                    },
+                }
+            };
+        let mut peers = vec![ClientPeer::UNKNOWN];
+        for s in 0..=3 {
+            for system_account in [None, Some(false), Some(true)] {
+                for elevated in [None, Some(false), Some(true)] {
+                    peers.push(ClientPeer {
+                        session_id: Some(s),
+                        system_account,
+                        elevated,
+                        ..ClientPeer::UNKNOWN
+                    });
+                }
+            }
+        }
+        for u in [0, 501, 502] {
+            peers.push(ClientPeer {
+                uid: Some(u),
+                gid: Some(u),
+                ..ClientPeer::UNKNOWN
+            });
+        }
+        let mut checked = 0;
+        for console in [1, 2] {
+            let c = Some(console);
+            // The worker in the console session, and a daemon in session 0.
+            for own in [c, Some(0)] {
+                for uid in [None, Some(0), Some(501)] {
+                    for scope in [Scope::Full, Scope::Person { owner_uid: 501 }] {
+                        for p in &peers {
+                            let was = console_user_was(p, c, uid);
+                            let key_or_record_was = match scope {
+                                Scope::Full => was,
+                                Scope::Person { owner_uid } => person_peer_ok(p, owner_uid),
+                            };
+                            let at = format!(
+                                "{p:?}, console {c:?}, own {own:?}, uid {uid:?}, {scope:?}"
+                            );
+                            assert_eq!(peer_is_console_user(p, c, own, uid), was, "{at}");
+                            assert_eq!(
+                                peer_may_set_console_key(p, scope, c, own, uid),
+                                key_or_record_was,
+                                "{at}"
+                            );
+                            assert_eq!(
+                                peer_may_record(p, scope, c, own, uid),
+                                key_or_record_was,
+                                "{at}"
+                            );
+                            assert_eq!(
+                                peer_may_start_keep_busy(p, scope, c, own, uid),
+                                keep_busy_was(p, scope, c, uid),
+                                "{at}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 2 * 3 * 2 * peers.len());
+    }
+
+    /// Pins what this thread reads as the daemon's own session and the
+    /// console session (`PINNED_SESSIONS`) until it drops.
+    struct PinnedSessions;
+
+    impl PinnedSessions {
+        fn own_and_console(own: Option<u32>, console: Option<u32>) -> Self {
+            PINNED_SESSIONS.set(Some((own, console)));
+            PinnedSessions
+        }
+    }
+
+    impl Drop for PinnedSessions {
+        fn drop(&mut self) {
+            PINNED_SESSIONS.set(None);
+        }
+    }
+
+    /// A daemon that takes every console person's verb and counts the ones
+    /// that reach it.
+    #[derive(Clone, Default)]
+    struct TakesTheVerbs(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl TakesTheVerbs {
+        fn reached(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn take(&self) -> Response {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Response::KeepBusy(KeepBusyInfo::unavailable())
+        }
+    }
+
+    #[async_trait]
+    impl LocalApiState for TakesTheVerbs {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn config_set(&self, _key: &str, _value: Option<&str>) -> Response {
+            self.take()
+        }
+        async fn external_password_set(&self, _password: &Secret) -> Response {
+            self.take()
+        }
+        async fn external_password_clear(&self) -> Response {
+            self.take()
+        }
+        async fn record_start(&self, _opts: RecordStartOpts) -> Response {
+            self.take()
+        }
+        async fn record_stop(&self) -> Response {
+            self.take()
+        }
+        async fn recording_delete(&self, _name: &str) -> Response {
+            self.take()
+        }
+        async fn keep_busy_on(&self, _opts: KeepBusyStartOpts) -> Response {
+            self.take()
+        }
+        async fn keep_busy_off(&self) -> Response {
+            self.take()
+        }
+    }
+
+    /// Through the dispatcher, with this thread reading the sessions each
+    /// kind of daemon reads: the person at the screen it shows sets a console
+    /// person's key, turns keep busy on, records, and sets and clears the
+    /// external-access password; anyone in another session is refused each
+    /// in the gate's own words, and nothing reaches the daemon. Stopping keep
+    /// busy stays open to every peer.
+    #[tokio::test]
+    async fn the_console_persons_verbs_follow_the_screen_the_daemon_shows() {
+        // Built, never a literal: a scanner cannot tell a test password from a leak.
+        let password_set = format!(
+            r#"{{"t":"external_password_set","d":{{"password":"{}"}}}}"#,
+            "p".repeat(16)
+        );
+        let verbs = [
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
+            r#"{"t":"keep_busy_on","d":{}}"#,
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"a.mp4"}}"#,
+            password_set.as_str(),
+            r#"{"t":"external_password_clear"}"#,
+        ];
+        /// A kind of daemon: the two sessions it reads, and the sessions
+        /// whose person it takes and refuses.
+        struct Daemon {
+            what: &'static str,
+            own: Option<u32>,
+            console: Option<u32>,
+            taken: &'static [u32],
+            refused: &'static [u32],
+        }
+        let daemons = [
+            Daemon {
+                what: "a per-user daemon in RDP session 3",
+                own: Some(3),
+                console: Some(1),
+                taken: &[3],
+                refused: &[1, 2, 0],
+            },
+            Daemon {
+                what: "a worker in the console session",
+                own: Some(1),
+                console: Some(1),
+                taken: &[1],
+                refused: &[3, 0],
+            },
+            Daemon {
+                what: "a daemon in session 0",
+                own: Some(0),
+                console: Some(1),
+                taken: &[1],
+                refused: &[3, 0],
+            },
+            Daemon {
+                what: "a daemon whose own session is unreadable",
+                own: None,
+                console: Some(1),
+                taken: &[],
+                refused: &[1, 3],
+            },
+            Daemon {
+                what: "a daemon in session 0, no console session",
+                own: Some(0),
+                console: None,
+                taken: &[],
+                refused: &[1, 3, 0],
+            },
+        ];
+        let mut wrong = Vec::new();
+        for Daemon {
+            what: daemon,
+            own,
+            console,
+            taken,
+            refused,
+        } in daemons
+        {
+            let _pinned = PinnedSessions::own_and_console(own, console);
+            for &s in taken {
+                if !person_in_session(s).is_console_user() {
+                    wrong.push(format!("{daemon}: session {s}: not is_console_user"));
+                }
+                for line in verbs {
+                    let state = TakesTheVerbs::default();
+                    let r =
+                        ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(s), line)
+                            .await;
+                    if state.reached() != 1 {
+                        wrong.push(format!("{daemon}: session {s} refused {line} → {r:?}"));
+                    }
+                }
+            }
+            for &s in refused {
+                if person_in_session(s).is_console_user() {
+                    wrong.push(format!("{daemon}: session {s}: is_console_user"));
+                }
+                for line in verbs {
+                    let state = TakesTheVerbs::default();
+                    let r =
+                        ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(s), line)
+                            .await;
+                    if state.reached() != 0 || !is_console_refusal(&r) {
+                        wrong.push(format!("{daemon}: session {s} taken {line} → {r:?}"));
+                    }
+                }
+                let state = TakesTheVerbs::default();
+                let off = r#"{"t":"keep_busy_off"}"#;
+                ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(s), off).await;
+                if state.reached() != 1 {
+                    wrong.push(format!("{daemon}: session {s} could not stop keep busy"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// #3907 — `line` from the person at the CONSOLE of a per-user daemon in
+    /// RDP session 3: since #3903 the console person's gates take the person
+    /// at the screen the daemon shows, session 3's, and refuse this one. The
+    /// refusal, which must not reach the daemon.
+    async fn refused_at_the_console_of_an_rdp_daemon(line: &str) -> String {
+        let _pinned = PinnedSessions::own_and_console(Some(3), Some(1));
+        let state = TakesTheVerbs::default();
+        let r = ask_state_scoped_as(state.clone(), Scope::Full, person_in_session(1), line).await;
+        assert_eq!(state.reached(), 0, "{line} reached the daemon: {r:?}");
+        match r {
+            Response::Error { message } => message,
+            other => panic!("{line} was not refused: {other:?}"),
+        }
+    }
+
+    /// #3907 — the recording verbs' refusal names the person at this device's
+    /// screen, whom the gate takes, and never the console, whose person it
+    /// refuses here.
+    #[tokio::test]
+    async fn a_recording_verbs_refusal_names_the_person_at_the_screen() {
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"a.mp4"}}"#,
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can start, stop or delete a recording, \
+                 or change where recordings are saved",
+                "{line}"
+            );
+        }
+    }
+
+    /// #3907 — keep busy on: its refusal names the person at this device's
+    /// screen.
+    #[tokio::test]
+    async fn a_keep_busy_starts_refusal_names_the_person_at_the_screen() {
+        assert_eq!(
+            refused_at_the_console_of_an_rdp_daemon(r#"{"t":"keep_busy_on","d":{}}"#).await,
+            "only the person at this device's screen can turn keep busy on here — not root or \
+             SYSTEM, not a background service, not another session (anyone may stop it)"
+        );
+    }
+
+    /// #3907 — the external-access password, set and clear: its refusal names
+    /// the person at this device's screen.
+    #[tokio::test]
+    async fn the_external_access_passwords_refusal_names_the_person_at_the_screen() {
+        // Built, never a literal: a scanner cannot tell a test password from a leak.
+        let set = format!(
+            r#"{{"t":"external_password_set","d":{{"password":"{}"}}}}"#,
+            "p".repeat(16)
+        );
+        for (verb, line) in [
+            ("external_password_set", set.as_str()),
+            (
+                "external_password_clear",
+                r#"{"t":"external_password_clear"}"#,
+            ),
+        ] {
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(line).await,
+                "only the person at this device's screen can open it to people outside the \
+                 organization, or change how",
+                "{verb}"
+            );
+        }
+    }
+
+    /// #3907 — a console person's `ConfigSet` key: every entry of
+    /// [`CONSOLE_PERSON_KEYS`] refuses in its own words, which name the person
+    /// at this device's screen.
+    #[tokio::test]
+    async fn a_console_persons_keys_refusal_names_the_person_at_the_screen() {
+        const RECORDING: &str = "only the person at this device's screen can start, stop or \
+                                 delete a recording, or change where recordings are saved";
+        const OUTSIDERS: &str = "only the person at this device's screen can open it to people \
+                                 outside the organization, or change how";
+        const SESSION_USE: &str = "only the person at this device's screen can change what a \
+                                   remote session may use here (clipboard, files, audio)";
+        let expected = [
+            ("record_dir", RECORDING),
+            ("record_remote_enabled", RECORDING),
+            ("record_remote_audio", RECORDING),
+            (
+                "files_dir",
+                "only the person at this device's screen can change where incoming files land",
+            ),
+            (
+                "keep_busy_enabled",
+                "only the person at this device's screen can change whether keep busy is \
+                 allowed here",
+            ),
+            (
+                "privacy_mode_allowed",
+                "only the person at this device's screen can change whether privacy mode is \
+                 allowed here",
+            ),
+            (
+                "lock_on_end",
+                "only the person at this device's screen can change whether this computer locks \
+                 when a remote session ends",
+            ),
+            (
+                "display_match",
+                "only the person at this device's screen can change whether a remote session \
+                 may switch this display",
+            ),
+            (
+                "peer_auth",
+                "only the person at this device's screen can change whether this device checks \
+                 the browsers that connect to it",
+            ),
+            ("rc_clipboard", SESSION_USE),
+            ("rc_files", SESSION_USE),
+            ("rc_audio", SESSION_USE),
+            (
+                "allow_plaintext_server",
+                "only the person at this device's screen can let it reach its server without TLS",
+            ),
+            ("external_access_enabled", OUTSIDERS),
+            ("external_consent_mode", OUTSIDERS),
+            ("external_max_permissions", OUTSIDERS),
+        ];
+        // Every entry of the table is asked, a new one included.
+        for k in CONSOLE_PERSON_KEYS {
+            assert!(
+                expected.iter().any(|(key, _)| k.keys.matches(key)),
+                "{k:?}: no key of it is asked here"
+            );
+        }
+        for (key, words) in expected {
+            let line = format!(r#"{{"t":"config_set","d":{{"key":"{key}","value":"false"}}}}"#);
+            assert_eq!(
+                refused_at_the_console_of_an_rdp_daemon(&line).await,
+                words,
+                "{key}"
+            );
+        }
+    }
+
+    /// The tray and the CLI as the pipe reads them: a client of this process,
+    /// read from the OS at accept (its session, its account from its token),
+    /// sets a console person's key, turns keep busy on and starts a recording
+    /// over a real pipe, as the person at the screen this process shows. A
+    /// process in session 0, or one running as a service account, shows no
+    /// person's screen, and the test says it skipped.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_client_at_the_screen_sets_a_console_persons_key_over_a_real_pipe() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let pipe = format!(
+            r"\\.\pipe\roomler-test-console-person-{}",
+            std::process::id()
+        );
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let client = ClientOptions::new().open(&pipe).unwrap();
+        server.connect().await.unwrap();
+        let peer = pipe_client_peer(server.as_raw_handle());
+        if own_session_id().is_none_or(|s| s == 0) || peer.system_account != Some(false) {
+            eprintln!("skipped: session 0 or a service account: {peer:?}");
+            return;
+        }
+        assert_eq!(
+            peer.session_id,
+            screen_session(own_session_id(), console_session_id()),
+            "{peer:?}"
+        );
+        let state = TakesTheVerbs::default();
+        let st = state.clone();
+        let served = tokio::spawn(async move { serve_connection_as(server, &st, peer).await });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        for line in [
+            r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
+            r#"{"t":"keep_busy_on","d":{}}"#,
+            r#"{"t":"record_start","d":{}}"#,
+        ] {
+            wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let got = lines.next_line().await.unwrap().unwrap();
+            let r = serde_json::from_str::<Response>(&got).unwrap();
+            assert!(!is_console_refusal(&r), "{line}: {got}");
+        }
+        drop(wr);
+        drop(lines);
+        served.await.unwrap().unwrap();
+        assert_eq!(state.reached(), 3);
     }
 
     /// FR-92 P10 — who may turn keep busy ON. Root never: it is how
@@ -8351,60 +9203,91 @@ mod tests {
         };
         let full = Scope::Full;
         let person = Scope::Person { owner_uid: 1000 };
-        // Windows: the active console session only; session 0 never.
-        assert!(peer_may_start_keep_busy(&win(1), full, Some(1), None));
+        // Windows, a worker in the console session (1): that session only;
+        // session 0 never.
+        assert!(peer_may_start_keep_busy(
+            &win(1),
+            full,
+            Some(1),
+            Some(1),
+            None
+        ));
         // P10b — SYSTEM (and LocalService / NetworkService) never, even inside
         // the console session: that is how `roomler exec` arrives on a host in
         // SystemContext mode. The console-user gate would let it through.
         assert!(
-            !peer_may_start_keep_busy(&win_as(1, Some(true)), full, Some(1), None),
+            !peer_may_start_keep_busy(&win_as(1, Some(true)), full, Some(1), Some(1), None),
             "SYSTEM in the console session"
         );
         assert!(
-            peer_is_console_user(&win_as(1, Some(true)), Some(1), None),
+            peer_is_console_user(&win_as(1, Some(true)), Some(1), Some(1), None),
             "the gate this one tightens"
         );
         // P10b — an account the listener could not read is a refusal.
         assert!(
-            !peer_may_start_keep_busy(&win_as(1, None), full, Some(1), None),
+            !peer_may_start_keep_busy(&win_as(1, None), full, Some(1), Some(1), None),
             "an unreadable account"
         );
         assert!(
-            !peer_may_start_keep_busy(&win(2), full, Some(1), None),
+            !peer_may_start_keep_busy(&win(2), full, Some(1), Some(1), None),
             "an RDP session"
         );
         assert!(
-            !peer_may_start_keep_busy(&win(0), full, Some(0), None),
+            !peer_may_start_keep_busy(&win(0), full, Some(0), Some(0), None),
             "session 0"
         );
         assert!(
-            !peer_may_start_keep_busy(&win(1), full, None, None),
+            !peer_may_start_keep_busy(&win(1), full, None, Some(0), None),
             "no console"
         );
         // A per-user daemon: its owner — and NOT root, unlike the console gate.
-        assert!(peer_may_start_keep_busy(&unix(501), full, None, Some(501)));
+        assert!(peer_may_start_keep_busy(
+            &unix(501),
+            full,
+            None,
+            None,
+            Some(501)
+        ));
         assert!(
-            !peer_may_start_keep_busy(&unix(0), full, None, Some(501)),
+            !peer_may_start_keep_busy(&unix(0), full, None, None, Some(501)),
             "root"
         );
         assert!(
-            peer_is_console_user(&unix(0), None, Some(501)),
+            peer_is_console_user(&unix(0), None, None, Some(501)),
             "the gate this one tightens"
         );
         assert!(
-            !peer_may_start_keep_busy(&unix(502), full, None, Some(501)),
+            !peer_may_start_keep_busy(&unix(502), full, None, None, Some(501)),
             "another user"
         );
         // A root daemon's own socket: only root reaches it, and root may not.
-        assert!(!peer_may_start_keep_busy(&unix(0), full, None, Some(0)));
+        assert!(!peer_may_start_keep_busy(
+            &unix(0),
+            full,
+            None,
+            None,
+            Some(0)
+        ));
         // The person socket of a system install: its person; root never.
-        assert!(peer_may_start_keep_busy(&unix(1000), person, None, Some(0)));
-        assert!(!peer_may_start_keep_busy(&unix(0), person, None, Some(0)));
+        assert!(peer_may_start_keep_busy(
+            &unix(1000),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(!peer_may_start_keep_busy(
+            &unix(0),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
         // #2871 (review) — and nobody else, decided HERE as well as by the
         // listener that would have dropped them: another account's uid on
         // that socket is not its person.
         assert!(
-            !peer_may_start_keep_busy(&unix(1001), person, None, Some(0)),
+            !peer_may_start_keep_busy(&unix(1001), person, None, None, Some(0)),
             "another account on the person socket"
         );
         // Fail closed.
@@ -8412,6 +9295,7 @@ mod tests {
             assert!(!peer_may_start_keep_busy(
                 &ClientPeer::UNKNOWN,
                 scope,
+                Some(1),
                 Some(1),
                 Some(501)
             ));
@@ -8620,8 +9504,12 @@ mod tests {
         serde_json::from_str(&r).unwrap()
     }
 
+    /// How every console person's gate refuses: it names the person at this
+    /// device's screen, whom the gate takes (#3907).
+    const AT_THE_SCREEN: &str = "only the person at this device's screen can ";
+
     fn is_console_refusal(r: &Response) -> bool {
-        matches!(r, Response::Error { message } if message.contains("console"))
+        matches!(r, Response::Error { message } if message.starts_with(AT_THE_SCREEN))
     }
 
     fn is_person_refusal(r: &Response) -> bool {
@@ -8995,8 +9883,8 @@ mod tests {
             assert_eq!(k.person_socket.contains(key), *on_person_socket, "{key}");
             assert_eq!(person_socket_admits_key(key), *on_person_socket, "{key}");
             assert!(
-                k.refusal.contains("console"),
-                "{key}'s refusal names the console person: {}",
+                k.refusal.starts_with(AT_THE_SCREEN),
+                "{key}'s refusal names the person at this device's screen: {}",
                 k.refusal
             );
             // A key kept off the person socket has its entry say why.
@@ -9134,30 +10022,74 @@ mod tests {
         };
         let full = Scope::Full;
         let person = Scope::Person { owner_uid: 501 };
-        // The daemon's own endpoint: as the console gate always decided.
-        assert!(peer_may_set_console_key(&win(1), full, Some(1), None));
+        // The daemon's own endpoint: as the console gate always decided (a
+        // worker in the console session, 1, on Windows).
+        assert!(peer_may_set_console_key(
+            &win(1),
+            full,
+            Some(1),
+            Some(1),
+            None
+        ));
         assert!(
-            !peer_may_set_console_key(&win(2), full, Some(1), None),
+            !peer_may_set_console_key(&win(2), full, Some(1), Some(1), None),
             "an RDP session"
         );
-        assert!(peer_may_set_console_key(&unix(501), full, None, Some(501)));
-        assert!(peer_may_set_console_key(&unix(0), full, None, Some(501)));
+        assert!(peer_may_set_console_key(
+            &unix(501),
+            full,
+            None,
+            None,
+            Some(501)
+        ));
+        assert!(peer_may_set_console_key(
+            &unix(0),
+            full,
+            None,
+            None,
+            Some(501)
+        ));
         assert!(
-            !peer_may_set_console_key(&unix(502), full, None, Some(501)),
+            !peer_may_set_console_key(&unix(502), full, None, None, Some(501)),
             "another user"
         );
         // A root daemon's own endpoint: only root reaches it, and only root
         // passes — which is why the person at the seat of a root-mode install
         // had no path to their own keys before design A.
-        assert!(peer_may_set_console_key(&unix(0), full, None, Some(0)));
-        assert!(!peer_may_set_console_key(&unix(501), full, None, Some(0)));
+        assert!(peer_may_set_console_key(
+            &unix(0),
+            full,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(!peer_may_set_console_key(
+            &unix(501),
+            full,
+            None,
+            None,
+            Some(0)
+        ));
         // The person socket of that root daemon: its person and root; never a
         // peer the OS said nothing about.
-        assert!(peer_may_set_console_key(&unix(501), person, None, Some(0)));
-        assert!(peer_may_set_console_key(&unix(0), person, None, Some(0)));
+        assert!(peer_may_set_console_key(
+            &unix(501),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
+        assert!(peer_may_set_console_key(
+            &unix(0),
+            person,
+            None,
+            None,
+            Some(0)
+        ));
         assert!(!peer_may_set_console_key(
             &ClientPeer::UNKNOWN,
             person,
+            None,
             None,
             Some(0)
         ));
@@ -9166,16 +10098,23 @@ mod tests {
         // known uid passed on that socket: drop the listener's check and
         // another account's `ConfigSet` would have been applied.
         assert!(
-            !peer_may_set_console_key(&unix(502), person, None, Some(0)),
+            !peer_may_set_console_key(&unix(502), person, None, None, Some(0)),
             "another account on the person socket"
         );
         assert!(
-            !peer_may_set_console_key(&unix(501), Scope::Person { owner_uid: 502 }, None, Some(0)),
+            !peer_may_set_console_key(
+                &unix(501),
+                Scope::Person { owner_uid: 502 },
+                None,
+                None,
+                Some(0)
+            ),
             "the person a socket was made for, on another person's socket"
         );
         assert!(!peer_may_set_console_key(
             &ClientPeer::UNKNOWN,
             full,
+            Some(1),
             Some(1),
             Some(0)
         ));
@@ -9503,9 +10442,376 @@ mod tests {
         };
         let r = ask_state_scoped_as(SeatNotKnownYet, SEAT, root, approve).await;
         assert_eq!(r, Response::ConsentDecided { ok: true });
-        // The daemon's own endpoint never asks the seat.
-        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana, approve).await;
+        // The daemon's own endpoint never asks the seat. It takes a consent
+        // answer only from the person at the screen it shows, SYSTEM or an
+        // elevated administrator (`peer_may_decide_for_the_screen`), so `ana`
+        // asks there as an elevated administrator: a peer it identifies on
+        // every OS.
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana
+        };
+        let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana_elevated, approve).await;
         assert_eq!(r, Response::ConsentDecided { ok: true });
+    }
+
+    /// A daemon that counts the consent answers and the Disconnects that
+    /// reach it, and takes every one.
+    #[derive(Clone, Default)]
+    struct Counting {
+        decided: Arc<std::sync::atomic::AtomicUsize>,
+        ended: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl LocalApiState for Counting {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            self.decided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        fn rc_disconnect(&self, _session_id: &str) -> bool {
+            self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    impl Counting {
+        fn decided(&self) -> usize {
+            self.decided.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn ended(&self) -> usize {
+            self.ended.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Who may answer a consent prompt or end a live session over the
+    /// daemon's own endpoint: the person at the screen the daemon shows,
+    /// SYSTEM, or an administrator who elevated. On Windows that screen is the
+    /// daemon's own session, and only a daemon in session 0 (the service host)
+    /// takes the console's; with neither known, only SYSTEM and an elevated
+    /// administrator. On Unix it is the daemon's own account or root, as its
+    /// owner-only socket admits.
+    #[test]
+    fn the_screen_decision_table() {
+        let decide = peer_may_decide_for_the_screen;
+        // A Windows person's process, read from its token.
+        let win = |s: u32| ClientPeer {
+            session_id: Some(s),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1001".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let elevated = |s: u32| ClientPeer {
+            sid: Some("S-1-5-21-1-2-3-500".into()),
+            elevated: Some(true),
+            ..win(s)
+        };
+        let system = |s: u32| ClientPeer {
+            system_account: Some(true),
+            sid: Some("S-1-5-18".into()),
+            elevated: Some(true),
+            ..win(s)
+        };
+        let unix = |u: u32| ClientPeer {
+            uid: Some(u),
+            gid: Some(u),
+            ..ClientPeer::UNKNOWN
+        };
+
+        // A machine-wide install: the worker runs in the console session (1).
+        assert!(
+            decide(&win(1), Some(1), Some(1), None),
+            "the console person"
+        );
+        assert!(
+            !decide(&win(2), Some(1), Some(1), None),
+            "another signed-in account: a switched-away user, an RDP session"
+        );
+        assert!(
+            decide(&elevated(2), Some(1), Some(1), None),
+            "an elevated administrator, from any session"
+        );
+        assert!(decide(&system(0), Some(1), Some(1), None), "SYSTEM");
+        assert!(
+            decide(&system(1), Some(1), Some(1), None),
+            "SYSTEM in the console session"
+        );
+
+        // A per-user install whose person works over RDP: the daemon runs in
+        // that RDP session (3), and its screen is the one it shows.
+        assert!(
+            decide(&win(3), Some(1), Some(3), None),
+            "the person in the RDP session the daemon shows"
+        );
+        assert!(
+            !decide(&win(1), Some(1), Some(3), None),
+            "the person at the console is someone else"
+        );
+        assert!(
+            decide(&elevated(1), Some(1), Some(3), None),
+            "an elevated administrator"
+        );
+        assert!(decide(&system(0), Some(1), Some(3), None), "SYSTEM");
+
+        // A daemon in session 0, the service host: the console session.
+        assert!(decide(&win(1), Some(1), Some(0), None));
+        assert!(
+            !decide(&win(0), Some(1), Some(0), None),
+            "session 0 is never a person's"
+        );
+        assert!(!decide(&win(2), Some(1), Some(0), None));
+
+        // No console session, or a daemon whose own session could not be
+        // read: nobody but SYSTEM and an elevated administrator.
+        for (console, own) in [(None, Some(0)), (Some(1), None), (None, None)] {
+            for s in [0, 1, 2] {
+                assert!(
+                    !decide(&win(s), console, own, None),
+                    "{console:?} {own:?} {s}"
+                );
+            }
+            assert!(
+                decide(&system(0), console, own, None),
+                "{console:?} {own:?}"
+            );
+            assert!(
+                decide(&elevated(1), console, own, None),
+                "{console:?} {own:?}"
+            );
+        }
+
+        // SYSTEM by its own account: LocalService and NetworkService are
+        // service accounts, not SYSTEM.
+        for sid in ["S-1-5-19", "S-1-5-20"] {
+            let service = ClientPeer {
+                sid: Some(sid.into()),
+                elevated: Some(false),
+                ..system(0)
+            };
+            assert!(!decide(&service, Some(1), Some(1), None), "{sid}");
+        }
+        // A Windows peer whose session or account could not be read.
+        let no_session = ClientPeer {
+            session_id: None,
+            ..win(1)
+        };
+        assert!(!decide(&no_session, Some(1), Some(1), None));
+        let no_account = ClientPeer {
+            session_id: Some(2),
+            ..ClientPeer::UNKNOWN
+        };
+        assert!(!decide(&no_account, Some(1), Some(1), None));
+
+        // Unix: the daemon's own account, or root.
+        assert!(decide(&unix(1000), None, None, Some(1000)));
+        assert!(decide(&unix(0), None, None, Some(1000)), "root");
+        assert!(!decide(&unix(1001), None, None, Some(1000)));
+        assert!(!decide(&unix(1000), None, None, None));
+
+        // Unknown: never.
+        for (console, own, uid) in [
+            (Some(1), Some(1), None),
+            (None, None, Some(1000)),
+            (None, None, None),
+        ] {
+            assert!(!decide(&ClientPeer::UNKNOWN, console, own, uid));
+        }
+
+        // The screen's session alone.
+        assert_eq!(screen_session(Some(3), Some(1)), Some(3), "its own");
+        assert_eq!(screen_session(Some(0), Some(1)), Some(1), "the console's");
+        assert_eq!(screen_session(Some(0), None), None);
+        assert_eq!(screen_session(Some(0), Some(0)), None);
+        assert_eq!(screen_session(None, Some(1)), None, "fails closed");
+    }
+
+    /// Over the daemon's own endpoint a consent answer, an approval or a
+    /// denial, and a Disconnect come from the person at the screen it shows,
+    /// SYSTEM or an elevated administrator. Another signed-in account, and a
+    /// peer the endpoint could not identify, are refused in words, and nothing
+    /// reaches the daemon. The person socket keeps its own rule (#3845).
+    #[tokio::test]
+    async fn a_consent_answer_or_a_disconnect_on_the_daemons_own_endpoint_comes_from_the_screens_person()
+     {
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":false}}"#;
+        let end = r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#;
+        // A session that is neither this process's nor the console's.
+        let other = [own_session_id(), console_session_id()]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let another_session = ClientPeer {
+            session_id: Some(other),
+            system_account: Some(false),
+            sid: Some("S-1-5-21-1-2-3-1002".into()),
+            elevated: Some(false),
+            ..ClientPeer::UNKNOWN
+        };
+        let stranger = if own_uid() == Some(4242) { 4243 } else { 4242 };
+        let another_account = ClientPeer {
+            uid: Some(stranger),
+            gid: Some(stranger),
+            ..ClientPeer::UNKNOWN
+        };
+        for (who, peer) in [
+            ("another session", another_session.clone()),
+            ("another account", another_account),
+            ("a peer nobody could identify", ClientPeer::UNKNOWN),
+        ] {
+            let state = Counting::default();
+            for line in [approve, deny] {
+                let r = ask_state_scoped_as(state.clone(), Scope::Full, peer.clone(), line).await;
+                assert!(
+                    matches!(&r, Response::Error { message } if message.starts_with("The answer was not taken")),
+                    "{who}: {line} → {r:?}"
+                );
+            }
+            let r = ask_state_scoped_as(state.clone(), Scope::Full, peer, end).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.starts_with("The session was not ended")),
+                "{who}: {r:?}"
+            );
+            assert_eq!(state.decided(), 0, "{who}: nothing was decided");
+            assert_eq!(state.ended(), 0, "{who}: nothing was ended");
+        }
+
+        let mut admitted = vec![
+            (
+                "SYSTEM",
+                ClientPeer {
+                    session_id: Some(0),
+                    system_account: Some(true),
+                    sid: Some(SYSTEM_SID.into()),
+                    elevated: Some(true),
+                    ..ClientPeer::UNKNOWN
+                },
+            ),
+            (
+                "an elevated administrator in another session",
+                ClientPeer {
+                    sid: Some("S-1-5-21-1-2-3-500".into()),
+                    elevated: Some(true),
+                    ..another_session
+                },
+            ),
+        ];
+        // The person at the screen this daemon shows, as the OS reads this
+        // process: on Windows the screen's session (its own, or the
+        // console's from session 0); on Unix this account.
+        let screen = screen_session(own_session_id(), console_session_id());
+        if cfg!(unix) || screen.is_some() {
+            admitted.push((
+                "the person at the screen",
+                ClientPeer {
+                    session_id: screen,
+                    uid: own_uid(),
+                    system_account: Some(false),
+                    elevated: Some(false),
+                    ..ClientPeer::UNKNOWN
+                },
+            ));
+        }
+        if cfg!(unix) {
+            admitted.push((
+                "root",
+                ClientPeer {
+                    uid: Some(0),
+                    gid: Some(0),
+                    ..ClientPeer::UNKNOWN
+                },
+            ));
+        }
+        for (who, peer) in admitted {
+            let state = Counting::default();
+            for line in [approve, deny] {
+                let r = ask_state_scoped_as(state.clone(), Scope::Full, peer.clone(), line).await;
+                assert_eq!(r, Response::ConsentDecided { ok: true }, "{who}: {line}");
+            }
+            let r = ask_state_scoped_as(state.clone(), Scope::Full, peer, end).await;
+            assert_eq!(r, Response::RcDisconnected { ok: true }, "{who}");
+            assert_eq!((state.decided(), state.ended()), (2, 1), "{who}");
+        }
+
+        // The person socket keeps #3845's rule: the person at the seat answers
+        // there and ends a session there, with no Windows identity at all.
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let r = ask_state_scoped_as(SeatAt(Some(501)), SEAT, ana.clone(), approve).await;
+        assert_eq!(r, Response::ConsentDecided { ok: true });
+        let state = Counting::default();
+        let r = ask_state_scoped_as(state.clone(), SEAT, ana, end).await;
+        assert_eq!(r, Response::RcDisconnected { ok: true });
+        assert_eq!(state.ended(), 1);
+    }
+
+    /// The tray and the CLI as the pipe reads them: a client of this process,
+    /// read from the OS at accept (its session, and its account from its
+    /// token), answers a consent prompt and ends a session over a real pipe.
+    /// It is admitted wherever this test runs as a person runs a tray or a
+    /// CLI: in an interactive session, which is this daemon's own screen
+    /// here, or elevated (a CI runner).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_client_at_the_screen_answers_and_ends_a_session_over_a_real_pipe() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let pipe = format!(r"\\.\pipe\roomler-test-screen-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let client = ClientOptions::new().open(&pipe).unwrap();
+        server.connect().await.unwrap();
+        let peer = pipe_client_peer(server.as_raw_handle());
+        let interactive = own_session_id().is_some_and(|s| s != 0);
+        if !interactive && peer.elevated != Some(true) {
+            eprintln!("skipped: this process runs in session 0, not elevated: {peer:?}");
+            return;
+        }
+        assert_eq!(peer.session_id, own_session_id(), "{peer:?}");
+        let state = Counting::default();
+        let st = state.clone();
+        let served = tokio::spawn(async move { serve_connection_as(server, &st, peer).await });
+        let (rd, mut wr) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(rd).lines();
+        for (line, want) in [
+            (
+                r#"{"t":"consent_decide","d":{"session_id":"sess-1","allow":true}}"#,
+                Response::ConsentDecided { ok: true },
+            ),
+            (
+                r#"{"t":"rc_disconnect","d":{"session_id":"6ac95ff543d358ac1a427048"}}"#,
+                Response::RcDisconnected { ok: true },
+            ),
+        ] {
+            wr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let got = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Response>(&got).unwrap(),
+                want,
+                "{line}"
+            );
+        }
+        drop(wr);
+        drop(lines);
+        served.await.unwrap().unwrap();
+        assert_eq!((state.decided(), state.ended()), (1, 1));
     }
 
     /// #2871 — the person's view of a configuration listing marks every key
@@ -9590,31 +10896,32 @@ mod tests {
         let full = Scope::Full;
         let person = Scope::Person { owner_uid: 1000 };
         // The person at the seat of a system install, on their own socket.
-        assert!(peer_may_record(&unix(1000), person, None, Some(0)));
+        assert!(peer_may_record(&unix(1000), person, None, None, Some(0)));
         assert!(
-            !peer_is_console_user(&unix(1000), None, Some(0)),
+            !peer_is_console_user(&unix(1000), None, None, Some(0)),
             "the gate this one widens"
         );
         // Another account is not the seat's person, even on the socket made
         // for one (#2871's review: the uid is checked here, not only by the
         // listener).
-        assert!(!peer_may_record(&unix(1001), person, None, Some(0)));
+        assert!(!peer_may_record(&unix(1001), person, None, None, Some(0)));
         // Root passes there as it does on its own socket.
-        assert!(peer_may_record(&unix(0), person, None, Some(0)));
+        assert!(peer_may_record(&unix(0), person, None, None, Some(0)));
         // The daemon's own endpoints: nothing moved. A root daemon's socket
         // refuses anyone else, and a per-user daemon's serves its owner.
-        assert!(peer_may_record(&unix(0), full, None, Some(0)));
-        assert!(!peer_may_record(&unix(1000), full, None, Some(0)));
-        assert!(peer_may_record(&unix(501), full, None, Some(501)));
-        assert!(!peer_may_record(&unix(502), full, None, Some(501)));
-        // Windows: the console session, RDP refused.
-        assert!(peer_may_record(&win(1), full, Some(1), None));
-        assert!(!peer_may_record(&win(2), full, Some(1), None));
+        assert!(peer_may_record(&unix(0), full, None, None, Some(0)));
+        assert!(!peer_may_record(&unix(1000), full, None, None, Some(0)));
+        assert!(peer_may_record(&unix(501), full, None, None, Some(501)));
+        assert!(!peer_may_record(&unix(502), full, None, None, Some(501)));
+        // Windows, a worker in the console session: that session, RDP refused.
+        assert!(peer_may_record(&win(1), full, Some(1), Some(1), None));
+        assert!(!peer_may_record(&win(2), full, Some(1), Some(1), None));
         // Fail closed.
         for scope in [full, person] {
             assert!(!peer_may_record(
                 &ClientPeer::UNKNOWN,
                 scope,
+                Some(1),
                 Some(1),
                 Some(0)
             ));
@@ -10064,7 +11371,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("incoming files")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("incoming files")),
                 "{line} → {r:?}"
             );
         }
@@ -10076,7 +11383,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -10103,7 +11410,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("without TLS")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("without TLS")),
                 "{line} → {r:?}"
             );
         }
@@ -10114,7 +11421,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -10140,7 +11447,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("locks")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("locks")),
                 "{line} → {r:?}"
             );
         }
@@ -10151,7 +11458,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -10177,7 +11484,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("display")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("display")),
                 "{line} → {r:?}"
             );
         }
@@ -10188,7 +11495,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -10214,7 +11521,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("browsers")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("browsers")),
                 "{line} → {r:?}"
             );
         }
@@ -10225,7 +11532,7 @@ mod tests {
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
@@ -10261,7 +11568,7 @@ mod tests {
         ] {
             let r = ask(ClientPeer::UNKNOWN, line).await;
             assert!(
-                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("outside")),
+                matches!(&r, Response::Error { message } if message.starts_with(AT_THE_SCREEN) && message.contains("outside")),
                 "{line} → {r:?}"
             );
         }
@@ -10329,14 +11636,15 @@ mod tests {
     #[tokio::test]
     async fn the_console_user_passes_the_gate() {
         let me = ClientPeer {
-            session_id: console_session_id(),
+            session_id: screen_session(own_session_id(), console_session_id()),
             uid: own_uid(),
             system_account: None,
             ..ClientPeer::UNKNOWN
         };
         if !me.is_console_user() {
-            // A Windows host with no active console session (some CI runners):
-            // the refusal half above is the part that must hold everywhere.
+            // A Windows process with no screen's session (session 0 with no
+            // active console session, as on some CI runners): the refusal half
+            // above is the part that must hold everywhere.
             return;
         }
         // The gate lets the console user through to the state, which in this

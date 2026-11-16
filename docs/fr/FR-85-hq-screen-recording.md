@@ -94,7 +94,7 @@ what it costs in installer size and ships with integration and e2e tests.
   not inherited, so a respawned worker cannot trip its own single-instance lock.
 - **Identity rule.** Whenever a console user exists, the recorder runs **as that user at normal integrity** — never
   SYSTEM, never root, never elevated. On Windows the worker holds the interactive admin's *elevated* linked token by
-  default (`ROOMLERD_ELEVATE_WORKER`, `agents/roomlerd/src/win_service/supervisor.rs:341`), so the recorder gets a
+  default (`ROOMLERD_ELEVATE_WORKER`, `agents/roomlerd/src/win_service/supervisor.rs:363`), so the recorder gets a
   restricted medium-integrity token; a SystemContext worker spawns it with the console user's token; a Linux root daemon
   drops to the console user the way the portal helper does. Only a host with **no console user** (headless, an Xvfb
   virtual desktop, nobody logged in) records as the daemon's identity.
@@ -109,7 +109,7 @@ what it costs in installer size and ships with integration and e2e tests.
   it is wall-clock. A lock screen or `ACCESS_LOST` re-acquires and inserts a black gap; it never aborts. A fast user
   switch terminates the worker, so the recording ends `session_changed` — a recording never follows a user switch.
 - **Recording encoder profile.** A new `RateMode { ConstantQuality { q }, Vbr { … } }` and an explicit GOP are threaded
-  through `build_encoder` (`encode/ffmpeg/encoder.rs:1570`) and `encoder_options` (`:258`); today both force
+  through `build_encoder` (`encode/ffmpeg/encoder.rs:1577`) and `encoder_options` (`:258`); today both force
   maxrate/bufsize and a 64 800-frame GOP (`:51`).
 
   | Backend | Recording options |

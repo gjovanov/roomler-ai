@@ -135,7 +135,20 @@ pub(crate) fn sid_string(sid: PSID) -> String {
 
 /// This process's user, as a SID string.
 pub fn own_user_sid() -> Option<String> {
-    let t = own_token(TOKEN_QUERY)?;
+    // SAFETY: the pseudo-handle of this process, valid for its whole life.
+    user_sid_of(unsafe { GetCurrentProcess() })
+}
+
+/// #3885 — the user of the process behind `process` (a handle with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`), as a SID string, from its token.
+/// `None` when its token cannot be opened or read.
+pub(crate) fn user_sid_of(process: HANDLE) -> Option<String> {
+    let mut t: HANDLE = std::ptr::null_mut();
+    // SAFETY: a process handle the caller holds and a valid out-param.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut t) } == 0 {
+        return None;
+    }
+    let t = Owned::new(t)?;
     let buf = token_info(t.raw(), TokenUser)?;
     // SAFETY: a TOKEN_USER whose SID points into `buf`.
     Some(sid_string(unsafe {

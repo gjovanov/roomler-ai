@@ -67,38 +67,38 @@ line), **doc** (a doc read at that line), **man** (a Linux manual page), **infer
 
 | # | Answer | Anchors |
 |---|---|---|
-| 1 | **Three followers exist.** The seat guard watches logind's D-Bus (`PropertiesChanged` under `/org/freedesktop/login1`) and re-reads seat0's `ActiveSession`, `Class`, `LockedHint` and `State` every second, failing closed after 5 s; it judges a bound session `Open`, `Locked` or `Away` by **session id, never by user** (code). The desktop brief polls `loginctl` every 60 s for the hello (code). The session lookups in `companion.rs` differ in which session they take; the worker uses `seat0_uid()`'s: seat0's active session only, class `user`, not `Remote=yes` (code). No logind `SessionNew`/`SessionRemoved` subscription exists (code, by grep). | `capture/seat_guard.rs:15-21`, `:30`, `:33`, `:75-91`, `:257-290`, `:300-335`; `desktop_brief.rs:21`, `:147-156`; `companion.rs:2837-2848`; `keep_busy/logind.rs:36-54`, `:65` |
-| 2 | **The helper's spawn gives the drop and the bus, not a life.** `spawn_child` sets `XDG_RUNTIME_DIR`, the session bus, `DISPLAY` and a GUESSED `WAYLAND_DISPLAY=wayland-0`, and drops through `drop_to_std` (getpwnam, `setgroups` then `setgid` then `setuid`, verified) (code). It sets no `XAUTHORITY` and none of the session's own environment, which the companion's launch reads from `systemctl --user show-environment` as the person (code). The child lives in the daemon's cgroup, not the person's session (inferred), one per capture, killed on drop, with no respawn, no death signal and no channel but its stdin and stdout (code). | `capture/portal/mod.rs:1306-1384`, `:1315-1319`, `:1338-1358`, `:1407-1415`; `exec.rs:1782-1812`, `:1948-1960`; `companion.rs:2449-2468`, `:2501-2535`, `:2750-2755`; `capture/portal/backend.rs:269-286` |
-| 3 | **Root keeps DRM and `uinput`; the worker adds the arms that need the session.** A root daemon's automatic plan is DRM + `uinput`, bound to the logind session on screen, only while it is unlocked, only where the person can be told, and on X11 only under a lock-reporting shell (code, doc). A worker in the session can run what root cannot: X11 (XShm/XTest with `DISPLAY` and `XAUTHORITY`), mutter's ScreenCast and RemoteDesktop, the portal (code: the helper already runs these as the person). GNOME closes every mutter and portal session at its lock and refuses new ones until unlock (doc), so the lock and login screens stay root's (DRM with `drm_capture`). | `capture/mod.rs:629`, `:1058`, `:1119`, `:1235`, `:1384`, `:1456`; `docs/linux-capture.md:335-360`, `:1792-1803` |
-| 4 | **All three are X11 calls in the process that holds the session.** The clipboard is the WebRTC `clipboard` data channel, served where the peer is, through `arboard` built with `image-data` only, so the X11 protocol (code); image change-watching is X11-only (code). The layout is X11 only, "not under Wayland ... nor on a system install", and GNOME reports without switching (code). Display match is X11 only: on a person's own X display (`x11_offered`, which leaves out the daemon's virtual desktop), and on that virtual desktop through a path of its own on Xorg's dummy driver (code). ⚠️ So a **per-user** install on GNOME or KDE Wayland gives the clipboard (through Xwayland: field question, no field read exists, see [the field question](#the-clipboard-under-wayland-a-field-question)) and neither the layout nor display match today. | `clipboard.rs:3-10`, `:633-635`; `Cargo.toml:320`; `agents/roomlerd/Cargo.toml:328`; `input/layout_x11.rs:27-34`, `:62`, `:79`; `display_match.rs:224`, `:326-339`, `:1079`; `encode/caps.rs:2775`, `:2793`, `:2831`, `:2961-2979` |
+| 1 | **Three followers exist.** The seat guard watches logind's D-Bus (`PropertiesChanged` under `/org/freedesktop/login1`) and re-reads seat0's `ActiveSession`, `Class`, `LockedHint` and `State` every second, failing closed after 5 s; it judges a bound session `Open`, `Locked` or `Away` by **session id, never by user** (code). The desktop brief polls `loginctl` every 60 s for the hello (code). The session lookups in `companion.rs` differ in which session they take; the worker uses `seat0_uid()`'s: seat0's active session only, class `user`, not `Remote=yes` (code). No logind `SessionNew`/`SessionRemoved` subscription exists (code, by grep). | `capture/seat_guard.rs:15-21`, `:30`, `:33`, `:75-91`, `:269-302`, `:312-347`; `desktop_brief.rs:21`, `:147-156`; `companion.rs:3477-3488`; `keep_busy/logind.rs:36-54`, `:65` |
+| 2 | **The helper's spawn gives the drop and the bus, not a life.** `spawn_child` sets `XDG_RUNTIME_DIR`, the session bus, `DISPLAY` and a GUESSED `WAYLAND_DISPLAY=wayland-0`, and drops through `drop_to_std` (getpwnam, `setgroups` then `setgid` then `setuid`, verified) (code). It sets no `XAUTHORITY` and none of the session's own environment, which the companion's launch reads from `systemctl --user show-environment` as the person (code). The child lives in the daemon's cgroup, not the person's session (inferred), one per capture, killed on drop, with no respawn, no death signal and no channel but its stdin and stdout (code). | `capture/portal/mod.rs:1306-1384`, `:1315-1319`, `:1338-1358`, `:1407-1415`; `exec.rs:1782-1812`, `:1948-1960`; `companion.rs:3089-3108`, `:3141-3175`, `:3390-3395`; `capture/portal/backend.rs:269-286` |
+| 3 | **Root keeps DRM and `uinput`; the worker adds the arms that need the session.** A root daemon's automatic plan is DRM + `uinput`, bound to the logind session on screen, only while it is unlocked, only where the person can be told, and on X11 only under a lock-reporting shell (code, doc). A worker in the session can run what root cannot: X11 (XShm/XTest with `DISPLAY` and `XAUTHORITY`), mutter's ScreenCast and RemoteDesktop, the portal (code: the helper already runs these as the person). GNOME closes every mutter and portal session at its lock and refuses new ones until unlock (doc), so the lock and login screens stay root's (DRM with `drm_capture`). | `capture/mod.rs:629`, `:1078`, `:1139`, `:1255`, `:1404`, `:1476`; `docs/linux-capture.md:335-360`, `:1988-1996` |
+| 4 | **All three are X11 calls in the process that holds the session.** The clipboard is the WebRTC `clipboard` data channel, served where the peer is, through `arboard` built with `image-data` only, so the X11 protocol (code); image change-watching is X11-only (code). The layout is X11 only, "not under Wayland ... nor on a system install", and GNOME reports without switching (code). Display match is X11 only: on a person's own X display (`x11_offered`, which leaves out the daemon's virtual desktop), and on that virtual desktop through a path of its own on Xorg's dummy driver (code). ⚠️ So a **per-user** install on GNOME or KDE Wayland gives the clipboard (through Xwayland: field question, no field read exists, see [the field question](#the-clipboard-under-wayland-a-field-question)) and neither the layout nor display match today. | `clipboard.rs:3-10`, `:1309-1311`; `Cargo.toml:326`; `agents/roomlerd/Cargo.toml:329`; `input/layout_x11.rs:27-34`, `:62`, `:79`; `display_match.rs:224`, `:326-339`, `:1079`; `encode/caps.rs:2775`, `:2793`, `:2831`, `:2961-2979` |
 | 5 | **The protocol and its gates carry over; the spawn chain and the session model do not.** Reusable (code): `DelegateFrame` (`WorkerCaps`, `WorkerLogs`, `PersonFloor` that only tightens), default-deny three ways (no secret, one worker, revoked on stop), the lifeline (pipe end = worker stops), the stale-worker reap, the backoff constants. macOS-only (code): `launchctl asuser` + `sudo`, whose `env_reset` and closed descriptors are why a secret on stdin exists at all; the `MacosSupervisor` supervision row is compiled for macOS only. On a Mac the worker holds the **peer** (`ToWorker{ServerMsg}` / `FromWorker{ClientMsg}`): root cannot capture there at all. | `macos_supervisor.rs:5-11`, `:34-36`, `:38-52`, `:376`, `:474`, `:1324`, `:1382`; `delegate.rs:16-53`, `:81`, `:94`, `:116-127`, `:172-188`, `:1274`, `:1300`, `:1519`; `delegate_worker.rs:33-43`, `:176`; `supervision.rs:21`, `:246`; `lib.rs:49-51` |
 | 6 | **A person socket, callable by anything running as the person.** Root binds `/run/user/<uid>/<socket>` as the person, admits a connection whose `SO_PEERCRED` uid is the person's or root's, and serves the exhaustive `person_may` list: status, sessions and Disconnect, consent and its answer, keep busy, Devices/Mesh/Peers, recording, the config listing and `ConfigSet` of the console person's keys (code). It follows seat0's person by **uid** every 5 s (code), which #2531 (open) shows breaks when a re-login of the same uid recreates `/run/user/<uid>`. | `person_socket.rs:16-22`, `:62-64`, `:82`; `crates/localapi/src/lib.rs:3391`, `:4661-4663`, `:4689-4715`, `:4772`; #2531 |
-| 7 | **Session change in, respawn with backoff, and one lesson.** The SCM's `SessionChanged` tears the old worker down and spawns in the new session (`WTSQueryUserToken` + `CreateProcessAsUserW`, a kill-on-close job), backing off 2 s to 60 s (code). ⚠️ Its field lesson: swapping the process that holds the stream mid-session took about 13 s, longer than the browser's 16 s reconnect ladder allows across its attempts, so every connect killed itself, and the SYSTEM worker lost the clipboard and file channels (code comment, field 2026-05-06). | `win_service/supervisor.rs:3-22`, `:55`, `:79-83`, `:98`, `:282`, `:880-892` |
+| 7 | **Session change in, respawn with backoff, and one lesson.** The SCM's `SessionChanged` tears the old worker down and spawns in the new session (`WTSQueryUserToken` + `CreateProcessAsUserW`, a kill-on-close job), backing off 2 s to 60 s (code). ⚠️ Its field lesson: swapping the process that holds the stream mid-session took about 13 s, longer than the browser's 16 s reconnect ladder allows across its attempts, so every connect killed itself, and the SYSTEM worker lost the clipboard and file channels (code comment, field 2026-05-06). | `win_service/supervisor.rs:3-22`, `:56`, `:80-84`, `:99`, `:304`, `:902-914` |
 
 ### How the root daemon finds and follows the person's session
 
 The worker is bound to ONE logind session id: seat0's `ActiveSession`, class `user`, not `Remote=yes`, by
-`seat0_uid()`'s rule (`companion.rs:2837-2848`) and the seat guard's id match (`seat_guard.rs:75-91`). Never by uid
+`seat0_uid()`'s rule (`companion.rs:3477-3488`) and the seat guard's id match (`seat_guard.rs:75-91`). Never by uid
 (#2531). The seat guard's watcher is the event source
-(`seat_guard.rs:257-290`).
+(`seat_guard.rs:269-302`).
 
 **Its life and its cost today** (code): the watcher starts on the first `on_screen()` call, once a process
-(`seat_guard.rs:117-120`, `:187-199`), and then loops for the daemon's whole life (`:221-242`). Its callers are the
-system plan (`capture/mod.rs:1221`), the DRM arm (`capture/drm_backend.rs:855-868`, `:1465`) and the automatic
-input gate (`input/mod.rs:235`, `:491`), so on a root daemon it may run from the first hello on (inferred: not
+(`seat_guard.rs:117-120`, `:199-211`), and then loops for the daemon's whole life (`:233-254`). Its callers are the
+system plan (`capture/mod.rs:1241`), the DRM arm (`capture/drm_backend.rs:855-868`, `:1465`) and the automatic
+input gate (`input/mod.rs:293`, `:564`), so on a root daemon it may run from the first hello on (inferred: not
 traced from the hello). With logind's bus it wakes on `PropertiesChanged` but also re-reads the seat with four
 uncached `Properties.Get` calls every second, signal or not (`:29-30`, `:281-289`), because a reading older than
 5 s closes the guard (`:18-21`, `:32-33`). D5's worker at login needs the follower always on, so P1 makes it
 signal-driven while nothing is bound (inferred design): with no capture bound and no viewer counted
-(`seat_guard.rs:132-185`), the loop waits on the signal alone and re-reads on a long timer (60 s, a missed signal's
+(`seat_guard.rs:132-197`), the loop waits on the signal alone and re-reads on a long timer (60 s, a missed signal's
 bound); the 1 s re-read and the 5 s staleness come back while a capture is bound, so the fail-closed rule is
 unchanged where it guards anything. The supervisor takes its login, lock and logout events from the same loop,
 not from a second watcher. A build without zbus keeps today's 1 s `loginctl` loop (`:236-242`).
 
-| event | logind shows (code: `seat_guard.rs:300-335`) | which session has a worker | a live remote-desktop session |
+| event | logind shows (code: `seat_guard.rs:312-347`) | which session has a worker | a live remote-desktop session |
 |---|---|---|---|
 | login | a new id, class `user`, `active` | the new id gets one (spawned at once while the key is on, D5) | none yet |
-| lock | same id, `LockedHint=yes` | kept; the worker's mutter/portal stream ends (GNOME, `docs/linux-capture.md:1792-1803`) | the peer stays in root; `GuardLocked` as today, or DRM reads the lock screen where `drm_capture` is set; clipboard and layout are refused while locked (D6) |
+| lock | same id, `LockedHint=yes` | kept; the worker's mutter/portal stream ends (GNOME, `docs/linux-capture.md:1971-1979`) | the peer stays in root; `GuardLocked` as today, or DRM reads the lock screen where `drm_capture` is set; clipboard and layout are refused while locked (D6) |
 | unlock | same id, `LockedHint=no` | the same worker reopens its sources | resumes on the same peer, no renegotiation |
 | user switch, greeter in front | another id, or class `greeter`; ours `online` (`keep_busy/logind.rs:65`) | ours kept, serves nothing while `Away`; the other person gets a worker only for a session opened to them | waits `GuardAway`, as today; never follows to the new person, who was not told (`seat_guard.rs:8-13`) |
 | several graphical sessions (xrdp, a second seat) | not seat0's active one | none | not served (out of scope) |
@@ -127,22 +127,22 @@ flowchart TB
   the daemon (the #2987 class, `macos_supervisor.rs:38-52`) and can inherit one end of a socketpair. It is spawned
   from the daemon's own executable, as the portal helper's drop does (`capture/portal/mod.rs:1360-1384`), with the
   session's bus and runtime dir, `DISPLAY` from logind, `XAUTHORITY` and the desktop's keys from the person's user
-  manager (`companion.rs:2449-2468`, `:2501-2535`), and `WAYLAND_DISPLAY` read, not guessed (`companion.rs:2750-2755`
+  manager (`companion.rs:3089-3108`, `:3141-3175`), and `WAYLAND_DISPLAY` read, not guessed (`companion.rs:3390-3395`
   guesses). A subcommand of its own, not `run`, so the worker reads no config, holds no enrollment and starts no
   WS, overlay or updater (the one-daemon rule).
 - **What the worker needs beyond the helper's spawn**: its session chosen by `seat0_uid()`'s rule and followed by
   id, the session's environment, a long life with
-  respawn (2 s to 60 s, `win_service/supervisor.rs:79-83`; stop after five fast exits, `macos_supervisor.rs:70-73`),
+  respawn (2 s to 60 s, `win_service/supervisor.rs:80-84`; stop after five fast exits, `macos_supervisor.rs:70-73`),
   and a channel in both directions.
 - **Its supervisor is the virtual desktop's, not a new `Supervision` row** (code, corrected after review): the
   daemon already keeps a child alive on Linux for its whole life, the virtual desktop's X server: a thread waits for
   its exit, marks the desktop down first, kills and reaps the tree, and waits before the next start, 1 s doubling to
-  300 s, a run of 60 s resetting it (`virtual_desktop.rs:1274-1300`, `:784-796`, `Backoff` `:1347`). The worker's
+  300 s, a run of 60 s resetting it (`virtual_desktop.rs:1991-2056`, `:984-996`, `Backoff` `:2133`). The worker's
   supervisor reuses that loop and its `Backoff`, with the worker's own floor and ceiling (2 s to 60 s, five fast
   exits). `Supervision` names what restarts the DAEMON (`supervision.rs:240-253`); the worker is a subcommand that
   never takes `run`'s restart path, so it needs no row there.
 - **A host whose only desktop is the virtual one gets no worker** (code and inferred): the daemon started that X
-  server and holds `DISPLAY` itself (`apps/linux.rs:500-506`), display match has its own path there
+  server and holds `DISPLAY` itself (`apps/linux.rs:502-508`), display match has its own path there
   (`display_match.rs:224`), and no logind session sits on seat0 for a worker to join. The key changes nothing there.
 - **What it owns, per session type** (code for what each reaches, inferred for the split):
 
@@ -171,17 +171,17 @@ flowchart TB
     clears close-on-exec on 0 only. The parent drops its copy as soon as `spawn` returns, as the pty's parent drops
     the slave (`pty/unix.rs:282`).
   - The worker sweeps like every long-lived child and every child that runs a caller's code: the repository's
-    guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-25`, `:202-228`),
+    guard is `tunnel_core::child::inherit_only_stdio` (#3080, `crates/tunnel-core/src/child.rs:3-27`, `:353-379`),
     used today by exec (`exec.rs:2434-2439`), the SSH shell (`pty/unix.rs:272-276`), the portal helper
-    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:1845`, `:1858`). It marks every
+    (`capture/portal/mod.rs:1380-1381`) and the virtual desktop (`virtual_desktop.rs:2739`, `:2752`). It marks every
     descriptor above stderr close-on-exec, so the channel must ride a standard stream or the sweep would close it.
-    The companion's launch is a `systemd-run` client whose unit PID 1 starts (`companion.rs:2586-2589`), so it holds
+    The companion's launch is a `systemd-run` client whose unit PID 1 starts (`companion.rs:3226-3229`), so it holds
     nothing of the daemon's either way.
   - At its start the worker moves the channel off descriptor 0 (`F_DUPFD_CLOEXEC`, then 0 reopened on
     `/dev/null`), so nothing it starts inherits it and no grandchild can hold the lifeline open, the #3080 class
     (inferred design). Root also waits on the worker's pid, so EOF is not its only sign of a death.
   - Tests that hold it (P1): both ends read `FD_CLOEXEC`; a sweeping child started while the pair is live has
-    neither end open, the shape of `child.rs:497-532`; a stand-in for the worker started by the real builder has one
+    neither end open, the shape of `child.rs:648-683`; a stand-in for the worker started by the real builder has one
     socket, on descriptor 0, with the worker end's inode; after the worker's move, a child it starts has no socket;
     killing the worker gives root's end an EOF.
 
@@ -202,7 +202,7 @@ flowchart TB
 |---|---|
 | every frame | a length prefix, read and checked against its type's cap BEFORE anything is allocated; over the cap closes the channel; an unknown type is skipped and counted |
 | handshake, features, layout, display state, a clipboard change event | one control frame, at most 64 KiB; the layout at most `MAX_GROUPS` (4) entries (`input/layout_x11.rs:51`), each token and tag at most 64 bytes; the display state one mode from the list root sent |
-| clipboard content | root applies the caps the data channel already has: text 1 MiB, PNG 8 MiB and 4096 x 4096 pixels, HTML 4 MiB, the native set 16 MiB (`clipboard.rs:1449`, `:1551-1570`); UTF-8 checked. The worker applies the same caps where it reads the clipboard (`clipboard.rs:865-871`, `:1237`), and root checks again |
+| clipboard content | root applies the caps the data channel already has: text 1 MiB, PNG 8 MiB and 4096 x 4096 pixels, HTML 4 MiB, the native set 16 MiB (`clipboard.rs:2147`, `:2249-2268`); UTF-8 checked. The worker applies the same caps where it reads the clipboard (`clipboard.rs:1561-1567`, `:1935`), and root checks again |
 | log lines | as `WorkerLogs`: 100 a frame, each message cut to 8 KiB and marked by root (`delegate.rs:259-290`, `:742-758`), inside the frame cap above |
 | pixels (P2) | root checks every frame's payload length against its stride and height before any consumer reads it: the payload is exactly `stride x height`, at most 256 MiB; the header carries the magic, the size the worker announced at open (non-zero, at most 8192 on a side) and a stride of at least four bytes a pixel; the frame lands in a buffer root reuses |
 - **What the worker accepts from root**: open or close a source; input events; clipboard read and write; a layout
@@ -220,12 +220,12 @@ test of root or of a display variable (code):
 | capability | per-user | system | anchor | P1's worker |
 |---|---|---|---|---|
 | clipboard, text, HTML, images | yes (X11; Wayland through Xwayland) | `no-session` | `encode/caps.rs:2966-2979`, `:3001-3010` | yes, four sessions |
-| a copied image reaches the viewer by itself | X11 only | no | `clipboard.rs:632-640`, `encode/caps.rs:2722-2727` | yes, X11 |
+| a copied image reaches the viewer by itself | X11 only | no | `clipboard.rs:1308-1316`, `encode/caps.rs:2722-2727` | yes, X11 |
 | layout read and switch | X11 (GNOME reads only) | no | `encode/caps.rs:2775-2805` | yes, X11 |
 | display match | a person's X11 display | no (the virtual desktop has its own path) | `encode/caps.rs:2828-2832`, `display_match.rs:326-339` | yes, X11 |
-| desktops served | any the cascade reaches | GNOME and KDE, unlocked; other X11 desktops `x11_not_enabled` | `capture/mod.rs:735`, `:1235` | no: P2, after a lock signal (D1) |
-| the computer's sound | Pulse, directly | yes, through the session helper the released build carries (`portal-capture` is in `full`) | `audio_source.rs:210`, `:228-245`; `agents/roomlerd/Cargo.toml:743`, `:756` | left out: it already works |
-| Remote Apps | yes | yes, run as whoever is at the screen | `apps/linux.rs:500-506`, `apps/mod.rs:396-404` | left out: same answer |
+| desktops served | any the cascade reaches | GNOME and KDE, unlocked; other X11 desktops `x11_not_enabled` | `capture/mod.rs:755`, `:1255` | no: P2, after a lock signal (D1) |
+| the computer's sound | Pulse, directly | yes, through the session helper the released build carries (`portal-capture` is in `full`) | `audio_source.rs:210`, `:228-245`; `agents/roomlerd/Cargo.toml:744`, `:757` | left out: it already works |
+| Remote Apps | yes | yes, run as whoever is at the screen | `apps/linux.rs:502-508`, `apps/mod.rs:396-404` | left out: same answer |
 | files | as the person | writes as seat0's person; reads are #3688's subject | `files.rs:341-376` | left out: same feature |
 | cursor shape | XFixes | the DRM arm's cursor plane | `capture/x11_cursor.rs:3-11`, `capture/cursor.rs:27-28` | left out: same answer |
 | consent prompt | the companion or the desktop's own | the companion, by design | `.claude/rules/remote-desktop.md` | left out |
@@ -258,7 +258,7 @@ the peer do not move.
 
 | | peer in root (recommended) | peer in the worker (FR-43's shape) |
 |---|---|---|
-| lock and unlock | the source changes under one peer; no process swap | a second peer or a swap, the 13 s Windows lesson (`win_service/supervisor.rs:880-892`) |
+| lock and unlock | the source changes under one peer; no process swap | a second peer or a swap, the 13 s Windows lesson (`win_service/supervisor.rs:902-914`) |
 | encoder | as root, as a system install encodes today | as the person (render node access: field question) |
 | pixels | copied across the process boundary, as the portal helper's are (`capture/portal/backend.rs:5-13`, `:29-33`); 4K at 60 fps: field question | none cross |
 | `close()` | one owner, today's | the worker must close it, and root must close its relay |
@@ -299,7 +299,7 @@ surface, which applies a key only where the device's own `remote_config_enabled`
 | failure | what a person would see | what the design does |
 |---|---|---|
 | the worker dies mid-session | the clipboard and layout chip stop; the picture goes on (P1) or stops with a reason (P2) | root's peer lives on; respawn with backoff; the caps narrow until the worker is back |
-| the worker cannot start: no session bus, a home it cannot enter, a session type nobody planned for (a tty, a WSL2 distro, `docs/linux-capture.md:1671-1693`) | the features answer `no-session`, as today | five fast exits stop the respawns (`macos_supervisor.rs:70-73`), the reason is logged and in the hello's `unavailable` |
+| the worker cannot start: no session bus, a home it cannot enter, a session type nobody planned for (a tty, a WSL2 distro, `docs/linux-capture.md:1849-1861`) | the features answer `no-session`, as today | five fast exits stop the respawns (`macos_supervisor.rs:70-73`), the reason is logged and in the hello's `unavailable` |
 | two people logged in | only the person on seat0 is served | one worker per session id; the one in the background serves nothing while `Away` |
 | an update replaces the binary under a running worker | nothing, until the daemon restarts | the worker is spawned from the daemon's own image (inferred: `/proc/self/exe`), and the lifeline ends it with its daemon; the next daemon spawns the new one |
 | the portal asks the person a question nobody is there to answer (KDE, P2) | a dialog on an unattended screen | the 120 s bound (`capture/portal/mod.rs:1505`) fails the open and the cascade falls through, as today; P1 opens no portal |
@@ -336,7 +336,7 @@ and D6 are open.
   the system card serves today), then the X11 desktops refused with `x11_not_enabled`. Cost: those desktops wait a
   phase.
   Sharpened by P0: a worker reaches those desktops, but they are refused because their lock is not reported to
-  logind (`capture/mod.rs:1235`), and a worker does not change that. They need a lock signal of their own first.
+  logind (`capture/mod.rs:1255`), and a worker does not change that. They need a lock signal of their own first.
 - **D2. What the system card says until this ships** is FR-141's D3.
 - **D3. AC2's and AC3's bar. Decided 2026-11-11, as recommended:** per-user parity, which on Wayland is the
   clipboard alone, and the layout read without a switch on GNOME. Cost: AC2 is reworded; Wayland layout and
