@@ -2171,6 +2171,35 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// #3864 — on a one-row Mac's worker, the questions its person's app
+    /// lists are this process's own and the root half's: the root daemon asks
+    /// that Mac's questions on its own broker, and the app reaches this
+    /// worker's socket ([`crate::consent_relay::listed`], over the root
+    /// half's person socket). Everywhere else, this daemon's own.
+    async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+        let own = self.consent_pending();
+        if !self.no_enrollment {
+            return own;
+        }
+        crate::consent_relay::listed(own, self.root_half.as_ref()).await
+    }
+
+    /// #3864 — and an answer to a question its own broker is not asking goes
+    /// to the root half, whose person socket asks the seat again before it
+    /// takes it ([`crate::consent_relay::decided`]). Its own questions, a
+    /// malformed id, and every other daemon decide here as before.
+    async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+        if !self.no_enrollment
+            || !is_hex_object_id(session_id)
+            || self.consent.is_asking(session_id)
+        {
+            return Response::ConsentDecided {
+                ok: self.consent_decide(session_id, allow),
+            };
+        }
+        crate::consent_relay::decided(self.root_half.as_ref(), session_id, allow).await
+    }
+
     /// #2871 (review) — is `uid` the person at this device's seat right now
     /// ([`crate::person_socket::at_the_seat_now`])? The person socket asks
     /// before it applies a config change. Only Linux and macOS serve one.

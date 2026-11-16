@@ -1158,7 +1158,7 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 pub async fn ensure_running() -> bool {
     let verdicts = ensure_verdicts();
     if let Some(up) = verdicts.standing() {
-        return up;
+        return up && reaches_the_tray().await;
     }
 
     let (up, stands) = match ensure_running_inner().await {
@@ -1188,7 +1188,7 @@ pub async fn ensure_running() -> bool {
         }
     };
     verdicts.keep(up, stands);
-    up
+    up && reaches_the_tray().await
 }
 
 /// One attempt per this interval, process-wide, after a verdict that cannot
@@ -2322,6 +2322,32 @@ fn start_tray(
 /// after another start began (`one_in_flight`'s cost).
 #[cfg(any(target_os = "windows", unix))]
 const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// #3864 — the rest of [`ensure_running`]'s verdict, asked fresh at every
+/// prompt, beside the tray's own: whether a question this daemon asks gets to
+/// the tray at all. Off a one-row Mac's root daemon the tray asks this daemon
+/// itself, and it does. On one, the tray asks the worker, which lists the
+/// root daemon's questions only while the road is open
+/// ([`crate::consent_relay::reach`]): closed, the tray is not the question's
+/// surface, and a window nobody answers ends as `no_prompt_surface`.
+async fn reaches_the_tray() -> bool {
+    // A test stands the road in with the tray's start.
+    #[cfg(all(test, any(target_os = "windows", unix)))]
+    let reach = match tray_stand_in::now().and_then(|stood| stood.road) {
+        Some(road) => road.reach().await,
+        None => crate::consent_relay::reach().await,
+    };
+    #[cfg(not(all(test, any(target_os = "windows", unix))))]
+    let reach = crate::consent_relay::reach().await;
+    if let crate::consent_relay::Reach::Closed(why) = &reach {
+        tracing::info!(
+            why = %why,
+            "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
+             (#3864); `roomlerd consent` still answers it"
+        );
+    }
+    reach.open()
+}
 
 /// #3855, #3858 — the tray's start stood in for the tasks of one test: its
 /// steps, in place of the daemon's ([`TraySteps::real`]), and starts in

@@ -3954,6 +3954,11 @@ where
                 // another process (a two-half Mac's root half).
                 Ok(Request::Status) => Response::Status(Box::new(state.status_view().await)),
                 Ok(Request::Peers) => Response::Peers(state.peers_view().await),
+                // #3864 — and the consent questions, which a one-row Mac's
+                // worker lists from the root half too.
+                Ok(Request::ConsentPending) => {
+                    Response::ConsentPending(state.consent_pending_view().await)
+                }
                 Ok(Request::Ping {
                     target,
                     timeout_ms,
@@ -4027,9 +4032,7 @@ where
                     if scope.is_person() && !peer.is_root() =>
                 {
                     match still_at_the_seat(state, &peer).await {
-                        AtTheSeat::Yes => Response::ConsentDecided {
-                            ok: state.consent_decide(&session_id, allow),
-                        },
+                        AtTheSeat::Yes => state.consent_decide_view(&session_id, allow).await,
                         AtTheSeat::No => not_at_the_seat_to_answer(),
                         AtTheSeat::NotKnownYet => Response::Error {
                             message: CANNOT_TELL_WHO_IS_AT_THE_SCREEN.into(),
@@ -4046,6 +4049,10 @@ where
                     if !scope.is_person() && !peer.may_decide_for_the_screen() =>
                 {
                     not_the_screens_person(&peer, false)
+                }
+                // #3864 — an answer past its gates: the daemon's view of it.
+                Ok(Request::ConsentDecide { session_id, allow }) => {
+                    state.consent_decide_view(&session_id, allow).await
                 }
                 Ok(Request::RcDisconnect { .. })
                     if !scope.is_person() && !peer.may_decide_for_the_screen() =>

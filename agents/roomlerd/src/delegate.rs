@@ -231,13 +231,16 @@ pub const KEEP_DELEGATED: &str = "keep-delegated";
 /// #3864 — `relays_consent`: a worker with no enrollment (a one-row Mac's)
 /// lists and decides the root half's consent questions for its person's app.
 pub fn worker_features(relays_consent: bool) -> Vec<String> {
-    let _ = relays_consent;
-    vec![KEEP_DELEGATED.to_string()]
+    let mut words = vec![KEEP_DELEGATED.to_string()];
+    if relays_consent {
+        words.push(crate::consent_relay::RELAY_CONSENT.to_string());
+    }
+    words
 }
 
 /// FR-138 P2b — the feature words the daemon knows. A word a worker gains is
 /// added here too, or the daemon never hears it.
-const WORKER_FEATURE_WORDS: [&str; 1] = [KEEP_DELEGATED];
+const WORKER_FEATURE_WORDS: [&str; 2] = [KEEP_DELEGATED, crate::consent_relay::RELAY_CONSENT];
 
 /// FR-138 P2b — what the daemon keeps of its worker's feature words, as
 /// [`worker_words`] keeps its capability words (#3706): the words this build
@@ -1274,8 +1277,15 @@ impl DelegateHost {
     }
 
     /// FR-43 P3b — this is a one-row Mac's daemon ([`one_row_daemon`]).
+    ///
+    /// #3864 — its consent questions reach its person's app only through this
+    /// host's worker, so the companion's verdict asks this host about that
+    /// road ([`crate::consent_relay::register`]). Not from a test, whose hosts
+    /// must not stand for the process.
     pub fn set_one_row(&self) {
         self.inner.one_row.store(true, Ordering::Release);
+        #[cfg(not(test))]
+        crate::consent_relay::register(self);
     }
 
     fn one_row(&self) -> bool {
