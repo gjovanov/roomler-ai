@@ -4314,6 +4314,30 @@ describe('codecChoiceToSettings (rc.199 unified Codec picker)', () => {
       renderPath: 'video',
     })
   })
+
+  it('#3651 — HEVC and H.264 with "Standard (4:2:0)": the plain choice\'s transport, chroma pinned to yuv420', () => {
+    expect(codecChoiceToSettings('hevc-420')).toEqual({
+      videoTransport: 'data-channel-hevc',
+      chroma: 'yuv420',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
+    expect(codecChoiceToSettings('h264-420')).toEqual({
+      videoTransport: 'data-channel-h264',
+      chroma: 'yuv420',
+      preferredCodec: 'h264',
+      renderPath: 'webcodecs',
+    })
+    // The escape hatch keeps its meaning for this choice too: the RTP track,
+    // which is 4:2:0 only, so it is exactly what the person picked. H.264
+    // 4:4:4 ignores the hatch because the RTP track cannot carry it.
+    expect(codecChoiceToSettings('h264-420', { h264Rtp: true })).toEqual({
+      videoTransport: 'webrtc',
+      chroma: 'yuv420',
+      preferredCodec: 'h264',
+      renderPath: 'video',
+    })
+  })
 })
 
 describe('settingsToCodecChoice (rc.199 reverse map)', () => {
@@ -4322,9 +4346,11 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
     expect(settingsToCodecChoice('data-channel-av1', 'auto')).toBe('av1')
     expect(settingsToCodecChoice('data-channel-hevc', 'auto')).toBe('hevc')
     // P7 — explicit yuv444 on the HEVC transport reads back as the Rext
-    // pick; yuv420 (and legacy auto above) stay plain HEVC.
+    // pick; #3651 — an explicit yuv420 reads back as "Standard (4:2:0)"
+    // (connect already ran it at 4:2:0 while the picker showed Auto), and
+    // the legacy `auto` above stays the dial-following plain HEVC.
     expect(settingsToCodecChoice('data-channel-hevc', 'yuv444')).toBe('hevc-444')
-    expect(settingsToCodecChoice('data-channel-hevc', 'yuv420')).toBe('hevc')
+    expect(settingsToCodecChoice('data-channel-hevc', 'yuv420')).toBe('hevc-420')
     expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv444')).toBe('vp9-444')
     expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv420')).toBe('vp9-420')
     // FR-77 — a vp9-444 transport with chroma 'auto' is the dial-following
@@ -4334,6 +4360,13 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
     expect(settingsToCodecChoice('webrtc', 'auto')).toBe('h264')
     // P2 — both H.264 transports read back as the single picker choice.
     expect(settingsToCodecChoice('data-channel-h264', 'auto')).toBe('h264')
+    // #3651 — …with its chroma: an explicit yuv420 is "Standard (4:2:0)" on
+    // either transport. The RTP track cannot carry 4:4:4, so a legacy
+    // (webrtc, yuv444) from the old toggles stays plain H.264.
+    expect(settingsToCodecChoice('data-channel-h264', 'yuv420')).toBe('h264-420')
+    expect(settingsToCodecChoice('webrtc', 'yuv420')).toBe('h264-420')
+    expect(settingsToCodecChoice('webrtc', 'yuv444')).toBe('h264')
+    expect(settingsToCodecChoice('data-channel-h264', 'yuv444')).toBe('h264-444')
     // FR-77 — codec Auto remembers an explicit chroma.
     expect(settingsToCodecChoice('auto', 'yuv444')).toBe('auto-444')
     expect(settingsToCodecChoice('auto', 'yuv420')).toBe('auto-420')
@@ -4344,6 +4377,13 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
     // without a settings mapping fails here instead of in the picker.
     for (const c of RC_CODEC_CHOICES) {
       const s = codecChoiceToSettings(c)
+      expect(settingsToCodecChoice(s.videoTransport, s.chroma)).toBe(c)
+    }
+  })
+
+  it('#3651 — …and with the legacy H.264 RTP mapping on, which must not drop a chroma either', () => {
+    for (const c of RC_CODEC_CHOICES) {
+      const s = codecChoiceToSettings(c, { h264Rtp: true })
       expect(settingsToCodecChoice(s.videoTransport, s.chroma)).toBe(c)
     }
   })

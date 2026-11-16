@@ -1,6 +1,6 @@
 # FR-64 — Remote desktop never rides the overlay
 
-**Issue:** [#1244](https://github.com/gjovanov/roomler-ai/issues/1244) · **Status:** open, AC1-AC5 read (AC2's p50 owes a read from pages loaded after 2026-11-08 15:56Z, when #3566's fix went live), two things owed (below) · **Plan:** `immutable-doodling-neumann` (approved 2026-09-02)
+**Issue:** [#1244](https://github.com/gjovanov/roomler-ai/issues/1244) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). The own-adapter filter stays: it is what the `off` policy means. The rule in this FR's title is replaced by FR-148's carrier rule (its D3), and AC2's read moved to FR-148's AC26. FR-148 §12 maps each open criterion. At the close: open, AC1-AC5 read (AC2's p50 owes a read from pages loaded after 2026-11-08 15:56Z, when #3566's fix went live), two things owed (below) · **Plan:** `immutable-doodling-neumann` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 

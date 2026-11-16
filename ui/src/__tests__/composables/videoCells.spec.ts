@@ -21,11 +21,14 @@ import {
   transportForSession,
   PICKER_CHROMAS,
   PICKER_CODECS,
+  SESSION_SUPPORTS_444,
+  type PickerCodec,
 } from '@/composables/videoCells'
 import {
   RC_CODEC_CHOICES,
   codecChoiceToSettings,
   pickAutoTransport,
+  settingsToCodecChoice,
 } from '@/composables/useRemoteControl'
 
 const base: AgentCapabilities = {
@@ -118,19 +121,44 @@ describe('FR-77 cellsFromCaps — one derivation for the picker and the chips', 
 })
 
 describe('FR-77 the two-axis picker ↔ the stored choice', () => {
-  it('every (codec, chroma) pair maps to a stored choice and back', () => {
-    for (const codec of PICKER_CODECS) {
-      for (const chroma of PICKER_CHROMAS) {
+  // #3651 — the property: every pair the picker offers survives the stored
+  // choice, its chroma included, except on a codec that has one chroma in a
+  // session (AV1), whose chroma reads back as "auto" by design. It is written
+  // over the two lists, so a codec or a chroma added to either fails here
+  // until its pair is carried. A pair the stored choice could not hold is how
+  // "Standard (4:2:0)" on HEVC and H.264 snapped back to "Auto (follows
+  // Priority)", and how the session then opened in 4:4:4 on Sharper.
+  const oneChroma = (codec: PickerCodec) => codec !== 'auto' && !SESSION_SUPPORTS_444[codec]
+  const pairs = PICKER_CODECS.flatMap((codec) => PICKER_CHROMAS.map((chroma) => ({ codec, chroma })))
+
+  it('every (codec, chroma) pair maps to a stored choice and back, its chroma included', () => {
+    for (const { codec, chroma } of pairs) {
+      const choice = choiceFromPicker(codec, chroma)
+      expect(RC_CODEC_CHOICES).toContain(choice)
+      expect(pickerFromChoice(choice), `${codec} × ${chroma} → ${choice}`).toEqual({
+        codec,
+        chroma: oneChroma(codec) ? 'auto' : chroma,
+      })
+    }
+  })
+
+  it('…and through the settings the choice is stored as: what the per-browser default reads back', () => {
+    // The page shows `settingsToCodecChoice(transport, chroma)` of the four
+    // refs the choice set, which is also what a reload reads back from the
+    // per-browser default; with and without the legacy H.264 RTP mapping.
+    for (const h264Rtp of [false, true]) {
+      for (const { codec, chroma } of pairs) {
         const choice = choiceFromPicker(codec, chroma)
-        expect(RC_CODEC_CHOICES).toContain(choice)
-        const back = pickerFromChoice(choice)
-        expect(back.codec).toBe(codec)
-        // AV1 (a single chroma) and the auto/420 HEVC and H.264 pairs (FR-77 P3b:
-        // H.264 has its 4:4:4 choice now) read back as "auto" chroma.
-        const collapses =
-          codec === 'av1' || ((codec === 'hevc' || codec === 'h264') && chroma !== 'yuv444')
-        expect(back.chroma).toBe(collapses ? 'auto' : chroma)
+        const s = codecChoiceToSettings(choice, { h264Rtp })
+        expect(settingsToCodecChoice(s.videoTransport, s.chroma), `${codec} × ${chroma}, h264Rtp ${h264Rtp}`).toBe(choice)
       }
+    }
+  })
+
+  it('pairs that differ in chroma are different stored choices, except on a one-chroma codec', () => {
+    for (const codec of PICKER_CODECS) {
+      const choices = new Set(PICKER_CHROMAS.map((chroma) => choiceFromPicker(codec, chroma)))
+      expect(choices.size, codec).toBe(oneChroma(codec) ? 1 : PICKER_CHROMAS.length)
     }
   })
 
@@ -142,6 +170,15 @@ describe('FR-77 the two-axis picker ↔ the stored choice', () => {
     expect(choiceFromPicker('auto', 'yuv444')).toBe('auto-444')
     expect(choiceFromPicker('auto', 'yuv420')).toBe('auto-420')
     expect(choiceFromPicker('auto', 'auto')).toBe('auto')
+    // #3651 — HEVC and H.264 carry an explicit 4:2:0 as VP9 and Auto do. The
+    // plain value stays chroma "Auto": what a page before the change stored
+    // still means "follows Priority".
+    expect(choiceFromPicker('hevc', 'yuv420')).toBe('hevc-420')
+    expect(choiceFromPicker('h264', 'yuv420')).toBe('h264-420')
+    expect(choiceFromPicker('hevc', 'auto')).toBe('hevc')
+    expect(choiceFromPicker('h264', 'auto')).toBe('h264')
+    expect(pickerFromChoice('hevc')).toEqual({ codec: 'hevc', chroma: 'auto' })
+    expect(pickerFromChoice('h264')).toEqual({ codec: 'h264', chroma: 'auto' })
     for (const choice of RC_CODEC_CHOICES) {
       // every stored choice reads back onto the two axes
       const { codec, chroma } = pickerFromChoice(choice)
@@ -332,7 +369,8 @@ describe('FR-77 P3b — H.264 4:4:4 and hardware VP9 4:4:4 cells', () => {
 
   it('the picker maps H.264 + 4:4:4 to its own stored choice and back', () => {
     expect(choiceFromPicker('h264', 'yuv444')).toBe('h264-444')
-    expect(choiceFromPicker('h264', 'yuv420')).toBe('h264')
+    // #3651 — and 4:2:0 to its own (it used to collapse into plain `h264`).
+    expect(choiceFromPicker('h264', 'yuv420')).toBe('h264-420')
     expect(pickerFromChoice('h264-444')).toEqual({ codec: 'h264', chroma: 'yuv444' })
   })
 })

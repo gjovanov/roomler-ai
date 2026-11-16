@@ -2005,3 +2005,742 @@ async fn overlay_removes_reach_peers_homed_on_another_pod() {
     ws_a.close(None).await.ok();
     ws_b.close(None).await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// A seat whose membership ended while the pod serving its call could not be
+// reached (#3839). The withdrawal of `revoke` could not reach that pod, so
+// no one closed the seat; the pod serving the call finds the seat's admission
+// gone in its own check and ends the seat itself.
+// ---------------------------------------------------------------------------
+
+/// How long these tests wait for the pod serving a call to end a seat whose
+/// admission is gone once no withdrawal reached it: two passes of its seat
+/// check, ten seconds apart, each read bounded at five seconds, and slack for
+/// a loaded runner.
+const SEAT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The pod serving `room_id`'s call (app1) can no longer be reached by the
+/// other: the call's claim names a pod no one runs, which app1 holds as its
+/// own, so its claim refresh neither folds the call nor gives the record up
+/// (`a_room_deleted_while_the_pod_serving_its_call_cannot_be_reached_ends_it_afterwards`
+/// does the same, and says what the two writes leave open).
+async fn cut_off_the_pod_serving(app1: &TestApp, room_id: &str) {
+    let dir = app1
+        .state
+        .cluster_directory
+        .clone()
+        .expect("a directory: the caller skips without Redis");
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let key = roomler_ai_api::cluster::directory::media_key(room_id);
+    let unreachable = format!("gone-{}", bson::oid::ObjectId::new().to_hex());
+    let raw = claim_record_of(&unreachable);
+    dir.claim_lww(&key, &raw).await.unwrap();
+    conf(app1).media_claim_tokens.insert(rid, raw);
+}
+
+/// The next frame of type `kind` within `within`, or `None` once it passed.
+async fn frame_of_within(
+    ws: &mut UserWs,
+    kind: &str,
+    within: std::time::Duration,
+) -> Option<serde_json::Value> {
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let msg = match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(other) => panic!("socket ended waiting for {kind}: {other:?}"),
+            Err(_) => return None,
+        };
+        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(msg.to_text().unwrap_or(""))
+            && frame["type"] == kind
+        {
+            return Some(frame);
+        }
+    }
+}
+
+/// The membership ended and no word of it reached the pod serving the call:
+/// the member's socket heard no end of its call, and app1 still seats it.
+async fn assert_seat_still_held(
+    app1: &TestApp,
+    room_id: &str,
+    member: &mut UserWs,
+    conn: &str,
+    what: &str,
+) {
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let heard: Vec<serde_json::Value> = frames_within(member, 500)
+        .await
+        .into_iter()
+        .filter(|f| f["type"] == "room:call_ended")
+        .collect();
+    assert!(
+        heard.is_empty(),
+        "{what}: the member heard the call end though no one reached the pod serving it: {heard:?}"
+    );
+    assert_eq!(
+        conf(app1).room_manager.get_connection_room(conn),
+        Some(rid),
+        "{what}: the seat went though no one reached the pod serving it"
+    );
+}
+
+/// The room's `participant_count`, whichever integer width it was stored as.
+fn participant_count_of(room: &bson::Document) -> Option<i64> {
+    match room.get("participant_count") {
+        Some(bson::Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(bson::Bson::Int64(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The pod serving the call (app1) ended the seat by itself, the way a
+/// withdrawal that reached it ends one: the member's socket (on app2) hears
+/// its call ended with `reason: "not_a_member"`, the host (on app1) hears it
+/// leave, app1 seats it no more, and the call goes on for the host, counted
+/// once.
+async fn assert_seat_ended_by_the_pod_serving_it(
+    app1: &TestApp,
+    room_id: &str,
+    host: &mut UserWs,
+    member: &mut UserWs,
+    conn: &str,
+    what: &str,
+) {
+    let ended = frame_of_within(member, "room:call_ended", SEAT_CHECK_WAIT)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "{what}: the seat outlived its membership: no room:call_ended within \
+                 {SEAT_CHECK_WAIT:?} of the membership's end"
+            )
+        });
+    assert_eq!(ended["data"]["room_id"], room_id, "{ended}");
+    assert_eq!(ended["data"]["reason"], "not_a_member", "{ended}");
+    let left = next_frame_of(host, "media:peer_left").await;
+    assert_eq!(left["data"]["connection_id"], conn, "{left}");
+    assert_eq!(
+        conf(app1).room_manager.get_connection_room(conn),
+        None,
+        "{what}: the pod serving the call still seats the member"
+    );
+    let rid = bson::oid::ObjectId::parse_str(room_id).unwrap();
+    let room = app1
+        .db
+        .collection::<bson::Document>("rooms")
+        .find_one(bson::doc! { "_id": rid })
+        .await
+        .unwrap()
+        .expect("the room exists");
+    assert_eq!(
+        room.get_str("conference_status").ok(),
+        Some("in_progress"),
+        "{what}: the host is still in the call: {room:?}"
+    );
+    assert_eq!(
+        participant_count_of(&room),
+        Some(1),
+        "{what}: the call counts the host alone: {room:?}"
+    );
+}
+
+/// The `room_members` row of `user_id` in `room_id`, if any.
+async fn room_row_of(app: &TestApp, room_id: &str, user_id: &str) -> Option<bson::Document> {
+    app.db
+        .collection::<bson::Document>("room_members")
+        .find_one(bson::doc! {
+            "room_id": bson::oid::ObjectId::parse_str(room_id).unwrap(),
+            "user_id": bson::oid::ObjectId::parse_str(user_id).unwrap(),
+        })
+        .await
+        .unwrap()
+}
+
+/// A member removed from the org while the pod serving their call cannot be
+/// reached keeps their seat only until that pod checks its seats: it finds
+/// them no longer a member of the room's org, twice, a pass apart, and ends
+/// the seat. The removal itself answers, and every hook after conference's
+/// runs (chat's ends the person's room memberships).
+#[tokio::test]
+async fn an_org_removal_the_pod_serving_the_call_did_not_hear_ends_the_seat_there() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    cut_off_the_pod_serving(&app1, &room_id).await;
+
+    let resp = app2
+        .auth_delete(
+            &format!(
+                "/api/tenant/{}/member/{}",
+                tenant.tenant_id, tenant.member.id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        room_row_of(&app1, &room_id, &tenant.member.id)
+            .await
+            .is_none(),
+        "chat's hook did not run after conference's: the person's room membership stayed"
+    );
+    assert_seat_still_held(&app1, &room_id, &mut member, &conn, "org removal").await;
+
+    assert_seat_ended_by_the_pod_serving_it(
+        &app1,
+        &room_id,
+        &mut host,
+        &mut member,
+        &conn,
+        "org removal",
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// A member who leaves a room only its members may enter, while the pod
+/// serving its call cannot be reached, keeps their seat only until that pod
+/// checks its seats: the room's visibility wants a membership they no longer
+/// hold, twice, a pass apart, and the pod ends the seat.
+#[tokio::test]
+async fn a_private_room_leave_the_pod_serving_the_call_did_not_hear_ends_the_seat_there() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+    // Only its members may enter the room from now on; both are members.
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+    app1.db
+        .collection::<bson::Document>("rooms")
+        .update_one(
+            bson::doc! { "_id": rid },
+            bson::doc! { "$set": { "visibility": "private" } },
+        )
+        .await
+        .unwrap();
+    cut_off_the_pod_serving(&app1, &room_id).await;
+
+    let resp = app2
+        .auth_post(
+            &format!("/api/tenant/{}/room/{}/leave", tenant.tenant_id, room_id),
+            &tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        room_row_of(&app1, &room_id, &tenant.member.id)
+            .await
+            .is_none(),
+        "the leave did not end the room membership"
+    );
+    assert_seat_still_held(&app1, &room_id, &mut member, &conn, "private room leave").await;
+
+    assert_seat_ended_by_the_pod_serving_it(
+        &app1,
+        &room_id,
+        &mut host,
+        &mut member,
+        &conn,
+        "private room leave",
+    )
+    .await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// What the seat check must never end (#3839): its positive controls. The
+// check closes a seat only on a positive reading, twice, that its admission
+// is gone; everything else keeps the seat. These drive it directly, one pass
+// at a time, with one memory between passes as its loop keeps one. Its own
+// loop runs beside them on every pod, so a control asserts what a pass
+// ends, never that only its own passes ran.
+// ---------------------------------------------------------------------------
+
+fn oid_of(hex: &str) -> bson::oid::ObjectId {
+    bson::oid::ObjectId::parse_str(hex).unwrap()
+}
+
+/// A new room in `tenant`, made by its admin, with a call started in it.
+async fn start_call_in_new_room(
+    app: &TestApp,
+    tenant: &crate::fixtures::seed::SeededTenant,
+    name: &str,
+) -> String {
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "room create: {}", resp.status());
+    let room: serde_json::Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/start",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    room_id
+}
+
+/// `token`'s account joins `room_id`'s call (`call/join`, then `media:join`
+/// on a socket of its own) and is seated on `app`. Returns the socket and
+/// its connection.
+async fn seat_in_call(
+    app: &TestApp,
+    tenant_id: &str,
+    room_id: &str,
+    token: &str,
+) -> (UserWs, String) {
+    join_call(app, tenant_id, room_id, token).await;
+    let (mut ws, conn) = connect_user_ws_conn(app, token).await;
+    send_media(&mut ws, "media:join", room_id).await;
+    assert_eq!(
+        next_media_msg(&mut ws).await["type"],
+        "media:router_capabilities"
+    );
+    assert_eq!(
+        next_media_msg(&mut ws).await["type"],
+        "media:transport_created"
+    );
+    assert_eq!(
+        conf(app).room_manager.get_connection_room(&conn),
+        Some(oid_of(room_id)),
+        "seated in {room_id}"
+    );
+    (ws, conn)
+}
+
+/// Set the room's visibility as its document stores it.
+async fn set_visibility(app: &TestApp, room_id: &str, visibility: &str) {
+    app.db
+        .collection::<bson::Document>("rooms")
+        .update_one(
+            bson::doc! { "_id": oid_of(room_id) },
+            bson::doc! { "$set": { "visibility": visibility } },
+        )
+        .await
+        .unwrap();
+}
+
+/// Remove `user_id`'s `room_members` row in `room_id` by a raw write, the way
+/// a path that tells no hook would: nothing reaches the seat but the check.
+async fn delete_room_row(app: &TestApp, room_id: &str, user_id: &str) {
+    let gone = app
+        .db
+        .collection::<bson::Document>("room_members")
+        .delete_many(bson::doc! { "room_id": oid_of(room_id), "user_id": oid_of(user_id) })
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.deleted_count, 1,
+        "one room row of {user_id} in {room_id}"
+    );
+}
+
+/// Remove `user_id`'s `tenant_members` row in `tenant_id` by a raw write.
+async fn delete_org_row(app: &TestApp, tenant_id: &str, user_id: &str) {
+    let gone = app
+        .db
+        .collection::<bson::Document>("tenant_members")
+        .delete_many(bson::doc! { "tenant_id": oid_of(tenant_id), "user_id": oid_of(user_id) })
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.deleted_count, 1,
+        "one org row of {user_id} in {tenant_id}"
+    );
+}
+
+/// `n` passes of the seat check, each ending nothing.
+async fn passes_end_nothing(
+    app: &TestApp,
+    memory: &mut roomler_ai_mod_conference::seat_check::SeatCheckMemory,
+    n: usize,
+    what: &str,
+) {
+    for pass in 1..=n {
+        let ended =
+            roomler_ai_mod_conference::seat_check::check_seats_once(conf(app), memory).await;
+        assert!(ended.is_empty(), "{what}: pass {pass} ended {ended:?}");
+    }
+}
+
+/// No `room:call_ended` for `room_id` reached `ws` within half a second. (A
+/// call that ends tells every socket of its room's members, whatever room
+/// each sits in, so a socket is asked about one room.)
+async fn heard_no_call_end(ws: &mut UserWs, room_id: &str, what: &str) {
+    let heard: Vec<serde_json::Value> = frames_within(ws, 500)
+        .await
+        .into_iter()
+        .filter(|f| f["type"] == "room:call_ended" && f["data"]["room_id"] == room_id)
+        .collect();
+    assert!(heard.is_empty(), "{what} heard its call end: {heard:?}");
+}
+
+/// The seat of `conn` is still held in `room_id`.
+fn assert_seated(app: &TestApp, conn: &str, room_id: &str, what: &str) {
+    assert_eq!(
+        conf(app).room_manager.get_connection_room(conn),
+        Some(oid_of(room_id)),
+        "{what}: the seat went"
+    );
+}
+
+/// The seat check's reading agrees with the room guard `media:join` runs, in
+/// every cell: each room visibility, with and without a room row, for a
+/// member of the org and for someone who is not one, for a plain member and
+/// for the org's administrator. Wherever the guard admits, the check must read
+/// `Admitted`, or it would end a seat the guard would give back at once; a
+/// change to the guard (a role that may enter without a row, say) breaks this
+/// test before it ends anyone's seat. Both answers are held against one table,
+/// `expected`, whose `match` names every visibility with no wildcard: a new
+/// visibility does not compile here until someone decides what a seat in such
+/// a room reads.
+#[tokio::test]
+async fn the_seat_checks_reading_agrees_with_the_room_guard_in_every_cell() {
+    use roomler_ai_db::models::RoomVisibility;
+    use roomler_ai_mod_conference::seat_check::{Gone, Reading, read_readings};
+
+    /// The reading a seat must get, cell by cell. Adding a visibility means
+    /// an arm here and an entry in `visibilities` below.
+    fn expected(visibility: RoomVisibility, in_org: bool, with_row: bool) -> Reading {
+        let needs_a_room_row = match visibility {
+            RoomVisibility::Public => false,
+            RoomVisibility::Private | RoomVisibility::Secret => true,
+        };
+        if !in_org {
+            Reading::Gone(Gone::NotInOrg)
+        } else if needs_a_room_row && !with_row {
+            Reading::Gone(Gone::NotInRoom)
+        } else {
+            Reading::Admitted
+        }
+    }
+
+    let app = TestApp::spawn().await;
+    let state = conf(&app);
+    let tenant = app.seed_tenant("seatmatrix").await;
+    let tid = oid_of(&tenant.tenant_id);
+    let people = [
+        ("member", tenant.member.id.clone()),
+        ("administrator", tenant.admin.id.clone()),
+    ];
+    let visibilities = [
+        RoomVisibility::Public,
+        RoomVisibility::Private,
+        RoomVisibility::Secret,
+    ];
+
+    // One room for each visibility and row: (visibility, with a row, room).
+    let mut rooms = Vec::new();
+    for visibility in visibilities {
+        for with_row in [true, false] {
+            let resp = app
+                .auth_post(
+                    &format!("/api/tenant/{}/room", tenant.tenant_id),
+                    &tenant.admin.access_token,
+                )
+                .json(&serde_json::json!({ "name": format!("{visibility:?} {with_row}") }))
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "room create: {}", resp.status());
+            let room: serde_json::Value = resp.json().await.unwrap();
+            let room_id = room["id"].as_str().unwrap().to_string();
+            let stored = bson::to_bson(&visibility).unwrap();
+            let stored = stored.as_str().unwrap().to_string();
+            set_visibility(&app, &room_id, &stored).await;
+            for (_, person) in &people {
+                // Exactly the row this cell wants, through the DAO that writes it.
+                app.db
+                    .collection::<bson::Document>("room_members")
+                    .delete_many(
+                        bson::doc! { "room_id": oid_of(&room_id), "user_id": oid_of(person) },
+                    )
+                    .await
+                    .unwrap();
+                if with_row {
+                    state
+                        .rooms
+                        .join(tid, oid_of(&room_id), oid_of(person))
+                        .await
+                        .unwrap();
+                }
+            }
+            rooms.push((visibility, with_row, room_id));
+        }
+    }
+
+    let mut cells = 0;
+    for in_org in [true, false] {
+        if !in_org {
+            for (_, person) in &people {
+                delete_org_row(&app, &tenant.tenant_id, person).await;
+            }
+        }
+        let seated: Vec<(bson::oid::ObjectId, bson::oid::ObjectId)> = rooms
+            .iter()
+            .flat_map(|(_, _, room)| people.iter().map(move |(_, p)| (oid_of(room), oid_of(p))))
+            .collect();
+        let readings = read_readings(state, &seated)
+            .await
+            .expect("a complete read");
+        for (visibility, with_row, room_id) in &rooms {
+            for (who, person) in &people {
+                let cell = format!(
+                    "{who}, {visibility:?} room, room row: {with_row}, in the org: {in_org}"
+                );
+                let admitted = match roomler_ai_mod_conference::guards::require_room_in_tenant(
+                    state,
+                    tid,
+                    oid_of(room_id),
+                    oid_of(person),
+                )
+                .await
+                {
+                    Ok(_) => true,
+                    Err(
+                        roomler_core::ApiError::NotAMember
+                        | roomler_core::ApiError::Forbidden(_)
+                        | roomler_core::ApiError::NotFound(_),
+                    ) => false,
+                    Err(other) => panic!("{cell}: the guard could not answer: {other:?}"),
+                };
+                let reading = readings
+                    .get(&(oid_of(room_id), oid_of(person)))
+                    .copied()
+                    .unwrap_or_else(|| panic!("{cell}: no reading"));
+                let want = expected(*visibility, in_org, *with_row);
+                assert_eq!(
+                    admitted,
+                    want == Reading::Admitted,
+                    "{cell}: the room guard and the table disagree (the table reads {want:?})"
+                );
+                assert_eq!(
+                    reading, want,
+                    "{cell}: the seat check reads {reading:?} where the guard's table reads {want:?}"
+                );
+                cells += 1;
+            }
+        }
+    }
+    assert_eq!(cells, 24, "every cell was read");
+}
+
+/// A member the room guard admits keeps their seat however often the pod
+/// serving the call checks it: in a room only its members may enter, holding
+/// their room membership, three passes end nothing and nobody hears a thing.
+#[tokio::test]
+async fn an_entitled_member_keeps_the_seat_across_seat_checks() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("seatkeep").await;
+    let room_id = start_call_in_new_room(&app, &tenant, "Keep").await;
+    let (mut host, host_conn) = seat_in_call(
+        &app,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.admin.access_token,
+    )
+    .await;
+    let (mut member, conn) = seat_in_call(
+        &app,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.member.access_token,
+    )
+    .await;
+    set_visibility(&app, &room_id, "private").await;
+    assert!(
+        room_row_of(&app, &room_id, &tenant.member.id)
+            .await
+            .is_some(),
+        "the member holds the room's membership"
+    );
+
+    let mut memory = roomler_ai_mod_conference::seat_check::SeatCheckMemory::default();
+    passes_end_nothing(&app, &mut memory, 3, "an entitled member").await;
+    heard_no_call_end(&mut member, &room_id, "the member").await;
+    heard_no_call_end(&mut host, &room_id, "the host").await;
+    assert_seated(&app, &conn, &room_id, "the member");
+    assert_seated(&app, &host_conn, &room_id, "the host");
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// A person a room's visibility admits with no room membership at all (any
+/// member of the org may enter a public room) keeps their seat: three passes
+/// end nothing.
+#[tokio::test]
+async fn a_person_the_rooms_visibility_admits_without_a_room_row_keeps_the_seat() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("seatpublic").await;
+    let room_id = start_call_in_new_room(&app, &tenant, "Public").await;
+    let (mut host, _) = seat_in_call(
+        &app,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.admin.access_token,
+    )
+    .await;
+    let (mut member, conn) = seat_in_call(
+        &app,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.member.access_token,
+    )
+    .await;
+    delete_room_row(&app, &room_id, &tenant.member.id).await;
+
+    let mut memory = roomler_ai_mod_conference::seat_check::SeatCheckMemory::default();
+    passes_end_nothing(&app, &mut memory, 3, "admitted by the visibility").await;
+    heard_no_call_end(&mut member, &room_id, "the member").await;
+    assert_seated(&app, &conn, &room_id, "the member");
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// The check ends exactly the seat whose admission is gone, and only on its
+/// second reading of it: the same person's seat in another room of the org,
+/// and in a room of another org, stays; a pass after a close ends nothing. The
+/// memberships go by raw writes, the way a path that tells no hook would.
+#[tokio::test]
+async fn the_seat_check_ends_only_the_seat_whose_admission_is_gone_and_once() {
+    use roomler_ai_mod_conference::seat_check::{SeatCheckMemory, check_seats_once};
+    let app = TestApp::spawn().await;
+    let org_a = app.seed_tenant("seatonlya").await;
+    let org_b = app.seed_tenant("seatonlyb").await;
+    let person = org_a.member.id.clone();
+    let token = org_a.member.access_token.clone();
+
+    // The person is a member of org B too.
+    let role_b: bson::Document = app
+        .db
+        .collection::<bson::Document>("roles")
+        .find_one(bson::doc! { "tenant_id": oid_of(&org_b.tenant_id), "name": "member" })
+        .await
+        .unwrap()
+        .expect("org B's member role");
+    conf(&app)
+        .tenants
+        .add_member(
+            oid_of(&org_b.tenant_id),
+            oid_of(&person),
+            vec![role_b.get_object_id("_id").unwrap()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Room A1 (members only, the admin in it too), room A2 (the person
+    // alone), and room B1 in org B: the person holds a seat in each.
+    let a1 = start_call_in_new_room(&app, &org_a, "A1").await;
+    let a2 = start_call_in_new_room(&app, &org_a, "A2").await;
+    let b1 = start_call_in_new_room(&app, &org_b, "B1").await;
+    let (mut host, _) = seat_in_call(&app, &org_a.tenant_id, &a1, &org_a.admin.access_token).await;
+    let (mut in_a1, conn_a1) = seat_in_call(&app, &org_a.tenant_id, &a1, &token).await;
+    let (mut in_a2, conn_a2) = seat_in_call(&app, &org_a.tenant_id, &a2, &token).await;
+    let (mut in_b1, conn_b1) = seat_in_call(&app, &org_b.tenant_id, &b1, &token).await;
+    set_visibility(&app, &a1, "private").await;
+    let mut memory = SeatCheckMemory::default();
+    passes_end_nothing(&app, &mut memory, 1, "every admission holds").await;
+
+    // The person's room membership of A1 goes: one reading never ends a
+    // seat, the second ends that one seat.
+    delete_room_row(&app, &a1, &person).await;
+    passes_end_nothing(&app, &mut memory, 1, "the first reading of A1's").await;
+    assert_seated(&app, &conn_a1, &a1, "A1 after one reading");
+    let ended = check_seats_once(conf(&app), &mut memory).await;
+    assert_eq!(
+        ended,
+        vec![(oid_of(&a1), oid_of(&person))],
+        "the second reading ends A1's seat"
+    );
+    let heard = frame_of_within(
+        &mut in_a1,
+        "room:call_ended",
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("A1's socket hears its call end");
+    assert_eq!(heard["data"]["room_id"], a1.as_str(), "{heard}");
+    assert_eq!(heard["data"]["reason"], "not_a_member", "{heard}");
+    let left = next_frame_of(&mut host, "media:peer_left").await;
+    assert_eq!(left["data"]["connection_id"], conn_a1.as_str(), "{left}");
+    assert_eq!(conf(&app).room_manager.get_connection_room(&conn_a1), None);
+    assert_seated(&app, &conn_a2, &a2, "another room of the org");
+    assert_seated(&app, &conn_b1, &b1, "a room of another org");
+    heard_no_call_end(&mut in_a2, &a2, "the seat in A2").await;
+    heard_no_call_end(&mut in_b1, &b1, "the seat in B1").await;
+
+    // The person's membership of org A goes: A2's seat ends on the second
+    // reading, and the call they were the last one in ends with it; B1's
+    // seat, in another org, stays.
+    delete_org_row(&app, &org_a.tenant_id, &person).await;
+    passes_end_nothing(&app, &mut memory, 1, "the first reading of org A's").await;
+    assert_seated(&app, &conn_a2, &a2, "A2 after one reading");
+    let ended = check_seats_once(conf(&app), &mut memory).await;
+    assert_eq!(
+        ended,
+        vec![(oid_of(&a2), oid_of(&person))],
+        "the second reading ends A2's seat"
+    );
+    let heard = frame_of_within(
+        &mut in_a2,
+        "room:call_ended",
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("A2's socket hears its call end");
+    assert_eq!(heard["data"]["room_id"], a2.as_str(), "{heard}");
+    assert_eq!(heard["data"]["reason"], "not_a_member", "{heard}");
+    let a2_room = app
+        .db
+        .collection::<bson::Document>("rooms")
+        .find_one(bson::doc! { "_id": oid_of(&a2) })
+        .await
+        .unwrap()
+        .expect("A2 exists");
+    assert_ne!(
+        a2_room.get_str("conference_status").ok(),
+        Some("in_progress"),
+        "the call the person was the last one in ended: {a2_room:?}"
+    );
+    assert_seated(&app, &conn_b1, &b1, "a room of another org");
+    heard_no_call_end(&mut in_b1, &b1, "the seat in B1").await;
+    // Whatever else the end of A2's call told its sockets is read now.
+    frames_within(&mut in_a1, 500).await;
+    frames_within(&mut in_a2, 500).await;
+
+    // Passes after the closes end nothing and tell nobody again.
+    passes_end_nothing(&app, &mut memory, 2, "after the closes").await;
+    heard_no_call_end(&mut in_a1, &a1, "A1's socket again").await;
+    heard_no_call_end(&mut in_a2, &a2, "A2's socket again").await;
+    heard_no_call_end(&mut in_b1, &b1, "the seat in B1").await;
+    assert_seated(&app, &conn_b1, &b1, "a room of another org");
+    for ws in [&mut host, &mut in_a1, &mut in_a2, &mut in_b1] {
+        ws.close(None).await.ok();
+    }
+}

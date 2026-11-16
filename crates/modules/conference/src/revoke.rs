@@ -226,7 +226,12 @@ async fn room_membership_ended(
     room_id: ObjectId,
     user_id: ObjectId,
 ) -> anyhow::Result<()> {
-    let closed = withdraw_seats(state, room_id, user_id).await;
+    // Not reached: reported where it happened; the pod serving the call
+    // ends the seat and settles the call there (`seat_check`).
+    let Withdrawal::Closed(closed) = withdraw_seats(state, tenant_id, room_id, user_id).await
+    else {
+        return Ok(());
+    };
     if closed == 0 {
         return Ok(());
     }
@@ -267,8 +272,11 @@ async fn org_membership_ended(
 
     let mut first_error = None;
     for (rid, in_session) in rooms {
-        let closed = withdraw_seats(state, rid, user_id).await;
-        if closed > 0 {
+        // Not reached: reported where it happened; the pod serving the call
+        // ends the seat by its own check (`seat_check`).
+        if let Withdrawal::Closed(closed) = withdraw_seats(state, tenant_id, rid, user_id).await
+            && closed > 0
+        {
             info!(
                 tenant = %tenant_id, room = %rid, ?user_id, seats = closed,
                 "call seats withdrawn: the org membership ended"
@@ -286,25 +294,57 @@ async fn org_membership_ended(
     first_error.map_or(Ok(()), Err)
 }
 
+/// What a withdrawal of a person's seats in one call came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    /// The pod serving the call's media closed this many of them (none when
+    /// the person held no seat there).
+    Closed(usize),
+    /// The pod the call's claim names could not be asked: no answer within
+    /// the bus deadline, or no bus. Reported where it happened; that pod's
+    /// seat check ends the seat once the membership reads as gone there
+    /// (`seat_check`), and a pod that is gone took its media with it.
+    NotReached,
+}
+
 /// End `user_id`'s seats in `room_id`'s call wherever its media is served:
-/// on this pod, or on the owner pod over the bus. Returns how many closed.
-async fn withdraw_seats(state: &ConferenceState, room_id: ObjectId, user_id: ObjectId) -> usize {
+/// on this pod, or on the owner pod over the bus. A pod that could not be
+/// asked is reported here, with the org, the room, the person and the pod,
+/// in one wording (`alert = membership_seat_unreached`), and answers
+/// [`Withdrawal::NotReached`]: the membership's end stands, and the hooks
+/// after conference's still run.
+async fn withdraw_seats(
+    state: &ConferenceState,
+    tenant_id: ObjectId,
+    room_id: ObjectId,
+    user_id: ObjectId,
+) -> Withdrawal {
     let owner = match resolve_media_route(state, &room_id, false).await {
         MediaRoute::Local { .. } => {
-            return withdraw_seats_here(state, room_id, user_id).await.len();
+            return Withdrawal::Closed(withdraw_seats_here(state, room_id, user_id).await.len());
         }
         MediaRoute::Remote(owner) => owner,
     };
     let Some(bus) = state.cluster_bus.clone() else {
-        return 0;
+        warn!(
+            tenant = %tenant_id, room = %room_id, user = %user_id, pod = %owner,
+            e = "no cluster bus on this pod", alert = "membership_seat_unreached",
+            "call seat withdrawal did not reach the pod serving the call; its seat check ends the seat"
+        );
+        return Withdrawal::NotReached;
     };
     let body = serde_json::json!({ "room_id": room_id.to_hex(), "user_id": user_id.to_hex() });
     match bus.request(&owner, WITHDRAW_SEATS, body).await {
-        Ok(reply) => reply["closed"].as_array().map_or(0, Vec::len),
+        Ok(reply) => Withdrawal::Closed(reply["closed"].as_array().map_or(0, Vec::len)),
         Err(e) => {
-            // The owner is gone (its media went with it), or the bus is down.
-            warn!(room = %room_id, ?user_id, %owner, %e, "withdrawing call seats on the owner pod failed");
-            0
+            // The owner is gone (its media went with it), the bus is down, or
+            // the owner did not answer in time.
+            warn!(
+                tenant = %tenant_id, room = %room_id, user = %user_id, pod = %owner,
+                %e, alert = "membership_seat_unreached",
+                "call seat withdrawal did not reach the pod serving the call; its seat check ends the seat"
+            );
+            Withdrawal::NotReached
         }
     }
 }
@@ -320,15 +360,52 @@ pub(crate) async fn withdraw_seats_here(
     let closed = state
         .room_manager
         .close_participant_by_user(&room_id, &user_id);
+    tell_seats_withdrawn(state, room_id, user_id, &closed).await;
+    closed
+}
+
+/// End the seats `conns` of `user_id` in `room_id`'s media on this pod, those
+/// of them it still holds as that person's, and tell everyone as
+/// [`withdraw_seats_here`] does. The seat check's way to end the seats it
+/// read: a seat taken after its read, such as a person added back who joins
+/// again, is not one of `conns`. Returns the closed connections.
+pub(crate) async fn withdraw_these_seats_here(
+    state: &ConferenceState,
+    room_id: ObjectId,
+    user_id: ObjectId,
+    conns: &[String],
+) -> Vec<String> {
+    let closed: Vec<String> = conns
+        .iter()
+        .filter(|conn| {
+            state
+                .room_manager
+                .close_participant_of_user(&room_id, conn, &user_id)
+        })
+        .cloned()
+        .collect();
+    tell_seats_withdrawn(state, room_id, user_id, &closed).await;
+    closed
+}
+
+/// The closed seats `closed` of `user_id` hear their call ended with
+/// `reason: "not_a_member"`, and everyone left in `room_id`'s call hears each
+/// of them leave.
+async fn tell_seats_withdrawn(
+    state: &ConferenceState,
+    room_id: ObjectId,
+    user_id: ObjectId,
+    closed: &[String],
+) {
     if closed.is_empty() {
-        return closed;
+        return;
     }
     let remaining = state.room_manager.connection_ids(&room_id);
     let ended = serde_json::json!({
         "type": "room:call_ended",
         "data": { "room_id": room_id.to_hex(), "reason": NOT_A_MEMBER }
     });
-    for conn in &closed {
+    for conn in closed {
         roomler_core::ws::dispatcher::send_to_connection_routed(
             &state.ws_storage,
             &state.redis_pubsub,
@@ -354,5 +431,4 @@ pub(crate) async fn withdraw_seats_here(
             .await;
         }
     }
-    closed
 }
