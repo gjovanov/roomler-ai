@@ -72,6 +72,13 @@ pub struct DamageTracker {
     /// failure. Distinct from `overflowed`: there we still have a truthful
     /// bounding box, here we have nothing and must say `Unknown`.
     blind: bool,
+    /// #3671 — the connection failed: said once, never polled again, and
+    /// blind for good. If only this connection broke and the server lives,
+    /// capturing every tick is right; if the server went away, the capture's
+    /// own check stops the frames (`scrap_backend`, `connection_lost`).
+    /// Before, the next poll read the same dead connection and warned again:
+    /// a warning per tick, 56 a second in the field.
+    dead: bool,
 }
 
 impl DamageTracker {
@@ -155,6 +162,7 @@ impl DamageTracker {
             rects: Vec::new(),
             overflowed: false,
             blind: false,
+            dead: false,
         })
     }
 
@@ -191,6 +199,9 @@ impl DamageTracker {
     /// no longer tell what changed, the safe answer is "assume it did, and
     /// admit we cannot say where".
     fn drain_events(&mut self) {
+        if self.dead {
+            return;
+        }
         loop {
             match self.conn.poll_for_event() {
                 Ok(Some(Event::DamageNotify(ev))) => {
@@ -218,6 +229,7 @@ impl DamageTracker {
                         "capture: X11 damage connection failed — assuming the screen changed from here on"
                     );
                     self.blind = true;
+                    self.dead = true;
                     return;
                 }
             }
@@ -235,8 +247,12 @@ impl DamageTracker {
     fn consume(&mut self) {
         self.rects.clear();
         self.overflowed = false;
-        self.blind = false;
+        // #3671 — a dead connection stays blind: nothing will ever say where.
+        self.blind = self.dead;
         self.last_capture = Instant::now();
+        if self.dead {
+            return;
+        }
         if let Ok(cookie) = self
             .conn
             .damage_subtract(self.damage, x11rb::NONE, x11rb::NONE)

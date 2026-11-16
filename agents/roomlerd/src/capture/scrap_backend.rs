@@ -261,8 +261,27 @@ impl ScrapCapture {
                 let mut seen_mode = crate::display_match::mode_generation();
                 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
                 let mut reopen_tried: Option<Instant> = None;
+                // #3671 — the X server this capturer was opened on went away.
+                // XShm then hands back the last picture in shared memory for
+                // ever, and the damage watcher, blind on its dead connection,
+                // called every tick a change: the frozen picture went out at
+                // the full rate. Once set, every ask is answered "no frame",
+                // which the pump treats as an idle screen. Nothing here opens
+                // the capture again: a session sees the desktop's next server
+                // by reconnecting, and the supervisor tells it so.
+                #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                let mut lost = false;
+
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
+                    // #3671 — before the display-mode check below: a mode
+                    // change (another session's display match ending) would
+                    // open the capture again, on whatever server answers now.
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    if lost {
+                        let _ = res_tx.send(Ok(None));
+                        continue;
+                    }
                     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
                     {
                         let now_mode = crate::display_match::mode_generation();
@@ -426,6 +445,22 @@ impl ScrapCapture {
                         downscale,
                         zero_copy,
                     );
+                    // #3671 — the grab's wait for its reply is what finds a
+                    // server that went away, and the frame it returned is
+                    // shared memory's last picture, not a new one: never sent.
+                    // Said once; the damage watcher and the cursor reader go
+                    // with it, since they read the same dead server.
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    if cap.connection_lost() {
+                        lost = true;
+                        damage = None;
+                        x11_cursor = None;
+                        tracing::warn!(
+                            "capture: the X server closed the capture's connection — this session shows no new picture until it reconnects (#3671)"
+                        );
+                        let _ = res_tx.send(Ok(None));
+                        continue;
+                    }
                     #[cfg(target_os = "macos")]
                     if let (Some(since), Ok(Some(_))) = (woke_at, reply.as_ref()) {
                         tracing::info!(
