@@ -1241,7 +1241,7 @@ Viewer switches are stored per browser, following `roomler-rc-*`: `roomler-rc-de
 
 **Version skew.** The viewer rolls in seconds and agents over days. Every viewer phase works against every agent in the field, every agent phase against a viewer that ignores unknown messages, and every wire change is additive (§6.13). Heartbeat fields are appended and never renamed, because `scripts/rc-shadow-report.cjs` and FR-70's reads parse those lines.
 
-**A ratchet, so the debt stops growing while it is paid.** `encode/**` grew ×2.7 in 8.5 weeks (§2.8), and a migration loses to that. R0 adds one CI check, `scripts/rc-media-ratchet.sh`, with a baseline file. The number of knob reads in the media path and the lines in each pump may only fall, unless the PR's message names the ledger row it adds and when that row retires. A fix that must touch a pump before R8 goes through this check.
+**A ratchet, so the debt stops growing while it is paid.** `encode/**` grew ×2.7 in 8.5 weeks (§2.8), and a migration loses to that. R0 adds one CI check, `scripts/rc-media-ratchet.sh`, with a baseline file. The number of knob reads in the media path and the lines in each pump may only fall, unless the PR raises that count's line in the baseline file (`scripts/rc-media-ratchet.baseline`) and names on that line the ledger row it adds and when that row retires. A fix that must touch a pump before R8 goes through this check.
 
 **Not before.** No agent-behaviour phase lands before FR-70 AC10's read (no earlier than 2026-11-04 17:04Z) and the start of the operator's FR-63 read (it must start before 2026-11-06 14:21Z). R0 and the viewer phases may land sooner, since they change neither read's numbers. R0's fields only add to the lines those reads parse. For R3 that holds because its arrival reading is a new field and `queueMs` stays, and R3's proof reads rate to show it. R2's message may land sooner too, while its grant cap, the one agent-behaviour change in Wave A, rides after the gate.
 
@@ -1252,7 +1252,7 @@ Viewer switches are stored per browser, following `roomler-rc-*`: `roomler-rc-de
 | FR-70 | **Build on** | The planes stand. M3b stays FR-70's phase and is listed as R6 for order only. "Media thread" is refined into two stages (§6.1) |
 | FR-98 | **Build on** | L4 is the end-to-end instrument. C7 is issue #3275 and is R4a here, with its own acceptance criteria unchanged. Its open decision 5, what the keepalive costs (`docs/fr/FR-98-input-to-photon-budget.md:127`, `:199-201`), goes with FR-38 (D14) |
 | FR-38 | **Build on, resumes now (D14)** | Its goal, ≤ 0.2 Mbit/s on a still screen, is met on `av1_nvenc` and missed by ×34-45 on QSV. P0's bisect and P0b's QP telemetry are open. R8 keeps what it lands and must not lose the drain |
-| FR-63 | **Build on, order stated (D4)** | B1b's read stays the operator's. B2 and B3 stay FR-63's. This plan asks that R7 land before B2, and R8 does not wait for B2 past D4's date |
+| FR-63 | **Build on, order stated (D4)** | [FR-148](FR-148-path-measured-plan-follows.md) (#3953) superseded FR-63 on 2026-11-16: B1b's read is FR-148's AC5, in its P0, and B2 and B3 are its P5. Where this plan names FR-63's read, B2 or B3, it means those. This plan asks that R7 land before B2, and R8 does not wait for B2 past D4's date |
 | FR-62 | **Build on** | A4 stays FR-62's, after B2 plus one release's soak, as its sequencing already says |
 | FR-118 | **Amend §4.3** | "One device, shared" becomes two devices per cell, by proof (R5, D2). Its `FrameData`, proof child and deny stay, and R5 adds a `gpu-shared` child beside its `gpu` one |
 | FR-119 | **Build on** | The grant, split and clock pin stay. Its dial and default-on stay its own, and R12 delivers what its criteria need |
@@ -1535,7 +1535,7 @@ D11 was answered by S15 and removed, so the numbers have a gap.
 
 - **Conferencing and the overlay,** except where the RC media path rides them. Mediasoup and the WireGuard path are untouched.
 - **Splitting the rest of `peer.rs`.** About 6,900 lines remain, with `AgentPeer::new` at 1,314 and `attach_control_handler` at 598. That is worth doing, and it is another FR.
-- **A rate-control law.** FR-63 owns it.
+- **A rate-control law.** [FR-148](FR-148-path-measured-plan-follows.md) owns it. FR-63 did until FR-148 superseded it on 2026-11-16.
 - **Alternatives already weighed:** a media worker process per session, libwebrtc on the agent, WebTransport, VVC, HEVC SCC, 10-bit and HDR (§5.8, §6.14). Each has a reason recorded, and a trigger where one exists.
 - **Native viewers.** The viewer stays a browser page with nothing installed.
 - **Host-side consent, the macOS native panel and input injection,** beyond what `rc:media-plan` says about them.
