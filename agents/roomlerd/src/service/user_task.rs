@@ -25,7 +25,7 @@
 //! | `service start` (the wizard, a restart by the tray or `roomler restart`, the updater's watcher after a failed install, the Start menu entry) and the hard stop's `schtasks /End` | its own task, else a legacy one that is its own ([`own_autostart`]) |
 //! | `service status` | the same, read without acting ([`status`]) |
 //! | `service uninstall` (the MSI's `UnregisterAutostart`) | its own tasks, and the legacy ones that are its own ([`unregister`]) |
-//! | the per-user arm of `cleanup-legacy-install` | the tasks of the account signed in to the step's session (`install_cleanup.rs`) |
+//! | the per-user arm of `cleanup-legacy-install` | the tasks of the account signed in to the step's session, each ended and then deleted, and then that account's daemon still running (`install_cleanup.rs`, #3885) |
 //!
 //! An install from before #3801 keeps its `Roomler` until its own account's
 //! update: the old product's `UnregisterAutostart` deletes it, as every update
@@ -106,6 +106,10 @@ pub(crate) trait Library {
     fn create(&mut self, name: &str, xml: &str) -> Result<()>;
     /// Delete `name`. A task this process cannot find is gone already.
     fn delete(&mut self, name: &str) -> Result<()>;
+    /// End the running instance of `name` (`schtasks /End`): the launcher the
+    /// task started, and through the launcher's kill-on-close job the daemon
+    /// (#3885, `agents/roomlerdw`).
+    fn end(&mut self, name: &str) -> Result<()>;
 }
 
 /// Is the task `name` the account `sid`'s, by its principal? A task this
@@ -375,7 +379,8 @@ pub(crate) mod fake {
         pub(crate) caller: String,
         pub(crate) elevated: bool,
         pub(crate) tasks: Vec<Task>,
-        /// Every create and delete asked of the library, refused ones too.
+        /// Every create, end and delete asked of the library, refused ones
+        /// too.
         pub(crate) asked: Vec<(&'static str, String)>,
         /// Names whose registration the library refuses.
         pub(crate) refuse: Vec<String>,
@@ -423,7 +428,7 @@ pub(crate) mod fake {
             self.find(name).map(|i| self.tasks[i].principal.clone())
         }
 
-        /// Was a create or a delete of `name` asked?
+        /// Was a create, an end or a delete of `name` asked?
         pub(crate) fn asked_for(&self, name: &str) -> bool {
             self.asked.iter().any(|(_, n)| n.eq_ignore_ascii_case(name))
         }
@@ -501,6 +506,15 @@ pub(crate) mod fake {
                 }
                 Some(i) if self.sees(&self.tasks[i]) => bail!("ERROR: Access is denied."),
                 _ => Ok(()),
+            }
+        }
+
+        fn end(&mut self, name: &str) -> Result<()> {
+            self.asked.push(("end", name.into()));
+            match self.find(name) {
+                Some(i) if self.may_change(&self.tasks[i]) => Ok(()),
+                Some(i) if self.sees(&self.tasks[i]) => bail!("ERROR: Access is denied."),
+                _ => bail!("ERROR: The system cannot find the file specified."),
             }
         }
     }

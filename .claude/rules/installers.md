@@ -134,6 +134,14 @@ name before it), so a task under one of those is acted on only when its principa
 definition this process is refused, one that does not parse, or one that names another account is left.
 Never delete, end or `/Create /F` a task by a shared name, and match a task's name whole: `Roomler` is a
 prefix of every account's own name (`account_of`).
+⚠️ **The per-user arm of `cleanup-legacy-install` ends a task before it deletes it, and stops the account's
+daemon only after the delete** (#3885, `docs/installation.md`): deleting a task leaves its process running,
+which made two daemons on one machine, and until the delete a one-shot, logon or boot trigger or `service
+start` can start it again, while `/End` needs the task. It stops a process only when BOTH its token's SID is
+the cleaned account's AND the file it was started from is `roomlerd.exe` or `roomlerdw.exe` in that account's
+per-user install; never this step (it is `roomlerd.exe` too), its parent (a launcher's job would end this step),
+the per-Machine daemon, another account's, or one it cannot read. Every stop re-reads the process through the
+handle that ends it (`companion_procs::terminate_checked`), and a test ends only a child it spawned.
 ⚠️ **The per-Machine MSI carries the service's `Environment` across an upgrade, and that may never fail
 one** (#3375, `docs/installation.md`). The old product's removal deletes the service, so
 `CaptureServiceEnvironment` (`agents/roomler-msi-ca`) reads the block before `InstallInitialize`, and

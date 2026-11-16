@@ -1117,13 +1117,13 @@ One rule, in one file, decides which task a path acts on, and every path goes th
 
 | Path | Who runs it | What it acts on |
 |---|---|---|
-| `service install` | the MSI's `RegisterAutostart`, the tray, by hand | registers `Roomler-<SID>`; then deletes `Roomler`, or the name before the P3d rename, when its principal is this account, never before its own task is registered (`register`, `agents/roomlerd/src/service/user_task.rs:155`) |
-| `service start`; the hard stop's `schtasks /End` | the wizard, the tray's and `roomler restart`'s restart, the updater's watcher after a failed install, the Start menu entry; `service stop` and the MSI's `StopDaemon` and `StopOldDaemon` | `Roomler-<SID>`, else a legacy task whose principal is this account (`own_autostart`, `agents/roomlerd/src/service/user_task.rs:121`) |
-| `service status` | the tray every 10 s, by hand | the same, read (`status`, `agents/roomlerd/src/service/user_task.rs:134`) |
-| `service uninstall` | the MSI's `UnregisterAutostart`, by hand | `Roomler-<SID>` and its launcher check, and the legacy ones whose principal is this account (`unregister`, `agents/roomlerd/src/service/user_task.rs:174`) |
-| the per-user arm of `cleanup-legacy-install` | an operator, by hand | the tasks of the account signed in to the step's session ([below](#what-the-per-user-arm-of-the-clean-up-removes-3801)) |
+| `service install` | the MSI's `RegisterAutostart`, the tray, by hand | registers `Roomler-<SID>`; then deletes `Roomler`, or the name before the P3d rename, when its principal is this account, never before its own task is registered (`register`, `agents/roomlerd/src/service/user_task.rs:159`) |
+| `service start`; the hard stop's `schtasks /End` | the wizard, the tray's and `roomler restart`'s restart, the updater's watcher after a failed install, the Start menu entry; `service stop` and the MSI's `StopDaemon` and `StopOldDaemon` | `Roomler-<SID>`, else a legacy task whose principal is this account (`own_autostart`, `agents/roomlerd/src/service/user_task.rs:125`) |
+| `service status` | the tray every 10 s, by hand | the same, read (`status`, `agents/roomlerd/src/service/user_task.rs:138`) |
+| `service uninstall` | the MSI's `UnregisterAutostart`, by hand | `Roomler-<SID>` and its launcher check, and the legacy ones whose principal is this account (`unregister`, `agents/roomlerd/src/service/user_task.rs:178`) |
+| the per-user arm of `cleanup-legacy-install` | an operator, by hand | the tasks of the account signed in to the step's session ([below](#what-the-per-user-arm-of-the-clean-up-removes-3801)), each ended and then deleted, and then that account's daemon still running ([#3885](#the-accounts-running-daemon-3885)) |
 
-A legacy task is this account's only when its principal says so (`is_own`, `agents/roomlerd/src/service/user_task.rs:114`). The
+A legacy task is this account's only when its principal says so (`is_own`, `agents/roomlerd/src/service/user_task.rs:118`). The
 principal is read from the task's definition (`schtasks /Query /XML`): a SID, or an account name
 the system resolves to one. A definition this process may not read, one that does not parse,
 and one that names a group are not its own, and nothing acts on them. A standard account sees
@@ -1160,13 +1160,13 @@ always was under the shared name.
 install of the account signed in to the step's session: the same account whose data trees it
 removes ([where a step finds its folders](#where-a-step-on-the-service-account-finds-its-folders-3702)).
 That account is read from the session (`account_cleaned`,
-`agents/roomlerd/src/install_cleanup.rs:440`), and the choice is
-`clean_up_choice` (`agents/roomlerd/src/service/user_task.rs:219`):
+`agents/roomlerd/src/install_cleanup.rs:523`), and the choice is
+`clean_up_choice` (`agents/roomlerd/src/service/user_task.rs:223`):
 
 | Task it finds | What it does | Its report line |
 |---|---|---|
-| `Roomler-<SID>` of the account it cleans | removes it | `Scheduled Task Roomler-<this account's SID>` |
-| `Roomler`, or the name before the P3d rename, that runs as that account | removes it | `Scheduled Task Roomler` |
+| `Roomler-<SID>` of the account it cleans | ends it (`schtasks /End`), then removes it ([#3885](#the-accounts-running-daemon-3885)) | `Scheduled Task Roomler-<this account's SID>` |
+| `Roomler`, or the name before the P3d rename, that runs as that account | ends it, then removes it | `Scheduled Task Roomler` |
 | `Roomler-<SID>` of another account | leaves it | `Scheduled Task Roomler-<another account's SID> left in place: it runs as another account` |
 | `Roomler`, or the name before the P3d rename, that runs as another account | leaves it | `Scheduled Task Roomler left in place: it runs as another account` |
 | `Roomler`, or the name before the P3d rename, whose principal it cannot read | leaves it | `… left in place: this step cannot tell which account it runs as` |
@@ -1174,6 +1174,60 @@ That account is read from the session (`account_cleaned`,
 
 No line names an account: an account's own task is shown with its SID left out. The arm's
 task calls run `schtasks.exe` from System32, where it ran a bare `schtasks`.
+
+#### The account's running daemon (#3885)
+
+Deleting a task does not end the process it started, so until #3885 the arm left the account's
+daemon running beside the per-Machine service's: two daemons on one machine, on one TUN name and
+GUID, one LocalAPI pipe, and the host-wide exit, DNS and WFP state. The arm now ends each task
+before it deletes it, and then stops what of the account's daemon still runs
+(`clean_up_user_tasks`, `agents/roomlerd/src/install_cleanup.rs:550`):
+
+```mermaid
+flowchart TD
+    L["list the processes named roomlerd.exe or roomlerdw.exe,<br/>pick the account's daemon"] --> E["schtasks /End each task it removes:<br/>the launcher, and through its job the daemon"]
+    E --> D["schtasks /Delete each:<br/>nothing starts the daemon again"]
+    D --> S["stop each pick, or find it gone;<br/>list again and stop what still runs"]
+    S --> F["remove the data trees"]
+```
+
+| Process listed as `roomlerd.exe` or `roomlerdw.exe` | What the arm does | Its report line |
+|---|---|---|
+| runs as the account it cleans, started from `roomlerd.exe` or `roomlerdw.exe` in that account's per-user install (`<profile>\AppData\Local\Programs\Roomler`, below the profile the data trees' plan names) | stops it: the task's end, or a terminate checked through the handle that ends it | `daemon pid N (roomlerd.exe) stopped` |
+| the same, when Windows refuses to end it or it does not go within 5 s | leaves it, as an error | `daemon pid N (roomlerd.exe) still running: stop it with taskkill /F /PID N` |
+| the per-Machine install's daemon (`Program Files\Roomler`), whichever account it runs as | nothing | none |
+| this step's own process | nothing | none |
+| the process that started this step | leaves it: ending a launcher ends what its job holds, this step with it | `pid N (roomlerdw.exe) left running: it started this step` |
+| runs as another account | leaves it | `pid N (roomlerd.exe) left running: it runs as another account` |
+| its account cannot be read | leaves it | `… left running: this step cannot read which account it runs as` |
+| the account's, started from another folder | leaves it | `… left running: it runs from another folder` |
+| the account's, its file cannot be read | leaves it | `… left running: this step cannot read the file it was started from` |
+
+The pick is `Pick::fate` (`agents/roomlerd/src/install_cleanup.rs:827`). The file a process
+was started from is the first entry of its module list, which a rename does not change, else its
+image now (`read_named`, `agents/roomlerd/src/win_service/companion_procs.rs:356`). Each stop
+reads the process again through the handle that ends it, so a pid another process took after the
+list is never ended (`terminate_checked`, `agents/roomlerd/src/win_service/companion_procs.rs:394`).
+
+**Why this order.** Until a task is deleted, something can start it again: its one-shot
+triggers 60, 180 and 600 s after each registration, its logon and boot triggers, and
+`service start` (the tray's restart, `roomler restart`, the updater's watcher, the Start menu
+entry). `<RestartOnFailure>` restarts nothing ([#3292](#what-the-per-user-scheduled-task-runs-3292)).
+A daemon stopped before the delete can come back, and the delete cannot come first:
+`schtasks /End` needs the task. After the delete nothing of the product starts the daemon, so
+what the second list holds is what is left. A launcher started just before the delete is in that
+list, as `roomlerdw.exe` is picked too, and its job ends its daemon with it. The data trees go
+last, once nothing of the account runs from them.
+
+With no account to clean the arm looks at no process (`no running daemon stopped: <why>`). When
+it cannot name the account's per-user install folder (no profile recorded for the account, or the
+step on the service account or unable to read its own account), it still ends each task before
+deleting it, and looks for nothing else (`no running daemon looked for: …`). A process list it
+cannot read is an error line. An administrator other than the account may be refused that
+account's processes: they are then left as unreadable, with their lines, and only the task's end
+stops the daemon. `--dry-run` reads the list, ends and stops nothing, and adds
+`[dry-run] schtasks /End /TN …` before each `[dry-run] schtasks /Delete …`, and
+`[dry-run] stop daemon pid N (roomlerd.exe)` for each pick.
 
 ### What an MSI run does to the `Roomler` service
 
@@ -1568,9 +1622,9 @@ folder they name from the system, never from the environment they were started w
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:292`, `crates/agent-core/src/appdirs.rs:251` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1121`, `agents/roomlerd/src/win_service/supervisor.rs:974` |
 | The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:814`, `crates/agent-core/src/appdirs.rs:823`, `crates/agent-core/src/appdirs.rs:673`, `crates/agent-core/src/appdirs.rs:1054`, `crates/agent-core/src/appdirs.rs:779` |
-| The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:257`, `agents/roomlerd/src/install_cleanup.rs:289` |
-| The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:679`, `agents/roomlerd/src/install_cleanup.rs:727` |
-| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the Scheduled Tasks of the account signed in to its session, and no other account's ([#3801](#what-the-per-user-arm-of-the-clean-up-removes-3801)): that account's `Roomler-<SID>`, and `Roomler` or the one under the retired name when their principal is that account. Then it removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session, or an account it cannot tell, it removes no tree and no task; when the system records no profile for that account, it removes no tree. Its lines say which. | `agents/roomlerd/src/install_cleanup.rs:182`, `agents/roomlerd/src/install_cleanup.rs:386`, `agents/roomlerd/src/service/user_task.rs:219`, `agents/roomlerd/src/install_cleanup.rs:557`, `agents/roomlerd/src/install_cleanup.rs:609`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
+| The one-time sweep of the vacated install folder | Reached by handle from the folder it lives below (FR-145): the machine's `Program Files` for a per-Machine install; for a per-User one, the profile the system records for the step's own account, found by its SID, then `AppData\Local\Programs`. Each folder on the way is opened below the one above it, never through a link. The product files are deleted below the held folder, and the folder itself, when empty, through the held folder above it. A folder that is a link, or sits below one, is left as it is, with a line that names it. | `agents/roomlerd/src/install_cleanup.rs:308`, `agents/roomlerd/src/install_cleanup.rs:349` |
+| The service logs of the cleanup step (`cleanup-legacy-install --target-flavour perUser`, run by hand) | Both segments' `service-logs` (the `roomler` app segment's and the retired one's, below `ProgramData\roomler`), FR-145: `ProgramData` held by handle, `roomler\<segment>` walked below it, never through a link, and `service-logs` removed bottom-up by handle through that walk (`HeldPath::remove_tree`). A link on the way or in the tree is never followed and never deleted: that tree stays, with a line that names the link, and the other segment's is still handled. | `agents/roomlerd/src/install_cleanup.rs:1112`, `agents/roomlerd/src/install_cleanup.rs:1160` |
+| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the Scheduled Tasks of the account signed in to its session, and no other account's ([#3801](#what-the-per-user-arm-of-the-clean-up-removes-3801)): that account's `Roomler-<SID>`, and `Roomler` or the one under the retired name when their principal is that account, each ended before it is deleted, and then it stops that account's daemon still running ([#3885](#the-accounts-running-daemon-3885)). Then it removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below the profile the system records for the account signed in to the step's session (`plan_per_user_removal`). FR-145: that account is told by its SID, from the session's user and domain names (`session_account_sid`: `WTSQuerySessionInformationW`, then `LookupAccountNameW`, a user account only), and its profile is `ProfileList\<SID>` (`profile_of_account`), never a folder named after the user. Each tree is reached by handle from that profile, each folder on the way opened below the one above it and never through a link, and removed bottom-up by handle through the walk that checked it (`remove_per_user_trees`). A link on the way or in a tree is never followed and never deleted: that tree is left in place with a line that names the link, and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session, or an account it cannot tell, it removes no tree and no task; when the system records no profile for that account, it removes no tree. Its lines say which. | `agents/roomlerd/src/install_cleanup.rs:233`, `agents/roomlerd/src/install_cleanup.rs:446`, `agents/roomlerd/src/service/user_task.rs:223`, `agents/roomlerd/src/install_cleanup.rs:550`, `agents/roomlerd/src/install_cleanup.rs:990`, `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62`, `crates/agent-core/src/appdirs.rs:251`, `crates/agent-core/src/appdirs.rs:313` |
 
 **Which tree an account's folders are in (#3747).** An account's tree is the one that holds its
 config folder: the NEW one when it holds one, else the OLD one when it holds one. Only when
