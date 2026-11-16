@@ -263,7 +263,9 @@ In P5, each on its own evidence, through the switch registry:
 ## 6. Phases
 
 Each phase ships in shadow or behind its switch first. Each field test is shown failing on the current release
-before it passes. Switch names are proposed.
+before it passes. Switch names are proposed. A switch read in the media path, a line added to a pump and a
+viewer storage key each go through FR-135's ratchet, and each arrives with a ledger row that names the phase
+retiring it (§13).
 
 | # | Phase | Kill switch | Proof | Status |
 |---|---|---|---|---|
@@ -284,8 +286,16 @@ before it passes. Switch names are proposed.
 4. The open-time train, logged and read by nothing.
 5. The standing relay cell: a shaped lab pair at 0.4, 2 and 8 Mbit/s over TURN/UDP, TURN/TLS and the mesh relay,
    with and without injected stalls, and the two laptops as the natural cells.
-6. The read of FR-63 B1's shadow, with an under-drive clause added to the report. FR-135's agent phases wait on
-   the start of this read (`docs/fr/FR-135-one-rc-media-pipeline.md:1246`), and so do PRs #3374 and #3307.
+6. The read of FR-63 B1's shadow over seven days, with an under-drive clause added to the report's verdict. A
+   first production read ran on 2026-11-02, over the release's first 3.4 days, and met the criterion: the shadow
+   asked for no more than the live law in 1,096 of 1,121 windows of elevated age, on 502 sessions
+   ([#1243, the comment of 2026-11-07](https://github.com/gjovanov/roomler-ai/issues/1243#issuecomment-6706580701)).
+   Its spend view shows what that criterion cannot fail on. In a pump's first 120 s the encoder spent more than
+   the shadow asked in 1,232 of 3,372 clean direct windows and 623 of 1,962 clean constrained ones, against 158
+   of 31,743 and 193 of 6,685 later, and every constrained window spending 5 Mbit/s or more was over the shadow
+   (313 of 313). The read over the release's seven days, due on 2026-11-06, was not run. PRs #3307 and #3374 and
+   the fixes for #3472 were parked behind it and wait on this read now, and FR-135's rule on agent-behaviour
+   phases names its start (`docs/fr/FR-135-one-rc-media-pipeline.md:1246`). #3374 also needs D6.
 7. The inferred mechanisms of §11, measured or struck.
 
 **P1, the model drives the open and the memory.**
@@ -498,12 +508,29 @@ All 29 open criteria, one by one:
 
 | Item | Relation |
 |---|---|
-| FR-135 (#3293), one RC media pipeline | It owns the shape: the stages, the one encode loop, the sinks, the plan's fields. This FR owns what the numbers are and where they come from. Touch points: ledger rows S09 and S17, D12, "FR-63 B2, then B3" in its order (P5 here), the second video channel as a sink property. This FR edits neither its spec nor its ledger |
+| FR-135 (#3293), one RC media pipeline | It owns the shape: the stages, the one encode loop, the sinks, the plan's fields. This FR owns what the numbers are and where they come from. Touch points: ledger rows S09 and S17, D12, "FR-63 B2, then B3" in its order (P5 here; 48 ledger rows name that phase), the second video channel as a sink property, and its ratchet (below). This FR does not edit FR-135's spec and changes no row of its ledger. It appends rows |
 | FR-70 (#1330), the media pipeline leaves the runtime | Its M4 and M5 are P5 here. Its AC6 (rate half) is ticked and did not hold on 2026-11-11 (§2.1) |
 | FR-38 (#949), #3472, #3050 | The triage of 2026-11-08 re-specified them into FR-135's encoder surface: an encoder is built at the plan's rate and owns its clock. This FR adds one fact to FR-38: on QSV the idle spend is constant-bitrate filler (§2.3) |
 | #3341, #3357 | P4 replaces the far-TURN hint with ranking. The default mesh policy is O4 |
 | #3259 | A relayed session can be labelled direct. P0's cell needs the label to be right |
 | FR-62 (#1242), FR-128 (#2989), both closed | A5 and patch 0004 (D4) and the live move (D3) are taken up here |
+
+**FR-135's ratchet binds this FR's code.** `scripts/rc-media-ratchet.sh` runs on every PR (FR-135 §7.1). It
+fails a PR that raises one of its counts past `scripts/rc-media-ratchet.baseline`, unless the PR raises that
+count's baseline line and names on it a row of `docs/plans/rc-media-debt.tsv` and when the row retires. Three
+of the counts meet this FR, read on master `1c584fb7e`:
+
+| Count | Now | Baseline | What in this FR raises it |
+|---|---|---|---|
+| `agent_env_reads`: env-knob reads in the agent's media path | 177 | 178 | Each new switch of §6 that is read there, as `ROOMLERD_RATECTL` is (`agents/roomlerd/src/encode/mod.rs:595`). FR-135's open PR #3912 lowers the baseline to 177 |
+| `pump_lines_ffmpeg_dc`: the length of the FFmpeg DC pump | 3,959 | 3,959 | P2's adoption rule, which D5 puts in today's pump, from its first added line |
+| `viewer_knobs`: distinct `roomler-rc-*` storage keys in the viewer's media files | 33 | 33 | P4's viewer flag, if it is such a key |
+
+So a PR of this FR that raises a count appends its own row at the end of the ledger, with file-only anchors as
+the ledger's later rows have (`r0:FPS-1`, `r0:CLOCK-1`), and its phase column names the phase of this FR that
+retires it. Rows that retire with another FR's phase are in the ledger already: 48 read `FR-63 B2, B3`, which
+is P5 here. This FR does not route a read around the count, through a shared helper or from a file the ratchet
+does not list.
 
 ## 14. Out of scope
 
