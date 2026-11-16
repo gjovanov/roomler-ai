@@ -550,6 +550,15 @@ fn set_autostart(enabled: bool, device_on: bool) -> Result<(), String> {
     record_opt_out(!enabled)
 }
 
+// #3940 — DELIBERATE, and removed by the next commit: a Windows-only item that
+// clippy denies (`ptr_arg`, `needless_return`), so the new Windows step fails
+// on this commit while every Linux and macOS lane compiles it out.
+#[cfg(windows)]
+#[allow(dead_code)]
+fn deliberate_windows_lint_3940(v: &Vec<u8>) -> usize {
+    return v.len();
+}
+
 /// The first run's belt for a per-user install: the worker registers the
 /// login start at each start, but the companion may exist before the worker
 /// next runs.
