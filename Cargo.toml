@@ -317,7 +317,13 @@ enigo = "0.6"
 # NSPasteboard). Used by the clipboard data-channel handler on the
 # agent side. No system deps required on Windows/macOS; Linux pulls
 # `x11rb` which we already have from `enigo`.
-arboard = { version = "3", default-features = false }
+# #3671 — exact: the clipboard worker's rebuild after an X server restart
+# (agents/roomlerd/src/clipboard.rs, `x11_follow`) relies on arboard 3.6.1's
+# handle-counting `Drop` (src/platform/linux/x11.rs, `MIN_OWNERS`). An upgrade
+# re-reads that Drop, and CI's negative control
+# (`x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server`)
+# says when the rule changed.
+arboard = { version = "=3.6.1", default-features = false }
 
 # FR-6 wave 23 (#773): the crypto crates build optimized even in the dev and
 # test profiles. Unoptimized, one `Argon2::default()` hash or verify took

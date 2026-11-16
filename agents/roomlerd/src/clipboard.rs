@@ -67,7 +67,10 @@
 use anyhow::{Context, Result};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+use crate::virtual_desktop::XServerNow;
 
 /// Command sent to the clipboard worker thread. Replies come back
 /// over the oneshot carried in each variant.
@@ -153,14 +156,27 @@ impl Clipboard {
     /// Spin up the worker thread. The `arboard::Clipboard` is
     /// constructed on the worker so the handle never crosses thread
     /// boundaries, which matters on Windows (the OpenClipboard
-    /// ownership is per-thread).
+    /// ownership is per-thread). On Linux it follows the daemon's own
+    /// virtual desktop to its next X server ([`x11_follow`], #3671).
     pub fn new() -> Result<Self> {
+        Self::following(crate::virtual_desktop::x_server_now)
+    }
+
+    /// [`Self::new`], reading the daemon's own desktop from `desk`: a test
+    /// passes a stand-in of its own.
+    fn following(desk: fn() -> Option<crate::virtual_desktop::XServerNow>) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = desk;
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
         let (tx, rx) = std_mpsc::channel::<ClipboardCmd>();
 
         thread::Builder::new()
             .name("roomlerd-clipboard".into())
             .spawn(move || {
+                // #3671 — the desktop as it was BEFORE the connect: a server
+                // that comes back during it is followed at the first look.
+                #[cfg(target_os = "linux")]
+                let born = desk();
                 let mut cb = match arboard::Clipboard::new() {
                     Ok(c) => {
                         let _ = ready_tx.send(Ok(()));
@@ -189,6 +205,13 @@ impl Clipboard {
                 let mut gate: Option<change_gate::Gate> = None;
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let mut gate_tried = false;
+                // #3671 — the desktop generation this worker's handle is on.
+                #[cfg(target_os = "linux")]
+                let mut follow = x11_follow::Follow::<arboard::Clipboard>::new(
+                    born,
+                    std::sync::Arc::new(x11_follow::connect_anew),
+                    x11_follow::REBUILD_BOUND,
+                );
                 loop {
                     // Block indefinitely when nothing is watching (the
                     // pre-v2 behavior — zero idle wakeups); poll at the
@@ -213,6 +236,25 @@ impl Clipboard {
                             Err(_) => break,
                         }
                     };
+                    // #3671 — the desktop came back on a new X server, and
+                    // this handle and the gate's connection were the old
+                    // one's. Before the command, so that it meets the new
+                    // server; a watcher's images follow the new gate.
+                    #[cfg(target_os = "linux")]
+                    if let Some(fresh) = follow.check(desk(), std::time::Instant::now()) {
+                        cb = fresh;
+                        gate = None;
+                        gate_tried = false;
+                        if !watchers.is_empty() {
+                            gate_tried = true;
+                            gate = change_gate::Gate::open();
+                            let seq = gate_tick(&mut gate);
+                            for w in watchers.values_mut() {
+                                w.events.image = w.asked_image && seq.is_some();
+                                w.last_seen_seq = seq.unwrap_or(0);
+                            }
+                        }
+                    }
                     match cmd {
                         Some(ClipboardCmd::Read { reply }) => {
                             let _ = reply.send(worker_read_text(&mut cb));
@@ -405,17 +447,23 @@ impl Clipboard {
     /// DC handlers AND the loopback bridge — so a bridge write is
     /// never echoed back by a concurrently-subscribed session watcher.
     /// `None` when the OS clipboard is unavailable (headless).
+    ///
+    /// #3671 — on a host whose desktop is the daemon's own, a start that
+    /// failed while the desktop was down (in a restart, in a back-off gap, or
+    /// after a first start that failed or was slow) is made again at the next
+    /// ask once the desktop is up, as [`Retry`] says. Elsewhere the first
+    /// failure is kept for the daemon's life, as before. The retry has no kill
+    /// switch of its own: `ROOMLERD_CLIPBOARD_X11_REBUILD=0` turns off only
+    /// the worker's follow of a new X server (`x11_follow`), and without the
+    /// retry a daemon whose first start failed has no clipboard for its life.
     pub fn shared() -> Option<Clipboard> {
-        static SHARED: std::sync::OnceLock<Option<Clipboard>> = std::sync::OnceLock::new();
-        SHARED
-            .get_or_init(|| match Clipboard::new() {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!(%e, "clipboard: shared worker init failed — clipboard disabled");
-                    None
-                }
-            })
-            .clone()
+        static SHARED: Kept<Clipboard> = Kept::new();
+        shared_at(
+            &SHARED,
+            crate::virtual_desktop::x_server_now(),
+            Instant::now(),
+            Clipboard::new,
+        )
     }
 
     /// v2 — install a change-watcher SUBSCRIPTION. Changes arrive on `tx`;
@@ -590,6 +638,11 @@ struct WatcherState {
     last_html_hash: u64,
     #[cfg_attr(not(windows), allow(dead_code))]
     last_native_hash: u64,
+    /// #3671 — the subscriber asked for images. The change gate decides
+    /// whether it gets them, and the gate of the desktop's next X server
+    /// decides again.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    asked_image: bool,
     /// Set when `try_send` hit a full channel or a read failed
     /// transiently — the next tick bypasses the unchanged-seq early
     /// exit and re-attempts.
@@ -623,6 +676,629 @@ fn gate_tick(gate: &mut Option<change_gate::Gate>) -> Option<u32> {
     seq
 }
 
+/// #3671 — when an attempt on the X server of the daemon's own virtual desktop
+/// that failed is made again. One rule for the clipboard's shared worker
+/// ([`Clipboard::shared`]), the change gate's answer for the hello
+/// (`x11_gate::available`) and the worker following the desktop to a new
+/// server (`x11_follow`): a failure is kept only while its cause can still
+/// hold.
+///
+/// - **No desktop of the daemon's own** ([`crate::virtual_desktop::x_server_now`]
+///   reads `None`: a person's display or none, or the desktop's teardown at a
+///   stop): kept for the daemon's life, as before #3671. This daemon does not
+///   see that server come and go.
+/// - **The desktop is down**: nothing is tried; there is no server to reach.
+/// - **Up on another server than the one the failure met** (it failed while
+///   the desktop was down, before its first server came up, or on an older
+///   generation): tried at the next ask.
+/// - **Up on the server the failure met**: tried again no sooner than
+///   [`Retry::EVERY`] after it, however often it is asked.
+///
+/// A failure is said once per period of the desktop (an up period is its
+/// generation, a down period its count), and a success that ends one once.
+#[derive(Debug)]
+pub(crate) struct Retry {
+    /// The last failure: the desktop as it was read before the attempt, and
+    /// when the attempt was made.
+    failed: Option<(Option<XServerNow>, Instant)>,
+    /// The period of the desktop the last failure was said in.
+    said: Option<Option<XServerNow>>,
+}
+
+impl Retry {
+    /// How often an attempt that failed on the server that still answers is
+    /// made again.
+    pub(crate) const EVERY: Duration = Duration::from_secs(10);
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            failed: None,
+            said: None,
+        }
+    }
+
+    /// Whether an attempt may be made at `now`, with the desktop as `desk`
+    /// reads.
+    pub(crate) fn may_try(&self, desk: Option<XServerNow>, now: Instant) -> bool {
+        let Some((met, at)) = self.failed else {
+            return true;
+        };
+        match desk {
+            None => false,
+            Some(d) if d.down.is_some() => false,
+            Some(d) if met == Some(d) => now.saturating_duration_since(at) >= Self::EVERY,
+            Some(_) => true,
+        }
+    }
+
+    /// An attempt made at `now`, with the desktop as `desk` read before it,
+    /// failed. `true`: the first failure in this period, to be said.
+    pub(crate) fn failed(&mut self, desk: Option<XServerNow>, now: Instant) -> bool {
+        self.failed = Some((desk, now));
+        let first = self.said != Some(desk);
+        self.said = Some(desk);
+        first
+    }
+
+    /// An attempt succeeded. `true`: it ends a failure, to be said.
+    pub(crate) fn succeeded(&mut self) -> bool {
+        self.said = None;
+        self.failed.take().is_some()
+    }
+}
+
+/// What [`Kept::get_at`] has to say about the attempt it made, if it made one.
+#[derive(Debug)]
+pub(crate) enum Said<E> {
+    /// Nothing new: the kept value, or a failure kept without an attempt.
+    Nothing,
+    /// An attempt failed, the first in this period of the desktop: say it.
+    Failed(E),
+    /// An attempt failed again, in a period that was said.
+    Again(E),
+    /// An attempt succeeded after a failure: say it, once.
+    Started,
+}
+
+/// #3671 — a value made from the X server at the first ask and kept for the
+/// daemon's life, where a failure is kept only as [`Retry`] says: what
+/// [`Clipboard::shared`] and `x11_gate::available` keep. Before #3671 both
+/// were a `OnceLock`, so a first ask while the desktop was down (in a restart,
+/// in a back-off gap, or after a first start that failed or was slow) left
+/// them off for good, though the desktop came back.
+pub(crate) struct Kept<T> {
+    st: std::sync::Mutex<(Option<T>, Retry)>,
+}
+
+impl<T: Clone> Kept<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            st: std::sync::Mutex::new((None, Retry::new())),
+        }
+    }
+
+    /// The kept value, or `make`'s when [`Retry`] allows an attempt at
+    /// `now`, with the desktop as `desk` reads. Callers wait for each other's
+    /// attempt, as with a `OnceLock`.
+    pub(crate) fn get_at<E>(
+        &self,
+        desk: Option<XServerNow>,
+        now: Instant,
+        make: impl FnOnce() -> Result<T, E>,
+    ) -> (Option<T>, Said<E>) {
+        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let (value, retry) = &mut *st;
+        if let Some(v) = value {
+            return (Some(v.clone()), Said::Nothing);
+        }
+        if !retry.may_try(desk, now) {
+            return (None, Said::Nothing);
+        }
+        match make() {
+            Ok(v) => {
+                *value = Some(v.clone());
+                let said = if retry.succeeded() {
+                    Said::Started
+                } else {
+                    Said::Nothing
+                };
+                (Some(v), said)
+            }
+            Err(e) => {
+                let said = if retry.failed(desk, now) {
+                    Said::Failed(e)
+                } else {
+                    Said::Again(e)
+                };
+                (None, said)
+            }
+        }
+    }
+}
+
+/// [`Clipboard::shared`], with its slot, the desktop, the time and the
+/// worker's start given: what its tests drive with a stand-in.
+fn shared_at<T: Clone>(
+    slot: &Kept<T>,
+    desk: Option<XServerNow>,
+    now: Instant,
+    make: impl FnOnce() -> Result<T>,
+) -> Option<T> {
+    let (value, said) = slot.get_at(desk, now, make);
+    match said {
+        Said::Nothing => {}
+        Said::Failed(e) if desk.is_none() => {
+            tracing::warn!(%e, "clipboard: shared worker init failed — clipboard disabled");
+        }
+        Said::Failed(e) => tracing::warn!(
+            %e,
+            retry_s = Retry::EVERY.as_secs(),
+            "clipboard: shared worker init failed on this device's virtual desktop — tried again at the next ask once its X server answers, at most every retry_s (#3671)"
+        ),
+        Said::Again(e) => tracing::debug!(%e, "clipboard: shared worker init failed again"),
+        Said::Started => tracing::info!(
+            "clipboard: the shared worker started on this device's virtual desktop, after a start that failed (#3671)"
+        ),
+    }
+    value
+}
+
+/// Drop `handle` with arboard's lines for a dead connection held back on this
+/// thread. On a dead connection arboard's `Drop` logs an ERROR for each
+/// request it can no longer make ("Could not hand the clipboard data over to
+/// the clipboard manager: …", "Failed to destroy the clipboard window. Error:
+/// …", "Failed to flush the clipboard window. Error: …"), and they all went
+/// with the server; the worker says what the rebuild came to, once (as
+/// enigo's `Job::Gone` does, #3918). Exactly those three are held back
+/// ([`AllBut`]). Every other line goes where it would: arboard's "The
+/// clipboard server thread panicked", the one line in that `Drop` that would
+/// name a bug, and anything else said during the drop. arboard's "Worker
+/// thread errored with: …" at the server's death is its serving thread's,
+/// and stays.
+#[cfg(target_os = "linux")]
+fn quietly_drop<T>(handle: T) {
+    let all_but = tracing::Dispatch::new(AllBut(tracing::dispatcher::get_default(Clone::clone)));
+    tracing::dispatcher::with_default(&all_but, move || drop(handle));
+}
+
+/// [`quietly_drop`]'s dispatcher: the one in use on the thread, less
+/// arboard's lines for the requests a dead connection can no longer make
+/// (arboard 3.6.1, `src/platform/linux/x11.rs`, `Drop for Clipboard`).
+#[cfg(target_os = "linux")]
+struct AllBut(tracing::Dispatch);
+
+#[cfg(target_os = "linux")]
+impl AllBut {
+    const DEAD_CONNECTION: [&'static str; 3] = [
+        "Could not hand the clipboard data over to the clipboard manager",
+        "Failed to destroy the clipboard window",
+        "Failed to flush the clipboard window",
+    ];
+}
+
+/// An event's `message`, as `log`'s bridge records it.
+#[cfg(target_os = "linux")]
+struct Message(String);
+
+#[cfg(target_os = "linux")]
+impl tracing::field::Visit for Message {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{value:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl tracing::Subscriber for AllBut {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        self.0.register_callsite(metadata)
+    }
+
+    /// The dispatcher's own hint is private to tracing-core (0.1.36), so this
+    /// answers the process's current maximum, which already counts it: a hint
+    /// is only an upper bound, `enabled` decides, and no hint at all would
+    /// raise the maximum to TRACE for every callsite until the next rebuild.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::current())
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        self.0.new_span(attrs)
+    }
+
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        self.0.record(span, values)
+    }
+
+    fn record_follows_from(&self, span: &tracing::span::Id, follows: &tracing::span::Id) {
+        self.0.record_follows_from(span, follows)
+    }
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut said = Message(String::new());
+        event.record(&mut said);
+        if !Self::DEAD_CONNECTION.iter().any(|l| said.0.starts_with(l)) {
+            self.0.event(event);
+        }
+    }
+
+    fn enter(&self, span: &tracing::span::Id) {
+        self.0.enter(span)
+    }
+
+    fn exit(&self, span: &tracing::span::Id) {
+        self.0.exit(span)
+    }
+
+    fn clone_span(&self, span: &tracing::span::Id) -> tracing::span::Id {
+        self.0.clone_span(span)
+    }
+
+    fn try_close(&self, span: tracing::span::Id) -> bool {
+        self.0.try_close(span)
+    }
+}
+
+/// #3671 — [`quietly_drop`] holds back exactly arboard's three
+/// lines for a dead connection, and every other line said during the drop
+/// reaches the dispatcher in use: arboard's panic line, which would name a
+/// bug, and a line of anyone else's. No X server and no clipboard: a `Drop`
+/// that says what arboard's says, under a subscriber that keeps each message.
+#[cfg(all(test, target_os = "linux"))]
+mod quietly_drop_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// Keeps each event's message, as [`super::Message`] reads it.
+    #[derive(Clone, Default)]
+    struct Heard(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Heard {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut said = super::Message(String::new());
+            event.record(&mut said);
+            self.0.lock().unwrap().push(said.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Says what arboard 3.6.1's `Drop for Clipboard` says on a dead
+    /// connection, then its panic line, then a line of someone else's.
+    struct SaysWhatArboardSays;
+
+    impl Drop for SaysWhatArboardSays {
+        fn drop(&mut self) {
+            let e = "Broken pipe (os error 32)";
+            tracing::error!("Could not hand the clipboard data over to the clipboard manager: {e}");
+            tracing::error!("Failed to destroy the clipboard window. Error: {e}");
+            tracing::error!("Failed to flush the clipboard window. Error: {e}");
+            tracing::error!("The clipboard server thread panicked. Error: {e}");
+            tracing::warn!("someone else's line, said during the drop");
+        }
+    }
+
+    #[test]
+    fn quietly_drop_holds_back_only_arboards_three_dead_connection_lines() {
+        let heard = Heard::default();
+        tracing::subscriber::with_default(heard.clone(), || {
+            super::quietly_drop(SaysWhatArboardSays)
+        });
+        let heard = heard.0.lock().unwrap().clone();
+        assert_eq!(
+            heard,
+            [
+                "The clipboard server thread panicked. Error: Broken pipe (os error 32)",
+                "someone else's line, said during the drop",
+            ],
+            "quietly_drop held back a line it must pass, or passed one of arboard's three"
+        );
+    }
+}
+
+/// #3671 — the clipboard worker's X connection follows the daemon's own
+/// virtual desktop to its next X server. The worker is one thread for the
+/// daemon's life and arboard keeps one X connection per process, so once the
+/// desktop's server exited and came back (its supervisor counts the
+/// generations: [`crate::virtual_desktop::generation`]), every copy and paste
+/// failed on the dead connection until the daemon restarted. Now the worker
+/// looks before each command and each watch tick and, once the desktop is up
+/// on a generation NEWER than its handle's, takes arboard's handle down and
+/// makes one on the new server. A rebuild that failed is tried again as
+/// [`Retry`] says. An idle worker does it at its next command.
+///
+/// Kill switch `ROOMLERD_CLIPBOARD_X11_REBUILD=0`: the worker keeps its first
+/// connection, as before #3671.
+#[cfg(target_os = "linux")]
+mod x11_follow {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::Retry;
+    use crate::virtual_desktop::XServerNow;
+
+    /// How long the worker waits for a rebuild before it serves again with
+    /// the handle it has: every session's clipboard command waits behind it,
+    /// once per new X server. What a rebuild can wait for, read in arboard
+    /// 3.6.1's source (`src/platform/linux/x11.rs`; the version is pinned
+    /// exactly in the workspace `Cargo.toml`, and an upgrade re-reads this):
+    ///
+    /// - the second handle's drop: on the dead connection the hand-over to a
+    ///   clipboard manager and `destroy_window` fail at their first request,
+    ///   and the drop returns before its join, so nothing is waited for. When
+    ///   no handle is left on any server (a try after one that failed), the
+    ///   second handle is a new connection to the live server, which owns no
+    ///   selection: its drop's hand-over returns at once, and the drop then
+    ///   joins arboard's serving thread, one round trip for its window's
+    ///   `DestroyNotify`;
+    /// - the new handle: a connect, and one round trip for its atoms;
+    /// - the proof ([`proves_a_live_connection`]): one round trip for the
+    ///   selection's owner, a reader's connection, and ONE target asked of the
+    ///   SECONDARY selection, which its owner answers within
+    ///   `LONG_TIMEOUT_DUR`, 4 s, or arboard gives up (`read_single`); with no
+    ///   owner the server answers at once.
+    ///
+    /// Worst case: 4 s and a few round trips, about 4.1 s, and 6 s leaves
+    /// almost 2 s for a loaded host. (A read of the text, as the proof was
+    /// before, asks six targets of 4 s each: 24 s.) A rebuild that takes
+    /// longer is not given up on: [`Follow::check`].
+    pub(super) const REBUILD_BOUND: Duration = Duration::from_secs(6);
+
+    /// #3671 kill switch `ROOMLERD_CLIPBOARD_X11_REBUILD=0`.
+    fn enabled() -> bool {
+        tunnel_core::env::flag("CLIPBOARD_X11_REBUILD", true)
+    }
+
+    /// A test takes the second handle out of [`connect_anew`], to show that
+    /// the rebuild fails without it.
+    #[cfg(test)]
+    pub(super) static SECOND_HANDLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    /// What makes a handle on the desktop's server now: [`connect_anew`], or a
+    /// test's stand-in.
+    pub(super) type Connect<H> = std::sync::Arc<dyn Fn() -> Result<H, String> + Send + Sync>;
+
+    /// The answer of a rebuild that has no thread to say it.
+    const NO_ANSWER: &str = "the rebuild's thread ended without an answer";
+
+    /// A rebuild the worker stopped waiting for: the generation it is for, the
+    /// desktop as read before it started, and where its answer comes.
+    struct Running<H> {
+        generation: u64,
+        desk: Option<XServerNow>,
+        answer: mpsc::Receiver<Result<H, String>>,
+    }
+
+    /// Which generation the worker's handle is on, and how it makes the next.
+    pub(super) struct Follow<H> {
+        on: u64,
+        running: Option<Running<H>>,
+        retry: Retry,
+        connect: Connect<H>,
+        bound: Duration,
+        off: bool,
+    }
+
+    impl<H: Send + 'static> Follow<H> {
+        /// A worker whose handle was made with the desktop as `born` read
+        /// before its connect.
+        pub(super) fn new(born: Option<XServerNow>, connect: Connect<H>, bound: Duration) -> Self {
+            Self {
+                on: born.map_or(0, |d| d.generation),
+                running: None,
+                retry: Retry::new(),
+                connect,
+                bound,
+                off: !enabled(),
+            }
+        }
+
+        /// A handle on the desktop's new X server, once the desktop is up on a
+        /// generation newer than the handle's. `desk` is the desktop now
+        /// ([`crate::virtual_desktop::x_server_now`]).
+        ///
+        /// - Only a NEWER generation: after the teardown at a stop the desktop
+        ///   reads `None`, which is no new server, and nothing is tried.
+        /// - Made on a helper thread the worker waits `bound`
+        ///   ([`REBUILD_BOUND`]) for, so a rebuild that hangs cannot take the
+        ///   worker, whose answers every session waits for, with it.
+        /// - At most ONE helper at a time. One the worker stopped waiting for
+        ///   is asked again at each look, and its answer is taken then; until
+        ///   it ends no other starts. A helper that hangs holds arboard's
+        ///   global lock (its `Clipboard::new` and `Drop` hold it throughout),
+        ///   which every other would queue on, one thread more each time. So
+        ///   following ends for good only if a helper never ends, which only a
+        ///   teardown or a server that hangs inside arboard can do.
+        /// - A rebuild that failed is tried again as [`Retry`] says; the worker
+        ///   serves with the handle it has meanwhile, dead as before #3671.
+        ///   Said once per generation, and once when it follows.
+        pub(super) fn check(&mut self, desk: Option<XServerNow>, now: Instant) -> Option<H> {
+            if self.off {
+                return None;
+            }
+            if let Some(running) = self.running.take() {
+                let answer = match running.answer.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.running = Some(running);
+                        return None;
+                    }
+                    Ok(answer) => answer,
+                    Err(mpsc::TryRecvError::Disconnected) => Err(NO_ANSWER.into()),
+                };
+                if let Some(fresh) =
+                    self.answered(running.generation, running.desk, desk, now, None, answer)
+                {
+                    return Some(fresh);
+                }
+            }
+            let d = desk?;
+            if d.down.is_some() || d.generation <= self.on || !self.retry.may_try(desk, now) {
+                return None;
+            }
+            let (tx, rx) = mpsc::channel();
+            let connect = self.connect.clone();
+            let started = Instant::now();
+            let spawned = std::thread::Builder::new()
+                .name("roomlerd-clipboard-follow".into())
+                .spawn(move || {
+                    let _ = tx.send(connect());
+                });
+            if let Err(e) = spawned {
+                let why = Err(format!("no thread for the rebuild: {e}"));
+                return self.answered(d.generation, desk, desk, now, Some(started), why);
+            }
+            match rx.recv_timeout(self.bound) {
+                Ok(answer) => self.answered(d.generation, desk, desk, now, Some(started), answer),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        generation = d.generation,
+                        bound_ms = self.bound.as_millis() as u64,
+                        "clipboard: following the desktop's new X server takes longer than bound_ms — the clipboard keeps its old connection until it ends, and copy and paste fail meanwhile (#3671)"
+                    );
+                    self.running = Some(Running {
+                        generation: d.generation,
+                        desk,
+                        answer: rx,
+                    });
+                    None
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let why = Err(NO_ANSWER.into());
+                    self.answered(d.generation, desk, desk, now, Some(started), why)
+                }
+            }
+        }
+
+        /// A rebuild's `answer`, for `generation`, started with the desktop
+        /// as `was` read and looked at with the desktop as `desk` reads;
+        /// `started` when it is the look's own rebuild.
+        fn answered(
+            &mut self,
+            generation: u64,
+            was: Option<XServerNow>,
+            desk: Option<XServerNow>,
+            now: Instant,
+            started: Option<Instant>,
+            answer: Result<H, String>,
+        ) -> Option<H> {
+            let current = desk.is_some_and(|d| d.down.is_none() && d.generation == generation);
+            match answer {
+                Ok(fresh) if current => {
+                    self.on = generation;
+                    let after_failure = self.retry.succeeded();
+                    tracing::info!(
+                        generation,
+                        took_ms = started.map(|s| s.elapsed().as_millis() as u64),
+                        after_failure,
+                        "clipboard: the clipboard follows the desktop's new X server (#3671)"
+                    );
+                    Some(fresh)
+                }
+                // A late answer whose server went meanwhile: nothing to take.
+                Ok(stale) => {
+                    super::quietly_drop(stale);
+                    None
+                }
+                Err(why) => {
+                    if self.retry.failed(was, now) {
+                        tracing::warn!(
+                            generation,
+                            %why,
+                            retry_s = Retry::EVERY.as_secs(),
+                            "clipboard: the clipboard could not follow the desktop's new X server — tried again every retry_s while that server answers, and copy and paste fail until then (#3671)"
+                        );
+                    } else {
+                        tracing::debug!(generation, %why, "clipboard: following the desktop's new X server failed again");
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// A handle on `$DISPLAY`'s server now, while the worker's own handle is
+    /// still the dead server's.
+    ///
+    /// ⚠️ The second handle is load-bearing: arboard's rule, as of arboard
+    /// 3.6.1 (pinned exactly in the workspace `Cargo.toml`; an upgrade
+    /// re-reads it), `src/platform/linux/x11.rs`. A process has one X
+    /// connection, held in a global for as long as any handle lives:
+    /// `Clipboard::new` (lines 915-933) hands that global back, dead or not.
+    /// A handle's drop tears the global down only when the handle is one of
+    /// exactly three owners (`impl Drop for Clipboard`, lines 1082-1130,
+    /// `MIN_OWNERS = 3`: the global, the thread that serves the selection, and
+    /// the handle). Once the server is gone, that thread has ended (arboard
+    /// logs "Worker thread errored with: …"), and the worker's handle and the
+    /// global are the only two owners: dropping the worker's handle tears
+    /// nothing down, and a new one is the dead global again. A second handle
+    /// makes three: its drop tears the global down (quietly,
+    /// [`super::quietly_drop`]: it returns at `destroy_window`, before its
+    /// join), and the next `Clipboard::new` connects to the new server. The
+    /// worker's old handle, dropped after, is then the only owner of the dead
+    /// connection and tears nothing down. A read on the new handle proves it
+    /// before the worker serves with it.
+    pub(super) fn connect_anew() -> Result<arboard::Clipboard, String> {
+        use arboard::GetExtLinux as _;
+        #[cfg(test)]
+        let second_handle = SECOND_HANDLE.load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let second_handle = true;
+        if second_handle {
+            let second = arboard::Clipboard::new()
+                .map_err(|e| format!("a second handle on the old server: {e}"))?;
+            super::quietly_drop(second);
+        }
+        let mut fresh =
+            arboard::Clipboard::new().map_err(|e| format!("a handle on the new server: {e}"))?;
+        let proof = fresh
+            .get()
+            .clipboard(arboard::LinuxClipboardKind::Secondary)
+            .html();
+        if proves_a_live_connection(&proof) {
+            return Ok(fresh);
+        }
+        let why = match proof {
+            Err(e) => format!("the new handle's first read failed: {e}"),
+            Ok(_) => String::new(),
+        };
+        super::quietly_drop(fresh);
+        Err(why)
+    }
+
+    /// Whether the proof's answer came over a live connection. Any answer at
+    /// all does: something, nothing to give, a conversion that failed, an
+    /// occupied clipboard. `Unknown` is arboard 3.6.1's word for an X request
+    /// or connection that failed (`into_unknown`, `src/platform/linux/mod.rs`),
+    /// which is what the dead server's connection gives at its first request,
+    /// the question of who owns the selection.
+    pub(super) fn proves_a_live_connection(answer: &Result<String, arboard::Error>) -> bool {
+        !matches!(answer, Err(arboard::Error::Unknown { .. }))
+    }
+}
+
 /// FR-97 P3e-3a — the X11 clipboard's change gate, Windows' sequence number
 /// for an X11 session: XFixes reports every change of the CLIPBOARD
 /// selection's owner, and a copy is exactly that. A tick that saw no event
@@ -641,8 +1317,6 @@ fn gate_tick(gate: &mut Option<change_gate::Gate>) -> Option<u32> {
 /// Kill switch `ROOMLERD_CLIPBOARD_X11_WATCH=0`: no gate, as before P3e-3a.
 #[cfg(target_os = "linux")]
 pub(crate) mod x11_gate {
-    use std::sync::OnceLock;
-
     use x11rb::connection::Connection as _;
     use x11rb::protocol::Event;
     use x11rb::protocol::xfixes::{self, ConnectionExt as _};
@@ -728,10 +1402,32 @@ pub(crate) mod x11_gate {
     }
 
     /// Whether copied images on this host are watched: an X11 session whose
-    /// server takes the gate. Asked once, for the hello.
+    /// server takes the gate. Asked for the hello. #3671 — on a host whose
+    /// desktop is the daemon's own, a `false` met while the desktop was down
+    /// is asked again once it is up, as [`super::Retry`] says, and a host
+    /// with no desktop of its own decides once, as before. The hello keeps
+    /// the copy its probe took (`encode::caps`).
     pub fn available() -> bool {
-        static AVAILABLE: OnceLock<bool> = OnceLock::new();
-        *AVAILABLE.get_or_init(|| Gate::open().is_some())
+        static AVAILABLE: super::Kept<()> = super::Kept::new();
+        available_at(
+            &AVAILABLE,
+            crate::virtual_desktop::x_server_now(),
+            std::time::Instant::now(),
+            || Gate::open().is_some(),
+        )
+    }
+
+    /// [`available`], with its slot, the desktop, the time and whether the
+    /// gate opens given: what its tests drive.
+    pub(super) fn available_at(
+        slot: &super::Kept<()>,
+        desk: Option<crate::virtual_desktop::XServerNow>,
+        now: std::time::Instant,
+        opens: impl FnOnce() -> bool,
+    ) -> bool {
+        slot.get_at(desk, now, || if opens() { Ok(()) } else { Err(()) })
+            .0
+            .is_some()
     }
 }
 
@@ -1054,6 +1750,7 @@ fn install_watcher(
     tx: tokio::sync::mpsc::Sender<ClipboardChange>,
     gate_seq: Option<u32>,
 ) -> WatcherState {
+    let asked_image = events.image;
     // Image watching needs the Windows sequence-number gate to bound
     // `get_image` calls; without it (a window station that denies
     // clipboard access) fall back to text-only watching. FR-97 P3e-3a —
@@ -1116,6 +1813,7 @@ fn install_watcher(
         last_img_hash: 0,
         last_html_hash: html_hash,
         last_native_hash: native_hash,
+        asked_image,
         retry: false,
     }
 }
@@ -2429,6 +3127,420 @@ mod follow_tests {
         assert!(!live(&Err(arboard::Error::Unknown {
             description: "Broken pipe (os error 32)".into(),
         })));
+    }
+}
+
+/// #3671 — the worker follows a new X server on the display it serves:
+/// against an Xvfb of the test's own (`ROOMLERD_TEST_X11=1`), killed and
+/// started again on the same display as the desktop's supervisor does, with
+/// the desktop's generation a counter of the test's. Each test writes the
+/// real clipboard of that display, so it waits for the real clipboard's
+/// opt-in too (#3813). CI's real-clipboard step runs each test of this module
+/// in a process of its own (`--exact`): arboard keeps one connection per
+/// process, so a second test in the same process would start on the first
+/// one's. `only_one_per_process` refuses that at once. `xclip` is the
+/// desktop's other client.
+#[cfg(all(test, target_os = "linux"))]
+mod x11_follow_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    /// Set by the first real-X clipboard test this process runs.
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    /// Called by each real-X clipboard test once it has opted in: a second one
+    /// in the same process would read arboard's connection to the first one's
+    /// server, so it fails at once, with the reason, instead of later with a
+    /// misleading one.
+    fn only_one_per_process() {
+        assert!(
+            !RAN.swap(true, Ordering::SeqCst),
+            "CI runs each real-X clipboard test in a process of its own: arboard keeps one connection per process"
+        );
+    }
+
+    /// The desktop as the worker reads it: always up, on the test's count.
+    fn desk() -> Option<XServerNow> {
+        Some(XServerNow {
+            generation: GENERATION.load(Ordering::SeqCst),
+            down: None,
+        })
+    }
+
+    /// Everything this process logs from here on, arboard's `log` lines too,
+    /// with each line's thread: the worker, its helper and arboard's serving
+    /// thread log from threads of their own, which a subscriber set for the
+    /// test's thread does not hear. Set once for the process; CI runs each
+    /// test of this module in a process of its own.
+    #[derive(Clone, Default)]
+    struct ProcessLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ProcessLog {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ProcessLog {
+        /// The process's log, installed at the first call with the bridge
+        /// from `log` (`try_init`). `None`: another subscriber was there first.
+        fn get() -> Option<&'static ProcessLog> {
+            use tracing_subscriber::util::SubscriberInitExt as _;
+            static LOG: std::sync::OnceLock<Option<ProcessLog>> = std::sync::OnceLock::new();
+            LOG.get_or_init(|| {
+                let log = ProcessLog::default();
+                let writer = log.clone();
+                tracing_subscriber::fmt()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_thread_names(true)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || writer.clone())
+                    .finish()
+                    .try_init()
+                    .ok()
+                    .map(|()| log)
+            })
+            .as_ref()
+        }
+
+        fn len(&self) -> usize {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+
+        /// The lines logged since `from` (a [`Self::len`]).
+        fn since(&self, from: usize) -> Vec<String> {
+            let all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&all[from.min(all.len())..])
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    /// The CLIPBOARD selection as another client of `display` reads it.
+    fn desktop_reads(display: &str) -> String {
+        let out = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-o", "-display", display])
+            .output()
+            .expect("xclip, which CI's real-clipboard step installs");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Another client of `display` copies `text`, as a copy on the desktop
+    /// does, and the copy is readable. xclip forks to serve the selection;
+    /// that child ends with the test's server.
+    fn desktop_copies(display: &str, text: &str) {
+        use std::io::Write as _;
+        let mut xclip = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-i", "-display", display])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("xclip, which CI's real-clipboard step installs");
+        xclip
+            .stdin
+            .take()
+            .expect("xclip's input")
+            .write_all(text.as_bytes())
+            .expect("xclip took the text");
+        let _ = xclip.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while desktop_reads(display) != text {
+            assert!(
+                Instant::now() < deadline,
+                "xclip's copy never became readable"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The test's own Xvfb, `DISPLAY` naming it, a worker on it and a runtime
+    /// for the worker's async API. `None`: the lane did not opt in.
+    fn worker_on_own_server(
+        test: &str,
+    ) -> Option<(
+        crate::virtual_desktop::TestX,
+        crate::virtual_desktop::TestDisplay,
+        Clipboard,
+        tokio::runtime::Runtime,
+    )> {
+        if !crate::virtual_desktop::TestX::opted_in() {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return None;
+        }
+        if !real_clipboard_opted_in(test) {
+            return None;
+        }
+        only_one_per_process();
+        let x = crate::virtual_desktop::TestX::start()
+            .expect("ROOMLERD_TEST_X11=1 but no Xvfb came up");
+        let display = x.point_display();
+        let cb =
+            Clipboard::following(desk).expect("the clipboard worker opens on the test's own Xvfb");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        Some((x, display, cb, rt))
+    }
+
+    /// After the restart a paste from the viewer reaches the desktop, a copy
+    /// on the desktop reaches the viewer, and a session that subscribed to
+    /// changes before the restart hears the copy: the worker and its change
+    /// gate are on the new server, with no daemon restart, and the rebuild
+    /// says so in one line: the second handle's drop on the dead connection
+    /// logs nothing (#3671). Before #3671 the worker kept the dead
+    /// connection: the paste failed.
+    #[test]
+    fn x11_real_the_clipboard_follows_a_new_x_server() {
+        x11_follow::SECOND_HANDLE.store(true, Ordering::SeqCst);
+        let Some((x, _display, cb, rt)) =
+            worker_on_own_server("x11_real_the_clipboard_follows_a_new_x_server")
+        else {
+            return;
+        };
+        let log = ProcessLog::get()
+            .expect("the log capture installs: CI runs this test in a process of its own");
+        let display = x.display().to_string();
+        rt.block_on(cb.write("before the restart".into()))
+            .expect("a write on the first server");
+        assert_eq!(desktop_reads(&display), "before the restart");
+        let (tx, mut changes) = tokio::sync::mpsc::channel(8);
+        cb.watch(
+            WatchEvents {
+                text: true,
+                ..WatchEvents::default()
+            },
+            tx,
+        )
+        .expect("a watch");
+
+        let mark = log.len();
+        x.kill();
+        // #3671 — what production always has before the generation moves:
+        // arboard's serving thread saw the connection die and ended (its
+        // "Worker thread errored with" line is its last act), every request
+        // on the old connection fails, and the supervisor waits its stop grace
+        // (1 s) before a new server. A rebuild that met that thread still
+        // holding its share of arboard's global would find four owners, not
+        // three, and tear nothing down.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log
+            .since(mark)
+            .iter()
+            .any(|l| l.contains("Worker thread errored with"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "arboard's serving thread did not end within 5 s of its server's kill: {:#?}",
+                log.since(mark)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rt.block_on(cb.read()).is_err(),
+            "a read on the dead server's connection answered"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(x.restart(), "no new server on the same display");
+        GENERATION.fetch_add(1, Ordering::SeqCst);
+
+        // The viewer pastes: the first command after the restart meets the
+        // new server.
+        let asked = Instant::now();
+        let pasted = rt.block_on(cb.write("after the restart".into()));
+        let took = asked.elapsed();
+        assert!(
+            pasted.is_ok(),
+            "the paste after the restart failed: {pasted:?}"
+        );
+        assert!(
+            took < x11_follow::REBUILD_BOUND,
+            "following the new server took {took:?}"
+        );
+        assert_eq!(
+            desktop_reads(&display),
+            "after the restart",
+            "the desktop did not get the paste"
+        );
+        // #3671 — one line for the rebuild, and none of arboard's ERRORs
+        // from the second handle's drop on the dead connection.
+        let lines = log.since(mark);
+        let follows = lines
+            .iter()
+            .filter(|l| l.contains("the clipboard follows the desktop's new X server"))
+            .count();
+        assert_eq!(follows, 1, "the rebuild's line, once: {lines:#?}");
+        for noise in [
+            "Could not hand the clipboard data over",
+            "Failed to destroy the clipboard window",
+            "could not follow the desktop's new X server",
+        ] {
+            assert!(
+                !lines.iter().any(|l| l.contains(noise)),
+                "the rebuild logged {noise:?}: {lines:#?}"
+            );
+        }
+
+        // The person copies on the desktop.
+        desktop_copies(&display, "copied on the new desktop");
+        assert_eq!(
+            rt.block_on(cb.read()).expect("a read on the new server"),
+            "copied on the new desktop"
+        );
+        let heard = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(change) = changes.recv().await {
+                    if matches!(&change, ClipboardChange::Text(t) if t == "copied on the new desktop")
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+        });
+        assert_eq!(
+            heard,
+            Ok(true),
+            "the session that subscribed before the restart was not told of the copy"
+        );
+        println!(
+            "x11-real: the clipboard followed a new X server in {took:?}: a paste, a copy and a watched copy on the new server"
+        );
+    }
+
+    /// The negative control: the same restart with the rebuild's second
+    /// handle taken out. The handle arboard then makes is the dead server's,
+    /// its first read fails, and the worker stays where it was before #3671:
+    /// the paste fails. If this ever passes, arboard's rule has changed (an
+    /// upgrade): re-read its `Drop` before trusting `x11_follow`.
+    #[test]
+    fn x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server() {
+        let Some((x, _display, cb, rt)) = worker_on_own_server(
+            "x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server",
+        ) else {
+            return;
+        };
+        let display = x.display().to_string();
+        rt.block_on(cb.write("before the restart".into()))
+            .expect("a write on the first server");
+        // The preconditions: the worker serves the first server both ways, and
+        // the new one answers another client, so the paste that fails below
+        // fails for the worker's connection and for nothing else.
+        assert_eq!(desktop_reads(&display), "before the restart");
+        desktop_copies(&display, "copied before the restart");
+        assert_eq!(
+            rt.block_on(cb.read()).expect("a read on the first server"),
+            "copied before the restart"
+        );
+        x.kill();
+        assert!(x.restart(), "no new server on the same display");
+        desktop_copies(&display, "the new server answers");
+        x11_follow::SECOND_HANDLE.store(false, Ordering::SeqCst);
+        GENERATION.fetch_add(1, Ordering::SeqCst);
+        let pasted = rt.block_on(cb.write("after the restart".into()));
+        x11_follow::SECOND_HANDLE.store(true, Ordering::SeqCst);
+        let Err(e) = pasted else {
+            panic!("without the second handle the paste reached the new server");
+        };
+        assert_ne!(desktop_reads(&display), "after the restart");
+        println!(
+            "x11-real: without the second handle the clipboard stayed on the dead X server: {e:#}"
+        );
+    }
+
+    /// #3671 — a clipboard first asked for while the desktop is down (in a
+    /// restart, in a back-off gap, or after a first start that failed) starts
+    /// at the first ask once a new X server answers, and a paste and a copy
+    /// then reach that server: the failure is not kept for the daemon's life.
+    /// The slot is the kind [`Clipboard::shared`] keeps and the start is its
+    /// own (`Clipboard::new`); the desktop is the test's, read as the daemon
+    /// reads its own. Before #3671 the first failure was kept, and the
+    /// clipboard stayed off until the daemon restarted. In a process of its
+    /// own: arboard keeps one connection per process.
+    #[test]
+    fn x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up() {
+        if !crate::virtual_desktop::TestX::opted_in() {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        if !real_clipboard_opted_in(
+            "x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up",
+        ) {
+            return;
+        }
+        only_one_per_process();
+        let log = ProcessLog::get()
+            .expect("the log capture installs: CI runs this test in a process of its own");
+        let x = crate::virtual_desktop::TestX::start()
+            .expect("ROOMLERD_TEST_X11=1 but no Xvfb came up");
+        let _display = x.point_display();
+        let display = x.display().to_string();
+        x.kill();
+        let mark = log.len();
+        let slot: Kept<Clipboard> = Kept::new();
+        let down = Some(XServerNow {
+            generation: 0,
+            down: Some(1),
+        });
+        assert!(
+            shared_at(&slot, down, Instant::now(), Clipboard::new).is_none(),
+            "a clipboard started on a display that no server answers"
+        );
+        assert!(
+            shared_at(&slot, down, Instant::now(), Clipboard::new).is_none(),
+            "a clipboard started while the desktop was still down"
+        );
+        assert!(x.restart(), "no new server on the same display");
+        let up = Some(XServerNow {
+            generation: 1,
+            down: None,
+        });
+        let cb = shared_at(&slot, up, Instant::now(), Clipboard::new)
+            .expect("the clipboard did not start at the first ask once the desktop was up");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(cb.write("pasted from the viewer".into()))
+            .expect("a paste on the new server");
+        assert_eq!(
+            desktop_reads(&display),
+            "pasted from the viewer",
+            "the desktop did not get the paste"
+        );
+        desktop_copies(&display, "copied on the desktop");
+        assert_eq!(
+            rt.block_on(cb.read()).expect("a read on the new server"),
+            "copied on the desktop"
+        );
+        let lines = log.since(mark);
+        let said = |what: &str| lines.iter().filter(|l| l.contains(what)).count();
+        assert_eq!(
+            (
+                said("shared worker init failed on this device's virtual desktop"),
+                said("the shared worker started on this device's virtual desktop")
+            ),
+            (1, 1),
+            "one line for the failure and one for the start: {lines:#?}"
+        );
+        println!(
+            "x11-real: a clipboard first asked for while the desktop was down started once it was up: a paste and a copy on the new server"
+        );
     }
 }
 
