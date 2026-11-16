@@ -251,6 +251,39 @@ pub fn daemon_has_something_to_show() -> bool {
     for_prompt
 }
 
+// ─── a person's opening of the running companion (#3941) ─────────────────
+
+/// #3941 — what a reopen does. RED: as today, nothing.
+pub fn decide_reopen(_first_run_done: bool, _tour_held: bool) -> SecondLaunch {
+    SecondLaunch::Ignore
+}
+
+/// #3941 — the reopen's one log line. RED: as today, none.
+pub fn log_reopen(
+    _decision: &SecondLaunch,
+    _first_run_done: bool,
+    _tour_held: bool,
+    _has_visible_windows: bool,
+) {
+}
+
+/// Show the window as a person's opening of the running companion decided
+/// (#3941): a second launch forwarded on Windows and Linux, a reopen on
+/// macOS, one code for both. `route` sends the page to a view, `show` shows
+/// and focuses the window. A tour shown here is held no more ([`showing`]),
+/// so it is offered once.
+pub fn open_window(decision: SecondLaunch, route: impl FnOnce(&str), show: impl FnOnce()) {
+    match decision {
+        SecondLaunch::Ignore => {}
+        SecondLaunch::Show => show(),
+        SecondLaunch::ShowView(view) => {
+            showing(&view);
+            route(&view);
+            show();
+        }
+    }
+}
+
 /// The first port in `start..start+span` that is not in `exclude` and that
 /// `can_bind` accepts. Userspace mode's SOCKS front needs a loopback port
 /// that is free NOW and not claimed by a declared route that is merely down
@@ -884,16 +917,170 @@ mod tests {
         );
     }
 
+    /// The tests that hold the tour back or release it share the process's
+    /// one hold ([`TOUR_HELD`]), and the harness runs tests on parallel
+    /// threads: they take turns, or one releases what another asserts.
+    static THE_HOLD: Mutex<()> = Mutex::new(());
+
     /// #3887 — the tour held back is offered once: the opening that shows it
     /// releases it, and another view leaves it held.
     #[test]
     fn the_held_tour_is_offered_once() {
+        let _turn = THE_HOLD.lock().unwrap_or_else(|p| p.into_inner());
         hold_the_tour();
         assert!(tour_held());
         showing("overview");
         assert!(tour_held(), "another view leaves it held");
         showing("welcome");
         assert!(!tour_held(), "shown once, held no more");
+    }
+
+    /// What [`open_window`] did with `decision`, in order: `#/<view>` for the
+    /// page routed to a view, `shown` for the window shown and focused.
+    fn opens(decision: SecondLaunch) -> Vec<String> {
+        let done = std::cell::RefCell::new(Vec::new());
+        open_window(
+            decision,
+            |view| done.borrow_mut().push(format!("#/{view}")),
+            || done.borrow_mut().push("shown".to_string()),
+        );
+        done.into_inner()
+    }
+
+    /// #3941 — a reopen (macOS: a double-click in Finder or Launchpad,
+    /// Spotlight, `open -a` on the running app) with the window closed shows
+    /// the main window where it is, as a plain second launch does on Windows
+    /// and Linux. It never does nothing: with no argument it can be neither a
+    /// login start nor a start for a prompt.
+    #[test]
+    fn a_reopen_shows_the_main_window() {
+        for done in [true, false] {
+            assert_eq!(
+                decide_reopen(done, false),
+                SecondLaunch::Show,
+                "done={done}"
+            );
+            assert_eq!(
+                decide_reopen(done, false),
+                decide_second_instance(&parse_launch_args(&args(&[])), done, false),
+                "decided as a second launch with no argument, done={done}"
+            );
+            assert_eq!(opens(decide_reopen(done, false)), ["shown"]);
+        }
+        for (done, held) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert_ne!(
+                decide_reopen(done, held),
+                SecondLaunch::Ignore,
+                "done={done} held={held}"
+            );
+        }
+    }
+
+    /// #3941 — while a start for a prompt holds the tour back (#3887), the
+    /// first reopen shows the tour and releases it, and the next shows the
+    /// main window where it is: the tour once, as a second launch and the
+    /// tray offer it.
+    #[test]
+    fn a_reopen_shows_the_held_tour_once() {
+        let _turn = THE_HOLD.lock().unwrap_or_else(|p| p.into_inner());
+        // The daemon started the companion for a question; the tour is not
+        // done, so the start held it back.
+        hold_the_tour();
+        assert_eq!(
+            opens(decide_reopen(false, tour_held())),
+            ["#/welcome", "shown"],
+            "the person opens the app again: the tour"
+        );
+        assert!(!tour_held(), "shown, so held no more");
+        assert_eq!(
+            opens(decide_reopen(false, tour_held())),
+            ["shown"],
+            "and again: the main window, not the tour a second time"
+        );
+    }
+
+    /// #3941 — the second launch's window code, which the reopen now shares,
+    /// does what it did: nothing for a login start or a start for a prompt,
+    /// the window where it is for a double-click, and an asked-for view
+    /// routed before the window shows.
+    #[test]
+    fn a_second_launch_opens_the_window_as_before() {
+        let a = |v: &[&str]| parse_launch_args(&args(v));
+        assert!(opens(decide_second_instance(&a(&["--autostart"]), true, false)).is_empty());
+        assert!(opens(decide_second_instance(&a(&["--for-prompt"]), false, true)).is_empty());
+        assert_eq!(
+            opens(decide_second_instance(&a(&[]), true, false)),
+            ["shown"]
+        );
+        assert_eq!(
+            opens(decide_second_instance(&a(&["--view=devices"]), true, false)),
+            ["#/devices", "shown"]
+        );
+    }
+
+    /// Where the tests read what the companion logged.
+    #[derive(Clone, Default)]
+    struct LogSink(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #3941 — one line per reopen, beside a second launch's, naming what it
+    /// shows: the tour while a start for a prompt holds it back, else the
+    /// main window. The macOS lab reads it as the second witness beside the
+    /// window itself.
+    #[test]
+    fn a_reopen_logs_what_it_shows() {
+        // A second live dispatcher for the whole test. With only one
+        // registered, a callsite that another test thread reaches first, with
+        // no subscriber of its own, is cached as `never`, and the subscriber
+        // below would miss the line (`agent-core`'s pairing_terminal tests
+        // hold one for the same reason).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_reopen(&decide_reopen(false, true), false, true, false);
+            log_reopen(&decide_reopen(true, false), true, false, true);
+        });
+        let log = String::from_utf8(sink.0.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            .expect("the log is UTF-8");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per reopen:\n{log}");
+        assert!(lines[0].contains("a reopen shows the tour"), "{}", lines[0]);
+        assert!(lines[0].contains("tour_held=true"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("a reopen shows the main window"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("has_visible_windows=true"),
+            "{}",
+            lines[1]
+        );
     }
 
     /// #3887 — on macOS, where the daemon's start (`launchctl kickstart`)
