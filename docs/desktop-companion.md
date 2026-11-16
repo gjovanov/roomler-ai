@@ -1641,6 +1641,14 @@ flowchart TD
 - **Unit:** `cargo test -p roomler-desktop` (the Rust side), `cargo test -p roomler-localapi
   --lib` (the pipe pool and backoff, including the back-to-back-open test that fails with 231
   on the single-instance server), `cargo test -p roomlerd --lib route_reconciler`.
+- **In CI, on all three OSes** (`ci.yml`): Linux runs the unit tests in "Rust unit tests
+  (server + crates)", step "Test the desktop companion (roomler-desktop)". Windows runs clippy
+  (`--all-targets -D warnings`) and the unit tests in "Windows overlay clippy", step "The
+  desktop companion on Windows — clippy + unit tests (#3940)". macOS `cargo check`s it in
+  "macOS overlay compile check", step "cargo check the desktop companion". Each OS compiles
+  only its own `#[cfg]` arms, so a mistake in Windows-only code (the login start in the Run
+  key, the service start's spawn, the panels' capture exclusion) fails the Windows step alone.
+  Before #3940 no lane compiled that code, and the release build found such mistakes first.
 - **The front without a daemon:** serve `src/front/` over loopback with a fake
   `window.__TAURI__` that answers the commands from fixtures, and drive it in a browser.
   That is how the Routes page (stale-while-error, the sequence guard, stable rows, edit) and
