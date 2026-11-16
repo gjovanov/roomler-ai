@@ -99,8 +99,8 @@ done
 [ -f "$JS" ] || die "missing $JS"
 [ -z "$SEED" ] || [ "$TARGET" = docker ] || die "--seed is for the --docker rehearsal only"
 
-# Prefix every ENVS entry with -e for `docker exec`.
-docker_env_args() { local a=(); for e in "${ENVS[@]+"${ENVS[@]}"}"; do a+=(-e "$e"); done; printf '%s\0' "${a[@]+"${a[@]}"}"; }
+# Prefix every ENVS entry with -e for `docker exec`; none prints nothing (printf with no argument still prints one empty field: the container name).
+docker_env_args() { local a=(); for e in "${ENVS[@]+"${ENVS[@]}"}"; do a+=(-e "$e"); done; [ "${#a[@]}" = 0 ] || printf '%s\0' "${a[@]}"; }
 
 case "$TARGET" in
   docker)
