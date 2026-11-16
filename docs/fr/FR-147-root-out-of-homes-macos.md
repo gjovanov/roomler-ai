@@ -413,7 +413,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 |---|---|---|
 | `crates/agent-core/src/logging.rs:228-239`, through appdirs | a root command made `<F>/logs` under its caller's `HOME` (#3802) | write; fixed by #3825 (`appdirs.rs:136-162`) |
 | `agents/roomlerd/src/instance_lock.rs:253-261` | the lock's path from `BaseDirs`, which reads `$HOME` (`:254-255`); reached by `run`. Typed by hand as `sudo roomlerd run`, the daemon takes its lock under the CALLER's `~/Library/Caches`. That is not the file the launchd daemon holds for the same config (`/var/root/Library/Caches`; the name is a hash of the config path, `lock_id`, `:100-104`, held by `flock`, `unix_acquire`, `:217-249`), so the second daemon is not refused as a second instance | write |
-| `agents/roomlerd/src/service.rs:2398-2430` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2428-2430`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
+| `agents/roomlerd/src/service.rs:2410-2442` | `plist_path()` from `BaseDirs`, then `create_dir_all` and `write` (`:2440-2442`): typed as `sudo roomlerd service install` (or `uninstall`), a root-owned `<L>` and plist in the caller's home, the #3763 state | write |
 | `scripts/install.sh:1954-1975` | the uninstall removes every account's `<L>/com.roomler.agent.plist` and `com.roomler.desktop.plist` as root (`remove_paths`, `:1521-1529`) | remove |
 | `scripts/install.sh:1988-1995` | the uninstall removes every account's roomler folders (`account_config_paths`, `:1569`) as root | remove |
 | `scripts/install.sh:1083` | `as_root grep` of the console person's `config.toml` | read |
