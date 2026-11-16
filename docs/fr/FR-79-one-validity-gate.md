@@ -1,6 +1,6 @@
 # FR-79: One validity gate — a window is evidence about the pipe, or it is not
 
-**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b proposed 2026-10-30** for the V5 loop FR-71's 2026-10-29 fleet read found, waiting on the operator ·
+**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). V1 to V5a stay live, and V3b's `Pipe` stays in shadow. V3b's flip is FR-148's first invariant, V5b (PR #3374) is the first step of FR-148 P1, and AC8 and AC9 are read there. FR-148 §12 maps each open criterion. At the close: proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b proposed 2026-10-30** for the V5 loop FR-71's 2026-10-29 fleet read found, waiting on the operator ·
 **Parent:** the consolidation FR-70's AC4 asks for (8 estimators → 1) and the rule
 FR-71's three field events wrote by induction. Deletes rather than adds:
 `transit_hold`, `transit_classify`, T2's quarantine and T2b's shadow all go.

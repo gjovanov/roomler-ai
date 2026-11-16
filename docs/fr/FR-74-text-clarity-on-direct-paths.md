@@ -1,6 +1,6 @@
 # FR-74 — Text clarity on direct paths: the bitrate ceiling follows the content, not a constant
 
-**Issue:** [#1442](https://github.com/gjovanov/roomler-ai/issues/1442) · **Status:** P0 done 2026-09-06;
+**Issue:** [#1442](https://github.com/gjovanov/roomler-ai/issues/1442) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). What met AC1, AC3 and AC5 stays. P5, the measured path as the operating point, is FR-148 P3. AC2 and AC4, the operator's read of the scroll, are FR-148's AC15. FR-148 §12 maps each open criterion. At the close: P0 done 2026-09-06;
 P1 (0.4.77) + P1b (0.4.79) + P3 (0.4.80) released and **field-verified 2026-09-07 on all four
 codecs** by the operator's read and the heartbeat; P2 retired by measurement (0 rate swaps);
 AC3 ticked; the thin-direct-path read of the q-cap done 2026-09-07 (sharp but laggy below the

@@ -65,6 +65,15 @@ FR-36=2   # D.1 #929 both `[~]` are ONE gap: 4K meets the latency bar and ~30 fp
 
 # ── E. closed NOT PLANNED: criteria for a fix that will not be built ─────────
 FR-31=7   # E.1 #897 closed 2026-11-08 not planned (triage): superseded by FR-35 #922. Its own A/B refuted both levers on 2026-08-29 (neither a post-open VBV nor `ldkfs` moves NVENC's opening keyframe), so these criteria describe a fix that will not be built. FR-35's criteria measure the opener now.
+FR-17=4   # E.2 #799 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. Stages A and B shipped inert behind an opt-in. The four open criteria (the relay cell, the storm bound, the direct cell, the RustDesk A/B) are FR-148's AC23, AC24, AC21 and AC27.
+FR-18=4   # E.3 #801 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. The age bound, the send-buffer cap and the counters are live. Three partial field reads and the `dropped_stale` criterion are FR-148's AC21, AC22 and AC23.
+FR-35=4   # E.4 #922 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. The two opening criteria are FR-148's AC20 and the 2 Mbit/s relay its AC18. The kill-switch criterion is dropped with the learner (FR-148 P5); its A/B of 2026-11-02 stands as the record. FR-31's opener rides along.
+FR-59=2   # E.5 #1163 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2 is FR-148's AC17 and AC5 its AC21.
+FR-63=6   # E.6 #1243 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC0b and AC4 are FR-148's AC17, AC2 its AC5 and AC28, AC3 its AC29, AC5 and AC7 its AC30.
+FR-64=1   # E.7 #1244 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2's p50 read is FR-148's AC26.
+FR-71=4   # E.8 #1362 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC3 and AC6 are FR-148's AC9, AC4 its AC21, AC5 its AC9 and AC30.
+FR-74=2   # E.9 #1442 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC2 and AC4 are FR-148's AC15; P5 is its P3.
+FR-79=2   # E.10 #1524 closed 2026-11-16 not planned: superseded by FR-148 #3953, one FR for the whole program by the operator's decision. AC8 is FR-148's AC6 and AC7, AC9 its AC9 and AC16. V5b (PR #3374) is the first step of its P1.
 
 # ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
 #
@@ -93,3 +102,4 @@ FR-31=7   # E.1 #897 closed 2026-11-08 not planned (triage): superseded by FR-35
 #    timestamp and not a date.
 
 nodocs FR-31  # #897 closed 2026-11-08 not planned: nothing shipped under it to document (draft PR #900 closed unmerged); FR-35 #922 carries the work.
+nodocs FR-17  # #799 closed 2026-11-16 not planned: stages A and B are inert behind an opt-in and no reader-facing page describes them. The docs of the deadline-limited channel are FR-148's AC31.
