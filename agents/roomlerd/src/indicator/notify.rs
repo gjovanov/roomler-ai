@@ -34,7 +34,11 @@
 //!   until it is answered, and show it under Do Not Disturb.
 //! - **The daemon takes it down** (answered elsewhere, timed out, the session
 //!   gone) by closing the helper's stdin. The helper closes the notification
-//!   and exits, so no Approve button outlives its question.
+//!   and exits, so no Approve button outlives its question. A press the
+//!   server took before that close still reaches the daemon (#3942): after
+//!   its close the helper reads the server's signals until the server says
+//!   the notification closed, for half a second from the daemon's close at
+//!   most, or a moment after a `Notify` that answered later than that.
 //! - **A helper the daemon gives up on** (no "up" within 5 s) is let go the
 //!   same way, and killed only if it is still there 1 s later (#3886): a
 //!   notification it did post, its line late, comes down with it. It posts
@@ -306,9 +310,12 @@ mod parent {
 
     /// #3886 — what a helper the daemon gave up on has, from the close of its
     /// stdin, to take down a notification it did post and exit: once its
-    /// `Notify` has answered, a `CloseNotification` round trip. Only then is
-    /// it killed. Counted on a thread of its own ([`let_go`]), after the
-    /// verdict: nothing waits for it.
+    /// `Notify` has answered, its `CloseNotification`, and (#3942) its read of
+    /// a press the server took before that close: half of this at most
+    /// (`helper::TAKE_DOWN_WAIT`), or a moment after a later answer
+    /// (`helper::TAKE_DOWN_LEAST`). Only then is it killed. A press it passes
+    /// on meanwhile still answers the question. Counted on a thread of its
+    /// own ([`let_go`]), after the verdict: nothing waits for it.
     pub(super) const GIVE_UP_GRACE: Duration = Duration::from_secs(1);
 
     /// The consent questions this daemon has on screen as notifications.
@@ -530,7 +537,9 @@ mod parent {
     /// notification down: its stdin closes, so a notification it did post,
     /// its line still on the way, comes down too. It is killed only if it is
     /// still there [`GIVE_UP_GRACE`] later ([`let_go`]). The verdict, "not
-    /// up", is returned at the give-up, as before.
+    /// up", is returned at the give-up, as before. Its reader runs until the
+    /// helper exits, so a press the helper passes on in that grace (#3942)
+    /// still reaches `on_said`.
     fn put_up(
         mut child: std::process::Child,
         req: &Request,
@@ -601,7 +610,9 @@ mod parent {
             Ok(Err(why)) => Err(why),
             Err(_) => {
                 // #3886 — the daemon's "take it down": a helper whose
-                // notification is up, its line late, closes it and exits.
+                // notification is up, its line late, closes it and exits,
+                // passing on a press the server took before the close
+                // (#3942).
                 drop(stdin);
                 let_go(pid, ended, GIVE_UP_GRACE);
                 Err(format!(
@@ -1106,6 +1117,18 @@ mod helper {
     /// closed within milliseconds of the close, and the wait ends there.
     const TAKE_DOWN_WAIT: Duration = Duration::from_millis(500);
 
+    /// #3942 — the least the helper reads after its own close, for a `Notify`
+    /// that answered more than [`TAKE_DOWN_WAIT`] after the daemon's close. A
+    /// bus that stalled delivers the answer and a press behind it at once,
+    /// and the press comes off the bus on the signals' own thread: without
+    /// this, the helper could look before that thread had passed it on.
+    const TAKE_DOWN_LEAST: Duration = Duration::from_millis(50);
+
+    /// #3942 — `NotificationClosed`'s reason for a notification closed by a
+    /// call to `CloseNotification`: the helper's own close, never the
+    /// person's answer.
+    const CLOSED_BY_CALL: u32 = 3;
+
     enum Event {
         Action(u32, String),
         Closed(u32, u32),
@@ -1130,8 +1153,15 @@ mod helper {
             post(self, req, body, deadline)
         }
 
+        /// #3942 — sent without waiting for its reply: the server's
+        /// `NotificationClosed` comes on the stream, and a slow session bus
+        /// cannot hold the helper past the daemon's grace on the reply.
+        /// `call_noreply` returns once the whole message is written to the
+        /// bus's socket (zbus 5: `Connection::send` writes until every byte
+        /// is out), so the close is on its way before the helper exits, on
+        /// every path that closes.
         fn close(&self, id: u32) {
-            let _ = self.call_method("CloseNotification", &(id,));
+            let _ = self.call_noreply("CloseNotification", &(id,));
         }
     }
 
@@ -1260,7 +1290,7 @@ mod helper {
         req: &Request,
         body: &str,
         deadline: Instant,
-        _take_down_wait: Duration,
+        take_down_wait: Duration,
         say: &mut impl FnMut(String),
     ) -> Result<(), String> {
         // #3886 — the daemon gave up on this helper before it could post:
@@ -1313,14 +1343,75 @@ mod helper {
                     say(format!("{CLOSED}{reason}"));
                     return Ok(());
                 }
-                Ok(Event::Parent(_heard)) => {
+                // #3942 — the daemon's close: the notification comes down at
+                // once, as before, and a press the server took before the
+                // close still reaches the daemon ([`take_down`]).
+                Ok(Event::Parent(heard)) => {
                     close(id, "the daemon took it down");
+                    let until = (heard + take_down_wait).max(Instant::now() + TAKE_DOWN_LEAST);
+                    take_down(signals, id, until, say);
                     return Ok(());
                 }
                 Ok(_) => {}
                 Err(_) => {
                     close(id, "its lifetime ended");
                     return Ok(());
+                }
+            }
+        }
+    }
+
+    /// #3942 — after the daemon's close, its `CloseNotification` for `id`
+    /// already sent: what the server sends about the notification is read
+    /// until the server says it closed, or until `until`. On the ONE stream,
+    /// a press the server took while the notification was up comes before
+    /// the `NotificationClosed` that the close brings. So a person who
+    /// pressed while the question was on the screen is heard, even when the
+    /// press reaches the helper after the close: on a slow session bus the
+    /// daemon's close comes before the server's reply to `Notify`, and the
+    /// press after that reply. The daemon reads the helper until it exits.
+    /// After a give-up its question is still asked, so the press answers it.
+    /// After an ordinary take-down the question is over, and the broker
+    /// refuses the press.
+    ///
+    /// - A press (any key but `default`) is passed on, as in the loop.
+    /// - A click on its body (`default`) is no answer, and nothing is posted
+    ///   again; nor is the dismissal a server sends after it (GNOME 50).
+    /// - `NotificationClosed` ends it. Reason 3 is the helper's own close,
+    ///   no answer. Any other reason is passed on as the loop passes it on:
+    ///   2, the person's own dismissal before the close, is a Deny.
+    fn take_down(signals: &Receiver<Event>, id: u32, until: Instant, say: &mut impl FnMut(String)) {
+        let mut clicked = false;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match signals.recv_timeout(left) {
+                Ok(Event::Action(i, key)) if i == id && key == DEFAULT => clicked = true,
+                Ok(Event::Action(i, key)) if i == id => {
+                    say(format!("{ACTION}{key}"));
+                    crate::logging::say_on_stderr(format_args!(
+                        "portal-helper --notify: passed on a press of notification {id} that came \
+                         after the daemon's close"
+                    ));
+                    return;
+                }
+                Ok(Event::Closed(i, reason)) if i == id => {
+                    if reason != CLOSED_BY_CALL && !clicked {
+                        say(format!("{CLOSED}{reason}"));
+                        crate::logging::say_on_stderr(format_args!(
+                            "portal-helper --notify: passed on the close of notification {id} \
+                             (reason {reason}) that came after the daemon's close"
+                        ));
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                // The wait is over, or nothing is left to send on the stream.
+                Err(_) => {
+                    crate::logging::say_on_stderr(format_args!(
+                        "portal-helper --notify: the server did not say notification {id} \
+                         closed in time; exiting"
+                    ));
+                    return;
                 }
             }
         }
@@ -1372,7 +1463,9 @@ mod helper {
     #[cfg(test)]
     mod tests {
         use super::super::parent::GIVE_UP_GRACE;
-        use super::{Event, Request, Server, TAKE_DOWN_WAIT, expire_timeout, serve};
+        use super::{
+            Event, Request, Server, TAKE_DOWN_LEAST, TAKE_DOWN_WAIT, expire_timeout, serve,
+        };
         use std::cell::RefCell;
         use std::sync::mpsc::{Receiver, Sender, channel};
         use std::time::{Duration, Instant};
@@ -1412,7 +1505,8 @@ mod helper {
             answer: Option<Receiver<()>>,
             behind_reply: RefCell<Vec<Event>>,
             notifies: Sender<()>,
-            closes: Sender<u32>,
+            /// Each close's id, and when it was sent.
+            closes: Sender<(u32, Instant)>,
             mute: bool,
         }
 
@@ -1431,7 +1525,7 @@ mod helper {
             }
 
             fn close(&self, id: u32) {
-                let _ = self.closes.send(id);
+                let _ = self.closes.send((id, Instant::now()));
                 if !self.mute {
                     let _ = self.stream.send(Event::Closed(id, 3));
                 }
@@ -1447,10 +1541,10 @@ mod helper {
             stream: Sender<Event>,
             said_rx: Receiver<String>,
             notify_rx: Receiver<()>,
-            close_rx: Receiver<u32>,
+            close_rx: Receiver<(u32, Instant)>,
             ended: Receiver<(Result<(), String>, Instant)>,
             said: Vec<String>,
-            closed: Vec<u32>,
+            closed: Vec<(u32, Instant)>,
             posted: usize,
         }
 
@@ -1460,6 +1554,8 @@ mod helper {
             said: Vec<String>,
             /// Each notification it closed, in order.
             closed: Vec<u32>,
+            /// When it sent its last close.
+            last_close: Option<Instant>,
             /// How many times it posted.
             posted: usize,
             /// When it returned.
@@ -1539,18 +1635,25 @@ mod helper {
             /// The daemon's close, as the helper's stdin listener hears it:
             /// when.
             fn daemon_closes(&self) -> Instant {
-                let heard = Instant::now();
+                self.daemon_closed(Duration::ZERO)
+            }
+
+            /// The daemon's close, heard `ago`: when.
+            fn daemon_closed(&self, ago: Duration) -> Instant {
+                let heard = Instant::now()
+                    .checked_sub(ago)
+                    .expect("the clock reaches back that far");
                 let _ = self.stream.send(Event::Parent(heard));
                 heard
             }
 
             /// Waits for the helper's `CloseNotification`: its id.
             fn closing(&mut self) -> u32 {
-                let id = self
+                let (id, at) = self
                     .close_rx
                     .recv_timeout(TEST_WAIT)
                     .expect("the helper closes its notification");
-                self.closed.push(id);
+                self.closed.push((id, at));
                 id
             }
 
@@ -1573,7 +1676,8 @@ mod helper {
                 self.posted += self.notify_rx.try_iter().count();
                 End {
                     said: self.said,
-                    closed: self.closed,
+                    closed: self.closed.iter().map(|(id, _)| *id).collect(),
+                    last_close: self.closed.last().map(|(_, at)| *at),
                     posted: self.posted,
                     at,
                 }
@@ -1590,25 +1694,61 @@ mod helper {
         /// while the question was on the screen, reached no one.
         #[test]
         fn a_press_behind_a_late_notify_answer_is_passed_on() {
+            for (when, ago) in [
+                ("just after the daemon's close", Duration::ZERO),
+                (
+                    "later than the take-down wait",
+                    TAKE_DOWN_WAIT + Duration::from_millis(100),
+                ),
+            ] {
+                let (let_answer, answer) = channel();
+                let mut run = start(
+                    false,
+                    Some(answer),
+                    vec![Event::Action(7, "approve".into())],
+                    TAKE_DOWN_WAIT,
+                );
+                run.posting();
+                // The daemon gives up while the `Notify` is on its way.
+                run.daemon_closed(ago);
+                let _ = let_answer.send(());
+                let end = run.end();
+                assert_eq!(
+                    end.said,
+                    ["ROOMLER_NOTIFY_SHOWN:7", "ROOMLER_NOTIFY_ACTION:approve"],
+                    "an answer {when}: the press behind it is passed on"
+                );
+                assert_eq!(end.closed, [7], "an answer {when}: closed once");
+                assert_eq!(end.posted, 1, "an answer {when}: posted once");
+            }
+        }
+
+        /// #3942 — a `Notify` that answers later than `TAKE_DOWN_WAIT` after
+        /// the daemon's close: the helper still reads for `TAKE_DOWN_LEAST`
+        /// after its own close, for a press that came in with the answer, and
+        /// not much longer, so it exits inside the daemon's grace.
+        #[test]
+        fn after_a_late_notify_answer_the_helper_reads_a_moment_after_its_close() {
             let (let_answer, answer) = channel();
-            let mut run = start(
-                false,
-                Some(answer),
-                vec![Event::Action(7, "approve".into())],
-                TAKE_DOWN_WAIT,
-            );
+            let mut run = start(true, Some(answer), Vec::new(), TAKE_DOWN_WAIT);
             run.posting();
-            // The daemon gives up while the `Notify` is on its way.
-            run.daemon_closes();
+            run.daemon_closed(TAKE_DOWN_WAIT + Duration::from_millis(100));
             let _ = let_answer.send(());
+            assert_eq!(run.closing(), 7, "the close goes at once");
             let end = run.end();
-            assert_eq!(
-                end.said,
-                ["ROOMLER_NOTIFY_SHOWN:7", "ROOMLER_NOTIFY_ACTION:approve"],
-                "the press behind the late answer is passed on"
+            let read = end
+                .at
+                .duration_since(end.last_close.expect("the helper closed it"));
+            assert_eq!(end.said, ["ROOMLER_NOTIFY_SHOWN:7"]);
+            assert!(
+                read >= TAKE_DOWN_LEAST,
+                "the helper read for {read:?} after its close: a press that came in with the \
+                 late answer could be missed"
             );
-            assert_eq!(end.closed, [7], "and the notification is closed, once");
-            assert_eq!(end.posted, 1);
+            assert!(
+                read < TAKE_DOWN_WAIT,
+                "the helper read for {read:?} after its close, as if its wait began there"
+            );
         }
 
         /// #3942 — a press the server took before the daemon's close reached
