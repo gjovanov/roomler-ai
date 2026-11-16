@@ -4440,7 +4440,7 @@ mod tests {
     /// answered under: the `.pending` markers the companion and `roomlerd
     /// consent --list` read.
     fn questions_up(broker: &crate::consent::ConsentBroker) -> Vec<String> {
-        let mut ids: Vec<String> = std::fs::read_dir(broker.sentinel_dir())
+        let mut ids: Vec<String> = std::fs::read_dir(broker.sentinel_dir().unwrap())
             .into_iter()
             .flatten()
             .filter_map(Result::ok)

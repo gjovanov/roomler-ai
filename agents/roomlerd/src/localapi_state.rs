@@ -1091,7 +1091,12 @@ impl LocalApiState for DaemonState {
         // a corrupted / adversarially stuffed directory must not turn the
         // LocalAPI thread into an I/O grinder.
         const MAX_PENDING_SCAN: usize = 64;
-        let Ok(entries) = std::fs::read_dir(self.consent.sentinel_dir()) else {
+        // #3939 — no folder: the file channel is off, and the broker holds
+        // each question's marker itself.
+        let Some(dir) = self.consent.sentinel_dir() else {
+            return self.consent.pending_in_memory();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new(); // dir not created yet ⇒ nothing pending
         };
         let mut out = Vec::new();
@@ -2602,7 +2607,7 @@ mod tests {
     fn consent_pending_scan_is_bounded() {
         let (_tx, rx) = watch::channel(view());
         let broker = consent_broker("cap");
-        let dir = broker.sentinel_dir().to_path_buf();
+        let dir = broker.sentinel_dir().unwrap().to_path_buf();
         // Stuff the dir well past the cap with well-formed pending sentinels
         // (only the daemon writes here in production — this simulates a
         // corrupted / adversarially stuffed directory).
@@ -2648,6 +2653,78 @@ mod tests {
             pending.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3939 — with no data folder the daemon's broker has no folder of its
+    /// own, and its file channel is off: an approval left in a file where a
+    /// stand-in folder used to be is never taken. The LocalAPI, which the
+    /// tray and `roomlerd consent` reach the daemon through, still lists each
+    /// question and decides it, an approval and a denial alike.
+    #[tokio::test]
+    async fn with_the_file_channel_off_the_localapi_lists_and_decides() {
+        use crate::consent::{
+            ConsentBroker, Decision, Mode, PendingPrompt, PromptKind, PromptSurface,
+        };
+        let window = Duration::from_secs(30);
+        let mode = Mode::Prompt { timeout: window };
+        let broker =
+            ConsentBroker::on_own_folder(mode, Err(anyhow::anyhow!("no data folder in this test")));
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            broker.clone(),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        let temp = std::env::temp_dir();
+        for (session, allow, decided) in [
+            ("393900000000000000000b01", true, Decision::Granted),
+            ("393900000000000000000b02", false, Decision::Denied),
+        ] {
+            let asking = broker.request_with_mode(session, mode);
+            let question = PendingPrompt {
+                kind: PromptKind::RemoteControl,
+                asked_by: "tester",
+                permissions: "VIEW".into(),
+                detail: String::new(),
+                org: String::new(),
+                timeout: window,
+                surface: PromptSurface::Companion,
+            };
+            broker
+                .write_prompt(session, &question)
+                .expect("the question is marked");
+            let left = [temp.join("roomlerd-consent"), temp.clone()]
+                .map(|dir| dir.join(format!("{session}.approve")));
+            for file in &left {
+                let _ = std::fs::create_dir_all(file.parent().unwrap());
+                std::fs::write(file, "0\n").unwrap();
+            }
+            let listed = st.consent_pending().iter().any(|q| q.session_id == session);
+            let taken = st.consent_decide(session, allow);
+            let decision = tokio::time::timeout(Duration::from_secs(3), asking).await;
+            let still_listed = st.consent_pending().iter().any(|q| q.session_id == session);
+            for file in &left {
+                let _ = std::fs::remove_file(file);
+            }
+            assert!(listed, "{session}: the LocalAPI did not list the question");
+            assert!(taken, "{session}: the LocalAPI's answer was refused");
+            assert_eq!(
+                decision.expect("an answered question resolves promptly"),
+                decided,
+                "{session}"
+            );
+            assert!(
+                !still_listed,
+                "{session}: a decided question is still listed"
+            );
+        }
     }
 
     #[tokio::test]
