@@ -27,6 +27,11 @@ Anchors are master `84a93e740` (2026-11-12). Everything below is code, read in t
 
 ### Today: SYSTEM reaches these folders by path
 
+> 🗄️ **History.** "Today" is the code as of master `84a93e740`, before FR-145's own change, and this table's
+> anchors stay there. P1 (#3758) moved the crash records, the uploader's deletes and the clean-up's three arms onto
+> `HeldPath`, and the profile row onto the account's SID. The two service-log rows still say what the code does:
+> they are P2's.
+
 | What | Today | Anchor |
 |---|---|---|
 | A crash record the service's supervisor writes | `create_dir_all` of `machine_global_dir()\crashes`; `<ts>-<pid>.json.tmp` created, written and flushed by path; `fs::rename` by path | `crates/agent-core/src/crash_recorder.rs:213-214`, `:275-293`, `:314-317` |
@@ -211,9 +216,9 @@ every drain whose read walk was refused added one, and the next record reported 
 
 | Arm | Today | After |
 |---|---|---|
-| per-Machine (`install_cleanup.rs:661-700`) | `exists()`, then `remove_dir_all` of both segments' `service-logs` | `HeldPath::base(machine_program_data())`, `walk(["roomler", segment])`, `remove_tree("service-logs", dry_run)` |
-| per-user (`:509-551`, `:561-579`) | each tree checked by path, then removed by path | for each of the four trees: `HeldPath::base(profile)`, `walk(["AppData", area, "roomler"])`, `remove_tree(segment, dry_run)`. The walk that finds no link is the walk whose handles delete; `link_below` and `link_inside` leave this arm |
-| the vacated install folder (`:286-362`) | `link_component`, then `remove_file` and `remove_dir` by path | `HeldPath::base(<the install root's parent>)` (`machine_program_files()` for a per-Machine install; for a per-User one, the profile from `profile_of_account(own SID)` and `AppData\Local\Programs`), `walk`, `remove_file` per product file, `remove_empty_dir`. The running-exe guard stays |
+| per-Machine (`install_cleanup.rs:1142-1182`) | `exists()`, then `remove_dir_all` of both segments' `service-logs` | `HeldPath::base(machine_program_data())`, `walk(["roomler", segment])`, `remove_tree("service-logs", dry_run)` |
+| per-user (`:990-1032`, `:1042-1060`) | each tree checked by path, then removed by path | for each of the four trees: `HeldPath::base(profile)`, `walk(["AppData", area, "roomler"])`, `remove_tree(segment, dry_run)`. The walk that finds no link is the walk whose handles delete; `link_below` and `link_inside` leave this arm |
+| the vacated install folder (`:349-425`) | `link_component`, then `remove_file` and `remove_dir` by path | `HeldPath::base(<the install root's parent>)` (`machine_program_files()` for a per-Machine install; for a per-User one, the profile from `profile_of_account(own SID)` and `AppData\Local\Programs`), `walk`, `remove_file` per product file, `remove_empty_dir`. The running-exe guard stays |
 
 The report keeps today's words ("not present", "left in place: <path> is a link") and gains a line wherever a walk
 meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its first pass only, with today's
@@ -405,7 +410,7 @@ The docs:
 - `.claude/rules/security.md`: the one-line rule for new code.
 - `docs/operator-systemcontext-smoke.md` (`:302-305`, `:401-402`): the folders are sealed (SYSTEM and
   Administrators write, Users read), and what a `<name>.moved-<unix>` entry means.
-- The module docs: `machine_tree.rs:3-77`, `install_cleanup.rs:19-42`, `crash_recorder.rs:17-60`,
+- The module docs: `machine_tree.rs:3-77`, `install_cleanup.rs:19-47`, `crash_recorder.rs:17-60`,
   `win_identity.rs:16-20`.
 - `docs/README.md`: the `security-baseline.md` row names the rule.
 - FR specs that mention these folders are dated history and stay as they are.

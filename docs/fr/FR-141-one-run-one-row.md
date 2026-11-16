@@ -137,7 +137,7 @@ person's half on it and says why.
 ### 4. The terminal and the web dialog (P4)
 
 - `install.sh --overlay` on Linux, opt-in: with `--system` the TUN, per-user the netstack, as the wizard does. The
-  default stays off, as the daemon's hint says (`service.rs:2324-2329`).
+  default stays off, as the daemon's hint says (`service.rs:518-529`, and its test at `:2481-2486`).
 - The dialog's Linux note says what a system install shows today (`enrollCommands.ts:239-241`). Its macOS block
   puts the wizard first where the server offers it (`enrollCommands.ts:198-203`) and says what the one-liner
   installs.
