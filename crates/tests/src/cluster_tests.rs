@@ -2415,10 +2415,31 @@ fn assert_seated(app: &TestApp, conn: &str, room_id: &str, what: &str) {
 /// for the org's administrator. Wherever the guard admits, the check must read
 /// `Admitted`, or it would end a seat the guard would give back at once; a
 /// change to the guard (a role that may enter without a row, say) breaks this
-/// test before it ends anyone's seat.
+/// test before it ends anyone's seat. Both answers are held against one table,
+/// `expected`, whose `match` names every visibility with no wildcard: a new
+/// visibility does not compile here until someone decides what a seat in such
+/// a room reads.
 #[tokio::test]
 async fn the_seat_checks_reading_agrees_with_the_room_guard_in_every_cell() {
-    use roomler_ai_mod_conference::seat_check::{Reading, read_readings};
+    use roomler_ai_db::models::RoomVisibility;
+    use roomler_ai_mod_conference::seat_check::{Gone, Reading, read_readings};
+
+    /// The reading a seat must get, cell by cell. Adding a visibility means
+    /// an arm here and an entry in `visibilities` below.
+    fn expected(visibility: RoomVisibility, in_org: bool, with_row: bool) -> Reading {
+        let needs_a_room_row = match visibility {
+            RoomVisibility::Public => false,
+            RoomVisibility::Private | RoomVisibility::Secret => true,
+        };
+        if !in_org {
+            Reading::Gone(Gone::NotInOrg)
+        } else if needs_a_room_row && !with_row {
+            Reading::Gone(Gone::NotInRoom)
+        } else {
+            Reading::Admitted
+        }
+    }
+
     let app = TestApp::spawn().await;
     let state = conf(&app);
     let tenant = app.seed_tenant("seatmatrix").await;
@@ -2428,9 +2449,9 @@ async fn the_seat_checks_reading_agrees_with_the_room_guard_in_every_cell() {
         ("administrator", tenant.admin.id.clone()),
     ];
     let visibilities = [
-        roomler_ai_db::models::RoomVisibility::Public,
-        roomler_ai_db::models::RoomVisibility::Private,
-        roomler_ai_db::models::RoomVisibility::Secret,
+        RoomVisibility::Public,
+        RoomVisibility::Private,
+        RoomVisibility::Secret,
     ];
 
     // One room for each visibility and row: (visibility, with a row, room).
@@ -2512,18 +2533,16 @@ async fn the_seat_checks_reading_agrees_with_the_room_guard_in_every_cell() {
                     .get(&(oid_of(room_id), oid_of(person)))
                     .copied()
                     .unwrap_or_else(|| panic!("{cell}: no reading"));
-                if admitted {
-                    assert_eq!(
-                        reading,
-                        Reading::Admitted,
-                        "{cell}: the guard admits, the seat check would end the seat"
-                    );
-                } else {
-                    assert!(
-                        matches!(reading, Reading::Gone(_)),
-                        "{cell}: the guard refuses, the seat check reads {reading:?}"
-                    );
-                }
+                let want = expected(*visibility, in_org, *with_row);
+                assert_eq!(
+                    admitted,
+                    want == Reading::Admitted,
+                    "{cell}: the room guard and the table disagree (the table reads {want:?})"
+                );
+                assert_eq!(
+                    reading, want,
+                    "{cell}: the seat check reads {reading:?} where the guard's table reads {want:?}"
+                );
                 cells += 1;
             }
         }
