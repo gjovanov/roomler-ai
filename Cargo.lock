@@ -8334,6 +8334,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "mediasoup",
+ "mongodb",
  "rand 0.9.4",
  "roomler-ai-config",
  "roomler-ai-db",

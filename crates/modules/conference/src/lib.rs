@@ -190,6 +190,8 @@ impl Module for ConferenceState {
         // C-4 — the owner-side bus handlers + the 10 s claim heartbeat, and
         // the 10 s reconcile that ends a deleted room's call.
         media_cluster::wire_media_cluster(&state);
+        // #3839 — the 10 s check of this pod's own seats (off by its switch).
+        seat_check::spawn(&state);
         // Stats PR-1 — the per-pod media sampler (no-op unless stats are on).
         media_stats::spawn_media_sampler(state.clone());
         // FR-115 P5 — the meeting-length cap's sweep (every pod; its writes
@@ -296,3 +298,6 @@ impl Module for ConferenceState {
         async move { media_cluster::release_all_claims(&state).await }
     }
 }
+
+// #3839 — declared last so the lines above keep the numbers the docs cite.
+pub mod seat_check;

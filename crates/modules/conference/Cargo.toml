@@ -33,6 +33,8 @@ dashmap.workspace = true
 futures.workspace = true
 hmac.workspace = true
 mediasoup.workspace = true
+# #3839 — the seat check reads the admissions from the primary.
+mongodb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

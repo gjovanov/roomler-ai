@@ -172,7 +172,7 @@ sequenceDiagram
 | Socket close | `ws_media.rs:83` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:134`), and the same leave runs naming the socket (`:141`) |
 | A miss | `dao/room.rs:960`, the close itself `close_sessions` (`:1028`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
-| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:286`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:288`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
 | Room deleted | `crates/modules/chat/src/room.rs:364`, `dao/room.rs:348` `cascade_delete` | The room's `room_members` rows go with its document, and their sessions with them. The call ends for everyone in it, on the pod serving it ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
 What a leave naming connection C may close:
@@ -262,6 +262,8 @@ playback of another room's file, or of a removed one.
 The gate checks membership once, at `media:join`. The seat it admits lasts only as long as
 that membership: when someone is removed from the org or leaves it, or leaves the room, any
 seat they hold in a call of that org or room goes at once, on whichever pod serves the call.
+When no word of it reaches that pod, the pod finds it by its own seat check, within 30 s
+([below](#the-pod-serving-a-call-checks-its-own-seats)).
 The membership's owner tells `conference` through core's `MembershipLifecycle` hook
 (`crates/core/src/hooks.rs:194`), after the membership row is gone, so nothing can be
 admitted on it again while the seats are withdrawn. A room deleted mid-call ends every
@@ -288,21 +290,26 @@ sequenceDiagram
 
 | Trigger | Told by | What ends |
 |---|---|---|
-| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:246`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
+| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:239`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:251`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
 | Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:239`, `room_member_removed` | their seats in that room's call (`revoke.rs:223`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:331` `settle_call_after_departure`) |
 | The room was deleted (`DELETE …/room/{room_id}`) | `crates/modules/chat/src/room.rs:384`, `room_removed` | the room's call, for everyone in it (`revoke.rs:120` `room_deleted`): every seat, the router, the claim and the call's stats record ([below](#a-room-deleted-mid-call-ends-its-call)) |
 
-- The seats close on the pod that holds them (`revoke.rs:315` `withdraw_seats_here`), reached
-  over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:291`,
-  `media_cluster.rs:882`). A pod that answers no withdrawal is presumed gone, and its media
-  with it; the failure is logged.
+- The seats close on the pod that holds them (`revoke.rs:355` `withdraw_seats_here`), reached
+  over the bus as `media.withdraw_seats` when it is the other pod (`revoke.rs:316`,
+  `media_cluster.rs:882`). A withdrawal that does not reach that pod (no answer within the
+  bus deadline, or no bus on this pod) is not taken to mean the pod is gone: it may be alive
+  and serving the call. It is a warning with the org, the room, the person and the pod
+  (`alert = membership_seat_unreached`), conference's hook still answers `Ok` so the hooks
+  after it run, and the pod serving the call ends the seat by its own check
+  ([below](#the-pod-serving-a-call-checks-its-own-seats)).
 - `room:call_ended` is what the web client already reads as "this call is over for you"
   (`ui/src/stores/ws.ts:349`): it tears the call down, with no client change.
 - A join already on its way when the membership ends asks the gate again once its seat
   exists (`ws_media.rs:457`): either the withdrawal sees that seat, or the seat sees the
   membership gone and closes itself before the client hears anything.
 - The routes answer the membership change whatever the hook says, since it has happened; a
-  failure to withdraw is logged as an error with the org, room and person.
+  hook that fails (a database read or write of the call's books) is logged as an error with
+  the org, room and person. A pod the withdrawal did not reach is no failure of the hook.
 - Before the seats, `network` (first in `HOOK_ORDER`) removes the tunnel clients the person
   owns in the org ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)). It never stops the
   cascade, so a failure there cannot keep a seat or a room membership alive.
@@ -320,6 +327,130 @@ their camera closes, they are off the participant list and the count, and their 
 nothing more); `the_last_participant_leaving_the_room_ends_its_call`.
 `cluster_tests::an_org_removal_on_one_pod_withdraws_the_seat_the_other_pod_holds` and
 `a_room_leave_on_one_pod_withdraws_the_seat_the_other_pod_holds`.
+
+### The pod serving a call checks its own seats
+
+A withdrawal reaches only a pod that answers. When the bus request is lost or late, when
+the pod that took the membership's end has no bus, when the pod serving the call runs an
+older image during a roll, or when a membership goes by a path that never calls the hook,
+no word reaches the seat, and the pod serving the call is not gone: the person would keep
+hearing and being heard in a meeting of an org or a room they no longer belong to. So that
+pod checks its own seats (`crates/modules/conference/src/seat_check.rs`), and a seat whose
+admission reads as gone twice in a row, a pass apart, ends there.
+
+```mermaid
+sequenceDiagram
+    participant R as membership's end, on the pod the request reached
+    participant O as the pod serving the call (seat_check.rs)
+    participant DB as MongoDB primary
+    participant M as the person's sockets
+    participant P as everyone else in the call
+    R--xO: media.withdraw_seats lost, late, no bus, or an older image
+    R->>R: warn alert=membership_seat_unreached, the hook answers Ok, chat's hook runs
+    loop every SEAT_CHECK_SECS = 10 s
+        O->>O: read its own seats into owned values, the person in the room and their connections
+        O->>DB: rooms by _id, tenant_members, room_members of members-only rooms, within 5 s
+        DB-->>O: one complete read, or a failed one that changes nothing
+        O->>O: seats_to_end, a second miss in a row ends the seat
+    end
+    O->>O: close the connections seated before the deciding read
+    O->>M: room:call_ended, reason not_a_member
+    O->>P: media:peer_left for each closed connection
+    O->>DB: close their open call sessions, settle the call
+    O->>O: warn seat check ended a call seat whose admission is gone, alert=seat_check_ended
+```
+
+- **The loop.** Every pod runs it in a task of its own (`seat_check::spawn`,
+  `seat_check.rs:195`, started at `crates/modules/conference/src/lib.rs:194`), every
+  `SEAT_CHECK_SECS` = 10 s (`seat_check.rs:74`), the room reconcile's cadence. A pass first
+  reads the pod's seats out of the room manager into owned values (`seats_here`, `:217`), so
+  no guard of it is held across a read.
+- **What it re-reads.** Two of the three checks `media:join` passed (`media_gate.rs:114`),
+  with the room guard's own rule: membership of the room's org (the `tenant_id` the room
+  records), and, in a room whose visibility `requires_membership()` (Private, Secret), a room
+  membership. Each counts as `is_member` counts it: `{tenant_id, user_id}` for the org,
+  `{tenant_id, room_id, user_id}` for the room. The third, an open call session for the
+  connection, is not re-read: a person's other tab, or a call whose sessions a sweep closed,
+  would lose a seat they are entitled to.
+- **One read a pass, three queries, from the primary** (`read_admissions_unbounded`, `:337`):
+  the rooms by `_id`; `tenant_members` by `$in` lists of orgs and people, on its unique
+  `(tenant_id, user_id)` index (`crates/db/src/indexes.rs:155`); and, for the members-only
+  rooms only, `room_members` by `$in` lists of rooms and people, on its unique
+  `(room_id, user_id)` index (`crates/modules/chat/src/lib.rs:224`). Each has a projection
+  and reads the primary whatever the connection string says (`:440`), so a person added a
+  moment ago reads as a member, as the join's own gate read them; all three together within
+  `READ_TIMEOUT` = 5 s (`:82`). A pod with 300 seats in 20 rooms makes three indexed queries
+  every 10 s, with `$in` lists of at most 20 rooms, their orgs and the seated people, and
+  reads back at most about 620 small documents; a pod with no seats reads nothing.
+- **The verdict** (`seats_to_end`, `:153`, a pure function), counted by the person in the
+  room. A seat ends on the `MISSES_TO_END` = 2nd complete read in a row that finds its
+  admission gone (`:78`). A read that fails, breaks off, does not decode or is late changes
+  nothing, not even what it forgets. A person found admitted, or seated in a room the read
+  found no document for (the reconcile's case,
+  [below](#a-room-deleted-mid-call-ends-its-call)), starts again from zero, and a seat no
+  longer held is forgotten. From the `FAILED_READS_TO_WARN` = 3rd failed read in a row,
+  each one warns (`:86`).
+- **One teardown, counted once.** A seat ends as a withdrawal that reached it ends
+  (`revoke::withdraw_these_seats_here`, `revoke.rs:372`): only the connections seated before
+  the deciding read close, so a person added back who joins again keeps the new seat; they
+  hear `room:call_ended` with `reason: "not_a_member"`, and everyone left hears
+  `media:peer_left`. Then the call's books, as a hang-up keeps them (`seat_check.rs:287`):
+  the person's open call sessions in the room close and the count drops
+  (`finalize_call_leave_db`, which finds nothing where the membership's hook closed them
+  already), and the call is settled (`settle_call_after_departure`), so a call they were the
+  last one in ends on the pod where its media is. A room row deleted by a raw write took its
+  call sessions with it; the count it leaves is the stale sweep's, not the check's.
+- **The bound.** On a pod whose reads succeed, a seat whose admission is gone ends within
+  two passes and their reads after the membership's end:
+  `2 × (SEAT_CHECK_SECS + READ_TIMEOUT)` = 30 s.
+- **Doubt keeps the seat.** The check's reading agrees with the room guard in every cell of
+  room visibility, room row, org membership and role: wherever the guard admits, it reads
+  admitted. A room that still has a document, a tombstone included, is judged by its
+  memberships, as the reconcile reads "no document" literally; the guard would answer 404
+  there, and the check keeps the seat.
+- **Who holds a seat.** Every participant entry is made by `RoomManager::create_transports`
+  (`media/room_manager.rs:333`), whose one caller, `handle_media_join` (`ws_media.rs:442`),
+  takes a `JoinPass` that only `admit_join` mints (`media_gate.rs:138`). A recording is no
+  seat (a member uploads it over REST), and the room manager's RTP taps are kept apart from
+  its participants. ⚠️ A seat made any other way (a recorder, a bot, a pipe between pods or
+  workers: anything no membership admits by design) must be skipped by the check, or the
+  check ends it.
+- **The switch.** `ROOMLER__CONFERENCE__SEAT_CHECK` set to `false`, `0`, `off` or `no` turns
+  the check off on a pod (`seat_check.rs:89`). It is read once, as the pod starts: turning
+  it off takes a pod restart with the variable set, not a new image. As it starts, a pod logs
+  `seat check: on this pod` or `seat check: off on this pod` at info; with it off, a seat no
+  withdrawal reached keeps its call.
+- **The log, read by hand.** Each seat the check ends is one warning,
+  `seat check: ended a call seat whose admission is gone` (`seat_check.rs:92`), with the
+  org, the room, the person, how many connections closed and what each of the two reads
+  found, `alert = seat_check_ended`. A withdrawal that did not reach the pod serving the
+  call is one warning on the pod that took the membership's end,
+  `call seat withdrawal did not reach the pod serving the call; its seat check ends the seat`,
+  with the org, the room, the person and the pod, `alert = membership_seat_unreached`
+  (`revoke.rs:316`). The two `alert` fields are handles for a person reading the pod logs:
+  nothing files or pages on them. `membership_seat_unreached` is expected once per room with
+  a remote claim when a removal lands in a roll's mixed minute; outside a roll it means a bus
+  that did not answer. `seat check: the admissions read keeps failing` is a pod that ends no
+  seat until it reads again.
+- **Mixed versions.** The check runs where the seat lives and adds no message:
+  `media.withdraw_seats` and its reply are unchanged, so pods on either image ask and answer
+  each other as before. A pod on the previous image runs no check; a seat it serves that no
+  withdrawal reached lasts until that pod is replaced.
+
+**Tests.** `seat_check::tests`: a seat ends on its second miss in a row and not before; a
+failed read changes nothing; one miss then found starts again from zero; no room document
+and no reading give no verdict; only the seat whose admission is gone ends; the switch; a
+room document decodes with the model's visibility default. `cluster_tests`:
+`an_org_removal_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` and
+`a_private_room_leave_the_pod_serving_the_call_did_not_hear_ends_the_seat_there` (the pod
+serving the call cannot be reached: the removal answers, chat's hook runs, and the seat ends
+within the bound with `not_a_member`, the call going on for the host, counted once; both
+fail without the check), `the_seat_checks_reading_agrees_with_the_room_guard_in_every_cell`,
+`an_entitled_member_keeps_the_seat_across_seat_checks`,
+`a_person_the_rooms_visibility_admits_without_a_room_row_keeps_the_seat` and
+`the_seat_check_ends_only_the_seat_whose_admission_is_gone_and_once` (the same person's seat
+in another room of the org and in a room of another org stays, a call they were the last one
+in ends, and passes after the closes end nothing).
 
 ### A room deleted mid-call ends its call
 
