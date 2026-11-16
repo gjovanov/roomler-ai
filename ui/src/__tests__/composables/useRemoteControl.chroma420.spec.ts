@@ -370,13 +370,17 @@ describe('#3651 the legacy H.264 RTP mapping (roomler-rc-h264-rtp=1)', () => {
     expect(req).not.toHaveProperty('preferred_transport')
     expect(req).not.toHaveProperty('chroma_pref')
 
+    // A reload: the per-browser default reads it back before connect (the
+    // RTP track's transport is one its reader keeps), the override after.
+    const reloaded = page()
+    expect(reloaded.shown()).toEqual({ codec: 'h264', chroma: 'yuv420' })
+    await reloaded.request()
+    expect(reloaded.shown()).toEqual({ codec: 'h264', chroma: 'yuv420' })
+
+    // Nothing new on the wire: plain H.264 with the flag sends the same.
     const today = page()
     today.dial('sharper')
     today.choose('h264', 'auto')
     expect(req).toEqual(await today.request())
-
-    const reloaded = page()
-    await reloaded.request()
-    expect(reloaded.shown()).toEqual({ codec: 'h264', chroma: 'yuv420' })
   })
 })

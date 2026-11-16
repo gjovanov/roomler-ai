@@ -369,7 +369,8 @@ describe('FR-77 P3b — H.264 4:4:4 and hardware VP9 4:4:4 cells', () => {
 
   it('the picker maps H.264 + 4:4:4 to its own stored choice and back', () => {
     expect(choiceFromPicker('h264', 'yuv444')).toBe('h264-444')
-    expect(choiceFromPicker('h264', 'yuv420')).toBe('h264')
+    // #3651 — and 4:2:0 to its own (it used to collapse into plain `h264`).
+    expect(choiceFromPicker('h264', 'yuv420')).toBe('h264-420')
     expect(pickerFromChoice('h264-444')).toEqual({ codec: 'h264', chroma: 'yuv444' })
   })
 })

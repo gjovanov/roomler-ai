@@ -2421,16 +2421,16 @@ export const RC_CODEC_CHOICES = [
   // FR-77 — the two-axis picker: codec "Auto" with an explicit chroma format.
   'auto-444',
   'auto-420',
+  // #3651 — HEVC and H.264 with "Standard (4:2:0)". Plain `hevc` / `h264` keep
+  // chroma "Auto" (the dial decides), which is what a value stored before means.
+  'hevc-420',
+  'h264-420',
 ] as const
 
 export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
   try {
     const raw = globalThis.localStorage?.getItem(CODEC_STORAGE_PREFIX + agentId)
-    if (
-      raw &&
-      raw !== 'auto' &&
-      (RC_CODEC_CHOICES as readonly string[]).includes(raw)
-    ) {
+    if (raw && raw !== 'auto' && (RC_CODEC_CHOICES as readonly string[]).includes(raw)) {
       return raw as RcCodecChoice
     }
   } catch {
@@ -3887,6 +3887,9 @@ export function codecChoiceToSettings(
       return { videoTransport: 'data-channel-av1', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
     case 'hevc':
       return { videoTransport: 'data-channel-hevc', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'hevc-420':
+      // #3651 — HEVC with "Standard (4:2:0)": plain HEVC with the chroma pinned.
+      return { ...codecChoiceToSettings('hevc'), chroma: 'yuv420' }
     case 'hevc-444':
       // P7 — HEVC Rext 4:4:4 (hevc_nvenc + Chrome Rext decode; kills
       // ClearType chroma fringing on the HW pipeline). connect() gates on
@@ -3899,12 +3902,7 @@ export function codecChoiceToSettings(
         renderPath: 'webcodecs',
       }
     case 'vp9-444':
-      return {
-        videoTransport: 'data-channel-vp9-444',
-        chroma: 'yuv444',
-        preferredCodec: null,
-        renderPath: 'webcodecs',
-      }
+      return { videoTransport: 'data-channel-vp9-444', chroma: 'yuv444', preferredCodec: null, renderPath: 'webcodecs' }
     case 'vp9-420':
       return {
         videoTransport: 'data-channel-vp9-444',
@@ -3948,17 +3946,19 @@ export function codecChoiceToSettings(
         preferredCodec: 'h264',
         renderPath: 'webcodecs',
       }
-    case 'auto':
-    default:
+    case 'h264-420':
+      // #3651 — likewise; with `h264Rtp` that is the RTP track, 4:2:0 only anyway.
+      return { ...codecChoiceToSettings('h264', opts), chroma: 'yuv420' }
+    case 'auto': // no `default`: a choice added to RC_CODEC_CHOICES with no case here fails the type check
       return { videoTransport: 'auto', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
   }
 }
 
 /** Reverse of `codecChoiceToSettings` (for the picker's displayed value): map
- *  the stored transport + chroma back to a choice. A `data-channel-vp9-444`
- *  transport reads as 4:4:4 only when the chroma is explicitly `yuv444`;
- *  otherwise (incl. the legacy `auto`) it reads as the 4:2:0 efficient choice.
- *  Pure + exported for the round-trip test. */
+ *  the stored transport + chroma back to a choice. An explicit chroma reads back
+ *  as itself on every transport that can carry it (#3651: HEVC and H.264 too),
+ *  and `auto` as the codec's plain choice, which follows the dial. Pure +
+ *  exported for the round-trip test. */
 export function settingsToCodecChoice(
   transport: RcVideoTransport,
   chroma: Vp9ChromaPref,
@@ -3967,18 +3967,18 @@ export function settingsToCodecChoice(
     case 'data-channel-av1':
       return 'av1'
     case 'data-channel-hevc':
-      // P7 — an explicit yuv444 chroma on the HEVC transport is the Rext
-      // pick; everything else (incl. the legacy 'auto') reads as plain HEVC.
-      return chroma === 'yuv444' ? 'hevc-444' : 'hevc'
+      // P7 — an explicit yuv444 is the Rext pick; #3651 — an explicit yuv420 is
+      // "Standard (4:2:0)"; the legacy 'auto' reads as plain, dial-following HEVC.
+      return chroma === 'yuv444' ? 'hevc-444' : chroma === 'yuv420' ? 'hevc-420' : 'hevc'
     case 'data-channel-vp9-444':
       // FR-77 — an explicit chroma keeps its VP9 profile; `auto` is the
       // dial-following `vp9` choice (it used to read as 4:2:0, which hid that
       // the agent's default for an unstated chroma is profile 1).
       return chroma === 'yuv444' ? 'vp9-444' : chroma === 'yuv420' ? 'vp9-420' : 'vp9'
     case 'data-channel-h264':
-      return chroma === 'yuv444' ? 'h264-444' : 'h264'
-    case 'webrtc':
-      return 'h264'
+      return chroma === 'yuv444' ? 'h264-444' : chroma === 'yuv420' ? 'h264-420' : 'h264'
+    case 'webrtc': // the RTP track is 4:2:0 only: a legacy yuv444 here is plain H.264
+      return chroma === 'yuv420' ? 'h264-420' : 'h264'
     case 'auto':
     default:
       // FR-77 — codec Auto remembers an explicit chroma.
