@@ -36,6 +36,12 @@
 //! `.approve`/`.deny` sentinel the poll loop below already consumes.
 //! The CLI subcommand remains a headless fallback.
 //!
+//! #3939 — that folder is the daemon's own ([`ConsentBroker::for_daemon`]),
+//! or there is none: no other folder stands in for it, the file channel is
+//! off, and the broker holds each question's marker and its answer itself.
+//! The LocalAPI (the tray, `roomlerd consent`) and a native panel answer as
+//! before.
+//!
 //! Audit lifecycle: hub.rs already emits
 //! [`AuditKind::ConsentPrompted`] on `rc:request` send and
 //! `ConsentGranted` / `ConsentDenied` on `rc:consent` receive, plus
@@ -302,7 +308,11 @@ struct BrokerInner {
     /// per pending session: `<sentinel_dir>/<session_hex>.{approve|deny}`.
     /// The CLI subcommand creates these with a tiny "now()" payload
     /// that the broker's poll loop discovers.
-    sentinel_dir: PathBuf,
+    ///
+    /// #3939 — the daemon's OWN folder ([`ConsentBroker::for_daemon`]), or
+    /// `None`: it has none, and the file channel is off. No file is then read
+    /// or written, and the books hold each question's marker and its answer.
+    sentinel_dir: Option<PathBuf>,
     /// Sessions currently awaiting a decision, each with the handle a
     /// [`ConsentBroker::cancel`] fires. Populated the moment
     /// [`ConsentBroker::request_with_mode`] is CALLED (before its future is
@@ -319,14 +329,74 @@ struct BrokerInner {
     /// Two files are written outside it: the `.pending` marker, by the caller
     /// that shows the question ([`ConsentBroker::write_prompt`]), and an
     /// answer from the CLI's fallback, with no check at all. That is why
-    /// each look reads the books before any answer.
-    pending: Mutex<HashMap<String, Arc<Notify>>>,
+    /// each look reads the books before any answer. With the file channel
+    /// off there are no files: the marker goes on the books under this lock
+    /// too, and no answer comes from outside them.
+    pending: Mutex<Books>,
+}
+
+/// The broker's books: the questions asking, and with the file channel off,
+/// what its folder would hold.
+#[derive(Default)]
+struct Books {
+    /// Each question asking, with the handle a [`ConsentBroker::cancel`]
+    /// fires.
+    asking: HashMap<String, Arc<Notify>>,
+    /// #3939 — the file channel off: the answer a question holds. The first
+    /// is kept, and any other is refused ([`ConsentBroker::record_decision`]).
+    answers: HashMap<String, SentinelKind>,
+    /// #3939 — the file channel off: each question's marker, the body its
+    /// `.pending` file would hold. The LocalAPI lists them
+    /// ([`ConsentBroker::pending_in_memory`]).
+    marks: HashMap<String, String>,
 }
 
 impl BrokerInner {
-    fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> PathBuf {
+    fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> Option<PathBuf> {
         self.sentinel_dir
-            .join(format!("{}.{}", session_hex, kind.suffix()))
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.{}", session_hex, kind.suffix())))
+    }
+
+    fn pending_path(&self, session_hex: &str) -> Option<PathBuf> {
+        self.sentinel_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{session_hex}.pending")))
+    }
+
+    /// Whether the question `session_hex` holds an answer of `kind`: its
+    /// file, or with the file channel off, its entry on the books.
+    fn answered(&self, books: &Books, session_hex: &str, kind: SentinelKind) -> bool {
+        match self.sentinel_path(session_hex, kind) {
+            Some(path) => path.exists(),
+            None => books.answers.get(session_hex) == Some(&kind),
+        }
+    }
+
+    /// Clears every answer left for `session_hex`: its files, or with the
+    /// file channel off, its entry on the books. Under the books.
+    fn clear_answers(&self, books: &mut Books, session_hex: &str) {
+        if self.sentinel_dir.is_none() {
+            books.answers.remove(session_hex);
+        }
+        for kind in [SentinelKind::Approve, SentinelKind::Deny] {
+            if let Some(path) = self.sentinel_path(session_hex, kind) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// How a log line names the folder the broker reads answers from, or says
+/// that it has none (#3939).
+struct FileChannel<'a>(Option<&'a Path>);
+
+impl std::fmt::Display for FileChannel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(dir) => write!(f, "{}", dir.display()),
+            None => f.write_str("none (file channel off)"),
+        }
     }
 }
 
@@ -353,8 +423,9 @@ struct PendingGuard {
 impl PendingGuard {
     /// Whether the books still hold THIS question, not a newer one for the
     /// same id.
-    fn holds(&self, books: &HashMap<String, Arc<Notify>>) -> bool {
+    fn holds(&self, books: &Books) -> bool {
         books
+            .asking
             .get(&self.session_hex)
             .is_some_and(|n| Arc::ptr_eq(n, &self.cancel))
     }
@@ -368,13 +439,14 @@ impl PendingGuard {
     /// so an Allow that passed `record_decision`'s check just before a cancel,
     /// or one the CLI's fallback wrote with no check at all, landed after it
     /// and was taken.
-    fn look(&self, approve: &Path, deny: &Path, deadline: Instant) -> Option<Decision> {
+    fn look(&self, deadline: Instant) -> Option<Decision> {
         let mut books = self.inner.pending.lock().unwrap();
+        let answered = |kind| self.inner.answered(&books, &self.session_hex, kind);
         let decided = if !self.holds(&books) {
             Decision::Cancelled
-        } else if approve.exists() {
+        } else if answered(SentinelKind::Approve) {
             Decision::Granted
-        } else if deny.exists() {
+        } else if answered(SentinelKind::Deny) {
             Decision::Denied
         } else if Instant::now() >= deadline {
             Decision::Timeout
@@ -414,25 +486,19 @@ impl PendingGuard {
         self.release_in(&mut books, remove_marker);
     }
 
-    fn release_in(
-        &self,
-        books: &mut HashMap<String, Arc<Notify>>,
-        remove_marker: impl FnOnce(&Path),
-    ) {
+    fn release_in(&self, books: &mut Books, remove_marker: impl FnOnce(&Path)) {
         if self.holds(books) {
-            books.remove(&self.session_hex);
-        } else if books.contains_key(&self.session_hex) {
+            books.asking.remove(&self.session_hex);
+        } else if books.asking.contains_key(&self.session_hex) {
             return;
         }
-        remove_marker(
-            &self
-                .inner
-                .sentinel_dir
-                .join(format!("{}.pending", self.session_hex)),
-        );
-        for kind in [SentinelKind::Approve, SentinelKind::Deny] {
-            let _ = std::fs::remove_file(self.inner.sentinel_path(&self.session_hex, kind));
+        match self.inner.pending_path(&self.session_hex) {
+            Some(marker) => remove_marker(&marker),
+            None => {
+                books.marks.remove(&self.session_hex);
+            }
         }
+        self.inner.clear_answers(books, &self.session_hex);
     }
 }
 
@@ -462,7 +528,7 @@ impl ArmedPrompt {
         tracing::info!(
             session = session_hex,
             timeout_secs = timeout.as_secs(),
-            sentinel_dir = %inner.sentinel_dir.display(),
+            sentinel_dir = %FileChannel(inner.sentinel_dir.as_deref()),
             // RETIRED-NAME-ANCHOR: naming the retired binary is the POINT —
             // this comment records which spelling was wrong and why.
             // FR-21 retired `roomler-agent`; this line is the ONLY guidance a
@@ -477,11 +543,9 @@ impl ArmedPrompt {
         // was registered — a sentinel that exists now is an answer to this
         // prompt. Purging here again would eat one recorded between arming
         // and this first poll.
-        let approve = inner.sentinel_path(session_hex, SentinelKind::Approve);
-        let deny = inner.sentinel_path(session_hex, SentinelKind::Deny);
         let deadline = Instant::now() + timeout;
         let outcome = loop {
-            if let Some(decided) = guard.look(&approve, &deny, deadline) {
+            if let Some(decided) = guard.look(deadline) {
                 break decided;
             }
             // #1632 — a cancel lands within the poll interval, not at its
@@ -514,7 +578,9 @@ impl ConsentBroker {
     /// dir inherits the owning profile's ACL (SYSTEM profile ⇒
     /// SYSTEM+Administrators only); the LocalAPI pipe SDDL is the enforced
     /// decision boundary — an explicit DACL here is future hardening
-    /// (P2b review M1).
+    /// (P2b review M1). #3939 — on Unix it must also be this account's own:
+    /// a folder another account owns is refused, since its owner could still
+    /// write in it after the chmod, which root's chmod does to any folder.
     pub fn new(mode: Mode, sentinel_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&sentinel_dir)
             .with_context(|| format!("creating sentinel dir {}", sentinel_dir.display()))?;
@@ -533,6 +599,19 @@ impl ConsentBroker {
         }
         #[cfg(unix)]
         {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid reads the caller's own credentials; it cannot fail.
+            let me = unsafe { libc::geteuid() };
+            if meta.uid() != me {
+                anyhow::bail!(
+                    "consent sentinel dir {} belongs to another account (uid {}), not to this one (uid {me}) — refusing to use it",
+                    sentinel_dir.display(),
+                    meta.uid()
+                );
+            }
+        }
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&sentinel_dir)?.permissions();
             perms.set_mode(0o700);
@@ -541,8 +620,8 @@ impl ConsentBroker {
         Ok(Self {
             inner: Arc::new(BrokerInner {
                 mode,
-                sentinel_dir,
-                pending: Mutex::new(HashMap::new()),
+                sentinel_dir: Some(sentinel_dir),
+                pending: Mutex::new(Books::default()),
             }),
         })
     }
@@ -551,51 +630,73 @@ impl ConsentBroker {
     /// agent's log dir. Mirrors the path layout used by the
     /// `last-install.json`/`needs-attention.txt` sentinels in
     /// `updater.rs` so operators only have to remember one location.
+    /// #3939 — the only folder the daemon's broker reads an answer from.
     pub fn default_sentinel_dir() -> Result<PathBuf> {
         let dirs = crate::appdirs::project_dirs()
             .context("could not resolve a platform data directory")?;
         Ok(dirs.data_dir().join("logs").join("consent"))
     }
 
-    /// The daemon's broker, on [`Self::default_sentinel_dir`]. Never fails,
-    /// and never changes `mode`.
+    /// #3939 — the daemon's broker. Its folder is its own,
+    /// [`Self::default_sentinel_dir`], made as [`Self::new`] makes it, or there
+    /// is none: when that folder cannot be resolved or set up, no other folder
+    /// stands in for it, and the file channel is off. The broker then holds
+    /// each question's marker and each answer itself, so the LocalAPI (the
+    /// tray, `roomlerd consent`) and a native panel answer as before, and a
+    /// question nobody answers ends at its window as before.
+    ///
+    /// Never fails, and never changes `mode`: a Prompt broker is never
+    /// downgraded to AutoGrant whatever its folder (prompt mode fails closed;
+    /// before P2b a glitch here auto-granted every session).
     pub fn for_daemon(mode: Mode) -> Self {
         Self::on_own_folder(mode, Self::default_sentinel_dir())
     }
 
     /// [`Self::for_daemon`], given what the daemon's own folder resolved to.
+    /// With the file channel off it says so once, and why. Its ready line
+    /// names the folder, or says that the file channel is off.
     pub(crate) fn on_own_folder(mode: Mode, own: Result<PathBuf>) -> Self {
-        let consent_dir = own.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
-            std::env::temp_dir().join("roomlerd-consent")
-        });
-        let broker = Self::new(mode, consent_dir).unwrap_or_else(|e| {
-            // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
-            // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
-            // dir doesn't match the tray's simply times out → deny (safe), instead
-            // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
-            tracing::error!(error = %e, ?mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
-            Self::new(mode, std::env::temp_dir())
-                .expect("consent broker init cannot fail with temp_dir")
-        });
+        let broker = match own.and_then(|dir| Self::new(mode, dir)) {
+            Ok(broker) => broker,
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "consent: the file channel is off — the daemon has no folder of its own to read an answer from, so it reads none from a file; answers come over the LocalAPI only (the tray, `roomlerd consent`) and from the device's own panel"
+                );
+                Self::without_folder(mode)
+            }
+        };
         tracing::info!(
             mode = ?broker.mode(),
-            sentinel_dir = %broker.sentinel_dir().display(),
+            sentinel_dir = %FileChannel(broker.sentinel_dir()),
             "operator-consent broker ready"
         );
         broker
     }
 
+    /// #3939 — a broker with no folder: its file channel is off.
+    fn without_folder(mode: Mode) -> Self {
+        Self {
+            inner: Arc::new(BrokerInner {
+                mode,
+                sentinel_dir: None,
+                pending: Mutex::new(Books::default()),
+            }),
+        }
+    }
+
     /// Path of the sentinel file for `(session_hex, decision)`.
-    /// Public so the CLI subcommand can write to it.
-    pub fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> PathBuf {
+    /// Public so the CLI subcommand can write to it. `None` with the file
+    /// channel off (#3939).
+    pub fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> Option<PathBuf> {
         self.inner.sentinel_path(session_hex, kind)
     }
 
     /// Sentinel directory in use. Public so the CLI can list pending
-    /// sessions.
-    pub fn sentinel_dir(&self) -> &Path {
-        &self.inner.sentinel_dir
+    /// sessions. `None`: the daemon has no folder of its own, and the file
+    /// channel is off (#3939).
+    pub fn sentinel_dir(&self) -> Option<&Path> {
+        self.inner.sentinel_dir.as_deref()
     }
 
     /// Mode the broker was built with. Mostly used by unit tests +
@@ -690,9 +791,8 @@ impl ConsentBroker {
         // existed.
         let cancel = Arc::new(Notify::new());
         let mut books = self.inner.pending.lock().unwrap();
-        let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Approve));
-        let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Deny));
-        books.insert(session_hex.to_string(), cancel.clone());
+        self.inner.clear_answers(&mut books, session_hex);
+        books.asking.insert(session_hex.to_string(), cancel.clone());
         drop(books);
         ArmedPrompt {
             guard: PendingGuard {
@@ -725,7 +825,13 @@ impl ConsentBroker {
     /// the poll looked for an answer before the cancel: an answer in between
     /// was taken, and won.
     pub fn cancel(&self, session_hex: &str) -> bool {
-        let handle = self.inner.pending.lock().unwrap().remove(session_hex);
+        let handle = self
+            .inner
+            .pending
+            .lock()
+            .unwrap()
+            .asking
+            .remove(session_hex);
         match handle {
             Some(cancel) => {
                 tracing::info!(
@@ -749,14 +855,20 @@ impl ConsentBroker {
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .asking
             .contains_key(session_hex)
     }
 
     /// Drop a sentinel file for the given session. Used by the CLI
     /// subcommand. Returns the path written so the caller can surface
-    /// it to the operator.
+    /// it to the operator. #3939 — with the file channel off there is no
+    /// folder to write it in, and it fails.
     pub fn write_sentinel(&self, session_hex: &str, kind: SentinelKind) -> Result<PathBuf> {
-        let path = self.sentinel_path(session_hex, kind);
+        let Some(path) = self.sentinel_path(session_hex, kind) else {
+            anyhow::bail!(
+                "the consent file channel is off: there is no folder to write an answer in"
+            );
+        };
         // Body: unix timestamp (string). Just so the file is never
         // empty, easier to grep / debug. The polling loop only checks
         // existence, not content.
@@ -778,7 +890,7 @@ impl ConsentBroker {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let tmp = self.inner.sentinel_dir.join(format!(
+            let tmp = path.with_file_name(format!(
                 ".{session_hex}.{}.{}-{}.tmp",
                 kind.suffix(),
                 std::process::id(),
@@ -818,8 +930,8 @@ impl ConsentBroker {
         // decided or withdrawn landed once the question had cleared its
         // sentinels: reported taken for nothing, and left behind. A withdrawal
         // before that next look still wins: the session it was for is over.
-        let books = self.inner.pending.lock().unwrap();
-        if !books.contains_key(session_hex) {
+        let mut books = self.inner.pending.lock().unwrap();
+        if !books.asking.contains_key(session_hex) {
             drop(books);
             tracing::warn!(
                 session = session_hex,
@@ -832,6 +944,27 @@ impl ConsentBroker {
         } else {
             SentinelKind::Deny
         };
+        // #3939 — the file channel off: the answer goes on the books, beside
+        // its question, for the prompt's next look to take. A question takes
+        // one: the first stands, and any other is refused, never reported
+        // taken while another decides.
+        if self.inner.sentinel_dir.is_none() {
+            let taken = match books.answers.entry(session_hex.to_string()) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(kind);
+                    true
+                }
+            };
+            drop(books);
+            if !taken {
+                tracing::warn!(
+                    session = session_hex,
+                    "consent decision ignored — this question already has its answer"
+                );
+            }
+            return taken;
+        }
         let landed = self.write_sentinel(session_hex, kind);
         drop(books);
         match landed {
@@ -847,10 +980,23 @@ impl ConsentBroker {
     /// `.approve`/`.deny` decision sentinels: this one is written by the AGENT
     /// (not the operator) when an attended session is awaiting a decision, so the
     /// tray can discover it and pop a prompt. Removed when the decision resolves.
-    pub fn pending_path(&self, session_hex: &str) -> PathBuf {
+    /// `None` with the file channel off: the marker is then on the books (#3939).
+    pub fn pending_path(&self, session_hex: &str) -> Option<PathBuf> {
+        self.inner.pending_path(session_hex)
+    }
+
+    /// #3939 — the questions marked on the books, as the LocalAPI lists them:
+    /// with the file channel off, every marker is there. Empty with a folder,
+    /// whose `.pending` files the LocalAPI reads instead.
+    pub fn pending_in_memory(&self) -> Vec<tunnel_core::localapi::ConsentRequest> {
         self.inner
-            .sentinel_dir
-            .join(format!("{session_hex}.pending"))
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .marks
+            .values()
+            .filter_map(|body| serde_json::from_str(body).ok())
+            .collect()
     }
 
     /// Write the `.pending` request marker (`body` = JSON describing the request:
@@ -861,12 +1007,30 @@ impl ConsentBroker {
     /// means the tray falls back to its CLI-less state; the CLI path still works.
     /// FR-27 — the typed form of [`Self::write_pending`]. Every subsystem
     /// should use this; the raw string form stays for tests.
-    pub fn write_prompt(&self, session_hex: &str, prompt: &PendingPrompt<'_>) -> Result<PathBuf> {
-        self.write_pending(session_hex, &prompt.to_body(session_hex))
+    ///
+    /// #3939 — with the file channel off there is no folder: the marker goes
+    /// on the books, where the LocalAPI lists it from ([`Self::pending_in_memory`]),
+    /// and the question's end takes it off them as it removes a file.
+    pub fn write_prompt(&self, session_hex: &str, prompt: &PendingPrompt<'_>) -> Result<()> {
+        let body = prompt.to_body(session_hex);
+        if self.inner.sentinel_dir.is_none() {
+            self.inner
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .marks
+                .insert(session_hex.to_string(), body);
+            return Ok(());
+        }
+        self.write_pending(session_hex, &body).map(drop)
     }
 
+    /// The marker as a file in the folder. With the file channel off there is
+    /// no folder, and it fails ([`Self::write_prompt`] then keeps the marker).
     pub fn write_pending(&self, session_hex: &str, body: &str) -> Result<PathBuf> {
-        let path = self.pending_path(session_hex);
+        let path = self
+            .pending_path(session_hex)
+            .context("the consent file channel is off: there is no folder to mark a question in")?;
         std::fs::write(&path, body)
             .with_context(|| format!("writing pending marker {}", path.display()))?;
         #[cfg(unix)]
@@ -1093,7 +1257,12 @@ mod tests {
 
         // Not pending yet ⇒ rejected, and NO sentinel is written.
         assert!(!broker.record_decision(sess, true));
-        assert!(!broker.sentinel_path(sess, SentinelKind::Approve).exists());
+        assert!(
+            !broker
+                .sentinel_path(sess, SentinelKind::Approve)
+                .unwrap()
+                .exists()
+        );
 
         // Start a prompt; once it's pending, a decision is honored + resolves it.
         let b2 = broker.clone();
@@ -1181,7 +1350,7 @@ mod tests {
             .write_pending(session, r#"{"session_id":"c","controller_name":"x"}"#)
             .unwrap();
         assert!(pending.exists(), ".pending must exist while awaiting");
-        assert_eq!(broker.pending_path(session), pending);
+        assert_eq!(broker.pending_path(session).as_ref(), Some(&pending));
 
         // Operator approves AFTER the prompt starts. P2b: a pre-dropped approve
         // sentinel is purged at prompt start, so the decision must arrive once
@@ -1245,7 +1414,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let marker = broker.pending_path(session);
+        let marker = broker.pending_path(session).unwrap();
         assert!(marker.exists(), "precondition: the marker was written");
 
         // Await in a task, let it register as pending and enter the poll loop,
@@ -1551,7 +1720,7 @@ mod tests {
         let session = "34270000000000000000abcd";
         broker.write_pending(session, "{}").unwrap();
         let armed = broker.arm(session, Duration::from_secs(30));
-        let marker = broker.pending_path(session);
+        let marker = broker.pending_path(session).unwrap();
         assert!(
             marker.exists(),
             "precondition: the question is on the screen"
@@ -1610,6 +1779,7 @@ mod tests {
         assert!(
             !broker
                 .sentinel_path(session, SentinelKind::Approve)
+                .unwrap()
                 .exists(),
             "the answer that came too late stayed behind"
         );
@@ -1656,7 +1826,10 @@ mod tests {
             "a question already decided took another answer"
         );
         assert!(
-            !broker.sentinel_path(session, SentinelKind::Deny).exists(),
+            !broker
+                .sentinel_path(session, SentinelKind::Deny)
+                .unwrap()
+                .exists(),
             "the answer that came too late stayed behind"
         );
 
@@ -1755,7 +1928,10 @@ mod tests {
             while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(books.contains_key(session), "the older question was asking");
+            assert!(
+                books.asking.contains_key(session),
+                "the older question was asking"
+            );
             broker
                 .write_sentinel(session, SentinelKind::Approve)
                 .unwrap();
@@ -1798,7 +1974,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let marker = broker.pending_path(session);
+        let marker = broker.pending_path(session).unwrap();
         assert!(marker.exists(), "precondition: the marker was written");
 
         let handle = tokio::spawn(broker.request_with_mode(session, LONG_WINDOW));
@@ -1848,6 +2024,7 @@ mod tests {
         assert!(
             !broker
                 .sentinel_path(&session_hex, SentinelKind::Approve)
+                .unwrap()
                 .exists()
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2109,6 +2286,170 @@ mod tests {
                     .expect("an answered prompt resolves promptly");
                 assert_eq!(decision, decided, "{session}");
             }
+        }
+
+        /// The daemon's broker takes its own folder when it can be set up, and
+        /// none otherwise. Without one it has no path for an answer or a
+        /// marker, the two writers that need one say so, and it keeps the
+        /// mode it was given: a Prompt broker still prompts.
+        #[test]
+        fn the_daemons_broker_takes_its_own_folder_or_none() {
+            let own = fixture_dir("own-or-none");
+            let on = ConsentBroker::on_own_folder(LONG_WINDOW, Ok(own.clone()));
+            assert_eq!(on.sentinel_dir(), Some(own.as_path()));
+            let broker = off(LONG_WINDOW);
+            let session = "393900000000000000000e06";
+            assert_eq!(broker.sentinel_dir(), None);
+            assert_eq!(broker.pending_path(session), None);
+            assert_eq!(broker.sentinel_path(session, SentinelKind::Approve), None);
+            assert!(
+                broker
+                    .write_sentinel(session, SentinelKind::Approve)
+                    .is_err()
+            );
+            assert!(broker.write_pending(session, "{}").is_err());
+            assert_eq!(broker.mode(), LONG_WINDOW, "the mode it was given");
+            let _ = std::fs::remove_dir_all(&own);
+        }
+
+        /// #3433 with the file channel off: from `cancel` on, a question takes
+        /// no answer, and it ends `Cancelled`.
+        #[tokio::test]
+        async fn with_the_file_channel_off_a_withdrawn_question_takes_no_answer() {
+            let broker = off(LONG_WINDOW);
+            let session = "393900000000000000000e01";
+            let prompt = broker.request_with_mode(session, LONG_WINDOW);
+            assert!(broker.cancel(session), "a prompt was standing");
+            let taken = broker.record_decision(session, true);
+            let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+                .await
+                .expect("a withdrawn prompt must still resolve promptly");
+            assert_eq!(
+                (taken, decision),
+                (false, Decision::Cancelled),
+                "an answer after the withdrawal was taken, and decided it"
+            );
+        }
+
+        /// #3433 with the file channel off: a decided question takes no more
+        /// answers, and its end leaves nothing on the books, so the same id
+        /// asked again starts with no answer.
+        #[tokio::test]
+        async fn with_the_file_channel_off_a_decided_question_keeps_no_answer() {
+            let broker = off(LONG_WINDOW);
+            let session = "393900000000000000000e02";
+            let prompt = broker.request_with_mode(session, LONG_WINDOW);
+            broker
+                .write_prompt(session, &a_question(Duration::from_secs(30)))
+                .unwrap();
+            assert!(broker.record_decision(session, true));
+            let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+                .await
+                .expect("an answered prompt resolves promptly");
+            assert_eq!(decision, Decision::Granted);
+            assert!(
+                !broker.record_decision(session, false),
+                "a decided question took another answer"
+            );
+            {
+                let books = broker.inner.pending.lock().unwrap();
+                assert!(
+                    books.asking.is_empty() && books.answers.is_empty() && books.marks.is_empty(),
+                    "a decided question left something on the books"
+                );
+            }
+            let short = Mode::Prompt {
+                timeout: Duration::from_millis(400),
+            };
+            let again =
+                tokio::time::timeout(PROMPT_BOUND, broker.request_with_mode(session, short))
+                    .await
+                    .expect("the second prompt ends at its window");
+            assert_eq!(
+                again,
+                Decision::Timeout,
+                "asked again, it took the first answer"
+            );
+        }
+
+        /// #3433 review F2 with the file channel off: a newer question for the
+        /// same id clears the older one's answer as it takes the id, and does
+        /// not take that answer.
+        #[tokio::test]
+        async fn with_the_file_channel_off_a_newer_question_takes_no_answer_given_before_it() {
+            let broker = off(LONG_WINDOW);
+            let session = "393900000000000000000e03";
+            let _older = broker.arm(session, Duration::from_secs(30));
+            assert!(
+                broker.record_decision(session, true),
+                "the older question was asking"
+            );
+            let newer = broker.arm(session, Duration::from_millis(400));
+            let decision = tokio::time::timeout(PROMPT_BOUND, newer.run())
+                .await
+                .expect("the newer prompt ends at its window");
+            assert_eq!(
+                decision,
+                Decision::Timeout,
+                "a newer question took an answer given before it existed"
+            );
+        }
+
+        /// #3433 with the file channel off: an older question's end leaves a
+        /// newer one's marker for the same id, which the LocalAPI keeps
+        /// listing, and the newer question's end takes it down.
+        #[test]
+        fn with_the_file_channel_off_an_older_question_leaves_a_newer_ones_marker() {
+            let broker = off(LONG_WINDOW);
+            let session = "393900000000000000000e04";
+            let listed = |b: &ConsentBroker| {
+                b.pending_in_memory()
+                    .iter()
+                    .any(|q| q.session_id == session)
+            };
+            let older = broker.arm(session, Duration::from_secs(30));
+            let newer = broker.arm(session, Duration::from_secs(30));
+            broker
+                .write_prompt(session, &a_question(Duration::from_secs(30)))
+                .unwrap();
+            drop(older);
+            assert!(
+                listed(&broker),
+                "an older question took a newer one's marker off the screen"
+            );
+            assert!(
+                broker.record_decision(session, true),
+                "the newer question stopped taking answers"
+            );
+            drop(newer);
+            assert!(!listed(&broker), "the newer question's end left its marker");
+        }
+
+        /// FR-27 with the file channel off: a prompt whose future is dropped
+        /// (its transport died) takes its marker down, so the tray and
+        /// `roomlerd consent --list` show no question that has ended.
+        #[tokio::test]
+        async fn with_the_file_channel_off_a_dropped_prompt_leaves_no_marker() {
+            let broker = off(LONG_WINDOW);
+            let session = "393900000000000000000e05";
+            let prompt = broker.request_with_mode(session, LONG_WINDOW);
+            broker
+                .write_prompt(session, &a_question(Duration::from_secs(30)))
+                .unwrap();
+            assert_eq!(
+                broker.pending_in_memory().len(),
+                1,
+                "the question is listed"
+            );
+            drop(prompt);
+            assert!(
+                broker.pending_in_memory().is_empty(),
+                "a dropped prompt left its marker"
+            );
+            assert!(
+                !broker.record_decision(session, true),
+                "a dropped prompt still takes answers"
+            );
         }
 
         /// Every event a test's thread logs: its message, and its fields as text.

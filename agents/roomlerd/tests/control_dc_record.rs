@@ -705,7 +705,7 @@ async fn mk_pc_pair() -> Result<(Arc<RTCPeerConnection>, Arc<RTCPeerConnection>)
 
 /// The prompt standing for this session: its marker's id and body.
 async fn standing_prompt(r: &Rig) -> Result<(String, Value)> {
-    let dir = r.broker.sentinel_dir().to_path_buf();
+    let dir = r.broker.sentinel_dir().unwrap().to_path_buf();
     for _ in 0..100 {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
@@ -1667,7 +1667,7 @@ async fn a_host_at_its_login_screen_is_refused_by_name_and_never_asked_cell() ->
             detail.contains("screen") && detail.contains("record"),
             "the refusal carries no words: {v}"
         );
-        let asked = std::fs::read_dir(r.broker.sentinel_dir())
+        let asked = std::fs::read_dir(r.broker.sentinel_dir().unwrap())
             .map(|rd| {
                 rd.flatten()
                     .any(|e| e.path().extension().is_some_and(|x| x == "pending"))
@@ -1808,7 +1808,7 @@ async fn a_question_whose_session_dropped_is_withdrawn_cell() -> Result<()> {
             .await?;
         assert_eq!(r.state(START).await?["state"], "pending_consent");
         let (prompt_id, _) = standing_prompt(&r).await?;
-        let marker = r.broker.pending_path(&prompt_id);
+        let marker = r.broker.pending_path(&prompt_id).unwrap();
         assert!(marker.exists(), "round {round}: no question on the screen");
 
         r.drop_session().await?;
@@ -1904,7 +1904,7 @@ async fn a_question_whose_session_ended_as_it_went_up_is_withdrawn_cell() -> Res
     r.send(json!({"t": "rc:record.start", "id": "w1"})).await?;
     assert_eq!(r.state(START).await?["state"], "pending_consent");
     let (prompt_id, _) = standing_prompt(&r).await?;
-    let marker = r.broker.pending_path(&prompt_id);
+    let marker = r.broker.pending_path(&prompt_id).unwrap();
 
     remote::session_ended(r.session_id);
     assert!(

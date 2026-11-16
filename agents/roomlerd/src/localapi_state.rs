@@ -1091,7 +1091,12 @@ impl LocalApiState for DaemonState {
         // a corrupted / adversarially stuffed directory must not turn the
         // LocalAPI thread into an I/O grinder.
         const MAX_PENDING_SCAN: usize = 64;
-        let Ok(entries) = std::fs::read_dir(self.consent.sentinel_dir()) else {
+        // #3939 — no folder: the file channel is off, and the broker holds
+        // each question's marker itself.
+        let Some(dir) = self.consent.sentinel_dir() else {
+            return self.consent.pending_in_memory();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new(); // dir not created yet ⇒ nothing pending
         };
         let mut out = Vec::new();
@@ -2602,7 +2607,7 @@ mod tests {
     fn consent_pending_scan_is_bounded() {
         let (_tx, rx) = watch::channel(view());
         let broker = consent_broker("cap");
-        let dir = broker.sentinel_dir().to_path_buf();
+        let dir = broker.sentinel_dir().unwrap().to_path_buf();
         // Stuff the dir well past the cap with well-formed pending sentinels
         // (only the daemon writes here in production — this simulates a
         // corrupted / adversarially stuffed directory).

@@ -2452,6 +2452,39 @@ the session user's own companion (`pgrep -u`), not anyone's.
 `roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
 
+⚠️ **The consent folder is the daemon's own, or the file channel is off** (#3939).
+The broker keeps a question's `.pending` marker and its answer as files in one
+folder, `<data folder>/logs/consent`, in the data folder of the account the daemon
+runs as ([`default_sentinel_dir`](../agents/roomlerd/src/consent.rs#L634)). The
+daemon makes it when it starts ([`new`](../agents/roomlerd/src/consent.rs#L584)).
+On Windows it sits in that account's profile, which only that account, SYSTEM and
+Administrators can change. On Unix it is mode 0700, and a folder that another
+account owns is refused (`:605`). An answer from the tray, from `roomlerd consent`
+or from a native panel reaches the broker in process (`record_decision`, `:925`),
+which writes it there. `roomlerd consent` writes the file itself only when it
+cannot reach the device service, and then only a console-run agent in the same
+profile sees it (`consent_cmd`, [`app.rs:2507`](../agents/roomlerd/src/app.rs#L2507)).
+
+| The daemon's own folder | the file channel | questions and answers | the log, once at start |
+|---|---|---|---|
+| resolved and set up | on | files in that folder | `operator-consent broker ready … sentinel_dir=<the folder>` |
+| cannot be resolved or set up | **off** | in memory, under the lock of the broker's books; no file is read or written | `consent: the file channel is off …` with the reason in `error=`, then `sentinel_dir=none (file channel off)` |
+
+With the file channel off, no other folder stands in for the daemon's own. Until
+issue #3939 a folder below the system's temporary folder did, or that folder
+itself. The LocalAPI still lists every question and decides it
+([`consent_pending`](../agents/roomlerd/src/localapi_state.rs#L1082) reads the
+broker's books, `:1097`), so the tray, `roomlerd consent --list` and
+`--approve` / `--deny` and a native panel all work, and a question nobody answers
+ends at its window, as before. A question then takes one answer: the first
+decides, and a second is refused. The broker keeps its configured mode either way,
+and a Prompt broker is never downgraded (`for_daemon`,
+[`consent.rs:651`](../agents/roomlerd/src/consent.rs#L651); the log lines,
+`on_own_folder`, `:658`). Pinned by `consent::tests::own_folder` and
+`localapi_state::tests::with_the_file_channel_off_the_localapi_lists_and_decides`,
+in "Test agent under vp9-444" (Linux) and "Agent unit tests on Windows (the whole
+--lib suite)".
+
 ⚠️ **Inside the companion, the prompt window asks; the main window's modal is
 only its fallback** (#2815). Both used to render every marker whose surface was
 not `native`. On the GNOME Wayland lab box on 2026-10-24, each exec and SSH
