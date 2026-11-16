@@ -47,6 +47,16 @@
 //! **The log.** Every seat the check ends is one warning in one wording,
 //! [`ENDED`], with the org, the room, the person, how many connections closed
 //! and what each of the two reads found (`alert = seat_check_ended`).
+//!
+//! **Who holds a seat.** Every participant entry is made by
+//! `RoomManager::create_transports`, whose one caller is
+//! `ws_media::handle_media_join`, which takes a `JoinPass` that only
+//! `media_gate::admit_join` mints. So every seat this check reads was admitted
+//! by the checks it re-reads. A recording is no seat: it is uploaded by a
+//! member over REST, and the room manager's RTP taps are kept apart from its
+//! participants. ⚠️ A seat made some other way (a recorder, a bot, a pipe
+//! between pods or workers: anything no membership admits by design) must be
+//! skipped here, or the check ends it.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -441,6 +451,18 @@ fn as_bson(ids: HashSet<ObjectId>) -> Vec<Bson> {
 
 fn oid(d: &Document, key: &str) -> Result<ObjectId, String> {
     d.get_object_id(key).map_err(|e| format!("{key}: {e}"))
+}
+
+/// What one pass's read finds for each of `seated`, without a verdict: the
+/// read [`check_seats_once`] makes, bounded the same way. Public so a test
+/// holds it against the room guard (`guards::require_room_in_tenant`) cell by
+/// cell: wherever the guard admits someone, this must read
+/// [`Reading::Admitted`].
+pub async fn read_readings(
+    state: &ConferenceState,
+    seated: &[SeatKey],
+) -> Result<HashMap<SeatKey, Reading>, String> {
+    read_admissions(state, seated).await.map(|a| a.readings)
 }
 
 #[cfg(test)]
