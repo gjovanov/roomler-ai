@@ -1346,9 +1346,95 @@ jobs:
           '
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_the_gate_counts_a_copy" /tmp/clip-plain.log
           grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping write_then_read_round_trip_and_survives_clone_drop" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_the_clipboard_follows_a_new_x_server" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server" /tmp/clip-plain.log
+          grep -q "ROOMLERD_TEST_REAL_CLIPBOARD unset: skipping x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up" /tmp/clip-plain.log
           xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_gate_tests clipboard::tests::write_then_read_round_trip_and_survives_clone_drop --nocapture --test-threads=1 2>&1 | tee /tmp/clip-real.log
           grep -q "x11-real: the clipboard gate counted an owner change" /tmp/clip-real.log
           grep -q "real-clipboard: the round trip ran and outlived a clone's drop" /tmp/clip-real.log
+
+      # #3671 — an X server that went away under an open session's capture,
+      # each test on an Xvfb of its own, SIGKILLed: the damage watcher warns
+      # once and never polls the dead connection again (it warned on every
+      # tick, 56 times a second in the field), and the capture sends no frame
+      # after the exit and warns at most twice (it sent the last picture at
+      # the full rate). The capture's test runs in a process of its own: it
+      # hears the capture's worker thread through a process-wide subscriber,
+      # which a process can set only once.
+      #
+      # This step and the two after it (#3918's input, #3671's clipboard) run
+      # even when a step before them failed (`!cancelled()`), so that one run
+      # shows each one's result: the commit that adds the tests ahead of the
+      # fix fails every one of them. They build nothing of their own (the X11
+      # step's features, in the same job; a build that failed fails here
+      # again), start an Xvfb per invocation through xvfb-run, and stop with
+      # a line that names what is missing when the steps above did not
+      # install it. Every invocation runs, its `x11-real:` line is grepped (a
+      # test that skipped itself prints none), and the step ends with one
+      # line per invocation and fails if any did.
+      - name: "#3671 — a session's capture after its X server exits, on a real X server"
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
+          rc=0
+          results=()
+          # One invocation: its output to a log, its `x11-real:` line grepped, its
+          # result kept for the summary; the next one runs whatever this one did.
+          check() {
+            local name=$1 log=$2 want=$3 r=0
+            shift 3
+            "$@" 2>&1 | tee "$log" || r=1
+            grep -q "$want" "$log" || { echo "::error::$name: no \"$want\" line in $log"; r=1; }
+            if [ "$r" = 0 ]; then results+=("$name: passed"); else results+=("$name: FAILED"); rc=1; fi
+          }
+          check capture::x11_damage /tmp/x11-damage.log "x11-real: a killed X server cost the damage watcher 1 warning in 200 ticks" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::x11_damage --nocapture --test-threads=1
+          check capture::scrap_backend::x11_exit_tests /tmp/x11-exit.log "x11-real: a capture whose X server went away sent" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::scrap_backend::x11_exit_tests --nocapture --test-threads=1
+          printf '%s\n' "${results[@]}"
+          exit $rc
+
+      # #3671 — the clipboard worker follows the virtual desktop's next X
+      # server: an Xvfb of the test's own is SIGKILLed and started again on
+      # the same display, and a paste, a copy and a copy that a subscriber
+      # from before the restart hears all reach the new server. Its negative
+      # control takes the rebuild's second handle out, and the paste must
+      # then fail: if it ever passes, arboard's teardown rule has changed.
+      # The third asks for the clipboard first while the server is down, then
+      # once a new one answers, as the daemon's shared worker is asked: a
+      # paste and a copy must reach the new server (#3671).
+      # Each test in a process of its own, because arboard keeps one X
+      # connection per process. They write only their own Xvfb's clipboard,
+      # under ROOMLERD_TEST_REAL_CLIPBOARD=1; the real-clipboard step greps
+      # the three skip lines of its plain half. xclip, which the tests copy and
+      # read through, comes from that step, so it is installed here when the
+      # step did not run. Runs as the capture's step above does.
+      - name: "#3671 — the clipboard follows the virtual desktop to a new X server, on a real X server"
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
+          command -v xclip >/dev/null || sudo apt-get install -y --no-install-recommends xclip || { echo "::error::xclip is missing and did not install: the follow tests copy and read through it"; exit 1; }
+          rc=0
+          results=()
+          # One invocation: its output to a log, its `x11-real:` line grepped, its
+          # result kept for the summary; the next one runs whatever this one did.
+          check() {
+            local name=$1 log=$2 want=$3 r=0
+            shift 3
+            "$@" 2>&1 | tee "$log" || r=1
+            grep -q "$want" "$log" || { echo "::error::$name: no \"$want\" line in $log"; r=1; }
+            if [ "$r" = 0 ]; then results+=("$name: passed"); else results+=("$name: FAILED"); rc=1; fi
+          }
+          check clipboard::x11_follow_tests::x11_real_the_clipboard_follows_a_new_x_server /tmp/clip-follow.log "x11-real: the clipboard followed a new X server" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_follow_tests::x11_real_the_clipboard_follows_a_new_x_server --exact --nocapture --test-threads=1
+          check clipboard::x11_follow_tests::x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server /tmp/clip-follow-control.log "x11-real: without the second handle the clipboard stayed on the dead X server" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_follow_tests::x11_real_without_the_second_handle_the_clipboard_stays_on_the_dead_server --exact --nocapture --test-threads=1
+          check clipboard::x11_follow_tests::x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up /tmp/clip-first-down.log "x11-real: a clipboard first asked for while the desktop was down started once it was up" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 ROOMLERD_TEST_REAL_CLIPBOARD=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- clipboard::x11_follow_tests::x11_real_a_clipboard_first_asked_while_the_desktop_is_down_starts_once_it_is_up --exact --nocapture --test-threads=1
+          printf '%s\n' "${results[@]}"
+          exit $rc
 
       # FR-6 wave 34: the job's LAST step; see rust-lint's.
       - name: Publish the cargo cache (release-asset store)
