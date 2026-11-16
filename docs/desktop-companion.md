@@ -1363,6 +1363,14 @@ A helper given up on is now let go the way the daemon takes any notification dow
 closes, and it takes down a notification it did post, then exits. It is killed only if it is
 still there 1 s later. The verdict, "not up", still comes at 5 s.
 
+In that 1 s an answer the helper reports still counts: its reader passes it on
+([`:576`](../agents/roomlerd/src/indicator/notify.rs#L576)), and the question is still being
+asked. The helper reports a press it heard of before the daemon's close. On the close it takes
+the notification down ([`:1200`](../agents/roomlerd/src/indicator/notify.rs#L1200)), so a press
+it hears of after that reaches no one (#3942). On a slow session bus, the case the give-up is
+for, that is every press: a press's `ActionInvoked` comes after the server's reply to `Notify`,
+and that reply came after the close.
+
 ```mermaid
 sequenceDiagram
     participant T as consent task
@@ -1399,6 +1407,10 @@ sequenceDiagram
   helper is killed with it in flight, and the server may still put the question up. It expires
   at the question's end on a server that keeps `expire_timeout`. A server that ignores it keeps
   the question until the person closes it, and a press on it reaches no one.
+- **GNOME may ignore `expire_timeout`.** On GNOME a question can then stay up until its helper
+  closes it at its end, and a notification whose helper was killed (above) until the person
+  closes it. Read on 0.4.223 with GNOME's own server (#3886): an unanswered question stayed up
+  until its helper closed it when its lifetime ended.
 - **The being-viewed notice** (FR-93 P6g) has the same helper and the same give-up. It expires
   after its day (`lifetime_ms`, 24 h), when its helper closes it anyway.
 - **Tested** in rust-agent's "Test agent under vp9-444" (`portal-capture`), with `sh` standing in
