@@ -40,7 +40,7 @@ Motion is elsewhere: `hevc_videotoolbox` 47 % of moving hours, `av1_nvenc` 22 %,
 
 **How to read the tags.** `[M]` measured, source named. `[R]` read from code at the pinned SHA. `[reasoned]` my inference: attack these first. Nothing here is a promise about a cell no session has run. A status word in §5 means exactly what its table says.
 
-**How to read the anchors.** A bare path is relative to `agents/roomlerd/src/`. A bare `:N` continues the file just named. `useRemoteControl.ts`, `videoCells.ts` and `rcBench.ts` are under `ui/src/composables/`, `rc-*-worker.ts` under `ui/src/workers/`. Every other path is from the repository root.
+**How to read the anchors.** A bare path is relative to `agents/roomlerd/src/`. A bare `:N` continues the file just named. `useRemoteControl.ts`, `videoCells.ts` and `rcBench.ts` are under `ui/src/composables/`, `rc-*-worker.ts` under `ui/src/workers/`. Every other path is from the repository root. An anchor is at the commit its text was written on. The plan's are at `de6571f1a`, where a script checked them (§13, 2026-11-02), and a step's are at its own merge. Master moves, so open an anchor at its commit, or search for the name beside it.
 
 ## 1. Goal
 
