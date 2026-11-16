@@ -19,7 +19,7 @@
 //! Three Lua ops shared by all namespaces: claim, refresh-if-mine
 //! (foreign ⇒ CONFLICT — the fold trigger), compare-delete.
 
-use redis::aio::ConnectionManager;
+use crate::ws::redis_conn::RedisConnection;
 
 /// TTL for connection-bound records (3× the 30 s heartbeat).
 pub const DIRECTORY_TTL_SECS: u64 = 90;
@@ -68,15 +68,15 @@ pub enum ClaimOutcome {
     Foreign(String),
 }
 
-/// The directory client. Cheap to clone (ConnectionManager is).
+/// The directory client. Cheap to clone (RedisConnection is).
 #[derive(Clone)]
 pub struct OwnershipDirectory {
-    conn: ConnectionManager,
+    conn: RedisConnection,
     origin: String,
 }
 
 impl OwnershipDirectory {
-    pub fn new(conn: ConnectionManager, origin: String) -> Self {
+    pub fn new(conn: RedisConnection, origin: String) -> Self {
         Self { conn, origin }
     }
 

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use redis::aio::ConnectionManager;
+use super::redis_conn::{RedisBounds, RedisConnection};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -27,7 +27,7 @@ const ONLINE_TTL_SECS: u64 = 90;
 /// `dispatcher::broadcast_with_redis`) — the "double notification" bug.
 #[derive(Clone)]
 pub struct RedisPubSub {
-    publisher: ConnectionManager,
+    publisher: RedisConnection,
     channel: String,
     instance_id: String,
 }
@@ -40,7 +40,7 @@ impl RedisPubSub {
     /// old random id.
     pub async fn new(redis_url: &str, origin: String) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let publisher = ConnectionManager::new(client).await?;
+        let publisher = RedisConnection::connect(client, RedisBounds::default()).await?;
         info!("Redis Pub/Sub publisher connected to {}", redis_url);
         Ok(Self {
             publisher,
@@ -56,7 +56,7 @@ impl RedisPubSub {
 
     /// A clone of the multiplexed command connection — the cluster
     /// directory + bus publisher ride the same manager.
-    pub fn connection(&self) -> ConnectionManager {
+    pub fn connection(&self) -> RedisConnection {
         self.publisher.clone()
     }
 
@@ -444,5 +444,26 @@ return 0
             }
         }
         Ok(())
+    }
+
+    /// #3840 — [`RedisPubSub::new`] with the URL and the bounds of the
+    /// settings (`ROOMLER__REDIS__RESPONSE_TIMEOUT_MS`,
+    /// `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS`); `new` uses the defaults.
+    pub async fn from_settings(
+        settings: &roomler_ai_config::RedisSettings,
+        origin: String,
+    ) -> Result<Self, redis::RedisError> {
+        let bounds = RedisBounds::from_settings(settings);
+        let client = redis::Client::open(settings.url.as_str())?;
+        let publisher = RedisConnection::connect(client, bounds).await?;
+        info!(
+            ?bounds,
+            "Redis Pub/Sub publisher connected to {}", settings.url
+        );
+        Ok(Self {
+            publisher,
+            channel: CHANNEL_NAME.to_string(),
+            instance_id: origin,
+        })
     }
 }

@@ -43,8 +43,8 @@
 //! session id, so a retried claim for the same session renews it rather
 //! than spending a second slot.
 
+use crate::ws::redis_conn::RedisConnection;
 use bson::oid::ObjectId;
-use redis::aio::ConnectionManager;
 
 /// How long a lease lives without renewal: three renewal rounds, the same
 /// ratio as the directory's records (`DIRECTORY_TTL_SECS`).
@@ -176,12 +176,12 @@ fn lengthen(pipe: &mut redis::Pipeline, key: &str, ttl_ms: u64) {
 /// tests) that share a Redis never count each other's sessions.
 #[derive(Clone)]
 pub struct SessionSlots {
-    conn: ConnectionManager,
+    conn: RedisConnection,
     db: String,
 }
 
 impl SessionSlots {
-    pub fn new(conn: ConnectionManager, db_name: &str) -> Self {
+    pub fn new(conn: RedisConnection, db_name: &str) -> Self {
         Self {
             conn,
             db: db_name.to_string(),

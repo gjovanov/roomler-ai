@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::ws::redis_conn::RedisConnection;
 use dashmap::DashMap;
-use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -88,7 +88,7 @@ pub type ReqHandler = Arc<
 
 pub struct PodBus {
     identity: PodIdentity,
-    publisher: ConnectionManager,
+    publisher: RedisConnection,
     pending: DashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>,
     handlers: DashMap<String, ReqHandler>,
     /// Mirrors whether the per-pod subscription is live (readiness /
@@ -102,7 +102,7 @@ impl PodBus {
     /// connection can't multiplex commands).
     pub fn start(
         identity: PodIdentity,
-        publisher: ConnectionManager,
+        publisher: RedisConnection,
         redis_url: String,
     ) -> Arc<Self> {
         let bus = Arc::new(Self {

@@ -137,7 +137,7 @@ impl AppState {
         let pod = crate::cluster::identity::PodIdentity::resolve(settings.app.pod_id.clone());
         tracing::info!(pod_id = %pod.pod_id, epoch = %pod.epoch, "cluster identity resolved");
 
-        let redis_pubsub = match RedisPubSub::new(&settings.redis.url, pod.origin()).await {
+        let redis_pubsub = match RedisPubSub::from_settings(&settings.redis, pod.origin()).await {
             Ok(ps) => Some(Arc::new(ps)),
             Err(e) => {
                 tracing::warn!(

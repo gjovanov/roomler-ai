@@ -1295,6 +1295,12 @@ pub struct JwtSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RedisSettings {
     pub url: String,
+    /// #3840 — a command with no answer fails after this; 0 = no bound.
+    #[serde(default = "redis_bound_ms")]
+    pub response_timeout_ms: u64,
+    /// #3840 — one connection attempt gives up after this; 0 = no bound.
+    #[serde(default = "redis_bound_ms")]
+    pub connection_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2017,5 +2023,34 @@ mod relay_cost_file_tests {
         // it is never what an operator means by filling this file in.
         assert!(c.derp_gb.unwrap() > 0.0);
         assert!(c.sfu_participant_hour.unwrap() > 0.0);
+    }
+}
+
+/// #3840 — the default of `ROOMLER__REDIS__RESPONSE_TIMEOUT_MS` and
+/// `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS`: 3 s. The reasoning is in
+/// `crates/core/src/ws/redis_conn.rs` and `docs/multi-pod-scale-out.md`.
+fn redis_bound_ms() -> u64 {
+    3000
+}
+
+#[cfg(test)]
+mod redis_bound_tests {
+    use super::RedisSettings;
+
+    /// A config that names only the URL (every deployment before #3840)
+    /// gets both bounds at 3 s; 0 is accepted and means no bound.
+    #[test]
+    fn the_redis_bounds_default_to_3_s_and_take_0() {
+        let s: RedisSettings =
+            serde_json::from_value(serde_json::json!({ "url": "redis://r:6379" })).unwrap();
+        assert_eq!(
+            (s.response_timeout_ms, s.connection_timeout_ms),
+            (3000, 3000)
+        );
+        let s: RedisSettings = serde_json::from_value(serde_json::json!({
+            "url": "redis://r:6379", "response_timeout_ms": 0, "connection_timeout_ms": 0
+        }))
+        .unwrap();
+        assert_eq!((s.response_timeout_ms, s.connection_timeout_ms), (0, 0));
     }
 }

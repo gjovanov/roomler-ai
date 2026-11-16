@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 // layer. The upgrade handler and the role gate stay in the api crate until
 // the modules exist to register namespaces on them.
 pub mod dispatcher;
+pub mod redis_conn;
 pub mod redis_pubsub;
 pub mod storage;
 // FR-69 P7b — what every upgrade shares (the frame ceiling, the query shape,
