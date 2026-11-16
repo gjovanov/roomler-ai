@@ -127,7 +127,9 @@ Six rules have been added since late August, each after a field failure:
 
 This week's failure is the 2026-09-04 picture again. The number that did it was the placeholder of the rule
 written to prevent it. FR-70's criterion "an unmeasured prior cannot hold a session at the floor" is ticked, and
-it did not hold.
+it holds inside a session: on 2026-11-16 one opened at 281,732 bit/s and its target was at 3.0 Mbit/s by 144 s.
+What it does not cover is where the week went wrong. The next open reads the remembered number again, and the
+size and frame rate are set once at the open.
 
 Each rule decides which stand-in to trust. None of them makes a session find out.
 
@@ -269,7 +271,7 @@ retiring it (§13).
 
 | # | Phase | Kill switch | Proof | Status |
 |---|---|---|---|---|
-| P0 | Measure, in shadow | `ROOMLERD_PATH_MODEL=off` | AC1 to AC5 | not started |
+| P0 | Measure, in shadow | `ROOMLERD_PATH_MODEL=off` | AC1 to AC5 | running since 2026-11-16; AC5 met |
 | P1 | The model drives the open and the memory | `ROOMLERD_PATH_MODEL=shadow` | AC6 to AC9 | not started |
 | P2 | The plan is live, and its moves have a cost | `ROOMLERD_PLAN_ADOPT=quiet` | AC10 to AC15 | not started |
 | P3 | Probes in a session; the bracket replaces the fixed caps | `ROOMLERD_PATH_PROBE=open` | AC16 to AC21 | not started |
@@ -293,9 +295,9 @@ retiring it (§13).
    Its spend view shows what that criterion cannot fail on. In a pump's first 120 s the encoder spent more than
    the shadow asked in 1,232 of 3,372 clean direct windows and 623 of 1,962 clean constrained ones, against 158
    of 31,743 and 193 of 6,685 later, and every constrained window spending 5 Mbit/s or more was over the shadow
-   (313 of 313). The read over the release's seven days, due on 2026-11-06, was not run. PRs #3307 and #3374 and
-   the fixes for #3472 were parked behind it and wait on this read now, and FR-135's rule on agent-behaviour
-   phases names its start (`docs/fr/FR-135-one-rc-media-pipeline.md:1246`). #3374 also needs D6.
+   (313 of 313). The read over seven days ran on 2026-11-16 (AC5, §15). PRs #3307 and #3374 and the fixes for
+   #3472 were parked behind it. FR-135's rule on agent-behaviour phases names two conditions, this read's start
+   and FR-70 AC10's read (`docs/fr/FR-135-one-rc-media-pipeline.md:1246`). The first is met. D6 stands (§8).
 7. The inferred mechanisms of §11, measured or struck.
 
 **P1, the model drives the open and the memory.**
@@ -338,9 +340,12 @@ index row.
 - [ ] **AC4 (P0)** — Each mechanism §11 lists as inferred is measured or struck: SCTP's 1 s retransmit floor under
       the mesh relay's age drop, the MTU split of a full SCTP packet into two WireGuard frames, whether the browser
       follows a lowered candidate priority, and what `auto` chooses on the two laptops.
-- [ ] **AC5 (P0)** — FR-63 B1's shadow is read over at least seven days with an under-drive clause added to the
+- [x] **AC5 (P0)** — FR-63 B1's shadow is read over at least seven days with an under-drive clause added to the
       report, and the report is attached. This is the read the parked rate-path work waits on (FR-135's agent
-      phases, #3374, #3307).
+      phases, #3374, #3307). FR-135's agent phases also wait on FR-70 AC10's read. **Read on 2026-11-16** over
+      seven days: agreement 2,852 of 2,939 (97.0 %), the clause 94.5 % constrained and 97.7 % direct, overall MET.
+      [The report](https://github.com/gjovanov/roomler-ai/issues/3953#issuecomment-6932207141) is on the issue,
+      and the numbers are in §15.
 - [ ] **AC6 (P1)** — A reconnect never opens below what the pair last demonstrated on that carrier: 20 reconnects
       in a row on each laptop, each opening at 0.85 × the demonstrated floor or higher. Fails first on the current
       release.
@@ -393,7 +398,7 @@ index row.
 - [ ] **AC27 (P4)** — A field A/B against RustDesk on the same relay pair.
 - [ ] **AC28 (P5)** — One release of shadow logs meets FR-63's flip criterion and the under-drive clause: where
       the bracket's low edge is 2 × the live rate or more, the controller's target is at least 0.7 × the low edge
-      in 90 % of windows.
+      in 90 % of windows. This clause and the report's (AC5) also hold on a pump's first 120 s taken alone (D7).
 - [ ] **AC29 (P5)** — Field A/B on CORPLAP-1 and CORPLAP-2 with the controller live: paint age p90 no worse than
       the baseline, and no window with a standing queue while the encoder tracks.
 - [ ] **AC30 (P5)** — The deletions of §5 are in the tree, `ROOMLERD_RATECTL=off` restores the prior behaviour for
@@ -403,7 +408,7 @@ index row.
 
 ## 8. Decisions taken
 
-By the operator on 2026-11-16, with the plan.
+D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 and D7 are this FR's owner's.
 
 | # | Decision |
 |---|---|
@@ -412,7 +417,8 @@ By the operator on 2026-11-16, with the plan.
 | D3 | FR-128's D4 is reopened: a live session moves. FR-64's rule, "remote desktop never rides the overlay", becomes the carrier rule |
 | D4 | QSV: FR-62's A5 first. One spike on FR-62's patch 0004, and only if A5 leaves QSV rebuild-bound |
 | D5 | The adoption rule lands in today's pump, before FR-135's R8 |
-| D6 | V5b's two open questions are invariant 1 applied: (a) the write-back records a reading or nothing, (b) a growing queue must be offered. Read as answered by the agreement to the plan. The operator can overturn it |
+| D6 | V5b's two open questions are invariant 1 applied: (a) the write-back records a reading or nothing, (b) a growing queue must be offered. Taken by this FR's owner. The operator, asked about it on 2026-11-16: "you are driving and owning this" |
+| D7 | At P5 the under-drive clauses, the report's (AC5) and AC28's, are each also read on a pump's first 120 s alone, per class, at the same thresholds, and the flip needs them to hold there. Taken by this FR's owner on 2026-11-16, from AC5's read and before P5's read exists: over all windows the report's clause is met (94.5 % constrained, 97.7 % direct), while in the first 120 s only 342 of 859 constrained windows and 2,046 of 2,925 direct ones are within ×1.25 of the shadow. A flip judged on all windows would pass and still open low |
 
 ## 9. Open decisions
 
@@ -448,8 +454,9 @@ to learn what its path carries.
 - The mesh's 1280-byte MTU splits each full SCTP packet into two WireGuard frames, doubling a frame's exposure to
   one drop.
 - Chrome follows a lowered candidate priority when it nominates.
-- `auto` would also have chosen the mesh relay on these laptops: every reflexive STUN query timed out in sessions
-  where TURN over UDP allocated, and the netcheck values behind `auto`'s hint were not read.
+- What `auto` chooses on these laptops. **Measured on CORPLAP-2 on 2026-11-16 (§15):** it chose the mesh relay,
+  on the hint `far_turn=Some(false)`, while a TURN relay carried a session under `off` half an hour later (TURN
+  over TLS on port 443, by elimination). The hint reads UDP reach only. CORPLAP-1 is not read yet.
 
 **A limit of the evidence:** the morning session on CORPLAP-2 had little motion and a different network state, so
 it shows what the laptop can look like and not what TURN over UDP carries under motion.
@@ -509,7 +516,7 @@ All 29 open criteria, one by one:
 | Item | Relation |
 |---|---|
 | FR-135 (#3293), one RC media pipeline | It owns the shape: the stages, the one encode loop, the sinks, the plan's fields. This FR owns what the numbers are and where they come from. Touch points: ledger rows S09 and S17, D12, "FR-63 B2, then B3" in its order (P5 here; 48 ledger rows name that phase), the second video channel as a sink property, and its ratchet (below). This FR does not edit FR-135's spec and changes no row of its ledger. It appends rows |
-| FR-70 (#1330), the media pipeline leaves the runtime | Its M4 and M5 are P5 here. Its AC6 (rate half) is ticked and did not hold on 2026-11-11 (§2.1) |
+| FR-70 (#1330), the media pipeline leaves the runtime | Its M4 and M5 are P5 here. Its AC6 (rate half) holds inside a session: on 2026-11-16 one opened at 281,732 bit/s and its target was at 3.0 Mbit/s by 144 s. The opening, and the size and frame rate set once at the open, are outside it: AC6 and AC7 here (§2.1) |
 | FR-38 (#949), #3472, #3050 | The triage of 2026-11-08 re-specified them into FR-135's encoder surface: an encoder is built at the plan's rate and owns its clock. This FR adds one fact to FR-38: on QSV the idle spend is constant-bitrate filler (§2.3) |
 | #3341, #3357 | P4 replaces the far-TURN hint with ranking. The default mesh policy is O4 |
 | #3259 | A relayed session can be labelled direct. P0's cell needs the label to be right |
@@ -544,3 +551,5 @@ does not list.
 | Date | Release | What was read | Result |
 |---|---|---|---|
 | 2026-11-16 | the fleet's current agents | production `agent_logs`, read-only, the sessions of 2026-11-10 to 2026-11-16 on CORPLAP-1 and CORPLAP-2 | §2. This is the failing "before" of AC6, AC10 and AC22, to be reproduced by AC1's script |
+| 2026-11-16 | the fleet's agents of 2026-11-09 to 2026-11-16 | production `agent_logs`, read-only, one bounded read: `scripts/rc-shadow-report.sh --mars --yes --rows` over 2026-11-09 21:50Z to 2026-11-16 21:50Z. 112,039 lines, 733 sessions, 103 agents. The database pod: no restart, no out-of-memory event, memory at 78.5 % of its limit before and 82.1 % after | **AC5: read, with the clause in the report (PR #3960), and the report attached.** Its verdict is MET. Agreement: the shadow asked for no more than the live law in 2,852 of 2,939 windows of elevated age (97.0 %), over 272 constrained and 393 direct sessions. The under-drive clause, per class: 12,131 of 12,835 constrained windows (94.5 %) over 163 sessions, and 38,355 of 39,251 direct windows (97.7 %) over 147. In a pump's first 120 s the shadow asks for much less than was spent: 342 of 859 constrained windows and 2,046 of 2,925 direct ones are within ×1.25 (D7). [The report](https://github.com/gjovanov/roomler-ai/issues/3953#issuecomment-6932207141) |
+| 2026-11-16 | 0.4.223 | three view-only sessions from neo16 to CORPLAP-2 behind its VPN, 22:08Z to 22:38Z, one per mesh policy, each read back from the laptop's own lines in `agent_logs` | **AC4, what `auto` chooses, for one laptop on one night.** `auto`: the mesh relay, on the hint `far_turn=Some(false)`, `own_far_turn=Some(false)`. `off`: a TURN relay on the laptop's side, connected within two seconds, opened at 2.55 Mbit/s and 1920×1200, quantiser 14, age 65 ms. In all three sessions TURN over UDP failed 4 of 4, TURN over TLS on port 5349 failed 2 of 2 and every STUN query timed out. That leaves TURN over TLS on port 443 as the relay that worked, by elimination: its success writes no line. So the hint reads UDP reach and misses it. **The remembered rate is one entry per viewer address and carrier** (O1): these sessions arrived from another overlay address than the operator's do. That address had no entry and opened at 2.55 Mbit/s and full size on the same mesh relay, where the operator's pair is remembered at 281,732 bit/s and opens at 1280×800 and 15 fps. An idle 4-minute session wrote nothing (`pipe_belief_n=(231, 0)` at its end). A 40-second session wrote 2,005,279 bit/s (`pipe_belief_n=(34, 1)`). The operator's entry does not heal, read from that day's write-backs on his pair: evidence moves the entry up by a tenth of the gap (213,427 to 233,769 bit/s on evidence of 416,847, then to 281,732 on 713,402), a 2.4-minute session whose target reached 3.0 Mbit/s wrote nothing, and a 14-second session re-stamped the entry with the prior as its evidence. The policy was set back to `on` |

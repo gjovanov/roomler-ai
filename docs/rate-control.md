@@ -1143,13 +1143,21 @@ whether the bar is right, and whether to flip, stay the operator's calls.
 > ≥ 20 constrained + ≥ 20 direct sessions, and shadow ≤ live in ≥ 90 % of the
 > elevated-age windows (and all four B0 fixtures green).
 
+Since FR-148 P0 the report's verdict has a second half, the **under-drive clause**,
+because the agreement above cannot fail a shadow that asks for too little (§ "The
+under-drive clause" below):
+
+> and, per path class and never pooled, spent ≤ 1.25 × shadow in ≥ 90 % of the clean
+> windows at or above the class's gate (2 Mbit/s direct, 0.5 Mbit/s constrained), over
+> ≥ 20 sessions per class that reached the gate; fewer sessions is INCONCLUSIVE.
+
 ```mermaid
 flowchart LR
     HB["DC pump heartbeat<br/>(FFmpeg ≈2 s · VP9-444 ≈1 s)<br/>target_bps + six shadow_*"] -->|"INFO line"| DISK["the host's rolling log<br/>roomlerd.log.* · 14 days"]
     HB -->|"uploader · 5 s batches"| AL[("agent_logs<br/>every daemon and RC worker,<br/>every org · 7-day TTL")]
     AL -->|"FLEET read: mongosh outside the Mongo pod, via a port-forward<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 14 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
     DISK -->|"HOST read: node over text<br/>(evidence about that host only)"| CORE
-    CORE --> OUT["per-class table · the criterion<br/>MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants<br/>· what the encoder spent"]
+    CORE --> OUT["per-class table · the agreement verdict<br/>· the under-drive clause per class<br/>· the overall verdict: MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants · what the encoder spent"]
 ```
 
 **One window is one DC-pump heartbeat.** A window without `shadow_state` came from a
@@ -1166,7 +1174,10 @@ VP9-444 heartbeat has no such field, so a VP9 session takes the `relay=` of its
 Windows classed that way are counted apart, because `relay` misses one case the
 pump's flag catches (an overlay remote on a relay tier).
 
-| verdict | when |
+The agreement's verdict, the report's `Verdict:` line (`criterion.verdict` in `--json`),
+is unchanged since B1b. The overall verdict reads it with the under-drive clause (below):
+
+| agreement verdict | when |
 |---|---|
 | **MET** | both session clauses met and the pooled agreement ≥ 90 % over at least one elevated window |
 | **NOT MET** | any clause below its bar |
@@ -1193,8 +1204,8 @@ threshold of its own; the detail and the B2 question it raises are in the FR-63 
 
 #### What the encoder spent: the reading the criterion cannot make
 
-⚠️ **The criterion can fail a shadow that asks for too much, never one that asks for
-too little.** Pinned at its floor, the shadow scores 100 %:
+⚠️ **The agreement criterion can fail a shadow that asks for too much, never one that
+asks for too little.** Pinned at its floor, the shadow scores 100 %:
 
 | clause | why it cannot catch a shadow asking for too little |
 |---|---|
@@ -1203,7 +1214,8 @@ too little.** Pinned at its floor, the shadow scores 100 %:
 | fixtures | the four fixtures run the shipped laws. `RatectlLaw`'s three tests (`sim.rs:1843-1906`) assert a domain, an upper bound and no pause on direct, and a shadow pinned at its floor passes all three |
 
 The self-test pins the result: pinned at its floor, with the encoder spending 20 Mbps,
-the verdict is MET. The clean-window disagreement cannot show it either, because
+the agreement verdict is MET (the under-drive clause reads NOT MET in both classes, and so
+does the overall verdict). The clean-window disagreement cannot show it either, because
 `target_bps` is a cap, usually far above what the encoder spends: the live cap climbs
 past 200 Mbps on a desktop sending 5 kbps. So −96 % reads the same on a resting desktop
 that lost nothing and on a scroll spending 14 times the shadow's target.
@@ -1233,10 +1245,10 @@ flowchart LR
 The live cap cannot hide a bite: while `shadow < live`, a window capped by live spends
 about live, which is over the shadow. Elevated windows are kept out of the table, since
 spending over the shadow there is the safe direction; a window with no viewer age is
-counted beside it, not judged clean. The report applies no bar, and the verdict does not
-read any of this. Each row carries the sessions, the share over and the share over by
-more than 25 % at its spend or more, so any gate can be read off one report, and `--json`
-keeps the whole cube.
+counted beside it, not judged clean. The table applies no bar of its own; the under-drive
+clause below reads it at one gate per class. Each row carries the sessions, the share over
+and the share over by more than 25 % at its spend or more, so any gate can be read off one
+report, and `--json` keeps the whole cube.
 
 **First read, 2026-11-02.** Every shadow heartbeat in one dev box's service log since
 `agent-v0.4.188`: 20 sessions, 235 windows, all direct, all NVENC. It is evidence about
@@ -1266,8 +1278,49 @@ never left its opening target:
   own arrival rate on most windows, in 197 of 215 windows. The report prints that control
   on every run.
 
-Whether the criterion gains a clause on this is the operator's call; the recommended
-wording and what it would need are in the FR-63 spec (§ "Open decisions").
+#### The under-drive clause: the verdict's second half (FR-148 P0)
+
+The wording recommended on #1243 on 2026-11-02 is now part of the report's verdict (the
+FR-63 spec, § "Open decisions", holds the same text with the reasons). Its numbers were
+published before the seven-day read and FR-148's owner fixed them, so they are named
+constants, `UNDERDRIVE_*` (`scripts/rc-shadow-report.cjs:115-119`), never tuned to fit a read:
+
+| number | value | why, as published |
+|---|---|---|
+| the gate, direct | spent ≥ 2 Mbit/s | the direct floor is 1.5 to 4 M, so most lower spend cannot be capped at all; 186 of the first read's 200 clean windows sat under it |
+| the gate, constrained | spent ≥ 0.5 Mbit/s | the constrained floor is 200 k against a ~3 M nominal cap. Not measured when published: no real constrained line had been read |
+| the ratio | spent ≤ 1.25 × shadow | a small excess can be overshoot |
+| the bar | ≥ 90 % of the gated windows, ≥ 20 sessions per class | the agreement's own numbers, so there is no new one to defend |
+
+How it is read:
+
+- **The sample is the spend view's.** A clean window with a rate counts when it spent its
+  class's gate or more. `spent`, `shadow` (the higher of its targets at the window's two
+  ends) and the class are the table's. Each gate is a row's lower edge and ×1.25 is a
+  column's, so the clause is read off the same cube.
+- **A pump's first 120 s count, on purpose.** B1's opener is what the clause is expected to
+  fail first. The report prints the opening and later split beside the clause, for
+  information: it decides nothing.
+- **A session counts as the agreement counts one** (`--min-windows` applies), when it gave
+  the class at least one clean window at the gate. With fewer than 20 such sessions the
+  class reads INCONCLUSIVE whatever its share: never a pass, and never a fail.
+- **Per class, never pooled.** The `unknown` class (VP9-444 without its ICE line) is judged
+  at the lower gate, 0.5 Mbit/s, and printed. It never decides.
+
+| overall verdict | when |
+|---|---|
+| **MET** | the agreement verdict is MET and the clause is MET for both `constrained` and `direct` |
+| **NOT MET** | the agreement verdict is NOT MET, or either class's clause is NOT MET |
+| **INCONCLUSIVE** | otherwise: a class with fewer than 20 sessions at its gate, or an agreement with no elevated window |
+
+The agreement and its `Verdict:` line read the same numbers on the same input as before.
+After them the report prints the clause, one line per class (the clean windows at the gate
+or more, how many spent ≤ ×1.25 the shadow, the sessions, the opening and later split, the
+status), then `Overall verdict:`. `--json` adds `underDrive` (the bar, and each class's
+counts) and `overall`; no existing key moved. On the published row 2 (20 + 20 synthetic
+sessions pinned at 200 k and 2.46 M while the encoder spends 20 Mbit/s) master's file read
+MET. It now reads agreement MET, the clause NOT MET in both classes (0 of 40 gated windows
+within ×1.25, from 20 sessions each), and overall NOT MET.
 
 **Why the fleet read is server-side.** The plan assumed the API could serve it
 (`list_for_agent(?session_id=…)`). It cannot: `GET /api/tenant/{tid}/agent/{aid}/logs`
@@ -1309,11 +1362,22 @@ included, there and again with 17 synthetic lines for what that log does not hol
 constrained session, VP9-444 with and without its ICE line). `explain` still reads
 `IXSCAN created_at_1` with no SORT stage, and `rc-shadow-report.sh` did not change.
 
+The under-drive clause was rehearsed the same way on 2026-11-16, on 2,979 invented lines in
+27 batches: 48 sessions, constrained ones under-driven in their opening, direct ones covered,
+five direct sessions under the gate, and VP9-444 with and without its ICE line. The mongosh
+read, the Node read of its own `--rows` output and the Node read of the text agreed exactly
+on every class, the pool, the criterion, the invariants, the clause and the overall verdict:
+agreement MET; constrained 180 of 1,360 gated windows within ×1.25 from 21 sessions, NOT MET;
+direct 1,300 of 1,300 from 20, MET; overall NOT MET. That run found `--docker` without an
+`RC_SHADOW_*` option handing `docker exec` an empty container name; the runner now passes no
+`-e` argument at all in that case.
+
 ```bash
-node scripts/rc-shadow-report.cjs --self-test                       # 80 cases, incl. the bar's edges, red runs and the spend's edges
+node scripts/rc-shadow-report.cjs --self-test                       # 102 cases, incl. the bar's edges, red runs, the spend's edges and the clause's
 node scripts/rc-shadow-report.cjs roomlerd.log.2026-10-30 …          # a host's logs: evidence about that host only
 bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z   # the fleet read AC2 is judged by (--until: now)
 bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehearsal
+node scripts/rc-shadow-report.cjs rows.ndjson                        # a read's --rows output, offline: the same verdict
 ```
 
 ⚠️ **The window starts at `agent-v0.4.188`** (published 2026-10-30 14:21Z), the first
