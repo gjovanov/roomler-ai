@@ -417,7 +417,7 @@ mod tests {
     /// of the test's own, SIGKILLed (`ROOMLERD_TEST_X11=1`, CI's X11 step).
     #[test]
     fn a_tracker_whose_server_went_away_says_so_once() {
-        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+        if !crate::virtual_desktop::TestX::opted_in() {
             eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
             return;
         }

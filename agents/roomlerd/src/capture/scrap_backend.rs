@@ -970,34 +970,6 @@ mod x11_exit_tests {
         }
     }
 
-    /// `DISPLAY` pointed at the test's own server while the capture opens
-    /// (its worker makes every connection it keeps before its first frame),
-    /// and put back when dropped.
-    struct DisplayFor(Option<std::ffi::OsString>);
-
-    impl DisplayFor {
-        fn new(display: &str) -> Self {
-            let was = std::env::var_os("DISPLAY");
-            // SAFETY: only under `ROOMLERD_TEST_X11=1`, which CI's X11 step
-            // sets and runs with `--test-threads=1`: no test runs beside
-            // this one to read the environment while it changes.
-            unsafe { std::env::set_var("DISPLAY", display) };
-            Self(was)
-        }
-    }
-
-    impl Drop for DisplayFor {
-        fn drop(&mut self) {
-            // SAFETY: as in `new`.
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("DISPLAY", v),
-                    None => std::env::remove_var("DISPLAY"),
-                }
-            }
-        }
-    }
-
     /// The frames `cap` delivers in `window`, asked as a pump asks.
     async fn frames_in(cap: &mut ScrapCapture, window: Duration) -> usize {
         let until = Instant::now() + window;
@@ -1019,7 +991,7 @@ mod x11_exit_tests {
     /// of rising, and the supervisor's notice tells the person to reconnect.
     #[tokio::test]
     async fn a_capture_whose_server_went_away_sends_nothing_and_says_so_once() {
-        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+        if !crate::virtual_desktop::TestX::opted_in() {
             eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
             return;
         }
@@ -1027,7 +999,8 @@ mod x11_exit_tests {
         let x = crate::virtual_desktop::TestX::start()
             .expect("ROOMLERD_TEST_X11=1 but no Xvfb came up");
         let from = log.len();
-        let display = DisplayFor::new(x.display());
+        // The worker makes every connection it keeps before its first frame.
+        let display = x.point_display();
         let mut cap = ScrapCapture::primary(30, DownscalePolicy::Auto)
             .expect("the capture opens on the test's own Xvfb");
         // A live (idle) second: the first frame, then the damage watcher's

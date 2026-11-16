@@ -1486,10 +1486,36 @@ pub(crate) fn planned_input_route(f: &ArmFacts) -> Option<crate::input::reach::R
 }
 
 /// #3671 — the facts say a session on this device captures its virtual
-/// desktop.
+/// desktop: the arm [`planned_arm`] gives with the desktop counted as up is
+/// X11. It is asked as the desktop goes down, when [`arm_facts`] counts it as
+/// gone. One decision for the device, which misses one session: one whose
+/// explicit `drm_capture` or `portal_capture` arm failed at its open and fell
+/// through to the desktop's X11. That session is not told; it shows its last
+/// picture until the person reconnects (`docs/linux-capture.md` §2.2), and
+/// its shared pipeline is not retired, so a later viewer of its profile joins
+/// that picture until it closes. The exact per-session rule is FR-135's
+/// pipeline record to carry (#3293).
 #[cfg(target_os = "linux")]
-pub(crate) fn plans_the_virtual_desktop(_facts: ArmFacts) -> bool {
-    false
+pub(crate) fn plans_the_virtual_desktop(facts: ArmFacts) -> bool {
+    planned_arm(&ArmFacts {
+        virtual_desktop: true,
+        ..facts
+    }) == Some(CaptureArm::X11)
+}
+
+/// #3671 — a session open on this device now captures the daemon's virtual
+/// desktop ([`plans_the_virtual_desktop`] on this device's facts). Read by
+/// the desktop's supervisor, on its own thread, when the desktop goes down
+/// and once it is back: with the desktop requested, both automatic plans
+/// answer at once (`wayland_plan`, `system_plan`), so this asks no bus.
+#[cfg(target_os = "linux")]
+pub(crate) fn sessions_capture_the_virtual_desktop() -> bool {
+    if !crate::virtual_desktop::requested() {
+        return false;
+    }
+    // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    plans_the_virtual_desktop(arm_facts(None, uid == 0, uid, false))
 }
 
 /// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`

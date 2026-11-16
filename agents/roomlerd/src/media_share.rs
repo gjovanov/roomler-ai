@@ -203,7 +203,9 @@ struct PipelineInner {
     /// for at the host (FR-93), for as long as it waits.
     notice: Option<OwnerNotice>,
     /// Owner marks this when its pump exits; blocks late joins racing the
-    /// registry removal.
+    /// registry removal. #3671 — `retire_all` marks it too, for a pipeline
+    /// whose capture was opened on an X server that is gone: its owner and
+    /// followers go on, and nobody joins it any more.
     closed: bool,
     /// Millis (process-epoch) of the owner's last loop iteration —
     /// [`Pipeline::beat`]. Joiners treat a silent owner as DEAD (rc.443):
@@ -875,6 +877,52 @@ pub fn try_join(
     })
 }
 
+/// #3671 — the X server that every registered pipeline's capture was opened
+/// on has gone. The virtual desktop's supervisor calls this where it tells
+/// the open sessions, and again once a restarted desktop is up. Each pipeline
+/// is closed to joins and its entry removed, so the next session of a profile
+/// runs a pump of its own on the server that answers now. It no longer
+/// follows a capture of the old server (that capture's last frame, then
+/// keepalives of it) or an open refused while the desktop was down. The
+/// owners and their followers stay as they are: the supervisor tells those
+/// sessions to reconnect, and a detach would send a follower back into an
+/// open that is refused while the desktop is down, which registers a
+/// `NoopCapture` owner under the same key. A retired owner's `Drop` leaves a
+/// newer owner's entry alone, because it is identity-aware. Retired
+/// pipelines no longer count against the spill budget (`MAX_PIPELINES`);
+/// they end with their sessions.
+///
+/// No lock is held across another. The spill gate takes the registry while
+/// it holds a pipeline (`pipeline_count()` under `inner`, in the owner's
+/// floor merge), so the entries are taken out under the registry's lock and
+/// each pipeline is closed after that lock is released. A joiner that
+/// fetched a pipeline before it was taken out reads `closed` under the
+/// pipeline's lock, so it is refused once this returns. A poisoned lock is
+/// used as it is: the caller is the supervisor's thread, which must not
+/// panic. Returns how many pipelines were retired.
+#[cfg(target_os = "linux")]
+pub(crate) fn retire_all() -> usize {
+    let retired: Vec<_> = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .map(|(_, inner)| inner)
+        .collect();
+    for inner in &retired {
+        inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+    if !retired.is_empty() {
+        tracing::info!(
+            pipelines = retired.len(),
+            "media_share: retired the shared pipelines of the desktop's old X server; the next session of each profile runs its own"
+        );
+    }
+    retired.len()
+}
+
 /// P6/P5 field fix (2026-08-05) — a follower's control DC just opened.
 ///
 /// `try_join` replays the owner's last `rc:video-info` at JOIN time, but a
@@ -1054,6 +1102,16 @@ fn ratio_qualifies(lo: u32, hi: u32, ratio: u32) -> bool {
 pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
     SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// #3671 — whether `key`'s pipeline would take a joiner now, read as
+/// [`try_join`] reads it (whatever the sharing switch says), for a test of
+/// the desktop's retire outside this module. The registry's lock is let go
+/// before the pipeline's is taken: the spill gate nests them the other way.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn takes_joiners(key: PipelineKey) -> bool {
+    let entry = registry().lock().unwrap().get(&key).cloned();
+    entry.is_some_and(|p| !p.lock().unwrap_or_else(|e| e.into_inner()).closed)
 }
 
 #[cfg(test)]
