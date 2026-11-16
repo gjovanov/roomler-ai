@@ -86,6 +86,7 @@ async fn a_message_post_answers_within_the_bound_when_redis_stops_answering() {
     );
     let tenant = app.seed_tenant("w14rb").await;
     let room_id = tenant.rooms[0].id.clone();
+    // The seeded admin may already be a member of the seeded room (409).
     let join = app
         .auth_post(
             &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
@@ -94,7 +95,11 @@ async fn a_message_post_answers_within_the_bound_when_redis_stops_answering() {
         .send()
         .await
         .expect("join");
-    assert!(join.status().is_success(), "join: {}", join.status());
+    assert!(
+        join.status().is_success() || join.status().as_u16() == 409,
+        "join: {}",
+        join.status()
+    );
     let post = |content: &str| {
         app.auth_post(
             &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
