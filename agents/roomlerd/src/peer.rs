@@ -5753,6 +5753,7 @@ pub(crate) fn spawn_capture_unavailable_notice(
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     reason: crate::capture::CaptureUnavailable,
 ) {
+    crate::input::told_no_picture(session_id, &reason);
     const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     // #1738 — each send is bounded: one on a channel a network drop left
@@ -6158,8 +6159,33 @@ fn shared_media_waiting_hook(
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     pipeline: &crate::media_share::Pipeline,
 ) -> crate::capture::OnOpenWait {
+    shared_media_waiting_hook_as(session_id, control_dc, pipeline, media_waiting_enabled())
+}
+
+/// [`shared_media_waiting_hook`] with the notices' switch given.
+///
+/// #3918 — and the pipeline's capture is being opened again: what it reads is
+/// unknown until the new capturer publishes its arm
+/// (`media_share::Pipeline::capture_opens_again`). Sound here because every
+/// open of a registered pipeline's capturer is built with this hook, and the
+/// open takes the hook by value, a type that cannot be cloned
+/// (`capture::OnOpenWait`): no open runs on a hook built for another. An open
+/// of such a capturer built with the plain [`media_waiting_hook`], or a hook
+/// that became shareable, would bring a stale arm back. First, before the
+/// switch: the switch turns the notices off, not this.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn shared_media_waiting_hook_as(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pipeline: &crate::media_share::Pipeline,
+    notices: bool,
+) -> crate::capture::OnOpenWait {
+    pipeline.capture_opens_again();
     let own = media_waiting_hook(session_id, control_dc);
-    if !media_waiting_enabled() {
+    if !notices {
         return own;
     }
     let share = pipeline.wait_teller();

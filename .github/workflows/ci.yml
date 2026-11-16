@@ -1395,6 +1395,33 @@ jobs:
           printf '%s\n' "${results[@]}"
           exit $rc
 
+      # #3918 — remote input on a desktop whose X server is killed and started
+      # again on the same display: the releases, a move, the next key and
+      # click and keep busy's move reach the new server, and the old injector
+      # goes with no ERROR line. In a process of its own: it reads enigo's
+      # lines, which come from enigo's thread through `log`. Runs as the
+      # capture's step above does.
+      - name: "#3918 — remote input follows the virtual desktop to a new X server, on a real X server"
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          command -v xvfb-run >/dev/null || { echo "::error::xvfb-run is missing: the X11 step above did not install xvfb, so no X server can start here"; exit 1; }
+          rc=0
+          results=()
+          # One invocation: its output to a log, its `x11-real:` line grepped, its
+          # result kept for the summary; the next one runs whatever this one did.
+          check() {
+            local name=$1 log=$2 want=$3 r=0
+            shift 3
+            "$@" 2>&1 | tee "$log" || r=1
+            grep -q "$want" "$log" || { echo "::error::$name: no \"$want\" line in $log"; r=1; }
+            if [ "$r" = 0 ]; then results+=("$name: passed"); else results+=("$name: FAILED"); rc=1; fi
+          }
+          check input::arbiter::x11_follow_tests /tmp/x11-input.log "x11-real: the input injector followed a new X server" \
+            xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- input::arbiter::x11_follow_tests --nocapture --test-threads=1
+          printf '%s\n' "${results[@]}"
+          exit $rc
+
       # #3671 — the clipboard worker follows the virtual desktop's next X
       # server: an Xvfb of the test's own is SIGKILLed and started again on
       # the same display, and a paste, a copy and a copy that a subscriber

@@ -78,6 +78,64 @@ pub mod enigo_backend;
 // #3787 — the level an X11 open with no display to open is said at.
 pub mod no_display;
 
+// #3918 — the X11 injector follows this daemon's virtual desktop to its next X
+// server, and input for the desktop is dropped while it is down.
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+pub(crate) mod x_follow;
+
+/// #3918 — `session` was told that it has no picture, and why (FR-80's
+/// notice, `peer::spawn_capture_unavailable_notice`, through which every
+/// `rc:media-unavailable` leaves). When the reason is this daemon's own
+/// virtual desktop, down or on an X server that is gone, the session has no
+/// input of the desktop either while its input would reach the desktop's X
+/// server ([`mark_no_picture`]).
+/// Any other reason marks nothing, as before #3918.
+pub(crate) fn told_no_picture(
+    session: bson::oid::ObjectId,
+    reason: &crate::capture::CaptureUnavailable,
+) {
+    if reason.is_the_virtual_desktop_down() {
+        mark_no_picture(session);
+    }
+}
+
+/// #3918 — `session` has no picture of this daemon's virtual desktop: it was
+/// told so, or it was open at an X server exit, which the supervisor marks
+/// whether it tells it or not (the device's plan, the tell's kill switch).
+/// Until it closes it has no input of the desktop while its input would reach
+/// the desktop's X server, and a shared pipeline it owns takes no joiner while
+/// its capture may read that server (`x_follow::no_picture`). Called from any
+/// thread; it takes one short lock and nothing else.
+///
+/// Nothing is marked where the desktop's X11 injector is not built (off
+/// Linux, and a Linux build without `enigo-input`): such a build has no input
+/// of the desktop to protect, and its shared pipelines are left to the
+/// supervisor's two retires. `full` and `full-hw` carry the feature.
+pub(crate) fn mark_no_picture(session: bson::oid::ObjectId) {
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    x_follow::no_picture::mark(session);
+    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    let _ = session;
+}
+
+/// #3918 — whether [`mark_no_picture`] marked `session`, as a shared
+/// pipeline's join reads it (`media_share::try_join`). `false` with
+/// `ROOMLERD_INPUT_X11_FOLLOW=0` (`x_follow::enabled`), the switch that also
+/// keeps the arbiter from leaving anybody behind, so a join is as before
+/// #3918, and always where the desktop's X11 injector is not built
+/// ([`mark_no_picture`]).
+pub(crate) fn has_no_picture(session: bson::oid::ObjectId) -> bool {
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    {
+        x_follow::no_picture::read(session, x_follow::enabled())
+    }
+    #[cfg(not(all(target_os = "linux", feature = "enigo-input")))]
+    {
+        let _ = session;
+        false
+    }
+}
+
 // rc.122 — Windows real-virtual-key text injection so typed letters land in the
 // legacy console (Windows PowerShell 5.1 / cmd), which drops enigo.text()'s
 // KEYEVENTF_UNICODE. Used by the shared `dispatch` KeyText arm.
@@ -467,6 +525,21 @@ pub trait InputInjector: Send {
     fn automatic(&self) -> bool {
         false
     }
+
+    /// #3918 — the generation of this daemon's virtual desktop
+    /// ([`crate::virtual_desktop::generation`]) whose X server this injector
+    /// is a client of, read before it connected. `None` for every injector
+    /// that is not an X client of the virtual desktop: then nothing follows
+    /// the desktop (`x_follow`). Default: `None`.
+    fn x_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// #3918 — this injector's X server is gone. It is dropped right after
+    /// this, and asks nothing of that server on the way: what it held went
+    /// with the server, and every request to a dead connection fails and logs.
+    /// Default: nothing.
+    fn server_gone(&mut self) {}
 }
 
 /// FR-95 P2 — `uinput` set to anything takes the automatic choice back:
@@ -576,6 +649,27 @@ impl InputInjector for NoopInjector {
     fn has_permission(&self) -> bool {
         false
     }
+}
+
+/// #3918 — whether [`open_default`] would open the X11 injector (enigo) here
+/// now, opening nothing: no uinput is configured (`ROOMLERD_UINPUT=1`) and no
+/// automatic system capture's uinput is due (FR-95 P2). ⚠️ It mirrors
+/// `open_default`'s order, so change the two together: the test
+/// `x11_would_open_names_every_route_open_default_tries_ahead_of_enigo`
+/// fails when one changes alone. A configured uinput
+/// whose open fails falls through to enigo there and counts as uinput here:
+/// an event for a desktop that is down then opens as before #3918.
+#[cfg(all(target_os = "linux", feature = "enigo-input"))]
+pub(crate) fn x11_would_open() -> bool {
+    #[cfg(feature = "uinput-input")]
+    if uinput_backend::env_enabled() {
+        return false;
+    }
+    #[cfg(all(feature = "uinput-input", feature = "drm-capture"))]
+    if uinput_unset() && crate::capture::seat_guard::live() {
+        return false;
+    }
+    true
 }
 
 /// Open the best-available input backend for the current host. Falls
@@ -704,6 +798,44 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3918 — `x11_would_open` says which injector `open_default` would open
+    /// on Linux by naming the routes it tries ahead of enigo: two lists of one
+    /// fact, so this fails when one changes alone. A route added ahead of
+    /// enigo would open another backend there and still count as X11 here,
+    /// and input would then follow a desktop it is not a client of.
+    #[test]
+    fn x11_would_open_names_every_route_open_default_tries_ahead_of_enigo() {
+        // A Windows checkout has CRLF line ends.
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let body = |head: &str| -> String {
+            let rest = &src[src.find(head).expect(head)..];
+            rest[..rest.find("\n}\n").expect("the fn's end")].to_string()
+        };
+        let open = body("pub fn open_default()");
+        let ahead = &open[..open
+            .find("enigo_backend::EnigoInjector::new()")
+            .expect("the enigo route")];
+        let would = body("pub(crate) fn x11_would_open()");
+        let guards = |s: &str| -> Vec<String> {
+            s.lines()
+                .filter_map(|l| l.trim().strip_prefix("if "))
+                .map(|g| g.trim_end_matches('{').trim().to_string())
+                .collect()
+        };
+        let routes = guards(ahead);
+        assert!(!routes.is_empty(), "{ahead}");
+        assert_eq!(
+            routes,
+            guards(&would),
+            "open_default's routes ahead of enigo"
+        );
+        assert_eq!(
+            ahead.matches("return Box::new(").count(),
+            routes.len() + 1,
+            "one return a guarded route, and Windows' system-context one: {ahead}"
+        );
+    }
 
     /// rc.54 — verify the env-var parse rules. Covers truthy variants
     /// (case + whitespace), explicit false values, missing var, and
