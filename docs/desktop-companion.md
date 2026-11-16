@@ -1802,7 +1802,7 @@ sequenceDiagram
     S-->>W: the root's questions
     W-->>A: the worker's own, then the root's
     A->>W: ConsentDecide (Approve)
-    W->>S: ConsentDecide; the seat is asked again first
+    W->>S: ConsentDecide, and the seat is asked again first
     S-->>W: ConsentDecided { ok: true }
     W-->>A: ConsentDecided { ok: true }
     R->>V: rc:consent granted
