@@ -1338,7 +1338,7 @@ joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same
 activity while the question stands,** including one that joins in the 250 ms
-before the broker next looks for the answer ([`consent.rs:67`](../agents/roomlerd/src/consent.rs#L67)). That is accepted
+before the broker next looks for the answer ([`consent.rs:73`](../agents/roomlerd/src/consent.rs#L73)). That is accepted
 on purpose: the prompt never shows the command text, so the person approves an
 activity, not a command, and one approved command can already run anything as
 the grant's identity.
