@@ -324,8 +324,8 @@ enum Command {
     },
     /// Record this device's screen to an HQ MP4 in the recordings folder
     /// (FR-85). Change the folder with `roomler config set record_dir <path>`.
-    /// The daemon runs the recorder; only the person at the console may
-    /// start, stop or delete a recording.
+    /// The daemon runs the recorder; only the person at this device's screen
+    /// may start, stop or delete a recording.
     Record {
         #[command(subcommand)]
         action: RecordAction,
@@ -576,7 +576,7 @@ enum HiveAction {
 
 /// `roomler record …` — FR-85 local screen recording. Every verb talks to the
 /// LOCAL daemon; `start`, `stop` and `rm` are refused unless the caller is the
-/// console user (an RDP guest must not record the console user's desktop).
+/// person at the screen the daemon shows (another session must not record it).
 #[derive(Debug, Subcommand)]
 enum RecordAction {
     /// Start recording the screen. Answers once the recorder is encoding.

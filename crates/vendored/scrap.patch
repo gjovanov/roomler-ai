@@ -157,8 +157,24 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
  }
 diff -ruN --strip-trailing-cr upstream/src/common/x11.rs vendored/src/common/x11.rs
 --- upstream/src/common/x11.rs	2018-04-08 11:24:21.000000000 +0200
-+++ vendored/src/common/x11.rs	2026-10-29 12:50:26.688616800 +0100
-@@ -68,4 +68,13 @@
++++ vendored/src/common/x11.rs	2026-11-15 09:13:21.255478900 +0100
+@@ -20,6 +20,15 @@
+     pub fn frame<'a>(&'a mut self) -> io::Result<Frame<'a>> {
+         Ok(Frame(self.0.frame()))
+     }
++
++    /// ROOMLER PATCH: this capturer's X connection has failed. From then on
++    /// `frame` hands back whatever its shared memory last held, for ever,
++    /// because the reply it waits for never comes and its result is not
++    /// read: a server that went away reads as a screen that stopped
++    /// changing. Ask after a `frame`, whose wait is what finds the failure.
++    pub fn connection_lost(&self) -> bool {
++        self.0.display().server().has_error()
++    }
+ }
+ 
+ pub struct Frame<'a>(&'a [u8]);
+@@ -68,4 +77,13 @@
      pub fn height(&self) -> usize {
          self.0.rect().h as usize
      }
@@ -541,3 +557,21 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/f
      }
  }
  
+diff -ruN --strip-trailing-cr upstream/src/x11/server.rs vendored/src/x11/server.rs
+--- upstream/src/x11/server.rs	2018-04-08 11:38:24.000000000 +0200
++++ vendored/src/x11/server.rs	2026-11-15 09:13:21.251427200 +0100
+@@ -38,6 +38,14 @@
+     }
+ 
+     pub fn raw(&self) -> *mut xcb_connection_t { self.raw }
++
++    /// ROOMLER PATCH: the connection has failed: the server closed it (it
++    /// exited) or a protocol error shut it. XCB sets this on the first read
++    /// or write that fails and never clears it, so asking costs no round
++    /// trip. Upstream binds `xcb_connection_has_error` for `connect` only.
++    pub fn has_error(&self) -> bool {
++        unsafe { xcb_connection_has_error(self.raw) != 0 }
++    }
+     pub fn screenp(&self) -> i32 { self.screenp }
+     pub fn setup(&self) -> *const xcb_setup_t { self.setup }
+ }

@@ -143,7 +143,19 @@ static VIEWING: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether an automatic capture is alive (its guard open or not).
 pub(crate) fn live() -> bool {
+    #[cfg(test)]
+    if let Some(here) = LIVE_HERE.with(std::cell::Cell::get) {
+        return here;
+    }
     LIVE.load(Ordering::Relaxed) > 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #3918 — `Some(live)` answers [`live`] on this thread: the
+    /// input arbiter's tests read no other test's automatic capture.
+    pub(crate) static LIVE_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether an automatic capture is reading a person's unlocked session now.

@@ -562,7 +562,7 @@ repair_tarball_owners() {
 # ⚠️ Every branch here ends in a construct that returns 0: under `set -e` a
 # function whose last command fails would abort the whole install.
 enable_update_helper() {
-    if ! /usr/bin/roomlerd update-helper --capabilities 2>/dev/null | grep -qx 'step-aside'; then
+    if ! /usr/bin/roomlerd update-helper --capabilities </dev/null 2>/dev/null | grep -qx 'step-aside'; then
         say "NOTE: this release's daemon cannot hand its updates to the root helper yet, and a per-user daemon cannot install them itself (writing /usr needs root). Re-run this script after the next release, or use --system."
         return 0
     fi
@@ -616,23 +616,23 @@ helper_on() {
 restart_old_user_daemon() {
     pid="$1"; helper_changed="$2"
     case "$pid" in ''|0) return 0 ;; esac
-    installed="$(/usr/bin/roomlerd --version 2>/dev/null || true)"
+    installed="$(/usr/bin/roomlerd --version </dev/null 2>/dev/null || true)"
     if [ -z "$installed" ]; then
         warn "/usr/bin/roomlerd --version did not answer; leaving the running daemon (pid $pid) as it is"
         return 0
     fi
-    running="$("/proc/$pid/exe" --version 2>/dev/null || true)"
+    running="$("/proc/$pid/exe" --version </dev/null 2>/dev/null || true)"
     if [ "$running" = "$installed" ]; then
         if [ "$helper_changed" = 0 ]; then
-            say "the running daemon (pid $pid) already runs ${installed#roomlerd }: nothing to restart"
+            say "the running daemon (pid $pid) already runs $(printable_version "${installed#roomlerd }"): nothing to restart"
             return 0
         fi
         why="the root update helper was just turned on, and the daemon decides at its start who installs its updates"
-    elif "/proc/$pid/exe" update-helper --capabilities 2>/dev/null | grep -qx 'restart-on-replace'; then
-        say "the running daemon (pid $pid) restarts onto ${installed#roomlerd } by itself, once nothing it serves would be cut"
+    elif "/proc/$pid/exe" update-helper --capabilities </dev/null 2>/dev/null | grep -qx 'restart-on-replace'; then
+        say "the running daemon (pid $pid) restarts onto $(printable_version "${installed#roomlerd }") by itself, once nothing it serves would be cut"
         return 0
     else
-        rv="${running#roomlerd }"
+        rv="${running:+$(printable_version "${running#roomlerd }")}"
         why="it runs ${rv:-an unknown version}, which cannot restart onto a new binary by itself"
     fi
     say "restarting the running daemon (pid $pid): $why (a remote or SSH session to this device drops for a few seconds)"
@@ -674,6 +674,7 @@ install_daemon_linux() {
         digest="$(asset_field_for "$releases" "$pattern" digest)"
     fi
     [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest roomlerd release" >&2; exit 1; }
+    name_release "$releases" "$pattern"
     deb="$STAGE/roomlerd.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
@@ -813,14 +814,14 @@ user_steps_linux() {
 place_system_config() {
     target="$1"; daemon_bin="$2"
     grp=root; [ "$OS" = Darwin ] && grp=wheel
-    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help >/dev/null 2>&1; then
+    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help </dev/null >/dev/null 2>&1; then
         say "a config already exists at $target — folding the new enrollment into it (operator settings kept)"
         take_args=""
         if [ -n "$CONFIG_TAKE" ]; then
             for k in $(printf '%s' "$CONFIG_TAKE" | tr ',' ' '); do take_args="$take_args --take $k"; done
         fi
         # shellcheck disable=SC2086
-        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args; then
+        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args </dev/null; then
             return 0
         fi
         warn "the daemon could not fold the enrollment in — placing the new config instead, the old one kept as $target.prev"
@@ -843,6 +844,7 @@ install_daemon_macos() {
     url="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' browser_download_url)"
     digest="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' digest)"
     [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest roomlerd release" >&2; exit 1; }
+    name_release "$releases" 'aarch64-apple-darwin[^"]*\.pkg'
     pkg="$STAGE/roomlerd.pkg"
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
@@ -974,7 +976,7 @@ install_macos_privileged_half() {
         # root LaunchDaemon is the `system` scope.
         # shellcheck disable=SC2046
         as_root $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
-            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay
+            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay </dev/null
     fi
 
     say "starting the privileged half"
@@ -1042,7 +1044,7 @@ install_macos_one_row() {
 
     # A release from before P3d refuses the flag. Asked before the marker and
     # before the token is spent, so the Mac keeps only the package.
-    if ! "$daemon_bin" enroll --help 2>/dev/null | grep -q -- '--one-row'; then
+    if ! "$daemon_bin" enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'; then
         echo "error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
         exit 1
     fi
@@ -1182,7 +1184,7 @@ enroll_daemon() {
     # env + two VAR=value words, binary + --config + path), none of which
     # contain whitespace.
     # shellcheck disable=SC2086
-    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    $enroll_sudo $enroll_trace $enroll_bin enroll --server "$SERVER" --token "$TOKEN" --name "$NAME" </dev/null
 }
 
 # ─── tunnel role ────────────────────────────────────────────────────────────
@@ -1254,7 +1256,7 @@ install_tunnel_macos() {
 # for another architecture, or one missing a library, is on PATH too.
 tunnel_cli_runs() {
     cli="$(command -v roomler || true)"
-    [ -n "$cli" ] && "$cli" --version >/dev/null 2>&1
+    [ -n "$cli" ] && "$cli" --version </dev/null >/dev/null 2>&1
 }
 
 # #2472 — never say "done" with nothing installed.
@@ -1263,7 +1265,7 @@ require_tunnel_cli() {
         echo "error: the roomler CLI did not install: no working \`roomler\` on PATH" >&2
         exit 1
     fi
-    say "installed: $(roomler --version 2>/dev/null | head -n 1)"
+    say "installed: $(printable_version "$(roomler --version </dev/null 2>/dev/null | head -n 1)" 'roomler ')"
 }
 
 install_tunnel_tarball() {
@@ -1298,7 +1300,7 @@ enroll_tunnel() {
         return 0
     fi
     say "enrolling this tunnel client as '$NAME' against $SERVER (token is single-use, never echoed)"
-    "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME" </dev/null
 }
 
 # FR-93 P6d — the tool that installs a local .rpm and resolves its
@@ -2013,6 +2015,99 @@ uninstall_finish() {
     exit 0
 }
 
+# #3881 — the release the download came from, as the server's feed names it,
+# and the installed daemon's own --version: information for the person and for
+# the labs that read this output. The feed's tag and the binary's answer are
+# printed only when they fit a small alphabet and 64 characters, and in fixed
+# words otherwise, so neither can write terminal control. Nothing here changes
+# a command the script runs or its exit code.
+fits_alphabet() {
+    case "$1" in
+        '' | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+say_unreadable() {
+    say "$1: unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
+}
+
+# The release that holds the asset the download takes: asset_field_for takes
+# the first asset over the WHOLE feed whose name matches $2, so when the newest
+# release lacks this host's file, an older release's is downloaded and named.
+# The asset is found in the caller's locale, as asset_field_for finds it; the
+# climb to its release's line runs in the C locale (where no byte hides a line)
+# and passes over asset lines (a name, then a URL) only. A line that does not
+# start with "tag_name" and close its quote is unreadable, never another's tag.
+name_release() {
+    RELEASE_TAG=""
+    nr_tag=""
+    nr_line="$(tr '{' '\n' < "$1" \
+        | grep -n '"name":"[^"]*'"$2"'"' \
+        | grep '"browser_download_url":"[^"]*"' \
+        | head -n 1 | cut -d: -f1)" || nr_line=""
+    if [ -n "$nr_line" ] && [ "$nr_line" -gt 1 ]; then
+        nr_tag="$(LC_ALL=C; export LC_ALL; tr '{' '\n' < "$1" \
+            | head -n "$((nr_line - 1))" \
+            | grep -v '^"name":"[^"]*","browser_download_url":"' \
+            | tail -n 1 \
+            | sed -n 's/^"tag_name":"\([^"]*\)".*/\1/p')" || nr_tag=""
+    fi
+    if fits_alphabet "$nr_tag"; then
+        RELEASE_TAG="$nr_tag"
+        say "release named by the server's feed: $nr_tag"
+    else
+        say_unreadable "release named by the server's feed"
+    fi
+}
+
+# After an install, the installed daemon's own --version, with stdin from
+# /dev/null (in the one-liner, stdin is the rest of this script). Download-only
+# installs nothing; the tunnel role's CLI names itself (require_tunnel_cli).
+report_installed_version() {
+    if [ "$ROLE" != daemon ]; then
+        return 0
+    fi
+    if [ "$DOWNLOAD_ONLY" = 1 ]; then
+        say "installed daemon's own --version: none (download-only installs nothing)"
+        return 0
+    fi
+    riv_bin=/usr/bin/roomlerd
+    if [ "$OS" = Darwin ]; then
+        riv_bin="$MACOS_DAEMON_BIN"
+    fi
+    riv_rc=0
+    riv_out="$("$riv_bin" --version </dev/null 2>/dev/null)" || riv_rc=$?
+    if [ "$riv_rc" != 0 ]; then
+        say "installed daemon's own --version: no answer ($riv_bin --version exited $riv_rc)"
+    elif [ -z "$riv_out" ]; then
+        say "installed daemon's own --version: no answer ($riv_bin --version printed nothing)"
+    else
+        riv_ver="$(printf '%s\n' "$riv_out" | head -n 1)" || riv_ver=""
+        riv_ver="${riv_ver#roomlerd }"
+        if fits_alphabet "$riv_ver"; then
+            say "installed daemon's own --version: $riv_ver"
+            if [ -n "${RELEASE_TAG:-}" ] && [ "${RELEASE_TAG#agent-v}" != "$riv_ver" ]; then
+                say "NOTE: the installed daemon's $riv_ver differs from the release this script resolved, $RELEASE_TAG"
+            fi
+        else
+            say_unreadable "installed daemon's own --version"
+        fi
+    fi
+}
+
+# #3919 — a version a binary printed, for the lines that name one elsewhere (a
+# running per-user daemon's, the tunnel CLI's): as it came when it fits the
+# alphabet (once a leading $2, if given, is set aside), fixed words otherwise.
+# Only what is printed passes here: comparisons use the answers as they came.
+printable_version() {
+    if fits_alphabet "${1#"${2:-}"}"; then
+        printf '%s\n' "$1"
+    else
+        printf '%s\n' "a version that is unreadable (empty, over 64 characters, or outside A-Z a-z 0-9 . _ + -)"
+    fi
+}
+
 # ─── main ───────────────────────────────────────────────────────────────────
 
 if [ "$UNINSTALL" = 1 ]; then
@@ -2059,4 +2154,5 @@ if [ "$PRIV_STEPS" = 1 ]; then
     fi
 fi
 
+report_installed_version
 say "done."

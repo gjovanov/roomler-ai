@@ -113,7 +113,10 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   with equal timers its own fallback fired ~130 ms before the agent's reasoned
   verdict. ⚠️ A server directive must never override a device's
   `auto_grant_session=false` — `consent::strictest_of` makes the local setting a
-  floor.
+  floor. ⚠️ The folder whose files can answer a prompt is the daemon's own
+  (`ConsentBroker::for_daemon`, #3939) or there is none: then the file channel is off
+  and the broker's books hold the markers and the answers. Never add a stand-in folder
+  (one below the temporary folder, or that folder itself, was removed by #3939).
 <!-- RETIRED-NAME-ANCHOR: the env-var spelling on the line below carries a
      retired product name deliberately — it is what the daemon actually reads,
      so renaming it would silently disable every virtual-desktop host. FR-27. -->
@@ -150,3 +153,20 @@ logind (#3830). Without an answer in time, the brief's kind stands. Later, only 
 of the seat changes the kind.
 ⚠️ `has_permission()` must stay true for any backend that works. This retry drops
 whatever reports false.
+
+### The virtual desktop's X server exit (#3671, #3918)
+
+What was open when the daemon's virtual desktop lost its X server follows the new
+server or is told to reconnect (`docs/linux-capture.md` §2.4, `docs/remote-control.md`
+§6.1c).
+⚠️ **No tokio signal listener ahead of the run loop's own.** The supervisor tells a
+stop from an X server exit by a stop grace, never by a signal: tokio installs the
+process's SIGTERM handler for good at the first `signal(SignalKind::terminate())`, and a
+listener made earlier, when the desktop starts, would swallow a SIGTERM that lands before
+the run loop's, and the daemon would run on. `git grep -n 'SignalKind::terminate()' --
+agents crates` must show one call in the agent, `terminate_signal` in `app.rs` (the other
+hits are the server's `crates/api/src/main.rs` and a doc comment).
+⚠️ **A capture whose X server went away answers `Ok(None)`, never `Err`.** The pumps
+reopen a capturer that errs, so an error there would reopen the session's capture on the
+new server by itself, which belongs to FR-135's capture contract (#3293). The CI test
+counts frames only, so it does not tell the two apart.

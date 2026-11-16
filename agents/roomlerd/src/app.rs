@@ -1319,7 +1319,7 @@ pub fn main() -> Result<()> {
             shut_down_runtime(rt);
             purge_after_daemon();
             if let Err(e) = res {
-                tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
+                roomlerd::daemon_error::say(&e);
                 std::process::exit(1);
             }
             // FR-84 D3 — a requested restart leaves with its own code (launchd
@@ -1372,6 +1372,14 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    // #3665 — the virtual desktop's keeper is this binary, re-run by the
+    // daemon with one hidden argument. It must not become a second daemon.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(code) = roomlerd::virtual_desktop::answer_keeper() {
+            std::process::exit(code);
+        }
+    }
     // #3702 — on the service account, the process's folder variables are the
     // machine's and the service account's own, before this process has a
     // second thread: the runtime below starts its workers.
@@ -3961,8 +3969,8 @@ async fn run_cmd(
     if unenrolled && !config_path.exists() {
         let name = roomlerd::machine::hostname().unwrap_or_default();
         let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
-        // #3802 — the reason names the folder and who owns it. On the macOS release build
-        // the AppKit `main` logs it through tracing and exits 1: nothing reaches stderr.
+        // #3802 — the reason names the folder and who owns it. The macOS release build's
+        // AppKit `main` writes it on stderr as std would (`daemon_error::say`), then exits 1.
         config::save(config_path, &blank).with_context(|| {
             format!(
                 "writing the person's config {}{}",
@@ -4737,26 +4745,26 @@ async fn run_cmd(
     // signaling loop prompts on; its live `pending` set gates LocalAPI consent
     // decisions (a decision is honoured only for an actively-prompting session).
     let consent_mode = roomlerd::consent::Mode::from_config(cfg.auto_grant_session);
-    let consent_dir =
-        roomlerd::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
-            std::env::temp_dir().join("roomlerd-consent")
-        });
-    let consent_broker = roomlerd::consent::ConsentBroker::new(consent_mode, consent_dir)
-        .unwrap_or_else(|e| {
-            // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
-            // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
-            // dir doesn't match the tray's simply times out → deny (safe), instead
-            // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
-            tracing::error!(error = %e, ?consent_mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
-            roomlerd::consent::ConsentBroker::new(consent_mode, std::env::temp_dir())
-                .expect("consent broker init cannot fail with temp_dir")
-        });
-    tracing::info!(
-        mode = ?consent_broker.mode(),
-        sentinel_dir = %consent_broker.sentinel_dir().display(),
-        "operator-consent broker ready"
-    );
+    // #3939 — the broker's folder, where an answer can also be a file
+    // (`<session>.approve` or `.deny`: the file channel), is the daemon's own:
+    // `default_sentinel_dir`, in this account's data folder, made as before.
+    // When it cannot be resolved or set up, no other folder stands in for it,
+    // neither one under the temporary folder nor that folder itself, and the
+    // file channel is off. The broker then keeps each question's `.pending`
+    // marker and each answer in memory, under the lock of its books: the
+    // tray, `roomlerd consent` and a native panel answer as before, and a
+    // question nobody answers times out as before. On Unix a folder that
+    // another account owns is not its own either.
+    //
+    // It keeps the CONFIGURED mode whatever its folder: prompt mode fails
+    // closed, never downgraded to AutoGrant (the pre-P2b fail-OPEN granted
+    // every session on a glitch). `for_daemon` says once that the file channel
+    // is off, and why; its `operator-consent broker ready` line names the
+    // folder or says that the file channel is off. A console-run agent and a
+    // `roomlerd consent` that cannot reach the device service still meet in
+    // that folder, in the profile both run in (`consent_cmd`). Pinned by the
+    // tests in `consent::tests::own_folder` and `localapi_state::tests`.
+    let consent_broker = roomlerd::consent::ConsentBroker::for_daemon(consent_mode);
     let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (overlay_view_tx, overlay_view_rx) =
         tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -8885,7 +8893,7 @@ mod one_row_enroll_tests {
     fn install_sh_asks_for_the_flag_this_binary_prints() {
         use clap::CommandFactory;
         let script = include_str!("../../../scripts/install.sh");
-        assert!(script.contains("enroll --help 2>/dev/null | grep -q -- '--one-row'"));
+        assert!(script.contains("enroll --help </dev/null 2>/dev/null | grep -q -- '--one-row'"));
         assert!(script.contains("enroll \"$@\" --overlay --one-row"));
         let mut cli = Cli::command();
         let help = cli

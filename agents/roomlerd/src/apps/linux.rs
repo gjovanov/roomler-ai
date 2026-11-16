@@ -7,8 +7,10 @@
 //! ## Session model (the flagship)
 //! A bash "session" is a **tmux** session shown as an xterm attached to
 //! it. This gives three properties a bare xterm can't:
-//! * survives the agent restarting / the operator disconnecting (the
-//!   tmux server outlives both);
+//! * survives the operator disconnecting (the tmux server outlives the
+//!   xterm). Not a stop or a restart of the daemon under the shipped
+//!   systemd units, whose control group ends with the daemon, the tmux
+//!   server in it; only a daemon no service manager owns leaves it running;
 //! * ssh-attachable (`tmux attach -t <name>` from a real login);
 //! * one X window per session, so focus works.
 //!

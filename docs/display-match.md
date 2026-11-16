@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:11177`](../agents/roomlerd/src/peer.rs#L11177)).
+control-channel arm sends the answer ([`peer.rs:11203`](../agents/roomlerd/src/peer.rs#L11203)).
 
 ### The answers
 
@@ -266,15 +266,15 @@ sequenceDiagram
 ```
 
 - **The server is Xorg with the dummy driver** wherever `xserver-xorg-video-dummy` and `xrandr` are installed
-  ([`virtual_desktop.rs:117`](../agents/roomlerd/src/virtual_desktop.rs#L117) `xorg_dummy`). Xvfb has one
+  ([`virtual_desktop.rs:138`](../agents/roomlerd/src/virtual_desktop.rs#L138) `xorg_dummy`). Xvfb has one
   mode, its start size, and cannot switch at all (the spec's §8 row 5), so a desktop on Xvfb still answers
   `unsupported`.
 - The real Xorg binary runs **unprivileged**, never the console-only wrapper. It gets a config of its own
   and an **empty** config directory, so no `xorg.conf.d` snippet of the host's (a GPU's, an input device's)
   leaks in, and no input device at all: input arrives through XTest, as on Xvfb
-  ([`virtual_desktop.rs:189`](../agents/roomlerd/src/virtual_desktop.rs#L189) `xorg_args`). It starts at the
+  ([`virtual_desktop.rs:210`](../agents/roomlerd/src/virtual_desktop.rs#L210) `xorg_args`). It starts at the
   configured size exactly, as a `roomler-WxH` modeline
-  ([`virtual_desktop.rs:145`](../agents/roomlerd/src/virtual_desktop.rs#L145) `xorg_conf`).
+  ([`virtual_desktop.rs:166`](../agents/roomlerd/src/virtual_desktop.rs#L166) `xorg_conf`).
 - ⚠️ **The config declares `ReducedBlanking`.** The modelines carry reduced blanking, and without the option
   Xorg drops the start mode ("monitor doesn't support reduced blanking") and starts at the dummy driver's
   2048×1536, leaving no named mode to restore to. Found in the build's own probe.
@@ -289,10 +289,10 @@ sequenceDiagram
   refuses to delete the mode in use ([`display_match.rs:303`](../agents/roomlerd/src/display_match.rs#L303)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
-  ([`scrap_backend.rs:269`](../agents/roomlerd/src/capture/scrap_backend.rs#L269)). The encoder already
+  ([`scrap_backend.rs:287`](../agents/roomlerd/src/capture/scrap_backend.rs#L287)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
-  the same display ([`virtual_desktop.rs:1113`](../agents/roomlerd/src/virtual_desktop.rs#L1113) `start_server`). An
+  the same display ([`virtual_desktop.rs:1602`](../agents/roomlerd/src/virtual_desktop.rs#L1602) `start_server`). An
   Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
   start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`
@@ -403,7 +403,7 @@ sequenceDiagram
   with the tracker it shares with Windows, with no exception for the switch itself.
 - **The capture follows the mode.** A Mac's stream is a `CGDisplayStream` opened at a size, so after a switch it
   opens again, as X11's capturer does
-  ([`capture/scrap_backend.rs:316`](../agents/roomlerd/src/capture/scrap_backend.rs#L316)).
+  ([`capture/scrap_backend.rs:334`](../agents/roomlerd/src/capture/scrap_backend.rs#L334)).
 - **Off the main thread.** `CGDisplaySetDisplayMode` from a second thread switched the mode and returned 0
   (measured), so the switch does not wait on the AppKit pump.
 

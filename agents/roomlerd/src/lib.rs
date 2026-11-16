@@ -162,6 +162,9 @@ pub mod notify;
 pub(crate) mod one_in_flight;
 /// FR-43 P3c — `sudo roomlerd one-row`: a two-row Mac becomes one row.
 pub mod one_row;
+/// FR-147 P1 — `roomlerd one-row-home <verb>`: the person's own process that
+/// `one-row` starts for what has to change inside that person's home.
+pub mod one_row_home;
 pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
@@ -500,6 +503,9 @@ pub fn purge_exit_routes_unless_owned(daemon_running: bool) -> bool {
     purge_exit_routes();
     true
 }
+
+// Here, not in the list above, so that no line the docs anchor in this file moves.
+pub mod daemon_error;
 
 #[cfg(test)]
 mod tests {

@@ -661,9 +661,9 @@ The sites on it since P1:
 | A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:399` |
 | Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:652`, `crates/agent-core/src/crash_recorder.rs:539` |
 | The uploader's verdicts ledger in a SYSTEM worker's `service-logs` (`crash-verdicts.txt`) | `HeldPath::machine(.., Seal::Readable)`, then `append_file`; read with `read_file`. A link, or a file with more than one name, at its name is deleted as itself and the file made again | `crates/agent-core/src/crash_recorder.rs:750` |
-| The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:727` |
-| The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:609`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
-| The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:289` |
+| The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:1160` |
+| The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
+| The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
 | #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1449` |
 
 P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
@@ -742,8 +742,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11553`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10890`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11579`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10916`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -766,11 +766,12 @@ escaping, on every line that holds it:
 |---|---|---|
 | `user` | the name the client logs in as | `ssh: authenticated (server grant)`, `ssh: authenticated (ssh_authorized_keys)`, `ssh: rejected — no live grant …` |
 | `term` | the terminal the client asks for | `ssh: pty requested`, `ssh: interactive session started` |
-| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2165`) |
-| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2083`) | the four `ssh: forward …` lines |
+| `request` | a subsystem's name the client asks for, or the `sftp` or `shell` the device refuses | `ssh: refused an unsupported request` (`agents/roomlerd/src/ssh.rs:2221`) |
+| `host`, `why` | where the client asks to forward to, and the refusal, which names it (`forward_allowed`, `agents/roomlerd/src/ssh.rs:2087`) | the four `ssh: forward …` lines |
 | `caller` | the grant's caller as the server words it; in a session `ssh:«caller»@«address»`, or `ssh:«user»@«address» (key-list)` with the client's own login name (`agents/roomlerd/src/ssh.rs:901`, `:924`) | the six `rc:ssh.grant` lines in `agents/roomlerd/src/signaling.rs`, the SYSTEM service's claim (`agents/roomlerd/src/ssh_service.rs:677`), every line of a session, the question to the person at the device, and the exec engine's lines for the command (`fleet-rpc: running command`, `exec: streaming command`, `exec: refusing to run …`, in `agents/roomlerd/src/exec.rs`) |
 | `run_as` | `daemon`, `console_user` or `named:«account»` (`RunAs::label`, `agents/roomlerd/src/exec.rs:791`) | `ssh: sftp session started`, `ssh: interactive session started`, `ssh: exec finished`, `exec: refusing to run …` |
 | `e` | the terminal's start error, which on Windows quotes `named:«account»` | `ssh: could not start the terminal session` |
+| `msg` | what `sftp-server` writes to its stderr, which can quote a path the client sent: its first 4 KiB, with `cut_bytes` counting the rest (`SftpStderr`, `agents/roomlerd/src/ssh.rs:2172`, #3890) | `ssh: sftp-server stderr`, one line a session, written when the child closes its stderr, from both spawns (a Windows `console_user` session's too) |
 
 Logged as they are: the server's ids (`grant_id`) and the daemon's own (a
 question's id), which the SYSTEM service checks with `valid_object_id` before it
@@ -781,8 +782,10 @@ service, which `clean_reason` has stripped of control characters. The exec
 engine's lines serve fleet RPC too, so a fleet RPC command's `caller` is escaped
 there as well. Pinned by `ssh::tests::wire_text_log_tests`: a client's login
 name, terminal, subsystem and forward hosts; a grant's caller, through the
-question to the person at the device and on the SYSTEM service's port; and a
-named account. Each holds a line break and a control character.
+question to the person at the device and on the SYSTEM service's port; a
+named account; and a stand-in `sftp-server`'s stderr, exactly one line for it
+(#3890). Each holds a line break and a control character; one more stand-in
+writes 6000 bytes and its line keeps 4 KiB.
 
 ### A received file's folders are its writer's own (#3688)
 
@@ -1130,6 +1133,8 @@ session, and its account and elevation from its token. `SYSTEM` is named by its 
   (never root, `SYSTEM`, LocalService, NetworkService or an unreadable account),
   elevation passes none of them, and the person socket keeps its own rules. A machine-wide
   install's worker runs in the console session, so there they decide as they always did.
+  Their refusals name the person they take, "only the person at this device's screen …"
+  (#3907), never the console, whose person a per-user install over Remote Desktop refuses.
 
 **A LocalAPI client keeps an endpoint only when its own account or the system serves
 it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
@@ -1170,7 +1175,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:3270` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:4072` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;

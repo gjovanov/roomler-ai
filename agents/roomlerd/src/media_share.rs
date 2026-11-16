@@ -203,8 +203,34 @@ struct PipelineInner {
     /// for at the host (FR-93), for as long as it waits.
     notice: Option<OwnerNotice>,
     /// Owner marks this when its pump exits; blocks late joins racing the
-    /// registry removal.
+    /// registry removal. #3671 — `retire_all` marks it too, for a pipeline
+    /// whose capture was opened on an X server that is gone: its owner and
+    /// followers go on, and nobody joins it any more. #3918 — and `try_join`,
+    /// for a beating owner with no picture of the virtual desktop whose
+    /// capture may read the desktop's X server.
     closed: bool,
+    /// #3918 — the session whose pump owns the pipeline ([`try_join`]).
+    owner: Option<bson::oid::ObjectId>,
+    /// #3918 — the owner's capture is known not to read an X server. One
+    /// setter: [`Pipeline::publish_video_info`], from the arm of the capturer
+    /// that payload was made for. Two clearers, back to unknown (`false`):
+    /// [`Pipeline::capture_opens_again`], because a reopen's new capturer can
+    /// be of another arm (an explicit arm that falls through to the X server)
+    /// and publishes its arm only after its first frame went out, or, after
+    /// the FFmpeg pump's error reopen, only with the next `rc:video-info` sent
+    /// for another reason (a viewer leaves, a transport flip, a change of
+    /// dims or rate); and [`Pipeline::tell_unavailable`], because a capture
+    /// with no pixels publishes nothing. Unknown at registration too.
+    /// [`try_join`] refuses the pipeline of a marked owner that is beating
+    /// unless this is known, so a fact that is stale or missing never lets a
+    /// joiner follow a capture of an X server that is gone; an owner silent
+    /// past [`PIPELINE_STALE`] is evicted first, marked or not, as on master.
+    /// What a refusal costs is the joiner's own pump: one more capture and
+    /// encoder; on a portal host without a restore token, a consent dialog;
+    /// and while the owner's portal request is still pending, the joiner's
+    /// request takes it over (one per host) and the owner's open falls
+    /// through to the virtual desktop's X server.
+    capture_not_x: bool,
     /// Millis (process-epoch) of the owner's last loop iteration —
     /// [`Pipeline::beat`]. Joiners treat a silent owner as DEAD (rc.443):
     /// field 2026-08-21, corplap — an av1_qsv driver hang froze the owner pump
@@ -267,7 +293,10 @@ impl Pipeline {
     /// already owned (two same-profile pumps raced), the returned pipeline
     /// is standalone — valid, merge helpers are no-ops, no followers.
     pub fn register(key: PipelineKey, owner_session: bson::oid::ObjectId) -> Self {
-        let inner = Arc::new(Mutex::new(PipelineInner::default()));
+        let inner = Arc::new(Mutex::new(PipelineInner {
+            owner: Some(owner_session),
+            ..PipelineInner::default()
+        }));
         inner.lock().unwrap().last_beat_ms.store(now_ms(), Relaxed);
         let mut reg = registry().lock().unwrap();
         let registered = match reg.entry(key) {
@@ -593,9 +622,15 @@ impl Pipeline {
     /// Publish the owner's `rc:video-info` payload: stored for joiner replay
     /// and pushed to every follower's control DC (spawned — control DCs are
     /// async).
+    ///
+    /// #3918 — the payload is read before the pipeline's lock is taken, and
+    /// the payload and what it says of the capture are stored under one hold
+    /// of it: no reader sees one payload with another payload's fact.
     pub fn publish_video_info(&self, payload: String) {
+        let capture_not_x = names_a_capture_off_x(&payload);
         let mut inner = self.inner.lock().unwrap();
         inner.video_info = Some(payload.clone());
+        inner.capture_not_x = capture_not_x;
         let targets: Vec<_> = inner
             .followers
             .iter()
@@ -612,6 +647,16 @@ impl Pipeline {
         }
     }
 
+    /// #3918 — the owner's capture is about to be opened again
+    /// (`peer::shared_media_waiting_hook`, built for each open of a
+    /// registered pipeline's capture, as a test reads from `peer.rs`): what
+    /// it reads is unknown until the owner publishes the new capture's arm,
+    /// and until then a marked owner's pipeline takes no joiner
+    /// ([`try_join`]).
+    pub fn capture_opens_again(&self) {
+        self.inner.lock().unwrap().capture_not_x = false;
+    }
+
     /// #3260 — the owner's capture cannot produce pixels, and `reason` says
     /// why (FR-80). The owner tells its own controller; this tells every
     /// follower's, and keeps the reason for the viewers that join later.
@@ -620,6 +665,7 @@ impl Pipeline {
     pub fn tell_unavailable(&self, reason: &crate::capture::CaptureUnavailable) {
         let mut inner = self.inner.lock().unwrap();
         inner.notice = Some(OwnerNotice::Unavailable(reason.clone()));
+        inner.capture_not_x = false;
         let targets: Vec<_> = inner
             .followers
             .iter()
@@ -766,6 +812,25 @@ impl Drop for FollowerGuard {
     }
 }
 
+/// #3918 — the `rc:video-info` field that names the capture arm, spelled as
+/// `peer::video_info_payload` writes it (a test reads that fn's source).
+const CAPTURE_ARM: &str = "capture_arm";
+
+/// #3918 — whether an `rc:video-info` payload names a capture arm that does
+/// not read an X server ([`crate::capture::CaptureArm::reads_an_x_server`]).
+/// Fails closed: `x11`, a spelling this build does not know, a payload
+/// without the field and one that is not JSON all answer `false`.
+fn names_a_capture_off_x(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get(CAPTURE_ARM)
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::capture::CaptureArm::from_wire)
+        })
+        .is_some_and(|arm| !arm.reads_an_x_server())
+}
+
 /// Join `key`'s pipeline as a follower. `None` when sharing is off, no
 /// pipeline owns the key, or the pipeline is closing. On success the
 /// follower's DC chunker task is running, a pipeline IDR is requested, and
@@ -808,6 +873,45 @@ pub fn try_join(
             ?key,
             silent_ms,
             "media_share: evicted stale pipeline (owner pump silent — wedged encode?); joiner will own a fresh one"
+        );
+        return None;
+    }
+    // #3918 — an owner that is beating and is marked as having no picture
+    // of this device's virtual desktop (open at an X server exit, or refused
+    // while the desktop was down) shares nothing a new viewer should follow
+    // while its capture may read the desktop's X server: the arm it
+    // published is `x11`, or none is known (`capture_not_x`, which fails
+    // closed). An owner silent past `PIPELINE_STALE` was evicted above,
+    // marked or not, as on master: its followers re-dispatch. A capture
+    // known to be off X (DRM, the portal, mutter) takes
+    // joiners, marked owner or not, as on master. The pipeline is closed to
+    // joins and its entry removed, as `retire_all` leaves one: the owner and
+    // its followers go on, and the caller runs a pump of its own, which
+    // registers under the key. The marks are kept only on Linux with
+    // `enigo-input` (`input::mark_no_picture`): a build without it has no
+    // input of the desktop to protect and keeps the supervisor's two
+    // retires, and `full` and `full-hw` carry the feature. Off Linux nothing
+    // changes. `ROOMLERD_INPUT_X11_FOLLOW=0` turns this reader off with the
+    // arbiter's (`input::has_no_picture`): every pipeline takes joiners, as
+    // before #3918. The registry is used as it is when poisoned, as
+    // `retire_all` uses it.
+    if guard.owner.is_some_and(crate::input::has_no_picture) && !guard.capture_not_x {
+        guard.closed = true;
+        drop(guard);
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cur) = reg.get(&key)
+            && Arc::ptr_eq(cur, &inner)
+        {
+            reg.remove(&key);
+        }
+        drop(reg);
+        tracing::info!(
+            ?key,
+            "media_share: the pipeline's owner is marked as having no picture of the virtual \
+             desktop, and its capture may read the desktop's X server — a new viewer runs its own \
+             pipeline (#3918)"
         );
         return None;
     }
@@ -873,6 +977,52 @@ pub fn try_join(
         session_id,
         detach,
     })
+}
+
+/// #3671 — the X server that every registered pipeline's capture was opened
+/// on has gone. The virtual desktop's supervisor calls this where it tells
+/// the open sessions, and again once a restarted desktop is up. Each pipeline
+/// is closed to joins and its entry removed, so the next session of a profile
+/// runs a pump of its own on the server that answers now. It no longer
+/// follows a capture of the old server (that capture's last frame, then
+/// keepalives of it) or an open refused while the desktop was down. The
+/// owners and their followers stay as they are: the supervisor tells those
+/// sessions to reconnect, and a detach would send a follower back into an
+/// open that is refused while the desktop is down, which registers a
+/// `NoopCapture` owner under the same key. A retired owner's `Drop` leaves a
+/// newer owner's entry alone, because it is identity-aware. Retired
+/// pipelines no longer count against the spill budget (`MAX_PIPELINES`);
+/// they end with their sessions.
+///
+/// No lock is held across another. The spill gate takes the registry while
+/// it holds a pipeline (`pipeline_count()` under `inner`, in the owner's
+/// floor merge), so the entries are taken out under the registry's lock and
+/// each pipeline is closed after that lock is released. A joiner that
+/// fetched a pipeline before it was taken out reads `closed` under the
+/// pipeline's lock, so it is refused once this returns. A poisoned lock is
+/// used as it is: the caller is the supervisor's thread, which must not
+/// panic. Returns how many pipelines were retired.
+#[cfg(target_os = "linux")]
+pub(crate) fn retire_all() -> usize {
+    let retired: Vec<_> = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .map(|(_, inner)| inner)
+        .collect();
+    for inner in &retired {
+        inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+    if !retired.is_empty() {
+        tracing::info!(
+            pipelines = retired.len(),
+            "media_share: retired the shared pipelines of the desktop's old X server; the next session of each profile runs its own"
+        );
+    }
+    retired.len()
 }
 
 /// P6/P5 field fix (2026-08-05) — a follower's control DC just opened.
@@ -1056,6 +1206,20 @@ pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// #3671, #3918 — whether a new viewer joins `key`'s pipeline now, for a
+/// test of the desktop's hooks outside this module: [`try_join`] itself, for
+/// a viewer of its own that leaves at once, on a runtime of its own (a join
+/// spawns the follower's sender). A refusal closes the pipeline to joins, as
+/// it does for a real viewer.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn takes_joiners(key: PipelineKey) -> bool {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for one join");
+    rt.block_on(async { try_join(key, tests::sink(bson::oid::ObjectId::new()), 60).is_some() })
+}
+
 #[cfg(test)]
 // The SERIAL guard is deliberately held across awaits: it serializes whole
 // tests against the process-global registry, and every await inside is a
@@ -1067,7 +1231,7 @@ mod tests {
 
     use super::test_serial as serial;
 
-    fn sink(session: ObjectId) -> FollowerSink {
+    pub(super) fn sink(session: ObjectId) -> FollowerSink {
         FollowerSink {
             session_id: session,
             video_bytes_dc: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1838,5 +2002,554 @@ mod tests {
             smaller_target(TargetResolution::Native, TargetResolution::Native),
             TargetResolution::Native
         );
+    }
+
+    /// #3671 — once the desktop's X server is gone, a pipeline whose capture
+    /// was opened on it takes no joiner: not one that finds it in the
+    /// registry, and not one that fetched it before it was retired (it reads
+    /// `closed` under the pipeline's lock). The next session of that profile
+    /// owns the key afresh, with a pump and a capture of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retired_pipeline_takes_no_joiner_and_its_key_is_free_for_a_new_owner() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3671-RETIRED");
+        let old = Pipeline::register(key, ObjectId::new());
+        retire_all();
+        assert!(
+            try_join(key, sink(ObjectId::new()), 60).is_none(),
+            "a joiner followed a capture of the old X server"
+        );
+        assert!(
+            old.inner.lock().unwrap().closed,
+            "a joiner that fetched the pipeline before the retire would join it"
+        );
+        let new = Pipeline::register(key, ObjectId::new());
+        let joined = try_join(key, sink(ObjectId::new()), 60).expect("the new owner takes joiners");
+        assert_eq!((new.follower_count(), old.follower_count()), (1, 0));
+        drop(joined);
+    }
+
+    /// #3671 — a retired owner keeps the followers it had, since the desktop's
+    /// supervisor tells those sessions to reconnect and a detach would send
+    /// each into an open refused while the desktop is down. They leave when
+    /// the owner ends, as before. Its end leaves the entry of the owner that
+    /// registered the key after the retire.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retired_owner_keeps_its_followers_and_its_end_leaves_the_new_owners_entry() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3671-KEPT");
+        let old = Pipeline::register(key, ObjectId::new());
+        let told = try_join(key, sink(ObjectId::new()), 60).expect("joined before the exit");
+        retire_all();
+        let new = Pipeline::register(key, ObjectId::new());
+        assert!(new.registered, "the key was not free after the retire");
+        assert_eq!(old.follower_count(), 1, "the retire detached a follower");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), told.detached())
+                .await
+                .is_err(),
+            "the retire detached a follower"
+        );
+        drop(old);
+        assert_eq!(told.detached().await, DetachReason::PipelineClosed);
+        assert!(
+            registry()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &new.inner)),
+            "the retired owner's end took the new owner's entry"
+        );
+    }
+
+    /// #3918 — a pipeline whose owner was told that it has no picture of this
+    /// device's virtual desktop takes no joiner while nothing known to be off
+    /// X has been published for it (here nothing is published), whichever
+    /// told it: the tell (its capture was on an X server that is gone) or its
+    /// own refused open.
+    /// It is closed and its entry removed, as a retire leaves one: its owner
+    /// and the follower it had go on, told, and the next session of the
+    /// profile owns the key afresh, with a capture of its own.
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    #[tokio::test]
+    async fn a_pipeline_whose_owner_has_no_picture_takes_no_joiner() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3918-NO-PICTURE");
+        let owner = ObjectId::new();
+        let old = Pipeline::register(key, owner);
+        let told =
+            try_join(key, sink(ObjectId::new()), 60).expect("joined before the owner was told");
+        crate::input::mark_no_picture(owner);
+        let refused = try_join(key, sink(ObjectId::new()), 60).is_none();
+        let followers_after_the_refusal = old.follower_count();
+        let new = Pipeline::register(key, ObjectId::new());
+        let joined = try_join(key, sink(ObjectId::new()), 60);
+        crate::input::x_follow::no_picture::forget(owner);
+        assert!(
+            refused,
+            "a new viewer followed the pipeline of an owner with no picture"
+        );
+        assert!(old.inner.lock().unwrap().closed);
+        // The refused joiner is not attached to the old pipeline, and the
+        // told follower is not detached from it: exactly the one it had.
+        assert_eq!(
+            followers_after_the_refusal, 1,
+            "the refused joiner was attached to the old pipeline, or its follower was detached"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), told.detached())
+                .await
+                .is_err(),
+            "the refusal detached the told owner's follower"
+        );
+        assert!(new.registered, "the key was not free for a new owner");
+        assert!(joined.is_some(), "the new owner takes joiners");
+        // The old pipeline's end leaves the new owner's entry under the key.
+        drop(old);
+        assert_eq!(told.detached().await, DetachReason::PipelineClosed);
+        assert!(
+            registry()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &new.inner)),
+            "the told owner's end took the new owner's entry"
+        );
+        drop((joined, new));
+    }
+
+    /// #3918 — an owner silent past [`PIPELINE_STALE`] is
+    /// evicted as on master (rc.443), marked or not: the join is refused, its
+    /// followers are detached with `PipelineClosed`, so that they re-dispatch,
+    /// and the key is ownable again. The mark's refusal is for an owner that
+    /// is beating. Here the owner is marked, its capture is not known to be
+    /// off X, and it has one follower.
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    #[tokio::test]
+    async fn a_marked_owner_silent_past_the_stale_horizon_is_evicted_with_its_followers() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3918-MARKED-STALE");
+        let owner = ObjectId::new();
+        let wedged = Pipeline::register(key, owner);
+        let follower =
+            try_join(key, sink(ObjectId::new()), 60).expect("joined before the owner was told");
+        crate::input::mark_no_picture(owner);
+        wedged.force_stale();
+        let refused = try_join(key, sink(ObjectId::new()), 60).is_none();
+        let entry_left = registry().lock().unwrap().get(&key).is_some();
+        let detached = tokio::time::timeout(Duration::from_millis(50), follower.detached())
+            .await
+            .ok();
+        let followers_left = wedged.follower_count();
+        let fresh = Pipeline::register(key, ObjectId::new());
+        let joined = try_join(key, sink(ObjectId::new()), 60);
+        crate::input::x_follow::no_picture::forget(owner);
+        assert!(refused, "a new viewer followed a marked owner's corpse");
+        assert!(wedged.inner.lock().unwrap().closed);
+        assert!(!entry_left, "the eviction left the marked corpse's entry");
+        assert_eq!(
+            (detached, followers_left),
+            (Some(DetachReason::PipelineClosed), 0),
+            "a marked owner silent past the stale horizon kept its follower"
+        );
+        assert!(fresh.registered, "the key was not ownable again");
+        assert!(joined.is_some(), "the fresh owner takes joiners");
+        // The evicted owner's late drop leaves the fresh owner's entry.
+        drop(wedged);
+        assert!(
+            registry()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &fresh.inner)),
+            "the evicted owner's late drop took the fresh owner's entry"
+        );
+        drop((joined, fresh));
+    }
+
+    /// #3918 — every capture arm, in the one list the join tests walk. A new
+    /// arm does not compile until [`reads_x`], right below, decides it; it
+    /// reaches this list only by hand, so an arm decided there and left out
+    /// here is not walked by the join tests. `CaptureArm::from_wire` keeps its
+    /// own list: an arm this list names that is missing there fails closed,
+    /// and `every_capture_arm_is_decided_on_or_off_x_and_what_is_unknown_fails_closed`
+    /// turns red.
+    const EVERY_ARM: [crate::capture::CaptureArm; 4] = [
+        crate::capture::CaptureArm::Drm,
+        crate::capture::CaptureArm::Mutter,
+        crate::capture::CaptureArm::Portal,
+        crate::capture::CaptureArm::X11,
+    ];
+
+    /// Whether `arm` reads an X server, decided here by hand. No wildcard: a
+    /// new arm does not compile until it is decided, beside [`EVERY_ARM`].
+    fn reads_x(arm: crate::capture::CaptureArm) -> bool {
+        use crate::capture::CaptureArm;
+        match arm {
+            CaptureArm::X11 => true,
+            CaptureArm::Drm | CaptureArm::Mutter | CaptureArm::Portal => false,
+        }
+    }
+
+    /// An `rc:video-info` payload naming `arm` as [`CAPTURE_ARM`], in the
+    /// producer's shape (`peer::video_info_payload`).
+    fn info_naming(arm: &str) -> String {
+        format!(r#"{{"t":"rc:video-info","{CAPTURE_ARM}":"{arm}","attended":false}}"#)
+    }
+
+    /// The text of `peer.rs` as compiled, for the tests that pin what it does
+    /// with this module's pipelines and payloads.
+    const PEER_RS: &str = include_str!("peer.rs");
+
+    /// The fn of `peer.rs` whose head is `head`, to its closing brace at the
+    /// start of a line. Fails unless there is exactly one, so a rename cannot
+    /// make a test pass by reading nothing.
+    fn peer_fn(head: &str) -> String {
+        // A Windows checkout has CRLF line ends.
+        let src = PEER_RS.replace("\r\n", "\n");
+        assert_eq!(src.matches(head).count(), 1, "one `{head}` in peer.rs");
+        let rest = &src[src.find(head).expect(head)..];
+        rest[..rest.find("\n}\n").expect("the fn's end")].to_string()
+    }
+
+    /// `peer.rs` as compiled outside its tests: each `#[cfg(test)]` item at
+    /// the top level (all of them are modules) is cut out, to its closing
+    /// brace at the start of a line.
+    fn peer_outside_tests() -> String {
+        let mut src = PEER_RS.replace("\r\n", "\n");
+        while let Some(at) = src.find("\n#[cfg(test)]\n") {
+            let len = src[at + 1..].find("\n}\n").expect("a test item's end") + 3;
+            src.replace_range(at + 1..at + 1 + len, "");
+        }
+        src
+    }
+
+    /// Every capture open in `body`, each to its closing paren, with where it
+    /// starts: a call of `capture::open…(`, whichever open function it names
+    /// (`open_default_async`, `open_async`, a later one). A mention that is
+    /// not a call is left out, and so are the two `open_*` predicates, which
+    /// open nothing.
+    fn capture_opens(body: &str) -> Vec<(usize, &str)> {
+        const OPEN: &str = "capture::open";
+        const OPENS_NOTHING: [&str; 2] = ["capture::open_has_session(", "capture::open_abandoned("];
+        body.match_indices(OPEN)
+            .filter_map(|(at, _)| {
+                let call = &body[at..];
+                let paren =
+                    call.find(|c: char| c != '_' && c != ':' && !c.is_ascii_alphanumeric())?;
+                if !call[paren..].starts_with('(')
+                    || OPENS_NOTHING.iter().any(|p| call.starts_with(p))
+                {
+                    return None;
+                }
+                let mut depth = 0usize;
+                let end = call[paren..]
+                    .char_indices()
+                    .find_map(|(i, c)| match c {
+                        '(' => {
+                            depth += 1;
+                            None
+                        }
+                        ')' => {
+                            depth -= 1;
+                            (depth == 0).then_some(paren + i)
+                        }
+                        _ => None,
+                    })
+                    .expect("the open's closing paren");
+                Some((at, &call[..=end]))
+            })
+            .collect()
+    }
+
+    /// #3918 — every open of a registered pipeline's capturer
+    /// is built with the clearing builder, `peer::shared_media_waiting_hook`:
+    /// a reopen's start clears the capture the pipeline published
+    /// ([`Pipeline::capture_opens_again`]). An open built with the plain
+    /// `media_waiting_hook` would let a marked owner's pipeline take a joiner
+    /// on the arm of the capturer it replaced. Read from the source as
+    /// compiled, in both DC pumps by name, through whichever capture open
+    /// function a call names; a pump, a register or an open
+    /// this cannot find fails, and so does a `Pipeline::register(` outside
+    /// the two pumps, which a third pump would escape the reads with. One
+    /// exception, named: the VP9-444 pump's first open runs before it
+    /// registers its pipeline, so nothing is published there to clear and no
+    /// viewer can join yet.
+    #[test]
+    fn every_open_of_a_registered_pipelines_capturer_clears_its_published_capture() {
+        const REGISTER: &str = "Pipeline::register(";
+        const CLEARING: &str = "shared_media_waiting_hook(";
+        const PLAIN: &str = "media_waiting_hook(";
+        // The FFmpeg pump registers before its first open: every open clears.
+        let ffmpeg = peer_fn("async fn media_pump_ffmpeg_dc(");
+        let registered = ffmpeg.find(REGISTER).expect("the FFmpeg pump's register");
+        let opens = capture_opens(&ffmpeg);
+        assert!(!opens.is_empty(), "the FFmpeg pump opens no capturer");
+        for (at, open) in &opens {
+            assert!(
+                registered < *at,
+                "an FFmpeg open before its register: {open}"
+            );
+            assert!(
+                open.contains(CLEARING),
+                "an FFmpeg open that clears nothing: {open}"
+            );
+        }
+        // The VP9-444 pump: its first open, before the register, is the one
+        // with the plain builder; every open after the register clears.
+        let vp9 = peer_fn("async fn media_pump_vp9_444_dc(");
+        let registered = vp9.find(REGISTER).expect("the VP9-444 pump's register");
+        let (first, reopens): (Vec<_>, Vec<_>) = capture_opens(&vp9)
+            .into_iter()
+            .partition(|(at, _)| *at < registered);
+        assert_eq!(
+            first.len(),
+            1,
+            "VP9-444 opens before its register: {first:?}"
+        );
+        assert!(
+            first[0].1.contains(PLAIN) && !first[0].1.contains(CLEARING),
+            "the VP9-444 first open: {}",
+            first[0].1
+        );
+        assert!(!reopens.is_empty(), "the VP9-444 pump reopens no capturer");
+        for (_, open) in &reopens {
+            assert!(
+                open.contains(CLEARING),
+                "a VP9-444 reopen that clears nothing: {open}"
+            );
+        }
+        // Pipelines are registered in these two pumps only.
+        assert_eq!(
+            peer_outside_tests().matches(REGISTER).count(),
+            ffmpeg.matches(REGISTER).count() + vp9.matches(REGISTER).count(),
+            "a `{REGISTER}` in peer.rs outside the two pumps read here: name its pump in this test"
+        );
+    }
+
+    /// #3918 — the field [`names_a_capture_off_x`] reads is
+    /// the one `peer::video_info_payload` writes, read from that fn's source
+    /// as compiled: a rename on either side fails here. The join tests build
+    /// their payloads with the same [`CAPTURE_ARM`] ([`info_naming`]).
+    #[test]
+    fn the_capture_arm_field_is_read_as_its_producer_spells_it() {
+        let producer = peer_fn("fn video_info_payload(");
+        let field = format!(r#","{CAPTURE_ARM}":""#);
+        assert_eq!(
+            producer.matches(&field).count(),
+            1,
+            "`{field}` in video_info_payload: {producer}"
+        );
+    }
+
+    /// #3918 — every capture arm, its wire spelling and the
+    /// join fact, pinned. A new arm does not compile until it is decided
+    /// ([`reads_x`]), a renamed X spelling shows, and whatever this build
+    /// cannot read fails closed: a marked owner's pipeline then takes no
+    /// joiner.
+    #[test]
+    fn every_capture_arm_is_decided_on_or_off_x_and_what_is_unknown_fails_closed() {
+        use crate::capture::CaptureArm;
+        for arm in EVERY_ARM {
+            assert_eq!(CaptureArm::from_wire(arm.wire()), Some(arm));
+            assert_eq!(arm.reads_an_x_server(), reads_x(arm), "{arm:?}");
+            assert_eq!(
+                names_a_capture_off_x(&info_naming(arm.wire())),
+                !reads_x(arm),
+                "{arm:?}"
+            );
+        }
+        assert_eq!(CaptureArm::X11.wire(), "x11");
+        for payload in [
+            info_naming("wayland-next"),
+            format!(r#"{{"t":"rc:video-info","{CAPTURE_ARM}":7}}"#),
+            r#"{"t":"rc:video-info","codec":"vp9"}"#.to_string(),
+            "not json".to_string(),
+            String::new(),
+        ] {
+            assert!(!names_a_capture_off_x(&payload), "{payload}");
+        }
+    }
+
+    /// #3918 — through `try_join` itself: a marked owner's
+    /// pipeline takes a joiner only while the capture its owner published is
+    /// known not to read an X server. Every arm ([`EVERY_ARM`]) joins as
+    /// [`reads_x`] decides it. Nothing published, a spelling this build does
+    /// not know, a republish as `x11`, a capture with no pixels and the start
+    /// of a reopen (the shared hook's builder, with the notices on or off)
+    /// all refuse; a republished arm off X joins again. An owner with no mark
+    /// takes joiners whatever its arm.
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    #[tokio::test]
+    async fn a_marked_owners_pipeline_takes_joiners_only_with_a_capture_known_off_x() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3918-EVERY-ARM");
+        let info = info_naming;
+        let down = crate::capture::CaptureUnavailable::virtual_desktop_down(
+            "this device's virtual desktop is down: its X server (Xvfb) exited",
+        );
+        let reopen = |p: &Pipeline, notices: bool| {
+            let no_dc = Arc::new(tokio::sync::Mutex::new(None));
+            drop(crate::peer::shared_media_waiting_hook_as(
+                ObjectId::new(),
+                no_dc,
+                p,
+                notices,
+            ));
+        };
+        // One case: a fresh pipeline of `owner`, `then` run on it, one joiner.
+        let joins = |owner: ObjectId, then: &dyn Fn(&Pipeline)| {
+            let p = Pipeline::register(key, owner);
+            then(&p);
+            let joined = try_join(key, sink(ObjectId::new()), 60);
+            let admitted = joined.is_some();
+            drop((joined, p));
+            admitted
+        };
+        let marked = ObjectId::new();
+        crate::input::mark_no_picture(marked);
+        // Every arm, as its capturer publishes it.
+        let by_arm: Vec<(&str, bool)> = EVERY_ARM
+            .iter()
+            .map(|arm| {
+                let wire = arm.wire();
+                (wire, joins(marked, &|p| p.publish_video_info(info(wire))))
+            })
+            .collect();
+        let cases = [
+            ("nothing published", joins(marked, &|_| {})),
+            (
+                "an unknown spelling",
+                joins(marked, &|p| p.publish_video_info(info("wayland-next"))),
+            ),
+            (
+                "portal, then x11",
+                joins(marked, &|p| {
+                    p.publish_video_info(info("portal"));
+                    p.publish_video_info(info("x11"));
+                }),
+            ),
+            (
+                "portal, then no pixels",
+                joins(marked, &|p| {
+                    p.publish_video_info(info("portal"));
+                    p.tell_unavailable(&down);
+                }),
+            ),
+            (
+                "portal, then a reopen starts",
+                joins(marked, &|p| {
+                    p.publish_video_info(info("portal"));
+                    reopen(p, true);
+                }),
+            ),
+            (
+                "portal, then a reopen starts with the notices off",
+                joins(marked, &|p| {
+                    p.publish_video_info(info("portal"));
+                    reopen(p, false);
+                }),
+            ),
+            (
+                "portal, a reopen, portal again",
+                joins(marked, &|p| {
+                    p.publish_video_info(info("portal"));
+                    reopen(p, true);
+                    p.publish_video_info(info("portal"));
+                }),
+            ),
+            (
+                "x11 under an owner with no mark",
+                joins(ObjectId::new(), &|p| p.publish_video_info(info("x11"))),
+            ),
+        ];
+        crate::input::x_follow::no_picture::forget(marked);
+        let decided: Vec<(&str, bool)> = EVERY_ARM
+            .iter()
+            .map(|&arm| (arm.wire(), !reads_x(arm)))
+            .collect();
+        assert_eq!(by_arm, decided, "a marked owner's pipeline, by its arm");
+        assert_eq!(
+            cases,
+            [
+                ("nothing published", false),
+                ("an unknown spelling", false),
+                ("portal, then x11", false),
+                ("portal, then no pixels", false),
+                ("portal, then a reopen starts", false),
+                ("portal, then a reopen starts with the notices off", false),
+                ("portal, a reopen, portal again", true),
+                ("x11 under an owner with no mark", true),
+            ]
+        );
+    }
+
+    /// #3918 — `ROOMLERD_INPUT_X11_FOLLOW=0`, the
+    /// operator's way back, through the join itself: a marked owner's
+    /// pipeline with nothing published of its capture takes a joiner as on
+    /// master; with the switch on it takes none. The switch is set on this
+    /// thread only (`x_follow::test_seam::follow`), and `try_join` reads it
+    /// as production does, through `input::has_no_picture`.
+    #[cfg(all(target_os = "linux", feature = "enigo-input"))]
+    #[tokio::test]
+    async fn with_the_switch_off_a_marked_owners_pipeline_takes_a_joiner() {
+        use crate::input::x_follow::{no_picture, test_seam};
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3918-SWITCH");
+        let marked = ObjectId::new();
+        crate::input::mark_no_picture(marked);
+        let joins = |on: bool| {
+            let _switch = test_seam::follow(on);
+            let p = Pipeline::register(key, marked);
+            let joined = try_join(key, sink(ObjectId::new()), 60);
+            let admitted = joined.is_some();
+            drop((joined, p));
+            admitted
+        };
+        let off = joins(false);
+        let on = joins(true);
+        no_picture::forget(marked);
+        assert!(
+            off,
+            "with the switch off a marked owner's pipeline took no joiner"
+        );
+        assert!(
+            !on,
+            "with the switch on a marked owner's pipeline with nothing published took a joiner"
+        );
+    }
+
+    /// #3671 — a retire touches only what was registered when it ran: it
+    /// takes the pipeline registered before it (closed to joins, its entry
+    /// removed), a pipeline registered after it takes joiners, and a second
+    /// retire with nothing registered in between retires nothing. The first
+    /// count is "at least one", because another test's pipeline can still be
+    /// registered as this one starts and is retired with it; `before`'s own
+    /// state is what shows that the retire took it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retire_leaves_what_registers_after_it_and_a_second_one_retires_nothing() {
+        let _s = serial();
+        let before_key = PipelineKey::FfmpegDc("TEST-3671-BEFORE");
+        let before = Pipeline::register(before_key, ObjectId::new());
+        assert!(retire_all() >= 1, "the first retire found no pipeline");
+        assert!(
+            before.inner.lock().unwrap().closed,
+            "the first retire left the pipeline registered before it open to joins"
+        );
+        assert!(
+            !registry().lock().unwrap().contains_key(&before_key),
+            "the first retire left the entry of the pipeline registered before it"
+        );
+        assert_eq!(retire_all(), 0, "a second retire found a pipeline");
+        let key = PipelineKey::FfmpegDc("TEST-3671-AFTER");
+        let after = Pipeline::register(key, ObjectId::new());
+        let joined = try_join(key, sink(ObjectId::new()), 60)
+            .expect("a pipeline registered after the retire takes joiners");
+        assert!(!after.inner.lock().unwrap().closed);
+        assert_eq!(after.follower_count(), 1);
+        drop((joined, after, before));
     }
 }

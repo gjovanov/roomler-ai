@@ -655,6 +655,10 @@ fn service_sync_enabled() -> bool {
 /// counts as reportable, so the field's absence never stands for "could not
 /// tell". #3814: with whether the retry is off where it runs
 /// ([`retry_off_where_it_runs`]), read only for a tray reported too old.
+///
+/// #3908 — the tray's version is the one the refresh goes by
+/// ([`known_beside`]): the EXE's own when the marker does not name this
+/// daemon's.
 #[cfg(target_os = "windows")]
 pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
     if !pipe_refuses_old_companions() {
@@ -663,27 +667,47 @@ pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
     let dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
-    let (exe_present, marker) = match &dir {
-        Some(dir) => (
-            dir.join(DESKTOP_EXE).try_exists().unwrap_or(true),
-            std::fs::read_to_string(dir.join(VERSION_MARKER)).ok(),
-        ),
-        // No folder of its own to look in: a tray of unknown version.
-        None => (true, None),
-    };
     let by_service =
         crate::supervision::current() == Some(crate::supervision::Supervision::WindowsScm);
-    too_old_to_connect(exe_present, true, marker.as_deref(), by_service).map(|reported| {
-        tunnel_core::localapi::CompanionTooOld {
-            retry_off: retry_off_where_it_runs(
-                by_service,
-                crate::win_identity::own_token_is_local_system(),
-                sync_enabled,
-                service_sync_enabled,
-            ),
-            ..reported
-        }
+    too_old_beside(
+        dir.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        by_service,
+        &EXE_VERSIONS,
+    )
+    .map(|reported| tunnel_core::localapi::CompanionTooOld {
+        retry_off: retry_off_where_it_runs(
+            by_service,
+            crate::win_identity::own_token_is_local_system(),
+            sync_enabled,
+            service_sync_enabled,
+        ),
+        ..reported
     })
+}
+
+/// #3908 — [`too_old_to_connect`] for the companion in `dir`, by the version
+/// [`known_beside`] knows for it now. `None` for `dir`: no folder of its own
+/// to look in, so a tray of unknown version. With no EXE there is no tray to
+/// refuse, and nothing is read.
+#[cfg(target_os = "windows")]
+fn too_old_beside(
+    dir: Option<&std::path::Path>,
+    own: &str,
+    by_service: bool,
+    versions: &'static ExeVersions,
+) -> Option<tunnel_core::localapi::CompanionTooOld> {
+    let (exe_present, version) = match dir {
+        Some(dir) => {
+            let present = dir.join(DESKTOP_EXE).try_exists().unwrap_or(true);
+            let version = present
+                .then(|| known_beside(dir, own, versions).version)
+                .flatten();
+            (present, version)
+        }
+        None => (true, None),
+    };
+    too_old_to_connect(exe_present, true, version.as_deref(), by_service)
 }
 
 /// #3781 — does this daemon's pipe refuse a companion older than
@@ -727,6 +751,127 @@ async fn sibling_version() -> Option<String> {
         })
     });
     tokio::time::timeout(LOOK_WAIT, read).await.ok()?.ok()?
+}
+
+/// #3908 — what the companion EXE beside this daemon states in its own
+/// version resource, for the readers that may not wait for that read:
+/// `roomler status` ([`too_old_here`]) and the heartbeat
+/// ([`installed_version`]). One for the process, shared by both.
+#[cfg(target_os = "windows")]
+static EXE_VERSIONS: ExeVersions = ExeVersions::new("companion-ver", exe_version);
+
+/// #3908 — the EXE's version as its last read stated it, for the files that
+/// read was made for ([`Stamp`]), and the read itself ([`exe_version`] in the
+/// daemon): on a thread of its own, one at a time
+/// ([`crate::one_in_flight::OneInFlight`]), waited for by nobody. A read that
+/// hangs (a filter driver holding the EXE) holds that one thread however
+/// often the readers ask, and they answer from the marker meanwhile.
+#[cfg(target_os = "windows")]
+struct ExeVersions {
+    read: fn(&std::path::Path) -> Option<String>,
+    /// The last read's answer and the files it was made for. Locked only to
+    /// look at it or to replace it, never across a read.
+    last: std::sync::Mutex<Option<(Stamp, Option<String>)>>,
+    reads: crate::one_in_flight::OneInFlight<()>,
+}
+
+#[cfg(target_os = "windows")]
+impl ExeVersions {
+    const fn new(thread_name: &'static str, read: fn(&std::path::Path) -> Option<String>) -> Self {
+        Self {
+            read,
+            last: std::sync::Mutex::new(None),
+            reads: crate::one_in_flight::OneInFlight::new(thread_name),
+        }
+    }
+
+    /// What the EXE in `dir` states, as read for the files there now, and
+    /// never a wait: `None` when no read was made for them yet. The read then
+    /// starts, unless one is running, and its answer is kept as it ends.
+    fn now(&'static self, dir: &std::path::Path) -> Option<Option<String>> {
+        let stamp = Stamp::of(dir);
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((read_for, stated)) = last
+            && read_for == stamp
+        {
+            return Some(stated);
+        }
+        let (read, exe) = (self.read, dir.join(DESKTOP_EXE));
+        self.reads.start_unless_running(move || {
+            let stated = read(&exe);
+            *self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stamp, stated));
+        });
+        None
+    }
+
+    /// Once the read running now, if any, has ended: a test's folder is
+    /// removed with nothing in it mapped.
+    #[cfg(test)]
+    fn drained(&self) {
+        let _ = self
+            .reads
+            .ask_blocking(std::time::Duration::from_secs(10), || ());
+    }
+}
+
+/// #3908 — the files a read of the EXE's version was made for: the marker's
+/// last write, and the EXE's last write and size. A swap whose marker write
+/// fails changes the EXE and not the marker, so the marker's alone would keep
+/// the version read before that swap for the process's life.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    marker: Option<std::time::SystemTime>,
+    exe: Option<(std::time::SystemTime, u64)>,
+}
+
+#[cfg(target_os = "windows")]
+impl Stamp {
+    fn of(dir: &std::path::Path) -> Self {
+        let written = |name: &str| {
+            let meta = std::fs::metadata(dir.join(name)).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        };
+        Self {
+            marker: written(VERSION_MARKER).map(|(at, _)| at),
+            exe: written(DESKTOP_EXE),
+        }
+    }
+}
+
+/// #3908 — the companion's version as [`known_beside`] reads it now.
+/// `settled` is false while the EXE's version, which the answer needs, is
+/// still being read: the answer is then the marker's.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BesideNow {
+    version: Option<String>,
+    settled: bool,
+}
+
+/// #3908 — the companion's version in `dir` by the refresh's rule
+/// ([`known_version`], #3850), for the readers that may not wait: the marker
+/// when it names `own` (one small file read, the common case); else what the
+/// EXE states, as `versions` read it for the files there now; else the
+/// marker's own words. With no answer for those files yet, the marker's
+/// words, not settled, and the read starts.
+#[cfg(target_os = "windows")]
+fn known_beside(dir: &std::path::Path, own: &str, versions: &'static ExeVersions) -> BesideNow {
+    let marker = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok();
+    let mut settled = true;
+    let version = known_version(own, marker.as_deref(), || {
+        let stated = versions.now(dir);
+        settled = stated.is_some();
+        stated.flatten()
+    });
+    BesideNow { version, settled }
 }
 
 /// #3850 — the version the EXE at `exe` states in its own version resource
@@ -997,9 +1142,13 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// is the difference between a diagnosable refusal and a mystery.
 ///
 /// ⚠️ Rate-limited process-wide. A burst of session requests must not turn into
-/// a burst of `launchctl kickstart` / `CreateProcessAsUserW` calls; one attempt
-/// per [`ENSURE_COOLDOWN`] is plenty, since a launch that works is visible
-/// within a second and one that doesn't will not work any better on retry.
+/// a burst of `launchctl kickstart` / `CreateProcessAsUserW` calls. A verdict
+/// that cannot change soon stands [`ENSURE_COOLDOWN`]: a tray that is up (a
+/// launch that works is visible within a second), or no companion on this
+/// host. #3884 — a start that failed or ran out of its wait stands
+/// [`ENSURE_RETRY_AFTER_ERROR`] only: it goes on on its thread and may bring
+/// the tray up just after, and the person may sign in meanwhile, so the prompt
+/// that refusal invites looks again.
 /// Returns whether a human can now, in fact, be shown a prompt on this host.
 ///
 /// The caller reports `no_prompt_surface` on `false`, which is why this is a
@@ -1007,27 +1156,19 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// report a TIMEOUT, and "nobody answered in 30 s" and "there is nobody to
 /// ask, and there never was" need different things done about them.
 pub async fn ensure_running() -> bool {
-    use std::sync::Mutex;
-    use std::time::Instant;
-    // Both halves of the rate limit: when we last tried, and what we concluded.
-    // A cooldown that returned an optimistic default would report a surface
-    // that does not exist — worse than not rate-limiting at all.
-    static LAST: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-
-    if let Some((at, verdict)) = *LAST.lock().unwrap()
-        && at.elapsed() < ENSURE_COOLDOWN
-    {
-        return verdict;
+    let verdicts = ensure_verdicts();
+    if let Some(up) = verdicts.standing() {
+        return up;
     }
 
-    let verdict = match ensure_running_inner().await {
+    let (up, stands) = match ensure_running_inner().await {
         Ok(EnsureOutcome::AlreadyRunning) => {
             tracing::debug!("desktop companion is already running");
-            true
+            (true, ENSURE_COOLDOWN)
         }
         Ok(EnsureOutcome::Started) => {
             tracing::info!("started the desktop companion for a prompt");
-            true
+            (true, ENSURE_COOLDOWN)
         }
         Ok(EnsureOutcome::Unsupported) => {
             tracing::info!(
@@ -1035,22 +1176,125 @@ pub async fn ensure_running() -> bool {
                  answer with `roomlerd consent --list` / `--approve`, or set this device to \
                  email/push consent"
             );
-            false
+            (false, ENSURE_COOLDOWN)
         }
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
+                asks_again_in = ?ENSURE_RETRY_AFTER_ERROR,
                 "could not start the desktop companion — an on-screen prompt is not possible"
             );
-            false
+            (false, ENSURE_RETRY_AFTER_ERROR)
         }
     };
-    *LAST.lock().unwrap() = Some((Instant::now(), verdict));
-    verdict
+    verdicts.keep(up, stands);
+    up
 }
 
-/// One attempt per this interval, process-wide.
+/// One attempt per this interval, process-wide, after a verdict that cannot
+/// change soon: the tray is up, or there is no companion on this host.
 const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// #3884 — how long a start that failed, or ran out of its wait, stands: a few
+/// seconds, not [`ENSURE_COOLDOWN`]. Such a start goes on on its thread and may
+/// bring the tray up just after, and the person may sign in meanwhile, so the
+/// prompt the refusal invites asks again. Under the 2.5 s the start waits
+/// (`TRAY_START_WAIT`): a start that ran out of time answers 2.5 s after its
+/// prompt and stands until 4.5 s, so a prompt 5 s after that one asks afresh.
+/// Still a rate limit: the prompts in a burst after a failure are answered
+/// from it, with no start of their own, and one that asks while a start still
+/// hangs joins that start (`TRAY_STARTS`, one in flight).
+const ENSURE_RETRY_AFTER_ERROR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// #3884 — [`ensure_running`]'s last verdict, and how long it stands: both
+/// halves of the rate limit. A cooldown that returned an optimistic default
+/// would report a surface that does not exist — worse than not rate-limiting
+/// at all.
+struct EnsureVerdicts(std::sync::Mutex<Option<EnsureVerdict>>);
+
+/// A verdict of [`ensure_running`]: when it was reached, whether the companion
+/// is up, and how long that stands.
+#[derive(Debug, Clone, Copy)]
+struct EnsureVerdict {
+    at: std::time::Instant,
+    up: bool,
+    stands: std::time::Duration,
+}
+
+impl EnsureVerdicts {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// The last verdict, while it stands.
+    fn standing(&self) -> Option<bool> {
+        let last = *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        last.filter(|v| v.at.elapsed() < v.stands).map(|v| v.up)
+    }
+
+    /// `up`, standing `stands` from now.
+    fn keep(&self, up: bool, stands: std::time::Duration) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(EnsureVerdict {
+            at: std::time::Instant::now(),
+            up,
+            stands,
+        });
+    }
+}
+
+/// The verdicts [`ensure_running`] keeps: the daemon's, or under a test's
+/// stand-in ([`tray_stand_in`]) that test's own.
+fn ensure_verdicts() -> &'static EnsureVerdicts {
+    static VERDICTS: EnsureVerdicts = EnsureVerdicts::new();
+    #[cfg(all(test, any(target_os = "windows", unix)))]
+    if let Some(stood) = tray_stand_in::now() {
+        return stood.verdicts;
+    }
+    &VERDICTS
+}
+
+/// #3888 — the companion's start for a consent prompt, as the WS loop asks
+/// for it ([`ensure_running`], [`crate::signaling::COMPANION_START_BUDGET`]
+/// at most): STARTED, on a task of its own, and never waited for here. The
+/// start asks other processes (logind, the process list, launchd), and the
+/// loop reads its next frame meanwhile. Its verdict is the session's consent
+/// task's to wait for ([`Starting::up`]), before the question's window
+/// starts, so a start that failed or ran out of time is still
+/// `no_prompt_surface`, as when the loop waited for it.
+pub(crate) async fn start_for_prompt() -> Starting {
+    let start = tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running());
+    // A test stands the tray's start in for its own task; the start runs on a
+    // task of its own, so the stand-in goes with it.
+    #[cfg(all(test, any(target_os = "windows", unix)))]
+    let start = {
+        let stood = tray_stand_in::now();
+        async move {
+            match stood {
+                Some(stood) => tray_stand_in::asking(stood, start).await,
+                None => start.await,
+            }
+        }
+    };
+    Starting(tokio::spawn(async move { start.await.unwrap_or(false) }))
+}
+
+/// #3888 — a companion's start for a prompt ([`start_for_prompt`]).
+pub(crate) struct Starting(tokio::task::JoinHandle<bool>);
+
+impl Starting {
+    /// Whether the companion is up to show the question: its start's
+    /// verdict. `false` for a start that failed, that did not answer within
+    /// its budget, or that ended with no answer.
+    pub(crate) async fn up(self) -> bool {
+        self.0.await.unwrap_or(false)
+    }
+}
 
 /// Whether the desktop companion can show a consent question, and a
 /// recording's banner. A remote recording asks through it, and so does an SSH
@@ -1111,20 +1355,46 @@ impl Companion {
 /// ⚠️ Deliberately does NOT run the companion binary. `--version` on a GUI
 /// binary is a process spawn on every heartbeat and, on Linux, a GTK-linked
 /// executable started by a root daemon with no display; both are worse than a
-/// file read. Every arm reads metadata the installer already wrote.
+/// file read. Every arm reads metadata the installer already wrote. #3908: on
+/// Windows that includes the EXE's own version resource, mapped as data on a
+/// thread of its own, never run.
 ///
 /// Cached for [`VERSION_TTL`]: the answer only changes when a package manager
-/// runs, and the heartbeat is every 30 s.
+/// runs, and the heartbeat is every 30 s. #3908: an answer that is not
+/// settled is not kept ([`kept_version`]).
 pub fn installed_version() -> Option<String> {
-    use std::time::Instant;
+    kept_version(&VERSION_CACHE, || {
+        #[cfg(target_os = "windows")]
+        {
+            let now = installed_version_inner();
+            (now.version, now.settled)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            (installed_version_inner(), true)
+        }
+    })
+}
 
-    if let Some((at, ref v)) = *VERSION_CACHE.lock().unwrap()
+/// [`installed_version`] over `cache`: the answer it holds while that is
+/// younger than [`VERSION_TTL`], else `read`'s. #3908: `read`'s is kept only
+/// when it says the answer is settled. A Windows answer from the marker while
+/// the EXE's version is still being read goes out once, and the next
+/// heartbeat reads again, instead of sending the marker's version for ten
+/// minutes after each start.
+fn kept_version(
+    cache: &std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
+    read: impl FnOnce() -> (Option<String>, bool),
+) -> Option<String> {
+    if let Some((at, ref v)) = *cache.lock().unwrap()
         && at.elapsed() < VERSION_TTL
     {
         return v.clone();
     }
-    let v = installed_version_inner();
-    *VERSION_CACHE.lock().unwrap() = Some((Instant::now(), v.clone()));
+    let (v, settled) = read();
+    if settled {
+        *cache.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+    }
     v
 }
 
@@ -1142,17 +1412,35 @@ pub(crate) fn forget_installed_version() {
     *VERSION_CACHE.lock().unwrap() = None;
 }
 
-/// Windows: the sidecar marker [`refresh_if_stale`] writes on every swap. A
-/// wizard-placed EXE with no marker reads as `None`, which is honest — the
-/// daemon genuinely does not know what version it is until it swaps it once.
+/// Windows: the version the refresh goes by (#3908, [`known_beside`]): the
+/// sidecar marker [`refresh_if_stale`] writes on every swap when it names
+/// this daemon's version, else what the EXE states in its own version
+/// resource, else the marker's words. `None` with no EXE, or when neither
+/// names a version.
 #[cfg(target_os = "windows")]
-fn installed_version_inner() -> Option<String> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+fn installed_version_inner() -> BesideNow {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return BesideNow {
+            version: None,
+            settled: true,
+        };
+    };
+    installed_beside(&dir, env!("CARGO_PKG_VERSION"), &EXE_VERSIONS)
+}
+
+/// #3908 — [`installed_version`]'s answer for the companion in `dir`.
+#[cfg(target_os = "windows")]
+fn installed_beside(dir: &std::path::Path, own: &str, versions: &'static ExeVersions) -> BesideNow {
     if !dir.join(DESKTOP_EXE).exists() {
-        return None;
+        return BesideNow {
+            version: None,
+            settled: true,
+        };
     }
-    let raw = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok()?;
-    sanitize_version(&raw)
+    known_beside(dir, own, versions)
 }
 
 /// macOS: `CFBundleShortVersionString` out of the app bundle's `Info.plist`.
@@ -1228,7 +1516,7 @@ fn sanitize_version(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod version_tests {
-    use super::sanitize_version;
+    use super::{kept_version, sanitize_version};
 
     #[test]
     fn blank_and_whitespace_are_absent_not_empty() {
@@ -1254,6 +1542,30 @@ mod version_tests {
             Some("scriptalert1script".into())
         );
         assert_eq!(sanitize_version(&"9".repeat(200)).unwrap().len(), 32);
+    }
+
+    /// #3908 — the heartbeat keeps an answer for `VERSION_TTL` only once it
+    /// is settled. One read from the marker while the EXE's version is still
+    /// being read goes out once, and the next heartbeat reads again.
+    ///
+    /// Red before #3908: every answer was kept, so the marker's version went
+    /// out for ten minutes after each start.
+    #[test]
+    fn the_heartbeat_keeps_only_a_settled_answer() {
+        let cache = std::sync::Mutex::new(None);
+        assert_eq!(
+            kept_version(&cache, || (Some("0.4.212".into()), false)).as_deref(),
+            Some("0.4.212")
+        );
+        assert_eq!(
+            kept_version(&cache, || (Some("0.4.223".into()), true)).as_deref(),
+            Some("0.4.223"),
+            "the marker's answer was not kept"
+        );
+        assert_eq!(
+            kept_version(&cache, || panic!("a settled answer is kept")).as_deref(),
+            Some("0.4.223")
+        );
     }
 }
 
@@ -1531,7 +1843,7 @@ impl TraySteps {
 /// The Windows tray's start, blocking, on the start in flight's thread: its
 /// steps in the order the start has always taken them, each recorded in `at`
 /// as it begins. `Started` only when the process was created
-/// ([`started_outcome`]).
+/// ([`started_outcome`]). The companion is told it is for a prompt (#3887).
 #[cfg(target_os = "windows")]
 fn start_tray(
     steps: &TraySteps,
@@ -1550,16 +1862,16 @@ fn start_tray(
         // about which of the two happened.
         return Ok(EnsureOutcome::Unsupported);
     };
-    // A SYSTEM daemon has no desktop of its own — the companion has to be
-    // launched INTO the interactive session, which is exactly what the
-    // update-respawn path already does.
+    // A SYSTEM daemon has no desktop of its own: the companion is launched INTO the interactive
+    // session, as the update respawn does. #3887: for a prompt, so the tour waits for the person.
+    let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG];
     step(TrayStep::Context);
     let ctx = (steps.context)();
     step(match ctx {
         RespawnContext::SystemService => TrayStep::StartInSession,
         RespawnContext::UserSession => TrayStep::StartHere,
     });
-    started_outcome((steps.start)(ctx, &dest, &[])).map_err(|e| format!("{e:#}"))
+    started_outcome((steps.start)(ctx, &dest, &args)).map_err(|e| format!("{e:#}"))
 }
 
 /// The tray beside this daemon, when it is installed there.
@@ -1947,7 +2259,7 @@ impl TraySteps {
 
 /// The Linux tray's start, blocking, on the start in flight's thread: its
 /// steps in the order the start has always taken them, each recorded in `at`
-/// as it begins. `Started` only when systemd-run exited 0.
+/// as it begins. `Started` only when systemd-run exited 0. For a prompt (#3887).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn start_tray(
     steps: &TraySteps,
@@ -1976,9 +2288,9 @@ fn start_tray(
     if (steps.running)(sess.uid) {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
-    // #2713 — a root daemon's system unit carries the desktop session's own
-    // environment ([`systemd_run_command`]); a per-user daemon's `--user`
-    // unit inherits its manager's.
+    let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG]; // #3887: for a prompt
+    // #2713 — a root daemon's system unit carries the desktop session's own environment
+    // ([`systemd_run_command`]); a per-user daemon's `--user` unit inherits its manager's.
     let session_env = if steps.user_manager {
         Vec::new()
     } else {
@@ -1987,7 +2299,7 @@ fn start_tray(
             .map(|text| session_env_pairs(&text))
             .unwrap_or_default()
     };
-    let cmd = systemd_run_command_with(&sess, &path, &[], steps.user_manager, &session_env);
+    let cmd = systemd_run_command_with(&sess, &path, &args, steps.user_manager, &session_env);
     step(TrayStep::SystemdRun);
     let out = (steps.systemd_run)(cmd).map_err(|e| format!("spawning systemd-run: {e}"))?;
     if !out.status.success() {
@@ -2017,12 +2329,14 @@ const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(25
 /// own starts, are never stood in.
 #[cfg(all(test, any(target_os = "windows", unix)))]
 mod tray_stand_in {
-    use super::{TrayStarts, TraySteps};
+    use super::{EnsureVerdicts, TrayStarts, TraySteps};
 
     #[derive(Clone)]
     pub(super) struct StandIn {
         pub(super) steps: TraySteps,
         pub(super) starts: &'static TrayStarts,
+        /// #3884 — [`super::ensure_running`]'s verdicts, of this test's own.
+        pub(super) verdicts: &'static EnsureVerdicts,
     }
 
     impl StandIn {
@@ -2030,6 +2344,7 @@ mod tray_stand_in {
             Self {
                 steps,
                 starts: Box::leak(Box::new(TrayStarts::new("tray-start"))),
+                verdicts: Box::leak(Box::new(EnsureVerdicts::new())),
             }
         }
     }
@@ -2064,12 +2379,18 @@ mod tray_start_tests {
     use super::tray_stand_in::{StandIn, asking};
     use super::*;
     #[cfg(all(unix, not(target_os = "macos")))]
+    use on_linux::host_steps;
+    #[cfg(all(unix, not(target_os = "macos")))]
     use on_linux::{COMPANION, HELD, steps};
+    #[cfg(target_os = "macos")]
+    use on_mac::host_steps;
     #[cfg(target_os = "macos")]
     use on_mac::{HELD, steps};
     #[cfg(target_os = "windows")]
+    use on_windows::host_steps;
+    #[cfg(target_os = "windows")]
     use on_windows::{DEST, HELD, steps};
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use std::sync::{Arc, Condvar, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
@@ -2331,13 +2652,394 @@ mod tray_start_tests {
         assert_eq!(held.began(), 2, "the held start, and the next ask's own");
     }
 
-    /// The control on Linux: a start whose steps answer in time does what it
-    /// always did. A root daemon starts the tray through the system manager
-    /// as the person, with the session's allowlisted environment; a per-user
-    /// daemon through its own manager, without reading it. A tray already
-    /// running, no companion installed, nobody at the screen and a failed
-    /// systemd-run answer as before, and only a systemd-run that exited 0 is
-    /// `Started`.
+    /// #3884, #3888 — a host the tray's start runs on, as each OS's
+    /// `host_steps` stands it in: whether the companion is installed, whether
+    /// someone is signed in at the screen, and whether the tray runs, which a
+    /// start that works brings about. The start itself (systemd-run, the
+    /// process start, launchctl) waits for `held` when there is one. Each
+    /// start is counted at its first step.
+    #[derive(Clone, Default)]
+    struct Host {
+        not_installed: Arc<AtomicBool>,
+        nobody: Arc<AtomicBool>,
+        up: Arc<AtomicBool>,
+        held: Option<Held>,
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl Host {
+        /// The starts that began.
+        fn starts(&self) -> usize {
+            self.starts.load(SeqCst)
+        }
+
+        /// Whether the tray runs.
+        fn up(&self) -> bool {
+            self.up.load(SeqCst)
+        }
+    }
+
+    /// What [`ensure_running`] answered a prompt, as a task on `rt` taking
+    /// `stood`'s steps, starts in flight and verdicts, and how long that
+    /// took: waited for `bound` at most from THIS thread.
+    fn ensure_on_a_worker(
+        rt: &tokio::runtime::Runtime,
+        stood: &StandIn,
+        bound: Duration,
+    ) -> std::result::Result<(bool, Duration), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = Instant::now();
+        rt.spawn(asking(stood.clone(), async move {
+            let up = ensure_running().await;
+            let _ = tx.send((up, asked.elapsed()));
+        }));
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("no answer within {bound:?}"))
+    }
+
+    /// #3884 — a start that ran out of its wait goes on on its thread, and
+    /// here brings the tray up just after. The prompt the refusal invites, a
+    /// few seconds later ([`ENSURE_RETRY_AFTER_ERROR`]), asks again and finds
+    /// the tray up, so its question shows.
+    ///
+    /// Red before #3884: the refusal stood [`ENSURE_COOLDOWN`], 20 s, and that
+    /// prompt was answered `false` from it, with no look.
+    #[test]
+    fn a_prompt_after_a_start_that_ran_out_of_time_finds_the_tray_it_brought_up() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let host = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let stood = StandIn::new(host_steps(&host));
+        let (up, waited) = ensure_on_a_worker(&rt, &stood, TRAY_START_WAIT + SLACK)
+            .expect("a start that runs out of time is answered within its wait");
+        assert!(!up, "a start that ran out of time shows no question");
+        assert!(
+            waited >= TRAY_START_WAIT,
+            "the start was waited for: {waited:?}"
+        );
+        // The start goes on, and brings the tray up.
+        held.open();
+        let opened = Instant::now();
+        while !host.up() {
+            assert!(
+                opened.elapsed() < RUNS_WITHIN,
+                "the late start never brought the tray up"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(ENSURE_RETRY_AFTER_ERROR);
+        let (up, _) =
+            ensure_on_a_worker(&rt, &stood, RUNS_WITHIN).expect("the next prompt is answered");
+        assert!(
+            up,
+            "a prompt a few seconds later finds the tray the late start brought up"
+        );
+        assert_eq!(
+            host.starts(),
+            2,
+            "it asked again: the start that ran out of time, then its own"
+        );
+    }
+
+    /// #3884 — with nobody at the screen the start fails. A prompt right
+    /// after it is answered from that verdict, with no start of its own: a
+    /// failure is still rate-limited. A few seconds on
+    /// ([`ENSURE_RETRY_AFTER_ERROR`]) a prompt asks again, finds the person
+    /// who signed in meanwhile, and the tray is started for them.
+    ///
+    /// Red before #3884: the failure stood 20 s.
+    #[test]
+    fn a_failed_start_is_tried_again_after_a_few_seconds_not_per_prompt() {
+        let rt = runtime();
+        let host = Host::default();
+        host.nobody.store(true, SeqCst);
+        let stood = StandIn::new(host_steps(&host));
+        let ask = || {
+            ensure_on_a_worker(&rt, &stood, RUNS_WITHIN)
+                .expect("a prompt is answered")
+                .0
+        };
+        assert!(!ask(), "nobody at the screen: no question shows");
+        assert_eq!(host.starts(), 1);
+        assert!(!ask(), "a prompt at once is answered from that start");
+        assert_eq!(host.starts(), 1, "with no start of its own");
+        host.nobody.store(false, SeqCst);
+        std::thread::sleep(ENSURE_RETRY_AFTER_ERROR);
+        assert!(
+            ask(),
+            "a prompt a few seconds later finds the person who signed in"
+        );
+        assert_eq!(host.starts(), 2, "it asked again");
+        assert!(host.up(), "and the tray was started for them");
+    }
+
+    /// #3884 — the control: what cannot change soon stands
+    /// [`ENSURE_COOLDOWN`], past a failure's few seconds, and no prompt in it
+    /// starts anything. On a host with no companion the answer stays `false`,
+    /// and with the tray up it stays `true`.
+    #[test]
+    fn no_companion_and_a_tray_that_is_up_stand_with_no_start_per_prompt() {
+        let rt = runtime();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let none_stood = StandIn::new(host_steps(&none));
+        let up = Host::default();
+        up.up.store(true, SeqCst);
+        let up_stood = StandIn::new(host_steps(&up));
+        let ask = |stood: &StandIn| {
+            ensure_on_a_worker(&rt, stood, RUNS_WITHIN)
+                .expect("a prompt is answered")
+                .0
+        };
+        assert!(!ask(&none_stood), "no companion: no question shows");
+        assert!(ask(&up_stood), "the tray is up: the question shows");
+        std::thread::sleep(ENSURE_RETRY_AFTER_ERROR + SLACK);
+        assert!(!ask(&none_stood), "still no companion");
+        assert!(ask(&up_stood), "still up");
+        assert_eq!(
+            none.starts(),
+            1,
+            "no companion is not looked for again per prompt"
+        );
+        assert_eq!(
+            up.starts(),
+            1,
+            "a tray that is up is not looked for again per prompt"
+        );
+    }
+
+    /// An RC prompt's question, open for 30 s.
+    fn rc_view(session_hex: &str) -> crate::indicator::PromptView {
+        crate::indicator::PromptView {
+            session_hex: session_hex.into(),
+            title: "Remote control request".into(),
+            lead: "Alice is requesting to control this device.".into(),
+            detail: String::new(),
+            permissions: "VIEW|INPUT".into(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    /// #3888 — while the tray's start is held, the WS loop handles its next
+    /// frame at once: it starts the companion's start ([`start_for_prompt`])
+    /// and hands it to the consent task, which hears within the start's wait
+    /// that no companion came up. The loop and the consent task are modelled
+    /// as they run, as #3857's tests model them: a frame is handled before the
+    /// next one is read.
+    ///
+    /// Red before #3888: the loop waited for the start, up to its 2.5 s wait,
+    /// and read no frame meanwhile.
+    #[test]
+    fn the_loop_handles_its_next_frame_while_the_tray_start_is_held() {
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let host = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let stood = StandIn::new(host_steps(&host));
+        let (frames, mut frames_rx) = tokio::sync::mpsc::channel::<Option<u32>>(4);
+        let (handled_tx, handled) = std::sync::mpsc::channel::<(u32, Instant)>();
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<(bool, Duration)>();
+        rt.spawn(asking(stood, async move {
+            // The WS loop, as far as it goes here. `None` is an RC request
+            // whose question no native panel shows.
+            while let Some(frame) = frames_rx.recv().await {
+                let Some(n) = frame else {
+                    let asked = Instant::now();
+                    let starting = start_for_prompt().await;
+                    // The consent task.
+                    let verdict_tx = verdict_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = verdict_tx.send((starting.up().await, asked.elapsed()));
+                    });
+                    continue;
+                };
+                let _ = handled_tx.send((n, Instant::now()));
+            }
+        }));
+        frames.blocking_send(None).expect("the loop reads frames");
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(
+                asked.elapsed() < RUNS_WITHIN,
+                "no start reached the held step"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let sent = Instant::now();
+        frames
+            .blocking_send(Some(7))
+            .expect("the loop reads frames");
+        let (n, at) = handled
+            .recv_timeout(crate::signaling::COMPANION_START_BUDGET + SLACK)
+            .expect("a frame sent while the tray's start is held is handled");
+        assert_eq!(n, 7);
+        assert!(
+            at.duration_since(sent) < AT_ONCE,
+            "the frame waited {:?} behind the tray's start",
+            at.duration_since(sent)
+        );
+        let (up, waited) = verdict
+            .recv_timeout(crate::signaling::COMPANION_START_BUDGET + SLACK)
+            .expect("the consent task hears within the start's budget");
+        assert!(!up, "a start held past its wait is no companion");
+        assert!(
+            waited >= TRAY_START_WAIT,
+            "the verdict came in {waited:?}, before the start's wait"
+        );
+    }
+
+    /// #3888 — a start that fails, or runs out of its wait, is still
+    /// `no_prompt_surface` once the window is out, never a timeout: the
+    /// consent task waits for its verdict before the window starts
+    /// ([`crate::signaling::rc_surfaces_up`]). The control beside them: a
+    /// start that works is a surface, and the window's end is then the
+    /// person's timeout.
+    #[test]
+    fn a_start_that_fails_or_runs_out_of_time_is_still_no_prompt_surface() {
+        use crate::consent::Decision;
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let ran_out = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let failed = Host::default();
+        failed.nobody.store(true, SeqCst);
+        let works = Host::default();
+        // No notification: the companion's verdict alone decides.
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let reason_at_the_windows_end = |host: &Host| {
+            let ind = ind.clone();
+            rt.block_on(asking(StandIn::new(host_steps(host)), async move {
+                // The loop's side.
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("f6"))),
+                    mark_up: None,
+                };
+                // The consent task's.
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "f6", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }))
+        };
+        assert_eq!(
+            reason_at_the_windows_end(&ran_out),
+            Some(ConsentDenyReason::NoPromptSurface),
+            "a start that ran out of time: nobody could be asked"
+        );
+        assert_eq!(
+            reason_at_the_windows_end(&failed),
+            Some(ConsentDenyReason::NoPromptSurface),
+            "a start that failed: nobody could be asked"
+        );
+        assert_eq!(
+            reason_at_the_windows_end(&works),
+            Some(ConsentDenyReason::HostTimeout),
+            "a start that worked: nobody answered"
+        );
+    }
+
+    /// #3888 — a question withdrawn while the tray's start is held (a
+    /// `Terminate` the loop reads meanwhile, which finds nothing on the screen
+    /// to take down) gets no notification once the start runs out of time: no
+    /// show starts for it, so logind is not even asked, and nothing comes up.
+    ///
+    /// The loop used to read no frame while the start ran, so no question
+    /// could end then.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    #[test]
+    fn a_question_withdrawn_while_the_tray_start_is_held_gets_no_notification() {
+        use super::session_walk_stand_in as walk;
+        let rt = runtime();
+        let held = Held::default();
+        let _opened = OpenedAtTheEnd(held.clone());
+        let host = Host {
+            held: Some(held.clone()),
+            ..Host::default()
+        };
+        let logind = walk::Held::default();
+        let _logind_opened = walk::OpenedAtTheEnd(logind.clone());
+        let (kill_tx, _disconnects) = tokio::sync::mpsc::channel(1);
+        let (consent_tx, _answers) = tokio::sync::mpsc::channel(4);
+        let ind = crate::indicator::ViewerIndicator::new(
+            kill_tx,
+            crate::rc_sessions::RcSessionRegistry::new(),
+            consent_tx,
+        )
+        .expect("an indicator");
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        let (verdict_tx, verdict) = std::sync::mpsc::channel::<bool>();
+        {
+            let (ind, withdrawn) = (ind.clone(), withdrawn.clone());
+            let walking = walk::StandIn::held(&logind, walk::ana());
+            rt.spawn(asking(
+                StandIn::new(host_steps(&host)),
+                walk::asking(walking, async move {
+                    let surfaces = crate::signaling::RcSurfaces {
+                        native: false,
+                        marker: true,
+                        behind: Some((start_for_prompt().await, rc_view("g7"))),
+                        mark_up: None,
+                    };
+                    let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                    let have_surface = crate::signaling::rc_surfaces_up(
+                        surfaces,
+                        &ind,
+                        move || !withdrawn.load(SeqCst),
+                        "g7",
+                        &outbound,
+                    )
+                    .await;
+                    let _ = verdict_tx.send(have_surface);
+                }),
+            ));
+        }
+        let asked = Instant::now();
+        while held.began() == 0 {
+            assert!(
+                asked.elapsed() < RUNS_WITHIN,
+                "no start reached the held step"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The `Terminate`: the question off the books, and its prompts taken
+        // down, of which none is up yet.
+        withdrawn.store(true, SeqCst);
+        ind.hide_prompt("g7");
+        let have_surface = verdict
+            .recv_timeout(TRAY_START_WAIT + SLACK)
+            .expect("the consent task hears once the start runs out of time");
+        assert!(!have_surface, "a question that is over has no surface");
+        logind.open();
+        std::thread::sleep(AT_ONCE);
+        assert_eq!(
+            logind.began(),
+            0,
+            "no notification was started for a question that is over"
+        );
+        assert!(!ind.notification_is_up("g7"), "nothing is up for it");
+    }
+
+    /// The control on Linux: a start in time does what it always did, and says it is for a
+    /// prompt (`--for-prompt`, #3887). A root daemon starts the tray through the system manager
+    /// as the person, with the session's allowlisted environment; a per-user daemon through its
+    /// own manager, without reading it. A running tray, no companion, nobody at the screen and a
+    /// failed systemd-run answer as before; only a systemd-run that exited 0 is `Started`.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_start_in_time_works_as_today() {
@@ -2365,6 +3067,7 @@ mod tray_start_tests {
                 "--setenv=DISPLAY=:0",
                 "--setenv=XDG_CURRENT_DESKTOP=GNOME",
                 COMPANION,
+                "--for-prompt",
             ])],
             "a root daemon: the system manager, as the person, with the allowlisted environment"
         );
@@ -2393,6 +3096,7 @@ mod tray_start_tests {
                 "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
                 "--setenv=DISPLAY=:0",
                 COMPANION,
+                "--for-prompt",
             ])],
             "a per-user daemon: its own manager"
         );
@@ -2456,7 +3160,7 @@ mod tray_start_tests {
     /// it always did. A SYSTEM service starts the tray into the console
     /// session as its person, and a daemon that runs as the person a plain
     /// start in its own session, each from the companion beside the daemon
-    /// with no arguments. A tray already running, no companion installed, a
+    /// with `--for-prompt` (#3887). A tray already running, no companion, a
     /// daemon that cannot find itself, nobody signed in and a refused start
     /// answer as before, and only a start that created the process is
     /// `Started` (#3824).
@@ -2476,8 +3180,8 @@ mod tray_start_tests {
         assert_eq!(ask(steps(None, &held, &ran)), Ok(EnsureOutcome::Started));
         assert_eq!(
             ran.argvs(),
-            vec![call(&["SystemService", DEST])],
-            "a SYSTEM service: into the console session, the companion beside it, no arguments"
+            vec![call(&["SystemService", DEST, "--for-prompt"])],
+            "a SYSTEM service: into the console session, the companion beside it, for a prompt"
         );
 
         let ran = Ran::default();
@@ -2486,8 +3190,8 @@ mod tray_start_tests {
         assert_eq!(ask(own), Ok(EnsureOutcome::Started));
         assert_eq!(
             ran.argvs(),
-            vec![call(&["UserSession", DEST])],
-            "the person's own daemon: a plain start in its own session"
+            vec![call(&["UserSession", DEST, "--for-prompt"])],
+            "the person's own daemon: a plain start in its own session, for a prompt"
         );
 
         let ran = Ran::default();
@@ -2703,6 +3407,41 @@ mod tray_start_tests {
                 user_manager: false,
             }
         }
+
+        /// #3884, #3888 — a root daemon's start on `host`: its install path
+        /// (each start's first step, counted), logind's session, the tray
+        /// check and systemd-run, which waits for `host.held` and brings the
+        /// tray up.
+        pub(super) fn host_steps(host: &Host) -> TraySteps {
+            let (at_path, at_session, at_running, at_run) =
+                (host.clone(), host.clone(), host.clone(), host.clone());
+            TraySteps {
+                path: Arc::new(move || -> Option<std::path::PathBuf> {
+                    at_path.starts.fetch_add(1, SeqCst);
+                    (!at_path.not_installed.load(SeqCst)).then(|| COMPANION.into())
+                }),
+                session: Arc::new(move || -> Result<GraphicalSession> {
+                    if at_session.nobody.load(SeqCst) {
+                        anyhow::bail!(
+                            "no active graphical session — nobody is at this machine's screen"
+                        );
+                    }
+                    Ok(ana())
+                }),
+                running: Arc::new(move |_: u32| at_running.up()),
+                environment: Arc::new(|_: &GraphicalSession| -> Option<String> { None }),
+                systemd_run: Arc::new(
+                    move |_: std::process::Command| -> std::io::Result<std::process::Output> {
+                        if let Some(held) = &at_run.held {
+                            held.hold();
+                        }
+                        at_run.up.store(true, SeqCst);
+                        Ok(exited(0, ""))
+                    },
+                ),
+                user_manager: false,
+            }
+        }
     }
 
     /// Windows' steps, stood in.
@@ -2760,6 +3499,37 @@ mod tray_start_tests {
                         }
                     },
                 ),
+            }
+        }
+
+        /// #3884, #3888 — a SYSTEM service's start on `host`: the tray check
+        /// (each start's first step, counted), the install path, and the
+        /// start into the console session, which waits for `host.held`, finds
+        /// nobody signed in or brings the tray up.
+        pub(super) fn host_steps(host: &Host) -> TraySteps {
+            let (at_running, at_path, at_start) = (host.clone(), host.clone(), host.clone());
+            TraySteps {
+                running: Arc::new(move || {
+                    at_running.starts.fetch_add(1, SeqCst);
+                    at_running.up()
+                }),
+                path: Arc::new(move || -> Result<Option<std::path::PathBuf>> {
+                    Ok((!at_path.not_installed.load(SeqCst)).then(|| DEST.into()))
+                }),
+                context: Arc::new(|| RespawnContext::SystemService),
+                start: Arc::new(move |_: RespawnContext, _: &std::path::Path, _: &[&str]| {
+                    if let Some(held) = &at_start.held {
+                        held.hold();
+                    }
+                    if at_start.nobody.load(SeqCst) {
+                        return TrayStart::NobodySignedIn;
+                    }
+                    at_start.up.store(true, SeqCst);
+                    TrayStart::Started {
+                        pid: 4242,
+                        session: Some(1),
+                    }
+                }),
             }
         }
     }
@@ -2824,6 +3594,38 @@ mod tray_start_tests {
                     move |cmd: std::process::Command| -> std::io::Result<std::process::Output> {
                         holds(Step::Launchctl, &at_launchctl);
                         ran.record(&cmd);
+                        Ok(exited(0, ""))
+                    },
+                ),
+            }
+        }
+
+        /// #3884, #3888 — the start on a Mac that is `host`: the app (each
+        /// start's first step, counted), the tray check, the console's owner
+        /// (the login window while nobody is signed in), and launchctl, which
+        /// waits for `host.held` and brings the tray up.
+        pub(super) fn host_steps(host: &Host) -> TraySteps {
+            let (at_installed, at_running, at_console, at_launchctl) =
+                (host.clone(), host.clone(), host.clone(), host.clone());
+            TraySteps {
+                installed: Arc::new(move || {
+                    at_installed.starts.fetch_add(1, SeqCst);
+                    !at_installed.not_installed.load(SeqCst)
+                }),
+                running: Arc::new(move || at_running.up()),
+                console: Arc::new(move || -> Result<String> {
+                    if at_console.nobody.load(SeqCst) {
+                        return console_owner_person("root\n");
+                    }
+                    Ok("ana".into())
+                }),
+                uid: Arc::new(|_: &str| -> Result<u32> { Ok(501) }),
+                launchctl: Arc::new(
+                    move |_: std::process::Command| -> std::io::Result<std::process::Output> {
+                        if let Some(held) = &at_launchctl.held {
+                            held.hold();
+                        }
+                        at_launchctl.up.store(true, SeqCst);
                         Ok(exited(0, ""))
                     },
                 ),
@@ -5619,8 +6421,9 @@ mod version_resource_tests {
 
     /// A resource with `strings` in its one string table, as the release's
     /// companion carries one: `VS_FIXEDFILEINFO`, then `StringFileInfo` and
-    /// `VarFileInfo`.
-    fn resource(strings: &[(&str, &str)]) -> Vec<u8> {
+    /// `VarFileInfo`. #3908: also the version resource of the EXEs
+    /// `beside_version_tests` builds.
+    pub(super) fn resource(strings: &[(&str, &str)]) -> Vec<u8> {
         let mut fixed = 0xFEEF_04BDu32.to_le_bytes().to_vec();
         fixed.resize(52, 0);
         let strings: Vec<Vec<u8>> = strings
@@ -5808,6 +6611,383 @@ mod version_resource_tests {
         std::fs::write(&text, "not a program").expect("write");
         assert_eq!(super::exe_version(&text), None);
         assert_eq!(super::exe_version(&dir.path().join("missing.exe")), None);
+    }
+}
+
+/// #3908 — `roomler status` ([`too_old_here`], through `too_old_beside`) and
+/// the heartbeat ([`installed_version`], through `installed_beside`) read the
+/// companion's version by the refresh's rule ([`known_version`], #3850): the
+/// marker when it names this daemon's version, else what the EXE states in
+/// its own version resource, else the marker's words. Each test has a folder
+/// of its own with a real EXE in it: a copy of this test's own executable,
+/// given the version resource the test needs with `UpdateResourceW`.
+///
+/// Red before #3908: both read the marker alone.
+#[cfg(all(test, target_os = "windows"))]
+mod beside_version_tests {
+    use super::version_resource_tests::resource;
+    use super::{
+        BesideNow, DESKTOP_EXE, ExeVersions, MIN_COMPANION_VERSION, Stamp, VERSION_MARKER,
+        installed_beside, known_version, too_old_beside,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::PoisonError;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+    use tunnel_core::localapi::CompanionTooOld;
+
+    /// This daemon's version, which the release's current tray states.
+    const OWN: &str = env!("CARGO_PKG_VERSION");
+    /// A tray too old to connect: `MIN_COMPANION_VERSION` is 0.4.216.
+    const OLD: &str = "0.4.212";
+    /// A tray of another version that connects.
+    const EARLIER: &str = "0.4.220";
+    /// How long a test waits for a read of the EXE to land.
+    const LAND: Duration = Duration::from_secs(20);
+
+    /// A folder as a system install has the companion beside the daemon: its
+    /// EXE and its version marker, read through a cache of the folder's own.
+    /// Removed on every path: once no read runs, with its marker writable
+    /// again.
+    struct Beside {
+        dir: tempfile::TempDir,
+        versions: &'static ExeVersions,
+    }
+
+    impl Beside {
+        fn new(read: fn(&Path) -> Option<String>) -> Self {
+            Self {
+                dir: tempfile::tempdir().expect("tempdir"),
+                versions: Box::leak(Box::new(ExeVersions::new("test-exe-ver", read))),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// The EXE: a copy of this test's executable whose one resource is
+        /// `res`, as its version resource, written beside and renamed into
+        /// place as a swap puts one there. Stamped with its own last write: a
+        /// copy keeps the source's.
+        fn exe(&self, res: &[u8]) -> PathBuf {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::System::LibraryLoader::{
+                BeginUpdateResourceW, EndUpdateResourceW, UpdateResourceW,
+            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::RT_VERSION;
+
+            let staged = self.path().join("staged.exe");
+            let this = std::env::current_exe().expect("this test's executable");
+            std::fs::copy(this, &staged).expect("copy this test's executable");
+            let wide: Vec<u16> = staged
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let len = u32::try_from(res.len()).expect("a test resource fits a u32");
+            // SAFETY: `wide` is NUL-terminated and outlives every call, the
+            // update is ended exactly once, and UpdateResourceW copies `res`,
+            // which outlives it. TRUE: the copy's own resources all go, so
+            // the version resource is the test's alone.
+            unsafe {
+                let update = BeginUpdateResourceW(wide.as_ptr(), 1);
+                assert!(
+                    !update.is_null(),
+                    "BeginUpdateResourceW: {}",
+                    std::io::Error::last_os_error()
+                );
+                let put = UpdateResourceW(
+                    update,
+                    RT_VERSION,
+                    std::ptr::without_provenance(1),
+                    0x0409,
+                    res.as_ptr().cast(),
+                    len,
+                );
+                let not_put = std::io::Error::last_os_error();
+                let ended = EndUpdateResourceW(update, i32::from(put == 0));
+                assert!(put != 0, "UpdateResourceW: {not_put}");
+                assert!(
+                    ended != 0,
+                    "EndUpdateResourceW: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let exe = self.path().join(DESKTOP_EXE);
+            retried("stamp the EXE's last write", || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&staged)?
+                    .set_modified(std::time::SystemTime::now())
+            });
+            retried("rename the EXE into place", || {
+                std::fs::rename(&staged, &exe)
+            });
+            exe
+        }
+
+        /// The marker, reading `text`, read-only as on the device in #3850:
+        /// the daemon cannot write it.
+        fn read_only_marker(&self, text: &str) {
+            self.writable_marker();
+            let marker = self.path().join(VERSION_MARKER);
+            std::fs::write(&marker, text).expect("write the marker");
+            let mut perms = std::fs::metadata(&marker).expect("marker").permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&marker, perms).expect("make the marker read-only");
+        }
+
+        /// The marker writable again, when there is one.
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "on Windows it clears the read-only attribute alone"
+        )]
+        fn writable_marker(&self) {
+            let marker = self.path().join(VERSION_MARKER);
+            if let Ok(meta) = std::fs::metadata(&marker) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&marker, perms);
+            }
+        }
+
+        /// What `installed_version` reads for this folder now.
+        fn installed(&self) -> BesideNow {
+            installed_beside(self.path(), OWN, self.versions)
+        }
+
+        /// What `status` is told about this folder now, from a daemon whose
+        /// pipe refuses an old tray, under the service.
+        fn too_old(&self) -> Option<CompanionTooOld> {
+            too_old_beside(Some(self.path()), OWN, true, self.versions)
+        }
+
+        /// [`Self::installed`] once the read of the EXE for the files there
+        /// now has landed, [`LAND`] at most.
+        fn settled(&self) -> BesideNow {
+            let deadline = Instant::now() + LAND;
+            loop {
+                let now = self.installed();
+                if now.settled || Instant::now() >= deadline {
+                    return now;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for Beside {
+        fn drop(&mut self) {
+            self.versions.drained();
+            self.writable_marker();
+        }
+    }
+
+    /// `op` until it works, [`LAND`] at most: a scanner may hold a new EXE
+    /// for a moment after it is written.
+    fn retried(what: &str, mut op: impl FnMut() -> std::io::Result<()>) {
+        let deadline = Instant::now() + LAND;
+        while let Err(e) = op() {
+            assert!(Instant::now() < deadline, "{what}: {e}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn settled(version: &str) -> BesideNow {
+        BesideNow {
+            version: Some(version.into()),
+            settled: true,
+        }
+    }
+
+    /// #3908, the issue's case: a read-only marker naming an old version,
+    /// beside an EXE of this daemon's version. Once the EXE's read lands,
+    /// status is told of no tray too old, and the heartbeat reports the EXE's
+    /// version: what the refresh reads from the same files.
+    #[test]
+    fn a_read_only_old_marker_beside_a_current_exe_reads_as_the_exe() {
+        let beside = Beside::new(super::exe_version);
+        let exe = beside.exe(&resource(&[("FileVersion", OWN), ("ProductVersion", OWN)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+
+        assert_eq!(beside.settled(), settled(OWN));
+        assert_eq!(beside.too_old(), None, "no tray too old");
+
+        let marker = std::fs::read_to_string(beside.path().join(VERSION_MARKER)).ok();
+        assert_eq!(
+            known_version(OWN, marker.as_deref(), || super::exe_version(&exe)).as_deref(),
+            Some(OWN),
+            "what the refresh reads"
+        );
+    }
+
+    /// #3908, the control: a marker naming this daemon's version reads as
+    /// today, and the EXE is not read at all, whatever it states. With no EXE,
+    /// as today too: no tray to refuse, no version to report, nothing read.
+    #[test]
+    fn a_marker_naming_this_version_reads_as_today() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted(exe: &Path) -> Option<String> {
+            READS.fetch_add(1, SeqCst);
+            super::exe_version(exe)
+        }
+        let beside = Beside::new(counted);
+        let exe = beside.exe(&resource(&[("ProductVersion", OLD)]));
+        for marker in [format!("{OWN}\n"), format!("{OWN}\r\n"), OWN.to_string()] {
+            beside.read_only_marker(&marker);
+            assert_eq!(beside.installed(), settled(OWN), "{marker:?}");
+            assert_eq!(beside.too_old(), None, "{marker:?}");
+        }
+
+        std::fs::remove_file(exe).expect("remove the EXE");
+        beside.read_only_marker(&format!("{OLD}\n"));
+        assert_eq!(
+            beside.installed(),
+            BesideNow {
+                version: None,
+                settled: true
+            },
+            "no EXE"
+        );
+        assert_eq!(beside.too_old(), None, "no EXE");
+        assert_eq!(READS.load(SeqCst), 0, "the EXE is not read");
+    }
+
+    /// #3908, the control: an EXE whose version resource is malformed states
+    /// no version, so both read by the marker, as today. A marker naming an
+    /// old version is too old, by that version; with no marker, the
+    /// heartbeat reports none and status a tray of no version.
+    #[test]
+    fn a_malformed_resource_reads_by_the_marker_as_today() {
+        let good = resource(&[("FileVersion", OWN), ("ProductVersion", OWN)]);
+        for (what, res) in [
+            ("garbage", vec![0xFFu8; 64]),
+            ("cut short", good[..good.len() / 2].to_vec()),
+        ] {
+            let beside = Beside::new(super::exe_version);
+            let exe = beside.exe(&res);
+            assert_eq!(super::exe_version(&exe), None, "{what}: states no version");
+
+            beside.read_only_marker(&format!("{OLD}\n"));
+            assert_eq!(beside.settled(), settled(OLD), "{what}");
+            assert_eq!(
+                beside.too_old(),
+                Some(CompanionTooOld {
+                    installed: Some(OLD.into()),
+                    minimum: MIN_COMPANION_VERSION.into(),
+                    by_service: true,
+                    retry_off: false,
+                }),
+                "{what}"
+            );
+
+            beside.writable_marker();
+            std::fs::remove_file(beside.path().join(VERSION_MARKER)).expect("remove the marker");
+            assert_eq!(
+                beside.settled(),
+                BesideNow {
+                    version: None,
+                    settled: true
+                },
+                "{what}, no marker"
+            );
+            let reported = beside.too_old().expect("a tray of no version");
+            assert_eq!(reported.installed, None, "{what}, no marker");
+        }
+    }
+
+    /// #3908 — status and the heartbeat never wait for the EXE. While its
+    /// read is held (a scanner holding the file), every ask answers from the
+    /// marker at once and is not settled, and one read runs however often
+    /// they ask. Once it lands, the EXE's version.
+    #[test]
+    fn a_cold_read_answers_from_the_marker_and_never_waits_for_the_exe() {
+        static OPEN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+        static OPENED: std::sync::Condvar = std::sync::Condvar::new();
+        static BEGAN: AtomicUsize = AtomicUsize::new(0);
+        fn open() {
+            *OPEN.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            OPENED.notify_all();
+        }
+        fn held(exe: &Path) -> Option<String> {
+            BEGAN.fetch_add(1, SeqCst);
+            let gate = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                OPENED
+                    .wait_while(gate, |open| !*open)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            super::exe_version(exe)
+        }
+        /// Opens the gate as the test ends, before its folder goes, so a
+        /// failed assertion leaves no read held.
+        struct OpenedAtTheEnd;
+        impl Drop for OpenedAtTheEnd {
+            fn drop(&mut self) {
+                open();
+            }
+        }
+
+        let beside = Beside::new(held);
+        let _opened = OpenedAtTheEnd;
+        beside.exe(&resource(&[("ProductVersion", OWN)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+
+        // A reader that waited for the read would wait forever: this turns
+        // that wait into a failure of the timing below.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+            open();
+        });
+        let from_the_marker = BesideNow {
+            version: Some(OLD.into()),
+            settled: false,
+        };
+        for _ in 0..5 {
+            let asked = Instant::now();
+            assert_eq!(beside.installed(), from_the_marker);
+            let reported = beside.too_old().expect("too old by the marker meanwhile");
+            assert_eq!(reported.installed.as_deref(), Some(OLD));
+            let took = asked.elapsed();
+            assert!(
+                took < Duration::from_secs(2),
+                "no wait for the EXE: {took:?}"
+            );
+        }
+        let deadline = Instant::now() + LAND;
+        while BEGAN.load(SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = (beside.installed(), beside.too_old());
+        assert_eq!(BEGAN.load(SeqCst), 1, "one read, however often asked");
+
+        open();
+        assert_eq!(beside.settled(), settled(OWN));
+        assert_eq!(beside.too_old(), None);
+        assert_eq!(BEGAN.load(SeqCst), 1, "and none after it");
+    }
+
+    /// #3908 — the refresh swaps the EXE and cannot write the marker
+    /// (#3850): the EXE is read again, by its own last write, and both
+    /// readers move to the new version. Keyed on the marker alone, they would
+    /// keep the version read before the swap for the process's life.
+    #[test]
+    fn an_exe_swapped_under_a_marker_that_cannot_be_written_is_read_again() {
+        let beside = Beside::new(super::exe_version);
+        beside.exe(&resource(&[("ProductVersion", EARLIER)]));
+        beside.read_only_marker(&format!("{OLD}\n"));
+        assert_eq!(beside.settled(), settled(EARLIER));
+        assert_eq!(beside.too_old(), None, "{EARLIER} connects");
+
+        let before = Stamp::of(beside.path());
+        beside.exe(&resource(&[("ProductVersion", OWN)]));
+        let after = Stamp::of(beside.path());
+        assert_eq!(after.marker, before.marker, "the marker was not written");
+        assert_ne!(after.exe, before.exe, "the EXE was");
+
+        assert_eq!(beside.settled(), settled(OWN));
+        assert_eq!(beside.too_old(), None);
     }
 }
 

@@ -381,7 +381,7 @@ const KEYS: &[KeyMeta] = &[
         // (agents/roomlerd/src/files.rs) — nothing is read at startup only.
         live: true,
         kind: "string",
-        description: "FR-84 - where files dropped onto a remote-control session land. An absolute folder, or `~/...` for the active user's profile (expanded per user, at the time of the drop). Must be outside system folders and, when the service runs as SYSTEM/root, inside the active user's profile; created if missing. Empty = the default: the active user's Downloads folder (Windows falls back to %PROGRAMDATA%\\roomler\\...\\uploads when that is unreachable). Only the person at the device's console can change it. Applies at once.",
+        description: "FR-84 - where files dropped onto a remote-control session land. An absolute folder, or `~/...` for the active user's profile (expanded per user, at the time of the drop). Must be outside system folders and, when the service runs as SYSTEM/root, inside the active user's profile; created if missing. Empty = the default: the active user's Downloads folder (Windows falls back to %PROGRAMDATA%\\roomler\\...\\uploads when that is unreachable). Only the person at this device's screen can change it. Applies at once.",
     },
     KeyMeta {
         key: "exec_enabled",
@@ -1813,7 +1813,7 @@ const KEYS: &[KeyMeta] = &[
         // the capability follows on the next heartbeat.
         live: true,
         kind: "bool",
-        description: "FR-99 - let a remote controller turn on privacy mode during a session: a curtain covers this screen for the person in front of it, with a notice saying who is connected, while the controller still sees the desktop (default off). Windows 10 2004 and later. The curtain hides the screen; it does not stop someone at this keyboard. Off also takes a curtain that is up down. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+        description: "FR-99 - let a remote controller turn on privacy mode during a session: a curtain covers this screen for the person in front of it, with a notice saying who is connected, while the controller still sees the desktop (default off). Windows 10 2004 and later. The curtain hides the screen; it does not stop someone at this keyboard. Off also takes a curtain that is up down. Only the person at this device's screen can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
         key: "lock_on_end",
@@ -1823,7 +1823,7 @@ const KEYS: &[KeyMeta] = &[
         // ends.
         live: true,
         kind: "string",
-        description: "FR-99 - lock this computer when the last remote session ends: never (default) | auto (lock if the session began on a locked screen or with nobody at the computer) | always. A new Windows service install starts at auto. Windows and Linux. With always, a per-user install cannot unlock the screen remotely afterwards: someone must sign in at the computer. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+        description: "FR-99 - lock this computer when the last remote session ends: never (default) | auto (lock if the session began on a locked screen or with nobody at the computer) | always. A new Windows service install starts at auto. Windows and Linux. With always, a per-user install cannot unlock the screen remotely afterwards: someone must sign in at the computer. Only the person at this device's screen can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
         key: "display_match",
@@ -1832,7 +1832,7 @@ const KEYS: &[KeyMeta] = &[
         // LIVE: read at every display-match request.
         live: true,
         kind: "string",
-        description: "FR-108 - whether a remote controller's display match may switch this computer's display mode to fit their window: auto (default: only while nobody is using this screen, that is no one has touched its keyboard or mouse for 5 minutes) | always (whenever asked) | never. Windows. A locked screen is switched only once it is unlocked. The original mode comes back when the session ends. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+        description: "FR-108 - whether a remote controller's display match may switch this computer's display mode to fit their window: auto (default: only while nobody is using this screen, that is no one has touched its keyboard or mouse for 5 minutes) | always (whenever asked) | never. Windows. A locked screen is switched only once it is unlocked. The original mode comes back when the session ends. Only the person at this device's screen can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
         key: "peer_auth",
@@ -1841,7 +1841,7 @@ const KEYS: &[KeyMeta] = &[
         // LIVE: every offer is judged by the value at that moment.
         live: true,
         kind: "string",
-        description: "FR-100 - whether this device checks the browser that offers it a remote session: audit (default: verify the browser's signature over its offer, remember each browser key per user, record the result, refuse nothing) | off (none of it). enforce arrives later and cannot be set yet. Whatever this says, the device still signs its own answers, so the browser can check it. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+        description: "FR-100 - whether this device checks the browser that offers it a remote session: audit (default: verify the browser's signature over its offer, remember each browser key per user, record the result, refuse nothing) | off (none of it). enforce arrives later and cannot be set yet. Whatever this says, the device still signs its own answers, so the browser can check it. Only the person at this device's screen can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
         key: "rc_clipboard",
@@ -1876,7 +1876,7 @@ const KEYS: &[KeyMeta] = &[
         // Read with the config at start: the server URLs are dialled from it.
         live: false,
         kind: "bool",
-        description: "FR-101 - keep a plaintext http:// server URL as written (default off: a remote http:// URL is used as https://, so signalling, token renewal, updates and uploads go over TLS). Only for a lab whose server serves no TLS; loopback never needs it. Only the person at this device's console can change it. Device-only: never pushable through remote config.",
+        description: "FR-101 - keep a plaintext http:// server URL as written (default off: a remote http:// URL is used as https://, so signalling, token renewal, updates and uploads go over TLS). Only for a lab whose server serves no TLS; loopback never needs it. Only the person at this device's screen can change it. Device-only: never pushable through remote config.",
     },
     KeyMeta {
         key: "forward_acl",

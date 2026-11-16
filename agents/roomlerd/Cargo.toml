@@ -325,6 +325,7 @@ ffmpeg-next = { version = "9.0", optional = true, default-features = false, feat
 # get_image/set_image (raw RGBA) for clipboard protocol v2 — on
 # Windows it only adds windows-sys Gdi (already compiled), on Linux
 # the pure-Rust `image` crate.
+# #3671 — pinned exactly in the workspace: see the note there.
 arboard = { workspace = true, optional = true, features = ["image-data"] }
 
 # PNG encode/decode for clipboard protocol v2 image payloads (the
