@@ -2977,6 +2977,23 @@ pub trait LocalApiState: Send + Sync {
     fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
         false
     }
+    /// #3864 — what a `ConsentPending` request answers. Default:
+    /// [`Self::consent_pending`]. A one-row Mac's worker overrides it: the
+    /// root half asks that Mac's questions, on a broker of its own, so the
+    /// worker lists those too, asked over the root half's person socket.
+    async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+        self.consent_pending()
+    }
+    /// #3864 — what a `ConsentDecide` request answers once the endpoint's
+    /// gates have passed. Default: [`Self::consent_decide`]'s verdict. A
+    /// one-row Mac's worker overrides it to send an answer to a question its
+    /// own broker is not asking to the root half, and passes on the root
+    /// half's refusal in its own words.
+    async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+        Response::ConsentDecided {
+            ok: self.consent_decide(session_id, allow),
+        }
+    }
     /// FR-27 — remote-control sessions currently LIVE on this device. Distinct
     /// from [`Self::consent_pending`], which is about sessions not yet allowed
     /// to start. Default: none.
@@ -10453,6 +10470,124 @@ mod tests {
         };
         let r = ask_state_scoped_as(SeatNotKnownYet, Scope::Full, ana_elevated, approve).await;
         assert_eq!(r, Response::ConsentDecided { ok: true });
+    }
+
+    /// #3864 — a daemon whose consent questions are another process's, as a
+    /// one-row Mac's worker's are the root half's: its own list is empty and
+    /// it takes no answer itself, while its views list the question and pass
+    /// the other process's verdict on, a refusal in its own words.
+    struct Relaying;
+    #[async_trait]
+    impl LocalApiState for Relaying {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        async fn at_the_seat_now(&self, uid: u32) -> AtTheSeat {
+            if uid == 501 {
+                AtTheSeat::Yes
+            } else {
+                AtTheSeat::No
+            }
+        }
+        fn consent_pending(&self) -> Vec<ConsentRequest> {
+            Vec::new()
+        }
+        fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+            false
+        }
+        async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
+            vec![ConsentRequest {
+                session_id: "c3".into(),
+                controller_name: "Alice".into(),
+                permissions: "VIEW".into(),
+                timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
+                surface: "companion".into(),
+                org: String::new(),
+            }]
+        }
+        async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
+            if session_id == "c3" && allow {
+                Response::ConsentDecided { ok: true }
+            } else {
+                Response::Error {
+                    message: "refused by the process that asked".into(),
+                }
+            }
+        }
+    }
+
+    /// #3864 — a list and an answer are the daemon's views
+    /// ([`LocalApiState::consent_pending_view`],
+    /// [`LocalApiState::consent_decide_view`]) on the daemon's own endpoint
+    /// and on the person socket alike, so a one-row Mac's worker can serve
+    /// the root half's questions on the socket its person's app dials. The
+    /// gates still come first: a peer the endpoint does not admit, or someone
+    /// who is not at the seat now, is refused before the view is asked.
+    ///
+    /// Red before #3864: both verbs were the sync dispatch's (`handle`), which
+    /// read the daemon's own lists, so the question was never listed and its
+    /// answer never taken.
+    #[tokio::test]
+    async fn the_consent_verbs_are_answered_by_the_daemons_views() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        // The daemon's own endpoint admits an answer from an elevated
+        // administrator on every OS (`peer_may_decide_for_the_screen`).
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana.clone()
+        };
+        let list = r#"{"t":"consent_pending"}"#;
+        let approve = r#"{"t":"consent_decide","d":{"session_id":"c3","allow":true}}"#;
+        let deny = r#"{"t":"consent_decide","d":{"session_id":"c3","allow":false}}"#;
+        for (scope, peer, what) in [
+            (Scope::Full, ana_elevated, "the daemon's own endpoint"),
+            (SEAT, ana.clone(), "the person socket"),
+        ] {
+            let r = ask_state_scoped_as(Relaying, scope, peer.clone(), list).await;
+            assert!(
+                matches!(&r, Response::ConsentPending(v) if v.len() == 1 && v[0].session_id == "c3"),
+                "{what}: {r:?}"
+            );
+            let r = ask_state_scoped_as(Relaying, scope, peer.clone(), approve).await;
+            assert_eq!(r, Response::ConsentDecided { ok: true }, "{what}");
+            let r = ask_state_scoped_as(Relaying, scope, peer, deny).await;
+            assert_eq!(
+                r,
+                Response::Error {
+                    message: "refused by the process that asked".into()
+                },
+                "{what}: a refusal passes through in its own words"
+            );
+        }
+        // The gates come first. On the person socket, someone who is not at
+        // the seat now; on the daemon's own endpoint, a peer it cannot read.
+        let bob = ClientPeer {
+            uid: Some(502),
+            ..ana.clone()
+        };
+        let r = ask_state_scoped_as(Relaying, SEAT, bob, approve).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("was not taken")),
+            "{r:?}"
+        );
+        let r = ask_state_scoped_as(Relaying, Scope::Full, ClientPeer::UNKNOWN, approve).await;
+        assert!(
+            matches!(&r, Response::Error { message } if message.contains("This caller is none of those")),
+            "{r:?}"
+        );
     }
 
     /// A daemon that counts the consent answers and the Disconnects that
