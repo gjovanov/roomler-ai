@@ -43,7 +43,7 @@ mod panels;
 mod pin;
 mod tray;
 
-use tauri::Manager;
+use tauri::{AppHandle, Manager, Runtime};
 
 fn main() {
     // #2286 — FIRST, before GTK starts and before any thread exists: on GNOME
@@ -115,27 +115,14 @@ fn main() {
             // the Overview once it is done); `--view=<name>` routes there.
             // #3887 — nor does the daemon's start for a prompt, and a
             // person's start shows the tour such a start held back.
+            // #3941 — on macOS, opening the app again starts no second
+            // process: it is a reopen (`reopen`), shown by the same code.
             let launch = first_run::parse_launch_args(&args);
             let done = roomler_node_core::desktop_state::load().first_run_done;
             let held = first_run::tour_held();
             let decision = first_run::decide_second_instance(&launch, done, held);
             tracing::info!(?launch, tour_held = held, ?decision, "a second launch");
-            let view = match decision {
-                first_run::SecondLaunch::Ignore => return,
-                first_run::SecondLaunch::Show => None,
-                first_run::SecondLaunch::ShowView(view) => Some(view),
-            };
-            if let Some(window) = app.get_webview_window("main") {
-                // The name is whitelisted to ascii-alphanumeric by the parser
-                // before it goes near eval; the router maps anything unknown
-                // to Overview.
-                if let Some(view) = view {
-                    first_run::showing(&view);
-                    let _ = window.eval(format!("window.location.hash = '#/{view}'"));
-                }
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app, decision);
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -257,8 +244,67 @@ fn main() {
             tauri::async_runtime::spawn(consent_watch_loop(handle));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running roomler-desktop");
+        .build(tauri::generate_context!())
+        .expect("error while running roomler-desktop")
+        .run(|app, event| {
+            // #3941 — `.run(context)` was this with a callback that did
+            // nothing. The one event acted on here is macOS's reopen; every
+            // other one (an exit request, the tray's, a window's) is handled
+            // where it was, before this callback runs.
+            if let Some(has_visible_windows) = reopened(&event) {
+                reopen(app, has_visible_windows);
+            }
+        });
+}
+
+/// Show the main window as a person's opening of the running companion
+/// decided: a second launch forwarded on Windows and Linux and a reopen on
+/// macOS (#3941) share it ([`first_run::open_window`]). The window exists
+/// from the start and is only ever hidden.
+fn show_main_window<R: Runtime>(app: &AppHandle<R>, decision: first_run::SecondLaunch) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    first_run::open_window(
+        decision,
+        // The name is whitelisted to ascii-alphanumeric by the parser before
+        // it goes near eval; the router maps anything unknown to Overview.
+        |view| {
+            let _ = window.eval(format!("window.location.hash = '#/{view}'"));
+        },
+        || {
+            let _ = window.show();
+            let _ = window.set_focus();
+        },
+    );
+}
+
+/// #3941 — `Some(has_visible_windows)` when `event` is macOS's reopen: the
+/// running app opened again from Finder, Launchpad, Spotlight or `open -a`.
+/// The only macOS code on this path; no other platform has a reopen.
+fn reopened(event: &tauri::RunEvent) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if let tauri::RunEvent::Reopen {
+        has_visible_windows,
+        ..
+    } = event
+    {
+        return Some(*has_visible_windows);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = event;
+    None
+}
+
+/// #3941 — a reopen: a person's own start with no argument, decided as a
+/// second launch with none ([`first_run::decide_reopen`]), logged once, and
+/// shown by the second launch's own code.
+fn reopen<R: Runtime>(app: &AppHandle<R>, has_visible_windows: bool) {
+    let done = roomler_node_core::desktop_state::load().first_run_done;
+    let held = first_run::tour_held();
+    let decision = first_run::decide_reopen(done, held);
+    first_run::log_reopen(&decision, done, held, has_visible_windows);
+    show_main_window(app, decision);
 }
 
 /// Ask the daemon (over the LocalAPI) which sessions await consent; when a NEW

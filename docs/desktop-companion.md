@@ -1605,7 +1605,7 @@ flowchart TD
 | Piece | Where | What |
 |---|---|---|
 | the decision | `decide_startup`, `agents/roomler-desktop/src/first_run.rs:75` | an explicit `--view=` first, then a start for a prompt stays in the tray, the tour done or not. It never leaves either: `Exit` stays for `--autostart` with the login-start switch off |
-| the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:87` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called at `tray.rs:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
+| the held tour | `holds_the_tour`, `first_run.rs:154`; set in `main.rs:87` | a start that stayed in the tray with the tour not done, which only a start for a prompt does. The person's own opening of the window shows the tour once: a second launch forwarded to the running companion (`decide_second_instance`, `first_run.rs:118`), a reopen on macOS (`decide_reopen`, `first_run.rs:264`; §10.7), the tray icon and its Device status (`tray_path`, `first_run.rs:188`, called at `tray.rs:83` and `:111`). The explicit items (Welcome tour…, Onboarding…, Check for Updates) are as before, and the daemon's next start for a prompt, forwarded, shows nothing |
 | macOS | `asks_the_daemon`, `first_run.rs:200`, asked at `main.rs:83`; `daemon_has_something_to_show`, `:222`; `something_to_show`, `:208` | only a start with no argument at all, for a person whose tour is not done, asks; Windows and Linux are told. The answer is the LocalAPI's `consent_pending` and `rc_sessions`, read as the consent watch reads them, 300 ms for all of it: a question the daemon does not show natively, or a session the banner is for (`wants_banner`). No answer is no reason, and the tour shows as before. The process that answers is whoever serves the person's `$TMPDIR/roomler.sock`, the one the consent watch polls: the screen worker on a one-row Mac, the per-user agent on a two-row Mac |
 
 - **Old and new together.** An older companion started with `--for-prompt` ignores it, as it
@@ -1635,6 +1635,51 @@ flowchart TD
   running. A remote session's consent start shows the question and no Welcome window; the
   person's own start, the tray icon and the next sign-in then show the tour. The control is the
   release before, where the tour opens together with the question.
+
+### 10.7 Opening the app again while it runs: the second launch and the macOS reopen (#3941)
+
+A person who opens the companion while it runs with its window closed expects the window back.
+How that reaches the running companion depends on the platform:
+
+| Platform | What opening the app again does | What the companion hears |
+|---|---|---|
+| Windows, Linux | starts a second process, which the single-instance plugin ends after it forwards its arguments to the running one | the plugin's callback (`agents/roomler-desktop/src/main.rs:107`): `a second launch` |
+| macOS | starts nothing: AppKit hands the running app a **reopen** (`applicationShouldHandleReopen`). That is a double-click in Finder or Launchpad, Spotlight, or `open -a`. `LSUIElement` gives the app no Dock tile to click | `RunEvent::Reopen`, matched by `reopened` (`main.rs:285`) and handled by `reopen` (`:302`): `a reopen shows …` |
+
+Until #3941 the companion had no handler for the reopen. It ran with `.run(context)`, whose
+callback does nothing, so on a Mac the menu-bar icon was the only way back to the window.
+
+```mermaid
+flowchart LR
+    W["Windows, Linux:<br/>a second process"] --> SI["the single-instance callback<br/>decide_second_instance(its arguments)<br/>log: a second launch"]
+    M["macOS: Finder, Launchpad,<br/>Spotlight, open -a"] --> RO["RunEvent::Reopen → reopen<br/>decide_reopen: no argument<br/>log: a reopen shows …"]
+    SI --> O["show_main_window → open_window<br/>route to the view, if any;<br/>show; focus"]
+    RO --> O
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the decision | `decide_reopen`, `agents/roomler-desktop/src/first_run.rs:264` | `decide_second_instance` with no argument: the window where the person left it (`Show`), or the Welcome tour while a start for a prompt holds it back and it is not done (§10.6). A reopen carries no argument, so it is never a login start or a start for a prompt, and never does nothing |
+| the window | `show_main_window`, `agents/roomler-desktop/src/main.rs:264`; `open_window`, `first_run.rs:304` | the second launch's code, moved out of its callback, not copied. It routes the page to the view asked for, releasing a held tour as it shows it (offered once), then shows and focuses the window. `Show` leaves the page where the person left it, as a double-click does on Windows; the tray's icon and Device status route to the Overview instead (`tray_path`) |
+| the line | `log_reopen`, `first_run.rs:283` | one line per reopen, beside `a second launch`: `a reopen shows the main window` or `a reopen shows the tour`, with `first_run_done`, `tour_held`, `has_visible_windows` and the decision. It is the lab's second witness beside the window |
+| `has_visible_windows` | AppKit's answer, passed on by tao | logged, not obeyed: the being-viewed banner and the consent panel are windows too, so it can be true while the main window is closed |
+| the run loop | `.build(…)` then `.run(…)`, `main.rs:247` | `.run(context)` was `build(context)` then `run` with a callback that does nothing (Tauri 2.11). The tray's and the menu's handlers, every plugin's `on_event` (the macOS single-instance socket's cleanup at exit) and the window bookkeeping still run before the callback. The callback never prevents an exit, and off macOS it matches nothing |
+
+- **Unchanged:** the second launch on Windows and Linux (its decision, its line, what it shows),
+  the tray, the close-to-hide, and exit requests.
+- **Tested:** `first_run::tests`: a reopen with the window closed shows the main window
+  (`a_reopen_shows_the_main_window`); the tour held back is shown once
+  (`a_reopen_shows_the_held_tour_once`); the line names what was shown
+  (`a_reopen_logs_what_it_shows`); and the moved window code does what the second launch did
+  (`a_second_launch_opens_the_window_as_before`). They run in "Rust unit tests (server +
+  crates)", step "Test the desktop companion (roomler-desktop)", and in "Windows overlay clippy",
+  step "The desktop companion on Windows — clippy + unit tests (#3940)". The macOS match
+  compiles in "macOS overlay compile check", step "cargo check the desktop companion". Nothing
+  in CI sends a reopen.
+- **Field cells:** a two-row and a one-row Mac, each with the companion running and its window
+  closed. Opened from Finder and with `open -a`, the window shows and the log names it. While a
+  start for a prompt holds the tour back, the reopen shows the tour once. The control is the
+  release before, where a reopen shows nothing.
 
 ## 11. Testing it
 
@@ -1726,7 +1771,7 @@ dialog's **Approve**. Now the capture open's wait hook marks its session `asking
 dialog is the wait (`agents/roomlerd/src/peer.rs:5880`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1370`), and the banner comes up only for a session that sees the
-screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:343`). The mark goes
+screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:389`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
 

@@ -253,18 +253,47 @@ pub fn daemon_has_something_to_show() -> bool {
 
 // ─── a person's opening of the running companion (#3941) ─────────────────
 
-/// #3941 — what a reopen does. RED: as today, nothing.
-pub fn decide_reopen(_first_run_done: bool, _tour_held: bool) -> SecondLaunch {
-    SecondLaunch::Ignore
+/// #3941 — what a reopen does. On macOS, opening the app while it runs (a
+/// double-click in Finder or Launchpad, Spotlight, `open -a`) starts no
+/// second process, so no launch is forwarded to it, as one is on Windows and
+/// Linux: AppKit hands the running app a reopen instead. That is a person's
+/// own start, and it carries no argument, so it is decided as a forwarded
+/// launch with none: the window where the person left it, or the tour a
+/// start for a prompt held back (#3887). Never a login start's path or a
+/// prompt's: only an argument asks for those.
+pub fn decide_reopen(first_run_done: bool, tour_held: bool) -> SecondLaunch {
+    decide_second_instance(&LaunchArgs::default(), first_run_done, tour_held)
 }
 
-/// #3941 — the reopen's one log line. RED: as today, none.
+/// What a person's opening of the running companion shows, in the words of
+/// its log line.
+fn what_it_shows(decision: &SecondLaunch) -> &'static str {
+    match decision {
+        SecondLaunch::Ignore => "nothing",
+        SecondLaunch::ShowView(view) if view == "welcome" => "the tour",
+        SecondLaunch::Show | SecondLaunch::ShowView(_) => "the main window",
+    }
+}
+
+/// #3941 — the reopen's one line, beside a second launch's. It names what the
+/// reopen shows: the macOS lab's second witness, beside the window itself.
+/// `has_visible_windows` is AppKit's, logged and not obeyed: the banner and
+/// the consent panel are windows too, so it can be true while the main
+/// window is closed.
 pub fn log_reopen(
-    _decision: &SecondLaunch,
-    _first_run_done: bool,
-    _tour_held: bool,
-    _has_visible_windows: bool,
+    decision: &SecondLaunch,
+    first_run_done: bool,
+    tour_held: bool,
+    has_visible_windows: bool,
 ) {
+    tracing::info!(
+        first_run_done,
+        tour_held,
+        has_visible_windows,
+        ?decision,
+        "a reopen shows {}",
+        what_it_shows(decision)
+    );
 }
 
 /// Show the window as a person's opening of the running companion decided
