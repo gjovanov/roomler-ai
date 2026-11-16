@@ -188,7 +188,7 @@ bounded passive staleness; (4) pod-alive → advisory only.
 "no record" ⇒ rc/tunnel answer pod-local (= today), rehome/nudge
 suppressed, media falls back to the S6 belt (logged
 `media_belt_fallback_total`). On recovery, heartbeats re-assert every
-record within one beat and the fold rule resolves any belt-era splits.
+record within one beat and the fold rule resolves any belt-era splits. A Redis that stops answering without a reset degrades the same way, within the response timeout ([below](#a-redis-that-stops-answering-3840)).
 
 ### A live RC session through its pod's death (FR-138)
 
@@ -213,6 +213,109 @@ mesh rebuilds that path before ICE gives up on the pair, as a Windows session's 
 the cut on 2026-11-12, and it redials otherwise, with no `agent_busy` either way. The switches, and
 what an operator reads before and after a roll, are in
 [deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138).
+
+### A Redis that stops answering (#3840)
+
+Every Redis command the server sends, except a subscription, goes through ONE multiplexed
+connection: the fan-out publisher, the presence registries, the ownership directory, the bus and
+the session slots all hold clones of it (`RedisConnection`, `crates/core/src/ws/redis_conn.rs:150`,
+made at `crates/api/src/state.rs:140`). A Redis lost without a TCP reset (a dropped path, a frozen
+machine, an address left black-holed by a failover) gives the client no error at all. Before the
+bound, every command in flight waited for as long as the kernel kept the socket, about 15 minutes
+with data in flight and for ever while the peer's kernel still acknowledged, and so did every
+request that awaited one. Now each command answers or fails within the response timeout, and the
+error takes the path "Redis down" always took.
+
+| Setting | Default | What it bounds | 0 |
+|---|---|---|---|
+| `ROOMLER__REDIS__RESPONSE_TIMEOUT_MS` | 3000 | one command or pipeline, end to end: the queue in front of the socket, the wait for a reconnect, the reply (`redis_conn.rs:191-212`) | no bound |
+| `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS` | 3000 | one connection attempt: TCP connect and the handshake the crate sends (`CLIENT SETINFO`) | no bound |
+
+Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no replacement: the
+behaviour before the bound, restored by a setting on the deployment and a restart, with no new
+image (`crates/config/src/settings.rs:1296-1304`).
+
+The crate's own response timeout does not cover the wait for a reconnect or the queue in front of
+the socket, so each call runs under an outer timeout of the same length. A timed-out command does
+not make the crate reconnect, so a timeout starts ONE background replacement
+(`redis_conn.rs:216`), built like the first connection and swapped in only once Redis has answered
+its handshake:
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant RC as RedisConnection
+    participant Old as connection in use
+    participant New as replacement
+    participant R as Redis
+    C->>RC: command
+    RC->>Old: command
+    Note over Old,R: no answer and no reset
+    RC-->>C: Err (io TimedOut) after 3 s
+    Note over RC: warn "redis: no answer within the timeout"
+    loop one attempt at a time, each at most 3 s, then 1, 2, 4, 5, 5 … s apart
+        RC->>New: connect + handshake
+        New->>R: TCP + CLIENT SETINFO
+    end
+    R-->>New: answers again
+    RC->>RC: swap: later commands use the replacement
+```
+
+| Bound | Value | Where it comes from |
+|---|---|---|
+| a command, whatever the connection does | ≤ 3 s | the outer timeout; measured 3.0 s (`crates/tests/src/redis_bound_tests.rs`) |
+| a request that awaits k commands one after another | ≤ k × 3 s | the paths below that loop |
+| a bus request | ≤ 3 s + its deadline (2 s, 5 s for a router-creating media op) | the request PUBLISH (`crates/core/src/cluster/bus.rs:225`) is awaited before the deadline starts (`:236`) |
+| Redis answering again → the server using it again | ≤ 8 s | an attempt in flight ends at its 3 s bound, then at most a 5 s wait (`REPLACE_WAIT_MAX`, `redis_conn.rs:59`); measured 2.8 s |
+
+Why 3 s, for both:
+
+- A Redis that answers answers every command the server sends in well under a millisecond: each is
+  O(1) or small (the largest are the presence sweep's MGET over a fleet's agent keys, `SCAN COUNT
+  100` and short Lua scripts). A timeout that fires on such a Redis would turn a healthy cluster's
+  work into errors, so the bound sits far from it.
+- The longest stall a Redis that is up imposes by design is the write delay of up to 2 s under
+  `appendfsync everysec` when its disk falls behind; 3 s is above it.
+- `/health/ready` already takes a pod out of rotation after 2 s without a PING answer
+  (`crates/api/src/lib.rs:485`), so a command never fails before the probe could.
+- The shorter bounds some callers keep fire first and are unchanged: `CLAIM_RELEASE_BOUND` 2 s
+  (`crates/modules/conference/src/media_cluster.rs:481`), the 200 ms and 250 ms reads of a listing
+  or a route, the 2 s read of `close-dead`. The room delete's `ROOM_REMOVED_BOUND` (5 s,
+  `crates/modules/chat/src/room.rs:342`) bounds several commands in a row, each now at most 3 s.
+
+**A timeout means the reply was lost, not that the write was.** A write may be applied behind a
+timed-out command. What each Redis user does with the error, which is what it did when Redis was
+down, and what heals a write applied behind it:
+
+| Redis user | Commands | On a timeout | A write applied behind the lost reply |
+|---|---|---|---|
+| Fan-out on `roomler:ws` (`crates/core/src/ws/dispatcher.rs:57`, `:85`, `:139`) | PUBLISH | logged; users on other pods miss that one event (at-most-once, never retried); the request that sent it still answers (a chat post: 200 in 3.0 s) | delivered: nothing to heal |
+| Online registry (`crates/core/src/ws/redis_pubsub.rs:109`, `:128`) | SADD + EXPIRE, SREM | logged; the 30 s heartbeat (`crates/api/src/state.rs:443`) writes it again | the 90 s TTL |
+| Push gate (`crates/core/src/notify.rs:39`) | EXISTS | read as offline: the web push (and a mention's email) is sent | — |
+| Agent presence (`crates/modules/fleet/src/socket.rs:436`, `:977`, `:1050`, `:1054`; `presence.rs:281`) | SET EX 90, compare-DEL, EXISTS, MGET | logged; a teardown announces the device offline and the next sweep (≤ 30 s) corrects it; the sweep skips a cycle | the next heartbeat, or the 90 s TTL |
+| Cycle claims (`try_claim`, `redis_pubsub.rs:246`: alerts, org daily, stats rollup, presence sweep, ephemeral reaper, relay allowance, RC resume sweep, SaaS pulls) | SET NX EX | that pod skips the cycle | the claim is held and run by nobody until its TTL ends: one cycle (the org daily: that day's run, recomputed the next day) |
+| TURN usage dedupe (`crates/core/src/turn_bytes.rs:101`) | SET NX EX 7 d | warn, the total is not booked | **lasting**: that total is never booked |
+| Relay load baseline (`crates/core/src/relay_load.rs:521`) | advance_baseline (Lua) | logged, the poll goes on | **lasting**: that delta is never booked |
+| OAuth attribution (`crates/core/src/attribution.rs:298`, `:313`) | SET EX 600; GET + DEL in MULTI | own 250 ms bound first; sign-in goes on without it | the take: **lasting**, that sign-up is not attributed |
+| Relay allowance (`crates/modules/network/src/relay_allowance.rs:260`, `:265`, `:282`) | DEL, SET EX 900, GET | a failed read is an empty set: throttles lift (fails open, as the code intends) | the previous set until the next job (300 s) |
+| Ownership directory (`crates/core/src/cluster/directory.rs`) | GET, SET (NX) EX, Lua refresh and release, SCAN | "no record": rc and tunnels answer pod-local, media serves the join here (the belt) | records are re-asserted within one beat or end by TTL; a DERP node whose claim failed stays out of convergence until it reconnects (`crates/modules/network/src/derp_cluster.rs:85`) |
+| Pod bus (`bus.rs:225`, `:317`) | PUBLISH | a request fails before its deadline starts; a lost reply is a deadline at the requester | handlers are idempotent |
+| Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error lets the session proceed uncounted (fails open, as the code intends); renew and release log | a lease lapses in 90 s |
+| Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:1984`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
+
+Paths that wait more than one bound, because they await Redis once per item: a call start (two
+commands per member, `notify.rs:270`), a post with mentions (two per mention), a member's removal
+(per call room), the agent hello's resume claims (per claimed session), the heartbeats and refresh
+passes (per record), and the shutdown release loops (per record, with no overall bound). Each step
+is bounded; the sum is k × 3 s.
+
+**Not covered: the subscriptions.** The `roomler:ws` and bus subscribers hold their own connections
+(`redis_pubsub.rs:427`, `bus.rs:258`), which nothing bounds yet: a subscriber whose Redis went silent
+stays subscribed to nothing until the kernel gives the socket up.
+
+**Field read.** Every timeout, of a command or of a replacement's connection attempt, logs one warn
+line in one wording: `redis: no answer within the timeout`. On a healthy pod its count is 0. A
+replacement that succeeds logs `redis: the shared connection was replaced after a timeout` at info.
 
 ## Stages
 
