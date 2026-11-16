@@ -557,6 +557,35 @@ impl ConsentBroker {
         Ok(dirs.data_dir().join("logs").join("consent"))
     }
 
+    /// The daemon's broker, on [`Self::default_sentinel_dir`]. Never fails,
+    /// and never changes `mode`.
+    pub fn for_daemon(mode: Mode) -> Self {
+        Self::on_own_folder(mode, Self::default_sentinel_dir())
+    }
+
+    /// [`Self::for_daemon`], given what the daemon's own folder resolved to.
+    pub(crate) fn on_own_folder(mode: Mode, own: Result<PathBuf>) -> Self {
+        let consent_dir = own.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
+            std::env::temp_dir().join("roomlerd-consent")
+        });
+        let broker = Self::new(mode, consent_dir).unwrap_or_else(|e| {
+            // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
+            // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
+            // dir doesn't match the tray's simply times out → deny (safe), instead
+            // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
+            tracing::error!(error = %e, ?mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
+            Self::new(mode, std::env::temp_dir())
+                .expect("consent broker init cannot fail with temp_dir")
+        });
+        tracing::info!(
+            mode = ?broker.mode(),
+            sentinel_dir = %broker.sentinel_dir().display(),
+            "operator-consent broker ready"
+        );
+        broker
+    }
+
     /// Path of the sentinel file for `(session_hex, decision)`.
     /// Public so the CLI subcommand can write to it.
     pub fn sentinel_path(&self, session_hex: &str, kind: SentinelKind) -> PathBuf {
@@ -1890,6 +1919,253 @@ mod tests {
         assert_eq!(broker.request("").await, Decision::Denied);
         assert!(start.elapsed() < Duration::from_millis(50));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3939 — the folder whose files can answer a question is the daemon's
+    /// own, or there is none and the file channel is off.
+    mod own_folder {
+        use super::*;
+
+        /// The daemon's broker as it is built with no data folder to resolve.
+        fn off(mode: Mode) -> ConsentBroker {
+            ConsentBroker::on_own_folder(mode, Err(anyhow::anyhow!("no data folder in this test")))
+        }
+
+        fn a_question(timeout: Duration) -> PendingPrompt<'static> {
+            PendingPrompt {
+                kind: PromptKind::RemoteControl,
+                asked_by: "tester",
+                permissions: "VIEW".into(),
+                detail: String::new(),
+                org: String::new(),
+                timeout,
+                surface: PromptSurface::Companion,
+            }
+        }
+
+        /// With its data folder unresolved, the daemon's broker used a folder
+        /// under the temporary folder; with its own folder not set up, the
+        /// temporary folder itself. It used each as it found it: the question
+        /// was marked there, and an answer left there decided it. Now neither
+        /// stands in: nothing is marked there and nothing there is read, so a
+        /// question nobody answers ends at its window, as it always has.
+        #[tokio::test]
+        async fn with_no_folder_of_its_own_no_answer_is_read_from_a_file() {
+            let temp = std::env::temp_dir();
+            let stand_in = temp.join("roomlerd-consent");
+            // Already there, as one left by an earlier start would be. Left in
+            // place after: another test may be writing in it.
+            std::fs::create_dir_all(&stand_in).unwrap();
+            // A file where the own folder's parent should be: it cannot be made.
+            let blocker = fixture_dir("not-a-folder");
+            std::fs::write(&blocker, "a file\n").unwrap();
+            let window = Duration::from_millis(700);
+            let mode = Mode::Prompt { timeout: window };
+            let cases: [(Result<PathBuf>, &Path, &str); 2] = [
+                (
+                    Err(anyhow::anyhow!("no data folder in this test")),
+                    &stand_in,
+                    "393900000000000000000a01",
+                ),
+                (
+                    Ok(blocker.join("consent")),
+                    &temp,
+                    "393900000000000000000a02",
+                ),
+            ];
+            let mut wrong = Vec::new();
+            for (own, left_in, session) in cases {
+                let broker = ConsentBroker::on_own_folder(mode, own);
+                let asking = broker.request_with_mode(session, mode);
+                broker
+                    .write_prompt(session, &a_question(window))
+                    .expect("the question is marked");
+                let marker = left_in.join(format!("{session}.pending"));
+                if marker.exists() {
+                    wrong.push(format!("the question was marked in {}", left_in.display()));
+                }
+                let answer = left_in.join(format!("{session}.approve"));
+                std::fs::write(&answer, "0\n").unwrap();
+                let decision = tokio::time::timeout(PROMPT_BOUND, asking)
+                    .await
+                    .expect("the prompt ends with its window");
+                if decision != Decision::Timeout {
+                    wrong.push(format!(
+                        "an answer left in {} decided the question: {decision:?}",
+                        left_in.display()
+                    ));
+                }
+                let _ = std::fs::remove_file(&answer);
+                let _ = std::fs::remove_file(&marker);
+            }
+            let _ = std::fs::remove_file(&blocker);
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// The ready line names the folder answers are read from, or says
+        /// that the file channel is off; an off channel is explained once,
+        /// with why.
+        #[test]
+        fn the_ready_line_names_the_folder_or_says_the_file_channel_is_off() {
+            use tracing_subscriber::layer::SubscriberExt;
+            // ⚠️ A second dispatcher, as in `a_decided_question_takes_no_more_answers`:
+            // another test may reach these log lines first, on a thread with none.
+            let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let _log = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(Lines(seen.clone())),
+            );
+            let own = fixture_dir("ready-line");
+            let _on = ConsentBroker::on_own_folder(Mode::AutoGrant, Ok(own.clone()));
+            let _off = off(Mode::AutoGrant);
+            let seen = seen.lock().unwrap().clone();
+            let _ = std::fs::remove_dir_all(&own);
+            let ready: Vec<&Line> = seen
+                .iter()
+                .filter(|l| l.message == "operator-consent broker ready")
+                .collect();
+            assert_eq!(ready.len(), 2, "{seen:#?}");
+            assert_eq!(ready[0].field("sentinel_dir"), own.display().to_string());
+            assert_eq!(
+                ready[1].field("sentinel_dir"),
+                "none (file channel off)",
+                "{seen:#?}"
+            );
+            let off: Vec<&Line> = seen
+                .iter()
+                .filter(|l| l.message.contains("file channel is off"))
+                .collect();
+            assert_eq!(off.len(), 1, "explained once: {seen:#?}");
+            assert!(
+                off[0]
+                    .field("error")
+                    .contains("no data folder in this test"),
+                "with why: {seen:#?}"
+            );
+        }
+
+        /// On Unix the folder is the daemon's own account's. A folder another
+        /// account owns is not used, though its mode could be changed (as root
+        /// it could), and the file channel is then off. `/tmp` is root's.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_folder_another_account_owns_is_not_used() {
+            use std::os::unix::fs::MetadataExt;
+            let theirs = PathBuf::from("/tmp");
+            // SAFETY: geteuid reads the caller's own credentials; it cannot fail.
+            let me = unsafe { libc::geteuid() };
+            // As root `/tmp` is this account's own, and its mode would change.
+            if me == 0 || !std::fs::metadata(&theirs).is_ok_and(|m| m.uid() != me) {
+                eprintln!("skipped: this account owns {}", theirs.display());
+                return;
+            }
+            let window = Duration::from_millis(700);
+            let mode = Mode::Prompt { timeout: window };
+            let session = "393900000000000000000c01";
+            let broker = ConsentBroker::on_own_folder(mode, Ok(theirs.clone()));
+            let asking = broker.request_with_mode(session, mode);
+            broker
+                .write_prompt(session, &a_question(window))
+                .expect("the question is marked");
+            let marker = theirs.join(format!("{session}.pending"));
+            let marked_there = marker.exists();
+            let answer = theirs.join(format!("{session}.approve"));
+            std::fs::write(&answer, "0\n").unwrap();
+            let decision = tokio::time::timeout(PROMPT_BOUND, asking).await;
+            let _ = std::fs::remove_file(&answer);
+            let _ = std::fs::remove_file(&marker);
+            assert!(
+                !marked_there,
+                "the question was marked in another account's folder"
+            );
+            assert_eq!(
+                decision.expect("the prompt ends with its window"),
+                Decision::Timeout,
+                "an answer in another account's folder decided the question"
+            );
+        }
+
+        /// With the file channel off the books hold the LocalAPI's answer, and
+        /// a question takes one: the first decides, and a second is refused
+        /// rather than reported taken.
+        #[tokio::test]
+        async fn with_the_file_channel_off_the_first_answer_decides() {
+            for (session, first, then, decided) in [
+                ("393900000000000000000d01", false, true, Decision::Denied),
+                ("393900000000000000000d02", true, false, Decision::Granted),
+            ] {
+                let broker = off(LONG_WINDOW);
+                let asking = broker.request_with_mode(session, LONG_WINDOW);
+                assert!(
+                    broker.record_decision(session, first),
+                    "{session}: the first answer was refused"
+                );
+                assert!(
+                    !broker.record_decision(session, then),
+                    "{session}: a second answer was reported taken"
+                );
+                let decision = tokio::time::timeout(PROMPT_BOUND, asking)
+                    .await
+                    .expect("an answered prompt resolves promptly");
+                assert_eq!(decision, decided, "{session}");
+            }
+        }
+
+        /// Every event a test's thread logs: its message, and its fields as text.
+        struct Lines(Arc<Mutex<Vec<Line>>>);
+
+        #[derive(Clone, Debug)]
+        struct Line {
+            message: String,
+            fields: Vec<(String, String)>,
+        }
+
+        impl Line {
+            fn field(&self, name: &str) -> String {
+                self.fields
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            }
+        }
+
+        struct Text(Line);
+
+        impl Text {
+            fn put(&mut self, f: &tracing::field::Field, v: String) {
+                if f.name() == "message" {
+                    self.0.message = v;
+                } else {
+                    self.0.fields.push((f.name().to_string(), v));
+                }
+            }
+        }
+
+        impl tracing::field::Visit for Text {
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.put(f, v.to_string());
+            }
+
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.put(f, format!("{v:?}"));
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut text = Text(Line {
+                    message: String::new(),
+                    fields: Vec::new(),
+                });
+                event.record(&mut text);
+                self.0.lock().unwrap().push(text.0);
+            }
+        }
     }
 }
 
