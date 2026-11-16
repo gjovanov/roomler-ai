@@ -103,6 +103,8 @@ flowchart TB
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
+  the codec × chroma picker, stored per device as one value per pair
+  ([encoders.md § The stored choice](encoders.md#the-stored-choice-one-value-per-pair-3651)),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
   its frame-skip rate control, and since FR-135 R0 also carries the worker's media
   window, which only records; since R3 also `queue_arr_ms`, the transit queue read

@@ -301,7 +301,7 @@ and telling nobody (`agents/roomlerd/src/signaling.rs:4089`), and the viewer ign
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10381`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
-watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
+watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:446`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
 its own fallback to the RTP track, which is safe only because that pick also forces
 `preferredCodec: 'h264'`. HEVC, AV1 and VP9 carry no codec, so their RTP track would
