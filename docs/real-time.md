@@ -363,7 +363,7 @@ sequenceDiagram
 - **The loop.** Every pod runs it in a task of its own (`seat_check::spawn`,
   `seat_check.rs:195`, started at `crates/modules/conference/src/lib.rs:194`), every
   `SEAT_CHECK_SECS` = 10 s (`seat_check.rs:74`), the room reconcile's cadence. A pass first
-  reads the pod's seats out of the room manager into owned values (`seats_here`, `:216`), so
+  reads the pod's seats out of the room manager into owned values (`seats_here`, `:217`), so
   no guard of it is held across a read.
 - **What it re-reads.** Two of the three checks `media:join` passed (`media_gate.rs:114`),
   with the room guard's own rule: membership of the room's org (the `tenant_id` the room
@@ -372,12 +372,12 @@ sequenceDiagram
   `{tenant_id, room_id, user_id}` for the room. The third, an open call session for the
   connection, is not re-read: a person's other tab, or a call whose sessions a sweep closed,
   would lose a seat they are entitled to.
-- **One read a pass, three queries, from the primary** (`read_admissions_unbounded`, `:336`):
+- **One read a pass, three queries, from the primary** (`read_admissions_unbounded`, `:337`):
   the rooms by `_id`; `tenant_members` by `$in` lists of orgs and people, on its unique
   `(tenant_id, user_id)` index (`crates/db/src/indexes.rs:155`); and, for the members-only
   rooms only, `room_members` by `$in` lists of rooms and people, on its unique
   `(room_id, user_id)` index (`crates/modules/chat/src/lib.rs:224`). Each has a projection
-  and reads the primary whatever the connection string says (`:439`), so a person added a
+  and reads the primary whatever the connection string says (`:440`), so a person added a
   moment ago reads as a member, as the join's own gate read them; all three together within
   `READ_TIMEOUT` = 5 s (`:82`). A pod with 300 seats in 20 rooms makes three indexed queries
   every 10 s, with `$in` lists of at most 20 rooms, their orgs and the seated people, and
@@ -394,7 +394,7 @@ sequenceDiagram
   (`revoke::withdraw_these_seats_here`, `revoke.rs:372`): only the connections seated before
   the deciding read close, so a person added back who joins again keeps the new seat; they
   hear `room:call_ended` with `reason: "not_a_member"`, and everyone left hears
-  `media:peer_left`. Then the call's books, as a hang-up keeps them (`seat_check.rs:286`):
+  `media:peer_left`. Then the call's books, as a hang-up keeps them (`seat_check.rs:287`):
   the person's open call sessions in the room close and the count drops
   (`finalize_call_leave_db`, which finds nothing where the membership's hook closed them
   already), and the call is settled (`settle_call_after_departure`), so a call they were the
@@ -417,9 +417,9 @@ sequenceDiagram
   check ends it.
 - **The switch.** `ROOMLER__CONFERENCE__SEAT_CHECK` set to `false`, `0`, `off` or `no` turns
   the check off on a pod (`seat_check.rs:89`). It is read once, as the pod starts: turning
-  it off takes a pod restart with the variable set, not a new image. A pod with it off logs
-  `seat check: off on this pod` at info, and there a seat no withdrawal reached keeps its
-  call.
+  it off takes a pod restart with the variable set, not a new image. As it starts, a pod logs
+  `seat check: on this pod` or `seat check: off on this pod` at info; with it off, a seat no
+  withdrawal reached keeps its call.
 - **The log, read by hand.** Each seat the check ends is one warning,
   `seat check: ended a call seat whose admission is gone` (`seat_check.rs:92`), with the
   org, the room, the person, how many connections closed and what each of the two reads

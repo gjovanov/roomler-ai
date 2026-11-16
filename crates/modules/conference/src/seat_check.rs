@@ -201,6 +201,7 @@ pub(crate) fn spawn(state: &ConferenceState) {
         return;
     }
     let st = state.clone();
+    info!(every_secs = SEAT_CHECK_SECS, "seat check: on this pod");
     tokio::spawn(async move {
         let mut memory = SeatCheckMemory::default();
         loop {
