@@ -10,6 +10,7 @@
 
 use std::time::{Duration, Instant};
 
+use roomler_core::ws::redis_conn::RedisBounds;
 use roomler_core::ws::redis_pubsub::RedisPubSub;
 
 use crate::fixtures::redis_blackout::{RedisBlackout, test_redis_url};
@@ -146,4 +147,168 @@ async fn a_message_post_answers_within_the_bound_when_redis_stops_answering() {
         took <= BOUND + SLACK,
         "the post answered after {took:?}; the bound is {BOUND:?}"
     );
+}
+
+// ── Controls: the bound changes nothing while Redis answers ─────────────────
+
+/// How long after Redis answers again a test allows before the shared
+/// connection is used again: a replacement attempt that began while Redis was
+/// silent ends at the connection timeout (3 s), then waits at most
+/// `REPLACE_WAIT_MAX` (5 s) before the next attempt; plus slack.
+const RECOVERY: Duration = Duration::from_secs(10);
+
+async fn through(fwd: &RedisBlackout) -> RedisPubSub {
+    RedisPubSub::new(&fwd.url_for(&test_redis_url()), unique("w14-test/"))
+        .await
+        .expect("the shared connection connects through the forwarder")
+}
+
+/// A Redis that answers: every kind of call the server sends (a command, a
+/// pipeline, a script, a publish) is answered, with no timeout and so no warn
+/// line (the counter counts exactly those lines), no replacement and no
+/// second connection.
+#[tokio::test]
+async fn a_healthy_redis_sees_no_timeout_and_no_replacement() {
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let key = unique("roomler:test:w14:");
+    for i in 0..50 {
+        ps.kv_set_ex(&key, &i.to_string(), 60).await.expect("SET");
+        assert_eq!(ps.kv_get(&key).await.expect("GET"), Some(i.to_string()));
+        ps.online_add(&key).await.expect("pipeline");
+        ps.agent_presence_del_if_owned(&key, "nobody")
+            .await
+            .expect("script");
+        ps.publish_to(&key, "x").await.expect("PUBLISH");
+    }
+    ps.online_remove(&key).await.expect("SREM");
+    ps.kv_del(&key).await.expect("DEL");
+    let conn = ps.connection();
+    assert_eq!(conn.timeouts(), 0, "a Redis that answers logs no timeout");
+    assert_eq!(conn.replacements(), 0, "and replaces nothing");
+    assert_eq!(fwd.accepted(), 1, "one connection carried all of it");
+}
+
+/// One answer slower than usual but under the bound arrives, and changes
+/// nothing: no timeout, no replacement.
+#[tokio::test]
+async fn one_slow_answer_under_the_bound_changes_nothing() {
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let key = unique("roomler:test:w14:");
+    ps.kv_set_ex(&key, "v", 60).await.expect("SET");
+
+    let slow = Duration::from_millis(1500);
+    fwd.delay_next_reply(slow);
+    let started = Instant::now();
+    let got = ps
+        .kv_get(&key)
+        .await
+        .expect("a slow answer is still an answer");
+    let took = started.elapsed();
+    eprintln!("W14-RESULT slow answer: {got:?} after {took:?}");
+    assert_eq!(got.as_deref(), Some("v"));
+    assert!(
+        took >= slow - Duration::from_millis(100),
+        "the reply was held only {took:?}"
+    );
+    assert!(
+        took < BOUND,
+        "a reply held {slow:?} answered after {took:?}"
+    );
+    let conn = ps.connection();
+    assert_eq!(
+        conn.timeouts(),
+        0,
+        "an answer under the bound is no timeout"
+    );
+    assert_eq!(conn.replacements(), 0, "and replaces nothing");
+    assert_eq!(fwd.accepted(), 1);
+    ps.kv_del(&key).await.expect("DEL");
+}
+
+/// After a blackout the old connection stays dead (the forwarder never
+/// forwards again on a connection that lost a byte, like a node that is
+/// gone), and a Redis that answers again is used again without a restart,
+/// through the replacement the first timeout started. The blackout outlasts
+/// the replacement's first attempt, so the time measured includes a failed
+/// attempt and the wait before the next one.
+#[tokio::test]
+async fn redis_answering_again_is_used_again_without_a_restart() {
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let key = unique("roomler:test:w14:");
+    ps.kv_set_ex(&key, "v", 60).await.expect("SET");
+
+    fwd.swallow();
+    let err = ps
+        .kv_get(&key)
+        .await
+        .expect_err("a Redis that stopped answering cannot answer");
+    assert!(err.is_timeout(), "{err}");
+    assert_eq!(ps.connection().timeouts(), 1);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    fwd.pass();
+    let back = Instant::now();
+    let mut answered = None;
+    while back.elapsed() < RECOVERY + BOUND {
+        // A short wait of the test's own: a probe that lands on the dead
+        // connection is dropped, never counted as a timeout.
+        if let Ok(Ok(v)) = tokio::time::timeout(Duration::from_millis(300), ps.kv_get(&key)).await {
+            answered = Some(v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let took = back.elapsed();
+    let conn = ps.connection();
+    eprintln!(
+        "W14-RESULT recovery: used again {took:?} after Redis answered again \
+         (timeouts {}, replacements {}, connections {})",
+        conn.timeouts(),
+        conn.replacements(),
+        fwd.accepted()
+    );
+    assert_eq!(
+        answered,
+        Some(Some("v".to_string())),
+        "Redis answering again was not used again within {:?}",
+        RECOVERY + BOUND
+    );
+    assert!(
+        took <= RECOVERY,
+        "used again only {took:?} after Redis answered again"
+    );
+    assert_eq!(conn.replacements(), 1, "through one replacement");
+    assert!(fwd.accepted() >= 2, "on a new connection");
+    ps.kv_del(&key).await.expect("DEL");
+}
+
+/// Both settings at 0 restore the connection as it was before #3840: a
+/// command sent after Redis stopped answering is still waiting at the test's
+/// own limit, and nothing counts it.
+#[tokio::test]
+async fn with_both_bounds_at_0_a_command_waits_as_before() {
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let settings = roomler_ai_config::RedisSettings {
+        url: fwd.url_for(&test_redis_url()),
+        response_timeout_ms: 0,
+        connection_timeout_ms: 0,
+    };
+    let ps = RedisPubSub::from_settings(&settings, unique("w14-test/"))
+        .await
+        .expect("connects");
+    assert_eq!(ps.connection().bounds(), RedisBounds::NONE);
+    let key = unique("roomler:test:w14:");
+    ps.kv_set_ex(&key, "v", 60).await.expect("SET");
+
+    fwd.swallow();
+    let res = tokio::time::timeout(BOUND + SLACK, ps.kv_get(&key)).await;
+    assert!(
+        res.is_err(),
+        "with no bound the command must still be waiting after {:?}, as before #3840",
+        BOUND + SLACK
+    );
+    assert_eq!(ps.connection().timeouts(), 0);
 }
