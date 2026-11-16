@@ -226,7 +226,7 @@ fields). All five are constrained-only, so a direct window moves nothing.
 | **(b)** | A growing queue counts only while the sender offered more than arrived, two windows running. | `offered` (`governor.rs:1473`), `viewer_rate::OfferLoop` (`viewer_rate.rs:676`) | step 2, and with it step 3 |
 
 ⚠️ **(b) needed a second clause.** `bytes_written` counts what left the pump's own
-channel, and both pumps stamp a frame before it (`peer.rs:5195`, `:9752`), so a
+channel, and both pumps stamp a frame before it (`peer.rs:5306`, `:10033`), so a
 queue growing INSIDE that channel reads sent ≈ rx even though the encoder is
 overdriving. The classifier already calls that window `Overproduced`, so it counts
 as an offer. jupiter's two windows were `clear` in the field (`pipe_states` read

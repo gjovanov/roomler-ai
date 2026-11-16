@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:11203`](../agents/roomlerd/src/peer.rs#L11203)).
+control-channel arm sends the answer ([`peer.rs:11201`](../agents/roomlerd/src/peer.rs#L11201)).
 
 ### The answers
 
@@ -108,7 +108,7 @@ roomler config set display_match auto     # auto (default) | always | never
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2712`](../crates/agent-core/src/config.rs#L2712) `DisplayMatchPolicy`).
+  ([`config.rs:2721`](../crates/agent-core/src/config.rs#L2721) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
