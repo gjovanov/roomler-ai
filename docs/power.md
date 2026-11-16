@@ -196,24 +196,24 @@ not answered yet holds nothing (§1.1).
 ### 3.2 The goodbye, per OS
 
 Every hook only listens, takes nothing, and is bounded
-([`sleep_notice.rs:392`](../agents/roomlerd/src/sleep_notice.rs#L392)
+([`sleep_notice.rs:402`](../agents/roomlerd/src/sleep_notice.rs#L402)
 `will_sleep`). It tells the remote-desktop viewers first (FR-93 P5h), then hands
 every live control connection its goodbye
-([`sleep_notice.rs:211`](../agents/roomlerd/src/sleep_notice.rs#L211)
+([`sleep_notice.rs:221`](../agents/roomlerd/src/sleep_notice.rs#L221)
 `register_control`), and returns within its bound whatever happened.
 
 | OS | the hook | how long the OS waits | our bound |
 |---|---|---|---|
-| Linux | logind `PrepareForSleep(true)` ([`sleep_notice.rs:569`](../agents/roomlerd/src/sleep_notice.rs#L569)) | while we hold the delay inhibitor (`InhibitDelayMaxSec`, 5 s by default), else not at all | 3.2 s |
-| Windows | `PowerRegisterSuspendResumeNotification`, `PBT_APMSUSPEND` ([`sleep_notice.rs:708`](../agents/roomlerd/src/sleep_notice.rs#L708)) | for the callback, about 2 s | 1.5 s |
-| macOS | `IORegisterForSystemPower`, `kIOMessageSystemWillSleep` ([`sleep_notice.rs:783`](../agents/roomlerd/src/sleep_notice.rs#L783)) | until `IOAllowPowerChange`, 30 s at most | 1.5 s |
+| Linux | logind `PrepareForSleep(true)` ([`sleep_notice.rs:579`](../agents/roomlerd/src/sleep_notice.rs#L579)) | while we hold the delay inhibitor (`InhibitDelayMaxSec`, 5 s by default), else not at all | 3.2 s |
+| Windows | `PowerRegisterSuspendResumeNotification`, `PBT_APMSUSPEND` ([`sleep_notice.rs:718`](../agents/roomlerd/src/sleep_notice.rs#L718)) | for the callback, about 2 s | 1.5 s |
+| macOS | `IORegisterForSystemPower`, `kIOMessageSystemWillSleep` ([`sleep_notice.rs:793`](../agents/roomlerd/src/sleep_notice.rs#L793)) | until `IOAllowPowerChange`, 30 s at most | 1.5 s |
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
 ([`signaling.rs:2345`](../agents/roomlerd/src/signaling.rs#L2345)). Then the run
 loop holds every new dial until the wake
 ([`signaling.rs:1232`](../agents/roomlerd/src/signaling.rs#L1232),
-[`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
+[`sleep_notice.rs:329`](../agents/roomlerd/src/sleep_notice.rs#L329)
 `hold_while_asleep`). A dial inside the window the OS gave the computer to go to
 sleep would say hello again and erase the reason.
 
@@ -276,7 +276,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
   a std channel with a hard bound. A hook that hung would hold a laptop awake in
   a bag.
 - ⚠️ **The announcement ends itself after 60 s** (`HOLD_MAX`,
-  [`sleep_notice.rs:308`](../agents/roomlerd/src/sleep_notice.rs#L308)), for a
+  [`sleep_notice.rs:318`](../agents/roomlerd/src/sleep_notice.rs#L318)), for a
   sleep that never came or a wake the OS never reported. It ends the
   announcement, not just one wait: an announcement that outlived it would hand
   every new connection its goodbye at once. On Linux and macOS the monotonic
@@ -289,7 +289,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
   `powercfg /requests` show nothing new and `never` stays byte-for-byte (AC3).
   The Linux delay inhibitor keeps FR-93 P5h's scope on a `never` device, live
   sessions only, and covers the control connections only under `on-ac` and
-  `always` ([`sleep_notice.rs:489`](../agents/roomlerd/src/sleep_notice.rs#L489)
+  `always` ([`sleep_notice.rs:499`](../agents/roomlerd/src/sleep_notice.rs#L499)
   `inhibitor_wanted`). So a `never` device's goodbye on Linux is best effort,
   sent in whatever time logind leaves. The operator chose that on 2026-10-30
   (the spec's open decisions), and it held in the field (§3.8).

@@ -23,7 +23,7 @@ set, switches mutter on by itself, or the portal where mutter is absent (§1.2).
 
 ## 1. The cascade
 
-`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2726`) tries the
+`capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2810`) tries the
 backends in this order and returns the first that opens. On Linux the Windows
 arms (SystemContext, WGC) do not exist, so the order is:
 
@@ -54,10 +54,10 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
-| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:3240`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **the greeter, no; a locked screen, per compositor** — mutter refuses to create *or restore* a screencast while locked, KWin keeps streaming its lock screen (§1.2) | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:3351`) |
+| **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:3324`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **the greeter, no; a locked screen, per compositor** — mutter refuses to create *or restore* a screencast while locked, KWin keeps streaming its lock screen (§1.2) | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:3435`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:73`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:3430`), after the Xwayland guard (`mod.rs:3396`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:3514`), after the Xwayland guard (`mod.rs:3480`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -74,7 +74,7 @@ backend arrives:
   screen). The portal is **attended**: defaulting it on would leave an
   unattended host waiting on a consent dialog nobody will answer — a hang
   dressed up as a feature. Both arms therefore log **loudly** when the operator
-  asked for them and they fell through (`mod.rs:3316`, `mod.rs:3366`), because
+  asked for them and they fell through (`mod.rs:3400`, `mod.rs:3450`), because
   silently serving X11 instead would look like the feature simply not working.
   Since FR-93 that error also travels: it becomes the session's `detail`
   (§1.1). And since FR-93 P2d-3 a per-user daemon in its own Wayland session,
@@ -97,18 +97,18 @@ and a different false thing per install type. Measured on the FR-93 lab
 
 Two changes stop both:
 
-- 🔑 **The Xwayland guard** (`mod.rs:3396`). Before scrap opens, the daemon
+- 🔑 **The Xwayland guard** (`mod.rs:3480`). Before scrap opens, the daemon
   asks the X server named by its `DISPLAY` whether it is Xwayland
-  (`x_server_is_xwayland`, `mod.rs:2404`). There are two signals, the same two
+  (`x_server_is_xwayland`, `mod.rs:2460`). There are two signals, the same two
   keep busy reads (FR-92): the `XWAYLAND` extension, which Xwayland has carried
   since 23.1, and before that its RandR monitors, all named `XWAYLAND<n>`. If
   it is Xwayland, scrap is refused, and the session gets a reason instead of
   black. The answer comes from the server, never from `XDG_SESSION_TYPE`, so a
   real Xorg and the daemon's own Xvfb are captured exactly as before.
 - 🔑 **The seat, not the daemon's environment, decides "headless"**
-  (`linux_no_pixels_code`, `mod.rs:2301`). When every arm has failed and the
+  (`linux_no_pixels_code`, `mod.rs:2357`). When every arm has failed and the
   daemon has no display variables, logind is asked whether a graphical session
-  is showing (`seat_kind`, `mod.rs:2385`, through
+  is showing (`seat_kind`, `mod.rs:2441`, through
   `companion::graphical_session`). A Wayland session there means
   `wayland_not_enabled`. No session at all means `no_display`, and that is now
   true.
@@ -133,7 +133,7 @@ because only root can read the scanout or create a uinput device:
 A failed arm is never told to "switch it on". It is already on, and its own
 error is the useful sentence.
 
-⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:2479`).
+⚠️ **The probe dials Unix sockets only** (`x_server_query`, `mod.rs:2535`).
 `x11rb::connect` falls back to TCP `localhost:6000+N` when the socket is
 missing. Under WSL2's mirrored networking a localhost connect to a closed port
 hangs instead of being refused, and systemd's `/tmp` handling there had hidden
@@ -494,7 +494,7 @@ all strings, so a newer agent's word reaches an older server as a word:
 | `capture_arm` | `mutter` · `drm` · `portal` · `x11` · `none` | the arm a session opened **now** would try first |
 | `input_reach` | `full` · `xwayland_only` · `none` | the `rc:input-reach` verdict (`input/reach.rs:291`), with the portal's input route predicted for a portal or mutter arm with `portal_input` on. ⚠️ **It never starts an X server.** GNOME starts Xwayland **on demand** for any client that connects, so on a Wayland desktop the brief connects only to an Xwayland already running (found in `/proc`), and with none it reads "no X server". It is also read again only when another field changed. The per-session `rc:input-reach` stays the authority |
 
-`capture_arm` is `capture::planned_arm` (`capture/mod.rs:1450`), a pure function
+`capture_arm` is `capture::planned_arm` (`capture/mod.rs:1470`), a pure function
 that walks `open_with`'s own order (`:3020`). The two sit together in one file
 because they must not drift:
 
@@ -558,7 +558,7 @@ On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
 `ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3589`,
-`virtual_desktop.rs:1672`) starts an X server at
+`virtual_desktop.rs:1957`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
 (FR-108 P2, `docs/display-match.md`), else Xvfb — with the window manager named by
@@ -703,11 +703,11 @@ stateDiagram-v2
 
 **While the desktop is down, the device does not offer it.**
 `virtual_desktop::down` (`:294`) carries the reason. The capture plan drops the
-X11 arm (`arm_facts`, `capture/mod.rs:1542`), and the supervisor wakes the
+X11 arm (`arm_facts`, `capture/mod.rs:1598`), and the supervisor wakes the
 brief's refresher (`refresh_soon`, `desktop_brief.rs:53`), so the hello's
 `desktop` reads `capture_arm: none` at the next heartbeat instead of up to a
 minute later. A session opened meanwhile is refused with `backend_error` and
-the agent's own words (`capture/mod.rs:3419`), for example: *this device's
+the agent's own words (`capture/mod.rs:3503`), for example: *this device's
 virtual desktop is down: its X server (Xvfb) exited: signal 6 (aborted), core
 dumped. The agent starts it again by itself; reconnect in a moment.* Display
 match treats the desktop as the daemon's own all the while
@@ -857,15 +857,15 @@ flowchart TD
 
 | Rule | What it means | Where |
 |---|---|---|
-| **Ready before the job** | The keeper checks that it is in a process group of the desktop's own (not the daemon's), makes itself a child subreaper, arms its signals and says `ready` on stderr. Only then does the daemon write the job, one JSON line: display, group, window manager, apps, grace. A keeper the daemon gives up on never had a job and started nothing; it is SIGKILLed and collected before its input ends, and leaves the tree in the same step. So a keeper whose input ends before its job, whose parent changed, or that has had no job for 15 s is one whose daemon left between `ready` and the job, or was stopped for that long (SIGSTOP, a debugger, a freezer): it takes the whole desktop down, with the job's grace of 1.5 s, as it does once it has its job. A daemon that was only stopped loses the desktop it was starting, and its supervisor starts it again | `run` `virtual_desktop/keeper.rs:643`, `JOB_WAIT` `virtual_desktop/keeper.rs:133`, `start_keeper` `virtual_desktop.rs:1464`, `discard_keeper` `virtual_desktop.rs:1167` |
+| **Ready before the job** | The keeper checks that it is in a process group of the desktop's own (not the daemon's), makes itself a child subreaper, arms its signals and says `ready` on stderr. Only then does the daemon write the job, one JSON line: display, group, window manager, apps, grace. A keeper the daemon gives up on never had a job and started nothing; it is SIGKILLed and collected before its input ends, and leaves the tree in the same step. So a keeper whose input ends before its job, whose parent changed, or that has had no job for 15 s is one whose daemon left between `ready` and the job, or was stopped for that long (SIGSTOP, a debugger, a freezer): it takes the whole desktop down, with the job's grace of 1.5 s, as it does once it has its job. A daemon that was only stopped loses the desktop it was starting, and its supervisor starts it again | `run` `virtual_desktop/keeper.rs:643`, `JOB_WAIT` `virtual_desktop/keeper.rs:133`, `start_keeper` `virtual_desktop.rs:1749`, `discard_keeper` `virtual_desktop.rs:1419` |
 | **Its clients get what the daemon's got** | Environment, working directory, umask, ignored and blocked signals (a SIGHUP the daemon ignores under `nohup` stays ignored), process group, session and descriptors; stdin, stdout and stderr are `/dev/null` on both paths. Their parent is the one difference | `arm_signals` `virtual_desktop/keeper.rs:298`, `Book::start` `virtual_desktop/keeper.rs:429` |
 | **Nothing that exits stays a zombie** | It waits for every child it has, its own and adopted. `waitpid(-1)` is right there, because all its children are the desktop's. The daemon still waits for one pid at a time | `Book::reap` `virtual_desktop/keeper.rs:447` |
-| **Its input is the lifeline** | Only the daemon holds the write end, write-only and close-on-exec. The daemon's teardown drops it just before it signals the tree, and a daemon that dies closes it. The keeper then ends everything under it and every other member of the desktop's group, the X server included, and leaves. A parent that changed means the same: the daemon died while something else held the write end | `serve` `virtual_desktop/keeper.rs:730`, `kill_recorded_tree` `virtual_desktop.rs:1198` |
+| **Its input is the lifeline** | Only the daemon holds the write end, write-only and close-on-exec. The daemon's teardown drops it just before it signals the tree, and a daemon that dies closes it. The keeper then ends everything under it and every other member of the desktop's group, the X server included, and leaves. A parent that changed means the same: the daemon died while something else held the write end | `serve` `virtual_desktop/keeper.rs:730`, `kill_recorded_tree` `virtual_desktop.rs:1450` |
 | **SIGTERM alone ends what it started, then it waits** | A service manager's stop signals every process of the unit at once. On SIGTERM alone the keeper ends its own children and waits up to 10 s for its input to end, so the supervisor sees no exit to report and the daemon's teardown finds it | `serve`, `LINGER` `virtual_desktop/keeper.rs:98` |
 | **Its teardown loops** | SIGTERM, a grace of 1.5 s, SIGKILL, collect; then again with no grace while a child is left, such as an orphan adopted during a pass. At most about 4.5 s | `teardown_with` `virtual_desktop/keeper.rs:617` |
 | **It signals only the desktop's** | Never pid 0, 1 or -1, itself or the daemon, and never a group, since it is a member of the desktop's. A pid that is not its own child is signalled only after its `/proc` start time matches the snapshot that selected it | `may_signal` `virtual_desktop/keeper.rs:192`, `KeeperProcs` `virtual_desktop/keeper.rs:560` |
 | **Quiet about what a stop or a death caused** | An exit of the window manager or an app is held for 2 s and said only while the X server still runs. A service manager's stop and an X server's death end those clients first, and neither is news. One false notice is left: an X server that closes its clients' connections and then takes over 2 s to exit. A server that has exited reads as not running, a zombie or reaped, and its pid cannot come back as another process while the keeper lives, because the keeper's membership holds the group's number | `Book::say_notices` `virtual_desktop/keeper.rs:496` |
-| **Its exit is the desktop's failure** | Once it has its job, the keeper's exit takes the desktop down and brings it back with the supervisor's backoff, as the server's exit does, never with a start on top. The reason reads `its keeper process (vd-keeper) exited: …`. A job it refuses (one it cannot read, or one for another group) is logged first, as a warning with its reason, `virtual-desktop vd-keeper: refused: …`, because the supervisor's warning names only the exit code | `supervise` `virtual_desktop.rs:1705`, `Gone` `virtual_desktop.rs:1867`, `keeper_line` `virtual_desktop.rs:1648` |
+| **Its exit is the desktop's failure** | Once it has its job, the keeper's exit takes the desktop down and brings it back with the supervisor's backoff, as the server's exit does, never with a start on top. The reason reads `its keeper process (vd-keeper) exited: …`. A job it refuses (one it cannot read, or one for another group) is logged first, as a warning with its reason, `virtual-desktop vd-keeper: refused: …`, because the supervisor's warning names only the exit code | `supervise` `virtual_desktop.rs:2003`, `Gone` `virtual_desktop.rs:2205`, `keeper_line` `virtual_desktop.rs:1933` |
 
 **When the daemon starts the clients itself**, as before #3665, what the apps
 leave behind is out of the teardown's reach again. The log says so at every
@@ -873,16 +873,16 @@ start:
 
 | Case | The daemon's log |
 |---|---|
-| The kill switch `ROOMLERD_VIRTUAL_DESKTOP_KEEPER=0` (`virtual_desktop.rs:865`) | nothing: the start of 0.4.221, except that the clients get `/dev/null` on stdin |
+| The kill switch `ROOMLERD_VIRTUAL_DESKTOP_KEEPER=0` (`virtual_desktop.rs:1062`) | nothing: the start of 0.4.221, except that the clients get `/dev/null` on stdin |
 | The keeper refuses: not in a group of the desktop's own, no subreaper (a seccomp filter or an old kernel refuses `PR_SET_CHILD_SUBREAPER`), or its signals cannot be armed | WARN `virtual-desktop: no vd-keeper — …`, with `why=it refused: …` |
 | Not ready within 5 s | the same WARN, `why=it did not say it was ready within 5s` |
-| Two keepers in a row that exited by themselves within a minute of their desktop's start, or two that were not ready in time with none ready between them | WARN `no vd-keeper for the rest of this daemon's life, after two keepers in a row exited by themselves within a minute of their desktop's start, or two were not ready in time with none ready between them`. These are two counts, and one of each turns nothing off. Early exits (`KeeperStrikes` `virtual_desktop.rs:1837`) start again after a keeper or a desktop that ran longer. Readiness timeouts (`keeper_slow` `virtual_desktop.rs:1037`) start again only at a `ready`, so a refusal between two timeouts does not reset them. The next daemon tries again |
+| Two keepers in a row that exited by themselves within a minute of their desktop's start, or two that were not ready in time with none ready between them | WARN `no vd-keeper for the rest of this daemon's life, after two keepers in a row exited by themselves within a minute of their desktop's start, or two were not ready in time with none ready between them`. These are two counts, and one of each turns nothing off. Early exits (`KeeperStrikes` `virtual_desktop.rs:2175`) start again after a keeper or a desktop that ran longer. Readiness timeouts (`keeper_slow` `virtual_desktop.rs:1249`) start again only at a `ready`, so a refusal between two timeouts does not reset them. The next daemon tries again |
 
 A stop that lands while a keeper starts leaves nothing behind. Before the keeper
 has its job, nothing is started, neither the keeper's clients nor the daemon's,
 and a keeper the stop ended then is logged at INFO, never as a warning:
 `virtual-desktop: the desktop is stopping, and its vd-keeper with it`
-(`start_clients` `virtual_desktop.rs:1417`). Once the job is sent, the keeper
+(`start_clients` `virtual_desktop.rs:1702`). Once the job is sent, the keeper
 may already have started the window manager and the apps; the stop then ends
 them with the rest of the desktop, within its usual bound, and logs nothing more.
 
@@ -1184,7 +1184,7 @@ backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
 real hardware, and the AC4 oracle's first target went missing. The device used
 to be created at the session's first event. The input arbiter now opens it as
 soon as a session that may input has its control channel
-(`warm`, `agents/roomlerd/src/input/arbiter.rs:1084`), which gives it the second
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:1302`), which gives it the second
 or more a viewer takes to send anything. This applies on Linux only, and an
 injector without the OS's permission is never cached. The kill switch is
 `ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides
@@ -1215,7 +1215,7 @@ decoded as `XR24`, `AB24` is the right picture with a blue sky turned orange,
 so every order has a test pinned to hand-computed bytes.
 
 ⚠️ **A reason must fit FR-80's cap whole.** `CaptureUnavailable` keeps 200
-characters of a detail (`capture/mod.rs:2527`), the cascade's prefix included,
+characters of a detail (`capture/mod.rs:2589`), the cascade's prefix included,
 and cuts the rest. The first draft of this reason was longer, and on the lab the
 viewer showed it ending *"…run roomler config clear"*: the fix, at the end, was
 the part cut off. Each new reason's test now builds the detail as the viewer
@@ -1854,10 +1854,10 @@ sequenceDiagram
 
 | | what | where |
 |---|---|---|
-| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:2751`, the eight pump call sites in `peer.rs` |
+| the open runs off the workers | `capture::open_default_async`: on Linux, `open_default` on the blocking pool. The pump stays droppable while it waits, and a capture that opens after its session is gone is dropped as it arrives. Elsewhere it stays inline | `capture/mod.rs:2835`, the eight pump call sites in `peer.rs` |
 | one request per host | `portal::pending::open_with`, which the configured and the automatic (P2d-3) arms share: a session that asks while a request is pending waits for **that** request, and an older waiter leaves (`Superseded`) | `portal/pending.rs:59`, `Broker::open` `:150` |
 | the newest waiter wins | the outcome goes to the session that asked last, which is the one the viewer shows now | `Request::wait` `:229` |
-| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1934`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:2751`, `Request::land` `pending.rs:220` |
+| nobody there, nothing starts | a waiter is a blocking thread, not a session. A session's end aborts its pump (`AgentPeer::stop_serving`, `peer.rs:1934`), which detaches the open, so the capture its waiter takes is dropped as it arrives: the helper is killed and the screencast stops. An outcome that outlives its **last waiter** (each waits 5 s past the request's own deadline) is dropped in `Request::land`, the backstop | `capture/mod.rs:2835`, `Request::land` `pending.rs:220` |
 | mutter is not brokered | `mutter_capture` asks nobody and opens in milliseconds, so concurrent sessions never wait on each other for it | `pending.rs:60` |
 
 **Measured** on the FR-93 lab's KDE guest: Plasma 6.7 on Fedora 44, 4 cores, a per-user install with
@@ -2438,7 +2438,7 @@ inhibitor, up to its `InhibitDelayMaxSec` (5 s by default). So while a
 remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
-(`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:534`, the rule
+(`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:544`, the rule
 `:149`) sends `peer.rs:5675`'s notice to all of them at once (`:93`):
 
 ```mermaid
