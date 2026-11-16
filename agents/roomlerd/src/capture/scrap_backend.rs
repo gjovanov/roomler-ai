@@ -261,7 +261,6 @@ impl ScrapCapture {
                 let mut seen_mode = crate::display_match::mode_generation();
                 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
                 let mut reopen_tried: Option<Instant> = None;
-
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
                     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
@@ -872,6 +871,165 @@ mod tests {
             frame.stride,
             frame.height,
             frame.cpu().len()
+        );
+    }
+}
+
+/// #3671 — a session's capture whose X server went away, against an Xvfb of
+/// the test's own, SIGKILLed (`ROOMLERD_TEST_X11=1`, CI's X11 step).
+#[cfg(all(test, target_os = "linux", feature = "scrap-capture"))]
+mod x11_exit_tests {
+    use super::*;
+
+    /// Everything this process logs, kept, with each line's thread: the
+    /// capture logs from its own worker thread, which a subscriber set for
+    /// the test's thread does not hear. Set once for the process; the X11
+    /// step runs one test at a time.
+    #[derive(Clone, Default)]
+    struct ProcessLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ProcessLog {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ProcessLog {
+        fn get() -> &'static ProcessLog {
+            static LOG: std::sync::OnceLock<ProcessLog> = std::sync::OnceLock::new();
+            LOG.get_or_init(|| {
+                let log = ProcessLog::default();
+                let writer = log.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_thread_names(true)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                // Refused when another test set one first: the test then
+                // finds nothing logged at the open, and says so.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                log
+            })
+        }
+
+        fn len(&self) -> usize {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+
+        /// The lines logged since `from` (a [`Self::len`]).
+        fn since(&self, from: usize) -> Vec<String> {
+            let all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&all[from.min(all.len())..])
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    /// `DISPLAY` pointed at the test's own server while the capture opens
+    /// (its worker makes every connection it keeps before its first frame),
+    /// and put back when dropped.
+    struct DisplayFor(Option<std::ffi::OsString>);
+
+    impl DisplayFor {
+        fn new(display: &str) -> Self {
+            let was = std::env::var_os("DISPLAY");
+            // SAFETY: only under `ROOMLERD_TEST_X11=1`, which CI's X11 step
+            // sets and runs with `--test-threads=1`: no test runs beside
+            // this one to read the environment while it changes.
+            unsafe { std::env::set_var("DISPLAY", display) };
+            Self(was)
+        }
+    }
+
+    impl Drop for DisplayFor {
+        fn drop(&mut self) {
+            // SAFETY: as in `new`.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("DISPLAY", v),
+                    None => std::env::remove_var("DISPLAY"),
+                }
+            }
+        }
+    }
+
+    /// The frames `cap` delivers in `window`, asked as a pump asks.
+    async fn frames_in(cap: &mut ScrapCapture, window: Duration) -> usize {
+        let until = Instant::now() + window;
+        let mut frames = 0;
+        while Instant::now() < until {
+            if let Ok(Some(_)) = cap.next_frame().await {
+                frames += 1;
+            }
+        }
+        frames
+    }
+
+    /// XShm handed back its last picture for ever and the blind damage
+    /// watcher called every tick a change, so the frozen picture went out at
+    /// the full rate, with a warning per frame (the field: 57 fps and 56
+    /// warnings a second). Now the capture sends no frame after the exit,
+    /// and its worker warns twice in all: once for the damage watcher's
+    /// connection, once for its own. Its frame rate falls to nothing instead
+    /// of rising, and the supervisor's notice tells the person to reconnect.
+    #[tokio::test]
+    async fn a_capture_whose_server_went_away_sends_nothing_and_says_so_once() {
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        let log = ProcessLog::get();
+        let x = crate::virtual_desktop::TestX::start()
+            .expect("ROOMLERD_TEST_X11=1 but no Xvfb came up");
+        let from = log.len();
+        let display = DisplayFor::new(x.display());
+        let mut cap = ScrapCapture::primary(30, DownscalePolicy::Auto)
+            .expect("the capture opens on the test's own Xvfb");
+        // A live (idle) second: the first frame, then the damage watcher's
+        // valve. DISPLAY goes back once the worker has made its connections.
+        let before = frames_in(&mut cap, Duration::from_secs(1)).await;
+        drop(display);
+        x.kill();
+        let after = frames_in(&mut cap, Duration::from_secs(3)).await;
+        let lines = log.since(from);
+        let ours: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("roomlerd-capture"))
+            .collect();
+        let warned: Vec<&&String> = ours
+            .iter()
+            .filter(|l| l.trim_start().starts_with("WARN"))
+            .collect();
+
+        assert!(
+            ours.iter()
+                .any(|l| l.contains("X11 damage tracking active")),
+            "the capture worker's log was not heard: {lines:#?}"
+        );
+        assert!(before >= 1, "no frame while the server lived");
+        // One grab may have been answered before the server died.
+        assert!(
+            after <= 1,
+            "{after} frames in the 3 s after the X server went away ({before} in the second before)"
+        );
+        assert!(
+            warned.len() <= 2,
+            "{} warnings after the X server went away: {warned:#?}",
+            warned.len()
+        );
+        println!(
+            "x11-real: a capture whose X server went away sent {after} frames in 3 s ({before} in the live second before), with {} warnings",
+            warned.len()
         );
     }
 }

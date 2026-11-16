@@ -1991,6 +1991,447 @@ mod x11_gate_tests {
     }
 }
 
+/// #3671 — the rule for a failure on the desktop's X server ([`Retry`]), as the
+/// shared worker ([`Clipboard::shared`]) and the change gate's answer
+/// (`x11_gate::available`) keep it. Stand-ins only: nothing here reaches a
+/// clipboard or an X server, so it runs wherever `clipboard::` does.
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn up(generation: u64) -> Option<XServerNow> {
+        Some(XServerNow {
+            generation,
+            down: None,
+        })
+    }
+
+    fn down(generation: u64, period: u64) -> Option<XServerNow> {
+        Some(XServerNow {
+            generation,
+            down: Some(period),
+        })
+    }
+
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `f` returns, and the lines it logs on this thread at INFO and up.
+    pub(super) fn logged<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let r = tracing::subscriber::with_default(subscriber, f);
+        let all = lines.0.lock().unwrap_or_else(|e| e.into_inner());
+        let said = String::from_utf8_lossy(&all)
+            .lines()
+            .map(String::from)
+            .collect();
+        (r, said)
+    }
+
+    /// The rule, row by row: a failure is kept only while its cause can
+    /// still hold, and said once per period of the desktop.
+    #[test]
+    fn the_retry_rule_keeps_a_failure_only_while_its_cause_can_hold() {
+        let t0 = Instant::now();
+        let mut r = Retry::new();
+        assert!(r.may_try(None, t0), "nothing failed yet");
+        assert!(r.failed(down(0, 0), t0), "the first failure is said");
+        assert!(
+            !r.may_try(down(0, 0), t0 + Retry::EVERY * 3),
+            "down: no server to reach"
+        );
+        assert!(
+            r.may_try(up(0), t0),
+            "up on a server the failure did not meet: at once"
+        );
+        assert!(r.failed(up(0), t0), "a new period is said again");
+        assert!(!r.may_try(up(0), t0 + Retry::EVERY - Duration::from_millis(1)));
+        assert!(r.may_try(up(0), t0 + Retry::EVERY), "after the interval");
+        assert!(
+            !r.failed(up(0), t0 + Retry::EVERY),
+            "the same period is said once"
+        );
+        assert!(
+            r.may_try(up(1), t0 + Retry::EVERY),
+            "a newer server: at once"
+        );
+        assert!(
+            !r.may_try(None, t0 + Retry::EVERY * 100),
+            "no desktop of its own: kept for life"
+        );
+        assert!(r.succeeded(), "a success ends the failure");
+        assert!(!r.succeeded(), "and is said once");
+        assert!(r.may_try(None, t0));
+    }
+
+    /// #3671 — the shared worker, first asked while the desktop is down: kept
+    /// off while it is down, started at the first ask once it is up, then
+    /// kept. Before #3671 the failure was kept for the daemon's life.
+    #[test]
+    fn a_shared_worker_that_failed_while_the_desktop_was_down_starts_once_it_is_up() {
+        let slot = Kept::<u32>::new();
+        let tries = AtomicU32::new(0);
+        let fails = || -> Result<u32> {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("no X server"))
+        };
+        let t0 = Instant::now();
+        let (got, said) = logged(|| shared_at(&slot, down(0, 0), t0, fails));
+        assert_eq!(got, None);
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(
+            said[0].contains("WARN") && said[0].contains("tried again at the next ask"),
+            "{said:#?}"
+        );
+        let (got, said) = logged(|| shared_at(&slot, down(0, 0), t0 + Retry::EVERY * 6, fails));
+        assert_eq!(got, None);
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "nothing tried while down");
+        assert!(said.is_empty(), "{said:#?}");
+        let (got, said) = logged(|| {
+            shared_at(&slot, up(0), t0 + Duration::from_secs(1), || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                Ok(7)
+            })
+        });
+        assert_eq!(got, Some(7), "started once the desktop is up");
+        assert_eq!(tries.load(Ordering::SeqCst), 2);
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(
+            said[0].contains("INFO") && said[0].contains("after a start that failed"),
+            "{said:#?}"
+        );
+        let (got, said) = logged(|| {
+            shared_at(&slot, up(1), t0, || -> Result<u32> {
+                panic!("a started worker is kept")
+            })
+        });
+        assert_eq!(got, Some(7));
+        assert!(said.is_empty(), "{said:#?}");
+    }
+
+    /// #3671 — on a live server, a start that failed is tried again no sooner
+    /// than the interval, and said once.
+    #[test]
+    fn a_shared_worker_that_failed_on_a_live_server_is_tried_again_after_the_interval() {
+        let slot = Kept::<u32>::new();
+        let tries = AtomicU32::new(0);
+        let fails = || -> Result<u32> {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("refused"))
+        };
+        let t0 = Instant::now();
+        let (_, said) = logged(|| shared_at(&slot, up(3), t0, fails));
+        assert_eq!(said.len(), 1, "{said:#?}");
+        let (got, said) = logged(|| shared_at(&slot, up(3), t0 + Duration::from_secs(1), fails));
+        assert_eq!((got, tries.load(Ordering::SeqCst)), (None, 1), "too soon");
+        assert!(said.is_empty(), "{said:#?}");
+        let (got, said) = logged(|| shared_at(&slot, up(3), t0 + Retry::EVERY, fails));
+        assert_eq!(
+            (got, tries.load(Ordering::SeqCst)),
+            (None, 2),
+            "tried again"
+        );
+        assert!(said.is_empty(), "said once per period: {said:#?}");
+        let (got, said) = logged(|| shared_at(&slot, up(3), t0 + Retry::EVERY * 2, || Ok(9)));
+        assert_eq!(got, Some(9));
+        assert_eq!(said.len(), 1, "{said:#?}");
+    }
+
+    /// #3671 — a host whose desktop is not the daemon's own keeps the first
+    /// failure for the daemon's life, as before #3671, in master's words.
+    #[test]
+    fn without_a_desktop_of_its_own_a_failed_shared_worker_stays_off() {
+        let slot = Kept::<u32>::new();
+        let tries = AtomicU32::new(0);
+        let fails = || -> Result<u32> {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("no display"))
+        };
+        let t0 = Instant::now();
+        let (got, said) = logged(|| shared_at(&slot, None, t0, fails));
+        assert_eq!(got, None);
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(
+            said[0].contains("clipboard: shared worker init failed — clipboard disabled"),
+            "{said:#?}"
+        );
+        for later in [Duration::ZERO, Retry::EVERY, Retry::EVERY * 1000] {
+            let (got, said) = logged(|| shared_at(&slot, None, t0 + later, fails));
+            assert_eq!(got, None);
+            assert!(said.is_empty(), "{said:#?}");
+        }
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "tried once, for good");
+    }
+
+    /// #3671 — the change gate's answer for the hello, asked while the
+    /// desktop is down and again once it is up: `true` the second time, and
+    /// tried no more often than the interval while it fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gate_answer_asked_while_the_desktop_is_down_is_asked_again_once_it_is_up() {
+        let slot = Kept::<()>::new();
+        let tries = AtomicU32::new(0);
+        let opens = |answer: bool| {
+            let tries = &tries;
+            move || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                answer
+            }
+        };
+        let t0 = Instant::now();
+        assert!(!x11_gate::available_at(&slot, down(0, 0), t0, opens(false)));
+        assert!(!x11_gate::available_at(
+            &slot,
+            down(0, 0),
+            t0 + Retry::EVERY,
+            opens(true)
+        ));
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "nothing tried while down");
+        assert!(!x11_gate::available_at(&slot, up(0), t0, opens(false)));
+        assert!(!x11_gate::available_at(
+            &slot,
+            up(0),
+            t0 + Duration::from_secs(1),
+            opens(true)
+        ));
+        assert_eq!(
+            tries.load(Ordering::SeqCst),
+            2,
+            "no more often than the interval"
+        );
+        assert!(x11_gate::available_at(
+            &slot,
+            up(0),
+            t0 + Retry::EVERY,
+            opens(true)
+        ));
+        assert!(
+            x11_gate::available_at(&slot, up(0), t0, opens(false)),
+            "kept"
+        );
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+    }
+
+    /// #3671 — a host with no desktop of its own decides the gate's answer once,
+    /// as before #3671, whichever way it went.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_desktop_of_its_own_the_gate_answer_is_decided_once() {
+        let t0 = Instant::now();
+        let no = Kept::<()>::new();
+        assert!(!x11_gate::available_at(&no, None, t0, || false));
+        assert!(!x11_gate::available_at(
+            &no,
+            None,
+            t0 + Retry::EVERY * 1000,
+            || true
+        ));
+        let yes = Kept::<()>::new();
+        assert!(x11_gate::available_at(&yes, None, t0, || true));
+        assert!(x11_gate::available_at(&yes, None, t0, || false));
+    }
+}
+
+/// #3671 — the worker's follow ([`x11_follow::Follow`]) through its seams: the
+/// desktop and the time are given, and the connect is a stand-in, so nothing
+/// here reaches a clipboard or an X server.
+#[cfg(all(test, target_os = "linux"))]
+mod follow_tests {
+    use super::retry_tests::logged;
+    use super::x11_follow::{Connect, Follow};
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn up(generation: u64) -> Option<XServerNow> {
+        Some(XServerNow {
+            generation,
+            down: None,
+        })
+    }
+
+    /// A connect that counts its calls and answers from `answers` in turn,
+    /// the last one for good.
+    fn scripted(answers: Vec<Result<u32, String>>) -> (Connect<u32>, Arc<AtomicU32>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let connect: Connect<u32> = Arc::new(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst) as usize;
+            answers[n.min(answers.len() - 1)].clone()
+        });
+        (connect, calls)
+    }
+
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// #3671 — only a NEWER generation is a new server. After the teardown at a
+    /// stop the desktop reads `None` (its generation 0): nothing is tried and
+    /// nothing is said, nor for an older or the same generation.
+    #[test]
+    fn a_follow_acts_only_on_a_newer_generation_and_says_nothing_otherwise() {
+        let (connect, calls) = scripted(vec![Ok(7)]);
+        let mut follow = Follow::new(up(0), connect, BOUND);
+        let t0 = Instant::now();
+        let (got, said) = logged(|| follow.check(up(1), t0));
+        assert_eq!(got, Some(7), "generation 1 is followed");
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(
+            said[0].contains("follows the desktop's new X server"),
+            "{said:#?}"
+        );
+        let (got, said) = logged(|| {
+            [
+                follow.check(
+                    Some(XServerNow {
+                        generation: 0,
+                        down: None,
+                    }),
+                    t0,
+                ),
+                follow.check(None, t0),
+                follow.check(up(1), t0 + Retry::EVERY),
+            ]
+        });
+        assert_eq!(got, [None, None, None]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no rebuild started");
+        assert!(said.is_empty(), "{said:#?}");
+    }
+
+    /// #3671 — nothing is tried while the desktop is down, and a newer
+    /// generation is followed once it is up.
+    #[test]
+    fn a_follow_waits_for_the_desktop_to_be_up() {
+        let (connect, calls) = scripted(vec![Ok(7)]);
+        let mut follow = Follow::new(up(0), connect, BOUND);
+        let t0 = Instant::now();
+        let gone = Some(XServerNow {
+            generation: 1,
+            down: Some(2),
+        });
+        assert_eq!(follow.check(gone, t0), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(follow.check(up(1), t0), Some(7));
+    }
+
+    /// #3671 — a rebuild that failed is tried again no sooner than the interval
+    /// while the same server answers, warned once, and said once when it
+    /// follows. Before, it was tried again only at the next X server.
+    #[test]
+    fn a_failed_follow_is_tried_again_after_the_interval_and_warned_once() {
+        let (connect, calls) = scripted(vec![Err("refused".into()), Err("refused".into()), Ok(7)]);
+        let mut follow = Follow::new(up(0), connect, BOUND);
+        let t0 = Instant::now();
+        let (got, said) = logged(|| follow.check(up(1), t0));
+        assert_eq!(got, None);
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(
+            said[0].contains("WARN") && said[0].contains("could not follow"),
+            "{said:#?}"
+        );
+        let (got, said) = logged(|| {
+            [
+                follow.check(up(1), t0 + Duration::from_secs(1)),
+                follow.check(up(1), t0 + Retry::EVERY),
+            ]
+        });
+        assert_eq!(got, [None, None]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "once more, after the interval"
+        );
+        assert!(said.is_empty(), "warned once per generation: {said:#?}");
+        let (got, said) = logged(|| follow.check(up(1), t0 + Retry::EVERY * 2));
+        assert_eq!(got, Some(7));
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(said[0].contains("after_failure=true"), "{said:#?}");
+    }
+
+    /// #3671 — a failure on one generation does not hold back the next one.
+    #[test]
+    fn a_follow_that_failed_tries_the_next_generation_at_once() {
+        let (connect, calls) = scripted(vec![Err("refused".into()), Ok(7)]);
+        let mut follow = Follow::new(up(0), connect, BOUND);
+        let t0 = Instant::now();
+        assert_eq!(follow.check(up(1), t0), None);
+        assert_eq!(follow.check(up(2), t0), Some(7));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// #3671 — a rebuild that outlasts the bound is not given up on: the worker
+    /// serves meanwhile, starts no second one while it runs (a hung one holds
+    /// arboard's global lock), and takes its answer at a later look.
+    #[test]
+    fn a_follow_that_outlasts_its_bound_is_taken_late_and_never_doubled() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let connect: Connect<u32> = Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = held.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            Ok(7)
+        });
+        let mut follow = Follow::new(up(0), connect, Duration::from_millis(50));
+        let t0 = Instant::now();
+        let (got, said) = logged(|| follow.check(up(1), t0));
+        assert_eq!(got, None);
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(said[0].contains("takes longer than"), "{said:#?}");
+        let (got, said) = logged(|| follow.check(up(1), t0 + Retry::EVERY * 3));
+        assert_eq!(got, None, "still running");
+        assert!(said.is_empty(), "{said:#?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "never a second rebuild");
+        release.send(()).expect("the rebuild waits");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (got, said) = loop {
+            let (got, said) = logged(|| follow.check(up(1), t0 + Retry::EVERY * 3));
+            if got.is_some() || Instant::now() > deadline {
+                break (got, said);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(got, Some(7), "taken late");
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// #3671 — the proof passes on any answer from a live connection, and fails
+    /// only on arboard's word for a connection that failed.
+    #[test]
+    fn the_proof_passes_on_any_answer_from_a_live_connection() {
+        use super::x11_follow::proves_a_live_connection as live;
+        assert!(live(&Ok(String::new())));
+        assert!(live(&Err(arboard::Error::ContentNotAvailable)));
+        assert!(live(&Err(arboard::Error::ConversionFailure)));
+        assert!(live(&Err(arboard::Error::ClipboardOccupied)));
+        assert!(!live(&Err(arboard::Error::Unknown {
+            description: "Broken pipe (os error 32)".into(),
+        })));
+    }
+}
+
 /// FR-97 P2e-1 — the change gate against the real pasteboard (CI's macOS job):
 /// a write moves the change count, as a copy does, and the gate counts it and
 /// then holds. Only under the real clipboard's opt-in,

@@ -1839,4 +1839,96 @@ mod tests {
             TargetResolution::Native
         );
     }
+
+    /// #3671 — once the desktop's X server is gone, a pipeline whose capture
+    /// was opened on it takes no joiner: not one that finds it in the
+    /// registry, and not one that fetched it before it was retired (it reads
+    /// `closed` under the pipeline's lock). The next session of that profile
+    /// owns the key afresh, with a pump and a capture of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retired_pipeline_takes_no_joiner_and_its_key_is_free_for_a_new_owner() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3671-RETIRED");
+        let old = Pipeline::register(key, ObjectId::new());
+        retire_all();
+        assert!(
+            try_join(key, sink(ObjectId::new()), 60).is_none(),
+            "a joiner followed a capture of the old X server"
+        );
+        assert!(
+            old.inner.lock().unwrap().closed,
+            "a joiner that fetched the pipeline before the retire would join it"
+        );
+        let new = Pipeline::register(key, ObjectId::new());
+        let joined = try_join(key, sink(ObjectId::new()), 60).expect("the new owner takes joiners");
+        assert_eq!((new.follower_count(), old.follower_count()), (1, 0));
+        drop(joined);
+    }
+
+    /// #3671 — a retired owner keeps the followers it had, since the desktop's
+    /// supervisor tells those sessions to reconnect and a detach would send
+    /// each into an open refused while the desktop is down. They leave when
+    /// the owner ends, as before. Its end leaves the entry of the owner that
+    /// registered the key after the retire.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retired_owner_keeps_its_followers_and_its_end_leaves_the_new_owners_entry() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3671-KEPT");
+        let old = Pipeline::register(key, ObjectId::new());
+        let told = try_join(key, sink(ObjectId::new()), 60).expect("joined before the exit");
+        retire_all();
+        let new = Pipeline::register(key, ObjectId::new());
+        assert!(new.registered, "the key was not free after the retire");
+        assert_eq!(old.follower_count(), 1, "the retire detached a follower");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), told.detached())
+                .await
+                .is_err(),
+            "the retire detached a follower"
+        );
+        drop(old);
+        assert_eq!(told.detached().await, DetachReason::PipelineClosed);
+        assert!(
+            registry()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &new.inner)),
+            "the retired owner's end took the new owner's entry"
+        );
+    }
+
+    /// #3671 — a retire touches only what was registered when it ran: it
+    /// takes the pipeline registered before it (closed to joins, its entry
+    /// removed), a pipeline registered after it takes joiners, and a second
+    /// retire with nothing registered in between retires nothing. The first
+    /// count is "at least one", because another test's pipeline can still be
+    /// registered as this one starts and is retired with it; `before`'s own
+    /// state is what shows that the retire took it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_retire_leaves_what_registers_after_it_and_a_second_one_retires_nothing() {
+        let _s = serial();
+        let before_key = PipelineKey::FfmpegDc("TEST-3671-BEFORE");
+        let before = Pipeline::register(before_key, ObjectId::new());
+        assert!(retire_all() >= 1, "the first retire found no pipeline");
+        assert!(
+            before.inner.lock().unwrap().closed,
+            "the first retire left the pipeline registered before it open to joins"
+        );
+        assert!(
+            !registry().lock().unwrap().contains_key(&before_key),
+            "the first retire left the entry of the pipeline registered before it"
+        );
+        assert_eq!(retire_all(), 0, "a second retire found a pipeline");
+        let key = PipelineKey::FfmpegDc("TEST-3671-AFTER");
+        let after = Pipeline::register(key, ObjectId::new());
+        let joined = try_join(key, sink(ObjectId::new()), 60)
+            .expect("a pipeline registered after the retire takes joiners");
+        assert!(!after.inner.lock().unwrap().closed);
+        assert_eq!(after.follower_count(), 1);
+        drop((joined, after, before));
+    }
 }

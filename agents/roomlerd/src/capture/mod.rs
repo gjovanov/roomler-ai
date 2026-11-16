@@ -1485,6 +1485,13 @@ pub(crate) fn planned_input_route(f: &ArmFacts) -> Option<crate::input::reach::R
     }
 }
 
+/// #3671 — the facts say a session on this device captures its virtual
+/// desktop.
+#[cfg(target_os = "linux")]
+pub(crate) fn plans_the_virtual_desktop(_facts: ArmFacts) -> bool {
+    false
+}
+
 /// FR-93 P2b — gather [`ArmFacts`] the way [`open_with`] reads them. `sessions`
 /// is logind's list (read once by the caller); mutter, then the portal, are
 /// asked only when the plan is `Auto`, as the cascade asks them. The portal is
