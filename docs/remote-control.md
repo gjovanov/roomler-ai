@@ -2589,7 +2589,10 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    `docs/desktop-companion.md` §10.3). A helper that has not posted within 5 s
    is let go with its stdin closed, which takes down a notification it did
    post, and is killed 1 s later if it is still there. What it posts expires at
-   the question's end (#3886, `docs/desktop-companion.md` §10.3.1).
+   the question's end (#3886). A press the person made while the question was
+   on the screen still answers it in that 1 s: after its close the helper
+   reads the server's signals until the server says the notification closed,
+   and passes the press on (#3942, `docs/desktop-companion.md` §10.3.1).
 4. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
 5. **none** — reported as `no_prompt_surface`, not as a deny.
 
