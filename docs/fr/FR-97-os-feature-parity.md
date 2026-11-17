@@ -31,6 +31,10 @@ session, continues as [FR-122](FR-122-arm64-linux-hardware-cell.md) (D18).
   person's profile), merged (#2438), field-verified red → green on a Win11 SystemContext guest (§8).
 - P4c, Hive adopt on Windows (a named pipe whose client is named by its token, and a hook that sends nothing to
   a pipe it does not trust), merged (#2439), field-verified red → green on a Win11 SystemContext guest (§8).
+  Parked since: [FR-137](FR-137-hive-leaves-master.md) took Hive off master (its P2, #3475, merged as `9da76c4e6`,
+  released in agent 0.4.201; 0.4.200 is the last release that carries it), so the pipe and the hook's client are not
+  built any more. FR-90 is kept whole on the branch
+  [`park/hive-fr90`](https://github.com/gjovanov/roomler-ai/tree/park/hive-fr90) at `7106d588d` (§3.9).
 - P5a, `console_user` on Linux and macOS (the person at logind's seat0 or owning `/dev/console`, by the drop a
   `named` account takes; refused while nobody is there), for SSH and for Fleet RPC's `run_as`, merged (#2441),
   field-verified red → green on a Linux root daemon, a Linux per-user daemon and a Mac's root daemon (§8).
@@ -161,7 +165,7 @@ flowchart LR
     P1["P1 · macOS network<br/>exit client · pf serving · DNS"]
     P2["P2 · macOS remote desktop<br/>SCK audio · panel · Remote Apps"]
     P3["P3 · Linux<br/>cursor · lock · audio · files · companion"]
-    P4["P4 · Windows<br/>SAS · SFTP as user · Hive adopt"]
+    P4["P4 · Windows<br/>SAS · SFTP as user · Hive adopt (parked)"]
     P5["P5 · console_user on Unix"]
     P6["P6 · install · update · ops"]
     P7["P7 · architectures"]
@@ -285,8 +289,8 @@ and the consent chain's fallbacks.
 | D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3568`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:195`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:948`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:282-332`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
-| D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`) | P0c, D5 |
-| D6 | Hive: adopt a terminal session | 🟡 built (P4c) | ✅ | ✅ | Was: `hive_adopt` read off on Windows. P4c adopts through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) | P4c |
+| D5 | The setup wizard installs the daemon | ✅ | ✅ since 0.4.184 (FR-129 B1) | ✅ since 0.4.184 (FR-129 B1); the root half since 0.4.187 (B2) | Was: the tunnel client only on Linux and macOS (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offered it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`). *Since FR-129 B1:* the wizard has daemon roles on every OS (`agents/roomler-setup/src/role.rs:101-108`): on Linux the system daemon and the per-user one, on macOS the person's, with the root half beside it when the private-network box is ticked (`role.rs:130`). Windows asks no server (`commands.rs:158`). On Linux and macOS a card shows only when the chosen server's switch for that OS is on (`commands.rs:239`, `features.rs:77`), and an install refuses without it (`orchestrator_unix.rs:331-343`). The server answers per OS on `GET /api/setup/features` from `[setup] wizard_linux_daemon` and `wizard_macos_daemon`, each default off (`crates/modules/fleet/src/setup_release.rs:200-211`, `crates/config/src/settings.rs:89`, `:93`). The enroll dialog and the homepages offer the wizard for an agent on that answer (`ui/src/utils/enrollCommands.ts:198-203`, `:290`). Field-verified on Ubuntu, Fedora KDE and macOS in [FR-129](FR-129-guided-cross-platform-installer.md) AC11 | P0c, D5, FR-129 B1 |
+| D6 | Hive: adopt a terminal session | ❌ parked (FR-137); was 🟡 built (P4c) | ❌ parked (FR-137); was ✅ | ❌ parked (FR-137); was ✅ | Was: `hive_adopt` read off on Windows. P4c adopted through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) and was field-verified on 0.4.143 (§8). *Now:* the operator parked FR-90 (Hive) on 2026-11-04. [FR-137](FR-137-hive-leaves-master.md)'s P2 (#3475, merged as `9da76c4e6`) took it off master, so no OS adopts a terminal session: agent 0.4.201 is the first release without it, and 0.4.200 the last with it. The code is kept whole on `park/hive-fr90` at `7106d588d`. Master keeps `hive_adopt` as one of 23 retired config keys (`crates/agent-core/src/config.rs:4281`) and a hidden `roomler hive hook` that exits 0, for the entries already written into Claude Code's settings (`agents/roomler-cli/src/cli.rs:1063`) | P4c, FR-137 |
 
 ### 2.5 SSH and Fleet RPC
 
@@ -1024,24 +1028,34 @@ test of the SIGKILL property itself.
     channels', so a closed channel or a dropped session kills the tree.
   - A `named` account still refuses on Windows. Kill switch: `ROOMLERD_SFTP_AS_USER=0` restores the refusal
     (`ssh.rs:1177`). `docs/roomler-ssh.md` (*File transfer*) has the details.
-- **P4c, Hive adopt** (built). The adopt socket is a named pipe, `\\.\pipe\roomler-hive-adopt`
-  (`hive/supervisor/adopt.rs:573`), and each end checks the other through the kernel (D16):
+- **P4c, Hive adopt** (built; parked since). FR-90 (Hive) is parked, and [FR-137](FR-137-hive-leaves-master.md) took it
+  off master: its P2 (#3475, merged as `9da76c4e6`) shipped in agent 0.4.201, and 0.4.200 is the last release that
+  carries P4c. The code is kept whole on `park/hive-fr90` at `7106d588d`; every anchor below is read there (at master
+  `7106d588d`), and none of the files it names is on master. Master keeps two traces of P4c: `hive_adopt`, one of 23
+  retired config keys (`crates/agent-core/src/config.rs:4281`), and the hidden `roomler hive hook`
+  (`agents/roomler-cli/src/cli.rs:1063`; `docs/retired-names.md`, *Reserved after FR-90 was parked*), which exits 0.
+  It answers the hook entries already written into Claude Code's settings, such as the bare `roomler.exe hive hook`
+  that P4c wrote on Windows. As the parked head has it, the adopt socket is a named pipe,
+  `\\.\pipe\roomler-hive-adopt` (`hive/supervisor/adopt.rs:573` at master `7106d588d`), and each end checks the other
+  through the kernel (D16):
   - The daemon names a client by its token, impersonating it just long enough after its first line
-    (`hive_win.rs:446`), never by its pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are refused
-    as root is.
+    (`hive_win.rs:446` at master `7106d588d`), never by its pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the
+    anonymous logon are refused as root is.
   - A person gets `0x12008b`, read and write data. Only SYSTEM, Administrators and the daemon's own account add
-    instances (`hive_win.rs:1011`). The first instance is the first, retried every 30 s while another process holds the
-    name.
+    instances (`hive_win.rs:1011` at master `7106d588d`). The first instance is the first, retried every 30 s while
+    another process holds the name.
   - The hook opens the pipe with exactly that mask, at identification level, and sends nothing unless the pipe is
-    owned by SYSTEM, Administrators or the hook's own account (`hive_adopt.rs:226`). The owner, not the server
-    process's token, which a person may not open for a SYSTEM process (measured, §8).
+    owned by SYSTEM, Administrators or the hook's own account (`hive_adopt.rs:226` at master `7106d588d`). The owner,
+    not the server process's token, which a person may not open for a SYSTEM process (measured, §8).
   - A record keeps the account's SID where Unix keeps the uid, and `hive_accounts` names the account as a start's
     gate does.
   - The hook entry is the bare `roomler.exe hive hook` on PATH, and the terminal is found past the shells and the shim
-    (`procs.rs:51`).
+    (`procs.rs:51` at master `7106d588d`).
   - Not in P4c: making an ended adopted session a managed one (FR-90 P2f-4a) on Windows, whose history import runs
     through Unix tools.
-  - Kill switch: `hive_adopt`, the device's own key, default off. `docs/hive.md` §8 (*On Windows*).
+  - Kill switch: `hive_adopt`, the device's own key, default off; on master it is a retired key, kept through every
+    save and ignored. `docs/hive.md` §8 (*On Windows*) described it at master `7106d588d`, and the doc left
+    master with Hive.
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
   reaches (`app.rs:3733-3748`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
@@ -1319,7 +1333,7 @@ model on Windows, so the three agree on what the mode means.
 | **P3i** | Linux host firewall: what governs the overlay adapter, reported in `roomler status`, never changed (D13) | `ROOMLERD_HOST_FW_PROBE=0` | a firewalld node (zone `public`) and a ufw node, red then green | S |
 | **P4a** | Windows `SendSAS` from the SCM host, which the SystemContext worker asks through a SYSTEM-only relay, where the policy lets services (built) | its cap word: no `sas` in the hello, no frame | Win11 SystemContext, red on 0.4.142; the corporate laptops' policy measured | S–M |
 | **P4b** | Windows SFTP as `console_user`: `sftp-server` through `exec`'s console-user spawn, raw, in the person's profile (built) | `ROOMLERD_SFTP_AS_USER=0` | Win11 SystemContext, red on 0.4.142 | S–M |
-| **P4c** | Windows Hive adopt: a named pipe, its client named by its token, a hook that checks the server first (D16, built) | `hive_adopt` (the device's own key, default off) | Win11 SystemContext, red on 0.4.142 | M |
+| **P4c** | Windows Hive adopt: a named pipe, its client named by its token, a hook that checks the server first (D16, built; parked since: FR-137 took Hive off master, and agent 0.4.201 is the first release without it, §3.9) | `hive_adopt` (the device's own key, default off; a retired key on master) | Win11 SystemContext, red on 0.4.142 | M |
 | **P4d** | Windows per-user clean stop: `service stop` and a session-end window (D15, built) | `ROOMLERD_SESSION_END=0` (the window); `service stop` acts only when run | Win11, a perUser ephemeral device, red on 0.4.142 | S |
 | **P4e** | Windows Home + v6 serving (parked by D1 until P0d's counts show Windows Home exits are wanted) | its own | Win11 Home | L |
 | **P5a** | `console_user` on Linux + macOS: the person at seat0 or owning the console, by the `named` drop, for SSH and exec's `run_as` (built) | the device's `ssh_account_mode`; the exec policy's `run_as` | the lab + a Mac | S–M |
@@ -1334,8 +1348,8 @@ model on Windows, so the three agree on what the mode means.
 | **P7b** | arm64 tunnel CLI + wizard (built #2641; released in tunnel-v0.4.149 and `setup-v0.4.149`; field-verified through prod on real arm64, the served `install.sh` and the wizard's download, §8) | — (new artifacts; x86_64's names and tokens unchanged) | an arm64 vmtest guest | S |
 | **P8** | Docs: `platform-support.md`, the user page, every §2.8 correction. *P8-1* merged (#2489): every §2.8 row but two, each re-checked against master first. *P8-2* (#2548), after 0.4.144 shipped FR-113: `platform-support.md` and the user page, written against 0.4.145; the stale code comments and W7c's last leftovers; the Linux system-install claims, but for the two public Wayland pages, which ride #2533 | — | — | M |
 
-Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `hive_adopt`,
-`power_policy` and `ssh_account_mode` exist today.
+Kill switches named `ROOMLERD_*`, and `ssh_sftp_as_user`, are proposed names. `[apps] enabled`, `power_policy` and
+`ssh_account_mode` exist today; `hive_adopt` existed until FR-137 retired it (§3.9).
 
 **Order.** P0 ships in one release before anything else; P0a can go out ahead of the FR on its own issue (D9). P0e
 was found while building P1a and follows it. Then P1, the headline and the only place a Mac can be wedged. Then P2, P3 and P4 in the order field demand sets, P5 after
@@ -1479,6 +1493,10 @@ one depends on it.
   - *perUser: the ephemeral device removed itself on `service stop`, a sign-out and a restart.*
 
   *The candidate rows for red → green are above them.)*
+
+  *Since 0.4.201 the Hive clause names no shipped code: FR-137 took Hive off master (its P2, #3475, merged as
+  `9da76c4e6`), and the adopt pipe is on `park/hive-fr90` at `7106d588d` (§3.9). That clause was met on 0.4.143; FR-137
+  does not touch the other clauses.*
 - [x] **AC12 (P5a):** `console_user` runs as the person at the screen on Linux and macOS, and refuses when nobody is
   there. *(Field-verified on the released 0.4.143, 2026-10-18, §8: a Linux root daemon with `wlab` at seat0, and a
   Mac's root daemon with `admin` at the GUI. Exec, the pty and `sftp` ran as the person; at the login screen and the
