@@ -1752,6 +1752,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-119 - how NVENC splits an HEVC or AV1 frame across its engines above 60 fps: `auto` (empty; the driver picks the number of strips), `off` (never ask, as before), or a strip count 2-4 (applied only on a GPU with that many engines). Env: ROOMLERD_NVENC_SPLIT. Read at every encoder open.",
     },
     KeyMeta {
+        key: "qsv_rate_mode",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:cbr|qvbr",
+        description: "FR-148 P2 - the rate control an Intel QSV HEVC or H.264 encoder opens in for a remote-desktop session: `cbr` (empty; constant bitrate, as before) or `qvbr` (a target at 0.9 x the cap, under the cap, at the session's quality, so a still screen can send less than the cap). A driver that refuses qvbr opens as cbr and the log says so. VP9, AV1 and recordings stay at cbr. Env: ROOMLERD_QSV_RATE_MODE. This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
         key: "vaapi_device",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2167,6 +2175,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rc_media_legacy" => cfg.rc_media_legacy.clone(),
         "rc_media_canary" => cfg.rc_media_canary.clone(),
         "nvenc_split" => cfg.nvenc_split.clone(),
+        "qsv_rate_mode" => cfg.qsv_rate_mode.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
         "vulkan_device" => cfg.vulkan_device.clone(),
@@ -2834,6 +2843,16 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     return Err(format!(
                         "nvenc_split must be auto, off, 2, 3 or 4 (got {v:?})"
                     ));
+                }
+            }
+        }
+        "qsv_rate_mode" => {
+            cfg.qsv_rate_mode = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() || v == "cbr" => None,
+                Some(v) if v == "qvbr" => Some(v),
+                Some(v) => {
+                    return Err(format!("qsv_rate_mode must be cbr or qvbr (got {v:?})"));
                 }
             }
         }
@@ -4955,6 +4974,32 @@ mod tests {
         for bad in ["1", "5", "forced", "on"] {
             assert!(
                 apply(&mut cfg, "nvenc_split", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P2 — `qsv_rate_mode`: `qvbr` is stored, `cbr` and blank clear
+    /// the key (today's open), and anything else is refused rather than stored
+    /// and read as `cbr` without a word.
+    #[test]
+    fn qsv_rate_mode_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "qsv_rate_mode"), None);
+        apply(&mut cfg, "qsv_rate_mode", Some(" QVBR ")).unwrap();
+        assert_eq!(cfg.qsv_rate_mode.as_deref(), Some("qvbr"));
+        assert_eq!(
+            entry_for(&cfg, "qsv_rate_mode").unwrap().value.as_deref(),
+            Some("qvbr")
+        );
+        apply(&mut cfg, "qsv_rate_mode", Some("cbr")).unwrap();
+        assert_eq!(cfg.qsv_rate_mode, None, "cbr is the default");
+        apply(&mut cfg, "qsv_rate_mode", Some("qvbr")).unwrap();
+        apply(&mut cfg, "qsv_rate_mode", Some("")).unwrap();
+        assert_eq!(cfg.qsv_rate_mode, None, "blank clears to the default");
+        for bad in ["on", "1", "vbr", "icq", "qvbr2"] {
+            assert!(
+                apply(&mut cfg, "qsv_rate_mode", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

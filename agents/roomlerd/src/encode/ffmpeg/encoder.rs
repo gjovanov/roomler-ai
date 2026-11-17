@@ -17,8 +17,8 @@
 //! - Input format: NV12 (single plane Y + interleaved UV at half-res both axes)
 //! - Output format: HEVC Annex-B (4-byte start codes; the pre-flight WebCodecs
 //!   spike confirmed Chrome accepts this without a hvcC description box)
-//! - Rate control: CBR target via `bit_rate`; HW backends interpret this
-//!   differently (NVENC = `NV_ENC_PARAMS_RC_CBR`, QSV = `CBR`, AMF = `CBR`)
+//! - Rate control: quality under a `maxrate` cap. `bit_rate` is the cap except on
+//!   NVENC, so QSV runs CBR unless `qsv_rate_mode` opens it at QVBR (FR-148 P2, `QsvRateOpen`)
 //! - GOP: 240 frames (matches libvpx VP9-444 cadence — same DC framing
 //!   anti-IDR-storm characteristics apply)
 //! - Profile: Main 8-bit 4:2:0 (matches RustDesk; broadest browser
@@ -381,7 +381,7 @@ fn encoder_options(
             lowlat.push(("delay".into(), v));
         }
     } else if name.contains("qsv") {
-        // Intel QSV: ICQ-style quality via `global_quality`; `maxrate`
+        // Intel QSV: quality via `global_quality`, read only off CBR (`QsvRateOpen`); `maxrate`
         // caps the burst. `low_power=1` uses the fixed-function VDENC path
         // (faster, lower power — the Iris Xe fps-unlock path). P4 — the
         // value is now caller-chosen: the vp9_qsv IDR probe measures BOTH
@@ -850,9 +850,9 @@ pub(crate) enum RateReconfig {
     /// `bit_rate` stays 0 (cq-driven VBR). FFmpeg's `reconfig_encoder` picks
     /// it up on the next `send_frame`.
     InPlaceVbr,
-    /// QSV (CBR — our `rc_max_rate == bit_rate` config): write `bit_rate` +
-    /// `rc_max_rate` + `rc_buffer_size` together; `qsvenc.c`'s per-frame
-    /// `update_bitrate` re-reads them and resets the encoder's BRC.
+    /// QSV: write `bit_rate` + `rc_max_rate`, equal, + `rc_buffer_size`; `qsvenc.c`'s per-frame
+    /// `update_bitrate` re-reads them and resets the BRC. The reset keeps the open's mode: after a
+    /// QVBR open (`QsvRateOpen`) it is QVBR with the target at the cap, CBR after today's open.
     InPlaceCbr,
     /// QSV/AMF/VideoToolbox when in-place is off or unsupported — rebuild.
     Rebuild,
@@ -1791,6 +1791,7 @@ impl FfmpegEncoder {
             encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
         // FR-119 P2b-10 — empty except on NVENC HEVC / AV1 above 60 fps.
         let throughput = throughput_options(name, fps, NvencSplit::from_env());
+        let rate = QsvRateOpen::plan(name, maxrate_bps, chroma444, qsv_low_power, gop_override);
         // FR-130 P1 — what the bitstream says about the YUV, read once per open
         // (`None` with `color_description` off: the context's fields stay
         // unspecified, today's stream exactly). None on the VP9 names: FFmpeg
@@ -1801,7 +1802,6 @@ impl FfmpegEncoder {
         } else {
             crate::encode::color_desc::active().map(crate::encode::color_desc::ffmpeg)
         };
-
         // FR-77 P4 / FR-78 P1 — a `*_vaapi` / `*_d3d12va` / `*_vulkan`
         // encoder takes HARDWARE frames from a pool on one of the kind's
         // devices, and which device is decided by the OPEN: on a two-GPU
@@ -1886,8 +1886,8 @@ impl FfmpegEncoder {
                 }
                 // For NVENC constant-quality VBR we set bit_rate=0 so `cq`
                 // drives quality and `maxrate` is the only ceiling (idle ≈ 0).
-                // QSV/AMF keep `maxrate` as the VBR anchor since their
-                // quality modes are less reliable about honouring b:v=0.
+                // QSV/AMF keep `maxrate` as their anchor (b:v=0 is less reliable
+                // there); on QSV that equality is constant bitrate (`QsvRateOpen`).
                 let target_bps = if name.contains("nvenc") {
                     0
                 } else {
@@ -1940,7 +1940,7 @@ impl FfmpegEncoder {
             // their own tier:
             //   0. throughput + quality + low-latency (FR-119 P2b-10: only when
             //      `throughput_options` has something, NVENC above 60 fps),
-            //   1. quality + low-latency,
+            //   1. quality + low-latency (FR-148 P2: at QVBR first when `QsvRateOpen` asks),
             //   2. quality ALONE (keeps `forced-idr` etc. if only a lowlat knob
             //      was rejected — a full revert to defaults would lose
             //      `forced-idr` → the NVENC black-screen IDR bug),
@@ -1982,8 +1982,8 @@ impl FfmpegEncoder {
                         for (k, v) in &lowlat {
                             full.set(k.as_str(), v.as_str());
                         }
-                        let enc = configure(colour)?;
-                        match enc.open_as_with(codec, full) {
+                        // FR-148 P2 — at QVBR first when the plan asks (`QsvRateOpen`).
+                        match rate.open(name, codec, full, || configure(colour))? {
                             Ok(encoder) => {
                                 tracing::info!(
                                     encoder = name,
@@ -3067,8 +3067,8 @@ impl VideoEncoder for FfmpegEncoder {
             }
             RateReconfig::InPlaceCbr => {
                 // FR-62 A1 — QSV in place. Our QSV runs CBR (`select_rc_mode`
-                // picks CBR because we open with `rc_max_rate == bit_rate`), so
-                // TargetKbps must move WITH MaxKbps: both are written.
+                // picks CBR: we open with `rc_max_rate == bit_rate`; QVBR under FR-148
+                // P2's switch, this arm unchanged), so both TargetKbps and MaxKbps are written.
                 // `qsvenc.c`'s per-frame `update_parameters` → `update_bitrate`
                 // re-reads them and calls `MFXVideoENCODE_Reset`, so no blocking
                 // encoder rebuild (which is 0.65-0.87 s on Iris-Xe-class and the
@@ -3405,6 +3405,236 @@ fn convert_pool() -> Option<&'static rayon::ThreadPool> {
             .ok()
     })
     .as_ref()
+}
+
+/// FR-148 P2 (FR-62 A5) — the rate control a QSV encoder is asked to open in:
+/// `qsv_rate_mode` in the config, `ROOMLERD_QSV_RATE_MODE` in the environment,
+/// read at every open. Off (`cbr`, unset, or anything but `qvbr`) is today's open.
+///
+/// Today's open hands FFmpeg `bit_rate` = `maxrate` = the cap, and FFmpeg
+/// 9.0.1's `select_rc_mode` reads that equality as constant bitrate
+/// (`libavcodec/qsvenc.c:628-631`): the runtime pads every frame, a still
+/// screen's too, to `maxrate ÷ fps ÷ 8` bytes, and `global_quality` is never
+/// read. `qvbr` opens an HEVC or H.264 encoder with `bit_rate` at 0.9 × the cap,
+/// `maxrate` at the cap and `global_quality` kept, which the same function reads
+/// as QVBR (`:641-643`). `init_video_param` then writes the `TargetKbps`,
+/// `MaxKbps` and buffer fields it writes for CBR, plus `QVBRQuality` = the
+/// open's quality (`:913-921`). Look-ahead, `mbbrc`, `extbrc` and
+/// `low_delay_brc` stay unset, as today. What the runtime makes of it is read on
+/// silicon, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QsvRateMode {
+    Cbr,
+    Qvbr,
+}
+
+impl QsvRateMode {
+    /// `qvbr`, in any case, turns it on. Anything else is today's open: a typo
+    /// is today's release, never a mode nobody asked for.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("qvbr") => Self::Qvbr,
+            _ => Self::Cbr,
+        }
+    }
+}
+
+/// FR-148 P2 — one QSV open's plan, decided once per `build_encoder` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QsvRateOpen {
+    /// The switch is off, or the encoder is not QSV: today's open, and no line
+    /// of its own.
+    Today,
+    /// The switch is on, and this open stays at constant bitrate, for `why`.
+    Kept { why: &'static str },
+    /// One open at `bit_rate` first, then today's open if that one fails.
+    Qvbr {
+        bit_rate: usize,
+        maxrate: usize,
+        key: QvbrKey,
+    },
+}
+
+impl QsvRateOpen {
+    /// The plan for one open. The switch is read for QSV names only, and an
+    /// open the switch asks for and cannot move says so on a line of its own.
+    fn plan(
+        name: &'static str,
+        maxrate_bps: usize,
+        chroma444: bool,
+        low_power: bool,
+        gop_override: Option<i32>,
+    ) -> Self {
+        if !name.ends_with("_qsv") {
+            return Self::Today;
+        }
+        let mode = QsvRateMode::parse(node_env("QSV_RATE_MODE").as_deref());
+        let recording = gop_override.is_some();
+        let plan = Self::decide(mode, name, maxrate_bps, chroma444, low_power, recording);
+        if let Self::Kept { why } = plan {
+            tracing::info!(
+                encoder = name,
+                asked = "qvbr",
+                rate_control = "cbr",
+                why,
+                "FR-148: the QSV rate switch asks for QVBR, and this open stays at constant bitrate"
+            );
+        }
+        plan
+    }
+
+    /// Pure. `recording` is an open with a GOP of its own (`gop_override`),
+    /// which only FR-85's recorder passes.
+    ///
+    /// Only a live HEVC or H.264 open moves. `vp9_qsv` stays because FFmpeg
+    /// 9.0.1 attaches no `CodingOption3` to VP9 (`qsvenc.c:964-965`, `:1173`),
+    /// so QVBR's quality would never reach the runtime. `av1_qsv` stays because
+    /// Intel's AV1 encoder fails a keyframe over its budget mid-session and then
+    /// hangs the driver (rc.443): a refusal there would come after the open,
+    /// where no fallback can take it. A recording keeps FR-85's rate control.
+    fn decide(
+        mode: QsvRateMode,
+        name: &'static str,
+        maxrate_bps: usize,
+        chroma444: bool,
+        low_power: bool,
+        recording: bool,
+    ) -> Self {
+        if mode == QsvRateMode::Cbr || !name.ends_with("_qsv") {
+            return Self::Today;
+        }
+        let why = match name {
+            "hevc_qsv" | "h264_qsv" if recording => "a recording keeps its rate control (FR-85)",
+            // 0.9 × a cap under 10 bit/s rounds to no rate at all.
+            "hevc_qsv" | "h264_qsv" if maxrate_bps < 10 => "no room under the cap",
+            "hevc_qsv" | "h264_qsv" => {
+                return Self::Qvbr {
+                    bit_rate: maxrate_bps / 10 * 9,
+                    maxrate: maxrate_bps,
+                    key: QvbrKey {
+                        name,
+                        chroma444,
+                        low_power,
+                    },
+                };
+            }
+            "vp9_qsv" => {
+                "FFmpeg 9.0.1 gives vp9_qsv no CodingOption3, so QVBR would have no quality"
+            }
+            "av1_qsv" => "Intel's AV1 encoder fails mid-session (rc.443), past the open's fallback",
+            _ => "only HEVC and H.264 QSV opens move",
+        };
+        Self::Kept { why }
+    }
+
+    /// [`Self::first_then_today`] on FFmpeg. `configure` makes the unopened
+    /// encoder exactly as today's tier does; the QVBR open differs from today's
+    /// only in `bit_rate`.
+    fn open(
+        self,
+        name: &str,
+        codec: ffmpeg_next::Codec,
+        options: ffmpeg_next::Dictionary<'static>,
+        configure: impl Fn() -> Result<ffmpeg_next::encoder::video::Video>,
+    ) -> Result<std::result::Result<codec::encoder::Video, ffmpeg_next::Error>> {
+        self.first_then_today(name, options, |bit_rate, options| {
+            let mut enc = configure()?;
+            if let Some(bit_rate) = bit_rate {
+                enc.set_bit_rate(bit_rate);
+            }
+            Ok(enc.open_as_with(codec, options))
+        })
+    }
+
+    /// Today's open, after one open at QVBR when the plan asks for it. `open`
+    /// opens at the `bit_rate` it is given, or exactly as today with `None`.
+    ///
+    /// Whatever stops the QVBR open, FFmpeg's refusal or the context before it,
+    /// is answered with today's open and one warning that carries the error, and
+    /// this process does not ask again for that encoder, chroma and `low_power`:
+    /// a host that refuses the mode pays one extra open, once. FFmpeg answers
+    /// `ENOSYS` when the runtime's `MFXVideoENCODE_Query` refuses a parameter
+    /// (`qsvenc.c:1287-1292`). A warning from the runtime is no refusal: FFmpeg
+    /// opens on it (`:675-698`, `:1820-1826`).
+    fn first_then_today<D: Clone, T, E: std::fmt::Display>(
+        self,
+        name: &str,
+        options: D,
+        open: impl Fn(Option<usize>, D) -> Result<std::result::Result<T, E>>,
+    ) -> Result<std::result::Result<T, E>> {
+        if let Self::Qvbr {
+            bit_rate,
+            maxrate,
+            key,
+        } = self
+        {
+            if key.refused() {
+                tracing::info!(
+                    encoder = name,
+                    asked = "qvbr",
+                    rate_control = "cbr",
+                    fallback = true,
+                    "FR-148: this QSV encoder refused QVBR earlier in this process, so it opens at constant bitrate"
+                );
+            } else {
+                let error = match open(Some(bit_rate), options.clone()) {
+                    Ok(Ok(opened)) => {
+                        tracing::info!(
+                            encoder = name,
+                            rate_control = "qvbr",
+                            fallback = false,
+                            bit_rate_bps = bit_rate,
+                            maxrate_bps = maxrate,
+                            "FR-148: the QSV encoder opened at QVBR, its target under its cap"
+                        );
+                        return Ok(Ok(opened));
+                    }
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => format!("{e:#}"),
+                };
+                key.note_refused();
+                tracing::warn!(
+                    encoder = name,
+                    asked = "qvbr",
+                    rate_control = "cbr",
+                    fallback = true,
+                    %error,
+                    "FR-148: the QSV encoder did not open at QVBR, so it opens as today, at constant bitrate"
+                );
+            }
+        }
+        open(None, options)
+    }
+}
+
+/// FR-148 P2 — what a QVBR refusal is remembered under: the encoder, its chroma
+/// and its `low_power`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QvbrKey {
+    name: &'static str,
+    chroma444: bool,
+    low_power: bool,
+}
+
+/// FR-148 P2 — the QSV opens this process has seen refuse QVBR.
+static QVBR_REFUSED: std::sync::Mutex<Vec<QvbrKey>> = std::sync::Mutex::new(Vec::new());
+
+impl QvbrKey {
+    fn refused(self) -> bool {
+        QVBR_REFUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&self)
+    }
+
+    fn note_refused(self) {
+        let mut refused = QVBR_REFUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !refused.contains(&self) {
+            refused.push(self);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4298,6 +4528,231 @@ mod tests {
         assert_eq!(NvencSplit::parse(Some("4")), NvencSplit::Strips(4));
         assert_eq!(NvencSplit::parse(Some("5")), NvencSplit::Auto);
         assert_eq!(NvencSplit::parse(Some("forced")), NvencSplit::Auto);
+    }
+
+    // ── FR-148 P2 — a QSV open can leave constant bitrate ───────────────
+
+    /// The switch reads `qvbr` as on, and nothing else.
+    #[test]
+    fn qsv_rate_mode_parse() {
+        assert_eq!(QsvRateMode::parse(None), QsvRateMode::Cbr);
+        assert_eq!(QsvRateMode::parse(Some("cbr")), QsvRateMode::Cbr);
+        assert_eq!(QsvRateMode::parse(Some(" QVBR ")), QsvRateMode::Qvbr);
+        for other in ["", "on", "1", "true", "vbr", "icq", "qvbr2"] {
+            assert_eq!(
+                QsvRateMode::parse(Some(other)),
+                QsvRateMode::Cbr,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// The parameters with the switch on. An HEVC or H.264 QSV open asks for
+    /// 0.9 × its cap under `maxrate` at the cap, `global_quality` kept, and
+    /// `select_rc_mode` reads only `rc_max_rate == bit_rate` as constant bitrate
+    /// (`qsvenc.c:628`). Master opened every QSV encoder at `bit_rate` = the
+    /// cap: on its parameters the first assertion reads `3000000 < 3000000`, and
+    /// fails.
+    #[test]
+    fn with_the_switch_on_a_qsv_open_asks_for_less_than_its_cap() {
+        for name in ["hevc_qsv", "h264_qsv"] {
+            for (cap, asked) in [
+                (3_000_000, 2_700_000),
+                (100_000, 90_000),
+                (25_000_000, 22_500_000),
+            ] {
+                let plan = QsvRateOpen::decide(QsvRateMode::Qvbr, name, cap, false, true, false);
+                let QsvRateOpen::Qvbr {
+                    bit_rate,
+                    maxrate,
+                    key,
+                } = plan
+                else {
+                    panic!("{name} at {cap}: {plan:?}");
+                };
+                // What the option dict hands FFmpeg: `maxrate` is `rc_max_rate`.
+                let (base, _, _) = encoder_options(name, cap, 22, true, false, false);
+                let option = |wanted: &str| {
+                    base.iter()
+                        .find(|(k, _)| k == wanted)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| panic!("{name}: no {wanted}"))
+                };
+                let rc_max_rate: usize = option("maxrate").parse().unwrap();
+                assert!(
+                    bit_rate < rc_max_rate,
+                    "{name}: bit_rate {bit_rate} must sit under rc_max_rate {rc_max_rate}"
+                );
+                assert_eq!((bit_rate, maxrate, rc_max_rate), (asked, cap, cap));
+                assert!(!option("global_quality").is_empty(), "{name}");
+                assert_eq!(
+                    key,
+                    QvbrKey {
+                        name,
+                        chroma444: false,
+                        low_power: true
+                    }
+                );
+            }
+        }
+    }
+
+    /// With the switch off every open is today's. With it on only a live HEVC or
+    /// H.264 QSV open moves, 4:4:4 and either `low_power` alike; VP9 and AV1
+    /// QSV, a recording and a cap with no room under it stay, and say why.
+    #[test]
+    fn the_switch_moves_only_live_hevc_and_h264_qsv_opens() {
+        let names = [
+            "hevc_qsv",
+            "h264_qsv",
+            "vp9_qsv",
+            "av1_qsv",
+            "hevc_nvenc",
+            "hevc_amf",
+            "hevc_vaapi",
+        ];
+        for name in names {
+            for chroma444 in [false, true] {
+                for recording in [false, true] {
+                    let plan = QsvRateOpen::decide(
+                        QsvRateMode::Cbr,
+                        name,
+                        3_000_000,
+                        chroma444,
+                        true,
+                        recording,
+                    );
+                    assert_eq!(plan, QsvRateOpen::Today, "{name}");
+                }
+            }
+        }
+        for name in ["hevc_nvenc", "av1_amf", "hevc_vaapi", "hevc_videotoolbox"] {
+            let plan = QsvRateOpen::decide(QsvRateMode::Qvbr, name, 3_000_000, false, true, false);
+            assert_eq!(plan, QsvRateOpen::Today, "{name}");
+        }
+        let kept = |name: &'static str, cap: usize, recording: bool| {
+            matches!(
+                QsvRateOpen::decide(QsvRateMode::Qvbr, name, cap, false, true, recording),
+                QsvRateOpen::Kept { .. }
+            )
+        };
+        assert!(kept("vp9_qsv", 3_000_000, false));
+        assert!(kept("av1_qsv", 3_000_000, false));
+        assert!(kept("hevc_qsv", 3_000_000, true));
+        assert!(kept("h264_qsv", 9, false));
+        assert!(!kept("h264_qsv", 10, false));
+        let plan =
+            QsvRateOpen::decide(QsvRateMode::Qvbr, "hevc_qsv", 3_000_000, true, false, false);
+        assert!(
+            matches!(
+                plan,
+                QsvRateOpen::Qvbr {
+                    bit_rate: 2_700_000,
+                    ..
+                }
+            ),
+            "{plan:?}"
+        );
+    }
+
+    /// Switch off, one open: today's, with no rate of its own. An accepted
+    /// QVBR open is the only open.
+    #[test]
+    fn todays_plan_opens_once_and_an_accepted_qvbr_open_is_the_only_one() {
+        use std::cell::RefCell;
+        type Answer = anyhow::Result<std::result::Result<Option<usize>, &'static str>>;
+        let calls = RefCell::new(Vec::new());
+        let open = |rate: Option<usize>, _: ()| -> Answer {
+            calls.borrow_mut().push(rate);
+            Ok(Ok(rate))
+        };
+        for plan in [QsvRateOpen::Today, QsvRateOpen::Kept { why: "test" }] {
+            calls.borrow_mut().clear();
+            assert_eq!(plan.first_then_today("test", (), open).unwrap(), Ok(None));
+            assert_eq!(*calls.borrow(), vec![None], "{plan:?}");
+        }
+        let plan = QsvRateOpen::Qvbr {
+            bit_rate: 90_000,
+            maxrate: 100_000,
+            key: QvbrKey {
+                name: "fr148_accepting_qsv",
+                chroma444: true,
+                low_power: false,
+            },
+        };
+        calls.borrow_mut().clear();
+        assert_eq!(
+            plan.first_then_today("test", (), open).unwrap(),
+            Ok(Some(90_000))
+        );
+        assert_eq!(*calls.borrow(), vec![Some(90_000)]);
+    }
+
+    /// The fallback decision. A QVBR open that fails, in FFmpeg or in the
+    /// context before it, is followed by today's open, whose answer stands, its
+    /// failure too; and what it failed for is not asked again in this process.
+    #[test]
+    fn a_refused_qvbr_open_falls_back_to_todays_and_is_not_asked_again() {
+        use std::cell::RefCell;
+        type Answer = anyhow::Result<std::result::Result<&'static str, &'static str>>;
+        let plan = |name: &'static str, chroma444: bool| QsvRateOpen::Qvbr {
+            bit_rate: 2_700_000,
+            maxrate: 3_000_000,
+            key: QvbrKey {
+                name,
+                chroma444,
+                low_power: true,
+            },
+        };
+        let calls = RefCell::new(Vec::new());
+        let refusing = |rate: Option<usize>, _: ()| -> Answer {
+            calls.borrow_mut().push(rate);
+            Ok(match rate {
+                Some(_) => Err("Function not implemented"),
+                None => Ok("cbr"),
+            })
+        };
+        let refused = plan("fr148_refusing_qsv", false);
+        assert_eq!(
+            refused.first_then_today("test", (), refusing).unwrap(),
+            Ok("cbr")
+        );
+        assert_eq!(*calls.borrow(), vec![Some(2_700_000), None]);
+        calls.borrow_mut().clear();
+        assert_eq!(
+            refused.first_then_today("test", (), refusing).unwrap(),
+            Ok("cbr")
+        );
+        assert_eq!(*calls.borrow(), vec![None], "a refusal is not asked again");
+        // The same encoder in 4:4:4 is another open, and is asked.
+        calls.borrow_mut().clear();
+        let other = plan("fr148_refusing_qsv", true);
+        assert_eq!(
+            other.first_then_today("test", (), refusing).unwrap(),
+            Ok("cbr")
+        );
+        assert_eq!(*calls.borrow(), vec![Some(2_700_000), None]);
+        // A context that fails before the QVBR open is a refusal too.
+        let no_context = |rate: Option<usize>, _: ()| -> Answer {
+            if rate.is_some() {
+                anyhow::bail!("encoder().video() failed");
+            }
+            Ok(Ok("cbr"))
+        };
+        let plan_no_context = plan("fr148_no_context_qsv", false);
+        assert_eq!(
+            plan_no_context
+                .first_then_today("test", (), no_context)
+                .unwrap(),
+            Ok("cbr")
+        );
+        // Today's open fails after a refused QVBR open as it fails today.
+        let neither = |_: Option<usize>, _: ()| -> Answer { Ok(Err("Invalid argument")) };
+        let plan_neither = plan("fr148_neither_qsv", false);
+        assert_eq!(
+            plan_neither.first_then_today("test", (), neither).unwrap(),
+            Err("Invalid argument")
+        );
     }
 
     /// FR-119 P2b-10 — the encode stage on THIS host's silicon, step by step.
