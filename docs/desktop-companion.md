@@ -1825,8 +1825,9 @@ sequenceDiagram
 - **One viewer, with the native panel up.** The app now receives that question too, marked
   `native`, and filters it out (`consent_watch_loop`,
   [`main.rs:338`](../agents/roomler-desktop/src/main.rs#L338); the prompt window,
-  `panel-consent.js:112`), as a Linux system install's tray does with a question its X11 panel
-  shows. There is one Approve on the screen, the panel's, and the broker takes the first answer.
+  `panel-consent.js:112`), as a Windows SYSTEM install's tray does with a question its own panel
+  shows. A Linux system daemon has no native panel, so its tray shows every question. There is
+  one Approve on the screen, the panel's: the app shows no button for that question.
   Whatever ends the question takes the panel down (`hide_prompt`), and the app's next poll no
   longer lists it.
 - **Ids.** Each question's id is an ObjectId: the server's session or request id for the root's
