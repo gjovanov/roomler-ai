@@ -220,22 +220,31 @@ honest: the same password grep matched the run's own credential file once.
 `scripts/rc-path-report.sh` + `.cjs` read the agents' own lines in `agent_logs` and print, per
 remote-desktop session, what it opened at beside what its pair had already carried, and the
 plan's target beside the encoder's applied rate. Per pair, they print the trail of writes to
-the rate memory, each marked inferred. Two flags count the failures FR-148 fixes. It is P0's
+the rate memory, each marked inferred. They also print what the path carried while bytes waited
+to be sent (the `path delivery` lines, #3968), when a session changed path, whether its picture
+ever left the slow-link profile, and whether the entry it opened with was measured and was the
+pair's (the P1 line, #3969). Three flags count the failures FR-148 fixes. It is P0's
 first instrument, and AC1 reads the two reference chains through it
 (`docs/fr/FR-148-path-measured-plan-follows.md` §2). What each column means, and what the lines
 cannot tell, is in the script's header. This section is the read's contract with production.
 
 | Bound | What it is | Where |
 |---|---|---|
-| Window | at most 8 days, read as one query per day | `scripts/rc-path-report.cjs:1325` |
-| Index | pinned with `hint`: `created_at_1` for the fleet and for `--agent` alone, `tenant_id_1_agent_id_1_created_at_-1` for one agent of one `--tenant`, `tenant_id_1_source_1_created_at_-1` for any other `--tenant` read. Each returns the batches in `created_at` order, so the `$sort` is no blocking SORT stage | `scripts/rc-path-report.cjs:1355` |
-| Time | `maxTimeMS` 240,000 per query | `scripts/rc-path-report.cjs:1360` |
-| Memory | `allowDiskUse: false`. After the `$match`, only streaming stages: a `$project` whose `$filter` keeps the lines of the ten messages read, `$unwind`, and a `$project` of 30 named fields | `scripts/rc-path-report.cjs:1248` |
+| Window | at most 8 days, read as one query per day | `scripts/rc-path-report.cjs:1951` |
+| Index | pinned with `hint`: `created_at_1` for the fleet and for `--agent` alone, `tenant_id_1_agent_id_1_created_at_-1` for one agent of one `--tenant`, `tenant_id_1_source_1_created_at_-1` for any other `--tenant` read. Each returns the batches in `created_at` order, so the `$sort` is no blocking SORT stage | `scripts/rc-path-report.cjs:1981` |
+| Time | `maxTimeMS` 240,000 per query | `scripts/rc-path-report.cjs:1986` |
+| Memory | `allowDiskUse: false`. After the `$match`, only streaming stages: a `$project` whose `$filter` keeps the lines of the twelve messages read, `$unwind`, and a `$project` of 37 named fields | `scripts/rc-path-report.cjs:1874` |
 | Cost | every batch in the window is examined once. `agent_logs` held 354,193 batches over its 7 days on 2026-11-10 (§7), so a 7-day run examines about 350,000 documents, about 50,000 per daily query, through the index | — |
-| What leaves | the matching lines' named fields only. The memory key leaves as its carrier half and the controlling user as the last 6 hex of its id: no address, no host name, no person's name | `scripts/rc-path-report.cjs:1252` |
+| What leaves | the matching lines' named fields only. The memory key leaves as its carrier half and the controlling user as the last 6 hex of its id: no address, no host name, no person's name. The P1 line's key leaves the same way | `scripts/rc-path-report.cjs:1878` |
 
 The runner prints `mongodb-0`'s restart count and memory before and after the read, and a
 restart fails the run (exit 3), as for every reader in §6.
+
+The two lines added on 2026-11-17 change nothing the read examines: the `$match` is the same.
+What leaves grows by one `path delivery` line per pump per 10 s, about a fifth more lines than
+an FFmpeg session's heartbeats and a tenth more than a VP9-444 session's, and by at most one P1
+line per pump start. Agents built before #3968 and #3969 write neither, and their sessions read
+`–` in the new columns.
 
 | Term | Rule | Constant |
 |---|---|---|
@@ -244,6 +253,11 @@ restart fails the run (exit 3), as for every reader in §6.
 | Clean window | the viewer reported an age, and it sat less than 70 ms over its floor | `AGE_SLACK_MS`, which the self-test checks against `encode/ratectl.rs` |
 | F1 | the opening (the first heartbeat's `target_bps`) is below 0.5 × the pair's demonstrated rate in the window. AC6's line, 0.85 ×, is counted beside it, against the window and against what the pair had shown before the session opened | `F1_RATIO`, `AC6_RATIO` |
 | F2 | the target's max is at least 1.5 × its min, the session lasted at least 5 min, and the encoder's applied rate (`maxrate_bps`, and the rate-apply counters) moved 0 times | `F2_SPREAD`, `F2_MIN_SESSION_MS` |
+| Backlogged max | the highest backlogged rate among the pair's `path delivery` lines in the window: a rate the path carried while the sender had more to send, a floor like the demonstrated rate and never a capacity. F1's table counts the openings against it in a row of its own, which is not F1's verdict | — |
+| Change of path | the pump's relay flag turns, or a carrier line or an ICE line repeats with another value, dated from the opening at the first heartbeat on the new side. A session keeps the class of its last carrier line, so its delivery lines and demonstrated runs count only on that side, and a line whose 10 s straddle a turn counts nowhere. A VP9-444 pump has no flag, so its lines and runs are never split by side | `MAX_CHANGES`: 8 kept per session, the rest counted |
+| F3 | judged on a session that opened with the slow-link profile, had a size and frame rate at its opening, and lasted at least 5 min. Raised when its plan stood above 1,000,000 bit/s for at least 60 s in a row (an open at or below that engages the profile) and no heartbeat's picture was both larger and faster than the opening: AC14 asks for both back | `SLOW_LINK_PROFILE_BPS`, checked against `rate_profile.rs`; `F3_MIN_SESSION_MS`, `F3_RUN_MS` |
+| At nominal after | for a session that opened on a relay below 3,000,000 bit/s (`relay_max_bps`'s default), the first heartbeat on the relay whose target reached it, or "left the relay first" | `RELAY_NOMINAL_BPS`, checked against `encode/mod.rs` |
+| Entry at the open | the entry the open was seeded with. A P1 line goes to the same agent's earliest pump start in the 5 s after it. "Opened without the pair's entry" is an FFmpeg pump that started on a relay with no entry, although the pair's last write with evidence before it, at most 7 days old, left one. It is inferred, as the trail is: the key may have differed, no key may have formed, or the daemon may have run under another user's data directory | `OPEN_LAG_MS`; `MEMORY_TTL_MS`, checked against `rate_memory.rs` with its `<=` |
 
 **Rehearsed, not run on production.** On 2026-11-16 the self-test's invented sessions (both
 reference chains and a healthy session) went into a throwaway `mongo:7` as 254 batches. The
@@ -254,10 +268,20 @@ two faults, fixed before the first push. A heartbeat batch that reached the read
 one was counted as a new pump, and is now a replay. `--docker` with no other option handed
 `docker exec` an empty argument as its container name.
 
+**Rehearsed again on 2026-11-17, not run on production.** The self-test's fixtures, now with
+`path delivery` lines, a change of path, the slow-link profile and a P1 line, went into a
+throwaway `mongo:7` as 650 batches. The mongosh read (2,047 lines in 8 daily queries), the Node
+read of its own `--rows` output and the Node read of the fixtures agreed exactly, in Markdown and
+in JSON, and F1, F2 and F3 read RAISED. `--explain` read an index scan with no SORT stage for all
+six combinations of `--tenant` and `--agent`. The functions that build and run the query
+(`pipelineFor`, `runMongosh`, `connectDb`, `rowOut`) did not change; only the named fields and
+the message filter grew. The container needs `MONGO_INITDB_ROOT_USERNAME` and `_PASSWORD` at its
+start: without them the seed loads, and the read stops at "No connected database".
+
 ```bash
-node scripts/rc-path-report.cjs --self-test                     # 83 cases: both chains, the rule's and the flags' edges, privacy, the seed
-node scripts/rc-path-report.cjs --fixtures > seed.ejson          # the self-test's sessions as agent_logs batches
-bash scripts/rc-path-report.sh --docker NAME --seed seed.ejson   # the rehearsal, against a mongo:7 you started
+node scripts/rc-path-report.cjs --self-test                     # 162 cases: both chains, the rule's and the flags' edges, the path's lines, privacy, the seed
+node scripts/rc-path-report.cjs --fixtures > seed.ejson          # the self-test's fixtures as agent_logs batches
+bash scripts/rc-path-report.sh --docker NAME --seed seed.ejson   # the rehearsal, against a mongo:7 you started with MONGO_INITDB_ROOT_* (an --env-file)
 bash scripts/rc-path-report.sh --mars --yes --label HEX=CORPLAP-1 --label HEX=CORPLAP-2   # the fleet read: the last 7 days
 bash scripts/rc-path-report.sh --mars --yes --rows > rows.ndjson; node scripts/rc-path-report.cjs rows.ndjson   # the same, re-read offline
 ```
