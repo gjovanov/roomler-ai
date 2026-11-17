@@ -157,6 +157,13 @@ pub struct Pipe {
     /// Counters for the heartbeat: deliveries folded, capacities folded.
     delivered_n: u32,
     capacity_n: u32,
+    /// FR-148 P0 — the class of the input that last wrote `floor`, and of the
+    /// one that wrote `capacity`. Written beside the values; no law reads them,
+    /// only the tagged readers ([`Self::floor_number`] and its two siblings).
+    floor_basis: Option<Basis>,
+    capacity_basis: Option<Basis>,
+    /// FR-148 P0 — FR-148 §4.1's laws over the same inputs, in shadow.
+    model: PathModel,
 }
 
 impl Pipe {
@@ -172,15 +179,21 @@ impl Pipe {
     /// V5b reads. A floor that rose is a delivery LATER than anything that set
     /// it, so it can contradict a reading taken earlier; a floor that stood
     /// cannot.
-    pub fn observe_delivered(&mut self, bps: u32, now: Instant) -> bool {
+    ///
+    /// FR-148 P0 — `basis` is how the delivery was measured. It is kept beside
+    /// the floor it sets and fed to the shadow model; nothing it says changes
+    /// what this returns or any number this type gives.
+    pub fn observe_delivered(&mut self, bps: u32, basis: Basis, now: Instant) -> bool {
         if bps == 0 {
             return false;
         }
+        self.model.delivered(bps, basis, now);
         self.delivered_n = self.delivered_n.saturating_add(1);
         match self.floor {
             Some((best, _)) if bps <= best => false,
             _ => {
                 self.floor = Some((bps, now));
+                self.floor_basis = Some(basis);
                 true
             }
         }
@@ -201,12 +214,19 @@ impl Pipe {
     /// optimistic floor forever either (that is the 38.88 Mbps constant, with
     /// extra steps). Damping says: one sample barely moves it, sustained
     /// evidence converges on it.
-    pub fn observe_capacity(&mut self, bps: u32, now: Instant) {
+    ///
+    /// FR-148 P0 — `basis` as for [`Self::observe_delivered`]: kept beside what
+    /// it sets, fed to the shadow model, read by no law here. An
+    /// application-limited push-back moves this type exactly as a backlogged
+    /// one does; only the model tells them apart.
+    pub fn observe_capacity(&mut self, bps: u32, basis: Basis, now: Instant) {
         if bps == 0 {
             return;
         }
+        self.model.pushed_back(bps, basis, now);
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
+        self.capacity_basis = Some(basis);
         // ⚠️ A capacity sample is ALSO a delivery. A blocked-send goodput of X
         // means X bits per second actually got through while the sender was
         // blocked — those bytes arrived. So it feeds the floor by the same law
@@ -221,9 +241,13 @@ impl Pipe {
         match self.floor {
             Some((floor, _)) if bps < floor => {
                 self.floor = Some((super::rate_memory::damp(floor, bps), now));
+                self.floor_basis = Some(basis);
             }
             Some((floor, _)) if bps <= floor => {}
-            _ => self.floor = Some((bps, now)),
+            _ => {
+                self.floor = Some((bps, now));
+                self.floor_basis = Some(basis);
+            }
         }
     }
 
@@ -275,6 +299,298 @@ impl Pipe {
     pub fn counts(&self) -> (u32, u32) {
         (self.delivered_n, self.capacity_n)
     }
+
+    /// FR-148 P0 — [`Self::floor_bps`], with the class of the input that set it
+    /// and how long ago. The value is always `floor_bps`'s
+    /// (`tests::tags_change_no_number`).
+    pub fn floor_number(&self, now: Instant) -> Option<PathNumber> {
+        let (bps, at) = self.floor?;
+        Some(PathNumber::new(
+            bps,
+            self.floor_basis?,
+            now.saturating_duration_since(at),
+        ))
+    }
+
+    /// FR-148 P0 — [`Self::capacity_bps`], tagged as [`Self::floor_number`] is.
+    pub fn capacity_number(&self, now: Instant) -> Option<PathNumber> {
+        let (bps, at) = self
+            .capacity
+            .filter(|(_, at)| now.duration_since(*at) <= CAPACITY_TTL)?;
+        Some(PathNumber::new(
+            bps,
+            self.capacity_basis?,
+            now.saturating_duration_since(at),
+        ))
+    }
+
+    /// FR-148 P0 — [`Self::ceiling_anchor_bps`]: the tagged number it takes, the
+    /// capacity on a tie.
+    pub fn anchor_number(&self, now: Instant) -> Option<PathNumber> {
+        match (self.capacity_number(now), self.floor_number(now)) {
+            (Some(c), Some(f)) => Some(if c.bps >= f.bps { c } else { f }),
+            (c, f) => c.or(f),
+        }
+    }
+
+    /// FR-148 P0 — the shadow model over this pipe's inputs.
+    pub fn model(&self) -> &PathModel {
+        &self.model
+    }
+
+    /// FR-148 P0 — the pair memory's seed at the open, for the shadow model
+    /// alone ([`PathModel::remembered`]). This type's own numbers do not move:
+    /// they never took a seed.
+    pub fn remember(&mut self, bps: u32, now: Instant) {
+        self.model.remembered(bps, now);
+    }
+}
+
+/// FR-148 §4.1 — how a path number was obtained. Three classes and no more: a
+/// stalled window is evidence about stalls and is never one of them (FR-71's
+/// classifier and FR-79's gate say which windows those are).
+///
+/// ⚠️ Not `rate_memory::Provenance`, which is what the pair memory stores today
+/// (measured or assumed). P1 merges the two; until then they stay apart, and are
+/// never glob-imported together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// Measured while the sender had more to send than the path took: evidence
+    /// about the path's capacity.
+    Backlogged,
+    /// Measured while the path took everything the sender offered: a lower
+    /// bound, which says nothing about where the path would refuse.
+    AppLimited,
+    /// Nobody measured it: a prior, a stand-in, a default, a computed ramp.
+    Assumed,
+}
+
+impl Basis {
+    /// A measured window's class: backlogged when the sender offered more than
+    /// arrived, application-limited when it did not.
+    pub fn of_window(backlogged: bool) -> Self {
+        if backlogged {
+            Basis::Backlogged
+        } else {
+            Basis::AppLimited
+        }
+    }
+
+    /// The word the `path model` line writes.
+    pub fn word(self) -> &'static str {
+        match self {
+            Basis::Backlogged => "backlogged",
+            Basis::AppLimited => "app-limited",
+            Basis::Assumed => "assumed",
+        }
+    }
+}
+
+/// FR-148 P0 — a path number as a session reports it: the value, how it was
+/// obtained, and how old the evidence behind it is when it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathNumber {
+    pub bps: u32,
+    pub basis: Basis,
+    /// Measured in an earlier session: the pair memory's seed, and what stands at
+    /// it. The entry does not say which measured class it was (P1 stores it), so
+    /// `basis` is the weaker one, [`Basis::AppLimited`], and the line says
+    /// `remembered`.
+    pub remembered: bool,
+    pub age: Duration,
+}
+
+impl PathNumber {
+    pub fn new(bps: u32, basis: Basis, age: Duration) -> Self {
+        Self {
+            bps,
+            basis,
+            remembered: false,
+            age,
+        }
+    }
+
+    /// A number measured in an earlier session, `age` old.
+    pub fn remembered(bps: u32, age: Duration) -> Self {
+        Self {
+            bps,
+            basis: Basis::AppLimited,
+            remembered: true,
+            age,
+        }
+    }
+
+    /// `backlogged`, `app-limited`, `assumed` or `remembered`.
+    pub fn word(&self) -> &'static str {
+        if self.remembered {
+            "remembered"
+        } else {
+            self.basis.word()
+        }
+    }
+}
+
+/// `<bps>/<word>/<age>ms`, as the `path model` line writes each number.
+impl std::fmt::Display for PathNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}/{}ms", self.bps, self.word(), self.age.as_millis())
+    }
+}
+
+/// FR-148 P0 — FR-148 §4.1's laws over the inputs [`Pipe`] takes, in shadow:
+/// what the path model would hold if provenance were read. Nothing reads it but
+/// the `path model` line (`media_delivery`) and the cells that replay two field
+/// chains against it (`governor::tests`).
+///
+/// | input | [`Pipe`] | here |
+/// |---|---|---|
+/// | a delivery, of either measured class | raises the floor | raises the floor |
+/// | a push-back, backlogged | sets the capacity; lowers the floor damped, or raises it | the same |
+/// | a push-back, application-limited | the same as a backlogged one | raises the floor, as a delivery does; the capacity does not move |
+/// | the pair memory's seed, at the open | never an input | an application-limited reading, marked remembered ([`Pipe::remember`]) |
+/// | anything assumed | never an input | never enters |
+///
+/// So the floor rises on any measured reading and falls only on a backlogged
+/// one, and the capacity moves only on a backlogged one. An assumed value never
+/// stands below the floor ([`Self::stand_in`]) and is never offered for storing
+/// ([`Self::offer`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PathModel {
+    floor: Option<Held>,
+    /// Backlogged by construction: nothing else sets it.
+    capacity: Option<(u32, Instant)>,
+}
+
+/// The reading that set the model's floor.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    bps: u32,
+    basis: Basis,
+    remembered: bool,
+    at: Instant,
+}
+
+impl PathModel {
+    /// A delivery: it raises the floor, whichever measured class it is.
+    pub fn delivered(&mut self, bps: u32, basis: Basis, now: Instant) {
+        if bps > 0 && basis != Basis::Assumed {
+            self.raise(bps, basis, false, now);
+        }
+    }
+
+    /// A rate an earlier session measured (the pair memory's seed), taken at the
+    /// open as the weaker measured class. Its age here runs from `now`; the
+    /// caller, who knows the entry's age, adds it.
+    pub fn remembered(&mut self, bps: u32, now: Instant) {
+        if bps > 0 {
+            self.raise(bps, Basis::AppLimited, true, now);
+        }
+    }
+
+    /// A push-back. Backlogged, it is [`Pipe::observe_capacity`]'s law;
+    /// application-limited, the path took everything offered, so it is a
+    /// delivery and nothing more.
+    pub fn pushed_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+        if bps == 0 {
+            return;
+        }
+        match basis {
+            Basis::Assumed => {}
+            Basis::AppLimited => self.raise(bps, basis, false, now),
+            Basis::Backlogged => {
+                self.capacity = Some((bps, now));
+                let set = |bps| Held {
+                    bps,
+                    basis,
+                    remembered: false,
+                    at: now,
+                };
+                match self.floor {
+                    Some(f) if bps < f.bps => {
+                        self.floor = Some(set(super::rate_memory::damp(f.bps, bps)));
+                    }
+                    Some(f) if bps <= f.bps => {}
+                    _ => self.floor = Some(set(bps)),
+                }
+            }
+        }
+    }
+
+    fn raise(&mut self, bps: u32, basis: Basis, remembered: bool, now: Instant) {
+        if self.floor.is_none_or(|f| bps > f.bps) {
+            self.floor = Some(Held {
+                bps,
+                basis,
+                remembered,
+                at: now,
+            });
+        }
+    }
+
+    /// The demonstrated floor, with the class of the reading that set it.
+    pub fn floor(&self, now: Instant) -> Option<PathNumber> {
+        self.floor.map(|f| PathNumber {
+            bps: f.bps,
+            basis: f.basis,
+            remembered: f.remembered,
+            age: now.saturating_duration_since(f.at),
+        })
+    }
+
+    /// The last backlogged push-back, on [`CAPACITY_TTL`] as [`Pipe`]'s is.
+    pub fn capacity(&self, now: Instant) -> Option<PathNumber> {
+        self.capacity
+            .filter(|(_, at)| now.duration_since(*at) <= CAPACITY_TTL)
+            .map(|(bps, at)| {
+                PathNumber::new(bps, Basis::Backlogged, now.saturating_duration_since(at))
+            })
+    }
+
+    /// An assumed value (the governor's stand-in) as the model lets it stand:
+    /// never below the demonstrated floor. Where the floor is at or above it,
+    /// the floor stands, with its own tag.
+    pub fn stand_in(&self, assumed: Option<PathNumber>, now: Instant) -> Option<PathNumber> {
+        let assumed = assumed?;
+        match self.floor(now) {
+            Some(floor) if floor.bps >= assumed.bps => Some(floor),
+            _ => Some(assumed),
+        }
+    }
+
+    /// What it would offer the pair memory at a session's end: its floor, with
+    /// the tag of the reading that set it, or nothing when the session measured
+    /// nothing. Never an assumed value, since none enters.
+    pub fn offer(&self, now: Instant) -> Option<PathNumber> {
+        self.floor(now)
+    }
+}
+
+/// FR-148 P0 — every path number a session's heartbeat carries, each tagged,
+/// and the shadow model's view beside them: what the `path model` line writes.
+/// Built by `RateGovernor::path_view` at a heartbeat.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PathView {
+    /// `goodput_bps`: the blocked-send estimate.
+    pub goodput: Option<PathNumber>,
+    /// `pipe_belief`: [`Pipe`]'s (anchor, floor, capacity).
+    pub belief: (Option<PathNumber>, Option<PathNumber>, Option<PathNumber>),
+    /// `pipe_measured`: the reading a stall is judged against.
+    pub measured: Option<PathNumber>,
+    /// `prior_bps`: the stand-in.
+    pub prior: Option<PathNumber>,
+    /// `learned_ceiling_bps`: `0` is the nominal start, assumed.
+    pub learned_ceiling: Option<PathNumber>,
+    /// `slow_link_floor_bps`: the relieved floor, tagged as what it came from.
+    pub slow_link_floor: Option<PathNumber>,
+    /// The last arrival rate the viewer reported.
+    pub viewer_rx: Option<PathNumber>,
+    /// The pair memory's seed at the open.
+    pub seed: Option<PathNumber>,
+    /// The model's floor, which is also what it would offer for storing.
+    pub model_floor: Option<PathNumber>,
+    pub model_capacity: Option<PathNumber>,
+    /// The stand-in as the model lets it stand ([`PathModel::stand_in`]).
+    pub model_stand_in: Option<PathNumber>,
 }
 
 #[cfg(test)]
@@ -285,13 +601,368 @@ mod tests {
         Instant::now()
     }
 
+    /// FR-148 P0 — the law as it stood before the tags, verbatim (`Pipe` at
+    /// `a0738e3b6`). Every cell in this module is checked against it.
+    #[derive(Default)]
+    struct Before {
+        floor: Option<(u32, Instant)>,
+        capacity: Option<(u32, Instant)>,
+        delivered_n: u32,
+        capacity_n: u32,
+    }
+
+    impl Before {
+        fn observe_delivered(&mut self, bps: u32, now: Instant) -> bool {
+            if bps == 0 {
+                return false;
+            }
+            self.delivered_n = self.delivered_n.saturating_add(1);
+            match self.floor {
+                Some((best, _)) if bps <= best => false,
+                _ => {
+                    self.floor = Some((bps, now));
+                    true
+                }
+            }
+        }
+
+        fn observe_capacity(&mut self, bps: u32, now: Instant) {
+            if bps == 0 {
+                return;
+            }
+            self.capacity_n = self.capacity_n.saturating_add(1);
+            self.capacity = Some((bps, now));
+            match self.floor {
+                Some((floor, _)) if bps < floor => {
+                    self.floor = Some((super::super::rate_memory::damp(floor, bps), now));
+                }
+                Some((floor, _)) if bps <= floor => {}
+                _ => self.floor = Some((bps, now)),
+            }
+        }
+
+        fn floor_bps(&self, _now: Instant) -> Option<u32> {
+            self.floor.map(|(bps, _)| bps)
+        }
+
+        fn capacity_bps(&self, now: Instant) -> Option<u32> {
+            self.capacity
+                .filter(|(_, at)| now.duration_since(*at) <= CAPACITY_TTL)
+                .map(|(bps, _)| bps)
+        }
+
+        fn ceiling_anchor_bps(&self, now: Instant) -> Option<u32> {
+            match (self.capacity_bps(now), self.floor_bps(now)) {
+                (Some(c), Some(f)) => Some(c.max(f)),
+                (c, f) => c.or(f),
+            }
+        }
+
+        fn counts(&self) -> (u32, u32) {
+            (self.delivered_n, self.capacity_n)
+        }
+    }
+
+    const BASES: [Basis; 3] = [Basis::Backlogged, Basis::AppLimited, Basis::Assumed];
+
+    /// FR-148 P0, decision 2: a tag changes no number. Every cell in this module
+    /// runs through this: the tagged [`Pipe`], fed a class that cycles through all
+    /// three, beside [`Before`]. After each input and at each read, every reader
+    /// gives `Before`'s number and each tagged reader its untagged reader's value.
+    #[derive(Default)]
+    struct Twin {
+        p: Pipe,
+        before: Before,
+        n: usize,
+    }
+
+    impl Twin {
+        fn basis(&mut self) -> Basis {
+            self.n = self.n.wrapping_add(1);
+            BASES[self.n % 3]
+        }
+
+        fn observe_delivered(&mut self, bps: u32, now: Instant) -> bool {
+            let basis = self.basis();
+            let rose = self.p.observe_delivered(bps, basis, now);
+            assert_eq!(rose, self.before.observe_delivered(bps, now), "rise");
+            self.check(now);
+            rose
+        }
+
+        fn observe_capacity(&mut self, bps: u32, now: Instant) {
+            let basis = self.basis();
+            self.p.observe_capacity(bps, basis, now);
+            self.before.observe_capacity(bps, now);
+            self.check(now);
+        }
+
+        fn check(&self, now: Instant) {
+            let p = &self.p;
+            assert_eq!(p.floor_bps(now), self.before.floor_bps(now), "floor");
+            assert_eq!(
+                p.capacity_bps(now),
+                self.before.capacity_bps(now),
+                "capacity"
+            );
+            assert_eq!(
+                p.ceiling_anchor_bps(now),
+                self.before.ceiling_anchor_bps(now),
+                "anchor"
+            );
+            assert_eq!(p.counts(), self.before.counts(), "counts");
+            assert_eq!(p.floor_number(now).map(|n| n.bps), p.floor_bps(now));
+            assert_eq!(p.capacity_number(now).map(|n| n.bps), p.capacity_bps(now));
+            assert_eq!(
+                p.anchor_number(now).map(|n| n.bps),
+                p.ceiling_anchor_bps(now)
+            );
+        }
+
+        fn floor_bps(&self, now: Instant) -> Option<u32> {
+            self.check(now);
+            self.p.floor_bps(now)
+        }
+
+        fn capacity_bps(&self, now: Instant) -> Option<u32> {
+            self.check(now);
+            self.p.capacity_bps(now)
+        }
+
+        fn ceiling_anchor_bps(&self, now: Instant) -> Option<u32> {
+            self.check(now);
+            self.p.ceiling_anchor_bps(now)
+        }
+
+        fn counts(&self) -> (u32, u32) {
+            assert_eq!(self.p.counts(), self.before.counts());
+            self.p.counts()
+        }
+    }
+
+    /// xorshift64: the same sequence on every run and every platform.
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut x = seed;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        }
+    }
+
+    /// A rate over six decades, a zero, or the one before it again.
+    fn draw_bps(next: &mut impl FnMut() -> u64, last: u32) -> u32 {
+        match next() % 10 {
+            0 => 0,
+            1 => last,
+            _ => {
+                let base = 10u64.pow(2 + (next() % 6) as u32);
+                (base + next() % (9 * base)) as u32
+            }
+        }
+    }
+
+    /// FR-148 P0, decision 2, over a long random sequence: 100,000 deliveries and
+    /// push-backs, values over six decades with zeros and repeats, steps from none
+    /// to past [`CAPACITY_TTL`], each with a class drawn at random, and a read at a
+    /// random later moment after each. Every number is `Before`'s.
+    #[test]
+    fn tags_change_no_number() {
+        let mut next = rng(0x9E37_79B9_7F4A_7C15);
+        let start = t0();
+        let mut t = start;
+        let mut twin = Twin::default();
+        let mut last = 0;
+        let (mut rises, mut pushes) = (0u32, 0u32);
+        for _ in 0..100_000 {
+            let bps = draw_bps(&mut next, last);
+            last = bps;
+            t += match next() % 16 {
+                0 => CAPACITY_TTL + Duration::from_millis(next() % 5_000),
+                1 => Duration::ZERO,
+                _ => Duration::from_millis(next() % 3_000),
+            };
+            twin.n = (next() % 3) as usize;
+            if next().is_multiple_of(3) {
+                twin.observe_capacity(bps, t);
+                pushes += 1;
+            } else if twin.observe_delivered(bps, t) {
+                rises += 1;
+            }
+            twin.check(t + Duration::from_millis(next() % 70_000));
+        }
+        // The sequence reached every branch of both laws.
+        assert!(
+            rises > 100 && pushes > 30_000,
+            "{rises} rises, {pushes} push-backs"
+        );
+    }
+
+    /// FR-148 P0 — with every input backlogged, the model is [`Pipe`]'s law
+    /// exactly; with every one application-limited, its capacity never moves and
+    /// its floor is the highest reading.
+    #[test]
+    fn the_model_is_pipes_law_when_everything_is_backlogged() {
+        for basis in [Basis::Backlogged, Basis::AppLimited] {
+            let mut next = rng(0xD1B5_4A32_D192_ED03);
+            let mut t = t0();
+            let mut p = Pipe::default();
+            let mut highest = 0;
+            let mut last = 0;
+            for _ in 0..20_000 {
+                let bps = draw_bps(&mut next, last);
+                last = bps;
+                t += Duration::from_millis(next() % 4_000);
+                if next().is_multiple_of(3) {
+                    p.observe_capacity(bps, basis, t);
+                } else {
+                    p.observe_delivered(bps, basis, t);
+                }
+                highest = highest.max(bps);
+                let m = p.model();
+                if basis == Basis::Backlogged {
+                    assert_eq!(m.floor(t).map(|n| n.bps), p.floor_bps(t));
+                    assert_eq!(m.capacity(t).map(|n| n.bps), p.capacity_bps(t));
+                } else {
+                    assert_eq!(m.capacity(t), None);
+                    assert_eq!(m.floor(t).map(|n| n.bps), Some(highest).filter(|h| *h > 0));
+                }
+            }
+        }
+    }
+
+    /// FR-148 P0 — the jupiter shape at this type's level: a minute's delivery,
+    /// then a push-back read on idle traffic. [`Pipe`] takes the trickle as the
+    /// capacity and halves its floor toward it; the model, which reads that the
+    /// sender was application-limited, moves neither, and offers the floor.
+    #[test]
+    fn an_application_limited_push_back_lowers_nothing_in_the_model() {
+        let now = t0();
+        let mut p = Pipe::default();
+        p.observe_delivered(15_915_240, Basis::AppLimited, now);
+        let t = now + Duration::from_secs(7);
+        p.observe_capacity(9_489, Basis::AppLimited, t);
+        assert_eq!(
+            (p.floor_bps(t), p.capacity_bps(t)),
+            (Some(7_962_364), Some(9_489)),
+            "the law of 2026-11-16"
+        );
+        let trickle = p.capacity_number(t).expect("a capacity");
+        assert_eq!((trickle.bps, trickle.word()), (9_489, "app-limited"));
+        let m = p.model();
+        assert_eq!(m.capacity(t), None, "no capacity from a trickle");
+        let floor = PathNumber::new(15_915_240, Basis::AppLimited, Duration::from_secs(7));
+        assert_eq!(m.floor(t), Some(floor), "the floor the minute set");
+        assert_eq!(m.offer(t), Some(floor));
+        // A backlogged push-back is the evidence that may lower it.
+        p.observe_capacity(2_000_000, Basis::Backlogged, t);
+        let floor = m_floor(&p, t);
+        assert!(floor.bps < 15_915_240 && floor.basis == Basis::Backlogged);
+        assert_eq!(p.model().capacity(t).map(|c| c.bps), Some(2_000_000));
+    }
+
+    fn m_floor(p: &Pipe, t: Instant) -> PathNumber {
+        p.model().floor(t).expect("a floor")
+    }
+
+    /// FR-148 P0 — an assumed value is never offered and never stands below a
+    /// demonstrated floor; above the floor it stands as what it is.
+    #[test]
+    fn an_assumed_value_never_stands_below_the_floor_and_is_never_offered() {
+        let now = t0();
+        let mut m = PathModel::default();
+        let stand_in = PathNumber::new(179_980, Basis::Assumed, Duration::from_secs(1));
+        assert_eq!(
+            m.offer(now),
+            None,
+            "a session that measured nothing offers nothing"
+        );
+        assert_eq!(
+            m.stand_in(Some(stand_in), now),
+            Some(stand_in),
+            "no floor to stand on"
+        );
+        m.delivered(179_980, Basis::Assumed, now);
+        m.pushed_back(179_980, Basis::Assumed, now);
+        assert_eq!(m.offer(now), None, "nothing assumed enters");
+        m.delivered(1_399_272, Basis::AppLimited, now);
+        let floor = PathNumber::new(1_399_272, Basis::AppLimited, Duration::ZERO);
+        assert_eq!(m.stand_in(Some(stand_in), now), Some(floor));
+        assert_eq!(m.offer(now), Some(floor));
+        let high = PathNumber::new(2_000_000, Basis::Assumed, Duration::ZERO);
+        assert_eq!(m.stand_in(Some(high), now), Some(high));
+        assert_eq!(m.stand_in(None, now), None);
+    }
+
+    /// FR-148 P0 — the pair memory's seed is a reading an earlier session took:
+    /// the model opens on it, marked remembered. This session's readings raise
+    /// it, and only a backlogged one lowers it. The pipe never sees it.
+    #[test]
+    fn a_remembered_seed_is_an_application_limited_floor() {
+        let now = t0();
+        let mut p = Pipe::default();
+        p.remember(3_322, now);
+        assert_eq!((p.floor_bps(now), p.capacity_bps(now)), (None, None));
+        let seed = PathNumber::remembered(3_322, Duration::ZERO);
+        assert_eq!(
+            p.model().offer(now),
+            Some(seed),
+            "measured nothing: the seed"
+        );
+        let t = now + Duration::from_secs(2);
+        p.observe_capacity(2_000, Basis::AppLimited, t);
+        assert_eq!(
+            m_floor(&p, t).bps,
+            3_322,
+            "an application-limited push-back"
+        );
+        p.observe_delivered(9_120, Basis::AppLimited, t);
+        let delivered = PathNumber::new(9_120, Basis::AppLimited, Duration::ZERO);
+        assert_eq!(p.model().offer(t), Some(delivered));
+        p.observe_capacity(4_000, Basis::Backlogged, t);
+        let floor = m_floor(&p, t);
+        assert!(
+            floor.bps < 9_120 && floor.basis == Basis::Backlogged,
+            "{floor:?}"
+        );
+    }
+
+    /// FR-148 P0 — how the line writes a number: value, word, age in ms.
+    #[test]
+    fn a_number_is_written_as_value_word_and_age() {
+        let age = Duration::from_millis(2_330_400);
+        let cases = [
+            (
+                PathNumber::new(1_399_272, Basis::AppLimited, age),
+                "1399272/app-limited/2330400ms",
+            ),
+            (
+                PathNumber::new(564_865, Basis::Backlogged, Duration::ZERO),
+                "564865/backlogged/0ms",
+            ),
+            (
+                PathNumber::new(179_980, Basis::Assumed, age),
+                "179980/assumed/2330400ms",
+            ),
+            (
+                PathNumber::remembered(3_322, age),
+                "3322/remembered/2330400ms",
+            ),
+        ];
+        for (n, want) in cases {
+            assert_eq!(n.to_string(), want);
+        }
+        assert_eq!(PathNumber::remembered(3_322, age).basis, Basis::AppLimited);
+    }
+
     /// Symptom 1, CORPLAP-3: a session that never blocks a send still knows
     /// something about its path. Before this type it knew nothing at all, and
     /// FR-79 V5's rule was inert there.
     #[test]
     fn a_session_that_never_pushed_back_still_has_a_belief() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(900_000, now);
         p.observe_delivered(1_200_000, now + Duration::from_secs(1));
         assert_eq!(p.capacity_bps(now + Duration::from_secs(1)), None);
@@ -308,7 +979,7 @@ mod tests {
     #[test]
     fn one_capacity_sample_does_not_collapse_the_belief_onto_itself() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(20_000_000, now);
         let t = now + Duration::from_secs(1);
         p.observe_capacity(6_028_814, t);
@@ -328,7 +999,7 @@ mod tests {
     #[test]
     fn sustained_push_back_converges_the_floor_onto_the_capacity() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(20_000_000, now);
         let mut t = now;
         for _ in 0..8 {
@@ -347,7 +1018,7 @@ mod tests {
     #[test]
     fn a_genuinely_slow_path_believes_its_measurement() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(1_050_000, now);
         p.observe_capacity(1_058_145, now + Duration::from_secs(1));
         assert_eq!(
@@ -361,7 +1032,7 @@ mod tests {
     #[test]
     fn an_idle_stretch_does_not_talk_the_floor_down() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(18_000_000, now);
         for i in 1..8 {
             p.observe_delivered(300_000, now + Duration::from_secs(i));
@@ -379,7 +1050,7 @@ mod tests {
     #[test]
     fn hours_of_a_still_screen_do_not_retire_what_the_path_demonstrated() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(8_409_584, now);
         // Seventeen hours of an idle desktop, one report a second.
         let mut t = now;
@@ -402,7 +1073,7 @@ mod tests {
     #[test]
     fn nothing_but_a_push_back_moves_the_floor_down() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(18_000_000, now);
         let mut t = now;
         // Deliveries below the floor, however many, never lower it.
@@ -428,7 +1099,7 @@ mod tests {
     #[test]
     fn a_capacity_sample_survives_its_own_expiry_by_raising_the_floor() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(4_050_945, now);
         p.observe_capacity(13_163_844, now + Duration::from_secs(1));
         let after_ttl = now + Duration::from_secs(1) + CAPACITY_TTL + Duration::from_secs(1);
@@ -446,7 +1117,7 @@ mod tests {
     #[test]
     fn a_capacity_estimate_expires() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_capacity(1_000_000, now);
         assert_eq!(p.capacity_bps(now + CAPACITY_TTL), Some(1_000_000));
         assert_eq!(
@@ -467,7 +1138,7 @@ mod tests {
     #[test]
     fn a_healthy_idle_session_offers_a_ceiling_anchor_but_no_overdrive_verdict() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         for i in 0..35 {
             p.observe_delivered(1_802_656, now + Duration::from_millis(i * 500));
         }
@@ -492,7 +1163,7 @@ mod tests {
     #[test]
     fn a_delivery_says_whether_it_raised_the_floor() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         assert!(!p.observe_delivered(0, now), "a zero is not a delivery");
         assert!(p.observe_delivered(1_199_442, now), "the first one rises");
         assert!(
@@ -507,8 +1178,8 @@ mod tests {
     /// first frame, and the one FR-79 V5 reads as "no claim to contradict".
     #[test]
     fn an_untouched_pipe_believes_nothing() {
-        assert_eq!(Pipe::default().ceiling_anchor_bps(t0()), None);
-        assert_eq!(Pipe::default().counts(), (0, 0));
+        assert_eq!(Twin::default().ceiling_anchor_bps(t0()), None);
+        assert_eq!(Twin::default().counts(), (0, 0));
     }
 
     /// Zero is not an observation — a window that delivered nothing says
@@ -516,7 +1187,7 @@ mod tests {
     #[test]
     fn a_zero_window_is_not_evidence() {
         let now = t0();
-        let mut p = Pipe::default();
+        let mut p = Twin::default();
         p.observe_delivered(0, now);
         p.observe_capacity(0, now);
         assert_eq!(p.ceiling_anchor_bps(now), None);

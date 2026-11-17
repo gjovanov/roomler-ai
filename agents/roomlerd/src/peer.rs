@@ -4158,7 +4158,7 @@ async fn media_pump_vp9_444_dc(
         DC_BUFFERED_HIGH_BYTES
     };
     if constrained_transport {
-        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay-TCP) transport — clamping bitrate + tightening backpressure");
+        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay) transport — clamping bitrate + tightening backpressure");
     }
     // Relay-escape — re-check the selected pair periodically (see the loop).
     let mut last_transport_check = std::time::Instant::now();
@@ -5464,7 +5464,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
-            delivery.heartbeat(&pc, session_id); // FR-148 P0: a line of its own, every 10 s
+            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, None)); // FR-148 P0
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -6727,10 +6727,9 @@ async fn media_pump_ffmpeg_dc(
         None
     };
     let rate_memory_path = crate::encode::rate_memory::default_path();
-    let rate_seed = match (&rate_peer_key, &rate_memory_path) {
-        (Some(peer), Some(path)) => crate::encode::rate_memory::RateMemory::load(path)
-            .seed_at_open(peer, crate::encode::rate_memory::now_unix()),
-        _ => None,
+    let (rate_seed, seed_age) = match (&rate_peer_key, &rate_memory_path) {
+        (Some(peer), Some(path)) => crate::media_delivery::seed_at_open(path, peer),
+        _ => (None, None),
     };
     if let Some(seed) = rate_seed {
         info!(
@@ -10488,7 +10487,7 @@ async fn media_pump_ffmpeg_dc(
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
-            delivery.heartbeat(&pc, session_id); // FR-148 P0: a line of its own, every 10 s
+            delivery.heartbeat(&pc, session_id, |t| governor.path_view(t, seed_age)); // FR-148 P0
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block

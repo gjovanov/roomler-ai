@@ -31,12 +31,21 @@
 //! the viewer nor the wire changes. `ROOMLERD_PATH_MODEL=off` takes no sample and
 //! writes no line. What a sample cannot tell is in `docs/rate-control.md`
 //! (§ Delivery samples).
+//!
+//! Step 3 writes a second line from the same call, [`MODEL_LINE`]: every path
+//! number the pump's heartbeat carries, each with how it was obtained and how
+//! old it is, and what FR-148 §4.1's model would hold beside them
+//! (`encode::pipe::PathView`). Also in shadow, also off with the switch; see
+//! `docs/rate-control.md` (§ Path numbers and their provenance).
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
+
+use crate::encode::pipe::{PathNumber, PathView};
 
 /// A sample closes at the first heartbeat at least this long after the last.
 pub const SAMPLE_MIN: Duration = Duration::from_millis(1500);
@@ -177,6 +186,10 @@ pub struct DeliverySampler {
     line_since: Option<Instant>,
     /// Whose line a drop writes.
     session: Option<ObjectId>,
+    /// Step 3 — the latest path numbers, not yet written, and when the last
+    /// [`MODEL_LINE`] was (its own [`LINE_EVERY`]).
+    view: Option<PathView>,
+    model_since: Option<Instant>,
 }
 
 impl DeliverySampler {
@@ -193,21 +206,32 @@ impl DeliverySampler {
             fold: Fold::default(),
             line_since: None,
             session: None,
+            view: None,
+            model_since: None,
         }
     }
 
     /// The pump's one call, at its heartbeat: read the association's clock,
-    /// close a sample when one is due, and write the line when it is due. Never
-    /// waits: before the association exists, or while its transport's slot is
-    /// held, the clock it already has answers, or nothing does.
-    pub fn heartbeat(&mut self, pc: &RTCPeerConnection, session_id: ObjectId) {
+    /// close a sample when one is due, and write the line when it is due; and
+    /// take the path numbers from `view` (step 3), writing [`MODEL_LINE`] when
+    /// that is due. Never waits: before the association exists, or while its
+    /// transport's slot is held, the clock it already has answers, or nothing
+    /// does. Off, it calls neither.
+    pub fn heartbeat(
+        &mut self,
+        pc: &RTCPeerConnection,
+        session_id: ObjectId,
+        view: impl FnOnce(Instant) -> PathView,
+    ) {
         if self.on {
-            self.observe(Instant::now(), session_id, || pc.sctp().delivery_clock());
+            let now = Instant::now();
+            self.observe(now, session_id, || pc.sctp().delivery_clock());
+            self.on_view(now, session_id, view);
         }
     }
 
-    /// [`Self::heartbeat`] at `now`, with the clock from `clock`. Off, it calls
-    /// nothing and returns `None`.
+    /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock`. Off,
+    /// it calls nothing and returns `None`.
     pub fn observe(
         &mut self,
         now: Instant,
@@ -266,15 +290,45 @@ impl DeliverySampler {
         self.line_since = Some(now);
         Some(std::mem::take(&mut self.fold).report)
     }
+
+    /// Step 3, [`Self::heartbeat`]'s path numbers at `now`: keep `view`'s as the
+    /// latest, and write them once [`LINE_EVERY`] has passed since the last
+    /// [`MODEL_LINE`] (the first heartbeat starts the count). A session that
+    /// ends between two lines has its last numbers written by the drop. Off, it
+    /// calls nothing.
+    pub fn on_view(
+        &mut self,
+        now: Instant,
+        session_id: ObjectId,
+        view: impl FnOnce(Instant) -> PathView,
+    ) {
+        if !self.on {
+            return;
+        }
+        self.session = Some(session_id);
+        let since = *self.model_since.get_or_insert(now);
+        self.view = Some(view(now));
+        if now.saturating_duration_since(since) >= LINE_EVERY {
+            self.model_since = Some(now);
+            if let Some(view) = self.view.take() {
+                emit_model(session_id, &view);
+            }
+        }
+    }
 }
 
 impl Drop for DeliverySampler {
-    /// A session left before its next line still has its last samples written.
+    /// A session left before its next line still has its last samples written,
+    /// and its last path numbers.
     fn drop(&mut self) {
-        if let Some(session_id) = self.session
-            && !self.fold.is_empty()
-        {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        if !self.fold.is_empty() {
             emit(session_id, &std::mem::take(&mut self.fold).report);
+        }
+        if let Some(view) = self.view.take() {
+            emit_model(session_id, &view);
         }
     }
 }
@@ -294,12 +348,65 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
     );
 }
 
+/// FR-148 P0, step 3 — the path numbers' line, which a field read greps for.
+pub const MODEL_LINE: &str = "path model (FR-148 P0, shadow, ≈10s)";
+
+/// A path number as the line writes it: `<bps>/<how>/<age>ms`, or `None`.
+struct Shown(Option<PathNumber>);
+
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => n.fmt(f),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+/// Step 3's line. Each field is the heartbeat's field of the same name with
+/// its tag; `viewer_rx_bps` and `seed_bps` have none there, and the `model_`
+/// fields are the shadow model's. Their names and order are pinned by a test.
+pub fn emit_model(session_id: ObjectId, v: &PathView) {
+    let (anchor, floor, capacity) = v.belief;
+    let belief = format!("({}, {}, {})", Shown(anchor), Shown(floor), Shown(capacity));
+    tracing::info!(
+        %session_id,
+        goodput_bps = %Shown(v.goodput),
+        pipe_belief = %belief,
+        pipe_measured = %Shown(v.measured),
+        prior_bps = %Shown(v.prior),
+        learned_ceiling_bps = %Shown(v.learned_ceiling),
+        slow_link_floor_bps = %Shown(v.slow_link_floor),
+        viewer_rx_bps = %Shown(v.viewer_rx),
+        seed_bps = %Shown(v.seed),
+        model_floor_bps = %Shown(v.model_floor),
+        model_capacity_bps = %Shown(v.model_capacity),
+        model_stand_in_bps = %Shown(v.model_stand_in),
+        "{MODEL_LINE}"
+    );
+}
+
+/// The pair memory's seed for `peer` as a session opens from it, which is
+/// `RateMemory::seed_at_open`'s, and how old its entry is then: the age the
+/// path model line gives the seed and every number that stands on it.
+pub fn seed_at_open(path: &Path, peer: &str) -> (Option<u32>, Option<Duration>) {
+    let memory = crate::encode::rate_memory::RateMemory::load(path);
+    let now = crate::encode::rate_memory::now_unix();
+    let seed = memory.seed_at_open(peer, now);
+    let at = seed.and(memory.entries.get(peer)).map(|e| e.at_unix);
+    (
+        seed,
+        at.map(|at| Duration::from_secs(now.saturating_sub(at))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::encode::pipe::Basis;
 
     /// A reading: bytes acknowledged so far, and the queue's fills and empties
     /// so far.
@@ -580,6 +687,185 @@ mod tests {
             s.on_reading(t0, r(0, 1, 0));
         });
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    fn n(bps: u32, basis: Basis, ms: u64) -> Option<PathNumber> {
+        Some(PathNumber::new(bps, basis, Duration::from_millis(ms)))
+    }
+
+    /// Step 3: a relayed session sending more than the path takes. Every field
+    /// has a number.
+    fn busy_view() -> PathView {
+        let floor = n(1_399_272, Basis::AppLimited, 41_300);
+        let goodput = n(1_162_000, Basis::Backlogged, 800);
+        PathView {
+            goodput,
+            belief: (floor, floor, goodput),
+            measured: goodput,
+            prior: n(1_162_000, Basis::Assumed, 800),
+            learned_ceiling: n(0, Basis::Assumed, 312_400),
+            slow_link_floor: n(987_700, Basis::Backlogged, 800),
+            viewer_rx: n(1_130_112, Basis::AppLimited, 400),
+            seed: Some(PathNumber::remembered(
+                1_250_000,
+                Duration::from_secs(9_120),
+            )),
+            model_floor: floor,
+            model_capacity: goodput,
+            model_stand_in: floor,
+        }
+    }
+
+    /// Step 3: the same session's screen at rest. Nothing measures the
+    /// capacity; the floor stands, older.
+    fn idle_view() -> PathView {
+        let floor = n(1_399_272, Basis::AppLimited, 101_300);
+        PathView {
+            belief: (floor, floor, None),
+            learned_ceiling: n(0, Basis::Assumed, 372_400),
+            viewer_rx: n(9_120, Basis::AppLimited, 600),
+            seed: Some(PathNumber::remembered(
+                1_250_000,
+                Duration::from_secs(9_180),
+            )),
+            model_floor: floor,
+            ..PathView::default()
+        }
+    }
+
+    #[test]
+    fn the_model_line_names_its_fields() {
+        let out = logged(|| emit_model(sid(), &busy_view()));
+        let mut rest = out.as_str();
+        for want in [
+            " INFO ",
+            MODEL_LINE,
+            "session_id=65a1b2c3d4e5f60718293a4b",
+            "goodput_bps=1162000/backlogged/800ms",
+            "pipe_belief=(1399272/app-limited/41300ms, 1399272/app-limited/41300ms, \
+             1162000/backlogged/800ms)",
+            "pipe_measured=1162000/backlogged/800ms",
+            "prior_bps=1162000/assumed/800ms",
+            "learned_ceiling_bps=0/assumed/312400ms",
+            "slow_link_floor_bps=987700/backlogged/800ms",
+            "viewer_rx_bps=1130112/app-limited/400ms",
+            "seed_bps=1250000/remembered/9120000ms",
+            "model_floor_bps=1399272/app-limited/41300ms",
+            "model_capacity_bps=1162000/backlogged/800ms",
+            "model_stand_in_bps=1399272/app-limited/41300ms",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(
+            !out.contains("None"),
+            "a busy line has every number: {out:?}"
+        );
+        let idle = logged(|| emit_model(sid(), &idle_view()));
+        for want in [
+            "goodput_bps=None",
+            "pipe_belief=(1399272/app-limited/101300ms, 1399272/app-limited/101300ms, None)",
+            "pipe_measured=None",
+            "prior_bps=None",
+            "viewer_rx_bps=9120/app-limited/600ms",
+            "model_capacity_bps=None",
+            "model_stand_in_bps=None",
+        ] {
+            assert!(idle.contains(want), "{want:?} is not in {idle:?}");
+        }
+        // Its cost: at most one line a pump every LINE_EVERY.
+        let per_hour = 3_600 / LINE_EVERY.as_secs();
+        for (what, l) in [("busy", &out), ("idle", &idle)] {
+            println!(
+                "path model line, {what}: {} bytes; {per_hour} lines and {} bytes a session hour\n{l}",
+                l.len(),
+                l.len() as u64 * per_hour
+            );
+            assert!(l.len() < 800, "{} bytes: {l:?}", l.len());
+        }
+    }
+
+    #[test]
+    fn the_model_line_comes_every_ten_seconds_and_a_drop_writes_the_last() {
+        let t0 = Instant::now();
+        let views = Cell::new(0u32);
+        let view = |ms: u32| {
+            let views = &views;
+            move |_: Instant| {
+                views.set(views.get() + 1);
+                PathView {
+                    viewer_rx: n(ms, Basis::AppLimited, 0),
+                    ..PathView::default()
+                }
+            }
+        };
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(true);
+            for ms in (0..=14_000u32).step_by(2_000) {
+                s.on_view(at(t0, u64::from(ms)), sid(), view(ms));
+            }
+        });
+        assert_eq!(views.get(), 8, "one view a heartbeat");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out:?}");
+        assert!(
+            lines[0].contains("viewer_rx_bps=10000/"),
+            "the line at 10 s: {out:?}"
+        );
+        assert!(
+            lines[1].contains("viewer_rx_bps=14000/"),
+            "the drop's: {out:?}"
+        );
+        // A drop right after a line writes nothing more.
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(true);
+            s.on_view(t0, sid(), view(0));
+            s.on_view(at(t0, 10_000), sid(), view(10_000));
+        });
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn off_takes_no_path_numbers_and_writes_no_model_line() {
+        let t0 = Instant::now();
+        let asked = Cell::new(false);
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(false);
+            for i in 0..30u64 {
+                s.on_view(at(t0, i * 2_000), sid(), |_| {
+                    asked.set(true);
+                    busy_view()
+                });
+            }
+            // Its drop writes nothing either.
+        });
+        assert!(!asked.get(), "off asked the governor for its numbers");
+        assert!(out.is_empty(), "off wrote {out:?}");
+    }
+
+    /// The seed is `RateMemory::seed_at_open`'s, and its age is its entry's:
+    /// none for a pair the memory does not seed.
+    #[test]
+    fn the_seed_at_open_comes_with_its_entrys_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate-memory.json");
+        let mut memory = crate::encode::rate_memory::RateMemory::default();
+        let written = crate::encode::rate_memory::now_unix() - 3 * 3_600;
+        memory.record_session("198.51.100.7|relay:turn/udp", Some(564_865), written);
+        memory.save(&path).unwrap();
+        let (seed, age) = seed_at_open(&path, "198.51.100.7|relay:turn/udp");
+        assert_eq!(seed, Some(564_865));
+        let age = age.expect("an age").as_secs();
+        assert!((3 * 3_600..3 * 3_600 + 60).contains(&age), "{age} s");
+        assert_eq!(seed_at_open(&path, "198.51.100.8|direct"), (None, None));
+        let missing = dir.path().join("none.json");
+        assert_eq!(
+            seed_at_open(&missing, "198.51.100.7|relay:turn/udp"),
+            (None, None)
+        );
     }
 }
 
