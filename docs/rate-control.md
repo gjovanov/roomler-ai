@@ -520,7 +520,8 @@ cannot prove that switch (FR-35 AC6). ⚠️ **On `h264_vaapi` the ceiling does 
 
 FR-35 P2 remembers a pair's rate so the next session opens at 85 % of it
 instead of at the fleet constant. FR-79 changed **what** is remembered and
-**under which key**:
+**under which key**. FR-148 P1 changed **which entry is read**: only a measured
+one (the provenance row below):
 
 ```mermaid
 flowchart LR
@@ -533,22 +534,26 @@ flowchart LR
         O["opener measured by the<br/>goodput estimator<br/>(a burst that QUEUED)"]
         N["nothing measured:<br/>a stand-in does not count"]
     end
-    B -- "first choice" --> D{"entry exists<br/>and fresh (7 d)?"}
+    B -- "first choice" --> D{"a measured entry,<br/>fresh (7 d)?"}
     L -- "second choice" --> D
     O -- "third choice" --> D
     N --> Z["write NOTHING —<br/>not the value, not the timestamp"]
-    D -- no --> AD["adopt the measurement outright"]
+    D -- "no: none, stale<br/>or assumed" --> AD["adopt the measurement outright"]
     D -- yes --> DM["damp(old, measured):<br/>half the gap down,<br/>a tenth of the gap up"]
-    AD & DM --> F["rate_memory.json<br/>(temp + rename)"]
+    AD & DM --> F["rate_memory.json<br/>(temp + rename)<br/>provenance: measured;<br/>assumed entries dropped"]
+    F --> S{"the next open:<br/>a measured entry,<br/>fresh (7 d)?"}
+    S -- yes --> SEED["seeded from the entry;<br/>slow-link profile at or under 1 Mbit/s"]
+    S -- "no: none, stale<br/>or assumed" --> NEVER["opens as a pair never seen"]
 ```
 
 | piece | rule | anchor |
 |---|---|---|
-| the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:2076` |
+| the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:2094` |
+| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `peer.rs:6729` |
 | the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9544` (`opener_measured_bps`) |
 | the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `peer.rs:9466`; `governor.rs:724` |
-| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:2133` |
-| the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days never seeds and is pruned on the next write | `rate_memory.rs:185`, `:22` |
+| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence, or the first after an assumed entry ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:230`, `:79`; `peer.rs:2151` |
+| the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days, or an assumed one, never seeds and is pruned on the next write | `rate_memory.rs:269`, `:22` |
 | the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:2160` |
 
 Field reads of the write-back so far (key `100.65.4.2\|relay:derp/tcp` unless noted):
@@ -1521,6 +1526,7 @@ switch.
 | 0.4.100 | FR-79 V3b-3 — a capacity sample is also a delivery, so it raises the floor and survives its own expiry. | A 13.16 M capacity expired after one TTL and the anchor fell to a 4.05 M content floor while the target ran to the 34.56 M constant. |
 | 0.4.188 | FR-63 B1 — the ONE delay-based controller (`encode::ratectl`) runs in SHADOW beside the governor, emitting six `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). It drives nothing; a containment test holds the line. (Merged after 0.4.187 was cut: 0.4.188, published 2026-10-30, is the first release that carries it.) | Eight estimators of one quantity glued with "the lower of" rules. Shadow-first per the rate-control plan: a release of `shadow_*` logs against the flip criterion (AC2) decides B2's flip, so the controller is never the fleet's own first trial. |
 | *next* | FR-79 V5b — only a measurement is evidence about the rate, five rules behind `measured_evidence`: a stall needs a live reading, a delivery takes out a reading it beats by 2×, a hold must be carried, the write-back records a reading or nothing, and a growing queue counts only while the sender offered more than arrived. New heartbeat fields `pipe_measured`, `readings_refuted`, `link_unoffered`. | 2026-11-02, jupiter: an idle session's 9,489 bps became the pipe, 6.2 M → 200 kbps, was walked to 3,322 and written, and each later session wrote its own stand-in back with a fresh TTL: 3,322 → 2,989 → 2,690 with no rise. 2026-10-30, CORPLAP-2: stalls cut 13 of 16 times with a stand-in and 0 of 26 with nothing. |
+| *next* | FR-148 P1, step 2 — an entry written before this release is read as assumed. `Entry.provenance` is `measured` on every write. An entry without it seeds nothing, so there is no slow-link profile and no opening below the floor. The first measurement replaces it outright, and the next write drops it. No switch: an older agent reads the file, and its writes read back as assumed ([§ the pair memory](#the-write-back-and-the-seed-v2--v4--the-pair-memory)). | 2026-11-16, CORPLAP-2: the operator's pair was remembered at 281,732 bit/s, grown from a placeholder written before V5b, and opened at 1280×800 and 15 fps. Its sessions could only creep the entry, and none could refute it. V5b stops new placeholders, and this lifts the ones already on disk (FR-148 §2.1). |
 
 ## The measured-rate closed loop
 
