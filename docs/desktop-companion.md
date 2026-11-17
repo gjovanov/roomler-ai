@@ -2031,7 +2031,7 @@ sequenceDiagram
     P->>W: Approve
     W->>W: buttons off, "Approving…" on the status line
     W->>A: cmd_consent_approve(the question shown, or none, and how long it has been shown)
-    alt its question came to the front under 1 s ago (#3987, §10.9.1)
+    alt its question came to the front under 1 s ago (§10.9.1)
         A->>A: log WARN "consent: a click arrived too soon …"
         A-->>W: "Nothing was sent: …", and nothing goes to the daemon
     else in front for 1 s or more
