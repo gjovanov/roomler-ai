@@ -3,8 +3,8 @@
 # the ledger row it adds and when that row retires:
 #   pump_lines_ffmpeg_dc=3950 # r0:FOO-1: retires with R8's delete
 # Set at FR-135 R0b, on the instruments it added to both data-channel pumps.
-agent_env_reads=178 # enc:I286: retires with FR-148 P5, which deletes the AIMD
+agent_env_reads=179 # p0:PATH-1: retires with FR-148 P5, when the switch is deleted
 viewer_knobs=33 # r0:CLOCK-1: retires after a week of field reads with the calibration on
 pump_lines_rtp=1312
-pump_lines_vp9_dc=1470 # fr148:HB-1: folds into R8's one loop
-pump_lines_ffmpeg_dc=3952 # r0:FPS-1: folds into R8's one loop
+pump_lines_vp9_dc=1472 # p0:PATH-2: retires with FR-148 P1
+pump_lines_ffmpeg_dc=3954 # p0:PATH-3: retires with FR-148 P1

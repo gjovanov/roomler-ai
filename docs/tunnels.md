@@ -352,8 +352,8 @@ Three links had to break, one in each place that owned it:
 | Where | Change | Anchor |
 |---|---|---|
 | `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write. They take turns on a `send_lock` of their own, which `close()` and `buffered_amount()` never take: the slot lock was the only thing ordering a channel's writes, and two at once shared a stream sequence number or split a message | `crates/vendored/webrtc/src/data_channel/mod.rs:378`, `:89` |
-| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:551`, `:291`, `queue/pending_queue.rs:193` |
-| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:264`, `queue/pending_queue.rs:186` |
+| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way. A write holds its stream's `write_turn` from its shutdown check until its chunks are queued, and the reset waits for that turn too, so it never goes ahead of a write the check let through | `crates/vendored/webrtc-sctp/src/stream/mod.rs:551`, `:291`, `queue/pending_queue.rs:219` |
+| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:264`, `queue/pending_queue.rs:212` |
 
 #1856's comment expected a transport that is really gone to fail the association's `recv`.
 Nothing below SCTP ever fails it on a dead path, because the ICE agent's conn ends only when
@@ -486,7 +486,7 @@ sequenceDiagram
 ```
 
 The agent drops send futures on purpose. On the control channel, `send_control_notice`
-(`agents/roomlerd/src/peer.rs:6256`) bounds each attempt with a timeout and retries, and the
+(`agents/roomlerd/src/peer.rs:6258`) bounds each attempt with a timeout and retries, and the
 idle warning (`agents/roomlerd/src/session_idle.rs:465`) and the session's `rc:ended`
 (`agents/roomlerd/src/session_table.rs:362`) each have a 2 s budget. Other sends race the
 session's end in a `select!` or die with an aborted pump. A tunnel flow's cancel cuts its
@@ -502,9 +502,9 @@ the fix is there and no caller changed:
 | Where | Change | Anchor |
 |---|---|---|
 | `stream/mod.rs` | `packetize` only reads the SSN. `commit_write` spends it and adds the write's bytes to `buffered_amount`; the queue calls it once the first chunk has room. A write refused because the association is not established commits nothing either | `crates/vendored/webrtc-sctp/src/stream/mod.rs:362`, `:384`, `:523` |
-| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:260`, `:283` |
-| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:546`, `:554`, `:487` |
-| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:295` |
+| `queue/pending_queue.rs` | `append` takes the queue's lock and the room, then commits and pushes, with no await between the two. The commit runs before the push, so an acknowledgement can never release bytes not yet counted | `crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:286`, `:309` |
+| `queue/pending_queue.rs` | a message of two thirds of the queue (87,381 bytes) or more is queued chunk by chunk. Once its first chunk is queued, it is begun: dropped before its last chunk, `BegunMessage` queues the rest at once, in place, under the lock it still holds, so the peer reads it whole and once. The rest's bytes are owed first (`overdraft`), then the free room pays what it can, and `pop` pays the remainder before it gives room again | `queue/pending_queue.rs:576`, `:584`, `:517` |
+| `queue/pending_queue.rs` | an append that must wait for room wakes the write loop first (`take_room`). The loop woke only after a whole append, so a message larger than the free room, on an association with nothing in flight, waited forever with its first chunks queued and never sent. That was a separate bug, which the same tests found | `queue/pending_queue.rs:321` |
 
 **What a cut write means now** (`write_sctp`'s doc comment, `stream/mod.rs:276`):
 
@@ -519,7 +519,7 @@ the fix is there and no caller changed:
 maximum message size of 65,536 bytes: the vendored `webrtc` passes 0
 (`crates/vendored/webrtc/src/sctp_transport/mod.rs:162`), which means the default
 (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:105`,
-`association/mod.rs:61`), and `prepare_write` refuses a larger write before it waits
+`association/mod.rs:63`), and `prepare_write` refuses a larger write before it waits
 (`stream/mod.rs:317`). So every agent and tunnel send is below the large threshold and is all
 or nothing: a cut send was never sent. `send_control_notice`'s retry therefore sends its notice
 once, and a tunnel write (at most 65,535 bytes, `crates/tunnel-core/src/forward.rs:68`) is the
@@ -586,7 +586,7 @@ writer busy. The rule was written before the counted runs, and it and every run 
 | 0.4.222, three runs | 6.4 s | 661,403 to 666,457 B | 4.6 to 4.9 s after the lock, 0.5 to 0.9 s after the cut's end | every later lock and unlock shows within 2 s, on one stream from start to end |
 
 **What a person saw on 0.4.221 was a reconnect, not a chip that stays wrong.** The lock
-notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10827`) was lost, and nothing the agent
+notice (`rc:host_locked`, `agents/roomlerd/src/peer.rs:10831`) was lost, and nothing the agent
 sent on the control channel after it was read. On this guest a locked session sends no video.
 The viewer's media watchdog spares only an agent that said it cannot capture or that it waits
 (`ui/src/composables/useRemoteControl.ts:5819`), and no such word could arrive. So it asked
@@ -598,9 +598,9 @@ never shows it:
 
 | Condition | Why | Anchor |
 |---|---|---|
-| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4328`, `:5273`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2353` |
-| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11456`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
-| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1510`, `:6256`, `agents/roomlerd/src/lock_state.rs:333` |
+| the video writer is waiting for room in the pending queue | with a wide congestion window the DC pump stops at its own 1 MiB mark first and the queue is empty: a notice then only waits its turn, which was the first cut of every run. A retransmission timeout collapses the window, so the next stall meets a waiting writer | `agents/roomlerd/src/peer.rs:4329`, `:5274`, `crates/vendored/webrtc-sctp/src/association/association_internal.rs:2364` |
+| the stall is in both directions | the viewer's clock probe arrives twice a second. The agent's echo is a send with no timeout: it waits in the full queue and holds the channel's send turn, so the timed notice behind it is cut before it takes a sequence number. With the incoming packets cut too, no probe arrives and nothing covers the notice | `ui/src/composables/useRemoteControl.ts:7251`, `:2206`, `agents/roomlerd/src/peer.rs:11460`, `crates/vendored/webrtc/src/data_channel/mod.rs:403` |
+| the stall outlasts the notice's first attempt | the lock state is polled every 2 s and an attempt has a budget of 2 s, so an attempt can start up to 2 s after the lock and is cut 2 s later | `agents/roomlerd/src/peer.rs:1510`, `:6258`, `agents/roomlerd/src/lock_state.rs:333` |
 
 A real path failure cuts both directions. The second row is read from the source: two runs on
 0.4.221 with only the agent's outgoing packets cut, and a waiting writer, delivered every

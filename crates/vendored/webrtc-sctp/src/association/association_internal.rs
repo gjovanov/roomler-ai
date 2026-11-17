@@ -330,6 +330,12 @@ impl AssociationInternal {
         let _ = self.awake_write_loop_ch.try_send(());
     }
 
+    /// roomler (FR-148): the acknowledgement clock, which `Association` keeps
+    /// to read without this struct's lock.
+    pub(crate) fn delivery_clock(&self) -> super::delivery::DeliveryClock {
+        self.pending_queue.delivery_clock()
+    }
+
     /// unregister_stream un-registers a stream from the association
     /// The caller should hold the association write lock.
     fn unregister_stream(&mut self, stream_identifier: u16) {
@@ -1425,6 +1431,11 @@ impl AssociationInternal {
         for n_bytes_acked in bytes_acked_per_stream.values() {
             total_bytes_acked += *n_bytes_acked;
         }
+        // roomler (FR-148): the acknowledgement clock, for a reader beside the
+        // association (`Association::delivery_clock`).
+        self.pending_queue
+            .delivery()
+            .on_acked(u64::try_from(total_bytes_acked).unwrap_or(0));
 
         let mut cum_tsn_ack_point_advanced = false;
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
