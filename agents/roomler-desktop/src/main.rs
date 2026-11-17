@@ -315,7 +315,8 @@ fn reopen<R: Runtime>(app: &AppHandle<R>, has_visible_windows: bool) {
 /// Tauri's async runtime; a 750 ms poll over the local pipe is cheap. The SPA
 /// does the actual render/approve/deny via `cmd_get_pending_consents` + the
 /// approve/deny commands; this loop's only job is "bring the window forward when
-/// something new needs a decision."
+/// something new needs a decision." #3998 — and to change nothing on a poll
+/// that failed ([`SessionWatch`]).
 async fn consent_watch_loop(app: tauri::AppHandle) {
     let mut watch = SessionWatch::default();
     loop {
@@ -352,11 +353,16 @@ type WatchReply = std::io::Result<(
     std::io::Result<Vec<roomler_localapi::RcSessionInfo>>,
 )>;
 
-/// #3998 — how long one poll may take, the connect and both lists.
+/// #3998 — how long one poll may take, the connect and both lists: above
+/// every bound the device service keeps on its answers to them (a Mac's
+/// relay to its root half, 1 s) and above the pipe's busy ladder (315 ms). A
+/// poll that takes longer is a failed one. Until #3998 nothing bounded it, so
+/// a read that never ended stopped the watch with whatever it showed.
 const WATCH_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// #3998 — how long reads that all fail keep the prompt's questions.
-#[cfg_attr(not(test), allow(dead_code))]
+/// #3998 — how long reads that all fail keep the prompt's questions on the
+/// screen. A question the service cannot decide does not linger: past this,
+/// the failure counts as an answer of none. The banner has no such bound.
 const QUESTIONS_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One poll's read, on one connection.
@@ -367,18 +373,26 @@ async fn read_service() -> WatchReply {
     Ok((pending, live))
 }
 
-/// #3998 — `read`, given `within`.
+/// #3998 — `read`, or a failed poll once `within` has passed.
 async fn read_within(
-    _within: std::time::Duration,
+    within: std::time::Duration,
     read: impl std::future::Future<Output = WatchReply>,
 ) -> WatchReply {
-    read.await
+    tokio::time::timeout(within, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer from the device service within {within:?}"),
+            ))
+        })
 }
 
 /// FR-85 — what the tray's red takes from a poll ([`tray::sessions_answered`]):
 /// the sessions an answer listed, none when no service is there at all
 /// (nothing records without it; a busy pipe is not that), and `None` when
-/// the poll failed.
+/// the poll failed. #3998 — the same answer the banner takes, and the same
+/// proof of no service ([`commands::connect_service`]).
 fn tray_answer(reply: &WatchReply) -> Option<&[roomler_localapi::RcSessionInfo]> {
     match reply {
         Ok((_, live)) => live.as_deref().ok(),
@@ -409,15 +423,35 @@ struct ScreenChange {
     banner: Option<bool>,
 }
 
-/// #3998 — what the watch shows, kept between polls.
+/// #3998 — what the watch shows, kept between polls: the device service's
+/// last answer, list by list.
+///
+/// - A list the service answered is what the screen shows: the prompt for its
+///   questions, the banner for its sessions.
+/// - A read that failed (a busy pipe, a broken reply, a poll past
+///   [`WATCH_READ_WITHIN`]) changes nothing. The prompt keeps its questions
+///   and its place, for [`QUESTIONS_KEPT_FOR`] of failures at most: a
+///   question the service cannot decide does not linger. The banner keeps
+///   what it shows for as long as no answer comes, and so does the tray's
+///   red: a privacy indicator never comes down on a timer.
+/// - Proven no service is an answer, at once: a service that is not there
+///   asks nothing and holds no session ([`commands::connect_service`]).
+///
+/// Until #3998 every failure read as an empty answer: one failed read took
+/// the person's question and the session banner down, and the next good one
+/// put the question up again, placed and armed again (#3987).
 #[derive(Default)]
 struct SessionWatch {
     /// The questions the prompt shows.
     questions: std::collections::HashSet<String>,
+    /// Since when every read of the questions has failed.
+    questions_failing_since: Option<std::time::Instant>,
     /// The live sessions the banner is for.
     sessions: Vec<roomler_localapi::RcSessionInfo>,
     /// Whether the banner is up.
     banner_up: bool,
+    /// Whether the last poll failed: a run of failures is logged once.
+    failing: bool,
 }
 
 impl SessionWatch {
@@ -425,21 +459,62 @@ impl SessionWatch {
     fn poll(
         &mut self,
         reply: WatchReply,
-        _now: std::time::Instant,
+        now: std::time::Instant,
         banner_enabled: bool,
     ) -> ScreenChange {
-        // Daemon down / pipe absent ⇒ nothing pending, nothing live.
-        let (pending, live) = match reply {
-            Ok((pending, live)) => (
-                on_the_prompt(pending.unwrap_or_default()),
-                live.unwrap_or_default(),
-            ),
-            Err(_) => Default::default(),
+        let (questions, sessions, failure) = match reply {
+            Ok((pending, live)) => {
+                let failure = match (&pending, &live) {
+                    (Err(e), _) => Some(format!("consent_pending: {e}")),
+                    (_, Err(e)) => Some(format!("rc_sessions: {e}")),
+                    _ => None,
+                };
+                (pending.ok().map(on_the_prompt), live.ok(), failure)
+            }
+            Err(e) if tray::no_service(&e) => (Some(Default::default()), Some(Vec::new()), None),
+            Err(e) => (None, None, Some(format!("connect: {e}"))),
         };
-        let seen = std::mem::replace(&mut self.questions, pending);
+        let seen = self.questions.clone();
+        match questions {
+            Some(questions) => {
+                self.questions = questions;
+                self.questions_failing_since = None;
+            }
+            None => {
+                let since = *self.questions_failing_since.get_or_insert(now);
+                if !self.questions.is_empty()
+                    && now.saturating_duration_since(since) >= QUESTIONS_KEPT_FOR
+                {
+                    tracing::warn!(
+                        after = ?QUESTIONS_KEPT_FOR,
+                        "session watch: the device service has not answered for its questions; \
+                         the prompt comes down, and the banner stays until it answers"
+                    );
+                    self.questions.clear();
+                }
+            }
+        }
+        if let Some(sessions) = sessions {
+            self.sessions = sessions;
+        }
+        match failure {
+            Some(reason) if !self.failing => {
+                self.failing = true;
+                if !self.questions.is_empty() || self.banner_up {
+                    tracing::info!(
+                        %reason,
+                        questions = self.questions.len(),
+                        banner = self.banner_up,
+                        "session watch: a read of the device service failed; the screen keeps \
+                         what its last answer said"
+                    );
+                }
+            }
+            Some(_) => {}
+            None => self.failing = false,
+        }
         let show_prompt = self.questions.difference(&seen).next().is_some();
         let hide_prompt = !show_prompt && self.questions.is_empty();
-        self.sessions = live;
         let want = wants_banner(&self.sessions) && banner_enabled;
         let banner = (want != self.banner_up).then_some(want);
         self.banner_up = want;

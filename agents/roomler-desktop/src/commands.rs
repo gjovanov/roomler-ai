@@ -2685,6 +2685,11 @@ where
             "the device service has no such question waiting (answered, withdrawn or expired)"
                 .to_string(),
         ),
+        // #3998 — no service at all, said plainly.
+        Ok(Err(AskError::Connect(e))) if crate::tray::no_service(&e) => (
+            "Could not reach the device service: it is not running.".to_string(),
+            describe_io("connect", &e),
+        ),
         Ok(Err(AskError::Connect(e))) => (
             format!("Could not reach the device service: {e}"),
             describe_io("connect", &e),
@@ -2770,6 +2775,10 @@ pub fn cmd_consent_modal_needed() -> bool {
 
 /// FR-27 — remote-control sessions currently LIVE on this device, for the
 /// "Being viewed by …" banner.
+///
+/// #3998 — a read that fails is an `Err`, not an empty list
+/// ([`sessions_answer`]): the banner keeps its words on it, and the session
+/// watch in `main.rs` decides whether the banner stays up.
 #[tauri::command]
 pub async fn cmd_rc_sessions() -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
     let read = match connect_service().await {
@@ -2779,15 +2788,19 @@ pub async fn cmd_rc_sessions() -> Result<Vec<roomler_localapi::RcSessionInfo>, S
     sessions_answer(read)
 }
 
-/// #3998 — what the banner page gets for its read of the sessions.
+/// #3998 — what the banner page gets for its read of the sessions: the list,
+/// or, for a read that failed, why. Until #3998 a failed read was an empty
+/// list, and the banner said "Being viewed" with no name and offered a
+/// Disconnect that ended nothing.
 fn sessions_answer(
     read: Result<Vec<roomler_localapi::RcSessionInfo>, (&'static str, std::io::Error)>,
 ) -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
-    Ok(read.unwrap_or_default())
+    read.map_err(|(stage, e)| describe_io(stage, &e))
 }
 
 /// #3998 — [`localapi::connect`] for the consent prompt, the session banner
-/// and the tray's red.
+/// and the tray's red: a connect that failed while this person's own
+/// endpoint is gone comes back as no service ([`proven`]).
 pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     match localapi::connect().await {
         Ok(client) => Ok(client),
@@ -2795,9 +2808,22 @@ pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     }
 }
 
-/// #3998 — a failed connect's error, as `connect` gave it.
-pub(crate) fn proven(e: std::io::Error, _own_endpoint_gone: bool) -> std::io::Error {
-    e
+/// #3998 — a failed connect's error, or, when this person's own endpoint is
+/// gone (`own_endpoint_gone`), `NotFound`: no device service is there for
+/// them, which the tray reads as an answer ([`crate::tray::no_service`]).
+/// On a Linux system install and on a Mac, `connect`'s error is its last
+/// endpoint's, the system socket in a folder only root may enter, so a
+/// stopped daemon read there as `PermissionDenied` (os error 13), the words
+/// a click's status line showed in the 0.4.224 Linux lab.
+pub(crate) fn proven(e: std::io::Error, own_endpoint_gone: bool) -> std::io::Error {
+    if own_endpoint_gone && !crate::tray::no_service(&e) {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the device service is not running: this account's own LocalAPI endpoint is gone",
+        )
+    } else {
+        e
+    }
 }
 
 /// FR-27 — the banner's Disconnect. Ends a live session from the DEVICE side;

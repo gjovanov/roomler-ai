@@ -222,7 +222,7 @@ const DAEMON_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis
 pub fn daemon_has_something_to_show() -> bool {
     let ask = async {
         let mut client = roomler_localapi::connect().await.ok()?;
-        // Read as the watch reads them: a list that fails is an empty one.
+        // A list that fails is an empty one here: it holds no tour back.
         let pending = client.consent_pending().await.unwrap_or_default();
         let live = client.rc_sessions().await.unwrap_or_default();
         Some((pending, live))
