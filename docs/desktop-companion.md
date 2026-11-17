@@ -1089,7 +1089,7 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:13025`), asked as the channel opens (`files_channel_here`, `:13034`, from the `"files"` arm, `:1331`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3944`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4883`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:13025`), asked as the channel opens (`files_channel_here`, `:13034`, from the `"files"` arm, `:1331`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3944`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4818`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
 | The channel | `attach_files` (`agents/roomlerd/src/peer.rs:13060`), `attach_files_declined` (`:13083`), `declined_reply` (`:13114`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
 | The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12993`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
@@ -1300,13 +1300,13 @@ sequenceDiagram
     S->>S: the account (1.5 s), the helper, its first line (5 s)
     S-->>T: up, or why not
     T->>T: the marker says Notification, the surface line is logged
-    T->>T: the prompt's window starts
+    Note over T: the prompt's window has run since the request, beside all of this
 ```
 
 | Piece | Where | What |
 |---|---|---|
-| the start | `notification_for_rc`, [`signaling.rs:7623`](../agents/roomlerd/src/signaling.rs#L7623); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:287`](../agents/roomlerd/src/indicator/mod.rs#L287) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
-| the consent task | `rc_surfaces_up`, [`signaling.rs:7570`](../agents/roomlerd/src/signaling.rs#L7570); `notification_shown`, [`:7638`](../agents/roomlerd/src/signaling.rs#L7638) | waits for the show's verdict before it first looks at the prompt, so the window still starts after the show. Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
+| the start | `notification_for_rc`, [`signaling.rs:7560`](../agents/roomlerd/src/signaling.rs#L7560); `ViewerIndicator::start_notification_prompt`, [`indicator/mod.rs:287`](../agents/roomlerd/src/indicator/mod.rs#L287) | only where the tray cannot show the question, in FR-27's order. It STARTS the show and returns: the show runs on the blocking pool as it always did, and nothing waits for it there. The loop started it until #3888; the consent task starts it now, once the tray's verdict is in (§10.5) |
+| the consent task | `rc_surfaces_up`, [`signaling.rs:7507`](../agents/roomlerd/src/signaling.rs#L7507); `notification_shown`, [`:7575`](../agents/roomlerd/src/signaling.rs#L7575) | waits for the show's verdict. Since #4000 it does so on a task of its own beside the prompt's window, which runs from the request (#3888 had the window start after the show, see §10.5). Then it writes the marker's `Notification` and logs `consent prompt surface` (`native`, `companion` since #3888, `notified`, `have_surface`), as the loop did |
 | the session walk | `graphical_session_within`, [`companion.rs:8372`](../agents/roomlerd/src/companion.rs#L8372); `SESSION_WALKS`, [`:8400`](../agents/roomlerd/src/companion.rs#L8400) | one walk in flight per kind of ask (the uid asked for, and whether only a person's session will do), on a thread named `session-walk`. Each caller waits `SESSION_WALK_WAIT`, 1.5 s ([`:8356`](../agents/roomlerd/src/companion.rs#L8356)), the seat and account lookups' wait. No answer in time is "not known" with its reason (`walked_in_time`, [`:8413`](../agents/roomlerd/src/companion.rs#L8413)), never "nobody at the screen" |
 | a question that ends on the way | `Prompts::coming`, [`indicator/notify.rs:358`](../agents/roomlerd/src/indicator/notify.rs#L358); `launch`, [`:505`](../agents/roomlerd/src/indicator/notify.rs#L505) | the question is on the books as coming before its show starts. `hide_prompt` (a `Terminate`, an answer from another surface, the closed socket the consent task watches) takes it off, and the show then starts no helper, or drops the one it started, whose helper closes the notification and exits. Its verdict is `its question ended while the notification was being put up`, once |
 
@@ -1322,11 +1322,13 @@ naming the uid for the recorder. logind's own answer keeps its words and its kin
 (`NoSession`).
 
 - **The bounds on the consent path**, with logind stopped: the tray's start gives up at 2.5 s
-  (§10.2) and the walk at 1.5 s, so the consent task hears "not up" about 4 s after the request.
-  The window starts then, and the agent's `no_prompt_surface` reaches the controller about a
-  second ahead of the hub's own timer. With logind answering and the session bus wedged, the
-  helper's own 5 s (`SHOW_BUDGET`) still applies: the verdict comes then, as before, and the
-  helper is let go, its stdin closed, and killed 1 s later if it is still there (#3886, below).
+  (§10.2) and the walk at 1.5 s, so the surfaces' verdict is "not up" about 4 s after the request.
+  With logind answering and the session bus wedged, the helper's own 5 s (`SHOW_BUDGET`) still
+  applies: the verdict comes then, and the helper is let go, its stdin closed, and killed 1 s
+  later if it is still there (#3886, below). Since #4000 the window does not wait for either: it
+  runs from the request, and the agent's verdict leaves when it ends. Until then the window
+  started after this verdict (#3888), and a wedged bus pushed the agent's `no_prompt_surface` past
+  the hub's own timer (`CONSENT_VERDICT_GRACE`), which answered a bare timeout first.
 - **A late prompt: nothing comes up late.** A walk out of time starts no helper (its late
   answer reaches no one, and the next ask waits for it or walks afresh); a helper that has not
   posted within 5 s is let go and then killed, and takes down a notification it did post
@@ -1613,18 +1615,25 @@ sequenceDiagram
     T->>N: where the tray cannot show it: start the notification
     N-->>T: up, or why not
     T->>T: have_surface, and the surface line is logged
-    T->>T: the prompt's window starts
+    Note over T: the prompt's window has run since the request, beside all of this
 ```
+
+Since #4000 the consent task's surfaces run on a task of their own, beside the prompt's window,
+which runs from the request; until then the task waited for them before its first look at the
+prompt started the window (#3888). The task reads their verdict when the question ends, without
+waiting, and an answer given while they go up decides at once (`docs/remote-control.md`, "The
+window runs from the request").
 
 | Piece | Where | What |
 |---|---|---|
-| the loop's side | `start_for_prompt`, [`companion.rs:1308`](../agents/roomlerd/src/companion.rs#L1308); the hand-off, [`signaling.rs:4550`](../agents/roomlerd/src/signaling.rs#L4550) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1326`](../agents/roomlerd/src/companion.rs#L1326)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7544`](../agents/roomlerd/src/signaling.rs#L7544)) |
-| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7570`](../agents/roomlerd/src/signaling.rs#L7570), called at [`:4632`](../agents/roomlerd/src/signaling.rs#L4632) | waits for the start's verdict, then for the notification where the tray cannot show the question, before its first look at the prompt starts the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
+| the loop's side | `start_for_prompt`, [`companion.rs:1308`](../agents/roomlerd/src/companion.rs#L1308); the hand-off, [`signaling.rs:4550`](../agents/roomlerd/src/signaling.rs#L4550) | starts `ensure_running` on a task of its own, 3 s at most, and returns its handle (`Starting`, [`companion.rs:1326`](../agents/roomlerd/src/companion.rs#L1326)) at once. The loop hands it to the consent task with the question, in `RcSurfaces` ([`signaling.rs:7480`](../agents/roomlerd/src/signaling.rs#L7480)) |
+| the consent task's side | `rc_surfaces_up`, [`signaling.rs:7507`](../agents/roomlerd/src/signaling.rs#L7507), called at [`:7612`](../agents/roomlerd/src/signaling.rs#L7612) on the task `rc_consent_task` spawns ([`:7649`](../agents/roomlerd/src/signaling.rs#L7649)) | waits for the start's verdict, then for the notification where the tray cannot show the question. Since #4000 that is beside the prompt's window, and `rc_shown_by_now` ([`:7750`](../agents/roomlerd/src/signaling.rs#L7750)) reads it when the question ends; #3888 had it before the first look at the prompt started the window. `have_surface` is the native panel, or the marker with the tray up, or a notification that came up, so a start that failed or ran out of time is still `no_prompt_surface`, never a timeout |
 | a question that ends while the start runs | `ConsentBroker::is_asking`, [`consent.rs:853`](../agents/roomlerd/src/consent.rs#L853) | a `Terminate` the loop reads meanwhile takes the question off the broker's books and finds no notification to take down. The consent task starts none for a question off the books, or whose socket closed, and takes down one started just as it was withdrawn |
 
 - **The bound is as before:** the start's 2.5 s and the 3 s budget, on the start's own task and
   the `tray-start` thread, never on an async worker. The question is still armed on the loop before
-  anything shows it (#1632, #3442), and the window still starts after the surfaces are up.
+  anything shows it (#1632, #3442). The window started after the surfaces were up until #4000,
+  and runs from the request since.
 - **The log:** `consent prompt surface` carries `companion` (`Some(true)`, `Some(false)`, or
   `None` when a native panel was up and no start was asked for) beside `native`, `notified` and
   `have_surface`.
@@ -1702,7 +1711,7 @@ flowchart TD
   package update stopped (`companion/package_sync.rs`).
 - **Every caller of the start is a question or a banner:** the remote-control prompt
   (`start_for_prompt`, `companion.rs:1308`, from `signaling.rs:4550`), the exec prompt
-  (`exec_surfaces_up`, `signaling.rs:7675`), a recording's and an SSH session's question (`Companion::up`,
+  (`exec_surfaces_up`, `signaling.rs:7721`), a recording's and an SSH session's question (`Companion::up`,
   `companion.rs:1370`), and Linux's being-viewed banner (`indicator/notify.rs:727`). The other
   callers are `tray_start_tests`' own.
 - **Tested:** the companion's `first_run::tests` (`startup_table`, the forwarded launches, the
@@ -1842,7 +1851,11 @@ sequenceDiagram
   | Linux, Windows, a Mac's per-user daemon | the start's alone, as before: the road is `Direct` there and answers at once |
 
   An exec question waits for neither: its surfaces go up beside its window, and `ensure_running`
-  gives it the start and then the road, with no budget, as before.
+  gives it the start and then the road, with no budget, as before. Since #4000 a remote-control
+  prompt does not wait for them either: its window runs from the request and its surfaces go up
+  beside it, so this table holds for an SSH session's and a recording's question only. The
+  remote-control prompt's wait was the start, the road and, on Linux, the notification: up to 11 s,
+  past the hub's 5 s (`docs/remote-control.md`, "The window runs from the request").
 - **One viewer, with the native panel up.** The app now receives that question too, marked
   `native`, and filters it out (`consent_watch_loop`,
   [`main.rs:338`](../agents/roomler-desktop/src/main.rs#L338); the prompt window,

@@ -4421,10 +4421,10 @@ async fn handle_server_msg(
             // loop reads finds the prompt whether or not the task has been
             // polled yet. (A spawned task has no ordering guarantee against
             // the loop that spawned it.) Armed after the show, an answer given
-            // while the surfaces went up was refused. The window still runs
-            // from the show: the prompt starts its clock at its first look, in
-            // the task. Owner-side consent asks nobody here, and auto-grant
-            // arms nothing: its answer is ready at once.
+            // while the surfaces went up was refused. The prompt starts its
+            // clock at its first look, in the task, which looks at once since
+            // #4000: the window runs from the request. Owner-side consent asks
+            // nobody here, and auto-grant arms nothing: its answer is ready at once.
             let prompt = (!owner_side_consent)
                 .then(|| consent_broker.request_with_mode(&session_hex, effective_mode));
             // #3857, #3888 — what the consent task below finishes for a
@@ -4540,13 +4540,13 @@ async fn handle_server_msg(
                     // means we could not confirm a surface, which is the same
                     // answer as not having one.
                     //
-                    // #3888 — STARTED here, and its verdict waited for by the
-                    // consent task below, before the prompt's window starts,
-                    // as the notification's is (#3857). The start asks other
-                    // processes (logind, the process list, launchd), and this
-                    // loop reads its next frame meanwhile. FR-93 P6f's
-                    // notification, where the companion cannot show the
-                    // question, goes up from there once the verdict is in.
+                    // #3888 — STARTED here; the consent task's surfaces read its
+                    // verdict, then put up FR-93 P6f's notification where the
+                    // companion cannot show the question (#3857), beside the
+                    // prompt's window, which since #4000 waits for neither. The
+                    // start asks logind, the process list or launchd; we read on.
+                    // #4000 — the window's end: a marker rewritten later keeps it.
+                    let ends = view.expires_at;
                     behind = Some((crate::companion::start_for_prompt().await, view));
                     // The marker says so once a notification is up.
                     mark_up = marker.then(|| {
@@ -4564,10 +4564,10 @@ async fn handle_server_msg(
                                 permissions,
                                 detail,
                                 org,
-                                timeout: host_window,
+                                timeout: ends.saturating_duration_since(std::time::Instant::now()),
                                 surface: crate::consent::PromptSurface::Notification,
                             };
-                            if let Err(e) = broker.write_prompt(&hex, &shown) {
+                            if let Err(e) = broker.write_prompt_while_asking(&hex, &shown) {
                                 tracing::warn!(session = %hex, %e, "could not mark the consent prompt as shown by a notification");
                             }
                         }) as Box<dyn FnOnce() + Send>
@@ -7474,8 +7474,9 @@ fn end_in_gap(
 }
 
 /// #3857, #3888 — what the WS loop hands an RC prompt's consent task: what
-/// shows the question, and what is still on its way. The consent task waits
-/// for the rest ([`rc_surfaces_up`]) before the prompt's window starts.
+/// shows the question, and what is still on its way. The rest goes up
+/// ([`rc_surfaces_up`]) beside the prompt's window, which since #4000 does not
+/// wait for it.
 pub(crate) struct RcSurfaces {
     /// The daemon's own panel is up.
     pub(crate) native: bool,
@@ -7489,13 +7490,14 @@ pub(crate) struct RcSurfaces {
     pub(crate) mark_up: Option<Box<dyn FnOnce() + Send>>,
 }
 
-/// #3888 — the consent task's wait for what the loop started for an RC
-/// prompt ([`RcSurfaces`]), before the prompt's window starts: the
-/// companion's verdict, then FR-93 P6f's notification where the companion
-/// cannot show the question ([`notification_for_rc`], [`notification_shown`]).
-/// Whether a person can be asked: [`consent_reply`]'s `have_surface`, so a
-/// start that failed or ran out of its budget is still `no_prompt_surface`,
-/// never a timeout. Logs the prompt's surfaces.
+/// #3888 — what the loop started for an RC prompt ([`RcSurfaces`]), going
+/// up: the companion's verdict, then FR-93 P6f's notification where the
+/// companion cannot show the question ([`notification_for_rc`],
+/// [`notification_shown`]). Whether a person can be asked: [`consent_reply`]'s
+/// `have_surface`, so a start that failed or ran out of its budget is still
+/// `no_prompt_surface`, never a timeout. Logs the prompt's surfaces. Since
+/// #4000 it runs on a task of its own beside the prompt's window, and the
+/// consent task reads its verdict when the question ends (`rc_shown_by_now`).
 ///
 /// `still_asked` is whether the question is still on the consent broker's
 /// books. A `Terminate` the loop read while the start ran withdrew it, and
@@ -7620,6 +7622,18 @@ async fn rc_surfaces_verdict(
 /// An RC prompt's consent task, which the WS loop spawns: the person's
 /// decision, whether a surface showed the question (`surfaces_up`,
 /// [`rc_surfaces_verdict`]), and the `rc:consent` that says so.
+///
+/// #4000 — the prompt's window runs from the request, and the surfaces go up
+/// beside it on a task of their own: the companion's start the loop started,
+/// then #3857's notification where the companion cannot show the question.
+/// Until #4000 this task waited for them before its first look at the prompt
+/// started the window (#3888), up to 11 s on a Linux root daemon. Every
+/// surface already counted down from the request (`PromptView::expires_at`,
+/// the marker's `expires_at_ms`), so those seconds were shown to nobody, and
+/// the verdict left after the hub's own timer (`CONSENT_VERDICT_GRACE` past
+/// the window it announced), which then answered a bare timeout. An answer
+/// given while the surfaces go up now decides at once, and the WS loop still
+/// waits for none of it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn rc_consent_task(
     prompt: impl std::future::Future<Output = crate::consent::Decision>,
@@ -7631,15 +7645,14 @@ pub(crate) async fn rc_consent_task(
     external_cfg: Option<crate::remote_config::RemoteConfigServices>,
     effective_mode: crate::consent::Mode,
 ) {
-    // #3857, #3888 — the companion's start the loop started, and the
-    // notification where the companion cannot show the question: their
-    // verdicts, here, before the prompt's clock starts at its first look
-    // below, as when the loop waited for them. A socket that closes first
-    // drops the notification (`notification_shown`), and a `Terminate` takes
-    // it down from the loop, or here once the start's verdict is in
-    // (`rc_surfaces_up`).
-    let have_surface = surfaces_up.await;
+    let (shown_tx, shown) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = shown_tx.send(surfaces_up.await);
+    });
     let decision = await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
+    // What the surfaces came to when the question ended: read before anything
+    // here takes them down, and never waited for.
+    let have_surface = rc_shown_by_now(shown, &session_hex, decision);
     // FR-27 — take the native panel down however the question was answered:
     // the click here, the CLI, the companion, the window simply expiring, or
     // the session ending first. This is the ONE place every one of those
@@ -7726,6 +7739,30 @@ pub(crate) async fn exec_surfaces_up(
 /// command's words.
 pub(crate) fn shown_by_now(mut verdict: tokio::sync::oneshot::Receiver<bool>) -> bool {
     verdict.try_recv().unwrap_or(true)
+}
+
+/// #4000 — [`shown_by_now`] for an RC question, read when it ends: what its
+/// surfaces came to, never waited for. Not known yet (still going up, or a
+/// task that ended with no verdict) counts as shown, so the question reads as
+/// the person's `timeout` and not `no_prompt_surface`. That takes surfaces
+/// slower than the window, which a 30 s or 300 s window and a chain of 11 s at
+/// most never are, and is logged so the field can see it.
+fn rc_shown_by_now(
+    mut verdict: tokio::sync::oneshot::Receiver<bool>,
+    session_hex: &str,
+    decision: crate::consent::Decision,
+) -> bool {
+    match verdict.try_recv() {
+        Ok(shown) => shown,
+        Err(_) => {
+            info!(
+                session = %session_hex,
+                ?decision,
+                "consent prompt surface not known when the question ended: the surfaces were still going up, counted as shown (#4000)"
+            );
+            true
+        }
+    }
 }
 
 /// #3982 — what an exec command's caller reads when the person at the
