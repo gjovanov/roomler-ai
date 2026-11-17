@@ -2578,7 +2578,7 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    surface only while that road is open: a worker that said `relay-consent`,
    and a person socket that answers within 1 s. A closed road leaves this
    chain's floor, `no_prompt_surface` at the window's end
-   (`docs/desktop-companion.md` §10.7).
+   (`docs/desktop-companion.md` §10.8).
 3. **notification** (Linux, FR-93 P6f) — the desktop's own notification with
    **Approve** and **Deny**, where the companion cannot show the question: none
    is installed, or there is no marker for it to read. Posted from inside the
