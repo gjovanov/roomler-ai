@@ -66,9 +66,9 @@
 //!   its final path checked; what it makes sealed from creation; what it
 //!   writes made fresh and renamed into place by handle; a removal deleting
 //!   what the same walk opened. #3737's readers ([`PrivateFolder`]) walk the
-//!   same way. The crash records and the install clean-up act through it
-//!   (FR-145 P1); the service logs and the other SYSTEM writers follow in P2
-//!   and P3.
+//!   same way. The crash records, the install clean-up (FR-145 P1) and the
+//!   daemon's key files in `peer-auth` (#3956: as R leaves them) use it;
+//!   the service logs and the other SYSTEM writers follow in P2 and P3.
 //!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`
@@ -2727,6 +2727,28 @@ pub mod test_support {
         let mut got = aces(sddl);
         got.sort();
         protected(sddl) && got == want
+    }
+
+    /// #3956 — `path`, read through a handle as [`super::repair`] reads it,
+    /// has what the repair leaves on a key file, or on the keys folder
+    /// (`folder`): an owner it never takes over (SYSTEM or Administrators) and
+    /// exactly the seal, not inheriting ([`super::is_sealed`], the repair's
+    /// own predicate).
+    pub fn as_the_repair_leaves(path: &Path, folder: bool) -> bool {
+        let (kind, flags) = if folder {
+            (
+                super::win::Kind::Dir,
+                super::OBJECT_INHERIT | super::CONTAINER_INHERIT,
+            )
+        } else {
+            (super::win::Kind::File, 0)
+        };
+        let entry = super::win::open(path, kind, false, false)
+            .unwrap_or_else(|why| panic!("{why}"))
+            .unwrap_or_else(|| panic!("{} is not there", path.display()));
+        let sd = super::win::read_sd(&entry.file)
+            .unwrap_or_else(|e| panic!("{}: reading its security: {e}", path.display()));
+        super::trusted(&sd.owner) && super::is_sealed(&sd, flags)
     }
 }
 

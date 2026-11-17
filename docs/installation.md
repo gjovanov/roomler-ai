@@ -839,7 +839,11 @@ Details worth knowing:
   names the entry and the reason once. `keep-system-context` reads a record
   that fails as no record, so SystemContext off. The writers create each file
   they write and give it its owner and permissions before it takes its name,
-  never writing into a file of that name that was there. Each change the
+  never writing into a file of that name that was there. The daemon's own key
+  files in `peer-auth\` (a new enrollment's device key, a browser key the
+  device has not seen before), and a `peer-auth\` it makes for them, are
+  created sealed, the owner and permissions in the call that creates them
+  (#3956), so the repair finds nothing to change on them. Each change the
   repair makes is a `machine tree: repaired` WARN line, which the default
   filter keeps; on an upgrade the first repair is made by one of the
   per-Machine MSI's own steps, which log into

@@ -19,6 +19,7 @@
 //! | [`HeldPath::base`] | the base opened as itself (a reparse point refused); its final path must be the base's long name, or [`Why::Elsewhere`] |
 //! | [`HeldPath::open_dir`], [`HeldPath::walk`] | each name opened below the handle above it (`NtCreateFile` with `RootDirectory`, `FILE_OPEN_REPARSE_POINT`), a link refused, the final path checked; `Ok(None)` when a name is not there. Makes nothing |
 //! | [`HeldPath::sealed_dir`], [`HeldPath::walk_sealed`] | as `walk`, and a folder that is not there is made with the seal's descriptor in its `OBJECT_ATTRIBUTES`; the last name gets the leaf policy |
+//! | [`HeldPath::open_or_make_dir`] | one name, opened as it is (a link refused) or made with the seal's descriptor when it is not there; no leaf policy, for a folder another's repair keeps (#3956: the machine config's `peer-auth`) |
 //! | [`HeldPath::machine`] | `base(machine_program_data())`, then down the names of a machine-tree folder; the machine folder and its parent are only opened (made sealed when absent) |
 //! | [`HeldPath::write_file`] | a fresh temp file (`FILE_CREATE`), written and flushed, renamed onto the name relative to the held folder; on failure the temp is deleted by handle |
 //! | [`HeldPath::append_file`] | for logs: a file there must be a plain file of one link owned by SYSTEM or Administrators, else it is deleted by handle and made again |
@@ -439,6 +440,19 @@ impl HeldPath {
     pub fn sealed_dir(&self, name: &str, seal: Seal) -> Result<Self, Refusal> {
         let held = self
             .step(name, Step::Leaf(seal))?
+            .ok_or_else(|| absent(self, name))?;
+        Ok(held.ready())
+    }
+
+    /// The folder `name` below this one, opened as it is when it is there (a
+    /// link refused, its final path checked), and made with `seal`'s
+    /// descriptor in its `OBJECT_ATTRIBUTES` when it is not. No leaf policy:
+    /// a folder whose repair is another's is never re-sealed or moved here,
+    /// as [`HeldPath::machine`] keeps the machine folder and its parent
+    /// (#3956: the machine config's `peer-auth`, FR-94's to repair).
+    pub fn open_or_make_dir(&self, name: &str, seal: Seal) -> Result<Self, Refusal> {
+        let held = self
+            .step(name, Step::Make(seal))?
             .ok_or_else(|| absent(self, name))?;
         Ok(held.ready())
     }

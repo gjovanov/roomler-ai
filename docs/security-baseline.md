@@ -592,7 +592,10 @@ would receive the token); an elevated Setup or `roomlerd enroll --machine-global
 writes a fresh one that keeps no `.prev` and no unknown key of the old. A wrong
 answer only ever stops a device: a deny is never credited, and a domain account
 that is an administrator only through a domain group reads as no administrator,
-because an answer that needed a domain controller would flap SYSTEM mode.
+because an answer that needed a domain controller would flap SYSTEM mode. What
+the daemon writes there itself, its device keys and browser keys in `peer-auth\`,
+comes out as the repair leaves it (#3956, the sites table below), so a repair
+changes something only where an entry drifted, and its log line says so.
 
 The SYSTEM service's FR-94 anchor is no file: it is read only from `HKLM\SOFTWARE\Roomler\ExecService`, a key that SYSTEM or Administrators own and no other account may change, read or create, below a parent no other account may change, neither of them a registry link (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)). A writer makes a key that fails that check again rather than sealing it where it stands, so a handle opened while it was loose reaches nothing.
 
@@ -610,7 +613,7 @@ removal deletes, by handle, what the same walk opened.
 Why: a check made by path and an act made by path are two lookups of the same name, and
 the name can change in between; a walk by handle looks each name up once, and every act
 goes through the handle that was checked. One helper carries the rule,
-`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:341`), so a new
+`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:342`), so a new
 SYSTEM writer gets it by calling the helper rather than by re-deriving it
 ([FR-145](fr/FR-145-machine-tree-by-handle.md)). `OBJ_DONT_REPARSE` goes on every
 relative open as a second lock where the build honours it, and nothing relies on it
@@ -672,11 +675,13 @@ The sites on it since P1:
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:1042`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:349` |
 | #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1449` |
+| The machine config's key files the daemon writes: a device key (`peer-auth\<tenant>.json`) and the browser keys (`<tenant>.controllers.json`), #3956 | `HeldPath::base(<machine folder>)`, then `open_or_make_dir("peer-auth", Seal::Private)`: opened as it is, or made sealed, with no leaf policy, since the keys folder is FR-94's to repair; then `write_file(.., Seal::Private)`, so each file comes out as that repair leaves it. A link at `peer-auth` leaves the key unwritten, and the hello offers none | `agents/roomlerd/src/peer_auth.rs:1193`, `crates/agent-core/src/machine_tree/held.rs:453` |
 
 P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
 machine folder, with a test that fails on a new path-based one; until then those sites
 write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
-sends the crash recorder back to its writes by path, with one WARN naming the switch
+sends the crash recorder and the machine config's key files back to their writes by
+path, each with one WARN naming the switch
 (`crates/agent-core/src/machine_tree.rs:377`). The clean-up's removals have no switch: a
 removal that follows a link has no safe old way to return to.
 
