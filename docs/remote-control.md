@@ -2578,7 +2578,14 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    surface only while that road is open: a worker that said `relay-consent`,
    and a person socket that answers within 1 s. A closed road leaves this
    chain's floor, `no_prompt_surface` at the window's end
-   (`docs/desktop-companion.md` §10.8).
+   (`docs/desktop-companion.md` §10.8). On a two-row Mac the root half asks
+   its own row's exec and SSH questions (and, supervised, its remote-control
+   ones), and the tray reaches the per-user half's socket. Since #3967 the
+   per-user half lists and decides them the same way, and tells the root
+   half so over the person socket (`consent_relaying`, held on that
+   connection). The root counts the tray only while that announcement is
+   live and the person socket answers within 1 s; otherwise the same floor
+   (`docs/desktop-companion.md` §10.8.1).
 3. **notification** (Linux, FR-93 P6f) — the desktop's own notification with
    **Approve** and **Deny**, where the companion cannot show the question: none
    is installed, or there is no marker for it to read. Posted from inside the
@@ -2687,7 +2694,7 @@ profile sees it (`consent_cmd`, [`app.rs:2507`](../agents/roomlerd/src/app.rs#L2
 With the file channel off, no other folder stands in for the daemon's own. Until
 issue #3939 a folder below the system's temporary folder did, or that folder
 itself. The LocalAPI still lists every question and decides it
-([`consent_pending`](../agents/roomlerd/src/localapi_state.rs#L1095) reads the
+([`consent_pending`](../agents/roomlerd/src/localapi_state.rs#L1143) reads the
 broker's books, `:1097`), so the tray, `roomlerd consent --list` and
 `--approve` / `--deny` and a native panel all work, and a question nobody answers
 ends at its window, as before. A question then takes one answer: the first
@@ -2849,7 +2856,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3467`](../crates/localapi/src/lib.rs#L3467), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3548`](../crates/localapi/src/lib.rs#L3548), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -6599,7 +6606,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   feature includes `parking_lot`. It is task-fair: once a writer waits,
   a new `read()` parks, even on a thread that already holds a read guard.
 - `DaemonState::status()`
-  (`agents/roomlerd/src/localapi_state.rs:775`) built `NodeStatus` as
+  (`agents/roomlerd/src/localapi_state.rs:823`) built `NodeStatus` as
   one struct literal, and ten of its fields each called
   `self.overlay.borrow()`. A temporary lives until the literal is
   finished, so every field's guard was still held when the next field
