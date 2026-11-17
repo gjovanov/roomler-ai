@@ -3208,6 +3208,118 @@ mod tray_start_tests {
         }
     }
 
+    /// #3983 — a slow start that works, followed by a slow road that
+    /// answers, is the question's surface. On a Mac's root daemon a
+    /// question's verdict waits for the tray's start, within its 3 s budget
+    /// ([`crate::signaling::COMPANION_START_BUDGET`]), and then for the road
+    /// to the tray, within its own 1 s ([`crate::consent_relay::RELAY_WITHIN`]),
+    /// outside that budget. A start of about 2.1 s and a road of about 0.95 s,
+    /// each within its own wait: on one row an RC question's window ends as
+    /// the person's timeout, and on two rows an SSH session's or a
+    /// recording's companion is up. The control: after the same start, a
+    /// road that never answers is no surface, and its verdict comes within
+    /// the budget and the road's wait.
+    ///
+    /// Red before #3983: the start's budget held the road too, ran out at
+    /// 3 s, and the question read as having no surface.
+    #[test]
+    fn a_slow_start_and_then_a_slow_road_is_still_the_surface() {
+        use crate::consent::Decision;
+        use crate::consent_relay::Worker;
+        use crate::consent_relay::stand_in::{Answers, Road};
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        // Together past the 3 s budget, each within its own wait. The start
+        // is a thread's, so it keeps 0.4 s of its 2.5 s (`TRAY_START_WAIT`)
+        // for a busy runner. The road is the runtime's own timer, which a
+        // `timeout` polls after its future, so it may come close to its 1 s.
+        const SLOW_START: Duration = Duration::from_millis(2100);
+        const SLOW_ROAD: Duration = Duration::from_millis(950);
+        let rt = runtime();
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        // A host whose start takes SLOW_START: its held step opens that long
+        // after a start reaches it.
+        let slow_host = || {
+            let held = Held::default();
+            let host = Host {
+                held: Some(held.clone()),
+                ..Host::default()
+            };
+            let opens = held.clone();
+            std::thread::spawn(move || {
+                let asked = Instant::now();
+                while opens.began() == 0 && asked.elapsed() < RUNS_WITHIN {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(SLOW_START);
+                opens.open();
+            });
+            (host, OpenedAtTheEnd(held))
+        };
+        let on_one_row = |answers: Answers| {
+            let (host, _opened) = slow_host();
+            let road = Road {
+                worker: Worker {
+                    relays: true,
+                    uid: Some(501),
+                },
+                answers,
+            };
+            let stood = StandIn::new(host_steps(&host)).on_one_row(road);
+            let ind = ind.clone();
+            let asked = Instant::now();
+            let reason = rt.block_on(asking(stood, async move {
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("m3"))),
+                    mark_up: None,
+                };
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "m3", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }));
+            (reason, asked.elapsed())
+        };
+        let (reason, waited) = on_one_row(Answers::After(SLOW_ROAD));
+        assert_eq!(
+            reason,
+            Some(ConsentDenyReason::HostTimeout),
+            "a slow start and a slow road, each in time: the tray shows the question, and \
+             nobody answered (the verdict came in {waited:?})"
+        );
+        let (reason, waited) = on_one_row(Answers::Never);
+        assert_eq!(
+            reason,
+            Some(ConsentDenyReason::NoPromptSurface),
+            "a road that never answers: nobody could be asked"
+        );
+        assert!(
+            waited
+                < crate::signaling::COMPANION_START_BUDGET
+                    + crate::consent_relay::RELAY_WITHIN
+                    + SLACK,
+            "the verdict came in {waited:?}: past the start's budget and the road's wait"
+        );
+        // An SSH session's and a recording's question ask the same, through
+        // `Companion::System`.
+        #[cfg(any(feature = "recording", feature = "ssh-server"))]
+        {
+            use crate::consent_relay::stand_in::Announced;
+            let (host, _opened) = slow_host();
+            let stood = StandIn::new(host_steps(&host)).on_two_rows(Announced {
+                uid: Some(501),
+                answers: Answers::After(SLOW_ROAD),
+            });
+            assert!(
+                rt.block_on(asking(stood, Companion::System.up())),
+                "two rows, a slow start and a slow road: the companion is up"
+            );
+        }
+    }
+
     /// #3888 — a question withdrawn while the tray's start is held (a
     /// `Terminate` the loop reads meanwhile, which finds nothing on the screen
     /// to take down) gets no notification once the start runs out of time: no
