@@ -313,6 +313,61 @@ impl ModelGuard {
             .as_ref()
             .map_or_else(|_| "none".to_string(), PairKey::id)
     }
+
+    /// The open line: the pair's entry, and what the model would open at
+    /// beside what today's rule opened at.
+    fn open_line(&self, o: &OpenFacts, now_unix: u64) {
+        let opening = pm::model_opening(
+            o.nominal,
+            o.hi_bps,
+            self.entry.as_ref(),
+            o.threshold,
+            now_unix,
+        );
+        let floor = self.entry.map(|e| e.floor);
+        let record = self.entry.and_then(|e| e.push_back);
+        info!(
+            session_id = %self.session_id,
+            codec_label = o.codec_label,
+            mode = %o.mode.word(),
+            key_id = %self.key_id(),
+            key_carrier = %self.key.as_ref().map_or("-", PairKey::carrier),
+            key_net = %self.key.as_ref().map_or("-", |k| k.net().word()),
+            no_key = %self.key.as_ref().err().map_or("-", |w| w.word()),
+            entry = %self.state.word(),
+            floor_bps = ?floor.map(|f| f.bps),
+            floor_basis = %floor.map_or("-", |f| f.basis.word()),
+            floor_age_s = ?floor.map(|f| now_unix.saturating_sub(f.at_unix)),
+            push_back_bps = ?record.map(|r| r.bps),
+            push_back_age_s = ?record.map(|r| now_unix.saturating_sub(r.at_unix)),
+            push_back_windows = ?record.map(|r| r.windows),
+            push_back_span_s = ?record.map(|r| r.span_s()),
+            model_trusted = opening.trusted,
+            nominal_bps = o.nominal,
+            model_open_bps = opening.bps,
+            model_profile = opening.profile,
+            today_seed_bps = ?o.today_seed,
+            today_open_bps = o.today_open,
+            today_profile = o.today_profile,
+            taken = %"today",
+            "{OPEN_LINE}"
+        );
+    }
+}
+
+/// What the open line reads beside the entry.
+struct OpenFacts {
+    codec_label: &'static str,
+    mode: Mode,
+    /// N, the nominal constrained opening at the session's dial.
+    nominal: u32,
+    hi_bps: u32,
+    /// The slow-link threshold as today's rule reads it; 0 = never.
+    threshold: u32,
+    today_seed: Option<u32>,
+    /// What today's rule opened the session at.
+    today_open: u32,
+    today_profile: bool,
 }
 
 impl Drop for ModelGuard {
@@ -339,15 +394,15 @@ impl Drop for ModelGuard {
         info!(
             session_id = %self.session_id,
             key_id = %self.key_id(),
-            key_carrier = self.key.as_ref().map_or("-", PairKey::carrier),
-            key_net = self.key.as_ref().map_or("-", |k| k.net().word()),
-            wrote = pm::wrote(self.entry.as_ref(), next.as_ref()),
-            why = why.word(),
+            key_carrier = %self.key.as_ref().map_or("-", PairKey::carrier),
+            key_net = %self.key.as_ref().map_or("-", |k| k.net().word()),
+            wrote = %pm::wrote(self.entry.as_ref(), next.as_ref()),
+            why = %why.word(),
             floor_bps = ?floor.map(|f| f.bps),
-            floor_basis = floor.map_or("-", |f| f.basis.word()),
+            floor_basis = %floor.map_or("-", |f| f.basis.word()),
             floor_age_s = ?floor.map(|f| now_unix.saturating_sub(f.at_unix)),
             best_bps = ?c.and_then(|c| c.best).map(|b| b.0),
-            best_basis = c.and_then(|c| c.best).map_or("-", |b| b.1.word()),
+            best_basis = %c.and_then(|c| c.best).map_or("-", |b| b.1.word()),
             push_back_bps = ?record.map(|r| r.bps),
             push_back_windows = ?record.map(|r| r.windows),
             push_back_span_s = ?record.map(|r| r.span_s()),
@@ -553,43 +608,21 @@ impl PumpMemory {
         } else {
             0
         };
-        let opening = pm::model_opening(
-            nominal,
-            self.hi_bps,
-            model.entry.as_ref(),
-            threshold,
-            now_unix,
-        );
         let today_open = governor
             .open_seed_bps()
             .unwrap_or_else(|| governor.ceiling_for(nominal, true));
-        let floor = model.entry.map(|e| e.floor);
-        let record = model.entry.and_then(|e| e.push_back);
-        info!(
-            session_id = %self.session_id,
-            codec_label = self.codec_label,
-            mode = self.mode.word(),
-            key_id = %model.key_id(),
-            key_carrier = model.key.as_ref().map_or("-", PairKey::carrier),
-            key_net = model.key.as_ref().map_or("-", |k| k.net().word()),
-            no_key = model.key.as_ref().err().map_or("-", |w| w.word()),
-            entry = model.state.word(),
-            floor_bps = ?floor.map(|f| f.bps),
-            floor_basis = floor.map_or("-", |f| f.basis.word()),
-            floor_age_s = ?floor.map(|f| now_unix.saturating_sub(f.at_unix)),
-            push_back_bps = ?record.map(|r| r.bps),
-            push_back_age_s = ?record.map(|r| now_unix.saturating_sub(r.at_unix)),
-            push_back_windows = ?record.map(|r| r.windows),
-            push_back_span_s = ?record.map(|r| r.span_s()),
-            model_trusted = opening.trusted,
-            nominal_bps = nominal,
-            model_open_bps = opening.bps,
-            model_profile = opening.profile,
-            today_seed_bps = ?self.seed,
-            today_open_bps = today_open,
-            today_profile,
-            taken = "today",
-            "{OPEN_LINE}"
+        model.open_line(
+            &OpenFacts {
+                codec_label: self.codec_label,
+                mode: self.mode,
+                nominal,
+                hi_bps: self.hi_bps,
+                threshold,
+                today_seed: self.seed,
+                today_open,
+                today_profile,
+            },
+            now_unix,
         );
     }
 
@@ -728,5 +761,254 @@ mod tests {
         // Nothing taken: nothing measured.
         let idle = ModelGuard::new(ObjectId::new(), turn_key());
         assert_eq!(idle.verdict(), (None, pm::Why::NothingMeasured));
+    }
+
+    /// What `f` logs, as the daemon's log file writes it (time, level,
+    /// message, fields; no target), as `media_delivery`'s cells read theirs.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is taken
+        // once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// A pump's memories with no file on either side: today's guard writes
+    /// nothing, the model's writes only its line.
+    fn pump(model: ModelGuard, seed: Option<u32>) -> PumpMemory {
+        PumpMemory {
+            session_id: model.session_id,
+            codec_label: "AV1",
+            mode: Mode::Shadow,
+            hi_bps: 8_000_000,
+            seed,
+            seed_age: None,
+            today: RateMemoryGuard {
+                path: None,
+                peer: None,
+                stable: AtomicU32::new(0),
+                opener_measured: AtomicU32::new(0),
+            },
+            model: Some(model),
+        }
+    }
+
+    /// The pump's open, with a governor built as the pump builds it.
+    fn open_line(p: &mut PumpMemory, now: Instant) -> String {
+        let mut governor = RateGovernor::new(
+            30,
+            12,
+            crate::encode::governor::GovernorFlags::from_env(),
+            p.hi_bps,
+            p.seed,
+            now,
+        );
+        logged(|| p.at_open(&mut governor, 0, false))
+    }
+
+    fn assert_in_order(line: &str, fields: &[&str]) {
+        let mut rest = line;
+        for f in fields {
+            let at = rest
+                .find(&format!(" {f}="))
+                .unwrap_or_else(|| panic!("{f} is not in order in {line:?}"));
+            rest = &rest[at + f.len() + 2..];
+        }
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+    }
+
+    const OPEN_FIELDS: [&str; 23] = [
+        "session_id",
+        "codec_label",
+        "mode",
+        "key_id",
+        "key_carrier",
+        "key_net",
+        "no_key",
+        "entry",
+        "floor_bps",
+        "floor_basis",
+        "floor_age_s",
+        "push_back_bps",
+        "push_back_age_s",
+        "push_back_windows",
+        "push_back_span_s",
+        "model_trusted",
+        "nominal_bps",
+        "model_open_bps",
+        "model_profile",
+        "today_seed_bps",
+        "today_open_bps",
+        "today_profile",
+        "taken",
+    ];
+
+    const CLOSE_FIELDS: [&str; 17] = [
+        "session_id",
+        "key_id",
+        "key_carrier",
+        "key_net",
+        "wrote",
+        "why",
+        "floor_bps",
+        "floor_basis",
+        "floor_age_s",
+        "best_bps",
+        "best_basis",
+        "push_back_bps",
+        "push_back_windows",
+        "push_back_span_s",
+        "samples_not_counted",
+        "record_ended",
+        "frozen",
+    ];
+
+    /// Both lines name their fields in this order, carry no address and no
+    /// user, and read as below on the three sessions a field read meets first
+    /// (printed with `--nocapture`): a pair's first session, a session that
+    /// measured nothing, and a session that counted three push-backs, with the
+    /// next session's open.
+    #[test]
+    fn the_two_lines_name_their_fields() {
+        use crate::encode::pipe::Basis;
+        let _env = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let now_unix = rate_memory::now_unix();
+        let sid = ObjectId::parse_str("65a1b2c3d4e5f60718293a5c").unwrap();
+        // `ModelGuard` writes at its drop, so no struct update.
+        let guard = |state: EntryState, entry: Option<PairEntry>| {
+            let mut g = ModelGuard::new(sid, turn_key());
+            g.state = state;
+            g.entry = entry;
+            g
+        };
+        let mut lines = Vec::new();
+
+        // 1. The pair's first session: no entry; it delivers 2.4 M.
+        let mut p = pump(guard(EntryState::None, None), None);
+        let open = open_line(&mut p, t0);
+        let mut mem = pm::SessionMemory::default();
+        mem.open(None, now_unix, t0);
+        mem.delivered(1_900_000, Basis::AppLimited, at(5));
+        mem.delivered(2_400_000, Basis::AppLimited, at(20));
+        p.model
+            .as_mut()
+            .unwrap()
+            .take(mem.closing(at(60), now_unix), true);
+        let close = logged(|| drop(p));
+        assert!(open.contains(" entry=none ") && open.contains(" model_trusted=false "));
+        assert!(
+            close.contains(" wrote=floor why=first_measurement "),
+            "{close}"
+        );
+        assert!(close.contains(" floor_bps=Some(2400000) floor_basis=app_limited "));
+        lines.push(("a pair's first session", open, close));
+
+        // 2. A session that measured nothing, on a 3-day-old floor.
+        let entry = PairEntry {
+            floor: pm::Floor {
+                bps: 2_200_000,
+                basis: pm::FloorBasis::AppLimited,
+                at_unix: now_unix - 3 * 86_400,
+            },
+            push_back: None,
+        };
+        let mut p = pump(guard(EntryState::Fresh, Some(entry)), Some(2_200_000));
+        let open = open_line(&mut p, t0);
+        let mut mem = pm::SessionMemory::default();
+        mem.open(Some(&entry), now_unix, t0);
+        p.model
+            .as_mut()
+            .unwrap()
+            .take(mem.closing(at(40), now_unix), true);
+        let close = logged(|| drop(p));
+        assert!(open.contains(" entry=fresh ") && open.contains(" floor_bps=Some(2200000) "));
+        assert!(
+            close.contains(" wrote=nothing why=nothing_measured "),
+            "{close}"
+        );
+        lines.push(("a session that measured nothing", open, close));
+
+        // 3. Three backlogged push-backs over 13 s under a 1.4 M floor ...
+        let entry = PairEntry {
+            floor: pm::Floor {
+                bps: 1_400_000,
+                basis: pm::FloorBasis::AppLimited,
+                at_unix: now_unix - 86_400,
+            },
+            push_back: None,
+        };
+        let mut p = pump(guard(EntryState::Fresh, Some(entry)), None);
+        let open = open_line(&mut p, t0);
+        let mut mem = pm::SessionMemory::default();
+        mem.open(Some(&entry), now_unix, t0);
+        mem.delivered(1_200_000, Basis::AppLimited, at(5));
+        mem.pushed_back(620_000, Basis::Backlogged, at(10));
+        mem.pushed_back(600_000, Basis::Backlogged, at(16));
+        mem.pushed_back(640_000, Basis::Backlogged, at(23));
+        let c = mem.closing(at(30), now_unix);
+        let (written, _) = pm::close(Some(&entry), &c);
+        let written = written.expect("the push-backs are written");
+        p.model.as_mut().unwrap().take(c, true);
+        let close = logged(|| drop(p));
+        assert!(
+            close.contains(" wrote=floor_and_push_back why=pushed_back "),
+            "{close}"
+        );
+        assert!(close.contains(" push_back_bps=Some(640000) push_back_windows=Some(3) "));
+        lines.push(("three push-backs", open, close));
+        // ... and the next session reads a trusted record.
+        let mut p = pump(guard(EntryState::Fresh, Some(written)), None);
+        let open = open_line(&mut p, t0);
+        let expect = (u64::from(written.floor.bps) * 85 / 100) as u32;
+        assert!(open.contains(" model_trusted=true "), "{open}");
+        assert!(
+            open.contains(&format!(" model_open_bps={expect} ")),
+            "{expect}: {open}"
+        );
+        drop(p);
+        lines.push(("the session after it", open, String::new()));
+
+        for (what, open, close) in &lines {
+            assert_in_order(open, &OPEN_FIELDS);
+            assert!(open.contains(OPEN_LINE));
+            if !close.is_empty() {
+                assert_in_order(close, &CLOSE_FIELDS);
+                assert!(close.contains(CLOSE_LINE));
+            }
+            for secret in ["203.0.113", "198.51.100", USER] {
+                assert!(
+                    !open.contains(secret) && !close.contains(secret),
+                    "{secret}"
+                );
+            }
+            println!(
+                "{what}: open {} bytes, close {} bytes\n{open}{close}",
+                open.len(),
+                close.len()
+            );
+            assert!(open.len() < 800 && close.len() < 800);
+        }
     }
 }
