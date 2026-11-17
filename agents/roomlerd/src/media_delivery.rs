@@ -31,12 +31,21 @@
 //! the viewer nor the wire changes. `ROOMLERD_PATH_MODEL=off` takes no sample and
 //! writes no line. What a sample cannot tell is in `docs/rate-control.md`
 //! (§ Delivery samples).
+//!
+//! Step 3 writes a second line from the same call, [`MODEL_LINE`]: every path
+//! number the pump's heartbeat carries, each with how it was obtained and how
+//! old it is, and what FR-148 §4.1's model would hold beside them
+//! (`encode::pipe::PathView`). Also in shadow, also off with the switch; see
+//! `docs/rate-control.md` (§ Path numbers and their provenance).
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
+
+use crate::encode::pipe::{PathNumber, PathView};
 
 /// A sample closes at the first heartbeat at least this long after the last.
 pub const SAMPLE_MIN: Duration = Duration::from_millis(1500);
@@ -177,6 +186,10 @@ pub struct DeliverySampler {
     line_since: Option<Instant>,
     /// Whose line a drop writes.
     session: Option<ObjectId>,
+    /// Step 3 — the latest path numbers, not yet written, and when the last
+    /// [`MODEL_LINE`] was (its own [`LINE_EVERY`]).
+    view: Option<PathView>,
+    model_since: Option<Instant>,
 }
 
 impl DeliverySampler {
@@ -193,21 +206,32 @@ impl DeliverySampler {
             fold: Fold::default(),
             line_since: None,
             session: None,
+            view: None,
+            model_since: None,
         }
     }
 
     /// The pump's one call, at its heartbeat: read the association's clock,
-    /// close a sample when one is due, and write the line when it is due. Never
-    /// waits: before the association exists, or while its transport's slot is
-    /// held, the clock it already has answers, or nothing does.
-    pub fn heartbeat(&mut self, pc: &RTCPeerConnection, session_id: ObjectId) {
+    /// close a sample when one is due, and write the line when it is due; and
+    /// take the path numbers from `view` (step 3), writing [`MODEL_LINE`] when
+    /// that is due. Never waits: before the association exists, or while its
+    /// transport's slot is held, the clock it already has answers, or nothing
+    /// does. Off, it calls neither.
+    pub fn heartbeat(
+        &mut self,
+        pc: &RTCPeerConnection,
+        session_id: ObjectId,
+        view: impl FnOnce(Instant) -> PathView,
+    ) {
         if self.on {
-            self.observe(Instant::now(), session_id, || pc.sctp().delivery_clock());
+            let now = Instant::now();
+            self.observe(now, session_id, || pc.sctp().delivery_clock());
+            self.on_view(now, session_id, view);
         }
     }
 
-    /// [`Self::heartbeat`] at `now`, with the clock from `clock`. Off, it calls
-    /// nothing and returns `None`.
+    /// [`Self::heartbeat`]'s samples at `now`, with the clock from `clock`. Off,
+    /// it calls nothing and returns `None`.
     pub fn observe(
         &mut self,
         now: Instant,
@@ -266,15 +290,45 @@ impl DeliverySampler {
         self.line_since = Some(now);
         Some(std::mem::take(&mut self.fold).report)
     }
+
+    /// Step 3, [`Self::heartbeat`]'s path numbers at `now`: keep `view`'s as the
+    /// latest, and write them once [`LINE_EVERY`] has passed since the last
+    /// [`MODEL_LINE`] (the first heartbeat starts the count). A session that
+    /// ends between two lines has its last numbers written by the drop. Off, it
+    /// calls nothing.
+    pub fn on_view(
+        &mut self,
+        now: Instant,
+        session_id: ObjectId,
+        view: impl FnOnce(Instant) -> PathView,
+    ) {
+        if !self.on {
+            return;
+        }
+        self.session = Some(session_id);
+        let since = *self.model_since.get_or_insert(now);
+        self.view = Some(view(now));
+        if now.saturating_duration_since(since) >= LINE_EVERY {
+            self.model_since = Some(now);
+            if let Some(view) = self.view.take() {
+                emit_model(session_id, &view);
+            }
+        }
+    }
 }
 
 impl Drop for DeliverySampler {
-    /// A session left before its next line still has its last samples written.
+    /// A session left before its next line still has its last samples written,
+    /// and its last path numbers.
     fn drop(&mut self) {
-        if let Some(session_id) = self.session
-            && !self.fold.is_empty()
-        {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        if !self.fold.is_empty() {
             emit(session_id, &std::mem::take(&mut self.fold).report);
+        }
+        if let Some(view) = self.view.take() {
+            emit_model(session_id, &view);
         }
     }
 }
@@ -294,12 +348,65 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
     );
 }
 
+/// FR-148 P0, step 3 — the path numbers' line, which a field read greps for.
+pub const MODEL_LINE: &str = "path model (FR-148 P0, shadow, ≈10s)";
+
+/// A path number as the line writes it: `<bps>/<how>/<age>ms`, or `None`.
+struct Shown(Option<PathNumber>);
+
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => n.fmt(f),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+/// Step 3's line. Each field is the heartbeat's field of the same name with
+/// its tag; `viewer_rx_bps` and `seed_bps` have none there, and the `model_`
+/// fields are the shadow model's. Their names and order are pinned by a test.
+pub fn emit_model(session_id: ObjectId, v: &PathView) {
+    let (anchor, floor, capacity) = v.belief;
+    let belief = format!("({}, {}, {})", Shown(anchor), Shown(floor), Shown(capacity));
+    tracing::info!(
+        %session_id,
+        goodput_bps = %Shown(v.goodput),
+        pipe_belief = %belief,
+        pipe_measured = %Shown(v.measured),
+        prior_bps = %Shown(v.prior),
+        learned_ceiling_bps = %Shown(v.learned_ceiling),
+        slow_link_floor_bps = %Shown(v.slow_link_floor),
+        viewer_rx_bps = %Shown(v.viewer_rx),
+        seed_bps = %Shown(v.seed),
+        model_floor_bps = %Shown(v.model_floor),
+        model_capacity_bps = %Shown(v.model_capacity),
+        model_stand_in_bps = %Shown(v.model_stand_in),
+        "{MODEL_LINE}"
+    );
+}
+
+/// The pair memory's seed for `peer` as a session opens from it, which is
+/// `RateMemory::seed_at_open`'s, and how old its entry is then: the age the
+/// path model line gives the seed and every number that stands on it.
+pub fn seed_at_open(path: &Path, peer: &str) -> (Option<u32>, Option<Duration>) {
+    let memory = crate::encode::rate_memory::RateMemory::load(path);
+    let now = crate::encode::rate_memory::now_unix();
+    let seed = memory.seed_at_open(peer, now);
+    let at = seed.and(memory.entries.get(peer)).map(|e| e.at_unix);
+    (
+        seed,
+        at.map(|at| Duration::from_secs(now.saturating_sub(at))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::encode::pipe::Basis;
 
     /// A reading: bytes acknowledged so far, and the queue's fills and empties
     /// so far.
@@ -581,6 +688,185 @@ mod tests {
         });
         assert!(out.is_empty(), "{out:?}");
     }
+
+    fn n(bps: u32, basis: Basis, ms: u64) -> Option<PathNumber> {
+        Some(PathNumber::new(bps, basis, Duration::from_millis(ms)))
+    }
+
+    /// Step 3: a relayed session sending more than the path takes. Every field
+    /// has a number.
+    fn busy_view() -> PathView {
+        let floor = n(1_399_272, Basis::AppLimited, 41_300);
+        let goodput = n(1_162_000, Basis::Backlogged, 800);
+        PathView {
+            goodput,
+            belief: (floor, floor, goodput),
+            measured: goodput,
+            prior: n(1_162_000, Basis::Assumed, 800),
+            learned_ceiling: n(0, Basis::Assumed, 312_400),
+            slow_link_floor: n(987_700, Basis::Backlogged, 800),
+            viewer_rx: n(1_130_112, Basis::AppLimited, 400),
+            seed: Some(PathNumber::remembered(
+                1_250_000,
+                Duration::from_secs(9_120),
+            )),
+            model_floor: floor,
+            model_capacity: goodput,
+            model_stand_in: floor,
+        }
+    }
+
+    /// Step 3: the same session's screen at rest. Nothing measures the
+    /// capacity; the floor stands, older.
+    fn idle_view() -> PathView {
+        let floor = n(1_399_272, Basis::AppLimited, 101_300);
+        PathView {
+            belief: (floor, floor, None),
+            learned_ceiling: n(0, Basis::Assumed, 372_400),
+            viewer_rx: n(9_120, Basis::AppLimited, 600),
+            seed: Some(PathNumber::remembered(
+                1_250_000,
+                Duration::from_secs(9_180),
+            )),
+            model_floor: floor,
+            ..PathView::default()
+        }
+    }
+
+    #[test]
+    fn the_model_line_names_its_fields() {
+        let out = logged(|| emit_model(sid(), &busy_view()));
+        let mut rest = out.as_str();
+        for want in [
+            " INFO ",
+            MODEL_LINE,
+            "session_id=65a1b2c3d4e5f60718293a4b",
+            "goodput_bps=1162000/backlogged/800ms",
+            "pipe_belief=(1399272/app-limited/41300ms, 1399272/app-limited/41300ms, \
+             1162000/backlogged/800ms)",
+            "pipe_measured=1162000/backlogged/800ms",
+            "prior_bps=1162000/assumed/800ms",
+            "learned_ceiling_bps=0/assumed/312400ms",
+            "slow_link_floor_bps=987700/backlogged/800ms",
+            "viewer_rx_bps=1130112/app-limited/400ms",
+            "seed_bps=1250000/remembered/9120000ms",
+            "model_floor_bps=1399272/app-limited/41300ms",
+            "model_capacity_bps=1162000/backlogged/800ms",
+            "model_stand_in_bps=1399272/app-limited/41300ms",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(
+            !out.contains("None"),
+            "a busy line has every number: {out:?}"
+        );
+        let idle = logged(|| emit_model(sid(), &idle_view()));
+        for want in [
+            "goodput_bps=None",
+            "pipe_belief=(1399272/app-limited/101300ms, 1399272/app-limited/101300ms, None)",
+            "pipe_measured=None",
+            "prior_bps=None",
+            "viewer_rx_bps=9120/app-limited/600ms",
+            "model_capacity_bps=None",
+            "model_stand_in_bps=None",
+        ] {
+            assert!(idle.contains(want), "{want:?} is not in {idle:?}");
+        }
+        // Its cost: at most one line a pump every LINE_EVERY.
+        let per_hour = 3_600 / LINE_EVERY.as_secs();
+        for (what, l) in [("busy", &out), ("idle", &idle)] {
+            println!(
+                "path model line, {what}: {} bytes; {per_hour} lines and {} bytes a session hour\n{l}",
+                l.len(),
+                l.len() as u64 * per_hour
+            );
+            assert!(l.len() < 800, "{} bytes: {l:?}", l.len());
+        }
+    }
+
+    #[test]
+    fn the_model_line_comes_every_ten_seconds_and_a_drop_writes_the_last() {
+        let t0 = Instant::now();
+        let views = Cell::new(0u32);
+        let view = |ms: u32| {
+            let views = &views;
+            move |_: Instant| {
+                views.set(views.get() + 1);
+                PathView {
+                    viewer_rx: n(ms, Basis::AppLimited, 0),
+                    ..PathView::default()
+                }
+            }
+        };
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(true);
+            for ms in (0..=14_000u32).step_by(2_000) {
+                s.on_view(at(t0, u64::from(ms)), sid(), view(ms));
+            }
+        });
+        assert_eq!(views.get(), 8, "one view a heartbeat");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out:?}");
+        assert!(
+            lines[0].contains("viewer_rx_bps=10000/"),
+            "the line at 10 s: {out:?}"
+        );
+        assert!(
+            lines[1].contains("viewer_rx_bps=14000/"),
+            "the drop's: {out:?}"
+        );
+        // A drop right after a line writes nothing more.
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(true);
+            s.on_view(t0, sid(), view(0));
+            s.on_view(at(t0, 10_000), sid(), view(10_000));
+        });
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn off_takes_no_path_numbers_and_writes_no_model_line() {
+        let t0 = Instant::now();
+        let asked = Cell::new(false);
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(false);
+            for i in 0..30u64 {
+                s.on_view(at(t0, i * 2_000), sid(), |_| {
+                    asked.set(true);
+                    busy_view()
+                });
+            }
+            // Its drop writes nothing either.
+        });
+        assert!(!asked.get(), "off asked the governor for its numbers");
+        assert!(out.is_empty(), "off wrote {out:?}");
+    }
+
+    /// The seed is `RateMemory::seed_at_open`'s, and its age is its entry's:
+    /// none for a pair the memory does not seed.
+    #[test]
+    fn the_seed_at_open_comes_with_its_entrys_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate-memory.json");
+        let mut memory = crate::encode::rate_memory::RateMemory::default();
+        let written = crate::encode::rate_memory::now_unix() - 3 * 3_600;
+        memory.record_session("198.51.100.7|relay:turn/udp", Some(564_865), written);
+        memory.save(&path).unwrap();
+        let (seed, age) = seed_at_open(&path, "198.51.100.7|relay:turn/udp");
+        assert_eq!(seed, Some(564_865));
+        let age = age.expect("an age").as_secs();
+        assert!((3 * 3_600..3 * 3_600 + 60).contains(&age), "{age} s");
+        assert_eq!(seed_at_open(&path, "198.51.100.8|direct"), (None, None));
+        let missing = dir.path().join("none.json");
+        assert_eq!(
+            seed_at_open(&missing, "198.51.100.7|relay:turn/udp"),
+            (None, None)
+        );
+    }
 }
 
 /// Done-criterion 3 of FR-148 P0's step 2: the sampler reads a known pipe. Two
@@ -597,7 +883,9 @@ mod tests {
 /// backlogged samples at 8 Mbit/s read 0.9 to 6.9 Mbit/s, and with a 48 KiB
 /// window over 0.4 Mbit/s's 10,000-byte queue one sample under load read 68 %.
 /// A path recovering from loss reads as a low backlogged rate: a sample
-/// carries what the path delivered, not what it could have.
+/// carries what the path delivered, not what it could have. One cell drops
+/// packets on purpose: an unordered `maxRetransmits: 0` channel, which
+/// recovers nothing, so it measures what the clock counts of a lossy path.
 ///
 /// What it does not prove: a real carrier's loss, jitter, reordering and
 /// stalls, a browser's SCTP at the far end, and DTLS and ICE beneath SCTP.
@@ -608,12 +896,14 @@ mod shaped_link {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use tokio::sync::{Mutex, mpsc};
     use webrtc::sctp::association::{Association, Config};
     use webrtc::sctp::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+    use webrtc::sctp::stream::ReliabilityType;
     use webrtc::util::Conn;
 
     use super::*;
@@ -640,15 +930,30 @@ mod shaped_link {
         (usize::try_from(rwnd(bps)).unwrap_or(usize::MAX) / 4).clamp(1024, 16 * 1024)
     }
 
+    /// A packet this long or longer carries a full DATA chunk: a lossy
+    /// direction drops only such packets, so the handshake, SACKs and
+    /// FORWARD TSNs always pass.
+    const FULL_PACKET: usize = 1_000;
+
     /// One direction of the link.
     struct Shaper {
         bps: u64,
         next_free: StdMutex<Instant>,
         due: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
+        /// Drops every n-th [`FULL_PACKET`] before its queue; 0 drops none.
+        drop_every: u64,
+        full_packets: AtomicU64,
     }
 
     impl Shaper {
         fn send(&self, b: &[u8]) {
+            if self.drop_every > 0
+                && b.len() >= FULL_PACKET
+                && (self.full_packets.fetch_add(1, Ordering::Relaxed) + 1)
+                    .is_multiple_of(self.drop_every)
+            {
+                return; // Lost on the way, as a lossy carrier loses it.
+            }
             let now = Instant::now();
             let mut next_free = self.next_free.lock().unwrap();
             let start = (*next_free).max(now);
@@ -671,7 +976,7 @@ mod shaped_link {
     }
 
     /// One direction's delivery: each packet reaches the far inbox when due.
-    fn direction(bps: u64) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
+    fn direction(bps: u64, drop_every: u64) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -686,13 +991,21 @@ mod shaped_link {
             bps,
             next_free: StdMutex::new(Instant::now()),
             due: due_tx,
+            drop_every,
+            full_packets: AtomicU64::new(0),
         };
         (shaper, inbox_rx)
     }
 
     fn link(bps: u64) -> (ShapedConn, ShapedConn) {
-        let (a_out, b_inbox) = direction(bps);
-        let (b_out, a_inbox) = direction(bps);
+        lossy_link(bps, 0)
+    }
+
+    /// A link whose agent-to-viewer direction drops every `drop_every`-th
+    /// packet that carries a full DATA chunk; 0 drops none.
+    fn lossy_link(bps: u64, drop_every: u64) -> (ShapedConn, ShapedConn) {
+        let (a_out, b_inbox) = direction(bps, drop_every);
+        let (b_out, a_inbox) = direction(bps, 0);
         let (a, b): (SocketAddr, SocketAddr) = (
             "10.0.0.1:5000".parse().unwrap(),
             "10.0.0.2:5000".parse().unwrap(),
@@ -759,6 +1072,16 @@ mod shaped_link {
         b: Arc<dyn Conn + Send + Sync>,
         rwnd: u32,
     ) -> (Association, Arc<Association>) {
+        pair_counting(a, b, rwnd, Arc::default()).await
+    }
+
+    /// As [`pair`], and `taken` counts the bytes the viewer reads.
+    async fn pair_counting(
+        a: Arc<dyn Conn + Send + Sync>,
+        b: Arc<dyn Conn + Send + Sync>,
+        rwnd: u32,
+        taken: Arc<AtomicU64>,
+    ) -> (Association, Arc<Association>) {
         let config = |net_conn, rwnd, name: &str| Config {
             net_conn,
             max_receive_buffer_size: rwnd,
@@ -772,10 +1095,13 @@ mod shaped_link {
         let reader = Arc::clone(&viewer);
         tokio::spawn(async move {
             while let Some(stream) = reader.accept_stream().await {
+                let taken = Arc::clone(&taken);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65_536];
                     // A shut stream answers 0 at once, forever: stop there.
-                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                    while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                        taken.fetch_add(n as u64, Ordering::SeqCst);
+                    }
                 });
             }
         });
@@ -894,6 +1220,76 @@ mod shaped_link {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_trickle_at_8_mbps_is_application_limited() {
         a_trickle_is_application_limited(8_000_000).await;
+    }
+
+    /// The clock counts what the viewer received, not what was lost. An
+    /// unordered channel with `maxRetransmits: 0`, as the viewer's opt-in
+    /// opens it, writes as fast as it may over a 2 Mbit/s link that loses one
+    /// full DATA packet in ten. Every chunk is abandoned at its first send,
+    /// and FORWARD TSNs let the cumulative point pass the lost ones. Before
+    /// the clock left them out it counted nearly all of them: at the third
+    /// sample's end 2,128,000 bytes against 1,920,000 the viewer took, with
+    /// 216,000 lost.
+    ///
+    /// It is not exact. A lost chunk that no later DATA follows before a
+    /// FORWARD TSN covering it reaches the viewer is never reported missing,
+    /// and the clock counts it. How often that happens depends on the timing.
+    /// At the third sample's end, of about 215,000 bytes lost, four runs on a
+    /// Windows box counted 11,000 to 21,000 over what the viewer took, and two
+    /// on CI's Linux runners, under the whole suite, 75,000 and 70,000. So at
+    /// each sample's end the clock has counted less than the viewer took plus
+    /// two thirds of what was lost, and at least nine tenths of what the viewer
+    /// took: the samples read backlogged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lossy_unordered_channel_counts_what_the_viewer_took() {
+        const SAMPLE: Duration = Duration::from_secs(2);
+        const DROP_EVERY: u64 = 10;
+        let bps = 2_000_000;
+        let (a, b) = lossy_link(bps, DROP_EVERY);
+        let a = Arc::new(a);
+        let taken = Arc::new(AtomicU64::new(0));
+        let (agent, viewer) =
+            pair_counting(a.clone(), Arc::new(b), rwnd(bps), Arc::clone(&taken)).await;
+        let stream = agent
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        stream.set_reliability_params(true, ReliabilityType::Rexmit, 0);
+        let writer = tokio::spawn(async move {
+            // One chunk a message, so a message the viewer read is a chunk it
+            // received, and a lost chunk is a lost message.
+            let msg = Bytes::from(vec![0x3c; 1_000]);
+            while stream.write(&msg).await.is_ok() {}
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut sampler = DeliverySampler::new(true);
+        let clock = || Some(agent.delivery_clock());
+        let start = Instant::now();
+        assert_eq!(sampler.observe(start, sid(), clock), None);
+        let mut ends = Vec::new();
+        for i in 1..=3u32 {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(start + SAMPLE * i)).await;
+            let sample = sampler.observe(Instant::now(), sid(), clock);
+            // The clock first, then the viewer's count, which only grows.
+            let acked = agent.delivery_clock().read().acked_bytes;
+            let took = taken.load(Ordering::SeqCst);
+            // Each dropped packet held one 1,000-byte chunk.
+            let lost = a.out.full_packets.load(Ordering::SeqCst) / DROP_EVERY * 1_000;
+            ends.push((sample, acked, took, lost));
+        }
+        writer.abort();
+        let _ = agent.close().await;
+        let _ = viewer.close().await;
+        println!("a lossy unordered channel, (sample, acked, viewer took, lost): {ends:?}");
+        for (sample, acked, took, lost) in &ends {
+            assert!(*acked < took + lost * 2 / 3, "counted {acked}: {ends:?}");
+            assert!(
+                *acked >= took * 9 / 10,
+                "counted {acked} of {took}: {ends:?}"
+            );
+            let sample = sample.as_ref().expect("a sample every 2 s");
+            assert_eq!(sample.class, Class::Backlogged, "{ends:?}");
+        }
     }
 
     /// A second association is a new clock: no sample spans the two, and the

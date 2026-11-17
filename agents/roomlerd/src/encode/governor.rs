@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use super::aimd::AimdController;
 use super::encode_pressure::{DownscaleTier, EncodePressure};
 use super::goodput::{GoodputEstimator, GoodputSink};
+use super::pipe::{Basis, PathNumber, PathView};
 use super::viewer_rate::{self, ViewerRateController};
 
 /// A bitrate target the pump must apply to the live encoder
@@ -369,6 +370,8 @@ pub struct RateGovernor {
     /// reports, and `tests::the_shadow_never_moves_the_live_decision` holds the
     /// line. B2 adds the one seam that lets it steer; B1 has none.
     shadow: Option<super::ratectl::Controller>,
+    /// FR-148 P0 — how each path number was obtained (shadow; see [`PathTags`]).
+    path: PathTags,
 }
 
 /// FR-71 T1a — what the pump measured about its own send side over one
@@ -459,7 +462,7 @@ impl RateGovernor {
         ceiling_seed_bps: Option<u32>,
         now: Instant,
     ) -> Self {
-        Self {
+        let mut governor = Self {
             aimd: None,
             send_depth,
             applied_bps: 0,
@@ -527,7 +530,18 @@ impl RateGovernor {
                     Some(super::ratectl::Controller::new(ceiling_seed_bps))
                 }
             },
+            path: PathTags::open(now, ceiling_seed_bps),
+        };
+        // FR-148 P0 — the learned ceiling as the session opens, at the seed or at
+        // its nominal start; and the seed, a rate an earlier session measured,
+        // is an application-limited reading to the shadow model.
+        governor.path.learned = governor
+            .path
+            .learned_at_open(governor.learner.learned_bps());
+        if let Some(seed_bps) = governor.path.seed_bps {
+            governor.belief.remember(seed_bps, now);
         }
+        governor
     }
 
     /// FR-59 P8 — the remembered rate this session opened at, when the pair
@@ -933,6 +947,7 @@ impl RateGovernor {
                 .on_measurement(g, self.slow_link.seed_contradiction)
         {
             self.seed_abandoned_bps = Some(dropped);
+            self.path.learned_moved(self.learner.learned_bps(), now);
         }
         // FR-35 — lift the constrained ceiling by what the learner has proven.
         let ceiling_bps = if constrained {
@@ -1014,6 +1029,10 @@ impl RateGovernor {
                     super::slow_link_min_bitrate_bps(),
                 );
                 self.relieved_floor_bps = (relieved < floor_bps).then_some(relieved);
+                // FR-148 P0 — tagged as the reading or stand-in it came from.
+                if let Some((_, tag)) = self.pipe_tagged(now, constrained) {
+                    self.path.relieved = tag;
+                }
                 relieved
             }
             _ => {
@@ -1041,6 +1060,9 @@ impl RateGovernor {
                     // force"; leaving it None here would report that the
                     // nominal floor stands when it does not.
                     self.relieved_floor_bps = Some(ramped);
+                    // FR-148 P0 — the opener's ramp is computed: assumed, as old
+                    // as the session.
+                    self.path.relieved = Tag::assumed(Origin::At(self.path.opened_at));
                 }
                 ramped
             }
@@ -1084,6 +1106,7 @@ impl RateGovernor {
             self.last_decreases = decreases;
             if constrained {
                 self.learner.on_decrease(ctrl.desired(), now);
+                self.path.learned_moved(self.learner.learned_bps(), now);
             }
         }
         let bps = ctrl.take_pending()?;
@@ -1185,6 +1208,9 @@ impl RateGovernor {
         fold_followers: impl FnOnce(u32) -> u32,
         sent_bytes_total: u64,
     ) -> Option<ViewerWindow> {
+        // FR-148 P0 — the transport the pump's heartbeat reads its numbers on,
+        // taken on every call so the `path model` line reads the same one.
+        self.path.constrained = constrained;
         let elapsed = now.duration_since(self.viewer_window_at);
         if elapsed < VIEWER_WINDOW {
             return None;
@@ -1233,16 +1259,6 @@ impl RateGovernor {
         // FR-59 P3 — the viewer's own view of the link, taken here so the
         // verdict below can see whether the viewer said anything at all.
         let link = viewer_rate::unpack_link(take_link());
-        // FR-79 V3b — the viewer's arrival rate is a DEMONSTRATED delivery:
-        // those bytes reached the far end, whatever the queue was doing. It
-        // arrives every window on every carrier, and until now it was thrown
-        // away unless the link loop called the window congested — which is why
-        // a relay-TCP session could finish knowing nothing about its own path
-        // (CORPLAP-3, `goodput_samples=(0, 5)`). It is a FLOOR, never a
-        // capacity: an idle desktop delivers 300 kbps through a gigabit path.
-        // V5b reads whether it rose, once the window has a verdict.
-        let floor_raised =
-            link.is_some_and(|(rx_bps, _)| self.belief.observe_delivered(rx_bps, now));
         // The window's blocked-send samples. Drained here rather than per
         // frame — the send task is a different task, and this is the existing
         // once-a-second rendezvous. Whether they are FOLDED is the gate's call,
@@ -1302,6 +1318,29 @@ impl RateGovernor {
         } else {
             (super::pipe_state::PipeState::Unknown, None)
         };
+        // FR-79 V3b — the viewer's arrival rate is a DEMONSTRATED delivery:
+        // those bytes reached the far end, whatever the queue was doing. It
+        // arrives every window on every carrier, and until now it was thrown
+        // away unless the link loop called the window congested — which is why
+        // a relay-TCP session could finish knowing nothing about its own path
+        // (CORPLAP-3, `goodput_samples=(0, 5)`). It is a FLOOR, never a
+        // capacity: an idle desktop delivers 300 kbps through a gigabit path.
+        // V5b reads whether it rose.
+        //
+        // FR-148 P0 — taken here, once the window has its verdict, because the
+        // delivery's class needs it: backlogged when the sender offered more than
+        // arrived (the per-window test the offer loop takes below), else
+        // application-limited. Nothing above this point reads the belief.
+        let delivered = link.map(|(rx_bps, _)| {
+            let backlogged = state == super::pipe_state::PipeState::Overproduced
+                || viewer_rate::offered_over_arrival(sent_bps, rx_bps);
+            (rx_bps, Basis::of_window(backlogged))
+        });
+        let floor_raised = delivered
+            .is_some_and(|(rx_bps, basis)| self.belief.observe_delivered(rx_bps, basis, now));
+        if let Some((rx_bps, basis)) = delivered {
+            self.path.arrival = Some((rx_bps, basis, now));
+        }
         let rejection = super::evidence::rejected(super::evidence::WindowFacts {
             state,
             prev_state,
@@ -1379,10 +1418,12 @@ impl RateGovernor {
             // fold is a capacity estimate, not a delivery. Only fold it into
             // the belief when the estimator actually accepted the window;
             // `observe_window` rejects anything under `MIN_WINDOW_BLOCKED`.
+            // FR-148 P0 — so it is always backlogged: the estimator takes only
+            // sends that blocked (`goodput::MIN_BLOCKED_SEND` each).
             if self.goodput.observe_window(&samples, now)
                 && let Some(bps) = self.goodput.estimate_bps(now)
             {
-                self.belief.observe_capacity(bps, now);
+                self.belief.observe_capacity(bps, Basis::Backlogged, now);
             }
         }
         // FR-35 — a send blocked ≥ `HARD_STALL` is a hard stall: ×0.5, bypassing
@@ -1470,12 +1511,15 @@ impl RateGovernor {
         // sender was feeding it (`viewer_rate::OfferLoop`, which says why the
         // classifier's word counts too). Asked of every report, whatever the
         // switch says, so the streak stays true to the windows.
-        let offered = link.is_some_and(|(rx_bps, _)| {
+        // FR-148 P0 — the streak's own verdict, kept apart from the switch: it
+        // is the class of the arrival rate taken below.
+        let offer_held = link.is_some_and(|(rx_bps, _)| {
             self.offer_loop.observe(
                 state == super::pipe_state::PipeState::Overproduced
                     || viewer_rate::offered_over_arrival(sent_bps, rx_bps),
             )
-        }) || !self.slow_link.measured_evidence;
+        });
+        let offered = offer_held || !self.slow_link.measured_evidence;
         // FR-79 — on an invalid window the clamp is neither armed nor released:
         // whatever it held before the stall, it still holds. The report that
         // lands in a stall's shadow is the stall's own arrival rate (field
@@ -1507,8 +1551,12 @@ impl RateGovernor {
                     // queue is GROWING is the path's limit, not merely a
                     // delivery: the sender was offering more than arrived,
                     // which V5b checks and no longer assumes.
-                    self.belief.observe_capacity(rx_bps, now);
+                    // FR-148 P0 — with the switch off it gets here unoffered, and
+                    // is then application-limited (the jupiter chain's trickle).
+                    let basis = Basis::of_window(offer_held);
+                    self.belief.observe_capacity(rx_bps, basis, now);
                     self.link_rx_bps = Some((rx_bps, now));
+                    self.path.link_rx = basis;
                 }
                 // FR-79 V5b — neither arms nor releases: the queue did grow, so
                 // whatever the clamp holds it still holds, and on its own TTL.
@@ -1621,6 +1669,13 @@ impl RateGovernor {
             let pushed_back =
                 age_over || age_elevated || link_over || drain_for_ms.is_some() || stall_seen;
             self.prior.on_window(live, pushed_back);
+            // FR-148 P0 — what the prior's base now stands on (shadow).
+            if live.is_some_and(|l| l > 0) {
+                self.path.prior = match reading {
+                    Some(r) if r > 0 => self.reading_origin(now),
+                    _ => Origin::At(now),
+                };
+            }
         } else if constrained && stall_is_ours && !self.slow_link.measured_evidence {
             // FR-79 V5 — no measurement (the stall's own numbers are not the
             // pipe's: that is the 14:52 defect), but the push-back is real, so
@@ -1646,6 +1701,13 @@ impl RateGovernor {
         } else {
             None
         };
+        // FR-148 P0 — a step is a rate the path carried with the target pinned
+        // under the ceiling: a lower bound. A cut or an abandonment is tagged
+        // where it happens (`pre_encode_tick`).
+        if ceiling_grown.is_some() {
+            let learned_bps = self.learner.learned_bps();
+            self.path.learned = (learned_bps, Tag::measured(Basis::AppLimited, now));
+        }
         // FR-63 B1 — fold the SAME window into the shadow controller, reading
         // only what the live loops above already computed. It returns nothing
         // and no field below is a function of it. `frames_lost` is 0 until the
@@ -1910,6 +1972,214 @@ impl RateGovernor {
         let changed = bps != self.applied_bps;
         self.applied_bps = bps;
         AppliedBitrate { bps, changed }
+    }
+}
+
+/// FR-148 P0 — the path numbers with their tags, and the shadow model beside
+/// them. Nothing a session does reads any of this: its one reader is the
+/// `path model` line (`media_delivery`).
+impl RateGovernor {
+    /// Every path number the pump's heartbeat carries, each with how it was
+    /// obtained and how old it is, and the shadow model's view: what the `path
+    /// model` line writes. Each number is the one the heartbeat's accessor gives
+    /// at `now`, which `tests::same_numbers` checks at every replayed window. `seed_age` is
+    /// how old the pair memory's entry was when the session opened.
+    pub fn path_view(&self, now: Instant, seed_age: Option<Duration>) -> PathView {
+        let tags = &self.path;
+        let number = |(bps, tag): (u32, Tag)| tags.number(bps, tag, now, seed_age);
+        // The model counts a remembered number's age from the open; the entry's
+        // own age is known here.
+        let aged = |n: PathNumber| PathNumber {
+            age: n.age + seed_age.filter(|_| n.remembered).unwrap_or_default(),
+            ..n
+        };
+        let prior = self.prior_tagged().map(number);
+        let model = self.belief.model();
+        PathView {
+            goodput: self.goodput_tagged(now).map(number),
+            belief: (
+                self.belief.anchor_number(now),
+                self.belief.floor_number(now),
+                self.belief.capacity_number(now),
+            ),
+            measured: self.measured_tagged(now, tags.constrained).map(number),
+            prior,
+            learned_ceiling: Some(number((self.learner.learned_bps(), tags.learned.1))),
+            slow_link_floor: self
+                .relieved_floor_bps
+                .map(|bps| number((bps, tags.relieved))),
+            viewer_rx: tags
+                .arrival
+                .map(|(bps, basis, at)| number((bps, Tag::measured(basis, at)))),
+            seed: tags.seed_bps.map(|bps| number((bps, Tag::REMEMBERED))),
+            model_floor: model.floor(now).map(aged),
+            model_capacity: model.capacity(now),
+            model_stand_in: model.stand_in(prior, now).map(aged),
+        }
+    }
+
+    /// [`Self::blocked_send_bps`], tagged: backlogged by construction, aged
+    /// from the last window the estimator folded.
+    fn goodput_tagged(&self, now: Instant) -> Option<(u32, Tag)> {
+        let bps = self.goodput.estimate_bps(now)?;
+        let at = self.goodput.sampled_at()?;
+        Some((bps, Tag::measured(Basis::Backlogged, at)))
+    }
+
+    /// [`Self::measured_bps`], tagged: the goodput's tag or the held arrival
+    /// rate's, whichever reading it is (the goodput's on a tie).
+    fn measured_tagged(&self, now: Instant, constrained: bool) -> Option<(u32, Tag)> {
+        if !constrained {
+            return None;
+        }
+        let link = match self.link_rx_bps {
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => {
+                Some((rx, Tag::measured(self.path.link_rx, at)))
+            }
+            _ => None,
+        };
+        match (self.goodput_tagged(now), link) {
+            (Some(g), Some(l)) => Some(if g.0 <= l.0 { g } else { l }),
+            (g, l) => g.or(l),
+        }
+    }
+
+    /// [`Self::pipe_bps`], tagged: the measured reading's, else the stand-in's.
+    fn pipe_tagged(&self, now: Instant, constrained: bool) -> Option<(u32, Tag)> {
+        if !constrained {
+            return None;
+        }
+        self.measured_tagged(now, constrained)
+            .or_else(|| self.prior_tagged())
+    }
+
+    /// [`Self::prior_bps`], tagged: assumed, aged from the reading its base
+    /// was anchored on, or from the seed's entry.
+    fn prior_tagged(&self) -> Option<(u32, Tag)> {
+        let bps = self.prior.stand_in_bps()?;
+        Some((bps, Tag::assumed(self.path.prior)))
+    }
+
+    /// When the reading the prior anchors on at `now` was taken: the goodput's
+    /// last folded window, else the held arrival rate's.
+    fn reading_origin(&self, now: Instant) -> Origin {
+        match (self.goodput_tagged(now), self.link_rx_bps) {
+            (Some((_, tag)), _) => tag.origin,
+            (None, Some((_, at))) => Origin::At(at),
+            (None, None) => Origin::At(now),
+        }
+    }
+}
+
+/// FR-148 P0 — where the evidence behind a held number was taken: at an
+/// instant of this session, or in an earlier one (the pair memory's seed,
+/// whose age at the open the pump knows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    At(Instant),
+    Seed,
+}
+
+/// FR-148 P0 — a held number's class, and where its age runs from. A measured
+/// class from the seed is a remembered number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tag {
+    basis: Basis,
+    origin: Origin,
+}
+
+impl Tag {
+    /// The seed: measured in an earlier session. The entry does not say which
+    /// measured class (FR-148 P1 stores it), so the weaker one.
+    const REMEMBERED: Tag = Tag {
+        basis: Basis::AppLimited,
+        origin: Origin::Seed,
+    };
+
+    fn measured(basis: Basis, at: Instant) -> Self {
+        Self {
+            basis,
+            origin: Origin::At(at),
+        }
+    }
+
+    fn assumed(origin: Origin) -> Self {
+        Self {
+            basis: Basis::Assumed,
+            origin,
+        }
+    }
+}
+
+/// FR-148 P0 — how each path number the governor holds was obtained, kept
+/// beside the numbers where they are written. Read only by
+/// [`RateGovernor::path_view`]: no decision reads a tag.
+#[derive(Debug, Clone, Copy)]
+struct PathTags {
+    opened_at: Instant,
+    /// The pair memory's seed, as the governor was given it.
+    seed_bps: Option<u32>,
+    /// The transport the pump's latest tick named: what its heartbeat reads
+    /// the numbers on.
+    constrained: bool,
+    /// The last per-window arrival rate the governor took, and its class.
+    arrival: Option<(u32, Basis, Instant)>,
+    /// The class of the held arrival-rate reading (`link_rx_bps`). Set with
+    /// it, so never read while that is `None`.
+    link_rx: Basis,
+    /// What the prior's base stands on: the seed, until a reading anchors it.
+    prior: Origin,
+    /// The learned ceiling as last tagged, and its tag.
+    learned: (u32, Tag),
+    /// What the relieved floor was derived from.
+    relieved: Tag,
+}
+
+impl PathTags {
+    fn open(now: Instant, seed_bps: Option<u32>) -> Self {
+        Self {
+            opened_at: now,
+            seed_bps: seed_bps.filter(|s| *s > 0),
+            constrained: false,
+            arrival: None,
+            link_rx: Basis::Assumed,
+            prior: Origin::Seed,
+            learned: (0, Tag::assumed(Origin::At(now))),
+            relieved: Tag::assumed(Origin::At(now)),
+        }
+    }
+
+    /// The learned ceiling as the session opens: at the seed, with the seed's
+    /// tag, or at its nominal start (0, assumed).
+    fn learned_at_open(&self, learned_bps: u32) -> (u32, Tag) {
+        if learned_bps > 0 {
+            (learned_bps, Tag::REMEMBERED)
+        } else {
+            (0, Tag::assumed(Origin::At(self.opened_at)))
+        }
+    }
+
+    /// The learned ceiling moved other than by a step (a cut, an abandonment):
+    /// it is the controller's own number.
+    fn learned_moved(&mut self, learned_bps: u32, now: Instant) {
+        if learned_bps != self.learned.0 {
+            self.learned = (learned_bps, Tag::assumed(Origin::At(now)));
+        }
+    }
+
+    /// `bps` with `tag`, read at `now`.
+    fn number(&self, bps: u32, tag: Tag, now: Instant, seed_age: Option<Duration>) -> PathNumber {
+        match tag.origin {
+            Origin::At(at) => PathNumber::new(bps, tag.basis, now.saturating_duration_since(at)),
+            Origin::Seed => {
+                let age =
+                    seed_age.unwrap_or_default() + now.saturating_duration_since(self.opened_at);
+                match tag.basis {
+                    Basis::Assumed => PathNumber::new(bps, Basis::Assumed, age),
+                    _ => PathNumber::remembered(bps, age),
+                }
+            }
+        }
     }
 }
 
@@ -5006,7 +5276,19 @@ mod tests {
             link: u64,
             opening: bool,
         ) -> ViewerWindow {
-            self.t += Duration::from_secs(1);
+            self.window_over(Duration::from_secs(1), wrote, age, link, opening)
+        }
+
+        /// [`Self::window`], `dt` long.
+        fn window_over(
+            &mut self,
+            dt: Duration,
+            wrote: u64,
+            age: Option<u16>,
+            link: u64,
+            opening: bool,
+        ) -> ViewerWindow {
+            self.t += dt;
             self.sent += wrote;
             self.g.note_window_sender(WindowSenderStats {
                 opening,
@@ -5032,6 +5314,7 @@ mod tests {
                 DEPTH,
                 self.t,
             );
+            same_numbers(&self.g, self.t);
             w
         }
 
@@ -5250,6 +5533,281 @@ mod tests {
         let entry = &memory.entries[V5B_KEY];
         assert_eq!(entry.stable_bps, 3_322);
         assert_eq!(entry.at_unix, written, "its age stands");
+    }
+
+    /// FR-148 P0 — the `path model` line's numbers are the heartbeat's, accessor
+    /// by accessor, whatever the tags say; and the learned ceiling's tag is for
+    /// the value it has. Every window of a [`V5bSession`] checks this.
+    fn same_numbers(g: &RateGovernor, t: Instant) {
+        let v = g.path_view(t, None);
+        let bps = |n: Option<PathNumber>| n.map(|n| n.bps);
+        let constrained = g.path.constrained;
+        assert_eq!(bps(v.goodput), g.blocked_send_bps(t), "goodput_bps");
+        assert_eq!(
+            (bps(v.belief.0), bps(v.belief.1), bps(v.belief.2)),
+            g.belief_bps(t),
+            "pipe_belief"
+        );
+        assert_eq!(
+            bps(v.measured),
+            g.measured_bps(t, constrained),
+            "pipe_measured"
+        );
+        assert_eq!(bps(v.prior), g.prior_bps(), "prior_bps");
+        let learned = g.learned_ceiling_bps();
+        assert_eq!(bps(v.learned_ceiling), Some(learned), "learned_ceiling_bps");
+        assert_eq!(g.path.learned.0, learned, "the learned ceiling's tag");
+        assert_eq!(
+            bps(v.slow_link_floor),
+            g.relieved_floor_bps(),
+            "slow_link_floor_bps"
+        );
+        let pipe = g.pipe_tagged(t, constrained).map(|(bps, _)| bps);
+        assert_eq!(pipe, g.pipe_bps(t, constrained), "pipe_bps");
+    }
+
+    /// FR-148 P0 — the check both field chains below fail on the laws of
+    /// 2026-11-16: in neither session did a backlogged reading say the path
+    /// carried less than it had delivered, so the floor stands at the most it
+    /// delivered, and nothing offered to the pair memory is below that.
+    fn keeps_what_it_delivered(floor: Option<u32>, offer: Option<u32>, delivered: u32) -> bool {
+        floor.is_some_and(|f| f >= delivered) && offer.is_none_or(|o| o >= delivered)
+    }
+
+    /// A number's value and word, for the cells below.
+    fn word(n: Option<PathNumber>) -> Option<(u32, &'static str)> {
+        n.map(|n| (n.bps, n.word()))
+    }
+
+    /// FR-148 P0 (AC3) — the jupiter chain of 2026-11-02, the replay above, read
+    /// with provenance. On the laws of 2026-11-16 (`measured_evidence` off) the
+    /// trickle's push-back halved the floor the busy minute set, and the session
+    /// offered the stand-in's last rung to the pair memory. The line says what
+    /// those numbers were: an application-limited push-back and an assumed
+    /// stand-in. The model that reads the tags keeps the floor and offers it.
+    /// Nothing the session acts on moved: the switch-off cell above still pins
+    /// the field's numbers to the unit.
+    #[test]
+    fn the_jupiter_chain_read_with_provenance_keeps_its_floor() {
+        let delivered = 15_915_240;
+        let mut s = V5bSession::open(false, None);
+        s.load();
+        s.idle_report();
+        s.walk();
+        let t = s.t;
+        // The laws of 2026-11-16.
+        let (_, floor, capacity) = s.g.belief_bps(t);
+        assert_eq!((floor, capacity), (Some(7_962_364), Some(9_489)));
+        assert_eq!(s.evidence(), Some(3_322));
+        assert!(!keeps_what_it_delivered(floor, s.evidence(), delivered));
+        // What the line says of them.
+        let v = s.g.path_view(t, None);
+        assert_eq!(
+            word(v.belief.2),
+            Some((9_489, "app-limited")),
+            "the push-back"
+        );
+        assert_eq!(word(v.belief.1), Some((7_962_364, "app-limited")));
+        assert_eq!(word(v.prior), Some((3_322, "assumed")), "what was offered");
+        assert_eq!(word(v.learned_ceiling), Some((0, "assumed")), "abandoned");
+        assert_eq!(word(v.viewer_rx), Some((V5B_IDLE_RX, "app-limited")));
+        assert_eq!(v.measured, None, "nothing live at the end");
+        // Read with provenance.
+        let model_floor = v.model_floor.expect("a floor");
+        assert_eq!(word(Some(model_floor)), Some((delivered, "app-limited")));
+        assert_eq!(v.model_capacity, None, "nothing backlogged pushed back");
+        assert_eq!(
+            v.model_stand_in,
+            Some(model_floor),
+            "the stand-in stands at it"
+        );
+        let offer = s.g.belief.model().offer(t);
+        assert_eq!(offer, Some(model_floor));
+        assert!(keeps_what_it_delivered(
+            Some(model_floor.bps),
+            offer.map(|o| o.bps),
+            delivered
+        ));
+    }
+
+    /// FR-148 P0 — a pair the replay's CORPLAP-2 session writes (an invented
+    /// documentation address).
+    const CORPLAP2_KEY: &str = "198.51.100.40|relay:derp/tcp";
+
+    /// FR-148 P0 — the CORPLAP-2 heartbeats of 2026-11-11
+    /// (`tests/fixtures/fr148-corplap2-20261111.txt`): each interval between two
+    /// heartbeats, the rate the pump wrote over it, and the stand-in the second
+    /// one reported. Times are read in tenths of a second, so no interval is a
+    /// float's rounding off its length.
+    fn corplap2_20261111() -> Vec<(Duration, u32, Option<u32>)> {
+        let mut rows = include_str!("../../tests/fixtures/fr148-corplap2-20261111.txt")
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| {
+                let f: Vec<&str> = l.split(' ').collect();
+                let tenths: u64 = f[0].replace('.', "").parse().expect("seconds");
+                let bytes: u64 = f[1].parse().expect("bytes_written");
+                (tenths, bytes, f[2].parse::<u32>().ok())
+            });
+        let mut last = rows.next().expect("a first heartbeat");
+        rows.map(|row| {
+            let tenths = row.0 - last.0;
+            let rate = u32::try_from((row.1 - last.1) * 80 / tenths).expect("a rate");
+            last = row;
+            (Duration::from_millis(tenths * 100), rate, row.2)
+        })
+        .collect()
+    }
+
+    /// FR-148 P0 (AC3) — FR-148 §2.1, where a placeholder became the pair's
+    /// remembered rate: CORPLAP-2, 2026-11-11, one relayed AV1 session of 45
+    /// minutes, replayed from its heartbeats on the laws of 2026-11-16.
+    ///
+    /// The path delivered 1,399,272 bit/s at 394.9 s. At 909.1 s the viewer's
+    /// queue read as growing while the pump wrote 498,304, and its arrival rate,
+    /// 564,865, became the reading: an application-limited one, since the pump
+    /// was offering no more than arrived. Nothing measured after it. The stand-in
+    /// walked on the paint ages, 178 single steps of the prior's law to 179,980,
+    /// and the session wrote that to the pair memory.
+    ///
+    /// Two windows an interval, the bytes the pump wrote taken as arrived. The
+    /// rates and the stand-in's 179 values are the field's. The windows between
+    /// two steps are not (10 clean windows a step up, 2 pushed back a step down,
+    /// at the replay's paint ages), and neither is the anchor's queue growth.
+    #[test]
+    fn the_corplap2_chain_read_with_provenance_keeps_its_floor() {
+        let intervals = corplap2_20261111();
+        assert_eq!(intervals.len(), 1_347);
+        let delivered = intervals.iter().map(|i| i.1).max().expect("a rate");
+        assert_eq!(delivered, 1_399_272);
+        // The stand-in as the field's heartbeats reported it, each value once.
+        let mut ladder: Vec<u32> = Vec::new();
+        for prior in intervals.iter().filter_map(|i| i.2) {
+            if ladder.last() != Some(&prior) {
+                ladder.push(prior);
+            }
+        }
+        assert_eq!(ladder.len(), 179);
+        assert_eq!((ladder[0], ladder[178]), (564_865, 179_980));
+        let anchor = intervals
+            .iter()
+            .position(|i| i.2.is_some())
+            .expect("a prior");
+        assert_eq!(anchor, 447, "the interval ending at 909.1 s");
+        let mut s = V5bSession::open(false, None);
+        let mut halves = intervals
+            .iter()
+            .flat_map(|&(dt, rate, _)| [(dt / 2, rate); 2]);
+        let mut used = 0usize;
+        let mut window = |s: &mut V5bSession, age: u16, link: Option<u64>| {
+            let (dt, rate) = halves.next().expect("an interval left");
+            used += 1;
+            let wrote = u64::from(rate) * dt.as_millis() as u64 / 8_000;
+            let link = link.unwrap_or(viewer_rate::pack_link(rate, 0));
+            s.window_over(dt, wrote, Some(age), link, false);
+        };
+        for _ in 0..2 * anchor {
+            window(&mut s, 56, None);
+        }
+        assert_eq!(s.g.prior_bps(), None, "nothing measured before 909.1 s");
+        let growing = viewer_rate::pack_link(564_865, 145);
+        window(&mut s, 224, Some(growing));
+        window(&mut s, 224, Some(growing));
+        let read_at = s.t;
+        assert!(s.g.link_loop_holding());
+        assert_eq!(s.g.prior_bps(), Some(564_865));
+        let reading = s.g.path_view(read_at, None).measured;
+        assert_eq!(word(reading), Some((564_865, "app-limited")), "the reading");
+        // It holds while the clamp does, then walks.
+        while s.g.link_loop_holding() {
+            window(&mut s, 56, None);
+        }
+        for step in ladder.windows(2) {
+            let (age, windows) = if step[1] > step[0] {
+                (56, 10)
+            } else {
+                (150, 2)
+            };
+            for _ in 0..windows {
+                window(&mut s, age, None);
+            }
+            assert_eq!(s.g.prior_bps(), Some(step[1]));
+        }
+        let t = s.t;
+        // The laws of 2026-11-16.
+        assert_eq!(s.g.stable_bps(), None);
+        assert_eq!(s.evidence(), Some(179_980));
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        let written = memory.record_session(CORPLAP2_KEY, s.evidence(), 1_794_000_000);
+        assert_eq!(written, 179_980);
+        let floor = s.g.belief_bps(t).1;
+        assert_eq!(floor, Some(982_068), "damped toward the reading");
+        assert!(!keeps_what_it_delivered(floor, s.evidence(), delivered));
+        // What the line says of them: the stand-in is assumed, as old as the
+        // reading it walked from.
+        let v = s.g.path_view(t, None);
+        let prior = v.prior.expect("the stand-in");
+        assert_eq!(word(Some(prior)), Some((179_980, "assumed")));
+        assert_eq!(prior.age, t - read_at);
+        // Read with provenance.
+        let model_floor = v.model_floor.expect("a floor");
+        assert_eq!(word(Some(model_floor)), Some((delivered, "app-limited")));
+        assert_eq!(v.model_capacity, None, "nothing backlogged pushed back");
+        assert_eq!(
+            v.model_stand_in,
+            Some(model_floor),
+            "the stand-in stands at it"
+        );
+        let offer = s.g.belief.model().offer(t);
+        assert_eq!(offer, Some(model_floor));
+        assert!(keeps_what_it_delivered(
+            Some(model_floor.bps),
+            offer.map(|o| o.bps),
+            delivered
+        ));
+        // The rest of the session, not replayed, delivered less than the floor.
+        let rest = &intervals[used.div_ceil(2)..];
+        assert!(!rest.is_empty());
+        assert!(rest.iter().all(|i| i.1 < delivered));
+    }
+
+    /// FR-148 P0 — what the line reads on a healthy session: the jupiter replay
+    /// on today's laws, at the end of its busy minute and on the still screen
+    /// after it. Everything measured is application-limited, nothing pushed
+    /// back, and the model's floor is the busiest second. `--nocapture` prints
+    /// the two lines.
+    #[test]
+    fn a_healthy_session_reads_application_limited() {
+        let mut s = V5bSession::open(true, None);
+        s.load();
+        let busy = s.g.path_view(s.t, None);
+        for _ in 0..30 {
+            s.idle(56);
+        }
+        let idle = s.g.path_view(s.t, None);
+        for v in [busy, idle] {
+            assert_eq!(word(v.model_floor), Some((15_915_240, "app-limited")));
+            assert_eq!(word(v.learned_ceiling), Some((6_209_663, "app-limited")));
+            assert_eq!((v.measured, v.model_capacity, v.prior), (None, None, None));
+            assert_eq!(v.belief.2, None, "no capacity");
+        }
+        assert_eq!(word(busy.viewer_rx), Some((15_915_240, "app-limited")));
+        assert_eq!(word(idle.viewer_rx), Some((V5B_IDLE_RX, "app-limited")));
+        assert_eq!(
+            idle.model_floor.unwrap().age,
+            busy.model_floor.unwrap().age + Duration::from_secs(30)
+        );
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .with_test_writer()
+            .finish();
+        let session = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::media_delivery::emit_model(session, &busy);
+            crate::media_delivery::emit_model(session, &idle);
+        });
     }
 
     /// FR-79 V5b (a) — a truly slow pair's reading expires long before its session

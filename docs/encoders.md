@@ -1583,6 +1583,7 @@ source's CSS values.
 | `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them (an RTP pump's SystemContext capture stays on the CPU path, because it waits: [remote-control.md §5.1g](remote-control.md#51g-the-capture-waits-3272)); on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is. Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`, passed on unread like the other denylists; a blank push clears it (FR-132 P1, [remote-config.md](remote-config.md)). `zero_copy` itself is not pushable |
 | `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |
+| `qsv_rate_mode` | `ROOMLERD_QSV_RATE_MODE` | `cbr` | FR-148 P2: `qvbr` opens an HEVC or H.264 QSV session encoder off constant bitrate, at QVBR with its target at 0.9 × the cap ([below](#qsv-off-constant-bitrate-fr-148-p2)). A driver that refuses it opens at `cbr`, and the log says so. `vp9_qsv`, `av1_qsv` and recordings stay at `cbr`. Read at every encoder open, so a restart applies a change in the config; the probe child follows it. This device only: not pushable through remote config (FR-132 decision 1) |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
@@ -1676,8 +1677,8 @@ flowchart TD
     C -->|"same rung as the running maxrate"| N["no-op"]
     C -->|"rung crossed"| M{"RateReconfig<br/>resolved at open"}
     M -->|"NVENC: InPlaceVbr"| V["write rc_max_rate + rc_buffer_size<br/>FFmpeg reconfigures on the next send_frame<br/>0.004 ms, no IDR with patch 0001"]
-    M -->|"QSV with the flag ON: InPlaceCbr"| Q["write bit_rate + rc_max_rate + rc_buffer_size<br/>MFXVideoENCODE_Reset answers −14 on Iris Xe<br/>the encoder is unusable after it"]
-    M -->|"QSV flag OFF, AMF, VideoToolbox, VAAPI, D3D12, Vulkan: Rebuild"| R["reopen at the new maxrate<br/>a fresh IDR plus the open's cost"]
+    M -->|"QSV with the flag ON: InPlaceCbr"| Q["write bit_rate + rc_max_rate + rc_buffer_size<br/>MFXVideoENCODE_Reset answers −14 on Iris Xe<br/>the encoder is unusable after it<br/>after a QVBR open the Reset keeps QVBR"]
+    M -->|"QSV flag OFF, AMF, VideoToolbox, VAAPI, D3D12, Vulkan: Rebuild"| R["reopen at the new maxrate<br/>a fresh IDR plus the open's cost<br/>QSV under qsv_rate_mode qvbr reopens at QVBR"]
     R -->|"bg_rebuild on a direct path, bg_rebuild_constrained on a relay"| S["off-thread swap, adopted at quiet on a relay<br/>counted as swaps"]
     R -->|"inline"| I["blocks the pump for the open<br/>counted as rebuilds"]
 ```
@@ -1713,7 +1714,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10377-10410`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10376-10409`):
 
 | Field | Meaning |
 |---|---|
@@ -1750,7 +1751,9 @@ reads taught it:
   (≤ 2×): a quality-driven backend sits under its cap on compressible content, so the
   RTX read printed `pass: false` on a 0.985 ratio deviation with 0/20 IDRs and a
   0.004 ms apply. The JSON names the basis (`"basis":"idr+apply"` or
-  `"idr+apply+tracking"`).
+  `"idr+apply+tracking"`). ⚠️ With `qsv_rate_mode = qvbr` QSV is quality-driven too,
+  and the sweep still gates it on the ratio, so its `pass` says nothing then: read
+  `rate_idr` and `set_ms` ([QSV off constant bitrate](#qsv-off-constant-bitrate-fr-148-p2)).
 
 **The patch and its gate.** `.github/ffmpeg-patches/0001-nvenc-no-idr-on-bitrate-reconfig.patch`
 drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s bitrate-only reconfigure.
@@ -1768,6 +1771,7 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 | `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:352`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:365`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
 | `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
 | `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
+| `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` (`encode/ffmpeg/encoder.rs:3471`) | `cbr` | `qvbr`: an HEVC or H.264 QSV open leaves constant bitrate for QVBR, its target at 0.9 × the cap, and every rebuild follows ([below](#qsv-off-constant-bitrate-fr-148-p2)). `cbr` is today's open, byte for byte | FR-148 P5 deletes the constant-bitrate path, and the switch with it |
 
 **Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
 VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
@@ -1776,6 +1780,103 @@ rationing, QSV keeps `coarsen_bitrate`, and AMF, D3D12 and Vulkan keep it for th
 Every rate-control switch, with the evidence that retires it and the phase that
 deletes it, is in the registry:
 [`rate-control.md` § Kill switches](rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4).
+
+### QSV off constant bitrate (FR-148 P2)
+
+Every QSV open hands FFmpeg `bit_rate` = `maxrate` = the cap (`build_encoder`,
+`encoder.rs:1891-1896`), and FFmpeg 9.0.1's `select_rc_mode` reads that equality as
+constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every frame to
+`maxrate ÷ fps ÷ 8` bytes, a keepalive of a still screen as much as a frame of motion,
+and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
+measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
+keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
+is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9885`), so
+a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.
+
+`qsv_rate_mode = qvbr` (`ROOMLERD_QSV_RATE_MODE`) opens HEVC and H.264 QSV off that
+equality. `QsvRateOpen` (`encoder.rs:3444`) decides it once per open inside
+`build_encoder`, so every open that function makes is decided the same way: a session's
+first open (`new_with_dispatch_opts`, `encoder.rs:1676`), the probe's, the
+make-before-break rebuild (`open_rebuilt`, `:2612`), the rate, resolution and GPU-device
+reopens (`reopen`, `:2655`), the `vp9_qsv` probe (`:1431`) and a recording's.
+
+```mermaid
+flowchart TD
+    O["a QSV open in build_encoder<br/>QsvRateOpen::plan reads qsv_rate_mode"] -->|"cbr, unset or anything else"| T["today's open, no line of its own<br/>bit_rate = maxrate = the cap<br/>select_rc_mode: CBR"]
+    O -->|"qvbr, but vp9_qsv, av1_qsv or a recording"| K["today's open<br/>one info line says why"]
+    O -->|"qvbr, hevc_qsv or h264_qsv, live"| Q["tier 1 once, at bit_rate = 0.9 × the cap<br/>maxrate = the cap, global_quality kept<br/>select_rc_mode: QVBR"]
+    Q -->|"opens"| A["info: opened at QVBR"]
+    Q -->|"refused, or no context"| F["warn with the error<br/>today's tier 1, then today's ladder<br/>not asked again in this process"]
+```
+
+What FFmpeg makes of the two opens, read from its source (n9.0.1, the pin on every
+platform). None of it is measured yet:
+
+| | Today (`cbr`) | `qvbr` |
+|---|---|---|
+| The context | `bit_rate` = `rc_max_rate` = the cap, `global_quality` = the CQ | `bit_rate` = 0.9 × the cap, `rc_max_rate` = the cap, `global_quality` = the CQ |
+| `select_rc_mode` | CBR, the first branch with a bit rate (`qsvenc.c:628-631`) | QVBR (`:641-643`): ICQ and AVBR both need no `rc_max_rate` (`:623-626`, `:633-639`) |
+| `init_video_param` | `TargetKbps`, `MaxKbps`, `BufferSizeInKB`, `InitialDelayInKB`, `BRCParamMultiplier` | the same fields, plus `QVBRQuality` = the CQ clipped to 0–51 (`:913-921`) |
+| Look-ahead, `mbbrc`, `extbrc`, `low_delay_brc` | unset | unset |
+| An in-place rate move (`encoder_inplace_rate`) | `update_bitrate` resets the BRC with the new fields (`:2410-2441`) | the same, and the method is not chosen again: the session stays QVBR, with the target written at the cap |
+
+Which opens move:
+
+| Open | With `qvbr` | Why |
+|---|---|---|
+| `hevc_qsv`, `h264_qsv`: 4:2:0 or 4:4:4, CPU or GPU input, either `low_power` | QVBR first | the case P2 is for |
+| `vp9_qsv` | today's | FFmpeg 9.0.1 attaches no coding-option buffer to VP9 (`qsvenc.c:964-965`), so `QVBRQuality` would never reach the runtime |
+| `av1_qsv` | today's | Intel's AV1 encoder fails a keyframe over its budget mid-session and hangs the driver (rc.443). A refusal there would come after the open, where no fallback reaches, and no QSV AV1 host has measured it |
+| A recording (`gop_override`) | today's | FR-85's rate control stays |
+| Tiers 0, 2 and 3 | today's | the QVBR attempt is tier 1's alone, so a refusal costs one open and never a lower tier |
+
+**The fallback.** One open at QVBR, with tier 1's whole option dict, at the colour the
+ladder is on. If FFmpeg refuses it (`ENOSYS` when the runtime's `MFXVideoENCODE_Query`
+refuses a parameter, `qsvenc.c:1287-1292`) or the context fails before it, tier 1 runs
+exactly as today, with today's ladder and colour fallback after it, and one warning
+carries the error. The refusal is remembered for the process (`QvbrKey`: the encoder,
+its chroma, its `low_power`), so a host that refuses pays one extra open, once. The
+memory does not know the cause: a QVBR open that fails over another of tier 1's
+options, or over the colour description, ends QVBR for that key in this process too.
+The next line tells them apart. The two opens differ only in `bit_rate`, so if tier
+1's `ffmpeg encoder opened with quality + low-latency options` follows the warning,
+QVBR alone was refused; `ffmpeg open rejected the low-latency knobs` means tier 1
+fails on this host anyway. Only tier 1 asks: with both QSV low-latency knobs emptied
+(`ROOMLERD_FFMPEG_QSV_ASYNC_DEPTH` and `ROOMLERD_FFMPEG_QSV_FORCED_IDR` set empty, the
+escape hatch for a driver that refuses them) there is no tier 1, so no open asks and
+no `FR-148` line is written.
+A warning from the runtime is no refusal: FFmpeg opens on it (`:675-698`, `:1820-1826`),
+so a runtime that quietly runs another mode shows only in the bytes. The probe child
+reads the same switch (a config fallback reaches it as an environment variable) and
+opens the same way, so the probe and a session agree about the cell. The caps cache
+hashes the knob, so a change re-probes. ⚠️ A QVBR open that kills the probe child costs
+the cell, as any death in an open does, until the switch is off again.
+
+**The log.** With the switch off, nothing new. With it on, one line per QSV open,
+beside tier 1's own (none without a tier 1, above):
+
+| Line | Level | When |
+|---|---|---|
+| `FR-148: the QSV encoder opened at QVBR, its target under its cap` (`bit_rate_bps`, `maxrate_bps`) | info | QVBR opened |
+| `FR-148: the QSV encoder did not open at QVBR, so it opens as today, at constant bitrate` (`error`) | warn | the first refusal in the process |
+| `FR-148: this QSV encoder refused QVBR earlier in this process, so it opens at constant bitrate` | info | every later open of that encoder, chroma and `low_power` |
+| `FR-148: the QSV rate switch asks for QVBR, and this open stays at constant bitrate` (`why`) | info | `vp9_qsv`, `av1_qsv`, a recording |
+
+**Turning it on for one device.** The person at the device runs `roomler config set
+qsv_rate_mode qvbr`, then `roomler restart`; on a Windows machine-wide install the
+signed-in user may, with no elevation ([installation.md](installation.md)). The
+daemon's start line `config-backed env fallbacks registered` then lists
+`QSV_RATE_MODE`. `roomler config set qsv_rate_mode cbr` and a restart undo it.
+Remote config cannot set it.
+
+**The read** (FR-148 AC13). On a still screen, two FFmpeg DC heartbeats apart:
+Δ`bytes_written` ÷ Δ`frames_sent` is the bytes a frame, and `keepalive_bytes` ÷
+`frames_keepalive` the same for one window's keepalives. At constant bitrate both are
+`maxrate_bps` ÷ `target_fps` ÷ 8, about 10.6 KB at 2.55 Mbit/s and 30 fps (FR-148
+measured 10,638 bytes). At QVBR they should fall well under it. The still screen's rate
+in kbit/s is Δ`bytes_written` × 8 ÷ `window_ms`; AC13 asks under 300. Whether Iris Xe's
+runtime takes QVBR on `low_power=1`, and what a still frame then costs, is owed that
+read on silicon.
 
 ## Software encoders: the clock and 60 fps (FR-112)
 

@@ -93,6 +93,17 @@ device the exec prompt then says "On behalf of «org»" by the same rule as a
 screen-control prompt ([multi-org.md](multi-org.md) §8b). Before, it named the
 enrollment's label, which on the primary enrollment is literally `primary`.
 
+**An unanswered prompt says whether anyone could be asked** (#3982). The
+question goes up as an SSH session's does: the native panel, else the desktop
+companion, else a desktop notification, while the command waits on the consent
+broker alone. A window that runs out with none of them showing the question
+ends with SSH's sentence, naming the execution policy: "nobody could be asked
+at this device — it has no prompt surface (…); answer with `roomlerd consent`
+there, start the desktop app, or set this device's execution policy to auto".
+One a surface showed, which nobody answered, ends "the operator at this device
+did not approve the command (Timeout)", as before. The chain and its log line
+are in [remote-control.md](remote-control.md), "Prompt surfaces".
+
 ## The four gates
 
 A command runs only if all four allow it. Each is owned by a different party,

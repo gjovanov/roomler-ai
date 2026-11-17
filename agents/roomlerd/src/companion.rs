@@ -1156,9 +1156,17 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// report a TIMEOUT, and "nobody answered in 30 s" and "there is nobody to
 /// ask, and there never was" need different things done about them.
 pub async fn ensure_running() -> bool {
+    tray_up().await && reaches_the_tray().await
+}
+
+/// #3983 — the tray's half of [`ensure_running`]'s verdict: whether the tray
+/// is up, started if it was not, within the start's own wait, and kept as
+/// [`EnsureVerdicts`] keeps it. The road to the tray ([`reaches_the_tray`]) is
+/// the other half, asked after it.
+async fn tray_up() -> bool {
     let verdicts = ensure_verdicts();
     if let Some(up) = verdicts.standing() {
-        return up && reaches_the_tray().await;
+        return up;
     }
 
     let (up, stands) = match ensure_running_inner().await {
@@ -1188,7 +1196,7 @@ pub async fn ensure_running() -> bool {
         }
     };
     verdicts.keep(up, stands);
-    up && reaches_the_tray().await
+    up
 }
 
 /// One attempt per this interval, process-wide, after a verdict that cannot
@@ -1259,16 +1267,46 @@ fn ensure_verdicts() -> &'static EnsureVerdicts {
     &VERDICTS
 }
 
+/// #3983 — the companion's verdict for a consent question that waits for it
+/// before its window starts: an RC prompt's consent task ([`start_for_prompt`])
+/// and an SSH session's or a recording's question ([`Companion::up`]). The
+/// tray's start gets [`crate::signaling::COMPANION_START_BUDGET`]. The road to
+/// the tray ([`reaches_the_tray`]) is asked after it, within its own
+/// [`crate::consent_relay::RELAY_WITHIN`], outside that budget. Until #3983 the
+/// budget held both, so on a Mac's root daemon a first start of about 2.5 s
+/// and a person socket slow to answer ran out of it, and a question the tray
+/// could show read as having no surface. Off a Mac's root daemon the road is
+/// direct and answers at once, so the wait is the start's alone, as before.
+async fn up_for_a_question() -> bool {
+    tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, tray_up())
+        .await
+        .unwrap_or(false)
+        && reaches_the_tray().await
+}
+
+// #3983 — the longest a question waits for `up_for_a_question` before its
+// window starts (#3888): the start's budget, then the road's. The hub waits
+// `CONSENT_VERDICT_GRACE` (crates/remote_control/src/consent.rs:149) past the
+// window it announced for the agent's verdict, so this wait stays under it:
+// longer, and the hub's backstop would answer a bare timeout first, throwing
+// away the agent's reason ("nobody answered" or "nobody could be asked").
+const _: () = assert!(
+    crate::signaling::COMPANION_START_BUDGET.as_millis()
+        + crate::consent_relay::RELAY_WITHIN.as_millis()
+        < roomler_ai_remote_control::consent::CONSENT_VERDICT_GRACE.as_millis()
+);
+
 /// #3888 — the companion's start for a consent prompt, as the WS loop asks
-/// for it ([`ensure_running`], [`crate::signaling::COMPANION_START_BUDGET`]
-/// at most): STARTED, on a task of its own, and never waited for here. The
+/// for it ([`up_for_a_question`]: the start within
+/// [`crate::signaling::COMPANION_START_BUDGET`], then the road to the tray):
+/// STARTED, on a task of its own, and never waited for here. The
 /// start asks other processes (logind, the process list, launchd), and the
 /// loop reads its next frame meanwhile. Its verdict is the session's consent
 /// task's to wait for ([`Starting::up`]), before the question's window
 /// starts, so a start that failed or ran out of time is still
 /// `no_prompt_surface`, as when the loop waited for it.
 pub(crate) async fn start_for_prompt() -> Starting {
-    let start = tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running());
+    let start = up_for_a_question();
     // A test stands the tray's start in for its own task; the start runs on a
     // task of its own, so the stand-in goes with it.
     #[cfg(all(test, any(target_os = "windows", unix)))]
@@ -1281,7 +1319,7 @@ pub(crate) async fn start_for_prompt() -> Starting {
             }
         }
     };
-    Starting(tokio::spawn(async move { start.await.unwrap_or(false) }))
+    Starting(tokio::spawn(start))
 }
 
 /// #3888 — a companion's start for a prompt ([`start_for_prompt`]).
@@ -1303,7 +1341,7 @@ impl Starting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Companion {
     /// Ask the system: start the companion if it is installed and not
-    /// running ([`ensure_running`], bounded).
+    /// running ([`up_for_a_question`], bounded).
     System,
     /// A fixed answer — for tests, which must never launch the real app.
     Fixed(bool),
@@ -1320,7 +1358,8 @@ pub enum Companion {
 
 impl Companion {
     /// Is the companion up to show the question? [`Self::System`] waits for
-    /// a start at most [`crate::signaling::COMPANION_START_BUDGET`].
+    /// a start at most [`crate::signaling::COMPANION_START_BUDGET`], then for
+    /// the road to the tray at most its own 1 s ([`up_for_a_question`]).
     ///
     /// Compiled where something asks through it: a remote recording, and an
     /// SSH session. Built without either, it is dead code, and every
@@ -1328,11 +1367,7 @@ impl Companion {
     #[cfg(any(feature = "recording", feature = "ssh-server"))]
     pub(crate) async fn up(self) -> bool {
         match self {
-            Self::System => {
-                tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running())
-                    .await
-                    .unwrap_or(false)
-            }
+            Self::System => up_for_a_question().await,
             Self::Fixed(up) => up,
             Self::Timed { .. } => true,
             Self::Starting(after) => {
@@ -2324,27 +2359,45 @@ fn start_tray(
 const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// #3864 — the rest of [`ensure_running`]'s verdict, asked fresh at every
-/// prompt, beside the tray's own: whether a question this daemon asks gets to
-/// the tray at all. Off a one-row Mac's root daemon the tray asks this daemon
-/// itself, and it does. On one, the tray asks the worker, which lists the
-/// root daemon's questions only while the road is open
+/// prompt after the tray's own ([`tray_up`]; since #3983 outside the start's
+/// budget, [`up_for_a_question`]): whether a question this daemon asks gets to
+/// the tray at all. Off a Mac's root daemon the tray asks this daemon
+/// itself, and it does. On a one-row Mac's, the tray asks the worker, which
+/// lists the root daemon's questions only while the road is open
 /// ([`crate::consent_relay::reach`]): closed, the tray is not the question's
-/// surface, and a window nobody answers ends as `no_prompt_surface`.
+/// surface, and a window nobody answers ends as `no_prompt_surface`. #3967 —
+/// on a two-row Mac's root half the same, through the per-user half that
+/// announced it relays.
 async fn reaches_the_tray() -> bool {
     // A test stands the road in with the tray's start.
     #[cfg(all(test, any(target_os = "windows", unix)))]
-    let reach = match tray_stand_in::now().and_then(|stood| stood.road) {
-        Some(road) => road.reach().await,
-        None => crate::consent_relay::reach().await,
+    let (reach, one_row) = match tray_stand_in::now().map(|stood| (stood.road, stood.two_rows)) {
+        Some((Some(road), _)) => (road.reach().await, true),
+        Some((None, Some(announced))) => (announced.reach().await, false),
+        _ => (
+            crate::consent_relay::reach().await,
+            crate::consent_relay::one_row(),
+        ),
     };
     #[cfg(not(all(test, any(target_os = "windows", unix))))]
-    let reach = crate::consent_relay::reach().await;
+    let (reach, one_row) = (
+        crate::consent_relay::reach().await,
+        crate::consent_relay::one_row(),
+    );
     if let crate::consent_relay::Reach::Closed(why) = &reach {
-        tracing::info!(
-            why = %why,
-            "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
-             (#3864); `roomlerd consent` still answers it"
-        );
+        if one_row {
+            tracing::info!(
+                why = %why,
+                "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
+                 (#3864); `roomlerd consent` still answers it"
+            );
+        } else {
+            tracing::info!(
+                why = %why,
+                "a two-row Mac's root-half question cannot reach the menu-bar app, which is not \
+                 its surface (#3967); `roomlerd consent` still answers it"
+            );
+        }
     }
     reach.open()
 }
@@ -2367,6 +2420,10 @@ mod tray_stand_in {
         /// the tray, stood in. `None`: this daemon is not a one-row Mac's
         /// root, and the tray asks it directly.
         pub(super) road: Option<crate::consent_relay::stand_in::Road>,
+        /// #3967 — a two-row Mac's road from the root half's question to the
+        /// tray, stood in. `None` with `road` `None`: this daemon is no Mac's
+        /// root half.
+        pub(super) two_rows: Option<crate::consent_relay::stand_in::Announced>,
     }
 
     impl StandIn {
@@ -2376,6 +2433,7 @@ mod tray_stand_in {
                 starts: Box::leak(Box::new(TrayStarts::new("tray-start"))),
                 verdicts: Box::leak(Box::new(EnsureVerdicts::new())),
                 road: None,
+                two_rows: None,
             }
         }
 
@@ -2383,6 +2441,15 @@ mod tray_stand_in {
         pub(super) fn on_one_row(self, road: crate::consent_relay::stand_in::Road) -> Self {
             Self {
                 road: Some(road),
+                ..self
+            }
+        }
+
+        /// #3967 — this daemon as a two-row Mac's root half, with what its
+        /// person socket knows of the console person's per-user half.
+        pub(super) fn on_two_rows(self, road: crate::consent_relay::stand_in::Announced) -> Self {
+            Self {
+                two_rows: Some(road),
                 ..self
             }
         }
@@ -3097,6 +3164,198 @@ mod tray_start_tests {
         }
     }
 
+    /// #3967 — on a two-row Mac the root half asks its own row's questions,
+    /// and the tray reads the console person's per-user half. A tray that is
+    /// up is the question's surface only while that per-user half has said
+    /// it lists the root half's questions (`consent_relaying`, held on its
+    /// connection) and the person socket answers a list in time. Otherwise it
+    /// is not counted, and a window nobody answered ends as
+    /// `no_prompt_surface`: an older per-user half (it says nothing), none
+    /// running for the console person, a person socket that is gone (it is
+    /// switched off, or the seat moved) or stalled. Nothing is shared without
+    /// an answer.
+    ///
+    /// Red before #3967: a two-row Mac's root half counted a tray that was up
+    /// whatever reached it, and the window's end read as the person's
+    /// timeout.
+    #[test]
+    fn a_two_row_tray_is_the_surface_only_while_its_per_user_half_announces() {
+        use crate::consent::Decision;
+        use crate::consent_relay::stand_in::{Announced, Answers};
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let rt = runtime();
+        let works = Host::default();
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let reason_at_the_windows_end = |road: Announced| {
+            let ind = ind.clone();
+            let stood = StandIn::new(host_steps(&works)).on_two_rows(road);
+            rt.block_on(asking(stood, async move {
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("j9"))),
+                    mark_up: None,
+                };
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "j9", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }))
+        };
+        let announced = Announced {
+            uid: Some(501),
+            answers: Answers::Yes,
+        };
+        assert_eq!(
+            reason_at_the_windows_end(announced),
+            Some(ConsentDenyReason::HostTimeout),
+            "announced: the tray shows the question, and nobody answered"
+        );
+        for (road, what) in [
+            (
+                Announced {
+                    uid: None,
+                    ..announced
+                },
+                "no per-user half announced (an older one, or none for the console person)",
+            ),
+            (
+                Announced {
+                    answers: Answers::No,
+                    ..announced
+                },
+                "a person socket that does not answer (gone)",
+            ),
+            (
+                Announced {
+                    answers: Answers::Never,
+                    ..announced
+                },
+                "a person socket that never answers (stalled)",
+            ),
+        ] {
+            assert_eq!(
+                reason_at_the_windows_end(road),
+                Some(ConsentDenyReason::NoPromptSurface),
+                "{what}: nobody could be asked"
+            );
+        }
+    }
+
+    /// #3983 — a slow start that works, followed by a slow road that
+    /// answers, is the question's surface. On a Mac's root daemon a
+    /// question's verdict waits for the tray's start, within its 3 s budget
+    /// ([`crate::signaling::COMPANION_START_BUDGET`]), and then for the road
+    /// to the tray, within its own 1 s ([`crate::consent_relay::RELAY_WITHIN`]),
+    /// outside that budget ([`up_for_a_question`]). A start of about 2.1 s and
+    /// a road of about 0.95 s, each within its own wait: on one row an RC
+    /// question's window ends as the person's timeout, and on two rows an SSH
+    /// session's or a recording's companion is up. The control: after the
+    /// same start, a road that never answers is no surface, and its verdict
+    /// comes within the budget and the road's wait.
+    ///
+    /// Red before #3983: the start's budget held the road too, ran out at
+    /// 3 s, and the question read as having no surface.
+    #[test]
+    fn a_slow_start_and_then_a_slow_road_is_still_the_surface() {
+        use crate::consent::Decision;
+        use crate::consent_relay::Worker;
+        use crate::consent_relay::stand_in::{Answers, Road};
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        // Together past the 3 s budget, each within its own wait. The start
+        // is a thread's, so it keeps 0.4 s of its 2.5 s (`TRAY_START_WAIT`)
+        // for a busy runner. The road is the runtime's own timer, which a
+        // `timeout` polls after its future, so it may come close to its 1 s.
+        const SLOW_START: Duration = Duration::from_millis(2100);
+        const SLOW_ROAD: Duration = Duration::from_millis(950);
+        let rt = runtime();
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        // A host whose start takes SLOW_START: its held step opens that long
+        // after a start reaches it.
+        let slow_host = || {
+            let held = Held::default();
+            let host = Host {
+                held: Some(held.clone()),
+                ..Host::default()
+            };
+            let opens = held.clone();
+            std::thread::spawn(move || {
+                let asked = Instant::now();
+                while opens.began() == 0 && asked.elapsed() < RUNS_WITHIN {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(SLOW_START);
+                opens.open();
+            });
+            (host, OpenedAtTheEnd(held))
+        };
+        let on_one_row = |answers: Answers| {
+            let (host, _opened) = slow_host();
+            let road = Road {
+                worker: Worker {
+                    relays: true,
+                    uid: Some(501),
+                },
+                answers,
+            };
+            let stood = StandIn::new(host_steps(&host)).on_one_row(road);
+            let ind = ind.clone();
+            let asked = Instant::now();
+            let reason = rt.block_on(asking(stood, async move {
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("m3"))),
+                    mark_up: None,
+                };
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "m3", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }));
+            (reason, asked.elapsed())
+        };
+        let (reason, waited) = on_one_row(Answers::After(SLOW_ROAD));
+        assert_eq!(
+            reason,
+            Some(ConsentDenyReason::HostTimeout),
+            "a slow start and a slow road, each in time: the tray shows the question, and \
+             nobody answered (the verdict came in {waited:?})"
+        );
+        let (reason, waited) = on_one_row(Answers::Never);
+        assert_eq!(
+            reason,
+            Some(ConsentDenyReason::NoPromptSurface),
+            "a road that never answers: nobody could be asked"
+        );
+        assert!(
+            waited
+                < crate::signaling::COMPANION_START_BUDGET
+                    + crate::consent_relay::RELAY_WITHIN
+                    + SLACK,
+            "the verdict came in {waited:?}: past the start's budget and the road's wait"
+        );
+        // An SSH session's and a recording's question ask the same, through
+        // `Companion::System`.
+        #[cfg(any(feature = "recording", feature = "ssh-server"))]
+        {
+            use crate::consent_relay::stand_in::Announced;
+            let (host, _opened) = slow_host();
+            let stood = StandIn::new(host_steps(&host)).on_two_rows(Announced {
+                uid: Some(501),
+                answers: Answers::After(SLOW_ROAD),
+            });
+            assert!(
+                rt.block_on(asking(stood, Companion::System.up())),
+                "two rows, a slow start and a slow road: the companion is up"
+            );
+        }
+    }
+
     /// #3888 — a question withdrawn while the tray's start is held (a
     /// `Terminate` the loop reads meanwhile, which finds nothing on the screen
     /// to take down) gets no notification once the start runs out of time: no
@@ -3774,6 +4033,66 @@ mod tray_start_tests {
                 ),
             }
         }
+    }
+
+    /// An exec question, open for 30 s.
+    fn exec_view(request_id: &str) -> crate::indicator::PromptView {
+        crate::indicator::PromptView {
+            session_hex: request_id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    /// #3982 — an exec question that no surface showed (no native panel, no
+    /// companion, no notification) ends with SSH's "nobody could be asked"
+    /// words once its window is out, naming the execution policy, and so
+    /// does one whose companion is up with no marker to read. One the
+    /// companion showed, which nobody answered, still ends "did not approve
+    /// the command (Timeout)". The surfaces go up as the WS loop's task puts
+    /// them up ([`crate::signaling::exec_surfaces_up`]), and the answer is
+    /// worded as the command's task words it
+    /// ([`crate::signaling::exec_refusal`]).
+    ///
+    /// Red before #3982: every unanswered exec question ended "did not
+    /// approve the command (Timeout)", whether anything showed it or not.
+    #[test]
+    fn an_exec_question_no_surface_showed_says_nobody_could_be_asked() {
+        use crate::consent::Decision;
+        let rt = runtime();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let works = Host::default();
+        // No native panel and no notification: the companion alone decides.
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let words_at_the_windows_end = |host: &Host, marker: bool| {
+            let ind = ind.clone();
+            rt.block_on(asking(StandIn::new(host_steps(host)), async move {
+                let have_surface =
+                    crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
+                crate::signaling::exec_refusal(Decision::Timeout, have_surface)
+            }))
+        };
+        let nobody = crate::consent::nobody_could_be_asked("execution");
+        assert_eq!(
+            words_at_the_windows_end(&none, true),
+            nobody,
+            "no companion: nobody could be asked"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&works, false),
+            nobody,
+            "a companion with no marker to read shows nothing"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&works, true),
+            "the operator at this device did not approve the command (Timeout)",
+            "a companion that showed it: nobody answered"
+        );
     }
 }
 
