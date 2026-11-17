@@ -296,6 +296,10 @@ pub fn log_reopen(
     );
 }
 
+/// #3996 — the tray's one line when its icon or its Device status opens the
+/// window.
+pub fn log_tray_open(_item: &str, _tour_held: bool, _view: &str) {}
+
 /// Show the window as a person's opening of the running companion decided
 /// (#3941): a second launch forwarded on Windows and Linux, a reopen on
 /// macOS, one code for both. `route` sends the page to a view, `show` shows
@@ -1107,6 +1111,43 @@ mod tests {
         );
         assert!(
             lines[1].contains("has_visible_windows=true"),
+            "{}",
+            lines[1]
+        );
+    }
+
+    /// #3996 — one line per click on the tray's icon or its Device status,
+    /// beside a reopen's, naming what it shows: the tour a start for a prompt
+    /// held back, else the Overview. Until #3996 that click logged nothing.
+    #[test]
+    fn a_tray_click_logs_what_it_shows() {
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_tray_open("icon", true, tray_open_view(true, false));
+            log_tray_open("Device status", false, tray_open_view(false, true));
+        });
+        let log = String::from_utf8(sink.0.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            .expect("the log is UTF-8");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per click:\n{log}");
+        assert!(
+            lines[0].contains("a tray click shows the tour")
+                && lines[0].contains(r#"item="icon""#)
+                && lines[0].contains("tour_held=true"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("a tray click shows the Overview")
+                && lines[1].contains(r#"item="Device status""#)
+                && lines[1].contains(r#"view="overview""#),
             "{}",
             lines[1]
         );
