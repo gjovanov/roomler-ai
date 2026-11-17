@@ -1267,9 +1267,9 @@ fn ensure_verdicts() -> &'static EnsureVerdicts {
     &VERDICTS
 }
 
-/// #3983 — the companion's verdict for a consent question that waits for it
-/// before its window starts: an RC prompt's consent task ([`start_for_prompt`])
-/// and an SSH session's or a recording's question ([`Companion::up`]). The
+/// #3983 — the companion's verdict for a consent question: read beside the
+/// window by an RC prompt's consent task since #4000 ([`start_for_prompt`]), and
+/// waited for first by an SSH session's or a recording's ([`Companion::up`]). The
 /// tray's start gets [`crate::signaling::COMPANION_START_BUDGET`]. The road to
 /// the tray ([`reaches_the_tray`]) is asked after it, within its own
 /// [`crate::consent_relay::RELAY_WITHIN`], outside that budget. Until #3983 the
@@ -1285,11 +1285,11 @@ async fn up_for_a_question() -> bool {
 }
 
 // #3983 — the longest a question waits for `up_for_a_question` before its
-// window starts (#3888): the start's budget, then the road's. The hub waits
-// `CONSENT_VERDICT_GRACE` (crates/remote_control/src/consent.rs:149) past the
-// window it announced for the agent's verdict, so this wait stays under it:
-// longer, and the hub's backstop would answer a bare timeout first, throwing
-// away the agent's reason ("nobody answered" or "nobody could be asked").
+// window starts: an SSH session's or a recording's (an RC prompt's has not
+// since #4000; #3888 had it wait). The hub waits `CONSENT_VERDICT_GRACE`
+// (crates/remote_control/src/consent.rs:149) past the window it announced for
+// the agent's verdict, so this wait stays under it: longer, and the hub's
+// backstop would answer a bare timeout first, throwing away the agent's reason.
 const _: () = assert!(
     crate::signaling::COMPANION_START_BUDGET.as_millis()
         + crate::consent_relay::RELAY_WITHIN.as_millis()
@@ -1302,9 +1302,9 @@ const _: () = assert!(
 /// STARTED, on a task of its own, and never waited for here. The
 /// start asks other processes (logind, the process list, launchd), and the
 /// loop reads its next frame meanwhile. Its verdict is the session's consent
-/// task's to wait for ([`Starting::up`]), before the question's window
-/// starts, so a start that failed or ran out of time is still
-/// `no_prompt_surface`, as when the loop waited for it.
+/// task's ([`Starting::up`]), read beside the question's window since #4000
+/// (#3888 waited for it before the window started), so a start that failed or
+/// ran out of time is still `no_prompt_surface`, as when the loop waited for it.
 pub(crate) async fn start_for_prompt() -> Starting {
     let start = up_for_a_question();
     // A test stands the tray's start in for its own task; the start runs on a
@@ -3004,8 +3004,8 @@ mod tray_start_tests {
 
     /// #3888 — a start that fails, or runs out of its wait, is still
     /// `no_prompt_surface` once the window is out, never a timeout: the
-    /// consent task waits for its verdict before the window starts
-    /// ([`crate::signaling::rc_surfaces_up`]). The control beside them: a
+    /// consent task reads its verdict when the window ends, which it reaches
+    /// first ([`crate::signaling::rc_surfaces_up`], #4000). The control beside them: a
     /// start that works is a surface, and the window's end is then the
     /// person's timeout.
     #[test]
@@ -8345,10 +8345,10 @@ impl NoGraphicalSession {
 /// own D-Bus timeout is 25 s, and every `loginctl` waits it out. A healthy
 /// walk is a few `loginctl` processes, tens of milliseconds, far less than
 /// half of this, and half is what one walk in flight needs to answer every
-/// caller (`one_in_flight`'s cost). On the consent path the tray's start
-/// (2.5 s at most) and this wait together stay inside the 5 s the hub waits
-/// past a prompt's window (`CONSENT_VERDICT_GRACE`), so the agent's
-/// `no_prompt_surface` reaches the controller ahead of the hub's own timer.
+/// caller (`one_in_flight`'s cost). On an RC prompt's consent path this wait,
+/// the tray's start and the notification's show go up beside the prompt's
+/// window (#4000), so none of them holds the agent's verdict back past the
+/// 5 s the hub waits after the window (`CONSENT_VERDICT_GRACE`).
 #[cfg(all(
     target_os = "linux",
     any(feature = "portal-capture", feature = "recording")

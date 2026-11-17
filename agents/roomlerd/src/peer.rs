@@ -6292,7 +6292,7 @@ async fn end_stopped_at_screen(
     );
     if let Some(p) = pipeline {
         for f in &followers {
-            if !rc_sessions.disconnect(f) {
+            if !rc_sessions.disconnect(f, crate::rc_sessions::Via::ShareStop) {
                 warn!(%session_id, follower = %f, "capture stopped at the screen: a follower's session could not be ended");
             }
         }
@@ -6306,7 +6306,7 @@ async fn end_stopped_at_screen(
     let mut ended = false;
     loop {
         if !ended {
-            ended = rc_sessions.disconnect(&session_id);
+            ended = rc_sessions.disconnect(&session_id, crate::rc_sessions::Via::ShareStop);
             if !ended && asks.is_multiple_of(30) {
                 warn!(%session_id, asks, "capture stopped at the screen: the session's Disconnect could not be queued yet");
             }
@@ -6350,7 +6350,7 @@ async fn end_no_video(
     let mut asked = false;
     loop {
         if !asked {
-            asked = rc_sessions.disconnect(&session_id);
+            asked = rc_sessions.disconnect(&session_id, crate::rc_sessions::Via::NoVideo);
             if !asked && asks.is_multiple_of(30) {
                 warn!(%session_id, asks, "no encoder: the session's end could not be queued yet");
             }
@@ -16817,7 +16817,7 @@ pub(crate) mod folder_download_as_the_person_tests {
 #[cfg(test)]
 mod stopped_at_screen_tests {
     use super::*;
-    use crate::rc_sessions::RcSessionRegistry;
+    use crate::rc_sessions::{RcSessionRegistry, Via};
     use bson::oid::ObjectId;
 
     fn listed(reg: &RcSessionRegistry, session: ObjectId, kill: crate::rc_sessions::KillSender) {
@@ -16847,7 +16847,7 @@ mod stopped_at_screen_tests {
             no_video.load(std::sync::atomic::Ordering::Relaxed),
             "the loop can name the end"
         );
-        assert_eq!(killed.try_recv().ok(), Some(sid), "the session's end");
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::NoVideo))); // the session's end
         assert!(killed.try_recv().is_err(), "asked once, not every second");
     }
 
@@ -16869,7 +16869,7 @@ mod stopped_at_screen_tests {
         assert!(killed.try_recv().is_err(), "nothing to end yet");
         listed(&reg, sid, kill);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::NoVideo)));
         assert!(!pump.is_finished(), "only the teardown ends the pump");
         pump.abort();
     }
@@ -16914,7 +16914,7 @@ mod stopped_at_screen_tests {
         );
         assert_eq!(
             killed.try_recv().ok(),
-            Some(sid),
+            Some((sid, Via::ShareStop)),
             "the session's Disconnect"
         );
         assert!(killed.try_recv().is_err(), "asked once, not every second");
@@ -16935,7 +16935,7 @@ mod stopped_at_screen_tests {
         assert!(killed.try_recv().is_err(), "nothing to end yet");
         listed(&reg, sid, kill);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert_eq!(killed.try_recv().ok(), Some((sid, Via::ShareStop)));
         pump.abort();
     }
 
@@ -16972,12 +16972,12 @@ mod stopped_at_screen_tests {
         tokio::select! {
             _ = end_stopped_at_screen(owner, &reg, Some(&pipeline)) => unreachable!("it never returns"),
             () = async {
-                assert_eq!(killed.recv().await, Some(follower), "the follower first");
+                assert_eq!(killed.recv().await, Some((follower, Via::ShareStop)), "the follower first");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 assert!(killed.try_recv().is_err(), "the owner waits while its follower is still on");
                 // The follower's own teardown aborts its task, which drops its guard.
                 drop(guard);
-                assert_eq!(killed.recv().await, Some(owner), "then the owner");
+                assert_eq!(killed.recv().await, Some((owner, Via::ShareStop)), "then the owner");
             } => {}
         }
     }

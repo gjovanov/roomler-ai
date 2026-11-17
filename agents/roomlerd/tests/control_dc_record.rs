@@ -307,7 +307,7 @@ struct Device {
 }
 
 impl Device {
-    fn new() -> (Self, mpsc::Receiver<ObjectId>) {
+    fn new() -> (Self, mpsc::Receiver<roomlerd::rc_sessions::KillOrder>) {
         let registry = RcSessionRegistry::new();
         let (kill_tx, kill_rx) = mpsc::channel(4);
         let indicator = ViewerIndicator::disabled().with_registry(kill_tx, registry.clone());
@@ -375,7 +375,7 @@ struct Rig {
     session_id: ObjectId,
     controller_user_id: ObjectId,
     pcs: (Arc<RTCPeerConnection>, Arc<RTCPeerConnection>),
-    _kill_rx: Option<mpsc::Receiver<ObjectId>>,
+    _kill_rx: Option<mpsc::Receiver<roomlerd::rc_sessions::KillOrder>>,
 }
 
 impl Rig {

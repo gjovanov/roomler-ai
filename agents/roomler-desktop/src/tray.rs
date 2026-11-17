@@ -80,7 +80,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     )?;
 
     let on_menu = |app: &AppHandle<R>, event: tauri::menu::MenuEvent| match event.id.as_ref() {
-        "open_status" => show_window(app, &crate::first_run::tray_path()),
+        "open_status" => show_status(app, "Device status"),
         "open_web" => open_roomler_web(app),
         RECORD_ITEM_ID => toggle_recording(app),
         KEEP_BUSY_ITEM_ID => toggle_keep_busy(app),
@@ -108,7 +108,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             ..
         } = event
         {
-            show_window(tray.app_handle(), &crate::first_run::tray_path());
+            show_status(tray.app_handle(), "icon");
         }
     };
 
@@ -534,6 +534,16 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
             }
         }
     });
+}
+
+/// #3996 — the tray's icon and its Device status: the main window, on the
+/// view [`crate::first_run::tray_path`] names, with one line saying what it
+/// shows ([`crate::first_run::log_tray_open`]).
+fn show_status<R: Runtime>(app: &AppHandle<R>, item: &'static str) {
+    let tour_held = crate::first_run::tour_held();
+    let path = crate::first_run::tray_path();
+    crate::first_run::log_tray_open(item, tour_held, path.trim_start_matches('/'));
+    show_window(app, &path);
 }
 
 /// Show + focus the main window and route the SPA to `path` (a hash-router
