@@ -1073,6 +1073,19 @@ impl SentinelKind {
     }
 }
 
+/// #3982 — what a caller is told when its question stood its window and no
+/// surface could show it: no native panel, no companion up to read the
+/// marker, no notification. SSH's words since FR-27, and an exec command's
+/// since #3982: one text, so the two cannot drift. `policy` names the device
+/// policy that would skip the question: `SSH`, `execution`.
+pub(crate) fn nobody_could_be_asked(policy: &str) -> String {
+    format!(
+        "nobody could be asked at this device — it has no prompt surface (no one at its \
+         screen and the Roomler desktop app is not running); answer with `roomlerd \
+         consent` there, start the desktop app, or set this device's {policy} policy to auto"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2543,6 +2556,23 @@ mod cli_name_tests {
         assert!(
             src.contains("roomlerd consent --session"),
             "the guidance must still tell the operator the actual command"
+        );
+    }
+}
+
+/// #3982 — the words a caller reads when nobody could be asked
+/// ([`nobody_could_be_asked`]): one text for SSH and an exec command.
+#[cfg(test)]
+mod no_surface_words_tests {
+    use super::nobody_could_be_asked;
+
+    /// SSH's sentence, word for word, as it read before the text was shared:
+    /// an edit to the shared text cannot drift it.
+    #[test]
+    fn sshs_no_surface_sentence_is_pinned() {
+        assert_eq!(
+            nobody_could_be_asked("SSH"),
+            "nobody could be asked at this device — it has no prompt surface (no one at its screen and the Roomler desktop app is not running); answer with `roomlerd consent` there, start the desktop app, or set this device's SSH policy to auto"
         );
     }
 }

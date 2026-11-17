@@ -6082,9 +6082,13 @@ async fn handle_server_msg(
                         crate::consent::PromptSurface::Companion
                     },
                 };
-                if let Err(e) = consent_broker.write_prompt(&request_id, &prompt) {
-                    tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
-                }
+                let marker = match consent_broker.write_prompt(&request_id, &prompt) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
+                        false
+                    }
+                };
                 if !native {
                     // FR-93 P6f — and where the companion cannot show it, a
                     // desktop notification. In the background, as the
@@ -6095,9 +6099,7 @@ async fn handle_server_msg(
                     // then would outlive it.
                     let ind = indicator.clone();
                     tokio::spawn(async move {
-                        if !crate::companion::ensure_running().await {
-                            ind.show_notification_prompt(view).await;
-                        }
+                        exec_surfaces_up(marker, &ind, view).await;
                     });
                 }
             }
@@ -6135,9 +6137,7 @@ async fn handle_server_msg(
                 let outcome = if !decision.granted() {
                     warn!(%request_id, ?caller, ?decision, "rc:rpc.exec denied at the device");
                     crate::exec::ExecOutcome {
-                        error: Some(format!(
-                            "the operator at this device did not approve the command ({decision:?})"
-                        )),
+                        error: Some(exec_refusal(decision, true)),
                         ..Default::default()
                     }
                 } else if via_service {
@@ -7645,6 +7645,28 @@ pub(crate) async fn notification_shown(
         }
         shown = notifying.shown() => shown,
     }
+}
+
+/// #3982 — the surfaces of an exec question that no native panel showed:
+/// the desktop companion, started if it is not running
+/// ([`crate::companion::ensure_running`]), and FR-93 P6f's desktop
+/// notification where the companion cannot show it. Whether either showed
+/// the question. Run on a task of its own: the command waits on the broker
+/// alone, never on this.
+pub(crate) async fn exec_surfaces_up(
+    marker: bool,
+    indicator: &ViewerIndicator,
+    view: crate::indicator::PromptView,
+) -> bool {
+    let companion = crate::companion::ensure_running().await;
+    let notified = !companion && indicator.show_notification_prompt(view).await;
+    (companion && marker) || notified
+}
+
+/// #3982 — what an exec command's caller reads when the person at the
+/// device did not approve it.
+pub(crate) fn exec_refusal(decision: crate::consent::Decision, _have_surface: bool) -> String {
+    format!("the operator at this device did not approve the command ({decision:?})")
 }
 
 #[cfg(test)]
@@ -9186,5 +9208,43 @@ mod notification_off_the_loop_tests {
             Some(Err("no graphical session".to_string())),
             "no marker for the companion to read: a notification"
         );
+    }
+}
+
+/// #3982 — what an exec command's caller reads when the person at the device
+/// did not approve it ([`exec_refusal`]).
+#[cfg(test)]
+mod exec_answer_tests {
+    use super::exec_refusal;
+    use crate::consent::Decision;
+
+    /// A window that ran out with no surface to show the question says that
+    /// nobody could be asked, in SSH's words naming the execution policy. One
+    /// a surface showed is the person's timeout, as before. An answer, and a
+    /// question withdrawn, read as they always did, surface or not.
+    ///
+    /// Red before #3982: every refusal read "did not approve the command".
+    #[test]
+    fn only_a_window_no_surface_showed_says_nobody_could_be_asked() {
+        assert_eq!(
+            exec_refusal(Decision::Timeout, false),
+            crate::consent::nobody_could_be_asked("execution")
+        );
+        assert_eq!(
+            exec_refusal(Decision::Timeout, true),
+            "the operator at this device did not approve the command (Timeout)"
+        );
+        for have_surface in [true, false] {
+            assert_eq!(
+                exec_refusal(Decision::Denied, have_surface),
+                "the operator at this device did not approve the command (Denied)",
+                "denied (surface={have_surface})"
+            );
+            assert_eq!(
+                exec_refusal(Decision::Cancelled, have_surface),
+                "the operator at this device did not approve the command (Cancelled)",
+                "withdrawn (surface={have_surface})"
+            );
+        }
     }
 }
