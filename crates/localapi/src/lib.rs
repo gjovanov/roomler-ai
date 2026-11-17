@@ -6694,6 +6694,27 @@ pub struct LanCaptureStatus {
     pub via_name: Option<String>,
 }
 
+/// #3998 — whether this account's OWN endpoint is gone.
+#[cfg(unix)]
+pub async fn own_endpoint_gone() -> bool {
+    match per_user_socket_path() {
+        Some(path) => endpoint_gone(&path).await,
+        None => false,
+    }
+}
+
+/// #3998 — the pipe is [`connect`]'s only endpoint on Windows.
+#[cfg(windows)]
+pub async fn own_endpoint_gone() -> bool {
+    false
+}
+
+/// #3998 — whether nothing is at `path` that a client could reach.
+#[cfg(unix)]
+pub(crate) async fn endpoint_gone(_path: &std::path::Path) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12552,6 +12573,32 @@ mod tests {
                 held.push(stream);
             }
         })
+    }
+
+    /// #3998 — an endpoint is gone when nothing is at its path, or nothing
+    /// listens on what is there: a daemon that stopped and left its socket
+    /// behind. One that a service listens on is not, busy or silent. On a
+    /// Linux system install and a Mac this is what tells a stopped daemon
+    /// from a refusal: `connect` returns its last endpoint's error, the
+    /// system socket's `PermissionDenied`, whether or not the daemon runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_endpoint_missing_or_left_behind_is_gone_and_a_served_one_is_not() {
+        let dir = test_socket_dir("3998-gone");
+        let missing = dir.join("missing.sock");
+        assert!(endpoint_gone(&missing).await, "nothing at the path");
+        let left = dir.join("left.sock");
+        drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+        assert!(left.exists(), "the socket stays behind its listener");
+        assert!(endpoint_gone(&left).await, "nothing listens on it");
+        let served = dir.join("served.sock");
+        let held = hold_silently(tokio::net::UnixListener::bind(&served).unwrap());
+        assert!(
+            !endpoint_gone(&served).await,
+            "a service listens on it, silent or not"
+        );
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The real kernel credentials, for a caller that is NOT the account
