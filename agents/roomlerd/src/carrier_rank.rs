@@ -574,6 +574,20 @@ mod tests {
         assert!(opening.waited < OPENING_TICK, "{opening:?}");
     }
 
+    /// The two helpers that await [`opening_pair`] run inside the data-channel
+    /// pumps, which `tokio::spawn` runs and which compile only with their
+    /// encoders (in CI): this keeps the wait's future `Send` in every build
+    /// that compiles the tests.
+    #[allow(dead_code)]
+    fn the_opening_wait_is_send(
+        pc: &RTCPeerConnection,
+        ice: &RTCIceTransport,
+        pair: RTCIceCandidatePair,
+    ) {
+        fn send<T: Send>(_: &T) {}
+        send(&opening_pair(pc, ice, pair));
+    }
+
     /// The pump's two reads share one connection's deadline.
     #[test]
     fn a_connections_two_reads_share_one_deadline() {
