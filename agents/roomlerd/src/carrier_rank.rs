@@ -14,7 +14,7 @@
 //!
 //! A ranked-last candidate is known by its priority alone: `256 - component`
 //! (type preference 0, local preference 0), 255 for component 1, which no
-//! other candidate on either side can have. Under switch `0` no candidate has
+//! other candidate of this agent's can have. Under switch `0` no candidate has
 //! it, so nothing here changes a byte or waits a moment.
 
 use std::collections::HashMap;
