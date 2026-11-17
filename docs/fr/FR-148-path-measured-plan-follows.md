@@ -1,6 +1,6 @@
 # FR-148: The path is measured, and the plan follows it
 
-**Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16, P1 and P2 have their first steps merged, and P4's first step is in build (§6). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
+**Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16, P1 and P2 have their first steps merged, P1's remaining steps are designed, and P4's first step is in build (§6). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
 **Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244). §12 says what moved where
 **Works beside:** [FR-135](FR-135-one-rc-media-pipeline.md) (#3293), which owns the pipeline's shape (§13)
 
@@ -276,7 +276,7 @@ retiring it (§13).
 | # | Phase | Kill switch | Proof | Status |
 |---|---|---|---|---|
 | P0 | Measure, in shadow | `ROOMLERD_PATH_MODEL=off` | AC1 to AC5 | running since 2026-11-16; AC1 and AC5 met; steps 1 and 6 done, steps 2 and 3 merged on 2026-11-17 (#3968, #3980, #3995), step 3's line not yet read in the field; step 5's cell designed on paper on 2026-11-17, nothing booted |
-| P1 | The model drives the open and the memory | `ROOMLERD_PATH_MODEL=shadow` | AC6 to AC9 | step 1 (#3374) and the first part of step 2 (#3969) merged on 2026-11-17, released that day in `0.4.224` and read on both laptops (§15): each pair's entry from an earlier release was passed over, and CORPLAP-2 opened at 2.55 Mbit/s, 1920×1200 and 30 fps; the rest not started |
+| P1 | The model drives the open and the memory | `ROOMLERD_PATH_MODEL=shadow` | AC6 to AC9 | step 1 (#3374) and the first part of step 2 (#3969) merged on 2026-11-17, released that day in `0.4.224` and read on both laptops (§15): each pair's entry from an earlier release was passed over, and CORPLAP-2 opened at 2.55 Mbit/s, 1920×1200 and 30 fps; the rest designed and ruled on 2026-11-17 (D22 to D28), not built |
 | P2 | The plan is live, and its moves have a cost | `ROOMLERD_PLAN_ADOPT=quiet` | AC10 to AC15 | the QSV step merged on 2026-11-17 (#3989), behind a switch of its own that is off by default (D10), and not yet read on Intel hardware; the rest not started |
 | P3 | Probes in a session; the bracket replaces the fixed caps | `ROOMLERD_PATH_PROBE=open` | AC16 to AC21 | not started |
 | P4 | The carrier | `ROOMLERD_RC_CARRIER_RANK=0`, a viewer flag | AC22 to AC27 | the first half designed and ruled on 2026-11-17 (D12 to D21); step 1, the rank behind its switch, in build; nothing merged |
@@ -327,10 +327,16 @@ retiring it (§13).
 2. The memory stores the model, keyed by the pair and the carrier. An entry from before this phase is read as
    assumed. The second sentence merged on 2026-11-17 (#3969): an entry carries its provenance, one without it
    seeds nothing, and the device's next measured write drops it. The first is not built. Both merged steps were
-   read on the two laptops on `0.4.224` the same day (§15).
-3. The opener reads the model: a known pair opens at its demonstrated floor, and the train's result may raise the
-   opening inside the bracket.
-4. The slow-link profile engages at the open only on a demonstrated low floor.
+   read on the two laptops on `0.4.224` the same day (§15). The first is designed and not built (D22 to D24):
+   the key is the carrier, the controlling user and the viewer's network; the model has a file of its own; and
+   it takes a delivery only from a window the validity gate accepts. P1 keeps today's scope, a constrained path
+   on the FFmpeg pump: a direct path and the VP9-444 pump have no memory today and get none here. AC7's field
+   week is read on the close line this step adds, which says why each write happened; today's write line also
+   appears when nothing was measured.
+3. The opener reads the model: a known pair opens at 0.85 × its demonstrated floor (D25), and the train's result
+   may raise the opening inside the bracket. It ships with the switch's default at `shadow` (D28).
+4. The slow-link profile engages at the open only on a demonstrated low floor, which is a push-back that is
+   trusted (D25, D26). Steps 3 and 4 ship in one release.
 
 **P2, the plan is live.** QSV off constant bitrate, built first, beside P0 and behind a switch of its own (D4,
 D10). Merged on 2026-11-17 (#3989, `docs/encoders.md` § QSV off constant bitrate): with `qsv_rate_mode = qvbr`,
@@ -394,8 +400,8 @@ index row.
       [The report](https://github.com/gjovanov/roomler-ai/issues/3953#issuecomment-6932207141) is on the issue,
       and the numbers are in §15.
 - [ ] **AC6 (P1)** — A reconnect never opens below what the pair last demonstrated on that carrier: 20 reconnects
-      in a row on each laptop, each opening at 0.85 × the demonstrated floor or higher. Fails first on the current
-      release.
+      in a row on each laptop, each opening at 0.85 × the demonstrated floor or higher, or at the relay cap while
+      that cap stands (D25). Fails first on the current release.
 - [ ] **AC7 (P1)** — Nothing assumed is written to the pair memory, and nothing assumed holds the plan below a
       demonstrated value: V5b's cells and the two replay cells are green, and one field week shows no memory write
       without a measurement behind it. An entry written before this phase is read as assumed.
@@ -455,7 +461,7 @@ index row.
 
 ## 8. Decisions taken
 
-D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D21 are this FR's owner's.
+D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D28 are this FR's owner's.
 
 | # | Decision |
 |---|---|
@@ -480,12 +486,19 @@ D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D21 are th
 | D19 | The live move's shape: the agent asks, the viewer restarts ICE and offers again, the server forwards that offer on an active session, the agent applies it to the live peer, and the agent's ICE restart keeps the old selected pair as the send path until the new generation has selected one. None of it is built before a design report of its own. That report says why the server admits one offer per session today and what bounds a second one, and what the make-before-break restart costs in the vendored ICE agent. Taken by this FR's owner on 2026-11-17 |
 | D20 | The agent's SCTP packets shrink from 1,228 to 1,191 bytes, for every association. A full packet today is 1,293 bytes on the mesh's IPv4 and 1,313 on its IPv6, against the mesh's 1,280. 1,191 is the size the browser's own SCTP stack uses, for the same reason: 1,280 less 40 for IPv6, 8 for UDP, 37 for DTLS and 4 for TURN's channel framing. The design report's 1,195 leaves those 4 out, and one of the mesh's carriers, the viewer's own relay, has them. The cost is about 3 % more packets on every path. It is a change of its own, made after the split is read on the viewer's reassembly counters (AC4). Taken by this FR's owner on 2026-11-17 |
 | D21 | `turn` keeps its meaning in the carrier's recorded vocabulary: a TURN relay. The transport of the agent's leg is an additive field beside it, and the viewer reports the relay protocol of its own selected candidate additively. A new value such as `turn_tls` would silently take sessions out of every count that reads `turn`. Taken by this FR's owner on 2026-11-17 |
+| D22 | The memory key is the carrier, the controlling user and the viewer's network, which decides O1. The relay worker's address leaves the key: it is why one pair had three entries in one day (AC8). The viewer's network is the /24 of its server-reflexive candidate, or the /48 on IPv6, a public address before a private one and never an overlay address. Without such a candidate it is the selected remote address when that is the viewer's own, then the viewer's overlay address, which names a device, then unknown. Without the controlling user or a known carrier there is no key, and nothing is read or written. An overlay carrier and any other carrier never share a word. The agent's own network is not in the key: the carrier separates most of its situations, and what is left, a floor learned in the office and read at home, costs one opening that is too high (D27). A log line carries a hash of the key and the kind of its network part, never the key. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D23 | The model is stored in a file of its own, `path_memory.json`, beside today's `rate_memory.json`, which is written exactly as before until P5. D8's "a rollback is safe" stands for #3374 and #3969. For the model it would not stand inside today's file: the release before it rewrites that file from its own shape at its first save, which drops every field it does not know and every entry not marked measured; an entry without today's rate field makes it read the whole file as empty; and an entry marked measured would open it at an application-limited floor, which is §2.1 again. A file of its own is never opened by an earlier release and survives a rollback. Each entry is checked on its own when read (a rate from 50 kbit/s to 100 Mbit/s, a time at most 300 s ahead, a known class), and a bad one drops alone. The floor keeps 7 days from the reading that set it, and a close never writes back a floor that is still the remembered one: the model's `offer` is made to do what its doc says. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D24 | The model takes a delivery only from a window the validity gate accepts. Today every window's arrival rate reaches it before the gate rules. The opener's burst and the drain after a stall deliver more in one window than the path carries, and a floor stored from one would open later sessions at up to the relay cap. This changes what P0's `path model` line shows, to the floor of valid windows; `Pipe`'s own numbers do not move. Both AC3 cells stay green unchanged. If one turns red, its floor came from a rejected window, and the change stops there. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D25 | The opening is 0.85 × the entry's floor, at most the relay cap while that cap stands (P3), and never under the nominal opening unless a push-back is trusted. A push-back is trusted when three things hold: a backlogged push-back last moved the floor; its newest sample is at most 24 hours old; and it was seen in at least three valid windows spread over at least 10 s, counted across sessions while it stands. A delivery above the floor clears it. With a trusted push-back the opening is 0.85 × the damped floor, which may sit under the nominal one. The design report proposed that one sample suffices. It does not: the usual entry is an application-limited floor near 2.2 Mbit/s, because a still screen measures no more; one sample at or under 0.15 Mbit/s halves that floor to under 1.18 Mbit/s; and the next session would open on the slow-link profile, from a single window. A lifetime of 7 days would open a recovered path small for a week of still screens. Three windows and 10 s are this FR's owner's numbers, to be read again on the shaped cell: a real link of 0.6 and of 1.5 Mbit/s must be trusted within its first minute of motion, and an injected dip of 3 s must not be. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D26 | The slow-link profile engages at the open only on a trusted push-back at or below the profile's threshold (1 Mbit/s), and only when the opening it leads to is at or below that threshold too. An application-limited floor never engages it, whatever its value: the entry of 281,732 bit/s in §2.1 was application-limited at best. Steps 3 and 4 ship in one release, so a slow link never loses its profile between them. Until P2 makes the profile a live plan field, a profile engaged at the open lasts the session, which is why the open asks for this much evidence. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D27 | The constrained opener's grace stays in P1: FR-35 P3's 2 s, 3 s at most, ended at 1.2 s when nothing drains. "A decrease never waits" is AC11's, about the encoder applying a lower rate, and it holds after the grace. So an opening that is too high, from a key that merged two paths or a path slower than last time, costs the grace plus the time the cut takes: seconds of delay, once, after which the floor is damped. That cost is inferred, not measured; the shaped cell reads it with an entry at the cap and the link at 2 Mbit/s. What bounds it by design is the open-time train (P0 step 4, P3), which measures before the opener commits. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D28 | Step 3 ships with the switch's default at `shadow`: today's opener, pinned bit for bit by a twin test, while the model is written and every constrained open logs both openings, the model's and today's. The values are `off` (the release before, exactly), `shadow` and `on`. A device is switched on by `path_model = on` in its config: `roomler config set`, then a restart. The default becomes `on` in the following release when two reads hold. On the fleet's shadow lines the model's opening stands more than 30 % above the trusted push-back the session then measured no more often than today's opening does, and under 0.85 × the floor the session then wrote less often. And AC6 and AC8 hold on the two laptops, switched on by hand. After the flip the kill switch is `ROOMLERD_PATH_MODEL=shadow`, per device. The design report proposed `on` from the first release; `shadow` first costs the fleet one release and the two laptops nothing. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
 
 ## 9. Open decisions
 
 | # | Question | Recommendation |
 |---|---|---|
-| O1 | What identifies the viewer's end in the memory key? | The controlling user and the viewer's reflexive network prefix, beside the carrier. P0 reads how often one user's sessions differ by network |
+| O1 | What identifies the viewer's end in the memory key? | The controlling user and the viewer's reflexive network prefix, beside the carrier. P0 reads how often one user's sessions differ by network. Decided on 2026-11-17: D22 |
 | O2 | The probe on the RTP sink | Transport-wide feedback there, the SCTP clock on the DataChannel sinks. Decide after P0's read of the SCTP samples |
 | O3 | Which comes first, TURN over TLS or the relayed mesh link? | TURN over TLS: one reliable layer fewer and an allocation of its own. The standing cell reads both, and AC22's read on CORPLAP-2 decides it (D14) |
 | O4 | After P4, are `auto` and `on` one policy, and what do new devices get (#3357)? | One policy, "mesh allowed, ranked by carrier", beside `off`. Decide the default on P4's field read; D18 says what that read must show |
