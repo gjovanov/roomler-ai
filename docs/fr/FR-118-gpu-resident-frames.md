@@ -41,7 +41,7 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 ### 2.2 What the fleet measures today (7 days to 2026-10-21, read-only)
 
 From `agent_logs`: 142 538 FFmpeg DC pump heartbeats from 11 hosts, read-only, from mars. The "encode"
-column is the pump's `avg_encode_ms` (`peer.rs:9152`): the time inside `encode_sync`, so **conversion,
+column is the pump's `avg_encode_ms` (`peer.rs:9151`): the time inside `encode_sync`, so **conversion,
 copies, upload, submission and the packet drain together** (§3). The fps columns are the delivered rate
 between consecutive heartbeats (spaced 2.0 s). The median sits at 16–17 fps on almost every host because an
 idle desktop produces few frames, which is not a limit. So the table shows the top of the distribution, p99
@@ -1091,7 +1091,7 @@ after each leg, over the frames encoded in between.
 | ON2 00:57:56–01:17:57 | 0.4.184 | on | `gpu` | 599 | 57.9 | 11.93 | 0 | 5.23 | 0.03 | 5.13 | 5.23 | 18 % (3.09 ms) |
 
 - **On this arm the capture stage is a wait.** WGC reads each frame back in its `FrameArrived` handler, on its own
-  thread (`agents/roomlerd/src/peer.rs:9693`), so the pump's `avg_capture_ms` is the time spent waiting for the
+  thread (`agents/roomlerd/src/peer.rs:9692`), so the pump's `avg_capture_ms` is the time spent waiting for the
   next frame at a 60 fps pace, not work. The work per frame is the readback plus the encode stage: 18.26 ms with
   the switch off, 5.14 and 5.23 ms with it on (−71 %).
 - **`send_frame` halves.** With CPU frames, FFmpeg's NVENC wrapper copies each 6 MB NV12 frame to the GPU inside
@@ -1171,7 +1171,7 @@ the frames encoded in between.
 | ON2 21:38:18–21:58:14 | on | `gpu` | 597 | 88.0; 87.0 | 11.21 | 0.12 | 0.03 | 0.05 | 11.32 | 23 % (2.60 ms) |
 
 - **On this arm capture + encode is the frame period.** The pump times the whole `next_frame()`
-  (`agents/roomlerd/src/peer.rs:7927`): the pacing gate's sleep, the capture thread polling the display stream every
+  (`agents/roomlerd/src/peer.rs:7926`): the pacing gate's sleep, the capture thread polling the display stream every
   2 ms until a new frame arrives (`agents/roomlerd/src/capture/scrap_backend.rs:554`), and on the CPU path the copy
   of the 23.7 MB frame into memory (`:551`). At 88 fps the pump waits for the stream on both paths, so capture +
   encode is 11.3 ms on both, and the time the GPU path saves goes into the wait. The work per frame is the encode

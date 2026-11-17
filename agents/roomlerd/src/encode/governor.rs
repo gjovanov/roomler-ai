@@ -1982,7 +1982,7 @@ impl RateGovernor {
     /// Every path number the pump's heartbeat carries, each with how it was
     /// obtained and how old it is, and the shadow model's view: what the `path
     /// model` line writes. Each number is the one the heartbeat's accessor gives
-    /// at `now` (`tests::the_view_carries_the_heartbeats_numbers`). `seed_age` is
+    /// at `now`, which `tests::same_numbers` checks at every replayed window. `seed_age` is
     /// how old the pair memory's entry was when the session opened.
     pub fn path_view(&self, now: Instant, seed_age: Option<Duration>) -> PathView {
         let tags = &self.path;
@@ -5741,10 +5741,8 @@ mod tests {
         let written = memory.record_session(CORPLAP2_KEY, s.evidence(), 1_794_000_000);
         assert_eq!(written, 179_980);
         let floor = s.g.belief_bps(t).1;
-        assert!(
-            !keeps_what_it_delivered(floor, s.evidence(), delivered),
-            "{floor:?}"
-        );
+        assert_eq!(floor, Some(982_068), "damped toward the reading");
+        assert!(!keeps_what_it_delivered(floor, s.evidence(), delivered));
         // What the line says of them: the stand-in is assumed, as old as the
         // reading it walked from.
         let v = s.g.path_view(t, None);
