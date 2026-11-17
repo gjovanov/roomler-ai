@@ -530,7 +530,7 @@ impl Sidecar {
     /// Its identity for the uploader's ledger: `<len>:<mtime> <file name>`,
     /// from when it was read.
     pub fn signature(&self) -> String {
-        format!("{}:{} {}", self.len, self.modified_unix, self.name)
+        signature_of(self.len, self.modified_unix, &self.name)
     }
 
     /// Delete it: below the machine's folder through the folder it was read
@@ -810,6 +810,105 @@ fn verdicts_left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::
         tracing::warn!("crash_recorder: crash verdicts left alone: {refused}");
     }
     refused.into()
+}
+
+// ─── The service's sweep (#3799) ───────────────────────────────────────────
+
+/// A sidecar's identity in a ledger: `<len>:<mtime> <file name>`. One rule
+/// for the uploader that writes it ([`Sidecar::signature`]) and the service
+/// that matches it ([`settled_names`]).
+fn signature_of(len: u64, modified_unix: i64, name: &str) -> String {
+    format!("{len}:{modified_unix} {name}")
+}
+
+/// #3799 — a name the recorder gives a record, `<digits>-<digits>.json`
+/// ([`record_inner_at`]): the only name the service's sweep removes.
+fn is_record_name(name: &str) -> bool {
+    let _ = name;
+    false
+}
+
+/// One or more ASCII digits, and nothing else.
+fn all_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// #3799 — the lines of `text`, a ledger or its last bytes, that can settle
+/// a record: each whole line, trimmed as the uploader reads its own ledger,
+/// that is a record's signature, `<digits>:<digits> <record name>` (the time
+/// may be negative). Any other line is dropped here and goes no further.
+/// `whole`: the text starts at the ledger's start; otherwise its first line
+/// may be cut, and is dropped too.
+fn settled_in(text: &str, whole: bool) -> std::collections::HashSet<String> {
+    let _ = (text, whole, all_digits(""));
+    std::collections::HashSet::new()
+}
+
+/// #3799 — one entry of a listing the service made itself, as the sweep
+/// compares it.
+#[derive(Debug, Clone, Copy)]
+struct Listed<'a> {
+    name: &'a str,
+    is_dir: bool,
+    is_link: bool,
+    len: u64,
+    modified_unix: i64,
+}
+
+/// #3799 — the entries of `listing` that `settled` removes: a record name
+/// ([`is_record_name`]) of a plain file, not a folder or a link, whose own
+/// signature, from the listing, is one of `settled`. A ledger's lines are
+/// only ever compared with those signatures: nothing in them names what is
+/// removed.
+fn settled_names<'a>(
+    listing: impl IntoIterator<Item = Listed<'a>>,
+    settled: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
+    let _ = (listing.into_iter().count(), settled);
+    Vec::new()
+}
+
+/// #3799 — what one sweep did: counts, and the names of the records it
+/// removed from its own listing. Never a ledger's text: a person writes that.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Swept {
+    /// The records removed, by name.
+    pub removed: Vec<String>,
+    /// Records no ledger settled: left for a drainer to send.
+    pub kept: usize,
+    /// The ledgers read.
+    pub ledgers_read: usize,
+    /// The ledgers left unread: a link on the way, a second name, an error.
+    pub ledgers_refused: usize,
+    /// Records a ledger settled that could not be removed: tried again at the
+    /// next sweep.
+    pub failed: usize,
+}
+
+/// #3799 — the most of a ledger the service reads: its last 1 MiB, where its
+/// newest lines are. Nothing before them is read.
+pub const SWEEP_LEDGER_MAX_BYTES: u64 = 1024 * 1024;
+
+/// #3799 — the service's sweep of the machine's `crashes`. A person's worker
+/// uploads a record from it but may not delete it there (`Seal::Readable`),
+/// so it writes the record's signature in its own ledger (#1748) and the
+/// record stays. The service, as SYSTEM, removes every record whose exact
+/// signature is a line of a ledger: each profile's in `profiles`, below
+/// `AppData\Local\roomler\<segment>\data\logs`, and a SystemContext worker's
+/// in `service-logs`.
+///
+/// - `crashes` is reached by handle from the machine's `ProgramData`, and
+///   only entries it lists itself are removed, each by handle below it
+///   ([`HeldPath::remove_file`](crate::machine_tree::HeldPath::remove_file),
+///   a link at the name refused).
+/// - A ledger is read by handle below its profile, never through a link
+///   and never a file with more than one name, and no more than its last
+///   [`SWEEP_LEDGER_MAX_BYTES`].
+/// - With no record in `crashes`, no ledger is read.
+#[cfg(windows)]
+pub fn sweep_settled(profiles: &[PathBuf]) -> Swept {
+    let _ = profiles;
+    Swept::default()
 }
 
 // ─── Crash-loop suppression ────────────────────────────────────────────────
@@ -1303,6 +1402,94 @@ mod tests {
             pid: 42,
             suppressed_since_last: 0,
         }
+    }
+
+    // ─── the service's sweep (#3799) ───────────────────────────────────────
+
+    /// Only a name the recorder gives a record is one.
+    #[test]
+    fn only_a_name_the_recorder_gives_is_a_record_name() {
+        for name in ["1788894634-71069.json", "1-1.json"] {
+            assert!(is_record_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".json",
+            "-1.json",
+            "1-.json",
+            "1.json",
+            "a-1.json",
+            "1-1.JSON",
+            "1-1.json.tmp",
+            "1-1-1.json",
+            "..\\1-1.json",
+            "C:\\ProgramData\\1-1.json",
+            " 1-1.json",
+            "+1-1.json",
+            "\u{ff11}-1.json",
+        ] {
+            assert!(!is_record_name(name), "{name:?}");
+        }
+    }
+
+    /// A ledger settles only a whole line in a record's signature shape, and
+    /// the first line of a ledger's tail, which may be cut, settles nothing.
+    #[test]
+    fn a_ledger_settles_only_whole_signature_lines() {
+        let text = "12:34 1-1.json\r\n\
+                    garbage\n\
+                    56:78 ..\\1-2.json\n\
+                    9:10 C:\\ProgramData\\roomler\\roomler\\1-3.json\n\
+                    11:12 notes.json\n\
+                    -1:12 1-4.json\n\
+                    13:-14 1-5.json\n\
+                    15:16  1-6.json\n\
+                    17:18 1-7.json and more\n\
+                    19:20 1-8.json";
+        let mut got: Vec<String> = settled_in(text, true).into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["12:34 1-1.json", "13:-14 1-5.json", "19:20 1-8.json"]);
+        let tail = settled_in("4 1-1.json\n19:20 1-8.json\n", false);
+        assert!(
+            tail.len() == 1 && tail.contains("19:20 1-8.json"),
+            "{tail:?}"
+        );
+        assert!(settled_in("19:20 1-8.json", false).is_empty());
+    }
+
+    /// The sweep removes only an entry of its own listing whose whole identity
+    /// a ledger names: never a name a ledger makes up (`..\`, an absolute
+    /// path), never a name that is not a record's, never a folder or a link,
+    /// and never a record whose length or modified time differs.
+    #[test]
+    fn a_ledger_removes_only_a_listed_record_by_its_whole_identity() {
+        let entry = |name, is_dir, is_link, len, modified_unix| Listed {
+            name,
+            is_dir,
+            is_link,
+            len,
+            modified_unix,
+        };
+        let listing = [
+            entry("1-1.json", false, false, 12, 34),
+            entry("2-2.json", false, false, 12, 34),
+            entry("3-3.json", false, false, 12, 34),
+            entry("notes.json", false, false, 12, 34),
+            entry("4-4.json", true, false, 0, 34),
+            entry("5-5.json", false, true, 12, 34),
+        ];
+        let settled = settled_in(
+            "12:34 1-1.json\n\
+             13:34 2-2.json\n\
+             12:35 3-3.json\n\
+             12:34 notes.json\n\
+             0:34 4-4.json\n\
+             12:34 5-5.json\n\
+             12:34 ..\\6-6.json\n\
+             12:34 C:\\ProgramData\\roomler\\roomler\\7-7.json\n",
+            true,
+        );
+        assert_eq!(settled_names(listing, &settled), ["1-1.json"]);
     }
 
     // ─── log tail ──────────────────────────────────────────────────────────
@@ -2165,6 +2352,274 @@ mod tests {
             assert_eq!(read_a, "23:45 3-4.json\n", "(a) the new ledger");
             assert_eq!(read_b, "56:78 5-6.json\n", "(b) the new ledger");
             assert!(!is_link(&logs), "service-logs is a real folder again");
+            println!("{CHECKED}");
+        }
+
+        // ─── #3799: the service's sweep ───────────────────────────────────
+
+        /// The folders below a profile where its account's daemon logs, and
+        /// keeps its ledger.
+        const LOGS: [&str; 6] = ["AppData", "Local", "roomler", "roomler", "data", "logs"];
+
+        /// A stand-in profile below the case's root, its ledger holding `text`.
+        fn profile_with_ledger(root: &Path, who: &str, text: &str) -> PathBuf {
+            let profile = root.join("Users").join(who);
+            let logs = LOGS.iter().fold(profile.clone(), |p, n| p.join(n));
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(logs.join(super::super::VERDICTS_FILE), text).unwrap();
+            profile
+        }
+
+        /// The supervisor's `crashes`, made sealed with one record in it, and
+        /// the records `<n>-<n>.json` for each `n` beside that one.
+        fn crashes_with(more: &[i64]) -> (PathBuf, String) {
+            let crashes = crate::appdirs::machine_global_dir().join("crashes");
+            let first = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            )
+            .expect("a sealed crashes and a record");
+            for n in more {
+                super::write_valid_sidecar(&crashes, *n, *n as u32);
+            }
+            let name = first.file_name().unwrap().to_string_lossy().into_owned();
+            (crashes, name)
+        }
+
+        /// The signature a drainer writes in its ledger for the record `name`.
+        fn signature_of_record(crashes: &Path, name: &str) -> String {
+            super::super::scan_dir(crashes)
+                .into_iter()
+                .find(|(s, _)| s.path().ends_with(name))
+                .map(|(s, _)| s.signature())
+                .unwrap_or_else(|| panic!("{name} is pending"))
+        }
+
+        /// #3799 — a ledger line removes only a record the sweep listed itself,
+        /// by handle, and only by its exact signature. Nothing else goes: a
+        /// record-named file beside `crashes` named through `..\` or by its
+        /// absolute path with its own length and time, a file in `crashes`
+        /// whose name is not a record's, and a record whose length or modified
+        /// time the line changes. What the sweep reports holds no ledger text.
+        /// Control: the record whose exact signature is named is gone.
+        #[test]
+        fn a_ledger_line_removes_only_a_record_the_sweep_listed_itself() {
+            use super::super::sweep_settled;
+            let Some(root) = child() else {
+                return run(
+                    "a_ledger_line_removes_only_a_record_the_sweep_listed_itself",
+                    "#3799: what a ledger line may remove",
+                );
+            };
+            let (crashes, first) = crashes_with(&[2, 3]);
+            std::fs::copy(crashes.join("2-2.json"), crashes.join("notes.json")).unwrap();
+            let machine = crate::appdirs::machine_global_dir();
+            super::write_valid_sidecar(&machine, 4, 4);
+            let beside = machine.join("4-4.json");
+            let meta = std::fs::metadata(&beside).unwrap();
+            let beside_sig = format!(
+                "{}:{}",
+                meta.len(),
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            );
+            let exact = signature_of_record(&crashes, &first);
+            let two = signature_of_record(&crashes, "2-2.json");
+            let (len, rest) = two.split_once(':').unwrap();
+            let longer = format!("{}:{rest}", len.parse::<u64>().unwrap() + 1);
+            let three = signature_of_record(&crashes, "3-3.json");
+            let (head, name) = three.split_once(' ').unwrap();
+            let (len, mtime) = head.split_once(':').unwrap();
+            let later = format!("{len}:{} {name}", mtime.parse::<i64>().unwrap() + 1);
+            let notes = signature_of_record(&crashes, "notes.json");
+            let marker = "A-PERSON-WROTE-THIS";
+            let ledger = format!(
+                "{marker} {exact}\n{longer}\n{later}\n{notes}\n\
+                 {beside_sig} ..\\4-4.json\n{beside_sig} {}\n{exact}\n",
+                beside.display()
+            );
+            let profile = profile_with_ledger(&root, "a", &ledger);
+
+            let swept = sweep_settled(&[profile]);
+
+            assert!(!crashes.join(&first).exists(), "the settled record is gone");
+            for kept in ["2-2.json", "3-3.json", "notes.json"] {
+                assert!(crashes.join(kept).is_file(), "{kept} stays");
+            }
+            assert!(beside.is_file(), "nothing beside crashes is removed");
+            assert_eq!(swept.removed, [first.clone()], "{swept:?}");
+            assert_eq!((swept.ledgers_read, swept.failed), (1, 0), "{swept:?}");
+            let report = format!("{swept:?}");
+            assert!(
+                !report.contains(marker) && !report.contains(".."),
+                "the report holds no ledger text: {report}"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// #3799 — a ledger reached through a link anywhere below the profile
+        /// is not read: each folder on the way in turn a junction to a tree
+        /// that holds the rest of the names and a ledger settling the record,
+        /// `logs` a directory symbolic link, and the ledger's own name a file
+        /// symbolic link, then a hard link. The record stays through each.
+        /// Control: the same ledger with no link on the way removes it.
+        #[test]
+        fn a_ledger_behind_a_link_below_the_profile_is_not_read() {
+            use super::super::{VERDICTS_FILE, sweep_settled};
+            let Some(root) = child() else {
+                return run(
+                    "a_ledger_behind_a_link_below_the_profile_is_not_read",
+                    "#3799: a ledger behind a link",
+                );
+            };
+            let (crashes, record) = crashes_with(&[]);
+            let line = format!("{}\n", signature_of_record(&crashes, &record));
+            let chain = |base: &Path, names: &[&str]| -> PathBuf {
+                let dir = names.iter().fold(base.to_path_buf(), |p, n| p.join(n));
+                std::fs::create_dir_all(&dir).unwrap();
+                dir
+            };
+            let mut cases: Vec<(String, PathBuf)> = Vec::new();
+            for depth in 0..LOGS.len() {
+                let profile = root.join("Users").join(format!("j{depth}"));
+                let above = chain(&profile, &LOGS[..depth]);
+                let target = root.join(format!("junction-target-{depth}"));
+                let logs = chain(&target, &LOGS[depth + 1..]);
+                std::fs::write(logs.join(VERDICTS_FILE), &line).unwrap();
+                junction(&above.join(LOGS[depth]), &target);
+                cases.push((format!("a junction at {}", LOGS[depth]), profile));
+            }
+            {
+                let profile = root.join("Users").join("dir-symlink");
+                let above = chain(&profile, &LOGS[..5]);
+                let target = chain(&root, &["symlink-target"]);
+                std::fs::write(target.join(VERDICTS_FILE), &line).unwrap();
+                std::os::windows::fs::symlink_dir(&target, above.join("logs")).unwrap();
+                cases.push(("logs a directory symbolic link".into(), profile));
+            }
+            {
+                let profile = root.join("Users").join("file-symlink");
+                let logs = chain(&profile, &LOGS);
+                let target = root.join("ledger-elsewhere.txt");
+                std::fs::write(&target, &line).unwrap();
+                std::os::windows::fs::symlink_file(&target, logs.join(VERDICTS_FILE)).unwrap();
+                cases.push(("the ledger a file symbolic link".into(), profile));
+            }
+            {
+                let profile = root.join("Users").join("hard-link");
+                let logs = chain(&profile, &LOGS);
+                let other = root.join("ledger-other-name.txt");
+                std::fs::write(&other, &line).unwrap();
+                std::fs::hard_link(&other, logs.join(VERDICTS_FILE)).unwrap();
+                cases.push(("the ledger a second name of a file".into(), profile));
+            }
+            for (case, profile) in &cases {
+                let swept = sweep_settled(std::slice::from_ref(profile));
+                assert!(
+                    crashes.join(&record).is_file() && swept.removed.is_empty(),
+                    "{case}: the ledger is not read ({swept:?})"
+                );
+                assert!(swept.ledgers_refused >= 1, "{case}: {swept:?}");
+            }
+
+            let control = profile_with_ledger(&root, "control", &line);
+            let swept = sweep_settled(&[control]);
+            assert_eq!(swept.removed, [record.clone()], "control: {swept:?}");
+            assert!(!crashes.join(&record).exists());
+            println!("{CHECKED}");
+        }
+
+        /// #3799 — a ledger past its cap is read no further: a line before its
+        /// last `SWEEP_LEDGER_MAX_BYTES` settles nothing, the one inside them
+        /// does, and the sweep ends.
+        #[test]
+        fn a_ledger_past_its_cap_is_read_no_further_and_the_sweep_ends() {
+            use super::super::{SWEEP_LEDGER_MAX_BYTES, sweep_settled};
+            let Some(root) = child() else {
+                return run(
+                    "a_ledger_past_its_cap_is_read_no_further_and_the_sweep_ends",
+                    "#3799: a ledger past its cap",
+                );
+            };
+            let (crashes, _) = crashes_with(&[2, 3]);
+            let early = signature_of_record(&crashes, "2-2.json");
+            let late = signature_of_record(&crashes, "3-3.json");
+            let filler = "x".repeat(99) + "\n";
+            let lines = (SWEEP_LEDGER_MAX_BYTES as usize).div_ceil(filler.len()) + 100;
+            let mut ledger = String::with_capacity(lines * filler.len() + 100);
+            ledger.push_str(&early);
+            ledger.push('\n');
+            for _ in 0..lines {
+                ledger.push_str(&filler);
+            }
+            ledger.push_str(&late);
+            ledger.push('\n');
+            assert!(ledger.len() as u64 > SWEEP_LEDGER_MAX_BYTES + 1000);
+            let profile = profile_with_ledger(&root, "a", &ledger);
+
+            let began = std::time::Instant::now();
+            let swept = sweep_settled(&[profile]);
+
+            assert!(began.elapsed() < std::time::Duration::from_secs(30));
+            assert!(
+                crashes.join("2-2.json").is_file(),
+                "the line before the cap is not read ({swept:?})"
+            );
+            assert!(
+                !crashes.join("3-3.json").exists(),
+                "the line inside the cap is read ({swept:?})"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// #3799 — never sent twice: once the service has swept, as it does
+        /// before every worker start, a record a person's ledger settled is
+        /// gone from what the next drainer reads, a SystemContext worker or a
+        /// second person, and so is one the SystemContext worker's own ledger
+        /// (`service-logs`) settled. A record nobody settled is still there
+        /// for the next drainer to send.
+        #[test]
+        fn a_settled_record_is_gone_before_the_next_drainer_reads_crashes() {
+            use super::super::{append_verdict, scan_dir, sweep_settled};
+            let Some(root) = child() else {
+                return run(
+                    "a_settled_record_is_gone_before_the_next_drainer_reads_crashes",
+                    "#3799: never sent twice",
+                );
+            };
+            let (crashes, by_a) = crashes_with(&[2, 3]);
+            // The person's worker sent `by_a` and may not delete it: its own
+            // ledger names it, as the uploader writes it.
+            let a = profile_with_ledger(&root, "a", "");
+            let a_logs = LOGS.iter().fold(a.clone(), |p, n| p.join(n));
+            append_verdict(&a_logs, &signature_of_record(&crashes, &by_a)).unwrap();
+            // A SystemContext worker's ledger names `2-2.json`.
+            let service_logs = crate::appdirs::machine_global_dir().join("service-logs");
+            append_verdict(&service_logs, &signature_of_record(&crashes, "2-2.json")).unwrap();
+            let b = profile_with_ledger(&root, "b", "");
+
+            let swept = sweep_settled(&[a, b]);
+
+            let pending: Vec<String> = scan_dir(&crashes)
+                .into_iter()
+                .map(|(s, _)| s.path().file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                pending,
+                ["3-3.json"],
+                "the next drainer reads only the record nobody sent ({swept:?})"
+            );
+            let mut removed = swept.removed.clone();
+            removed.sort();
+            let mut want = vec![by_a, "2-2.json".to_string()];
+            want.sort();
+            assert_eq!(removed, want);
+            assert_eq!(swept.kept, 1, "{swept:?}");
             println!("{CHECKED}");
         }
     }

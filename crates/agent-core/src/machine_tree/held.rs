@@ -588,6 +588,34 @@ impl HeldPath {
             .map_err(|e| self.refuse_at(name, Why::Io(std::io::Error::other(e))))
     }
 
+    /// #3799 — the last `max_len` bytes of the file `name`, read below this
+    /// folder as [`HeldPath::read_file`] reads it: never through a link, never
+    /// a folder, never a file with more than one name. Nothing before them is
+    /// read, however long the file. The flag says the bytes start at the
+    /// file's start. `Ok(None)`: it is not there.
+    pub fn read_file_tail(
+        &self,
+        name: &str,
+        max_len: u64,
+    ) -> Result<Option<(Vec<u8>, bool)>, Refusal> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let path = self.path().join(name);
+        let file = match win::open_below(self.handle(), name, &path, false) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(self.refuse_at(name, why_of_text(&e))),
+        };
+        if links_of(&file).map_err(|e| self.refuse_at(name, Why::Io(e)))? > 1 {
+            return Err(self.refuse_at(name, Why::TooManyLinks));
+        }
+        let io = |e| self.refuse_at(name, Why::Io(e));
+        let from = file.metadata().map_err(io)?.len().saturating_sub(max_len);
+        (&file).seek(SeekFrom::Start(from)).map_err(io)?;
+        let mut bytes = Vec::new();
+        (&file).take(max_len).read_to_end(&mut bytes).map_err(io)?;
+        Ok(Some((bytes, from == 0)))
+    }
+
     /// The entries of this folder, read through its handle
     /// (`GetFileInformationByHandleEx`, `FileIdExtdDirectoryInfo`): nothing
     /// is opened or followed.

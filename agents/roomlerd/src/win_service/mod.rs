@@ -38,6 +38,10 @@ pub mod companion_procs;
 /// FR-84 D6 — start the companion from a user-context daemon without
 /// handing it our handles (#1035).
 pub mod companion_spawn;
+/// #3799 — the host removes from the machine's `crashes` what a person's
+/// worker has sent but may not delete, before every worker start and once a
+/// minute, on a thread of its own.
+mod crash_sweep;
 pub mod desktop;
 pub mod environment;
 pub mod firewall;
