@@ -282,11 +282,11 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:780-917`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:868-873`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:960`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3551`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:195`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3568`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:195`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:948`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
-| D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:279-326`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
-| D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:85-109`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`) | P0c, D5 |
-| D6 | Hive: adopt a terminal session | 🟡 built (P4c) | ✅ | ✅ | Was: `hive_adopt` read off on Windows. P4c adopts through a named pipe (`hive/supervisor/adopt.rs:573`) | P4c |
+| D4 | Received files land as the signed-in user (system install) | 🟡 built (#3048): as the person signed in to the session, into their Downloads; nobody signed in refuses. Was: written as LocalSystem | 🟡 built (P3d); nobody at seat0: the default folder, never one a controller chose (#3688) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:282-332`). Windows, #3048: the same, every step on the person's side as them (`win_identity::as_person`), and the end copies into a file they create (`desktop-companion.md` §9.2). Linux, #3688: with nobody at seat0 the file is the daemon's, in the default folder, as FR-84 D4 asks of a privileged writer with no one signed in; the viewer's reads take the same person as the writes (`desktop-companion.md` §9.4) | P3d, #3048, #3688 |
+| D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:79-103` at master `c9fe4c391`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`) | P0c, D5 |
+| D6 | Hive: adopt a terminal session | 🟡 built (P4c) | ✅ | ✅ | Was: `hive_adopt` read off on Windows. P4c adopts through a named pipe (`hive/supervisor/adopt.rs:573` at master `7106d588d`; FR-137 took Hive off master) | P4c |
 
 ### 2.5 SSH and Fleet RPC
 
@@ -649,7 +649,7 @@ test of the SIGKILL property itself.
 ### 3.7 P2 — macOS remote desktop
 
 - **P2a, system audio through ScreenCaptureKit** (`SCStreamConfiguration.capturesAudio`, macOS 13+; the agent's floor
-  is 15, `docs/installation.md:267-282`), in the GUI worker, under the Screen Recording grant it already holds. The
+  is 15, `docs/installation.md:2247-2262`), in the GUI worker, under the Screen Recording grant it already holds. The
   same stream feeds FR-85's recorder (R12). Until it ships, P0c stops advertising `opus` on macOS.
   *As built (P2a), after a probe measured ScreenCaptureKit first (§8):* `agents/roomlerd/src/audio/sck.rs`, an
   `SCStream` over the main display with `capturesAudio` on and this process's own sound excluded, behind the
@@ -669,7 +669,7 @@ test of the SIGKILL property itself.
     only to an object conforming to `SCStreamOutput`.
 - **D2, video through SCK as well.** It would bring dirty rects (R13), keep the banner out of the stream (R14), and
   cursor metadata (R4), but it replaces a backend that works. Decide on a measured A/B of latency and CPU.
-- **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2885-2899`: a dispatch
+- **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2898-2912`: a dispatch
   build on a real Mac where the daemon starts and a prompt appears and answers, then add `viewer-indicator-macos` to
   the release set. It moves tokio off the main thread on every Mac, and a Mac that fails to start cannot pull its own
   fix, so it goes to one Mac, then the field Macs, then a release.
@@ -725,7 +725,7 @@ test of the SIGKILL property itself.
   answer with the window, as Linux's title convention does.
 - **P2d, the small ones.** *P2d-1, the lock hint (built):* the session dictionary's lock flag
   (`CGSessionCopyCurrentDictionary`), read as keep busy reads it (`keep_busy/host_mac.rs:187`), reaches the viewer at
-  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1442-1508`): whether
+  two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1453-1519`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
   `signaling.rs:4603`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
@@ -760,7 +760,7 @@ test of the SIGKILL property itself.
   `ROOMLERD_MAC_DISPLAY_MATCH=0`. Details: `docs/display-match.md`.
 - **P2e, clipboard.** Image watching on the `NSPasteboard` change count (the Windows sequence-number shape); RTF as
   `public.rtf` beside the HTML lane.
-  *P2e-1, as built (images):* `clipboard::mac_gate` (`agents/roomlerd/src/clipboard.rs:756`) is P3e-3a's X11 gate
+  *P2e-1, as built (images):* `clipboard::mac_gate` (`agents/roomlerd/src/clipboard.rs:1452`) is P3e-3a's X11 gate
   with the change count as its counter, so the worker's tick, the early return and the image read are X11's. Two
   findings shaped it, both measured on the operator's MacBook (macOS 27.0.1, 2026-10-22, §8):
   - The ungated watcher read the general pasteboard's text and html every second for as long as a session was
@@ -768,7 +768,7 @@ test of the SIGKILL property itself.
     programmatically (`NSPasteboardAccessBehavior`). No alert was logged for roomlerd, but every read the gate skips
     is one that could not ask. Behind the gate a quiet clipboard costs one change-count read per tick.
   - A root daemon outside the console session cannot reach the pasteboard server: its lookup fails with "No such
-    process". So the hello does not ask the process's own pasteboard (`clipboard.rs:807`): on a supervised Mac the
+    process". So the hello does not ask the process's own pasteboard (`clipboard.rs:1503`): on a supervised Mac the
     root daemon says the hello, and a delegated session's clipboard runs in the GUI worker, inside the session.
   *The Mac kill switches on a supervised Mac (found 2026-10-23, by FR-119's field run):* the hello is the root's and
   the session the worker's, and `sudo`'s `env_reset` gave the worker none of the root's `ROOMLERD_*`. So
@@ -777,7 +777,7 @@ test of the SIGKILL property itself.
   value of each (FR-43's `WORKER_ENV_FORWARD`, #2758); a per-user half's own LaunchAgent environment is unchanged.
 - **P2f, a microphone for recordings.** cpal on macOS, `NSMicrophoneUsageDescription` in the bundle (a missing key
   ends the process at first access), and the audio-input entitlement.
-  *As built (P2f):* cpal is a macOS dependency for the microphone only (`agents/roomlerd/Cargo.toml:414-420`; a
+  *As built (P2f):* cpal is a macOS dependency for the microphone only (`agents/roomlerd/Cargo.toml:377-383`; a
   Mac's computer audio stays ScreenCaptureKit's), and the recorder child's `open_microphone` opens CoreAudio's
   default input through the same `cpal_backend` Linux and Windows use. One thing the platform added: macOS records
   **silence** from a microphone the person turned off, and the stream opens and runs. So
@@ -792,14 +792,14 @@ test of the SIGKILL property itself.
   lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
   the server and the companion as they are:
   - the root half serves the console user a person socket (FR-27 P11's mechanism) at
-    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4414`). The directory is root's and writable by
-    nobody else (`root_only_dir`, `:4321`), so root binds and then hands the socket over (`bind_root_owned`,
-    `:4334`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
-  - `person_may` (`:3057`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4913`). The directory is root's and writable by
+    nobody else (`root_only_dir`, `:5092`), so root binds and then hands the socket over (`bind_root_owned`,
+    `:5105`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
+  - `person_may` (`:3568`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
     socket the same way, and its companion's Devices page was refused there before;
   - the per-user half asks the root half only when its own answer is `no_node` and it is not root
-    (`agents/roomlerd/src/person_socket.rs:121`). It shows the root half's answer only when that is `ok` (`:129`),
-    and keeps its own on any other answer, a timeout (5 s) or no socket (`:146`).
+    (`agents/roomlerd/src/person_socket.rs:170`). It shows the root half's answer only when that is `ok` (`:178`),
+    and keeps its own on any other answer, a timeout (5 s) or no socket (`:195`).
   Kill switch: `ROOMLERD_PERSON_SOCKET=0` on the root half, which gives the pre-P2g page.
 - **P2h, the rest of the network view on a two-half Mac.** The companion's other network fields come from the
   per-user half's own synchronous reads (`LocalApiState::peers` and `status`), so after P2g a Mac still shows:
@@ -810,18 +810,22 @@ test of the SIGKILL property itself.
 
   Built:
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
-    (`crates/localapi/src/lib.rs:2744`, `:2749`, dispatched at `:3652`). They default to the sync reads, so the
-    tests' fakes are untouched.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2101`, `:2114`), with P2g's
-    rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:200`). Then
-    `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status and
-    MagicDNS (`with_machine_network`, `:213`).
-  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3443`). That drops
+    (`crates/localapi/src/lib.rs:2949`, `:2954`, dispatched at `:3955`). They default to the sync reads, so the
+    tests' fakes are untouched. #3864 later put two more beside them, `consent_pending_view` and
+    `consent_decide_view` (`:2984`, `:2992`), which default to the daemon's own consent questions and answers. A
+    one-row Mac's GUI worker (FR-43 P3) overrides them to list the root half's questions beside its own and to
+    send the root half the answers to them.
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2148`, `:2161`), with P2g's
+    rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:272`). Then
+    `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status,
+    MagicDNS and, since FR-128 D8, netcheck (`with_machine_network`, `:289`). On a one-row Mac's GUI worker
+    (FR-43 P3a), `Status` also takes the root half's identity and link (`with_machine_identity`, `:313`).
+  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3681`). That drops
     the endpoints of either end and of a relay, the carrier snapshot, the path decision and the probes, which
     name other devices' public and LAN addresses.
   - **A root half slow to answer** (1.5 s) leaves the half's own answer for that poll.
   - **The answer names its lender (#2892).** `with_machine_network` also sets `NodeStatus.network_from`
-    (`crates/localapi/src/lib.rs:201`; the root half's node id and name), additive and absent unless lent. Until then `roomler status` as the console
+    (`crates/localapi/src/lib.rs:197`; the root half's node id and name), additive and absent unless lent. Until then `roomler status` as the console
     user printed the root half's address as the per-user half's, right above that half's own "overlay OFF"
     enrollments, and told it to join the mesh with netstack. The CLI marks the lent lines "(the root daemon's)",
     adds a `network` line naming that daemon, and reads the enrollments' closing line as "off the mesh by design";
