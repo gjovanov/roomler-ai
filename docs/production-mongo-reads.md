@@ -175,6 +175,7 @@ can prevent it:
 | `scripts/rc-shadow-report.sh` + `.cjs` | FR-63's shadow report and its verdict: the flip criterion's agreement, and FR-148's under-drive clause (per class, spent ≤ 1.25 × shadow in ≥ 90 % of the clean windows at the class's gate, 2 Mbit/s direct and 0.5 Mbit/s constrained, over ≥ 20 sessions), whose thresholds were published on 2026-11-02, before the seven-day read (`docs/rate-control.md`) | the same shape (`scripts/rc-shadow-report.sh:142`) |
 | `scripts/fr97-caps-census.sh` | FR-97's capability words by OS | on mars. The aggregation goes to the runner on stdin with `--db` (`scripts/fr97-caps-census.sh:78`). It no longer reads the app's database URL, which holds the password, from `roomler2` |
 | `scripts/fr138-roll-read.sh` | FR-138's roll read | the same (`scripts/fr138-roll-read.sh:539`). `--mars` ships itself and the runner in one `roomler ssh` |
+| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8) | the same shape (`scripts/rc-path-report.sh:164`). `--mars` ships both files and the runner in one `roomler ssh` |
 | By hand | the growth-observability field check, the `rc.connect` mining in `docs/remote-control.md`, the pairing audit in `docs/device-pairing.md` | `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` … `JS`, with `db` already open |
 
 ```bash
@@ -213,3 +214,53 @@ One read-only run through `--mars`, 12:27:33Z–12:28:03Z: `estimatedDocumentCou
 The client held 180 MiB while the database's container grew by 168 KB. Run the old way, those
 180 MiB would have counted against mongod's own limit. A positive control kept the zeros
 honest: the same password grep matched the run's own credential file once.
+
+## 8. FR-148's path report
+
+`scripts/rc-path-report.sh` + `.cjs` read the agents' own lines in `agent_logs` and print, per
+remote-desktop session, what it opened at beside what its pair had already carried, and the
+plan's target beside the encoder's applied rate. Per pair, they print the trail of writes to
+the rate memory, each marked inferred. Two flags count the failures FR-148 fixes. It is P0's
+first instrument, and AC1 reads the two reference chains through it
+(`docs/fr/FR-148-path-measured-plan-follows.md` §2). What each column means, and what the lines
+cannot tell, is in the script's header. This section is the read's contract with production.
+
+| Bound | What it is | Where |
+|---|---|---|
+| Window | at most 8 days, read as one query per day | `scripts/rc-path-report.cjs:1325` |
+| Index | pinned with `hint`: `created_at_1` for the fleet and for `--agent` alone, `tenant_id_1_agent_id_1_created_at_-1` for one agent of one `--tenant`, `tenant_id_1_source_1_created_at_-1` for any other `--tenant` read. Each returns the batches in `created_at` order, so the `$sort` is no blocking SORT stage | `scripts/rc-path-report.cjs:1355` |
+| Time | `maxTimeMS` 240,000 per query | `scripts/rc-path-report.cjs:1360` |
+| Memory | `allowDiskUse: false`. After the `$match`, only streaming stages: a `$project` whose `$filter` keeps the lines of the ten messages read, `$unwind`, and a `$project` of 30 named fields | `scripts/rc-path-report.cjs:1248` |
+| Cost | every batch in the window is examined once. `agent_logs` held 354,193 batches over its 7 days on 2026-11-10 (§7), so a 7-day run examines about 350,000 documents, about 50,000 per daily query, through the index | — |
+| What leaves | the matching lines' named fields only. The memory key leaves as its carrier half and the controlling user as the last 6 hex of its id: no address, no host name, no person's name | `scripts/rc-path-report.cjs:1252` |
+
+The runner prints `mongodb-0`'s restart count and memory before and after the read, and a
+restart fails the run (exit 3), as for every reader in §6.
+
+| Term | Rule | Constant |
+|---|---|---|
+| Pair | the agent, the controlling user and the carrier class. The viewer's device and network are not read, because the lines carry them only as addresses (FR-148 §9 O1) | — |
+| Demonstrated rate | for every run of K consecutive heartbeat windows of one pump, all with a delivered rate and all clean, the run's lowest rate; the pair's is the highest of those in the window. A lower bound on what the path carries, never its capacity | `DEMO_K`: K = 15 FFmpeg heartbeats (about 2 s each) or 30 VP9-444 ones (about 1 s), a run of about 30 s |
+| Clean window | the viewer reported an age, and it sat less than 70 ms over its floor | `AGE_SLACK_MS`, which the self-test checks against `encode/ratectl.rs` |
+| F1 | the opening (the first heartbeat's `target_bps`) is below 0.5 × the pair's demonstrated rate in the window. AC6's line, 0.85 ×, is counted beside it, against the window and against what the pair had shown before the session opened | `F1_RATIO`, `AC6_RATIO` |
+| F2 | the target's max is at least 1.5 × its min, the session lasted at least 5 min, and the encoder's applied rate (`maxrate_bps`, and the rate-apply counters) moved 0 times | `F2_SPREAD`, `F2_MIN_SESSION_MS` |
+
+**Rehearsed, not run on production.** On 2026-11-16 the self-test's invented sessions (both
+reference chains and a healthy session) went into a throwaway `mongo:7` as 254 batches. The
+mongosh read, the Node read of its own `--rows` output and the Node read of the fixtures agreed
+exactly, in Markdown and in JSON, and both flags read RAISED. `--explain` read an index scan
+with no SORT stage for all six combinations of `--tenant` and `--agent`. The rehearsal found
+two faults, fixed before the first push. A heartbeat batch that reached the read after a later
+one was counted as a new pump, and is now a replay. `--docker` with no other option handed
+`docker exec` an empty argument as its container name.
+
+```bash
+node scripts/rc-path-report.cjs --self-test                     # 83 cases: both chains, the rule's and the flags' edges, privacy, the seed
+node scripts/rc-path-report.cjs --fixtures > seed.ejson          # the self-test's sessions as agent_logs batches
+bash scripts/rc-path-report.sh --docker NAME --seed seed.ejson   # the rehearsal, against a mongo:7 you started
+bash scripts/rc-path-report.sh --mars --yes --label HEX=CORPLAP-1 --label HEX=CORPLAP-2   # the fleet read: the last 7 days
+bash scripts/rc-path-report.sh --mars --yes --rows > rows.ndjson; node scripts/rc-path-report.cjs rows.ndjson   # the same, re-read offline
+```
+
+⚠️ `agent_logs` deletes a batch 7 days after it arrives. Read a chain before its first batches
+turn 7 days old.

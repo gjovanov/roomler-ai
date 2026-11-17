@@ -1385,6 +1385,8 @@ bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehea
 node scripts/rc-shadow-report.cjs rows.ndjson                        # a read's --rows output, offline: the same verdict
 ```
 
+FR-148's path report reads the same `agent_logs` per session: what it opened at beside what its pair had carried, and the plan beside the encoder (`bash scripts/rc-path-report.sh --mars --yes`, [production-mongo-reads.md](production-mongo-reads.md) §8).
+
 ⚠️ **The window starts at `agent-v0.4.188`** (published 2026-10-30 14:21Z), the first
 release with B1. `agent_logs` deletes a batch 7 days after it arrives, so a window
 anchored at the release loses its first hours the moment it turns 7 days old: read it
