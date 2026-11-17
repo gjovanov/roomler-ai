@@ -95,7 +95,7 @@ sequenceDiagram
 > the daemon's `started_at_ms` is 1792967954; the watcher's `finished_unix` is
 > 1792967960. For those seconds the record honestly reads `InProgress`, which
 > is why the daemon reads the file **on every answer** rather than once at
-> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:1015`),
+> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:1063`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
 
 ## 4. The eight words
@@ -157,7 +157,7 @@ record's file. Two topologies split roles:
   worker's own token, and only the S-1-5-18 SID is `SystemContext`
   (`agents/roomlerd/src/system_context/worker_role.rs:208`); `roomler status`
   shows the same fact as `privileged` (`process_is_privileged`,
-  `agents/roomlerd/src/localapi_state.rs:492`), `service (per-user)` when it is
+  `agents/roomlerd/src/localapi_state.rs:505`), `service (per-user)` when it is
   false. The dev box is the attended case (`privileged: false`): the 0.4.172
   and 0.4.174 records sit under the signed-in user's profile, while the SYSTEM
   profile's copy is a July `InProgress` for `agent-v0.3.0-rc.183` — a watcher
