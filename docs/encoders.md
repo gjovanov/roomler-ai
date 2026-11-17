@@ -1835,8 +1835,17 @@ ladder is on. If FFmpeg refuses it (`ENOSYS` when the runtime's `MFXVideoENCODE_
 refuses a parameter, `qsvenc.c:1287-1292`) or the context fails before it, tier 1 runs
 exactly as today, with today's ladder and colour fallback after it, and one warning
 carries the error. The refusal is remembered for the process (`QvbrKey`: the encoder,
-its chroma, its `low_power`), so a host that refuses pays one extra open, once. A
-warning from the runtime is no refusal: FFmpeg opens on it (`:675-698`, `:1820-1826`),
+its chroma, its `low_power`), so a host that refuses pays one extra open, once. The
+memory does not know the cause: a QVBR open that fails over another of tier 1's
+options, or over the colour description, ends QVBR for that key in this process too.
+The next line tells them apart. The two opens differ only in `bit_rate`, so if tier
+1's `ffmpeg encoder opened with quality + low-latency options` follows the warning,
+QVBR alone was refused; `ffmpeg open rejected the low-latency knobs` means tier 1
+fails on this host anyway. Only tier 1 asks: with both QSV low-latency knobs emptied
+(`ROOMLERD_FFMPEG_QSV_ASYNC_DEPTH` and `ROOMLERD_FFMPEG_QSV_FORCED_IDR` set empty, the
+escape hatch for a driver that refuses them) there is no tier 1, so no open asks and
+no `FR-148` line is written.
+A warning from the runtime is no refusal: FFmpeg opens on it (`:675-698`, `:1820-1826`),
 so a runtime that quietly runs another mode shows only in the bytes. The probe child
 reads the same switch (a config fallback reaches it as an environment variable) and
 opens the same way, so the probe and a session agree about the cell. The caps cache
@@ -1844,7 +1853,7 @@ hashes the knob, so a change re-probes. ⚠️ A QVBR open that kills the probe 
 the cell, as any death in an open does, until the switch is off again.
 
 **The log.** With the switch off, nothing new. With it on, one line per QSV open,
-beside tier 1's own:
+beside tier 1's own (none without a tier 1, above):
 
 | Line | Level | When |
 |---|---|---|
