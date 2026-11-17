@@ -292,6 +292,13 @@ impl GoodputEstimator {
     pub fn rejected(&self) -> u64 {
         self.rejected
     }
+
+    /// FR-148 P0 — when the last qualifying window was folded: the age of the
+    /// freshest evidence in [`Self::estimate_bps`]. Read by the `path model`
+    /// line only.
+    pub fn sampled_at(&self) -> Option<Instant> {
+        self.last_sample_at
+    }
 }
 
 #[cfg(test)]
