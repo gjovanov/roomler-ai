@@ -1224,7 +1224,7 @@ impl LocalApiState for DaemonState {
             return false;
         };
         match &self.rc_sessions {
-            Some(reg) => reg.disconnect(&oid),
+            Some(reg) => reg.disconnect(&oid, crate::rc_sessions::Via::LocalApi),
             None => false,
         }
     }

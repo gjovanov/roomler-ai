@@ -2667,9 +2667,9 @@ it: there is no hub timer for SSH, and the Windows worker relay waits the window
 
 | Test | Shows |
 |---|---|
-| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:8525`](../agents/roomlerd/src/signaling.rs#L8525)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
-| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:8595`](../agents/roomlerd/src/signaling.rs#L8595)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
-| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:8636`](../agents/roomlerd/src/signaling.rs#L8636)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
+| `an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take` ([`signaling.rs:8527`](../agents/roomlerd/src/signaling.rs#L8527)) | with the surfaces held to each OS's worst case above, the `rc:consent` reaches the stood-in hub at the window's end, before `window + CONSENT_VERDICT_GRACE`, saying `no_prompt_surface` |
+| `surfaces_still_going_up_at_the_windows_end_count_as_shown` ([`:8597`](../agents/roomlerd/src/signaling.rs#L8597)) | surfaces slower than the window do not hold the verdict; it says `timeout` |
+| `an_answer_given_while_the_surfaces_go_up_decides_at_once` ([`:8638`](../agents/roomlerd/src/signaling.rs#L8638)) | an Approve or a Deny at 1 s, with the surfaces held 11 s, decides at once |
 | `a_marker_is_rewritten_only_while_its_question_stands` ([`consent.rs:1174`](../agents/roomlerd/src/consent.rs#L1174)) | the notification's marker rewrite writes nothing for a question that ended |
 
 ⚠️ **A click on a notification's body is not an answer** (FR-93 P6f). GNOME 50
@@ -3151,6 +3151,26 @@ reaches it over the LocalAPI (`RcDisconnect`), which takes it, as it takes a
 consent answer, only from the person at the screen the daemon shows, SYSTEM
 or an elevated administrator (`docs/desktop-companion.md` §12.4). The badge's
 is the daemon's own and never crosses the pipe.
+
+Each order on that channel names what asked (`rc_sessions::Via`,
+[`rc_sessions.rs:300`](../agents/roomlerd/src/rc_sessions.rs#L300), #4001), and the arm logs
+`the person at the device ended the session` with it as `via`
+([`signaling.rs:3036`](../agents/roomlerd/src/signaling.rs#L3036) →
+[`rc_sessions.rs:335`](../agents/roomlerd/src/rc_sessions.rs#L335)):
+
+| `via` | what asked |
+|---|---|
+| `overlay_badge` | the Windows badge's Disconnect |
+| `localapi` | a LocalAPI client: the companion banner's Disconnect, or `roomlerd rc --disconnect`. The request does not say which, so the line does not either |
+| `being_viewed_notification` | the Disconnect on the Linux being-viewed notification (FR-93 P6g) |
+| `desktop_share_stop` | the desktop's own Stop on the screen share (FR-93 P6c, below) |
+
+The line's text is pinned by `the_host_ended_line_says_the_person_ended_it_and_names_what_asked`.
+Until #4001 every one of these read `viewee requested disconnect via overlay badge`, and only
+Windows has a badge. The field logs in `docs/fr/FR-27-consent-surfaces-and-desktop-companion.md`
+quote that old line as it read then. A pump with no encoder (#3245) asks on the same channel, as
+`no_video`, and the arm names that end `no_video`, not the person's (`DeviceEnd::NoVideo`,
+`docs/encoders.md`).
 
 ```mermaid
 sequenceDiagram
@@ -4807,7 +4827,7 @@ session not yet live, and an external one, end as before FR-138.
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2396`); `arm_key_rotated_closes_every_peer` (`:2397`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2900`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
 | each row above | each arm is the loop's one call into the table, and nothing else closes the connection's peers | `every_arm_of_the_connection_ends_through_the_table` (`agents/roomlerd/src/session_table.rs:2438`) |
-| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:8441`) |
+| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:8443`) |
 | an external session (FR-52, D3) | built with no link, so it closes at every exit. The server ends it at the drop and refuses a claim of it | `an_external_session_is_built_without_a_link` (`agents/roomlerd/src/session_table.rs:3351`); `a_delegated_or_external_session_closes_at_a_transient_exit` (`:2513`); `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_claim_of_an_external_session_is_refused` (`crates/tests/src/rc_resume_pd_tests.rs:379`) |
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
