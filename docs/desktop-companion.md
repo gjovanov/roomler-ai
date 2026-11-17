@@ -69,15 +69,17 @@ Hash routes in `src/front/app.js`; one `<section id="view-*">` per page. The ins
 ## 3. The LocalAPI, and why the Routes page used to blink
 
 Every companion request opens the pipe **fresh**, sends one JSON request (or a short batch
-on one connection) and closes. Five things poll it at once in a running companion:
+on one connection) and closes. Five things poll it at once in a running companion, and a sixth
+while the prompt window asks a question:
 
 | Poller | Where | Interval | Connections per tick |
 |---|---|---|---|
-| service status | `src/front/app.js:166` | 10 s | 0 (reads config, runs `roomlerd service status`) |
-| device view (`Status` + `Peers`) | `src/front/app.js:168` → `cmd_device_view`, `src/commands.rs:323` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:2181` | 2 s, visible only | 1 |
-| consent (in-window) | `src/front/consent.js:157` | 1.5 s | 1 |
+| service status | `src/front/app.js:190` | 10 s | 0 (reads config, runs `roomlerd service status`) |
+| device view (`Status` + `Peers`) | `src/front/app.js:192` → `cmd_device_view`, `src/commands.rs:335` | 2 s | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:2793` | 2 s, visible only | 1 |
+| consent (in-window) | `src/front/consent.js:193` | 1.5 s | 1 |
 | consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
+| consent (the prompt window, §10.9) | `src/front/panel-consent.js:202` | 750 ms | 1 |
 
 **What went wrong (field, 2026-09-25):** the Routes page's tables appeared and disappeared
 every few seconds while the daemon's data was steady. Three raw back-to-back opens of the
@@ -1825,7 +1827,7 @@ sequenceDiagram
 - **One viewer, with the native panel up.** The app now receives that question too, marked
   `native`, and filters it out (`consent_watch_loop`,
   [`main.rs:338`](../agents/roomler-desktop/src/main.rs#L338); the prompt window,
-  `panel-consent.js:112`), as a Windows SYSTEM install's tray does with a question its own panel
+  `panel-consent.js:183`), as a Windows SYSTEM install's tray does with a question its own panel
   shows. A Linux system daemon has no native panel, so its tray shows every question. There is
   one Approve on the screen, the panel's: the app shows no button for that question.
   Whatever ends the question takes the panel down (`hide_prompt`), and the app's next poll no
@@ -1854,6 +1856,77 @@ sequenceDiagram
 - **Field cells:** a one-row Mac with two viewers, where viewer 2 asks while viewer 1's panel is up
   and the menu-bar app shows viewer 2's question; Approve and Deny each do what they say; and a
   two-row Mac as the control.
+
+### 10.9 A click on the prompt is acted on, or logged (#3873)
+
+Read in the 0.4.221 release lab on a Linux system install: the daemon started the tray for a
+question, the prompt window showed it, and two clicks on Approve, 6 s and about 3 min after it
+showed, did nothing. Neither the tray's log nor the daemon's journal has a line at either click,
+and the question timed out. When the second click came, the window still counted down the
+question's own deadline, so the page was alive and showed that question.
+
+No step of a click said anything, and none had a bound:
+
+| Step | Until #3873 |
+|---|---|
+| the page's `decide()` | left early, without a word, while an earlier answer was "on its way" or after the page had let go of the question |
+| the page's words | "Approving…" and "Failed: …" went into the countdown, which repaints every second |
+| the app's `consent_decide` | no line on any outcome |
+| the LocalAPI reply | read with no deadline (`Client::request`, [`crates/localapi/src/lib.rs:5775`](../crates/localapi/src/lib.rs#L5775)) |
+| the page's read of the questions | a failure read as "no question": the page let go of the question while it stayed on screen |
+
+The answer never reached the daemon: 0.4.221 answers a `ConsentDecide` at once, and logs a
+refusal or the grant, and its journal has neither. The likeliest path is that the first click's
+answer never came back, so the page stayed "sending" and dropped the second click. Whether the
+first click reached the app cannot be told from those logs, because nothing logged a click's
+arrival. The earlier tray's WebKit processes, still running when this tray started, are not shown
+to be the cause: a later tray approved at once beside three of them.
+
+Now a click is acted on, or the person reads why not, and the tray's log has it either way:
+
+```mermaid
+sequenceDiagram
+    participant P as the person
+    participant W as prompt window (panel-consent.js)
+    participant A as the app (answer_click)
+    participant D as roomlerd
+    P->>W: Approve
+    W->>W: buttons off, "Approving…" on the status line
+    W->>A: cmd_consent_approve(the question shown, or none)
+    A->>A: log "consent: a click arrived"
+    A->>D: ConsentDecide, 10 s for connect and reply
+    D-->>A: taken, refused in its words, or nothing
+    A->>A: log the outcome
+    A-->>W: "approved", or the reason
+    W->>P: "Approved.", or the reason, until the next click or question
+    Note over W: no reply from the app in 15 s:<br/>the page's own limit, the buttons come back
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2608`](../agents/roomler-desktop/src/commands.rs#L2608) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`) |
+| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2581`](../agents/roomler-desktop/src/commands.rs#L2581): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a one-row Mac's relay (5 s, §10.8) |
+| the page | `decide`, [`panel-consent.js:133`](../agents/roomler-desktop/src/front/panel-consent.js#L133); `paintButtons`, [`:67`](../agents/roomler-desktop/src/front/panel-consent.js#L67); `PAGE_LIMIT_MS`, [`:51`](../agents/roomler-desktop/src/front/panel-consent.js#L51); the status line, `panel-consent.html:103` | the click is sent before anything else can stop it. The buttons are off only while no question is shown, an answer is on its way, or this window answered the question, and the status line says which. It is an element of its own (`p-status`), so the countdown never overwrites it, and its words stay until the next click or question. The page's own 15 s limit fires only when the app never replies, and the buttons then come back. Escape acts as the Deny button does |
+| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2681`](../agents/roomler-desktop/src/commands.rs#L2681) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
+| the fallback modal | `decide`, [`consent.js:69`](../agents/roomler-desktop/src/front/consent.js#L69) | the same: the click is sent first, the buttons are off while an answer is on its way, the same 15 s limit, and an answered question is not shown again |
+
+- **The WARN at every start** (`refresh failed surface="encoder_caps" … person-at-the-device
+  socket of a system install`, in the same lab) is gone since #3891 (0.4.223): the person socket
+  serves `encoder_caps`, and an older daemon's refusal reads `root_only` with no WARN (§8).
+- **Unchanged:** what the daemon decides and how (`consent_decide_view`, #3845's seat check),
+  the prompt's window and placement, the watch that shows and hides it (`consent_watch_loop`), and
+  the words a viewer reads.
+- **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop
+  companion on Windows — clippy + unit tests (#3940)": `a_click_whose_answer_never_comes_ends_at_the_bound`,
+  `every_click_is_logged_when_it_arrives_and_with_its_outcome`, `a_click_with_no_question_is_logged_and_sends_nothing`,
+  `a_failed_read_of_the_questions_is_an_error_and_in_the_log`, and the pages' own pins:
+  `the_prompt_sends_every_click_and_says_why_its_buttons_are_off`, `the_prompt_keeps_its_question_on_a_failed_read`,
+  `the_fallback_modal_sends_every_click_too`.
+- **Field cells:** a Linux system install; a tray the daemon starts for a question about 40 s
+  after the earlier tray was stopped; Approve, then Deny on the next question. Each click has its
+  arrival and outcome lines in the tray's log and the outcome on the window's status line. A click
+  with the daemon stopped reads its reason within 10 s, and the buttons come back. The control is
+  the release before, with no line at the click.
 
 ## 11. Testing it
 
@@ -2183,7 +2256,7 @@ Who calls them, and how each is read:
 
 | Caller | Runs | Taken as |
 |---|---|---|
-| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2545`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2615`) | as the person, in their session | the screen's session |
+| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2548`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2744`) | as the person, in their session | the screen's session |
 | `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2507`; `rc_cmd`, `:2404`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
@@ -2789,8 +2862,10 @@ crashed with them (the field check below).
 Since #2729 the daemon starts the companion with `--property=KillMode=process`
 (`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:3993`), in a root daemon's system
 unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
-Its own helpers end with it regardless, since WebKit's web and network processes exit when their
-UI process's connection closes.
+Its own helpers were expected to end with it, since WebKit's web and network processes exit when
+their UI process's connection closes. ⚠️ Not on every host: on the 0.4.221 lab's Ubuntu VM (software
+rendering), two and then three of them kept running in the stopped unit after each tray stop
+(§10.9).
 
 Measured 2026-10-22 on the same box, with a replica of the daemon's unit whose main process starts
 a child and exits after 4 s:
