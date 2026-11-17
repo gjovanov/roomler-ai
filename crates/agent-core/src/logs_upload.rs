@@ -190,19 +190,19 @@ where
             ts: DateTime::now(),
             level,
             target,
-            msg: visitor.message,
+            msg: visitor.message.unwrap_or_default(),
             fields: visitor.fields,
         };
         self.forward(line, &LINES_DROPPED);
     }
 }
 
-/// Visitor that splits a tracing event's fields into the conventional
-/// `message` (the `"some literal {}"` interpolated arg) plus the
-/// structured key=value pairs.
+/// Splits an event's fields into its text, the FIRST `message` (tracing's macros put the format
+/// string first), and the key=value pairs. #3816 — a later field named `message` is one of the
+/// pairs: keeping the last let a field replace an uploaded line's text.
 #[derive(Default)]
 struct FieldVisitor {
-    message: String,
+    message: Option<String>,
     fields: Document,
 }
 
@@ -210,17 +210,17 @@ impl tracing::field::Visit for FieldVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let name = field.name();
         let s = format!("{value:?}");
-        if name == "message" {
+        if name == "message" && self.message.is_none() {
             // tracing wraps Debug output in quotes for &str; strip them
             // so the persisted msg matches the visible log line.
-            self.message = strip_outer_quotes(&s);
+            self.message = Some(strip_outer_quotes(&s));
         } else {
             self.fields.insert(name, s);
         }
     }
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
+        if field.name() == "message" && self.message.is_none() {
+            self.message = Some(value.to_string());
         } else {
             self.fields.insert(field.name(), value.to_string());
         }
@@ -709,5 +709,52 @@ mod tests {
         }
         uploader.abort();
         feeder.abort();
+    }
+
+    /// #3816 — an uploaded line keeps its own text beside a field named
+    /// `message`. tracing calls a line's text `message` too, and its macros put
+    /// the text first, so the first `message` is the text and a later one is a
+    /// field. The visitor used to keep the last: the clipboard's "rich write
+    /// failed" line went up with its error for its text. A `message` with no
+    /// text beside it is still the line's text.
+    #[test]
+    fn a_field_named_message_never_replaces_the_lines_own_text() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (layer, mut rx) = LogUploadLayer::new();
+        let message = String::from("rich transfer n1 ended at 0 of 2 declared bytes");
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::warn!(id = "n1", ?message, "clipboard: rich write failed");
+            tracing::warn!(id = "n1", %message, "clipboard: rich write failed");
+            tracing::warn!(message = "a field's text", "the line's text");
+            tracing::info!(id = "n1", message = %message);
+        });
+        let mut next = || rx.try_recv().expect("the layer forwards every line");
+
+        let debug = next();
+        assert_eq!(debug.msg, "clipboard: rich write failed");
+        assert_eq!(
+            debug.fields.get_str("message"),
+            Ok("\"rich transfer n1 ended at 0 of 2 declared bytes\"")
+        );
+        assert_eq!(debug.fields.get_str("id"), Ok("n1"));
+
+        let display = next();
+        assert_eq!(display.msg, "clipboard: rich write failed");
+        assert_eq!(
+            display.fields.get_str("message"),
+            Ok("rich transfer n1 ended at 0 of 2 declared bytes")
+        );
+
+        let text = next();
+        assert_eq!(text.msg, "the line's text");
+        assert_eq!(text.fields.get_str("message"), Ok("a field's text"));
+
+        let lone = next();
+        assert_eq!(lone.msg, "rich transfer n1 ended at 0 of 2 declared bytes");
+        assert_eq!(
+            lone.fields.get("message"),
+            None,
+            "a lone message is the text"
+        );
     }
 }

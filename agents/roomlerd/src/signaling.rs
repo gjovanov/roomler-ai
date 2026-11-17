@@ -1478,7 +1478,7 @@ pub async fn run(
                 recent_replacements.push(now);
                 let displacements = recent_replacements.len();
                 warn!(
-                    %message,
+                    reason = %message,
                     count = displacements,
                     "server signalled this connection was replaced; staggering reconnect to break the duel"
                 );
@@ -5224,7 +5224,7 @@ async fn handle_server_msg(
             message,
             open_nonce: _,
         } => {
-            warn!(?session_id, %code, %message, "server-side rc error");
+            warn!(?session_id, %code, reason = %message, "server-side rc error");
         }
 
         // rc.53: server has decided this WS is over. Tear down every
@@ -5248,14 +5248,14 @@ async fn handle_server_msg(
             if ctx.is_primary {
                 tracing::error!(
                     ?reason,
-                    %message,
+                    detail = %message,
                     "server-side rc:goodbye received — stopping current session loop"
                 );
             } else {
                 tracing::debug!(
                     org = %ctx.label,
                     ?reason,
-                    %message,
+                    detail = %message,
                     "server-side rc:goodbye received — stopping this org's session loop"
                 );
             }
