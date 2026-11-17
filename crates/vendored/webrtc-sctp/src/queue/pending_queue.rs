@@ -8,6 +8,10 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::sync::{mpsc, MutexGuard, SemaphorePermit, TryAcquireError};
 use util::sync::RwLock;
 
+// roomler (FR-148): the queue's fills and empties, for the delivery clock.
+use std::sync::Arc;
+
+use crate::association::delivery::{DeliveryClock, DeliveryCounters};
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 
 // TODO: benchmark performance between multiple Atomic+Mutex vs one Mutex<PendingQueueInternal>
@@ -65,6 +69,9 @@ pub(crate) struct PendingQueue {
     n_bytes: AtomicUsize,
     selected: AtomicBool,
     unordered_is_selected: AtomicBool,
+    // roomler (FR-148): counts `n_bytes` leaving and reaching zero, and holds
+    // the association's acknowledged bytes (`Association::delivery_clock`).
+    delivery: Arc<DeliveryCounters>,
 }
 
 impl Default for PendingQueue {
@@ -92,6 +99,25 @@ impl PendingQueue {
             n_bytes: Default::default(),
             selected: Default::default(),
             unordered_is_selected: Default::default(),
+            delivery: Default::default(), // roomler (FR-148)
+        }
+    }
+
+    /// roomler (FR-148): the counters this queue and the SACK handler keep.
+    pub(crate) fn delivery(&self) -> &DeliveryCounters {
+        &self.delivery
+    }
+
+    /// roomler (FR-148): a reader's handle onto those counters.
+    pub(crate) fn delivery_clock(&self) -> DeliveryClock {
+        DeliveryClock::new(Arc::clone(&self.delivery))
+    }
+
+    /// roomler (FR-148): `n` bytes queued; the first bytes into an empty
+    /// queue count as a fill.
+    fn add_bytes(&self, n: usize) {
+        if self.n_bytes.fetch_add(n, Ordering::SeqCst) == 0 && n > 0 {
+            self.delivery.on_queue_filled();
         }
     }
 
@@ -204,7 +230,7 @@ impl PendingQueue {
         } else {
             self.ordered_queue.write().push_back(c);
         }
-        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+        self.add_bytes(user_data_len); // roomler (FR-148)
         self.queue_len.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -232,7 +258,7 @@ impl PendingQueue {
             }
         }
 
-        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+        self.add_bytes(user_data_len); // roomler (FR-148)
         self.queue_len.fetch_add(1, Ordering::SeqCst);
         true
     }
@@ -372,7 +398,7 @@ impl PendingQueue {
             let mut ordered_queue = self.ordered_queue.write();
             ordered_queue.push_back(chunk);
         }
-        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+        self.add_bytes(user_data_len); // roomler (FR-148)
         self.queue_len.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -399,8 +425,7 @@ impl PendingQueue {
             ordered_queue.extend(chunks);
         }
 
-        self.n_bytes
-            .fetch_add(total_user_data_len, Ordering::SeqCst);
+        self.add_bytes(total_user_data_len); // roomler (FR-148)
         self.queue_len.fetch_add(chunks_len, Ordering::SeqCst);
     }
 
@@ -480,7 +505,12 @@ impl PendingQueue {
 
         if let Some(p) = &popped {
             let user_data_len = p.user_data.len();
-            self.n_bytes.fetch_sub(user_data_len, Ordering::SeqCst);
+            // roomler (FR-148): the last bytes out count as an empty.
+            if self.n_bytes.fetch_sub(user_data_len, Ordering::SeqCst) == user_data_len
+                && user_data_len > 0
+            {
+                self.delivery.on_queue_emptied();
+            }
             self.queue_len.fetch_sub(1, Ordering::SeqCst);
             // roomler (#3755): the overdraft is paid first, and only the rest
             // becomes room again. One load while nothing is owed.

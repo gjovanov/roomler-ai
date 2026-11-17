@@ -1479,3 +1479,35 @@ fn test_chunk_set_incomplete_chunk_set_no_contiguous_tsn() -> Result<()> {
     );
     Ok(())
 }
+
+// roomler (FR-148): the queue counts each time it fills and runs empty, and the
+// delivery clock reads those counts beside the acknowledged bytes.
+#[tokio::test]
+async fn test_pending_queue_counts_its_fills_and_empties() {
+    use crate::association::delivery::Delivery;
+
+    let pq = PendingQueue::new();
+    let clock = pq.delivery_clock();
+    assert_eq!(clock.read(), Delivery::default());
+    assert!(clock.read().queue_empty(), "a new queue is empty");
+
+    pq.push(make_data_chunk(0, false, NO_FRAGMENT)).await;
+    pq.push(make_data_chunk(1, false, NO_FRAGMENT)).await;
+    let d = clock.read();
+    assert_eq!((d.queue_fills, d.queue_empties), (1, 0), "two pushes, one fill");
+    assert!(!d.queue_empty());
+
+    let c = pq.peek().unwrap();
+    assert!(pq.pop(c.beginning_fragment, c.unordered).is_some());
+    assert_eq!(clock.read().queue_empties, 0, "bytes are still queued");
+    let c = pq.peek().unwrap();
+    assert!(pq.pop(c.beginning_fragment, c.unordered).is_some());
+    let d = clock.read();
+    assert_eq!((d.queue_fills, d.queue_empties), (1, 1), "the last bytes out");
+    assert!(d.queue_empty());
+
+    pq.push(make_data_chunk(2, false, NO_FRAGMENT)).await;
+    assert_eq!(clock.read().queue_fills, 2);
+    pq.delivery().on_acked(10);
+    assert_eq!(clock.read().acked_bytes, 10);
+}

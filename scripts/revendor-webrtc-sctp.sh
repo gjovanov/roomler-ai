@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Consolidation invariant I5 — the vendored `crates/vendored/webrtc-sctp`
 # is pristine upstream + ONE canonical patch (`crates/vendored/webrtc-sctp.patch`).
-# Its deltas (the FORWARD-TSN parse fix, #1856, #3716, #3755) are listed, each
+# Its deltas (the FORWARD-TSN parse fix, #1856, #3716, #3755, FR-148) are listed, each
 # with its reason, at the top of crates/vendored/webrtc-sctp/Cargo.toml. A
 # standalone `cargo test --manifest-path` of the fork writes a Cargo.lock into
 # it: delete that before `--check` or `--regen`.
