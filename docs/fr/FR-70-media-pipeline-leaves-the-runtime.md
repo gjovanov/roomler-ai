@@ -1499,6 +1499,11 @@ the same memory, so it came along every time.
    the prior as it has decayed, else (as before) the applied rate. A
    misremembered fast pair records ≥ the band after one session and stops
    re-seeding slow; a genuinely slow pair records roughly the pipe.
+   *Reversed by [FR-79](FR-79-one-validity-gate.md) V5b rule (a), built 2026-11-03
+   and landed as [FR-148](FR-148-path-measured-plan-follows.md) P1's first step. The
+   decayed prior is no longer written: a session records a reading or nothing, so
+   its own stand-in cannot hold a key low. What that gives up, and why it was
+   already mostly gone, is in FR-79 §Key design.*
 4. **After the FR-59 P3 clamp releases, the floor stays at the last MEASURED
    rate** and decays from there, instead of snapping back to the 1.5 M
    constant — that snap forced the target 4× over a pipe just measured and

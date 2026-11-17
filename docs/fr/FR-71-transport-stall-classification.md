@@ -429,7 +429,8 @@ The docs for the classifier live with the gate's, as the section it feeds:
 ## Open decisions
 
 - **The V5 loop — a stall is "ours" because the last stall said so
-  (2026-10-29).** `stall_is_ours` (`governor.rs:1154`) is the one rule that lets
+  (2026-10-29).** **DECIDED 2026-11-02 in [FR-79](FR-79-one-validity-gate.md): the
+  operator chose A, built as V5b.** `stall_is_ours` (`governor.rs:1154`) is the one rule that lets
   a rejected `TransitStalled` window cut, gated on `desired > 1.2 × pipe_bps`.
   `pipe_bps` (`:607`) falls through to the prior's stand-in (`:613`) when neither
   the blocked-send goodput nor the viewer's arrival rate is live, and the same
@@ -458,6 +459,9 @@ The docs for the classifier live with the gate's, as the section it feeds:
   at 555 ms; 13 such drops in 15 days, two of them to 0.20 M. The
   make-before-break answer T2 used fits: a congested report arms the clamp one
   window late, if the window after it is not stalled.
+  *2026-11-03: still open, and still this FR's. FR-79 V5b's rule (b) stops a
+  congested report the sender was not feeding. Here the sender really is
+  offering, so (b) leaves this case exactly as it was.*
 - **Whether T1b's hold should be deleted, and what replaces it (2026-09-08).** **DECIDED 2026-09-08: FR-79 V1 deleted it, T2 and T2b, and kept T1a's classifier as the gate's instrument.** The
   field's finding-4 shape on the corp-VPN host is not the simulated one (post-ack
   paint age with a tiny queue): it is a pump pass stalled in `other` by the overlay's
