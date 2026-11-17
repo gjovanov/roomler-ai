@@ -612,6 +612,11 @@ impl Listener {
 }
 
 /// Run until `shutdown`. Inert unless this is a root daemon with the switch on.
+///
+/// #3967 — on a Mac, the other side of the same socket: a two-row Mac's
+/// per-user half (`LocalApiState::announces_consent_relay`) tells its root
+/// half here, for as long as it runs, that it lists the root half's consent
+/// questions to its person's app (`consent_relay::tell_the_root_half`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn run(state: Arc<dyn LocalApiState>, shutdown: watch::Receiver<bool>) {
     if !enabled_by_env(std::env::var("ROOMLERD_PERSON_SOCKET").ok().as_deref()) {
@@ -620,6 +625,10 @@ pub async fn run(state: Arc<dyn LocalApiState>, shutdown: watch::Receiver<bool>)
     }
     // SAFETY: geteuid never fails.
     if unsafe { libc::geteuid() } != 0 {
+        #[cfg(target_os = "macos")]
+        if state.announces_consent_relay() {
+            crate::consent_relay::tell_the_root_half(shutdown).await;
+        }
         return;
     }
     follow_the_seat(state, shutdown, Following::the_daemons()).await

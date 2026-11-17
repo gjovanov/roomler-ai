@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! #3864 — a one-row Mac's consent questions reach the menu-bar app.
+//! #3864 — a one-row Mac's consent questions reach the menu-bar app; #3967 —
+//! and a two-row Mac's root half's.
 //!
 //! On a one-row Mac (FR-43 P3) the root daemon holds the device's row, so it
 //! asks every remote-control, exec and SSH question, on its own consent
@@ -13,20 +14,27 @@
 //! while the root counted the app as the question's surface and the viewer
 //! waited out the window.
 //!
+//! #3967 — and so do a two-row Mac's. There the root half holds a row of its
+//! own (`-daemon`) and asks that row's exec and SSH questions (on a supervised
+//! Mac, its remote-control questions too) on its own broker, and the socket
+//! the app reaches is the per-user half's, whose list was its own broker's.
+//!
 //! | Half | What it does |
 //! |---|---|
 //! | the worker (`run --supervised --unenrolled`) | lists its own questions, then the root half's, asked over the root's person socket ([`listed`]); sends an answer to a question its own broker is not asking there ([`decided`]); says [`RELAY_CONSENT`] in its caps frame |
 //! | the root daemon | counts the app as a question's surface only while that road is open ([`reach`]): an attached worker that said [`RELAY_CONSENT`], and the person socket of that worker's account answering within [`RELAY_WITHIN`] |
+//! | #3967 — a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) | lists and decides as the worker does; says `consent_relaying` over the root half's person socket for its person and holds that connection (`keep_telling`) |
+//! | #3967 — a two-row Mac's root half | takes that announcement from the socket's own person, for as long as its connection stays open ([`Announcements`]), and counts the app only while one is live and that person's socket answers within [`RELAY_WITHIN`] ([`reach_two_rows`]) |
 //!
 //! Nothing is written anywhere: the question crosses the root's person socket
 //! (`/var/run/roomler-person/<uid>.sock`), which serves only the person at the
 //! console and root (`localapi::person_peer_ok`) and asks the seat again
-//! before it takes an answer, and the worker's own socket is that person's
-//! alone. A road that is closed leaves the floor every host has: the app is
-//! not the question's surface, the question stands its window for `roomlerd
-//! consent`, and it ends as `no_prompt_surface`. A two-row Mac is unchanged:
-//! its per-user half holds an enrollment, and its root daemon is not one
-//! row's.
+//! before it takes an answer, and the worker's (or per-user half's) own
+//! socket is that person's alone. The announcement lives in the root
+//! daemon's memory, for its connection's life. A road that is closed leaves
+//! the floor every host has: the app is not the question's surface, the
+//! question stands its window for `roomlerd consent`, and it ends as
+//! `no_prompt_surface`.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -188,6 +196,16 @@ where
     let Some(uid) = worker.uid else {
         return Reach::Closed("the worker's account is not known".into());
     };
+    relayed_if_it_answers(uid, answers).await
+}
+
+/// The last step of either road: the person socket for `uid` answers a list
+/// within [`RELAY_WITHIN`], or the road is closed.
+async fn relayed_if_it_answers<F, Fut>(uid: u32, answers: F) -> Reach
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: Future<Output = bool>,
+{
     match tokio::time::timeout(RELAY_WITHIN, answers(uid)).await {
         Ok(true) => Reach::Relayed(uid),
         Ok(false) => Reach::Closed(format!("the person socket for uid {uid} does not answer")),
@@ -206,13 +224,42 @@ pub fn register(host: &crate::delegate::DelegateHost) {
     let _ = ONE_ROW_HOST.set(host.clone());
 }
 
-/// [`reach_from`], for this daemon.
+/// Whether this process is a one-row Mac's root daemon ([`register`]).
+pub fn one_row() -> bool {
+    ONE_ROW_HOST.get().is_some()
+}
+
+/// The road a question this daemon asks takes to the menu-bar app: a one-row
+/// Mac's root daemon reads its worker ([`reach_from`]); #3967 — any other
+/// Mac's root half reads the announcement the console person's per-user half
+/// made over its person socket ([`reach_two_rows`]); every other daemon is
+/// asked by its tray directly.
 pub async fn reach() -> Reach {
-    let worker = ONE_ROW_HOST.get().map(|host| Worker {
-        relays: host.relays_consent(),
-        uid: host.worker_uid(),
-    });
-    reach_from(worker, person_socket_answers).await
+    if let Some(host) = ONE_ROW_HOST.get() {
+        let worker = Worker {
+            relays: host.relays_consent(),
+            uid: host.worker_uid(),
+        };
+        return reach_from(Some(worker), person_socket_answers).await;
+    }
+    if a_macs_root_half() {
+        return reach_two_rows(announcements().current(), person_socket_answers).await;
+    }
+    Reach::Direct
+}
+
+/// #3967 — whether this process is a Mac's root half: root, on a Mac. Never
+/// in a test, which stands its road in.
+fn a_macs_root_half() -> bool {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        // SAFETY: geteuid never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    {
+        false
+    }
 }
 
 /// Whether this daemon's person socket for `uid` answers a list, asked the
@@ -242,9 +289,17 @@ where
     F: FnOnce(u32) -> Fut,
     Fut: Future<Output = bool>,
 {
-    let _ = (announced, answers);
-    Reach::Direct
+    let Some(uid) = announced else {
+        return Reach::Closed(NOBODY_ANNOUNCED.into());
+    };
+    relayed_if_it_answers(uid, answers).await
 }
+
+/// #3967 — why a two-row Mac's root half does not count the app when no
+/// per-user half has announced.
+const NOBODY_ANNOUNCED: &str = "no per-user half of the person at the screen has said it lists \
+                                this daemon's consent questions (`consent_relaying`): an older \
+                                one, or none running";
 
 /// #3967 — the per-user halves that told this root daemon, over its person
 /// socket, that they list its consent questions to their person's app
@@ -258,19 +313,59 @@ pub struct Announcements {
 
 impl Announcements {
     /// `uid`'s per-user half said so, on a connection that holds the answer
-    /// until it ends.
+    /// until it ends: when the per-user half closes it (it stopped, or
+    /// restarted), or when the person socket stops serving it (the person at
+    /// the screen changed, or this daemon is stopping). Each start and each
+    /// end is logged once, with why it ended.
     pub fn announce(
         self: &std::sync::Arc<Self>,
         uid: u32,
     ) -> tunnel_core::localapi::HeldForTheConnection {
-        let _ = uid;
-        tunnel_core::localapi::HeldForTheConnection::new(|_| {})
+        use std::sync::atomic::Ordering;
+        let token = self.next.fetch_add(1, Ordering::Relaxed);
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((token, uid));
+        tracing::info!(
+            uid,
+            "consent relay: a two-row Mac's per-user half lists this daemon's consent questions \
+             to its person's app, which counts as their surface while it does (#3967)"
+        );
+        let book = self.clone();
+        tunnel_core::localapi::HeldForTheConnection::new(move |how| {
+            book.live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|&(t, _)| t != token);
+            let why = match how {
+                tunnel_core::localapi::ConnectionEnd::ClosedByThePeer => {
+                    "its connection closed: the per-user half stopped or restarted"
+                }
+                tunnel_core::localapi::ConnectionEnd::Dropped => {
+                    "the person socket stopped serving it: the person at the screen changed, or \
+                     this daemon is stopping"
+                }
+            };
+            tracing::info!(
+                uid,
+                why,
+                "consent relay: the per-user half no longer lists this daemon's consent \
+                 questions; the app is not their surface (#3967)"
+            );
+        })
     }
 
     /// The person whose per-user half said so last, while its connection is
-    /// open.
+    /// open. The person socket serves one person at a time, and stops every
+    /// connection of the last before it serves the next, so this is the
+    /// person at the screen, or was within its look's 5 s.
     pub fn current(&self) -> Option<u32> {
-        None
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .map(|&(_, uid)| uid)
     }
 }
 
@@ -312,18 +407,217 @@ pub const HELD_STEADY: Duration = Duration::from_secs(30);
 /// person, that it lists the root half's questions to its person's app
 /// ([`tunnel_core::localapi::Request::ConsentRelaying`]), and holds that
 /// connection until it ends or `shutdown` flips.
-pub(crate) async fn keep_telling<D, F, S>(dial: D, mut shutdown: tokio::sync::watch::Receiver<bool>)
-where
+///
+/// Never in a loop. A held connection is not dialled again: the root half
+/// sends nothing on it unasked, and its listener holds an idle connection
+/// with no deadline (`localapi::serve_person_listener`). One that ended after
+/// [`HELD_STEADY`] is dialled again [`ANNOUNCE_AGAIN_FIRST`] later; a dial
+/// that finds no root half, or no answer in [`ANNOUNCE_ANSWER_WITHIN`], waits
+/// twice as long as the last, up to [`ANNOUNCE_AGAIN_MOST`]; and a root half
+/// that refused and closed the connection soon after waits
+/// [`ANNOUNCE_AFTER_A_REFUSAL`]. Each change of what the root half was told is
+/// logged once, never a retry.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) async fn keep_telling<D, F, S>(
+    mut dial: D,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
     D: FnMut() -> F,
     F: Future<Output = Option<S>>,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let _ = dial;
-    while !*shutdown.borrow() {
+    let mut said = Said::Nothing;
+    let mut wait = ANNOUNCE_AGAIN_FIRST;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let told = match dial().await {
+            Some(stream) => tell_and_hold(stream, &mut shutdown, &mut said).await,
+            None => Told::Unreachable,
+        };
+        let pause = match told {
+            Told::Stopping => return,
+            Told::Held(held) | Told::Refused(held) if held >= HELD_STEADY => {
+                wait = ANNOUNCE_AGAIN_FIRST;
+                doubled(&mut wait)
+            }
+            Told::Refused(_) => ANNOUNCE_AFTER_A_REFUSAL,
+            Told::Held(_) | Told::Unreachable | Told::NoAnswer => doubled(&mut wait),
+        };
+        tokio::select! {
+            () = tokio::time::sleep(pause) => {}
+            () = stopping(&mut shutdown) => return,
+        }
+    }
+}
+
+/// #3967 — what one dial of [`keep_telling`] came to.
+#[cfg(any(target_os = "macos", test))]
+enum Told {
+    /// No root half to tell: no socket for this person, or no connection.
+    Unreachable,
+    /// A connection, and no answer in time (or it closed before one).
+    NoAnswer,
+    /// The root half took it, and the connection stood this long.
+    Held(Duration),
+    /// The root half refused it (an older one answers "unknown variant"), and
+    /// the connection stood this long.
+    Refused(Duration),
+    /// `shutdown` flipped.
+    Stopping,
+}
+
+/// #3967 — what a per-user half last said in its log, so each change is
+/// said once.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Said {
+    Nothing,
+    Announced,
+    Refused,
+}
+
+/// The pause before the next dial: `wait`, which then doubles, up to
+/// [`ANNOUNCE_AGAIN_MOST`].
+#[cfg(any(target_os = "macos", test))]
+fn doubled(wait: &mut Duration) -> Duration {
+    let pause = *wait;
+    *wait = (*wait * 2).min(ANNOUNCE_AGAIN_MOST);
+    pause
+}
+
+/// Ends when `shutdown` is true, or its sender is gone.
+#[cfg(any(target_os = "macos", test))]
+async fn stopping(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
         if shutdown.changed().await.is_err() {
             return;
         }
     }
+}
+
+/// One connection of [`keep_telling`]: say it, read the root half's answer,
+/// and hold the connection until the root half closes it or `shutdown`
+/// flips.
+#[cfg(any(target_os = "macos", test))]
+async fn tell_and_hold<S>(
+    stream: S,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    said: &mut Said,
+) -> Told
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut conn = tokio::io::BufReader::new(stream);
+    let mut ask = serde_json::to_vec(&Request::ConsentRelaying).expect("a request serialises");
+    ask.push(b'\n');
+    let mut line = String::new();
+    let asked = tokio::time::timeout(ANNOUNCE_ANSWER_WITHIN, async {
+        conn.write_all(&ask).await?;
+        conn.flush().await?;
+        conn.read_line(&mut line).await
+    });
+    let read = tokio::select! {
+        read = asked => read,
+        () = stopping(shutdown) => return Told::Stopping,
+    };
+    let answer = match read {
+        Ok(Ok(n)) if n > 0 => serde_json::from_str::<Response>(line.trim_end()).ok(),
+        _ => None,
+    };
+    let refused = match answer {
+        Some(Response::ConsentRelayingTaken) => {
+            if *said != Said::Announced {
+                tracing::info!(
+                    "consent relay: told the root half, which counts this person's app as its \
+                     questions' surface while this connection stays open (#3967)"
+                );
+                *said = Said::Announced;
+            }
+            false
+        }
+        Some(Response::Error { message }) => {
+            if *said != Said::Refused {
+                if tunnel_core::localapi::is_unknown_verb(&message) {
+                    tracing::info!(
+                        answer = %message,
+                        "consent relay: the root half is older than the announcement (#3967), so \
+                         it does not count this person's app; its questions are still listed here"
+                    );
+                } else {
+                    tracing::info!(
+                        answer = %message,
+                        "consent relay: the root half did not take the announcement (#3967); its \
+                         questions are still listed here"
+                    );
+                }
+                *said = Said::Refused;
+            }
+            true
+        }
+        _ => return Told::NoAnswer,
+    };
+    let since = tokio::time::Instant::now();
+    let held = async {
+        let mut rest = String::new();
+        loop {
+            rest.clear();
+            match conn.read_line(&mut rest).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    };
+    tokio::select! {
+        () = held => {}
+        () = stopping(shutdown) => return Told::Stopping,
+    }
+    let stood = since.elapsed();
+    if refused {
+        return Told::Refused(stood);
+    }
+    tracing::info!(
+        "consent relay: the root half's person socket closed (it restarted, or the person at the \
+         screen changed); telling it again once it is back (#3967)"
+    );
+    *said = Said::Nothing;
+    Told::Held(stood)
+}
+
+/// #3967 — a two-row Mac's per-user half tells its root half, for as long as
+/// it runs ([`keep_telling`], over the root half's person socket for this
+/// account). Started by `person_socket::run` on a Mac daemon that runs as a
+/// person and holds an enrollment
+/// (`LocalApiState::announces_consent_relay`).
+#[cfg(target_os = "macos")]
+pub async fn tell_the_root_half(shutdown: tokio::sync::watch::Receiver<bool>) {
+    keep_telling(dial_the_root_half, shutdown).await
+}
+
+/// #3967 — the root half's person socket for this account, kept only when
+/// root serves it, as the relay asks it (`person_socket::machine_answer`).
+/// `None` while there is none: someone else is at the screen, the root
+/// daemon is down, or its person socket is switched off.
+#[cfg(target_os = "macos")]
+async fn dial_the_root_half() -> Option<tokio::net::UnixStream> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    let path = tunnel_core::localapi::person_socket_path(euid);
+    if !path.exists() {
+        return None;
+    }
+    tokio::time::timeout(
+        RELAY_WITHIN,
+        tunnel_core::localapi::connect_unix_stream_served_by_root(path),
+    )
+    .await
+    .ok()?
+    .ok()
 }
 
 /// A one-row Mac's road, stood in for a test of the root daemon's verdict

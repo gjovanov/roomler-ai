@@ -2325,27 +2325,43 @@ const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(25
 
 /// #3864 — the rest of [`ensure_running`]'s verdict, asked fresh at every
 /// prompt, beside the tray's own: whether a question this daemon asks gets to
-/// the tray at all. Off a one-row Mac's root daemon the tray asks this daemon
-/// itself, and it does. On one, the tray asks the worker, which lists the
-/// root daemon's questions only while the road is open
+/// the tray at all. Off a Mac's root daemon the tray asks this daemon
+/// itself, and it does. On a one-row Mac's, the tray asks the worker, which
+/// lists the root daemon's questions only while the road is open
 /// ([`crate::consent_relay::reach`]): closed, the tray is not the question's
-/// surface, and a window nobody answers ends as `no_prompt_surface`.
+/// surface, and a window nobody answers ends as `no_prompt_surface`. #3967 —
+/// on a two-row Mac's root half the same, through the per-user half that
+/// announced it relays.
 async fn reaches_the_tray() -> bool {
     // A test stands the road in with the tray's start.
     #[cfg(all(test, any(target_os = "windows", unix)))]
-    let reach = match tray_stand_in::now().map(|stood| (stood.road, stood.two_rows)) {
-        Some((Some(road), _)) => road.reach().await,
-        Some((None, Some(announced))) => announced.reach().await,
-        _ => crate::consent_relay::reach().await,
+    let (reach, one_row) = match tray_stand_in::now().map(|stood| (stood.road, stood.two_rows)) {
+        Some((Some(road), _)) => (road.reach().await, true),
+        Some((None, Some(announced))) => (announced.reach().await, false),
+        _ => (
+            crate::consent_relay::reach().await,
+            crate::consent_relay::one_row(),
+        ),
     };
     #[cfg(not(all(test, any(target_os = "windows", unix))))]
-    let reach = crate::consent_relay::reach().await;
+    let (reach, one_row) = (
+        crate::consent_relay::reach().await,
+        crate::consent_relay::one_row(),
+    );
     if let crate::consent_relay::Reach::Closed(why) = &reach {
-        tracing::info!(
-            why = %why,
-            "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
-             (#3864); `roomlerd consent` still answers it"
-        );
+        if one_row {
+            tracing::info!(
+                why = %why,
+                "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
+                 (#3864); `roomlerd consent` still answers it"
+            );
+        } else {
+            tracing::info!(
+                why = %why,
+                "a two-row Mac's root-half question cannot reach the menu-bar app, which is not \
+                 its surface (#3967); `roomlerd consent` still answers it"
+            );
+        }
     }
     reach.open()
 }

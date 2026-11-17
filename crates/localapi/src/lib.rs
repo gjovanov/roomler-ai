@@ -3706,7 +3706,15 @@ pub fn person_may(req: &Request) -> bool {
         // it), and it changes nothing on the host. The denylist and the
         // preference it reports are on the configuration listing above
         // already, and Windows serves the verb to every interactive user.
-        | Request::EncoderCaps => true,
+        | Request::EncoderCaps
+        // #3967 — a two-row Mac's per-user half says it lists the root
+        // half's consent questions to its person's app. It reads nothing and
+        // grants nothing: it decides only whether the root half counts that
+        // person's app as its questions' surface, which nobody but that
+        // person can reach anyway. The dispatcher takes it only from the
+        // socket's own person, never root, and only for as long as the
+        // connection stays open.
+        | Request::ConsentRelaying => true,
         // #2871 (design A) — and `ConfigSet` of exactly the keys that are the
         // console person's call (`CONSOLE_PERSON_KEYS`): where their incoming
         // files land, whether a controller may record their screen, what a
@@ -3741,7 +3749,6 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::ConsentRelaying
         | Request::RestartDaemon { .. } => false,
     }
 }
@@ -4014,6 +4021,11 @@ where
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
+    // #3967 — what this connection holds for as long as it stays open: a
+    // per-user half's `ConsentRelaying`. Ended below when the loop ends
+    // (the peer closed it, or it failed); dropped with this future when the
+    // listener stops serving it.
+    let mut held: Option<HeldForTheConnection> = None;
     let served: std::io::Result<()> = async {
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -4042,6 +4054,29 @@ where
                 Ok(Request::ConsentPending) => {
                     Response::ConsentPending(state.consent_pending_view().await)
                 }
+                // #3967 — a two-row Mac's per-user half says it lists them,
+                // over the root half's person socket: taken only from that
+                // socket's own person, never root, and held on this
+                // connection.
+                Ok(Request::ConsentRelaying) => match scope {
+                    Scope::Person { owner_uid }
+                        if owner_uid != 0 && peer.uid == Some(owner_uid) =>
+                    {
+                        if held.is_none() {
+                            held = state.consent_relaying(owner_uid);
+                        }
+                        if held.is_some() {
+                            Response::ConsentRelayingTaken
+                        } else {
+                            Response::Error {
+                                message: CONSENT_RELAYING_NOT_TAKEN.into(),
+                            }
+                        }
+                    }
+                    _ => Response::Error {
+                        message: CONSENT_RELAYING_NOT_HERE.into(),
+                    },
+                },
                 Ok(Request::Ping {
                     target,
                     timeout_ms,
@@ -4266,8 +4301,25 @@ where
         Ok(())
     }
     .await;
+    // #3967 — the peer closed the connection (EOF), or reading or writing it
+    // failed: whatever it held ends with it.
+    if let Some(held) = held.take() {
+        held.end(ConnectionEnd::ClosedByThePeer);
+    }
     served
 }
+
+/// #3967 — a `ConsentRelaying` the daemon does not take: it is no Mac's root
+/// half.
+const CONSENT_RELAYING_NOT_TAKEN: &str = "consent_relaying was not taken: only a two-row Mac's \
+                                          root daemon takes it, from the per-user half of the \
+                                          person at its screen";
+
+/// #3967 — a `ConsentRelaying` anywhere but the person socket, or from anyone
+/// but that socket's own person.
+const CONSENT_RELAYING_NOT_HERE: &str = "consent_relaying is taken only over the person-at-the-\
+                                         device socket, from the person it serves, never from \
+                                         root";
 
 // ---------------------------------------------------------------------------
 // Platform listener (unification P1-cont)
@@ -5828,6 +5880,18 @@ fn own_account_sid() -> Option<String> {
 /// a socket served by anyone else is refused, not believed.
 #[cfg(unix)]
 pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::Result<Client> {
+    let stream = connect_unix_stream_served_by_root(path).await?;
+    Ok(Client::new(Box::new(stream)))
+}
+
+/// #3967 — [`connect_unix_served_by_root`]'s stream itself, for a caller that
+/// holds the connection open after its request: a two-row Mac's per-user
+/// half, telling its root half that it lists the root half's questions
+/// ([`Request::ConsentRelaying`]).
+#[cfg(unix)]
+pub async fn connect_unix_stream_served_by_root(
+    path: std::path::PathBuf,
+) -> std::io::Result<tokio::net::UnixStream> {
     let stream = tokio::net::UnixStream::connect(&path).await?;
     let server = stream.peer_cred()?.uid();
     if server != 0 {
@@ -5836,7 +5900,7 @@ pub async fn connect_unix_served_by_root(path: std::path::PathBuf) -> std::io::R
             format!("{} is served by uid {server}, not root", path.display()),
         ));
     }
-    Ok(Client::new(Box::new(stream)))
+    Ok(stream)
 }
 
 impl Client {
@@ -9705,6 +9769,10 @@ mod tests {
             // #3831 — what this device can encode, the Overview's card: the
             // probe's cached summary, read-only, never a probe.
             r#"{"t":"encoder_caps"}"#,
+            // #3967 — a two-row Mac's per-user half says it lists the root
+            // half's consent questions; taken from the socket's own person
+            // only, on the dispatcher's own check.
+            r#"{"t":"consent_relaying"}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();

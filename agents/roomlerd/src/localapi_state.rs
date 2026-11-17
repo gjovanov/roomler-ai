@@ -703,6 +703,15 @@ impl DaemonState {
         self
     }
 
+    /// #3864, #3967 — whether this daemon lists the root half's consent
+    /// questions beside its own and sends it the answers to them: a one-row
+    /// Mac's worker, or any Mac daemon that runs as a person (a two-row
+    /// Mac's per-user half). A Mac with no root half answers nothing on its
+    /// person socket's path, so its own list stands, at once.
+    fn relays_the_root_half(&self) -> bool {
+        self.no_enrollment || self.macs_per_user_half
+    }
+
     /// FR-43 P3a — the answer to a verb only the root half can serve, on a
     /// worker with no enrollment. At once: a verb that needs a server would
     /// otherwise reach the stand-in, which discards it, and hang until its
@@ -2214,10 +2223,12 @@ impl LocalApiState for DaemonState {
     /// lists are this process's own and the root half's: the root daemon asks
     /// that Mac's questions on its own broker, and the app reaches this
     /// worker's socket ([`crate::consent_relay::listed`], over the root
-    /// half's person socket). Everywhere else, this daemon's own.
+    /// half's person socket). #3967 — on a two-row Mac's per-user half too,
+    /// whose root half asks its own row's questions
+    /// ([`Self::relays_the_root_half`]). Everywhere else, this daemon's own.
     async fn consent_pending_view(&self) -> Vec<ConsentRequest> {
         let own = self.consent_pending();
-        if !self.no_enrollment {
+        if !self.relays_the_root_half() {
             return own;
         }
         crate::consent_relay::listed(own, self.root_half.as_ref()).await
@@ -2228,7 +2239,7 @@ impl LocalApiState for DaemonState {
     /// takes it ([`crate::consent_relay::decided`]). Its own questions, a
     /// malformed id, and every other daemon decide here as before.
     async fn consent_decide_view(&self, session_id: &str, allow: bool) -> Response {
-        if !self.no_enrollment
+        if !self.relays_the_root_half()
             || !is_hex_object_id(session_id)
             || self.consent.is_asking(session_id)
         {
@@ -2237,6 +2248,21 @@ impl LocalApiState for DaemonState {
             };
         }
         crate::consent_relay::decided(self.root_half.as_ref(), session_id, allow).await
+    }
+
+    /// #3967 — a two-row Mac's root half takes its console person's
+    /// `consent_relaying` here, for as long as that connection stays open
+    /// ([`crate::consent_relay::Announcements`]). Every other daemon refuses
+    /// it.
+    fn consent_relaying(&self, uid: u32) -> Option<tunnel_core::localapi::HeldForTheConnection> {
+        self.announcements.as_ref().map(|book| book.announce(uid))
+    }
+
+    /// #3967 — a Mac's per-user half that holds an enrollment, which is a
+    /// two-row Mac's, tells its root half it relays (`person_socket::run`). A
+    /// one-row Mac's worker does not: its channel says so (`relay-consent`).
+    fn announces_consent_relay(&self) -> bool {
+        self.macs_per_user_half && !self.no_enrollment
     }
 
     /// #2871 (review) — is `uid` the person at this device's seat right now
