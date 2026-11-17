@@ -72,6 +72,17 @@
 #     the bytes. Counting only: nothing the association does changes.
 #     src/queue/queue_test.rs holds its test (the fills, the empties and the
 #     acknowledged bytes, read through the clock).
+#   - src/association/association_internal.rs and src/association/delivery.rs
+#     (FR-148 P0): the clock counts the bytes the peer received. Under
+#     partial reliability a FORWARD TSN lets the cumulative point pass a
+#     chunk the peer never had, and `maxRetransmits: 0` marks every chunk
+#     abandoned at its first send, so the flag says nothing about loss. An
+#     abandoned chunk is left out when a SACK reported it missing or it was
+#     outstanding at a T3-rtx expiry (`DeliveryCounters::loss_mark`); the
+#     buffer release and the congestion window still use the full sum.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its tests (a skipped chunk, a gap-acked one counted once, a
+#     T3-rtx expiry, and an abandoned chunk with no evidence of loss).
 
 [package]
 edition = "2021"
