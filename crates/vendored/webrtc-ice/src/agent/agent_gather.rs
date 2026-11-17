@@ -35,7 +35,7 @@ const OVERLAY_HOST_TYPE_PREFERENCE: u32 = 90;
 /// "no override — compute the RFC 8445 value") for non-overlay interfaces.
 /// Escape hatch: `ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE=0` restores upstream
 /// behaviour for every interface.
-fn overlay_host_priority_override(ip: &std::net::IpAddr, component: u16) -> u32 {
+pub(crate) fn overlay_host_priority_override(ip: &std::net::IpAddr, component: u16) -> u32 {
     if std::env::var("ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE").as_deref() == Ok("0") {
         return 0;
     }
@@ -43,6 +43,61 @@ fn overlay_host_priority_override(ip: &std::net::IpAddr, component: u16) -> u32 
         return 0;
     }
     (1 << 24) * OVERLAY_HOST_TYPE_PREFERENCE + (1 << 8) * 65535 + (256 - u32::from(component))
+}
+
+/// Roomler patch (FR-148 P4): local preference of a relay candidate allocated
+/// over TCP or TLS while the carrier rank is set, so TURN over UDP (65535)
+/// ranks above TURN over TLS on this agent's leg. Without the rank both are
+/// 65535: every relay candidate is made with network `udp`.
+const RANK_TCP_RELAY_LOCAL_PREFERENCE: u32 = 32767;
+
+/// Roomler patch (FR-148 P4): the priority override of a host candidate on
+/// `ip` (0 = compute the RFC 8445 value). Ranked last when the carrier rank
+/// names `ip`; otherwise exactly [`overlay_host_priority_override`].
+pub(crate) fn host_priority(rank: Option<&CarrierRank>, ip: &std::net::IpAddr, component: u16) -> u32 {
+    match rank {
+        Some(rank) if rank.ranks_last(&[*ip]) => ranked_last_priority(component),
+        _ => overlay_host_priority_override(ip, component),
+    }
+}
+
+/// Roomler patch (FR-148 P4): the priority override of a server-reflexive
+/// candidate whose mapped address is `mapped`. A STUN answer that crossed the
+/// mesh maps to this machine's mesh address, and nothing else lowers it: as a
+/// server-reflexive candidate it would rank above the mesh host itself.
+pub(crate) fn srflx_priority(rank: Option<&CarrierRank>, mapped: &std::net::IpAddr, component: u16) -> u32 {
+    match rank {
+        Some(rank) if rank.ranks_last(&[*mapped]) => ranked_last_priority(component),
+        _ => 0,
+    }
+}
+
+/// Roomler patch (FR-148 P4): the priority override of a relay candidate
+/// relayed at `relayed` by the TURN server at `turn_host` (an IP literal, or a
+/// name that never matches). Ranked last when either is on the mesh: the
+/// viewer's own relay is reached over the mesh. Otherwise a relay allocated over
+/// TCP or TLS ranks below one allocated over UDP.
+pub(crate) fn relay_priority(
+    rank: Option<&CarrierRank>,
+    relayed: &std::net::IpAddr,
+    turn_host: &str,
+    over_tcp: bool,
+    component: u16,
+) -> u32 {
+    let Some(rank) = rank else {
+        return 0;
+    };
+    let server = turn_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>();
+    if rank.ranks_last(&[*relayed]) || server.is_ok_and(|server| rank.ranks_last(&[server])) {
+        ranked_last_priority(component)
+    } else if over_tcp {
+        (1 << 8) * RANK_TCP_RELAY_LOCAL_PREFERENCE + (256 - u32::from(component))
+    } else {
+        0
+    }
 }
 
 /// The Roomler overlay addresses: CGNAT 100.64.0.0/10 (v4) and the mesh ULA
@@ -367,7 +422,11 @@ impl Agent {
                         port,
                         component: COMPONENT_RTP,
                         conn: Some(conn),
-                        priority: overlay_host_priority_override(&ip, COMPONENT_RTP),
+                        priority: host_priority(
+                            (*agent_internal.carrier_rank).as_ref(),
+                            &ip,
+                            COMPONENT_RTP,
+                        ),
                         ..CandidateBaseConfig::default()
                     },
                     ..CandidateHostConfig::default()
@@ -501,7 +560,11 @@ impl Agent {
                     port,
                     conn: Some(conn.clone()),
                     component: COMPONENT_RTP,
-                    priority: overlay_host_priority_override(&candidate_ip, COMPONENT_RTP),
+                    priority: host_priority(
+                        (*agent_internal.carrier_rank).as_ref(),
+                        &candidate_ip,
+                        COMPONENT_RTP,
+                    ),
                     ..Default::default()
                 },
                 tcp_type: TcpType::Unspecified,
@@ -597,6 +660,11 @@ impl Agent {
                         port: laddr.port(),
                         component: COMPONENT_RTP,
                         conn: Some(conn),
+                        priority: srflx_priority(
+                            (*agent_internal2.carrier_rank).as_ref(),
+                            &mapped_ip,
+                            COMPONENT_RTP,
+                        ),
                         ..CandidateBaseConfig::default()
                     },
                     rel_addr: laddr.ip().to_string(),
@@ -751,6 +819,11 @@ impl Agent {
                             port,
                             component: COMPONENT_RTP,
                             conn: Some(conn),
+                            priority: srflx_priority(
+                                (*agent_internal2.carrier_rank).as_ref(),
+                                &ip,
+                                COMPONENT_RTP,
+                            ),
                             ..CandidateBaseConfig::default()
                         },
                         rel_addr: laddr.ip().to_string(),
@@ -998,6 +1071,13 @@ impl Agent {
                         port: raddr.port(),
                         component: COMPONENT_RTP,
                         conn: Some(Arc::clone(&relay_conn)),
+                        priority: relay_priority(
+                            (*agent_internal2.carrier_rank).as_ref(),
+                            &raddr.ip(),
+                            &turn_host_for_sni,
+                            transport_proto == ProtoType::Tcp,
+                            COMPONENT_RTP,
+                        ),
                         ..CandidateBaseConfig::default()
                     },
                     rel_addr,

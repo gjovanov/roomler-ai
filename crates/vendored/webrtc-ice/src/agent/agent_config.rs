@@ -54,6 +54,44 @@ pub(crate) fn default_candidate_types() -> Vec<CandidateType> {
 pub type InterfaceFilterFn = Box<dyn (Fn(&str) -> bool) + Send + Sync>;
 pub type IpFilterFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
 
+/// Roomler patch (FR-148 P4): is this an address only the mesh carries? Asked
+/// of a host candidate's interface address, a server-reflexive candidate's
+/// mapped address, and a relay candidate's relayed address and TURN server.
+pub type MeshAddrFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
+
+/// Roomler patch (FR-148 P4): the carrier rank, one per agent. Absent, the
+/// agent ranks and checks exactly as before. Present:
+///
+/// - a relay candidate allocated over TCP or TLS has local preference 32767,
+///   below one allocated over UDP (65535);
+/// - the controlled agent keeps checking after its first selection: every
+///   pair the follow gate would follow, and nothing else
+///   (`agent_selector::outranks_on_a_real_path`);
+/// - with `mesh_last` set (the mesh link is not direct), every local candidate
+///   on an address it names is signalled at type preference 0 and local
+///   preference 0 ([`ranked_last_priority`]). No other candidate on either side
+///   can rank that low, so every pair it is in ranks below every pair it is
+///   not in, for both roles.
+#[derive(Default)]
+pub struct CarrierRank {
+    pub mesh_last: Option<MeshAddrFn>,
+}
+
+impl CarrierRank {
+    /// Does this rank put a candidate on any of `addrs` last?
+    pub(crate) fn ranks_last(&self, addrs: &[IpAddr]) -> bool {
+        self.mesh_last
+            .as_ref()
+            .is_some_and(|mesh| addrs.iter().any(|ip| mesh(*ip)))
+    }
+}
+
+/// Roomler patch (FR-148 P4): the priority of a candidate the carrier rank puts
+/// last: type preference 0, local preference 0. 255 for component 1.
+pub fn ranked_last_priority(component: u16) -> u32 {
+    256 - u32::from(component)
+}
+
 /// Collects the arguments to `ice::Agent` construction into a single structure, for
 /// future-proofness of the interface.
 #[derive(Default)]
@@ -155,6 +193,10 @@ pub struct AgentConfig {
 
     /// Include loopback addresses in the candidate list.
     pub include_loopback: bool,
+
+    /// Roomler patch (FR-148 P4): see [`CarrierRank`]. `None`, the default,
+    /// changes nothing.
+    pub carrier_rank: Arc<Option<CarrierRank>>,
 }
 
 impl AgentConfig {

@@ -18,6 +18,21 @@
 #     on a task of its own (naming one still closing after 5 s), so one
 #     close that waits on the network no longer holds the agent's close and
 #     every other socket with it.
+#   - src/agent/agent_gather.rs (media dodges the overlay): a host candidate
+#     on the overlay ranges is signalled at type preference 90, below
+#     server-reflexive and above relay
+#     (`ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE=0` turns it off).
+#   - src/agent/agent_selector.rs (2026-07-28): the controlled agent follows
+#     a renomination upward onto a real-path pair, or off a stale pair
+#     (`ROOMLER_ICE_FOLLOW_RENOMINATION` pins it), and keeps the validated
+#     pairs it is not using warm (`ROOMLER_ICE_WARM_STANDBY=0` turns it off).
+#   - src/agent/agent_config.rs, agent_internal.rs, agent_gather.rs and
+#     agent_selector.rs (FR-148 P4): the carrier rank,
+#     `AgentConfig::carrier_rank` (`None`, the default, changes nothing).
+#     Candidates only the mesh carries are signalled at priority 255, a relay
+#     allocated over TCP or TLS at local preference 32767, and after its first
+#     selection the controlled agent keeps checking the pairs its follow gate
+#     would follow. Cells: src/agent/agent_carrier_rank_test.rs.
 #   - this Cargo.toml: the `tcp-turn-conn` path dependency below.
 
 [package]

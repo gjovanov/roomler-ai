@@ -27,6 +27,10 @@
 #     since `association()` is crate-private. It never waits for the slot:
 #     `stop()` holds it across the association's close, so a held slot
 #     answers `None`.
+#   - src/api/setting_engine/mod.rs + src/ice_transport/ice_gatherer.rs
+#     (FR-148 P4): `SettingEngine::set_ice_carrier_rank`, carried into the
+#     ICE agent's `AgentConfig::carrier_rank` the way the IP filter is (a
+#     patch of the vendored webrtc-ice). Unset, the agent is unchanged.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only
