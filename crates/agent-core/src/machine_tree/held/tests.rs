@@ -449,6 +449,65 @@ fn a_leaf_another_account_owns_is_moved_aside() {
     println!("{CHECKED}: T9");
 }
 
+/// #3956 — `open_or_make_dir`, the machine config's `peer-auth`: a folder
+/// that is not there is made sealed, Administrators its owner, and a file
+/// written in it is sealed from its creation; one that is there is opened as
+/// it is, inheriting what it had, never re-sealed or moved (FR-94's repair
+/// decides on it, by its as-found rule); a junction there is refused, and
+/// nothing is made where it leads.
+#[test]
+fn a_folder_another_repair_keeps_is_opened_as_it_is_or_made_sealed() {
+    if !elevated_or_skip("#3956: open_or_make_dir names Administrators as the owner") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("machine");
+    std::fs::create_dir(&base).unwrap();
+
+    let made = base_of(&base)
+        .open_or_make_dir("peer-auth", Seal::Private)
+        .expect("made");
+    assert!(!made.resealed());
+    let shape = sddl(&base.join("peer-auth"));
+    assert!(sealed(&shape, true) && owner(&shape) == "BA", "{shape}");
+    made.write_file("66f0c0ffee00000000000a01.json", b"{}", Seal::Private)
+        .expect("written");
+    let file = sddl(&base.join("peer-auth").join("66f0c0ffee00000000000a01.json"));
+    assert!(file_sealed(&file, false) && owner(&file) == "BA", "{file}");
+    assert_eq!(
+        names_in(&base.join("peer-auth")),
+        ["66f0c0ffee00000000000a01.json"]
+    );
+
+    let open = base.join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::write(open.join("kept.json"), b"{}").unwrap();
+    let as_found = sddl(&open);
+    assert!(!protected(&as_found), "it inherits: {as_found}");
+    let held = base_of(&base)
+        .open_or_make_dir("open", Seal::Private)
+        .expect("opened");
+    assert!(!held.resealed());
+    assert_eq!(sddl(&open), as_found, "never re-sealed");
+    assert_eq!(names_in(&open), ["kept.json"]);
+    assert!(moved_in(&base, "open.moved-").is_empty(), "never moved");
+
+    let elsewhere = root.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    junction(&base.join("linked"), &elsewhere);
+    let refused = base_of(&base)
+        .open_or_make_dir("linked", Seal::Private)
+        .expect_err("a junction is refused");
+    assert!(matches!(refused.why, Why::Link), "{refused}");
+    assert!(
+        is_link(&base.join("linked")),
+        "the junction is left as it is"
+    );
+    assert!(names_in(&elsewhere).is_empty(), "nothing made where it led");
+    assert!(moved_in(&base, "linked.moved-").is_empty(), "never moved");
+    println!("{CHECKED}: #3956");
+}
+
 /// The folder seal's shape for a file: protected; SYSTEM and Administrators
 /// full control, Users read when `readable`.
 fn file_sealed(sddl: &str, readable: bool) -> bool {

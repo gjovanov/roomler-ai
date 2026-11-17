@@ -27,7 +27,7 @@
 //! | Run | `peer-auth` |
 //! |---|---|
 //! | Unix | made 0700, its files 0600, whoever runs the daemon |
-//! | Windows, the machine config (the SYSTEM service) | `machine_tree` seals and checks it: SYSTEM and Administrators |
+//! | Windows, the machine config (the SYSTEM service) | `machine_tree` seals and checks it: SYSTEM and Administrators. The daemon writes its files as that repair leaves them, by handle |
 //! | Windows, elevated or SYSTEM, any other config | sealed here to SYSTEM and Administrators, owner Administrators, read and written by handle |
 //! | Windows, neither elevated nor SYSTEM (a per-user install) | the person's own profile, as it is: nothing is sealed |
 //!
@@ -838,9 +838,10 @@ fn parse(bytes: &[u8]) -> Read {
 }
 
 /// Write `bytes` to `path` whole or not at all (a sibling, synced, renamed),
-/// by path: [`Keeping::Plain`]'s writer. On Unix readable by the daemon's own
-/// identity alone; on Windows with what the folder hands down. Each error
-/// keeps its kind, so a run that is not elevated can say why it was denied.
+/// by path: [`Keeping::Plain`]'s writer, the machine folder's aside
+/// ([`machine`]). On Unix readable by the daemon's own identity alone; on
+/// Windows with what the folder hands down. Each error keeps its kind, so a
+/// run that is not elevated can say why it was denied.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let context = |what: String| {
@@ -897,8 +898,8 @@ const PINS_MAX: u64 = 1024 * 1024;
 /// How this process keeps the `peer-auth` folder of a config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Keeping {
-    /// Read, and written by path, with what the folder hands down ([`Plain`]
-    /// says why).
+    /// Read by path, and written by path with what the folder hands down
+    /// ([`Plain`] says why), the machine folder's aside ([`machine`]).
     Plain(Plain),
     /// Windows, elevated or SYSTEM, a config outside the machine folder: the
     /// folder sealed to SYSTEM and Administrators, read and written by handle.
@@ -910,7 +911,9 @@ pub(crate) enum Keeping {
 pub(crate) enum Plain {
     /// Unix: the folder is made 0700 and its files 0600.
     NotWindows,
-    /// The machine config's folder, which `machine_tree` seals and checks.
+    /// The machine config's folder, which `machine_tree` seals and checks:
+    /// what the daemon writes there comes out as that repair leaves it
+    /// ([`machine`], #3956).
     MachineFolder,
     /// Neither elevated nor SYSTEM (a per-user install): this run may not
     /// seal, and changes nothing. A folder an elevated run sealed is closed
@@ -1129,9 +1132,13 @@ impl Folder {
     }
 
     /// Write `bytes` as the file `name`: sealed and by handle where the
-    /// folder is sealed, by path otherwise.
+    /// folder is sealed or is the machine config's, by path otherwise.
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         let why = match self.mode()? {
+            #[cfg(windows)]
+            Mode::Plain(Plain::MachineFolder) if machine::by_handle() => {
+                return machine::write(&self.base, name, bytes);
+            }
             Mode::Plain(why) => Some(why),
             #[cfg(windows)]
             Mode::Sealed => return sealed::write(&self.base, name, bytes),
@@ -1157,6 +1164,52 @@ impl Folder {
                 )
             },
         )
+    }
+}
+
+/// #3956 — [`Plain::MachineFolder`]'s writes. The machine config's folder is
+/// `machine_tree`'s to seal and check, and what the daemon writes in it comes
+/// out as that repair leaves it, so the next start's repair has nothing to
+/// change and a `machine tree: repaired` line still means drift. By handle
+/// (`machine_tree::HeldPath`, FR-145's rule): the config's folder held as
+/// itself; `peer-auth` opened as it is, or made sealed when it is not there,
+/// and never re-sealed or moved here (the repair's as-found rule decides on
+/// it); then a fresh temp file made with `Seal::Private` (owner
+/// Administrators, protected, SYSTEM and Administrators alone) in the call
+/// that creates it, flushed, and renamed onto the name by handle. A link at
+/// either folder leaves the file unwritten. Reads stay by path, judged by the
+/// machine tree's check.
+#[cfg(windows)]
+mod machine {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use roomler_node_core::machine_tree::{HeldPath, Seal, Switches};
+
+    use super::DIR_NAME;
+
+    /// `name` in `<base>/peer-auth`, written as the machine tree's repair
+    /// leaves a key file.
+    pub(super) fn write(base: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+        HeldPath::base(base)
+            .and_then(|base| base.open_or_make_dir(DIR_NAME, Seal::Private))
+            .and_then(|held| held.write_file(name, bytes, Seal::Private))
+            .map_err(|refused| refused.to_string())
+    }
+
+    /// FR-145's switch, `ROOMLERD_MACHINE_TREE_HELD=0`: off, these files are
+    /// written by path as before ([`super::write_private`]), with one WARN
+    /// naming it.
+    pub(super) fn by_handle() -> bool {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        let on = Switches::from_env().held;
+        if !on && !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "peer-auth: ROOMLERD_MACHINE_TREE_HELD=0: the machine config's key files are \
+                 written by path, and the next start's repair seals each new one"
+            );
+        }
+        on
     }
 }
 
