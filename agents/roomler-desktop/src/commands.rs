@@ -5036,7 +5036,7 @@ mod tests {
     // ─── #3873 — a click on the consent prompt is acted on, or logged ────
 
     /// A session the daemon could be asking about.
-    const SESSION: &str = "6af8596776312ccaab1e7b9f";
+    const SESSION: &str = "0123456789abcdef01234567";
 
     /// The lines the code under test logs, as the desktop log writes them.
     #[derive(Clone, Default)]
