@@ -1409,7 +1409,7 @@ of the vendored webrtc-sctp keeps where the events happen:
 
 | Counter | Counted in | Means |
 |---|---|---|
-| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1438`) | user data the peer acknowledged, each chunk once, over every stream of the association. An abandoned PR-SCTP chunk counts once the peer's cumulative point passes it |
+| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1468`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
 | fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:118`, `:512`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
 
 The agent reads both without the association's lock (`Association::delivery_clock`,
@@ -1494,6 +1494,16 @@ its next sample spans the quiet time and reads application-limited.
   the queue fills.
 - The acknowledged bytes are the association's: video, and the control, input and file
   channels beside it.
+- On a partially reliable channel the count is close, not exact. The viewer's unordered
+  opt-in opens video with `maxRetransmits: 0`; the vendored SCTP marks each such chunk
+  abandoned at its first send and sends a FORWARD TSN after nearly every SACK, over
+  everything then in flight. A lost chunk that a later one follows is reported missing
+  and left out. A lost chunk that nothing follows before such a FORWARD TSN reaches the
+  viewer is never reported missing, and it is counted: SCTP does not tell a sender which
+  skipped chunks arrived. The lossy shaped-link cell measures that share (below): from a
+  twentieth to over a third of the loss, depending on the timing. A chunk
+  reported missing that then arrives late is left out, which reads low. On a reliable
+  channel the count is exact: a FORWARD TSN never skips its chunks.
 - A starved runtime runs its heartbeats late. The counts stay exact, but a sample
   stretches.
 - Not sampled: the RTP pump (its media rides SRTP, not SCTP), and a shared pipeline's
@@ -1511,7 +1521,7 @@ adds `shadow` to it, and it is deleted in P5. Its ledger row is `p0:PATH-1`
 | the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:171` (`DeliverySampler`), `:203` (`heartbeat`), `:239` (`on_reading`), `:261` (`take_line`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:4061` (made), `:5467` (drained, after the heartbeat line) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:6617` (made), `:10491` (drained, after the heartbeat line) |
-| the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:68` (`DeliveryClock`), `:76` (`read`) |
+| the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:93` (`DeliveryClock`), `:101` (`read`) |
 
 **The tests** (`cargo test -p roomlerd --lib -- media_delivery`):
 
@@ -1522,6 +1532,13 @@ adds `shadow` to it, and it is deleted in P5. Its ledger row is `p0:PATH-1`
 | `an_idle_trickle_yields_only_application_limited_samples` | the jupiter chain of 2026-11-02 as a cell: a still screen's keepalives give only application-limited samples, so none of them can stand for the path |
 | `shaped_link::backlogged_at_{0_4,2,8}_mbps_reads_the_link`, `shaped_link::a_trickle_at_{0_4,2,8}_mbps_is_application_limited` | two in-process SCTP associations over a link the test shapes (serialised at its rate, 10 ms each way, a drop-tail queue of 200 ms, a viewer window of 7/8 of that queue, and messages that fit it): a writer that always has more reads backlogged at the link's rate within 20 %; a 164 kbit/s trickle reads application-limited at every rate |
 | `shaped_link::a_new_association_starts_a_new_sample` | a new clock starts over, and a held slot keeps the clock the sampler has |
+| `shaped_link::a_lossy_unordered_channel_counts_what_the_viewer_took` | an unordered `maxRetransmits: 0` channel, as the viewer's opt-in opens it, writing 1,000-byte messages over the 2 Mbit/s link while one full DATA packet in ten is lost: at each sample's end the clock has counted at least nine tenths of what the viewer took and less than that plus two thirds of what was lost. Of about 215,000 bytes lost by the third sample's end, four runs on a Windows box counted 11,000 to 21,000 more than the viewer took, and two on CI's Linux runners, under the whole suite, 75,000 and 70,000. Before the clock left lost chunks out it counted 2,128,000 against 1,920,000 taken, with 216,000 lost |
+
+The fork's own tests (`src/association/association_internal/association_internal_test.rs`,
+`test_delivery_clock_*`) pin the rule chunk by chunk: a chunk reported missing that a
+FORWARD TSN then passes adds nothing, a chunk acknowledged by a gap block counts once,
+a chunk out at a retransmission timeout adds nothing, and an abandoned chunk nothing
+reported missing counts.
 
 The shaped link proves the classes and the rate on a known pipe. It does not prove a real
 carrier's loss, jitter, reordering or stalls, a browser's SCTP at the far end, or DTLS

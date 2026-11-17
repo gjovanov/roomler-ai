@@ -571,3 +571,124 @@ async fn test_assoc_max_message_size_explicit() -> Result<()> {
 
     Ok(())
 }
+
+// roomler (FR-148): the acknowledgement clock counts the bytes the peer
+// received. Under `maxRetransmits: 0` every chunk is abandoned at its first
+// send, and a FORWARD TSN lets the cumulative point pass a lost one; the clock
+// leaves such a chunk out once a SACK reported it missing or T3-rtx expired
+// while it was out.
+
+fn delivery_association(next_tsn: u32) -> AssociationInternal {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+    });
+    a.set_state(AssociationState::Established);
+    a.use_forward_tsn = true;
+    a.cumulative_tsn_ack_point = 9;
+    a.advanced_peer_tsn_ack_point = 9;
+    a.my_next_tsn = next_tsn;
+    a
+}
+
+/// A chunk in flight. A partially reliable one is abandoned at its first
+/// send, as `maxRetransmits: 0` leaves it.
+fn sent(tsn: u32, len: usize, partially_reliable: bool) -> ChunkPayloadData {
+    ChunkPayloadData {
+        unordered: partially_reliable,
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        stream_identifier: 1,
+        user_data: Bytes::from(vec![0u8; len]),
+        nsent: 1,
+        abandoned: Arc::new(AtomicBool::new(partially_reliable)),
+        all_inflight: Arc::new(AtomicBool::new(true)),
+        ..Default::default()
+    }
+}
+
+fn sack(cumulative_tsn_ack: u32, gaps: &[(u16, u16)]) -> ChunkSelectiveAck {
+    use crate::chunk::chunk_selective_ack::GapAckBlock;
+    ChunkSelectiveAck {
+        cumulative_tsn_ack,
+        advertised_receiver_window_credit: 1 << 20,
+        gap_ack_blocks: gaps
+            .iter()
+            .map(|&(start, end)| GapAckBlock { start, end })
+            .collect(),
+        duplicate_tsn: vec![],
+    }
+}
+
+fn acked_bytes(a: &AssociationInternal) -> u64 {
+    a.delivery_clock().read().acked_bytes
+}
+
+#[tokio::test]
+async fn test_delivery_clock_counts_no_skipped_chunk_and_a_gap_acked_one_once() -> Result<()> {
+    let mut a = delivery_association(13);
+    for (tsn, len) in [(10, 100), (11, 200), (12, 400)] {
+        a.inflight_queue.push_no_check(sent(tsn, len, true));
+    }
+
+    // 10 is lost; 11 and 12 arrive and are acknowledged by a gap block.
+    a.handle_sack(&sack(9, &[(2, 3)])).await?;
+    assert_eq!(acked_bytes(&a), 600, "the gap block's two chunks");
+
+    // A FORWARD TSN skips 10, and the cumulative point passes all three.
+    a.handle_sack(&sack(12, &[])).await?;
+    assert_eq!(
+        acked_bytes(&a),
+        600,
+        "10 never arrived, and 11 and 12 count once"
+    );
+    assert_eq!(a.cumulative_tsn_ack_point, 12);
+    assert!(a.inflight_queue.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delivery_clock_counts_a_partially_reliable_chunk_nothing_reported_missing(
+) -> Result<()> {
+    let mut a = delivery_association(13);
+    a.inflight_queue.push_no_check(sent(10, 100, false));
+    a.inflight_queue.push_no_check(sent(11, 200, true));
+    a.inflight_queue.push_no_check(sent(12, 400, true));
+
+    // 10, a reliable chunk, is reported missing: 11 is in a gap block.
+    a.handle_sack(&sack(9, &[(2, 2)])).await?;
+    assert_eq!(acked_bytes(&a), 200);
+
+    // 10 was retransmitted until it arrived: a reliable chunk is never
+    // skipped, so the cumulative point passing it means the peer has it. 12
+    // is abandoned, as every chunk of its stream is, and nothing reported it
+    // missing: it counts.
+    a.handle_sack(&sack(12, &[])).await?;
+    assert_eq!(acked_bytes(&a), 700);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delivery_clock_counts_no_chunk_out_at_a_t3_expiry_that_a_forward_tsn_passes(
+) -> Result<()> {
+    let mut a = delivery_association(11);
+    a.inflight_queue.push_no_check(sent(10, 100, true));
+
+    // Nothing comes back for 10, and T3-rtx expires. A FORWARD TSN skips it.
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    a.handle_sack(&sack(10, &[])).await?;
+    assert_eq!(acked_bytes(&a), 0, "10 may never have arrived");
+
+    // The mark covers what was out at the expiry, and nothing sent after it.
+    a.my_next_tsn = 12;
+    a.inflight_queue.push_no_check(sent(11, 200, true));
+    a.handle_sack(&sack(11, &[])).await?;
+    assert_eq!(acked_bytes(&a), 200);
+
+    Ok(())
+}

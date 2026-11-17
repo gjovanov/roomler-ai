@@ -597,7 +597,9 @@ mod tests {
 /// backlogged samples at 8 Mbit/s read 0.9 to 6.9 Mbit/s, and with a 48 KiB
 /// window over 0.4 Mbit/s's 10,000-byte queue one sample under load read 68 %.
 /// A path recovering from loss reads as a low backlogged rate: a sample
-/// carries what the path delivered, not what it could have.
+/// carries what the path delivered, not what it could have. One cell drops
+/// packets on purpose: an unordered `maxRetransmits: 0` channel, which
+/// recovers nothing, so it measures what the clock counts of a lossy path.
 ///
 /// What it does not prove: a real carrier's loss, jitter, reordering and
 /// stalls, a browser's SCTP at the far end, and DTLS and ICE beneath SCTP.
@@ -608,12 +610,14 @@ mod shaped_link {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use tokio::sync::{Mutex, mpsc};
     use webrtc::sctp::association::{Association, Config};
     use webrtc::sctp::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+    use webrtc::sctp::stream::ReliabilityType;
     use webrtc::util::Conn;
 
     use super::*;
@@ -640,15 +644,30 @@ mod shaped_link {
         (usize::try_from(rwnd(bps)).unwrap_or(usize::MAX) / 4).clamp(1024, 16 * 1024)
     }
 
+    /// A packet this long or longer carries a full DATA chunk: a lossy
+    /// direction drops only such packets, so the handshake, SACKs and
+    /// FORWARD TSNs always pass.
+    const FULL_PACKET: usize = 1_000;
+
     /// One direction of the link.
     struct Shaper {
         bps: u64,
         next_free: StdMutex<Instant>,
         due: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
+        /// Drops every n-th [`FULL_PACKET`] before its queue; 0 drops none.
+        drop_every: u64,
+        full_packets: AtomicU64,
     }
 
     impl Shaper {
         fn send(&self, b: &[u8]) {
+            if self.drop_every > 0
+                && b.len() >= FULL_PACKET
+                && (self.full_packets.fetch_add(1, Ordering::Relaxed) + 1)
+                    .is_multiple_of(self.drop_every)
+            {
+                return; // Lost on the way, as a lossy carrier loses it.
+            }
             let now = Instant::now();
             let mut next_free = self.next_free.lock().unwrap();
             let start = (*next_free).max(now);
@@ -671,7 +690,7 @@ mod shaped_link {
     }
 
     /// One direction's delivery: each packet reaches the far inbox when due.
-    fn direction(bps: u64) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
+    fn direction(bps: u64, drop_every: u64) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -686,13 +705,21 @@ mod shaped_link {
             bps,
             next_free: StdMutex::new(Instant::now()),
             due: due_tx,
+            drop_every,
+            full_packets: AtomicU64::new(0),
         };
         (shaper, inbox_rx)
     }
 
     fn link(bps: u64) -> (ShapedConn, ShapedConn) {
-        let (a_out, b_inbox) = direction(bps);
-        let (b_out, a_inbox) = direction(bps);
+        lossy_link(bps, 0)
+    }
+
+    /// A link whose agent-to-viewer direction drops every `drop_every`-th
+    /// packet that carries a full DATA chunk; 0 drops none.
+    fn lossy_link(bps: u64, drop_every: u64) -> (ShapedConn, ShapedConn) {
+        let (a_out, b_inbox) = direction(bps, drop_every);
+        let (b_out, a_inbox) = direction(bps, 0);
         let (a, b): (SocketAddr, SocketAddr) = (
             "10.0.0.1:5000".parse().unwrap(),
             "10.0.0.2:5000".parse().unwrap(),
@@ -759,6 +786,16 @@ mod shaped_link {
         b: Arc<dyn Conn + Send + Sync>,
         rwnd: u32,
     ) -> (Association, Arc<Association>) {
+        pair_counting(a, b, rwnd, Arc::default()).await
+    }
+
+    /// As [`pair`], and `taken` counts the bytes the viewer reads.
+    async fn pair_counting(
+        a: Arc<dyn Conn + Send + Sync>,
+        b: Arc<dyn Conn + Send + Sync>,
+        rwnd: u32,
+        taken: Arc<AtomicU64>,
+    ) -> (Association, Arc<Association>) {
         let config = |net_conn, rwnd, name: &str| Config {
             net_conn,
             max_receive_buffer_size: rwnd,
@@ -772,10 +809,13 @@ mod shaped_link {
         let reader = Arc::clone(&viewer);
         tokio::spawn(async move {
             while let Some(stream) = reader.accept_stream().await {
+                let taken = Arc::clone(&taken);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65_536];
                     // A shut stream answers 0 at once, forever: stop there.
-                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                    while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                        taken.fetch_add(n as u64, Ordering::SeqCst);
+                    }
                 });
             }
         });
@@ -894,6 +934,76 @@ mod shaped_link {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_trickle_at_8_mbps_is_application_limited() {
         a_trickle_is_application_limited(8_000_000).await;
+    }
+
+    /// The clock counts what the viewer received, not what was lost. An
+    /// unordered channel with `maxRetransmits: 0`, as the viewer's opt-in
+    /// opens it, writes as fast as it may over a 2 Mbit/s link that loses one
+    /// full DATA packet in ten. Every chunk is abandoned at its first send,
+    /// and FORWARD TSNs let the cumulative point pass the lost ones. Before
+    /// the clock left them out it counted nearly all of them: at the third
+    /// sample's end 2,128,000 bytes against 1,920,000 the viewer took, with
+    /// 216,000 lost.
+    ///
+    /// It is not exact. A lost chunk that no later DATA follows before a
+    /// FORWARD TSN covering it reaches the viewer is never reported missing,
+    /// and the clock counts it. How often that happens depends on the timing.
+    /// At the third sample's end, of about 215,000 bytes lost, four runs on a
+    /// Windows box counted 11,000 to 21,000 over what the viewer took, and two
+    /// on CI's Linux runners, under the whole suite, 75,000 and 70,000. So at
+    /// each sample's end the clock has counted less than the viewer took plus
+    /// two thirds of what was lost, and at least nine tenths of what the viewer
+    /// took: the samples read backlogged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lossy_unordered_channel_counts_what_the_viewer_took() {
+        const SAMPLE: Duration = Duration::from_secs(2);
+        const DROP_EVERY: u64 = 10;
+        let bps = 2_000_000;
+        let (a, b) = lossy_link(bps, DROP_EVERY);
+        let a = Arc::new(a);
+        let taken = Arc::new(AtomicU64::new(0));
+        let (agent, viewer) =
+            pair_counting(a.clone(), Arc::new(b), rwnd(bps), Arc::clone(&taken)).await;
+        let stream = agent
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        stream.set_reliability_params(true, ReliabilityType::Rexmit, 0);
+        let writer = tokio::spawn(async move {
+            // One chunk a message, so a message the viewer read is a chunk it
+            // received, and a lost chunk is a lost message.
+            let msg = Bytes::from(vec![0x3c; 1_000]);
+            while stream.write(&msg).await.is_ok() {}
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut sampler = DeliverySampler::new(true);
+        let clock = || Some(agent.delivery_clock());
+        let start = Instant::now();
+        assert_eq!(sampler.observe(start, sid(), clock), None);
+        let mut ends = Vec::new();
+        for i in 1..=3u32 {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(start + SAMPLE * i)).await;
+            let sample = sampler.observe(Instant::now(), sid(), clock);
+            // The clock first, then the viewer's count, which only grows.
+            let acked = agent.delivery_clock().read().acked_bytes;
+            let took = taken.load(Ordering::SeqCst);
+            // Each dropped packet held one 1,000-byte chunk.
+            let lost = a.out.full_packets.load(Ordering::SeqCst) / DROP_EVERY * 1_000;
+            ends.push((sample, acked, took, lost));
+        }
+        writer.abort();
+        let _ = agent.close().await;
+        let _ = viewer.close().await;
+        println!("a lossy unordered channel, (sample, acked, viewer took, lost): {ends:?}");
+        for (sample, acked, took, lost) in &ends {
+            assert!(*acked < took + lost * 2 / 3, "counted {acked}: {ends:?}");
+            assert!(
+                *acked >= took * 9 / 10,
+                "counted {acked} of {took}: {ends:?}"
+            );
+            let sample = sample.as_ref().expect("a sample every 2 s");
+            assert_eq!(sample.class, Class::Backlogged, "{ends:?}");
+        }
     }
 
     /// A second association is a new clock: no sample spans the two, and the
