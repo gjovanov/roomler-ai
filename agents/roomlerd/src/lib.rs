@@ -45,6 +45,10 @@ pub mod clock;
 pub mod code_signature;
 pub mod companion;
 pub mod consent;
+/// #3864 — a one-row Mac's consent questions reach the menu-bar app: the
+/// worker lists and decides the root half's, and the root counts the app only
+/// while that road is open.
+pub mod consent_relay;
 pub mod crash_uploader;
 pub mod delegate;
 #[cfg(unix)]

@@ -1158,7 +1158,7 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 pub async fn ensure_running() -> bool {
     let verdicts = ensure_verdicts();
     if let Some(up) = verdicts.standing() {
-        return up;
+        return up && reaches_the_tray().await;
     }
 
     let (up, stands) = match ensure_running_inner().await {
@@ -1188,7 +1188,7 @@ pub async fn ensure_running() -> bool {
         }
     };
     verdicts.keep(up, stands);
-    up
+    up && reaches_the_tray().await
 }
 
 /// One attempt per this interval, process-wide, after a verdict that cannot
@@ -2323,6 +2323,32 @@ fn start_tray(
 #[cfg(any(target_os = "windows", unix))]
 const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// #3864 — the rest of [`ensure_running`]'s verdict, asked fresh at every
+/// prompt, beside the tray's own: whether a question this daemon asks gets to
+/// the tray at all. Off a one-row Mac's root daemon the tray asks this daemon
+/// itself, and it does. On one, the tray asks the worker, which lists the
+/// root daemon's questions only while the road is open
+/// ([`crate::consent_relay::reach`]): closed, the tray is not the question's
+/// surface, and a window nobody answers ends as `no_prompt_surface`.
+async fn reaches_the_tray() -> bool {
+    // A test stands the road in with the tray's start.
+    #[cfg(all(test, any(target_os = "windows", unix)))]
+    let reach = match tray_stand_in::now().and_then(|stood| stood.road) {
+        Some(road) => road.reach().await,
+        None => crate::consent_relay::reach().await,
+    };
+    #[cfg(not(all(test, any(target_os = "windows", unix))))]
+    let reach = crate::consent_relay::reach().await;
+    if let crate::consent_relay::Reach::Closed(why) = &reach {
+        tracing::info!(
+            why = %why,
+            "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
+             (#3864); `roomlerd consent` still answers it"
+        );
+    }
+    reach.open()
+}
+
 /// #3855, #3858 — the tray's start stood in for the tasks of one test: its
 /// steps, in place of the daemon's ([`TraySteps::real`]), and starts in
 /// flight of its own. A task-local, so the tests beside it, and the daemon's
@@ -2337,6 +2363,10 @@ mod tray_stand_in {
         pub(super) starts: &'static TrayStarts,
         /// #3884 — [`super::ensure_running`]'s verdicts, of this test's own.
         pub(super) verdicts: &'static EnsureVerdicts,
+        /// #3864 — a one-row Mac's road from the root daemon's question to
+        /// the tray, stood in. `None`: this daemon is not a one-row Mac's
+        /// root, and the tray asks it directly.
+        pub(super) road: Option<crate::consent_relay::stand_in::Road>,
     }
 
     impl StandIn {
@@ -2345,6 +2375,15 @@ mod tray_stand_in {
                 steps,
                 starts: Box::leak(Box::new(TrayStarts::new("tray-start"))),
                 verdicts: Box::leak(Box::new(EnsureVerdicts::new())),
+                road: None,
+            }
+        }
+
+        /// #3864 — this daemon as a one-row Mac's root, with `road`.
+        pub(super) fn on_one_row(self, road: crate::consent_relay::stand_in::Road) -> Self {
+            Self {
+                road: Some(road),
+                ..self
             }
         }
     }
@@ -2952,6 +2991,110 @@ mod tray_start_tests {
             Some(ConsentDenyReason::HostTimeout),
             "a start that worked: nobody answered"
         );
+    }
+
+    /// #3864 — on a one-row Mac the root daemon asks, and the tray reads the
+    /// worker's socket, so a tray that is up is the question's surface only
+    /// while the road between them is open: a worker that said
+    /// `relay-consent`, for a known account, whose person socket answers in
+    /// time. Closed, it is not counted, and a window nobody answered ends as
+    /// `no_prompt_surface`: the floor every host has, nothing shared without
+    /// an answer. The control: a daemon that is not a one-row Mac's root (a
+    /// two-row Mac's halves, Linux, Windows) counts its tray as before.
+    ///
+    /// Red before #3864: a tray that was up was counted whatever the road,
+    /// and the window's end read as the person's timeout.
+    #[test]
+    fn a_one_row_tray_is_the_surface_only_while_its_road_is_open() {
+        use crate::consent::Decision;
+        use crate::consent_relay::Worker;
+        use crate::consent_relay::stand_in::{Answers, Road};
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let rt = runtime();
+        let works = Host::default();
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let reason_at_the_windows_end = |road: Option<Road>| {
+            let ind = ind.clone();
+            let stood = StandIn::new(host_steps(&works));
+            let stood = match road {
+                Some(road) => stood.on_one_row(road),
+                None => stood,
+            };
+            rt.block_on(asking(stood, async move {
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("h8"))),
+                    mark_up: None,
+                };
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "h8", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }))
+        };
+        let relaying = Worker {
+            relays: true,
+            uid: Some(501),
+        };
+        let open = Road {
+            worker: relaying,
+            answers: Answers::Yes,
+        };
+        assert_eq!(
+            reason_at_the_windows_end(None),
+            Some(ConsentDenyReason::HostTimeout),
+            "not a one-row Mac's root: the tray is the surface, as before"
+        );
+        assert_eq!(
+            reason_at_the_windows_end(Some(open)),
+            Some(ConsentDenyReason::HostTimeout),
+            "the road open: the tray shows the question, and nobody answered"
+        );
+        for (road, what) in [
+            (
+                Road {
+                    worker: Worker {
+                        relays: false,
+                        ..relaying
+                    },
+                    ..open
+                },
+                "a worker that did not say relay-consent (or none)",
+            ),
+            (
+                Road {
+                    worker: Worker {
+                        uid: None,
+                        ..relaying
+                    },
+                    ..open
+                },
+                "a worker whose account is not known",
+            ),
+            (
+                Road {
+                    answers: Answers::No,
+                    ..open
+                },
+                "a person socket that does not answer (gone)",
+            ),
+            (
+                Road {
+                    answers: Answers::Never,
+                    ..open
+                },
+                "a person socket that never answers (stalled)",
+            ),
+        ] {
+            assert_eq!(
+                reason_at_the_windows_end(Some(road)),
+                Some(ConsentDenyReason::NoPromptSurface),
+                "{what}: nobody could be asked"
+            );
+        }
     }
 
     /// #3888 — a question withdrawn while the tray's start is held (a
