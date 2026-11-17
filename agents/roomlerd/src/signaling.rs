@@ -268,7 +268,7 @@ fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
 /// encoder (#3245). All end alike: said first, closed after the grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEnd {
-    HostDisconnect,
+    HostDisconnect(crate::rc_sessions::Via),
     Idle,
     NoVideo,
 }
@@ -276,7 +276,7 @@ enum DeviceEnd {
 impl DeviceEnd {
     fn terminate(self, session_id: bson::oid::ObjectId) -> ClientMsg {
         match self {
-            Self::HostDisconnect => host_disconnect_terminate(session_id),
+            Self::HostDisconnect(_) => host_disconnect_terminate(session_id),
             Self::Idle => idle_terminate(session_id),
             Self::NoVideo => crate::peer::no_video_terminate(session_id),
         }
@@ -284,7 +284,7 @@ impl DeviceEnd {
 
     fn label(self) -> &'static str {
         match self {
-            Self::HostDisconnect => "host_disconnect",
+            Self::HostDisconnect(_) => "host_disconnect",
             Self::Idle => "idle_timeout",
             Self::NoVideo => "no_video",
         }
@@ -294,11 +294,11 @@ impl DeviceEnd {
 /// The next session the device ends, from either channel. Both `recv`s are
 /// cancel-safe, so losing the outer `select!` drops no hand-back.
 async fn device_end(
-    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    kill_rx: &mut mpsc::Receiver<crate::rc_sessions::KillOrder>,
     idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
 ) -> Option<(bson::oid::ObjectId, DeviceEnd)> {
     tokio::select! {
-        Some(sid) = kill_rx.recv() => Some((sid, DeviceEnd::HostDisconnect)),
+        Some((sid, via)) = kill_rx.recv() => Some((sid, DeviceEnd::HostDisconnect(via))),
         Some(sid) = idle_rx.recv() => Some((sid, DeviceEnd::Idle)),
         else => None,
     }
@@ -1053,7 +1053,7 @@ pub async fn run(
     // reconnects. A `kill_tx` clone is retained below for the whole loop
     // so the channel never fully closes — a closed receiver would busy-
     // spin the select! — even when the overlay is disabled.
-    let (kill_tx, mut kill_rx) = mpsc::channel::<bson::oid::ObjectId>(4);
+    let (kill_tx, mut kill_rx) = mpsc::channel::<crate::rc_sessions::KillOrder>(4);
     // #1754 — where a tunnel peer reports that its client is gone, so the
     // loop reaps it without waiting for a `rc:tunnel.terminate` that an
     // older client, a crashed one or a dead network never sends. Same
@@ -1789,7 +1789,7 @@ async fn connect_once(
     delegation: &mut crate::delegate::Delegation,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
-    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    kill_rx: &mut mpsc::Receiver<crate::rc_sessions::KillOrder>,
     // FR-27 — Approve/Deny from a NATIVE consent panel.
     consent_rx: &mut mpsc::Receiver<(String, bool)>,
     // #1754 — the tunnel-peer reap channel: the sender every new tunnel
@@ -3016,8 +3016,8 @@ async fn connect_once(
                     debug!(session_id = %sid, "idle limit reached for a session no longer held — nothing to end");
                     continue;
                 }
-                // Viewee clicked "Disconnect" in the on-screen overlay: the
-                // Windows badge, or the companion banner over LocalAPI. Or
+                // The person at the device ended the session, and the line
+                // names what asked (`rc_sessions::Via`, #4001). Or
                 // (P4b-2) the session sat idle past its limit: the same end,
                 // said the same way, under its own reason.
                 //
@@ -3032,8 +3032,8 @@ async fn connect_once(
                 // field log). The peer closes after a short grace, in a task
                 // of its own, so this loop is never held.
                 match end {
-                    DeviceEnd::HostDisconnect => {
-                        info!(session_id = %sid, "viewee requested disconnect via overlay badge")
+                    DeviceEnd::HostDisconnect(via) => {
+                        crate::rc_sessions::log_host_ended(sid, via)
                     }
                     DeviceEnd::Idle => {
                         info!(session_id = %sid, "idle limit reached — ending the session")
@@ -3099,7 +3099,7 @@ async fn connect_once(
                 // reads; the others name their reason.
                 let grace_ms = grace.as_millis() as u64;
                 match end {
-                    DeviceEnd::HostDisconnect => info!(
+                    DeviceEnd::HostDisconnect(_) => info!(
                         session_id = %sid,
                         reason = end.label(),
                         grace_ms,
@@ -7250,7 +7250,7 @@ async fn serving_kept<F: std::future::Future>(
     // roll drops the worker's own socket too, and the daemon's orders and the
     // deadlines are served while it redials.
     side: &mut Option<DelegatedSide>,
-    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    kill_rx: &mut mpsc::Receiver<crate::rc_sessions::KillOrder>,
     idle_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
     indicator: &ViewerIndicator,
 ) -> F::Output {
@@ -7459,7 +7459,7 @@ fn end_in_gap(
         DeviceEnd::Idle => {
             debug!(session_id = %sid, "idle limit reached for a session no longer held — nothing to end");
         }
-        DeviceEnd::HostDisconnect | DeviceEnd::NoVideo => {
+        DeviceEnd::HostDisconnect(_) | DeviceEnd::NoVideo => {
             info!(
                 session_id = %sid,
                 reason = end.label(),
@@ -8254,11 +8254,12 @@ mod tests {
         assert!(json.contains(r#""t":"rc:terminate""#), "{json}");
         assert!(json.contains(r#""reason":"idle_timeout""#), "{json}");
         assert!(json.contains(r#""limit":"idle""#), "{json}");
-        let json = serde_json::to_string(&DeviceEnd::HostDisconnect.terminate(sid)).unwrap();
+        let host = DeviceEnd::HostDisconnect(crate::rc_sessions::Via::LocalApi);
+        let json = serde_json::to_string(&host.terminate(sid)).unwrap();
         assert!(json.contains(r#""reason":"host_disconnect""#), "{json}");
         assert!(!json.contains("limit"), "{json}");
         assert_eq!(DeviceEnd::Idle.label(), "idle_timeout");
-        assert_eq!(DeviceEnd::HostDisconnect.label(), "host_disconnect");
+        assert_eq!(host.label(), "host_disconnect");
         assert_eq!(DeviceEnd::NoVideo.label(), "no_video");
     }
 
@@ -8266,6 +8267,7 @@ mod tests {
     /// reason: the overlay's Disconnect and an idle watcher's hand-back.
     #[tokio::test]
     async fn either_channel_ends_a_session() {
+        use crate::rc_sessions::Via;
         let (kill_tx, mut kill_rx) = mpsc::channel(1);
         let (idle_tx, mut idle_rx) = mpsc::channel(1);
         let (a, b) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
@@ -8274,10 +8276,10 @@ mod tests {
             device_end(&mut kill_rx, &mut idle_rx).await,
             Some((a, DeviceEnd::Idle))
         );
-        kill_tx.send(b).await.unwrap();
+        kill_tx.send((b, Via::OverlayBadge)).await.unwrap();
         assert_eq!(
             device_end(&mut kill_rx, &mut idle_rx).await,
-            Some((b, DeviceEnd::HostDisconnect))
+            Some((b, DeviceEnd::HostDisconnect(Via::OverlayBadge)))
         );
     }
 
@@ -9218,7 +9220,7 @@ mod notification_off_the_loop_tests {
     struct Indicator {
         ind: ViewerIndicator,
         _answers: mpsc::Receiver<(String, bool)>,
-        _disconnects: mpsc::Receiver<bson::oid::ObjectId>,
+        _disconnects: mpsc::Receiver<crate::rc_sessions::KillOrder>,
     }
 
     fn indicator() -> Indicator {
