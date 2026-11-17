@@ -2532,11 +2532,11 @@ mod sshd {
         }
         warn!(?caller, %grant, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
         Err(match decision {
+            // #3982 — one text with an exec command that no surface showed
+            // (`consent::nobody_could_be_asked`); a test there pins this
+            // sentence.
             crate::consent::Decision::Timeout if !have_surface => {
-                "nobody could be asked at this device — it has no prompt surface (no one at its \
-                 screen and the Roomler desktop app is not running); answer with `roomlerd \
-                 consent` there, start the desktop app, or set this device's SSH policy to auto"
-                    .to_string()
+                crate::consent::nobody_could_be_asked("SSH")
             }
             crate::consent::Decision::Timeout => format!(
                 "nobody approved this session at the device within {}s",

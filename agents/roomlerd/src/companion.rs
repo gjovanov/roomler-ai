@@ -3886,6 +3886,66 @@ mod tray_start_tests {
             }
         }
     }
+
+    /// An exec question, open for 30 s.
+    fn exec_view(request_id: &str) -> crate::indicator::PromptView {
+        crate::indicator::PromptView {
+            session_hex: request_id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    /// #3982 — an exec question that no surface showed (no native panel, no
+    /// companion, no notification) ends with SSH's "nobody could be asked"
+    /// words once its window is out, naming the execution policy, and so
+    /// does one whose companion is up with no marker to read. One the
+    /// companion showed, which nobody answered, still ends "did not approve
+    /// the command (Timeout)". The surfaces go up as the WS loop's task puts
+    /// them up ([`crate::signaling::exec_surfaces_up`]), and the answer is
+    /// worded as the command's task words it
+    /// ([`crate::signaling::exec_refusal`]).
+    ///
+    /// Red before #3982: every unanswered exec question ended "did not
+    /// approve the command (Timeout)", whether anything showed it or not.
+    #[test]
+    fn an_exec_question_no_surface_showed_says_nobody_could_be_asked() {
+        use crate::consent::Decision;
+        let rt = runtime();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let works = Host::default();
+        // No native panel and no notification: the companion alone decides.
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let words_at_the_windows_end = |host: &Host, marker: bool| {
+            let ind = ind.clone();
+            rt.block_on(asking(StandIn::new(host_steps(host)), async move {
+                let have_surface =
+                    crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
+                crate::signaling::exec_refusal(Decision::Timeout, have_surface)
+            }))
+        };
+        let nobody = crate::consent::nobody_could_be_asked("execution");
+        assert_eq!(
+            words_at_the_windows_end(&none, true),
+            nobody,
+            "no companion: nobody could be asked"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&works, false),
+            nobody,
+            "a companion with no marker to read shows nothing"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&works, true),
+            "the operator at this device did not approve the command (Timeout)",
+            "a companion that showed it: nobody answered"
+        );
+    }
 }
 
 /// Where the Linux companion lives: `/usr/bin` from its .deb, `/usr/local/bin`
