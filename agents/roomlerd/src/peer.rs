@@ -4058,6 +4058,7 @@ async fn media_pump_vp9_444_dc(
     let mut media_window = media_paths
         .is_new(crate::media_paths::MediaPath::Stats)
         .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let mut delivery = crate::media_delivery::DeliverySampler::from_env(); // FR-148 P0
     let pump_started = std::time::Instant::now();
     let mut first_frame_noted = false;
 
@@ -5463,6 +5464,7 @@ async fn media_pump_vp9_444_dc(
                 shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
+            delivery.heartbeat(&pc, session_id); // FR-148 P0: a line of its own, every 10 s
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
@@ -6612,6 +6614,7 @@ async fn media_pump_ffmpeg_dc(
     let mut media_window = media_paths
         .is_new(crate::media_paths::MediaPath::Stats)
         .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let mut delivery = crate::media_delivery::DeliverySampler::from_env(); // FR-148 P0
     let pump_started = std::time::Instant::now();
     let mut first_frame_noted = false;
 
@@ -10485,6 +10488,7 @@ async fn media_pump_ffmpeg_dc(
                 viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
+            delivery.heartbeat(&pc, session_id); // FR-148 P0: a line of its own, every 10 s
             // Stopped BEFORE the snapshot below, so the rebase carries it.
             PassWatch::stop(hb_t, &mut heartbeat_us);
             // FR-65 — the pass now open was marked against counters this block

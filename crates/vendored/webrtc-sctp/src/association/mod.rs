@@ -3,6 +3,8 @@ mod association_test;
 
 mod association_internal;
 mod association_stats;
+// roomler (FR-148): the acknowledgement clock (`Association::delivery_clock`).
+pub mod delivery;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -246,6 +248,8 @@ pub struct Association {
     net_conn: Arc<dyn Conn + Send + Sync>,
     bytes_received: Arc<AtomicUsize>,
     bytes_sent: Arc<AtomicUsize>,
+    // roomler (FR-148): read without `association_internal`'s lock.
+    delivery: delivery::DeliveryClock,
 
     pub(crate) association_internal: Arc<Mutex<AssociationInternal>>,
 }
@@ -346,6 +350,7 @@ impl Association {
         let max_message_size = Arc::clone(&ai.max_message_size);
         let inflight_queue_length = Arc::clone(&ai.inflight_queue_length);
         let will_send_shutdown = Arc::clone(&ai.will_send_shutdown);
+        let delivery = ai.delivery_clock(); // roomler (FR-148)
 
         let mut init = ChunkInit {
             initial_tsn: ai.my_next_tsn,
@@ -429,6 +434,7 @@ impl Association {
                 net_conn,
                 bytes_received,
                 bytes_sent,
+                delivery,
                 association_internal,
             },
             handshake_completed_ch_rx,
@@ -617,6 +623,14 @@ impl Association {
         }
 
         log::debug!("[{}] write_loop exited", name);
+    }
+
+    /// roomler (FR-148): what the peer has acknowledged, and when the queue of
+    /// written, not yet sent chunks filled and ran empty, read without this
+    /// association's lock (`delivery::DeliveryClock::read`). `bytes_sent`
+    /// below counts packets written to the wire, retransmissions included.
+    pub fn delivery_clock(&self) -> delivery::DeliveryClock {
+        self.delivery.clone()
     }
 
     /// bytes_sent returns the number of bytes sent

@@ -61,6 +61,17 @@
 #     random on one thread and on two, the queue's accounting at rest, pops
 #     during a cut message's drop and one split around it, a refused and an
 #     empty write).
+#   - src/association/delivery.rs (new), src/association/mod.rs,
+#     src/association/association_internal.rs and src/queue/pending_queue.rs
+#     (FR-148 P0): the association's acknowledgement clock, read without its
+#     lock (`Association::delivery_clock`). The SACK handler counts the user
+#     data the peer acknowledged, over every stream; the pending queue counts
+#     each time it fills and runs empty. The agent reads both to tell a
+#     delivery rate the path carried while bytes waited from one an idle
+#     sender set; the write call cannot, as it returns once SCTP has queued
+#     the bytes. Counting only: nothing the association does changes.
+#     src/queue/queue_test.rs holds its test (the fills, the empties and the
+#     acknowledged bytes, read through the clock).
 
 [package]
 edition = "2021"

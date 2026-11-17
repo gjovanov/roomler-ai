@@ -110,7 +110,7 @@ flowchart TB
 
 The heartbeat carries the tally as `evidence_rejected=[agent-stalled,
 transit-stalled, stall-shadow, carrier-changed, opening, keyframe-burst]` (`Rejections`,
-`evidence.rs:219`; printed at `peer.rs:10334` for the FFmpeg pump and `:5427` for
+`evidence.rs:219`; printed at `peer.rs:10337` for the FFmpeg pump and `:5428` for
 VP9's) — one field where T1b, T2 and
 T2b each had their own counter. `opening` was appended (P2b-8) and then
 `keyframe-burst` (P2b-13), so the earlier positions keep their meaning for a
@@ -177,8 +177,8 @@ a permanent stall, and a stall never lowers the floor it is measured against.
 **The heartbeat.** `pipe_state` is the last window's verdict, `pipe_states` the
 session's windows per verdict as `[unknown, clear, overproduced,
 transit-stalled, viewer-late]`, and `pipe_gap_stalls` the subset of the
-transit-stalled count that came from the gap rule (`peer.rs:10331`–`:10341` for
-the FFmpeg pump; `:5286`–`:5296` for VP9's, whose transit share is an upper
+transit-stalled count that came from the gap rule (`peer.rs:10334`–`:10344` for
+the FFmpeg pump; `:5287`–`:5297` for VP9's, whose transit share is an upper
 bound because that pump keeps no send-wait figure). Three rules for reading them:
 
 - a heartbeat spans about two windows, so `pipe_state` and the histogram are
@@ -370,8 +370,8 @@ were followed within 2 s by a delivery at least 2× above them, and the floor ne
 moved in the true one's 60 s.
 
 ⚠️ **(b) reads two sources because `bytes_written` is not the whole offer.** It counts
-what left the pump's own channel, and both pumps stamp a frame before it (`peer.rs:5306`,
-`:9752`), so a queue growing INSIDE that channel reads sent ≈ rx. `Overproduced` is
+what left the pump's own channel, and both pumps stamp a frame before it (`peer.rs:5307`,
+`:9755`), so a queue growing INSIDE that channel reads sent ≈ rx. `Overproduced` is
 that case. A window with no link report keeps the streak, and an unoffered congested
 window neither arms nor releases, because the queue did grow.
 
@@ -387,7 +387,7 @@ entry at all, so the entry stands until a session measures or carries a hold, or
 
 The heartbeat carries `pipe_measured` (what a stall is judged against),
 `readings_refuted`, and `link_unoffered`, a subset of `link_stats`' congested count: a
-link loop gone quiet with this climbing is rule (b) (`peer.rs:5440`, `:10367`).
+link loop gone quiet with this climbing is rule (b) (`peer.rs:5441`, `:10370`).
 
 ### The ceiling learner (FR-35 P1) — growth above the nominal
 
@@ -474,8 +474,8 @@ plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
 sessions never touch the learner (`governor.rs:603` gates on `constrained`).
 
 ⚠️ **Only the FFmpeg DC pump runs the learner.** `relay_max_hi_bps()` has one
-caller (`peer.rs:6690`, `media_pump_ffmpeg_dc`), the VP9-444 pump builds its
-governor with `hi = 0` (`peer.rs:4358`), and the RTP pump has no governor. There
+caller (`peer.rs:6693`, `media_pump_ffmpeg_dc`), the VP9-444 pump builds its
+governor with `hi = 0` (`peer.rs:4359`), and the RTP pump has no governor. There
 is no software FFmpeg encoder, so a host with no hardware encoder never reaches
 the learner, and `relay_ceiling_learn` reads the same on and off there. A VM
 cannot prove that switch (FR-35 AC6). ⚠️ **On `h264_vaapi` the ceiling does not show in the bytes:** on jupiter (0.4.197, Raphael iGPU) one scroll delivered 10.7 Mbps under `maxrate` 2.55, 3.0 and 5.84 M alike, so on that cell read the target, `learned_ceiling_bps` and the memory ([FR-35's kill-switch A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-kill-switch-ab-2026-11-02)).
@@ -514,7 +514,7 @@ cannot prove that switch (FR-35 AC6). ⚠️ **On `h264_vaapi` the ceiling does 
 >   measured a sustainable limit; the memory's level is the write-back's
 >   dynamics, not the pipe's. (FR-35 AC1's numbers passed on 2026-10-31 without
 >   moving this, and a cold opener passes them too:
->   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).) ⚠️ **Compare opening keyframes only at equal `dc_unopen_drops`.** Every frame the pump encodes before the video channel opens is dropped and forces another keyframe (`peer.rs:9990`, `:9996`), and the one delivered shrinks as the count rises: 63,284 B at 2 drops and 23,435 B at 4 on one `maxrate`. At equal drops it follows `maxrate` ([what moved it](fr/FR-35-relay-ceiling-learns-the-pair.md#what-moved-the-openers-keyframe-2026-11-02), [#3334](https://github.com/gjovanov/roomler-ai/issues/3334)).
+>   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).) ⚠️ **Compare opening keyframes only at equal `dc_unopen_drops`.** Every frame the pump encodes before the video channel opens is dropped and forces another keyframe (`peer.rs:9993`, `:9999`), and the one delivered shrinks as the count rises: 63,284 B at 2 drops and 23,435 B at 4 on one `maxrate`. At equal drops it follows `maxrate` ([what moved it](fr/FR-35-relay-ceiling-learns-the-pair.md#what-moved-the-openers-keyframe-2026-11-02), [#3334](https://github.com/gjovanov/roomler-ai/issues/3334)).
 
 ### The write-back and the seed (V2 + V4) — the pair memory
 
@@ -549,9 +549,9 @@ flowchart LR
 | piece | rule | anchor |
 |---|---|---|
 | the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:2094` |
-| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `peer.rs:6729` |
-| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9544` (`opener_measured_bps`) |
-| the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `peer.rs:9466`; `governor.rs:724` |
+| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `peer.rs:6732` |
+| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9547` (`opener_measured_bps`) |
+| the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `peer.rs:9469`; `governor.rs:724` |
 | the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence, or the first after an assumed entry ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:230`, `:79`; `peer.rs:2151` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days, or an assumed one, never seeds and is pruned on the next write | `rate_memory.rs:269`, `:22` |
 | the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:2160` |
@@ -583,7 +583,7 @@ is a hold, not a measurement, and on the connect-look-leave sessions this fleet
 actually has it writes the opener's own seed back as evidence. The asymmetry
 that protects against a flooded opener (believe a drop fast) then compounds it:
 the pair that carried 6–7.6 Mbps windows is remembered at 4.4 M. A fix belongs
-with the governor (`peer.rs:9466`: require the hold to have been *carried*, or
+with the governor (`peer.rs:9469`: require the hold to have been *carried*, or
 route the first-choice evidence through the gate); nothing here is changed yet.
 The 2026-10-25 → 10-30 row is the same defect at scale: every write on that pair,
 not only the idle sessions.
@@ -628,7 +628,7 @@ operator says which reading counts. The hold question is worth deciding for what
 the memory buys on AV1, and AC1's numbers do not depend on it.
 
 **Three writes in one night (2026-10-31, CORPLAP-2).** Evidence was
-`stable_bps()`, else `pipe_bps()` (`peer.rs:9194`), and nothing clamps the
+`stable_bps()`, else `pipe_bps()` (`peer.rs:9197`), and nothing clamps the
 second to `hi`. ⚠️ V5b leaves this open: the 13.04 M was a live goodput, not a hold
 and not a stand-in, so it is evidence by the new rules too:
 
@@ -664,7 +664,7 @@ evidence the old `min(goodput, link_rx)` averaged together:
 | the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:265`) |
 
 ⚠️ **It is a shadow, with one exception.** The heartbeat prints `pipe_belief=(anchor,
-floor, capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8631`), and
+floor, capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8634`), and
 none of the three values has a consumer: not V5, not the ceiling, not the memory.
 V5b reads one fact and nothing else, whether a delivery RAISED the floor
 (`Pipe::observe_delivered`, q2). The shadow corrected its own design three times in
@@ -797,7 +797,7 @@ floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:268`). On a direct
 transport `effective_ceiling` is the plan's value unchanged (`governor.rs:599`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
 divides it by the follower count; and the result is both the AIMD's ceiling
-and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7451`).
+and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7454`).
 
 ⚠️ The encode-pressure factor multiplies the bound, so a host whose encoder is
 struggling lowers its own ceiling with no path evidence in it. On 2026-09-25
@@ -822,10 +822,10 @@ meant to bound.
 |---|---|---|
 | soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:559` (`direct_queue_budget_bytes`) |
 | hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:578` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
-| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6755`–`6261`; set and cleared by the send task at `:5972`, `:6040` |
-| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6799` |
-| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6878`, `:6753` |
-| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6724`–`6190` |
+| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6758`–`6261`; set and cleared by the send task at `:5974`, `:6042` |
+| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6802` |
+| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6881`, `:6756` |
+| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6727`–`6190` |
 
 ```mermaid
 flowchart TB
@@ -1226,8 +1226,8 @@ past 200 Mbps on a desktop sending 5 kbps. So −96 % reads the same on a restin
 that lost nothing and on a scroll spending 14 times the shadow's target.
 
 So the report also compares the shadow with what was actually sent. `bytes_written` is
-the send task's running total of whole frames the transport took (`peer.rs:7439`,
-`:4215`), on both heartbeats (`peer.rs:10195`, `:5319`):
+the send task's running total of whole frames the transport took (`peer.rs:7442`,
+`:4216`), on both heartbeats (`peer.rs:10198`, `:5320`):
 
 ```mermaid
 flowchart LR
@@ -1245,7 +1245,7 @@ flowchart LR
 |---|---|---|
 | `spent > shadow`, clean window | the shadow would have capped spending the path was carrying | that the picture needed those bits. Every FFmpeg backend but NVENC anchors `bit_rate = maxrate` (`ffmpeg/encoder.rs:1887-1896`), so a high target can also draw spend, which is why the report splits by encoder. A small excess can be overshoot, hence the "by > 25 %" column |
 | `spent ≤ shadow` | the window's average fit | that no burst inside the window was capped |
-| the encoder's demand | `spent` bounds it from below | nothing bounds it from above: the heartbeat has no maxrate field (`peer.rs:10186-10201`), and a new field cannot help a read of logs already written |
+| the encoder's demand | `spent` bounds it from below | nothing bounds it from above: the heartbeat has no maxrate field (`peer.rs:10189-10204`), and a new field cannot help a read of logs already written |
 
 The live cap cannot hide a bite: while `shadow < live`, a window capped by live spends
 about live, which is over the shadow. Elevated windows are kept out of the table, since
@@ -1390,6 +1390,152 @@ release with B1. `agent_logs` deletes a batch 7 days after it arrives, so a wind
 anchored at the release loses its first hours the moment it turns 7 days old: read it
 during its 7th day (`--until` = the time of the read), not after.
 
+## Delivery samples (FR-148 P0) — what the path carried, and whether the sender was waiting
+
+FR-148 P0, step 2 (#3953). **A shadow: nothing reads these numbers.** No rate, pacing or
+queue budget changes, and neither the viewer nor the wire does. Each data-channel pump
+cuts its session's SCTP association into **delivery samples** of about 2 s, marks each
+one by whether bytes were waiting while it ran, and writes one line of its own every
+10 s. The heartbeat lines stay as they were.
+
+**Why the transport, not the write.** The goodput estimator (`encode::goodput`) times
+the pump's `dc.send()`, which returns once SCTP has queued the bytes in its pending
+queue of 128 KiB: it says how fast SCTP took them, and it is silent whenever the queue
+is downstream ([§ V3b](#v3b--one-belief-about-the-path-shadow-since-agent-v0498-one-consumer-since-v5b)). A
+sample reads the association's **acknowledgement clock** instead, two counters a patch
+of the vendored webrtc-sctp keeps where the events happen:
+
+| Counter | Counted in | Means |
+|---|---|---|
+| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1438`) | user data the peer acknowledged, each chunk once, over every stream of the association. An abandoned PR-SCTP chunk counts once the peer's cumulative point passes it |
+| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:118`, `:512`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
+
+The agent reads both without the association's lock (`Association::delivery_clock`,
+`crates/vendored/webrtc-sctp/src/association/mod.rs:632`), through the peer
+connection's SCTP transport (`RTCSctpTransport::delivery_clock`,
+`crates/vendored/webrtc/src/sctp_transport/mod.rs:437`, a patch of the vendored
+webrtc). That accessor never waits: `stop()` holds the transport's slot across the
+association's close, so a held slot answers `None` and the sampler keeps the clock it
+already has.
+
+```mermaid
+flowchart LR
+  P["the pump's write<br/>dc.send()"] --> Q["SCTP pending queue<br/>counts fills, empties"]
+  Q --> F["in flight<br/>(cwnd, rwnd)"]
+  F --> V["the viewer"]
+  V -- "SACK" --> A["SACK handler<br/>counts acknowledged bytes"]
+  Q -.-> C["DeliveryClock::read"]
+  A -.-> C
+  C --> S["DeliverySampler::heartbeat<br/>one call per pump heartbeat"]
+  S --> L["the path delivery line<br/>every 10 s"]
+```
+
+**A sample** runs between two readings at least 1.5 s apart (`SAMPLE_MIN`): the first
+heartbeat that far after the last reading closes it. That is about 2 s on both pumps:
+the FFmpeg pump beats every 2 s, and the VP9-444 pump every 30 encoded frames (about
+1 s at 30 fps), so every other one of its beats closes a sample. Samples tile the time
+from the association's first reading on, with no gap and no overlap. A new association
+is a new clock, and no sample spans the two. Because the queue counts its own fills and
+empties, a sample is classed right whatever its length and however late a heartbeat
+runs (`agents/roomlerd/src/media_delivery.rs:87`):
+
+| Class | When | What it says about the path |
+|---|---|---|
+| **backlogged** | the queue held bytes at the sample's start and never ran empty in it, and some bytes were acknowledged | it carried this rate while bytes waited: **evidence about capacity** |
+| **application-limited** | the queue was empty at the start, or ran empty at least once: the path took everything offered | a **lower bound**, which never lowers a capacity |
+| **stalled** | the queue held bytes throughout and nothing was acknowledged | **evidence about stalls, never about capacity** |
+
+Calling a sample application-limited when in doubt is the safe direction: such a
+sample can only raise a floor.
+
+**The line** is `path delivery (FR-148 P0, shadow, ≈10s)`, at INFO, written by
+`media_delivery::emit` (`agents/roomlerd/src/media_delivery.rs:284`) at the first
+heartbeat 10 s after the last line (`LINE_EVERY`), and once more when the pump ends with
+samples not yet written. A test pins its field names (`the_line_names_its_fields`):
+
+| Field | Meaning |
+|---|---|
+| `session_id` | the session |
+| `span_ms` | the milliseconds the line's samples cover |
+| `delivery_samples` | `(backlogged, application-limited, stalled)`: samples per class |
+| `backlogged_bps` | `Some((lowest, over all their bytes, highest))`, bit/s, over the backlogged samples; `None` when there was none |
+| `app_limited_bps` | the highest application-limited sample's rate, bit/s; `None` when there was none |
+| `stalled_ms` | the milliseconds of stalled samples |
+| `acked_bytes` | user-data bytes acknowledged over the line's samples, every stream of the association |
+
+**Its cost** is at most 360 lines a session hour per pump. In the daemon's log-file
+format a busy line is 264 bytes and an idle one 232: 95,040 and 83,520 bytes a session
+hour, measured by the same test. The VP9-444 pump's heartbeat
+counts frames, so a pump that encodes nothing writes nothing until frames flow again;
+its next sample spans the quiet time and reads application-limited.
+
+**What a healthy line looks like.**
+
+| Screen and path | Reads |
+|---|---|
+| an idle screen | every sample application-limited: `delivery_samples=(0, 5, 0)` at the FFmpeg pump's 2 s beat (the VP9-444 pump beats by frames, so it can write fewer, longer samples), `backlogged_bps=None`, `app_limited_bps` about what the still screen sends (its frames and the other channels), `stalled_ms=0` |
+| a busy screen on a path with room (a LAN, a fast direct pair) | mostly application-limited: the encoder's rate is under the path's, so `app_limited_bps` is about the encoder's rate. A sample is backlogged only if the queue held bytes for its whole 2 s, which a keyframe's burst alone does not do, so backlogged samples are rare |
+| a busy screen on a path at its limit (a relay, a slow link) | backlogged samples whose lowest, overall and highest rates sit close together near the path's rate, `stalled_ms=0` |
+| a stall | `stalled_ms` above 0, and the third count of `delivery_samples` with it: bytes waited and the peer acknowledged none |
+
+**What a sample cannot tell.**
+
+- A sample partly stalled reads as a low backlogged rate: the class covers the whole
+  sample (the shaped link's first runs showed it, below). FR-148 §4.1 keeps FR-71's
+  classifier and FR-79's gate for stalled windows.
+- A viewer that stops reading closes SCTP's receive window. The queue stays full, and
+  the sample reads backlogged or stalled though the path is fine.
+- A pump that stops at its own mark (`dc_buffered_high`: 256 KiB on a constrained relay,
+  1 MiB otherwise) under a wide congestion window leaves the queue empty while the path
+  is full. Such a sample reads application-limited; its rate is still a valid floor.
+- A path that dies while nothing is offered reads as idle (application-limited) until
+  the queue fills.
+- The acknowledged bytes are the association's: video, and the control, input and file
+  channels beside it.
+- A starved runtime runs its heartbeats late. The counts stay exact, but a sample
+  stretches.
+- Not sampled: the RTP pump (its media rides SRTP, not SCTP), and a shared pipeline's
+  followers, whose packets the owner's pump fans out over their own associations.
+
+**The switch** is `ROOMLERD_PATH_MODEL` (env only), read once per pump at its start
+through `tunnel_core::env::node_env` (`agents/roomlerd/src/media_delivery.rs:53`). `off`
+reads no clock, takes no sample and writes no line, which a test shows
+(`off_takes_no_sample_and_writes_no_line`). Any other value, or none, samples. FR-148 P1
+adds `shadow` to it, and it is deleted in P5. Its ledger row is `p0:PATH-1`
+(`docs/plans/rc-media-debt.tsv`); the two pumps' calls are `p0:PATH-2` and `p0:PATH-3`.
+
+| Where | Anchor |
+|---|---|
+| the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:171` (`DeliverySampler`), `:203` (`heartbeat`), `:239` (`on_reading`), `:261` (`take_line`) |
+| the VP9-444 pump | `agents/roomlerd/src/peer.rs:4061` (made), `:5467` (drained, after the heartbeat line) |
+| the FFmpeg pump | `agents/roomlerd/src/peer.rs:6617` (made), `:10491` (drained, after the heartbeat line) |
+| the clock | `crates/vendored/webrtc-sctp/src/association/delivery.rs:68` (`DeliveryClock`), `:76` (`read`) |
+
+**The tests** (`cargo test -p roomlerd --lib -- media_delivery`):
+
+| Test | Shows |
+|---|---|
+| `a_queue_that_held_bytes_throughout_and_delivered_is_backlogged`, `a_queue_that_ran_empty_once_is_application_limited`, `bytes_that_waited_with_nothing_acknowledged_are_a_stall`, `an_idle_association_is_application_limited_not_stalled` | the three classes, and an idle association |
+| `samples_tile_the_readings_from_the_first_on`, `the_line_comes_every_ten_seconds_and_folds_its_samples`, `a_dropped_sampler_writes_its_last_samples` | the boundaries: the first reading, `SAMPLE_MIN`, the line's fold and its 10 s |
+| `an_idle_trickle_yields_only_application_limited_samples` | the jupiter chain of 2026-11-02 as a cell: a still screen's keepalives give only application-limited samples, so none of them can stand for the path |
+| `shaped_link::backlogged_at_{0_4,2,8}_mbps_reads_the_link`, `shaped_link::a_trickle_at_{0_4,2,8}_mbps_is_application_limited` | two in-process SCTP associations over a link the test shapes (serialised at its rate, 10 ms each way, a drop-tail queue of 200 ms, a viewer window of 7/8 of that queue, and messages that fit it): a writer that always has more reads backlogged at the link's rate within 20 %; a 164 kbit/s trickle reads application-limited at every rate |
+| `shaped_link::a_new_association_starts_a_new_sample` | a new clock starts over, and a held slot keeps the clock the sampler has |
+
+The shaped link proves the classes and the rate on a known pipe. It does not prove a real
+carrier's loss, jitter, reordering or stalls, a browser's SCTP at the far end, or DTLS
+and ICE beneath SCTP: those are FR-148 P0's standing relay cell (its step 5). Its first
+runs showed the first limitation above, twice. With SCTP's default window of 1 MB,
+three backlogged samples at 8 Mbit/s read 3.6, 0.9 and 6.9 Mbit/s. The likely cause,
+inferred and not traced, is slow start overrunning the 200 ms queue and the
+retransmission timeouts after it (1 s at least) idling the link inside the samples.
+With a 48 KiB window over the 10,000 bytes the 0.4 Mbit/s queue holds, one sample read
+68 % of the link during a run of the whole suite. The window is now 7/8 of the queue
+at every rate (8,750, 43,750 and 175,000 bytes), and the writer's messages are a
+quarter of it, at most 16 KiB: the receiver counts a message's chunks against its
+window before the message is whole, and drops new data once the window is full. So
+what is in flight stays under the queue, and the cells measure the sampler, not SCTP's
+loss recovery.
+
 ## Config / env reference
 
 All keys live in the agent config (`roomler config set …`) with
@@ -1417,6 +1563,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `ROOMLERD_ENCODER_CLOCK` | on (Linux), off (Windows, macOS) | FR-112 P1, P3 — the encoding and capture threads ask for their clock (Linux: a `uclamp_min`; macOS: a QoS class; Windows: out of power throttling); `0` = the scheduler's default, `1` opts Windows or macOS in until their own numbers decide ([`encoders.md`](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) |
 | `ROOMLERD_SW_PACE_UP_MARGIN` | 2.5 | Env only. FR-112 P2d: how far (fps) a software encoder's estimate must clear a higher step before its pace moves up to it (0–10). `0` = 0.4.142's pace, which steps up as soon as the estimate quantises higher ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
 | `ROOMLERD_RATECTL` | shadow | Env only (B1). FR-63 B1 — whether the shadow rate controller runs beside the governor; `off` stops it, any other value is `shadow`. It drives NOTHING — its only output is the `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). The config-surface tribool and the `live` value are B2 |
+| `ROOMLERD_PATH_MODEL` | on | Env only. FR-148 P0 — whether the data-channel pumps take delivery samples from SCTP's acknowledgement clock and write the `path delivery` line; `off` takes none and writes none, any other value samples. It drives NOTHING ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)). FR-148 P1 adds `shadow` |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
@@ -1477,13 +1624,14 @@ still waiting for its evidence.
 | `RATE_SLOW_START` | `:557` | FR-63 | off | a session opens with slow start instead of a constant | B2's evidence flips it, or it is deleted | FR-63 | — |
 | `RATECTL` (env only) | `:597` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
 | `SHARED_RATE_SPLIT` (env only) | `:910` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
+| `PATH_MODEL` (env only) | `agents/roomlerd/src/media_delivery.rs:53`, not `encode/mod.rs` | FR-148 P0 | on | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)); nothing reads them | FR-148 P1 turns it into `shadow` and on; P5 deletes it with the composition it measures | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
 Each one retires through this table too, and its deletion PR cites the precondition below.
 
 | Heuristic | Anchor | Plan row | Precondition | State |
 |---|---|---|---|---|
-| Motion-defer: `deferred_bps`, `DEFER_QUIET`, `relay_deferred_apply_allowed`, `rebuild_apply_allowed` | `peer.rs:7367`, `:7374`; `encode/mod.rs:702`, `:744` | A4 row 1 | A0 passes on QSV, and the switch is ON for one release | ❌ QSV's A0 failed (2026-09-02); both recorded causes are refuted (2026-09-04). NVENC already skips the `held_increase` arm (`peer.rs:9635`), because `NVENC_RECONFIG_FORCES_IDR` is `false` (`encode/ffmpeg/encoder.rs:893`, #1252) |
+| Motion-defer: `deferred_bps`, `DEFER_QUIET`, `relay_deferred_apply_allowed`, `rebuild_apply_allowed` | `peer.rs:7370`, `:7377`; `encode/mod.rs:702`, `:744` | A4 row 1 | A0 passes on QSV, and the switch is ON for one release | ❌ QSV's A0 failed (2026-09-02); both recorded causes are refuted (2026-09-04). NVENC already skips the `held_increase` arm (`peer.rs:9638`), because `NVENC_RECONFIG_FORCES_IDR` is `false` (`encode/ffmpeg/encoder.rs:893`, #1252) |
 | The coarsen ladder: `BITRATE_LADDER_BPS`, `coarsen_bitrate` | `encode/aimd.rs:297`, `:317` | A4 row 2 | VideoToolbox is measured, or kept on the settle rule | VideoToolbox is measured (2026-11-05): an 8–12 ms rebuild with an IDR on every move, so the ladder stays for it too. It is load-bearing for QSV, which has no cheap apply. It keeps AMF, D3D12 and Vulkan's rate IDRs rare. It is dead weight on NVENC, and it caps NVENC at the 25 Mbps rung |
 | The background swap: `rebuild_spec`, `open_rebuilt`, `adopt_rebuilt` | `encode/ffmpeg/encoder.rs:2560`, `:2608`, `:2730` | A4 row 2 | as above, plus a cheap QSV apply | load-bearing while QSV rebuilds |
 | VP9's rebuild divergence: `on_encoder_rebuilt_mirror_only` | `encode/governor.rs:1166` | A4 row 3 | none in the plan, but the code calls unifying it "a behavioral decision for the post-soak pass" | waits for B2's soak. ⚠️ It is a defect, measured in #3472: a fresh libvpx encoder starts at its 8 Mbps boot target and nothing re-applies the session's, so a relay session that display match rebuilt 0.1 s in ran 6 min 18 s at 8.8 Mbps against its 3 Mbps ceiling, `target_bps=0` in every heartbeat (2026-11-04). Pinned, red on master, by the ignored `a_vp9_rebuild_hands_the_fresh_encoder_its_target` |
