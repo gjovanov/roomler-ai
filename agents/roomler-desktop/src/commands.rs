@@ -2573,7 +2573,11 @@ async fn consent_decide(session: Option<&str>, allow: bool) -> Result<String, St
 }
 
 /// #3873 — how long a click's answer may take, from the connect to the
-/// daemon's reply.
+/// daemon's reply: above the daemon's own bounds on an answer, who is at the
+/// seat (1.5 s, `files::SEAT_LOOKUP_WAIT`) and a one-row Mac's relay to its
+/// root half (5 s, `consent_relay::DECIDE_WITHIN`). Until #3873 nothing
+/// bounded it: an answer that never came kept the page "sending" for good,
+/// and it dropped every later click on the question without a word.
 const CONSENT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
 /// #3873 — what the page shows for a click with no question on it.
@@ -2592,37 +2596,87 @@ enum AskError {
     Request(std::io::Error),
 }
 
-/// #3873 — one click on Approve or Deny, from the page to the daemon.
+/// #3873 — one click on Approve or Deny, from the page to the daemon: in the
+/// log when it arrives and again with its outcome, and given `within` for the
+/// daemon's answer. `ask` is the round trip ([`consent_decide`]'s LocalAPI
+/// call). Returns what the page shows: `approved` / `denied`, or the reason.
+///
+/// Until #3873 no step of a click logged anything and none had a bound: on a
+/// Linux system install two clicks on a question the prompt window showed
+/// left no line in this app's log or the daemon's, and the question timed
+/// out (0.4.221 release lab).
 async fn answer_click<F, Fut>(
     session: Option<&str>,
     allow: bool,
-    _within: Duration,
+    within: Duration,
     ask: F,
 ) -> Result<String, String>
 where
     F: FnOnce(String, bool) -> Fut,
     Fut: std::future::Future<Output = Result<bool, AskError>>,
 {
-    match ask(session.unwrap_or_default().to_string(), allow).await {
-        Ok(true) => Ok(if allow {
-            "approved".into()
-        } else {
-            "denied".into()
-        }),
-        Ok(false) => {
-            Err("The device service rejected the decision (unknown or invalid session).".into())
+    let verb = if allow { "Approve" } else { "Deny" };
+    let Some(session) = session.filter(|s| !s.is_empty()) else {
+        tracing::warn!(
+            verb,
+            "consent: a click with no question on the page; nothing was sent"
+        );
+        return Err(NO_QUESTION.into());
+    };
+    tracing::info!(
+        verb,
+        session,
+        "consent: a click arrived; asking the device service"
+    );
+    let (shown, why) = match tokio::time::timeout(within, ask(session.to_string(), allow)).await {
+        Ok(Ok(true)) => {
+            tracing::info!(verb, session, "consent: the device service took the answer");
+            return Ok(if allow { "approved" } else { "denied" }.into());
         }
-        Err(AskError::Connect(e)) => Err(format!("Device service unreachable: {e}")),
-        Err(AskError::Request(e)) => Err(format!("LocalAPI error: {e}")),
-    }
+        Ok(Ok(false)) => (
+            "The device service did not take the answer: this question is no longer waiting for \
+             one (answered, withdrawn or expired)."
+                .to_string(),
+            "the device service has no such question waiting (answered, withdrawn or expired)"
+                .to_string(),
+        ),
+        Ok(Err(AskError::Connect(e))) => (
+            format!("Could not reach the device service: {e}"),
+            describe_io("connect", &e),
+        ),
+        Ok(Err(AskError::Request(e))) => match e.to_string().strip_prefix("localapi error: ") {
+            // The daemon's own refusal: its words, as they are (#3845's seat
+            // check, a one-row Mac's relay, an id it does not know).
+            Some(words) => (words.to_string(), words.to_string()),
+            None => (
+                format!("No answer from the device service: {e}"),
+                describe_io("consent_decide", &e),
+            ),
+        },
+        Err(_) => {
+            tracing::warn!(
+                verb,
+                session,
+                ?within,
+                "consent: no answer from the device service in time; the click is not taken"
+            );
+            return Err(format!(
+                "No answer from the device service within {within:?}. Try again."
+            ));
+        }
+    };
+    tracing::warn!(verb, session, reason = %why, "consent: the answer was not taken");
+    Err(shown)
 }
 
 /// List consent requests currently awaiting a decision — asked of the daemon
-/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The SPA
-/// polls this to render the Approve/Deny modal. NEVER errors — the modal must
-/// stay quiet when the daemon is down or nothing is pending. `ConsentRequest`
+/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The
+/// prompt window and the main window's fallback modal poll this. `ConsentRequest`
 /// serialises to the same `{session_id, controller_name, permissions,
-/// timeout_secs}` shape the SPA already consumes.
+/// timeout_secs}` shape the pages already consume.
+///
+/// #3873 — a read that fails is an `Err`, not an empty list
+/// ([`pending_answer`]): both pages stay quiet on it and keep what they show.
 #[tauri::command]
 pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
     let read = match localapi::connect().await {
@@ -2635,11 +2689,30 @@ pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
     pending_answer(read)
 }
 
-/// The page's read of the questions.
+/// #3873 — what the pages get for their read of the questions: the list, or,
+/// for a read that failed, an error. An empty list clears the question a
+/// page shows; a failed read keeps it, since the daemon may still be asking
+/// it, and a click on it reaches [`answer_click`], which logs what becomes of
+/// it. Until #3873 a failed read was an empty list: the prompt window let go
+/// of the question while it stayed on screen, and dropped a click on it. The
+/// failure is in the log through the refresh ledger, once a streak; a daemon
+/// that is not running is quiet, as on every other surface.
 fn pending_answer(
     read: Result<Vec<ConsentRequest>, (&'static str, std::io::Error)>,
 ) -> Result<Vec<ConsentRequest>, String> {
-    Ok(read.unwrap_or_default())
+    match read {
+        Ok(list) => {
+            refresh_ok(CONSENT_PENDING_SURFACE);
+            Ok(list)
+        }
+        Err((stage, e)) if stage == "connect" && e.kind() == std::io::ErrorKind::NotFound => {
+            Err(describe_io(stage, &e))
+        }
+        Err((stage, e)) => Err(refresh_failed(
+            CONSENT_PENDING_SURFACE,
+            describe_io(stage, &e),
+        )),
+    }
 }
 
 /// #2815 — must the main window's modal ask the question itself? Only when
