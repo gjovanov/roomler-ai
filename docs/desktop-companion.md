@@ -2100,8 +2100,9 @@ at most 480 × 240 logical.
 
 The prompt opens in the middle of the main screen. Where the middle comes within 16 of that
 box, the prompt opens 16 below it instead, at y 304. On a screen too short for that, the
-prompt's bottom edge sits on the screen's bottom edge, so its buttons stay in view. On the lab's
-1024-pt-wide Mac the prompt therefore opens at y 304 on any screen under 868 tall.
+prompt's bottom edge sits on the screen's bottom edge, so its buttons stay in view. On any
+screen from 564 to 867 tall the prompt therefore opens at y 304, and 1024 × 768, as wide as the
+lab's Mac, is one of them.
 `the_daemons_panels_fit_the_box_the_prompt_keeps_clear_of` reads the three panels' sizes and
 places from the daemon's sources, so a panel that moves or grows fails a test before it reaches
 anyone's screen.
@@ -2129,7 +2130,8 @@ the question appeared (a reaction takes about a quarter of a second), or the sec
 double click (0.5 s by default on macOS and Windows). Nobody reads a question and answers it
 faster than that. The click is still logged when it arrives:
 `consent: a click arrived too soon after the question came to the front; nothing was sent`,
-with the verb, the question's id and the time. The page's status line reads
+with the verb, the question's id and how long after the question came up the click came
+(`after`). The page's status line reads
 `Nothing was sent: this click came 0.3 s after the question came up …`. The buttons come back at
 once, and the next click is sent.
 
