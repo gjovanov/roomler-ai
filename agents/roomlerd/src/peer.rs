@@ -12718,11 +12718,11 @@ async fn finish_rich_write(
             "id": id,
             "bytes": bytes,
         }),
-        Err(message) => {
-            warn!(%session_id, id, ?message, "clipboard: rich write failed");
+        Err(reason) => {
+            warn!(%session_id, id, ?reason, "clipboard: rich write failed");
             serde_json::json!({
                 "t": "clipboard:error",
-                "message": message,
+                "message": reason,
                 "id": id,
             })
         }

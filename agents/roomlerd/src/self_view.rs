@@ -486,7 +486,7 @@ impl SelfView {
                 },
                 true,
             ) => tracing::info!(
-                verb, org, code = %code, status = ?status, %message, elapsed_ms,
+                verb, org, code = %code, status = ?status, reason = %message, elapsed_ms,
                 "localapi self-view: the server did not give the list"
             ),
             (_, true) if matches!(previous, Some(Some(_))) => tracing::info!(
