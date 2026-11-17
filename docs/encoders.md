@@ -1788,7 +1788,7 @@ Every QSV open hands FFmpeg `bit_rate` = `maxrate` = the cap (`build_encoder`,
 constant bitrate (`libavcodec/qsvenc.c:628-631`). The runtime then pads every frame to
 `maxrate ÷ fps ÷ 8` bytes, a keepalive of a still screen as much as a frame of motion,
 and `global_quality` is never read. [FR-148](fr/FR-148-path-measured-plan-follows.md)
-measured what follows on CORPLAP-2: a still screen spends the cap (about 0.9 Mbit/s of
+measured what follows on CORPLAP-1: a still screen spends the cap (about 0.9 Mbit/s of
 keepalive filler in a 1.64 Mbit/s session), and every real frame, a caret blink's too,
 is over the pump's 4 KB motion threshold (`DEFER_MOTION_MIN_BYTES`, `peer.rs:9886`), so
 a rebuild-bound rate apply that waits for quiet waits for good: 0 rate moves in 16,719 s.

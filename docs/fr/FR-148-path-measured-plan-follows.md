@@ -273,7 +273,7 @@ retiring it (§13).
 |---|---|---|---|---|
 | P0 | Measure, in shadow | `ROOMLERD_PATH_MODEL=off` | AC1 to AC5 | running since 2026-11-16; AC1 and AC5 met; steps 1 and 6 done, step 2 merged on 2026-11-17 (#3968, #3980); step 3 in work |
 | P1 | The model drives the open and the memory | `ROOMLERD_PATH_MODEL=shadow` | AC6 to AC9 | step 1 (#3374) and the first part of step 2 (#3969) merged on 2026-11-17 and released that day in `0.4.224`, not yet read in the field; the rest not started |
-| P2 | The plan is live, and its moves have a cost | `ROOMLERD_PLAN_ADOPT=quiet` | AC10 to AC15 | the QSV step in work since 2026-11-17, behind a switch of its own (D10); the rest not started |
+| P2 | The plan is live, and its moves have a cost | `ROOMLERD_PLAN_ADOPT=quiet` | AC10 to AC15 | the QSV step merged on 2026-11-17 (#3989), behind a switch of its own that is off by default (D10), and not yet read on Intel hardware; the rest not started |
 | P3 | Probes in a session; the bracket replaces the fixed caps | `ROOMLERD_PATH_PROBE=open` | AC16 to AC21 | not started |
 | P4 | The carrier | `ROOMLERD_RC_CARRIER_RANK=0`, a viewer flag | AC22 to AC27 | not started |
 | P5 | One controller, then the deletions | `ROOMLERD_RATECTL=shadow` | AC28 to AC30 | not started |
@@ -320,7 +320,12 @@ retiring it (§13).
 4. The slow-link profile engages at the open only on a demonstrated low floor.
 
 **P2, the plan is live.** QSV off constant bitrate, built first, beside P0 and behind a switch of its own (D4,
-D10). Then cost-budgeted adoption in today's pump (D5), frame rate by pacing, the profile as a plan field, motion
+D10). Merged on 2026-11-17 (#3989, `docs/encoders.md` § QSV off constant bitrate): with `qsv_rate_mode = qvbr`,
+which is off by default and set at the device, an HEVC or H.264 QSV encoder opens at QVBR with its target at
+0.9 × the cap, and a driver that refuses it opens as before. Its read on Intel hardware is AC13. The in-place
+rate arm is unchanged and stays off by default.
+
+After it: cost-budgeted adoption in today's pump (D5), frame rate by pacing, the profile as a plan field, motion
 from damage.
 
 **P3, probes in a session.** The probe scheduler. The relay caps become bounds on the probe and then go. The
