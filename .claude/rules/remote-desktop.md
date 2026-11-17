@@ -117,6 +117,13 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   (`ConsentBroker::for_daemon`, #3939) or there is none: then the file channel is off
   and the broker's books hold the markers and the answers. Never add a stand-in folder
   (one below the temporary folder, or that folder itself, was removed by #3939).
+  ⚠️ On a **one-row Mac** the tray's socket is the screen worker's, not the asking
+  root daemon's. The worker lists and decides the root's questions over the root's
+  person socket (`consent_relay`, #3864). The root counts the tray only while that
+  road is open: a worker that said `relay-consent`, matched by equality, and a person
+  socket that answers within 1 s. A closed road keeps the floor (`no_prompt_surface`
+  at the window's end), never an answer at once. Write nothing into the person's
+  home for this.
 <!-- RETIRED-NAME-ANCHOR: the env-var spelling on the line below carries a
      retired product name deliberately — it is what the daemon actually reads,
      so renaming it would silently disable every virtual-desktop host. FR-27. -->

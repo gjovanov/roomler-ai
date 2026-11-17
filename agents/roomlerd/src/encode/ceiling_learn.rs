@@ -43,6 +43,13 @@
 //! without a decrease — is what `rate_memory` persists per peer, so the next
 //! session on the pair opens at [`SEED_PCT`] of it instead of at the constant.
 //!
+//! FR-79 V5b: a hold is evidence only if a valid window carried it
+//! ([`CeilingLearner::note_carried`]). A target nothing pushed is a hold, not a
+//! measurement. Field 2026-10-25 → 10-30, CORPLAP-2's DERP pair: all 18 writes
+//! were rungs of the session's own opener, 0.85 × the memory × (17/16)^k, and
+//! only 6 of them held a target that a window carried at [`CARRIED_PCT`]. The
+//! entry lost 43 % while those sessions delivered up to 10.2 M.
+//!
 //! Pure: no clocks, no I/O, no encoder types; every method takes `now`.
 
 use std::time::{Duration, Instant};
@@ -98,6 +105,11 @@ pub struct CeilingLearner {
     last_grow_at: Option<Instant>,
     stable_bps: u32,
     stable_candidate: Option<(u32, Instant)>,
+    /// FR-79 V5b — must a hold be carried to count as the stable rate? `false`
+    /// is the kill switch, and every hold counts as it did before.
+    carried_hold: bool,
+    /// FR-79 V5b — the last target a valid window carried at [`CARRIED_PCT`].
+    hold_carried_bps: Option<u32>,
 }
 
 impl CeilingLearner {
@@ -117,6 +129,24 @@ impl CeilingLearner {
             last_grow_at: None,
             stable_bps: 0,
             stable_candidate: None,
+            carried_hold: false,
+            hold_carried_bps: None,
+        }
+    }
+
+    /// FR-79 V5b — require a hold to have been carried ([`Self::note_carried`]).
+    pub fn with_carried_hold(mut self, carried_hold: bool) -> Self {
+        self.carried_hold = carried_hold;
+        self
+    }
+
+    /// FR-79 V5b — a VALID window's delivered rate, before [`Self::on_window`].
+    /// The caller filters on the gate, because the opener's keyframe is exactly
+    /// a burst that would otherwise prove the opener: a session that opens and
+    /// goes idle has carried nothing.
+    pub fn note_carried(&mut self, desired_bps: u32, sent_bps: u32) {
+        if (sent_bps as u64) * 100 >= (desired_bps as u64) * CARRIED_PCT {
+            self.hold_carried_bps = Some(desired_bps);
         }
     }
 
@@ -199,7 +229,8 @@ impl CeilingLearner {
         match self.stable_candidate {
             Some((bps, since)) if bps == desired_bps => {
                 let clean_since = self.last_decrease_at.is_none_or(|d| d <= since);
-                if clean_since && now.duration_since(since) >= STABLE_HOLD {
+                let carried = !self.carried_hold || self.hold_carried_bps == Some(bps);
+                if clean_since && carried && now.duration_since(since) >= STABLE_HOLD {
                     self.stable_bps = self.stable_bps.max(bps);
                 }
             }
@@ -488,6 +519,42 @@ mod tests {
         // No growth within GROW_CLEAN of a stall.
         assert!(l.on_window(NOMINAL, NOMINAL, None, t(base, 5)).is_none());
         assert!(l.on_window(NOMINAL, NOMINAL, None, t(base, 14)).is_some());
+    }
+
+    /// FR-79 V5b — one carried window makes the hold count, at any point in it,
+    /// and at exactly 70 % of the target. 69.9 % does not, and neither does a
+    /// window that carried a different target.
+    #[test]
+    fn a_hold_counts_only_once_a_window_carried_it() {
+        let base = Instant::now();
+        let hold = |carried_sent: Option<(u32, u32)>| {
+            let mut l = CeilingLearner::new(HI, None).with_carried_hold(true);
+            let _ = l.effective_ceiling(NOMINAL);
+            for i in 0..12 {
+                if let (5, Some((desired, sent))) = (i, carried_sent) {
+                    l.note_carried(desired, sent);
+                }
+                l.on_window(6_000_000, 250_000, None, t(base, i));
+            }
+            l.stable_bps()
+        };
+        assert_eq!(hold(None), None, "nothing carried it");
+        assert_eq!(hold(Some((6_000_000, 4_199_999))), None, "just under 70 %");
+        assert_eq!(hold(Some((6_000_000, 4_200_000))), Some(6_000_000));
+        assert_eq!(hold(Some((5_000_000, 6_000_000))), None, "another target");
+    }
+
+    /// FR-79 V5b, the kill switch: off, a hold counts as it always did. The test
+    /// below this one is the same arm, through `new`'s default.
+    #[test]
+    fn a_hold_needs_no_carrying_with_the_switch_off() {
+        let base = Instant::now();
+        let mut l = CeilingLearner::new(HI, None).with_carried_hold(false);
+        let _ = l.effective_ceiling(NOMINAL);
+        for i in 0..12 {
+            l.on_window(6_000_000, 250_000, None, t(base, i));
+        }
+        assert_eq!(l.stable_bps(), Some(6_000_000));
     }
 
     #[test]

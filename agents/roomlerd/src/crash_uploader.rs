@@ -18,7 +18,9 @@
 //! - **A final verdict (2xx or 4xx) this process may not delete** — typically a
 //!   sidecar another account wrote — is recorded in `<log dir>/crash-verdicts.txt`
 //!   and never sent again (#1748). Before, it went out again on every drain:
-//!   a 4xx forever, or a duplicate crash.
+//!   a 4xx forever, or a duplicate crash. On Windows the service removes one in
+//!   the machine's `crashes` once that ledger names it (#3799), so that one is
+//!   logged at INFO; one kept anywhere else stays, with a WARN.
 //!
 //! ## Concurrency
 //!
@@ -83,6 +85,7 @@ const INTER_REQUEST_DELAY: Duration = Duration::from_millis(1100);
 /// started with may since have been renewed.
 pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::TokenSlot) {
     let ledger = verdicts_dir();
+    let swept = swept_dir();
     let settled = ledger.as_deref().map(load_settled).unwrap_or_default();
     let pending = without_settled(crash_recorder::pending_all(), &settled);
     if pending.is_empty() {
@@ -122,6 +125,7 @@ pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::Toke
                 settle(
                     &sidecar,
                     ledger.as_deref(),
+                    swept.as_deref(),
                     "uploaded",
                     crash_recorder::Sidecar::remove,
                 );
@@ -137,6 +141,7 @@ pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::Toke
                 settle(
                     &sidecar,
                     ledger.as_deref(),
+                    swept.as_deref(),
                     "rejected (4xx)",
                     crash_recorder::Sidecar::remove,
                 );
@@ -271,6 +276,31 @@ fn verdicts_dir() -> Option<std::path::PathBuf> {
     crate::logging::log_dir()
 }
 
+/// #3799 — the folder whose records the service removes once a drainer's
+/// ledger names them: the machine's `crashes`, on Windows
+/// (`crash_recorder::sweep_settled`). A worker that runs as the signed-in
+/// person reads the supervisor's records there but may not delete them
+/// (`Seal::Readable`). A per-user install runs no service: a record an
+/// earlier per-Machine install left there stays until a service sweeps again.
+/// `None` off Windows, where nothing removes a record this process may not.
+fn swept_dir() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        crash_recorder::crashes_dir_for(crash_recorder::WriterContext::Supervisor).ok()
+    } else {
+        None
+    }
+}
+
+/// Whose sidecar this process may not delete, outside [`swept_dir`]: measured
+/// on macOS, where `sudo` keeps `HOME` ([`verdicts_dir`]). On Windows a
+/// drainer reads another account's records only in [`swept_dir`], SYSTEM's;
+/// its own folder holds what its own account's processes wrote.
+const OWNER: &str = if cfg!(windows) {
+    ""
+} else {
+    " (typically one another account wrote, e.g. a root process run with this user's HOME)"
+};
+
 /// Every signature recorded in the ledger in `dir`. A missing or unreadable
 /// ledger is an empty one: the cost is one more send, never a lost crash.
 fn load_settled(dir: &Path) -> std::collections::HashSet<String> {
@@ -307,10 +337,13 @@ fn without_settled<T>(
 /// A sidecar has its final verdict: delete it, or, when this process may not,
 /// record the verdict so the sidecar is never sent again. `remove` is
 /// [`crash_recorder::Sidecar::remove`] outside the tests: below the machine's
-/// folder, by handle through the folder it was read from (FR-145).
+/// folder, by handle through the folder it was read from (FR-145). `swept` is
+/// [`swept_dir`]: a recorded sidecar there is the service's to remove, so
+/// nothing is wrong and the line is INFO; one anywhere else stays, a WARN.
 fn settle(
     sidecar: &crash_recorder::Sidecar,
     ledger: Option<&Path>,
+    swept: Option<&Path>,
     verdict: &str,
     remove: impl FnOnce(&crash_recorder::Sidecar) -> std::io::Result<()>,
 ) {
@@ -321,15 +354,28 @@ fn settle(
         Err(e) => e,
     };
     match ledger {
-        Some(l) if record_settled(l, &sidecar.signature()).is_ok() => tracing::warn!(
-            file = %path.display(),
-            error = %err,
-            ledger = %l.join(crash_recorder::VERDICTS_FILE).display(),
-            "crash_uploader: {verdict}, but this process may not delete the sidecar \
-             (typically one another account wrote, e.g. a root process run with this \
-             user's HOME); its verdict is recorded so it is not sent again. Remove it \
-             as the account that owns it"
-        ),
+        Some(l) if record_settled(l, &sidecar.signature()).is_ok() => {
+            let ledger = l.join(crash_recorder::VERDICTS_FILE);
+            if swept.is_some_and(|dir| path.parent() == Some(dir)) {
+                tracing::info!(
+                    file = %path.display(),
+                    error = %err,
+                    ledger = %ledger.display(),
+                    "crash_uploader: {verdict}; this process may not delete the sidecar in the \
+                     machine's crashes folder, so its verdict is recorded and it is not sent \
+                     again. The service removes it once this ledger names it"
+                );
+            } else {
+                tracing::warn!(
+                    file = %path.display(),
+                    error = %err,
+                    ledger = %ledger.display(),
+                    "crash_uploader: {verdict}, but this process may not delete the sidecar\
+                     {OWNER}; its verdict is recorded so it is not sent again. Remove it as \
+                     the account that owns it"
+                );
+            }
+        }
         _ => tracing::warn!(
             file = %path.display(),
             error = %err,
@@ -374,7 +420,7 @@ mod tests {
         let sidecar = plain(&path);
         let ledger = dir.path();
 
-        settle(&sidecar, Some(ledger), "rejected (4xx)", denied);
+        settle(&sidecar, Some(ledger), None, "rejected (4xx)", denied);
 
         assert!(path.exists(), "the test's remove refused, so it stays");
         let left = without_settled(vec![(plain(&path), ())], &load_settled(ledger));
@@ -396,6 +442,7 @@ mod tests {
         settle(
             &plain(&path),
             Some(ledger),
+            None,
             "uploaded",
             crash_recorder::Sidecar::remove,
         );
@@ -424,13 +471,115 @@ mod tests {
         );
         assert_eq!(none.len(), 2, "no ledger yet: nothing is skipped");
 
-        settle(&plain(&old), Some(ledger), "rejected (4xx)", denied);
+        settle(&plain(&old), Some(ledger), None, "rejected (4xx)", denied);
         let left = without_settled(
             vec![(plain(&old), ()), (plain(&new), ())],
             &load_settled(ledger),
         );
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0.path(), new);
+    }
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// #3799 — a recorded sidecar in the folder the service sweeps is the
+    /// service's to remove: nothing is wrong, so the line is INFO and says the
+    /// service removes it. One anywhere else stays: a WARN that says to remove
+    /// it. Both are recorded, and the next drain skips both.
+    #[test]
+    fn a_record_the_service_removes_is_info_and_any_other_a_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let swept = dir.path().join("crashes");
+        std::fs::create_dir(&swept).unwrap();
+        let theirs = swept.join("100-1.json");
+        let elsewhere = dir.path().join("200-2.json");
+        std::fs::write(&theirs, b"{}").unwrap();
+        std::fs::write(&elsewhere, b"{}").unwrap();
+        let ledger = dir.path();
+
+        let line = logged(|| {
+            settle(
+                &plain(&theirs),
+                Some(ledger),
+                Some(swept.as_path()),
+                "uploaded",
+                denied,
+            )
+        });
+        assert!(line.trim_start().starts_with("INFO "), "{line}");
+        assert!(
+            line.contains("The service removes it once this ledger names it"),
+            "{line}"
+        );
+        assert!(!line.contains("Remove it as the account"), "{line}");
+
+        let line = logged(|| {
+            settle(
+                &plain(&elsewhere),
+                Some(ledger),
+                Some(swept.as_path()),
+                "uploaded",
+                denied,
+            )
+        });
+        assert!(line.trim_start().starts_with("WARN "), "{line}");
+        assert!(
+            line.contains("Remove it as the account that owns it"),
+            "{line}"
+        );
+        assert!(!line.contains("The service removes it"), "{line}");
+
+        let left = without_settled(
+            vec![(plain(&theirs), ()), (plain(&elsewhere), ())],
+            &load_settled(ledger),
+        );
+        assert!(left.is_empty(), "both are recorded: {left:?}");
+    }
+
+    /// #3799 — the folder the uploader calls the service's is the one the
+    /// service sweeps, the machine's `crashes` (`sweep_settled`), and only on
+    /// Windows: nothing removes a record anywhere else.
+    #[test]
+    fn only_windows_has_a_folder_the_service_sweeps() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                swept_dir(),
+                Some(crate::appdirs::machine_global_dir().join("crashes"))
+            );
+            assert_eq!(OWNER, "", "no root running with this user's HOME there");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(swept_dir(), None);
+            assert!(OWNER.contains("this user's HOME"), "{OWNER}");
+        }
     }
 
     #[tokio::test]

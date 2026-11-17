@@ -40,9 +40,9 @@ use std::sync::OnceLock;
 /// Windows/Linux ignore it). Historically "live" — preserved so existing
 /// macOS dirs aren't orphaned.
 const QUALIFIER: &str = "live";
-const ORG: &str = "roomler";
+pub(crate) const ORG: &str = "roomler";
 /// New app segment (post-rename, fresh installs).
-const NEW_APP: &str = "roomler";
+pub(crate) const NEW_APP: &str = "roomler";
 /// Legacy app segment (pre-rename installs already in the field).
 // RETIRED-NAME-ANCHOR: a pre-rename host resolves its ENROLLED config through this
 // segment. Renaming it orphans that config -- the device drops off the mesh and

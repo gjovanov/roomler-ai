@@ -346,7 +346,7 @@ impl RouteReconciler {
                             };
                             let backoff = create_backoff(failures);
                             warn!(
-                                route = %route.id, %message, failures,
+                                route = %route.id, reason = %message, failures,
                                 backoff_s = backoff.as_secs(),
                                 "route flow creation failed; retrying"
                             );

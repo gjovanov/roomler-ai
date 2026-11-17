@@ -524,7 +524,7 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
         }
         .await;
         if let Err(message) = outcome {
-            tracing::warn!(%message, "tray: recording toggle refused");
+            tracing::warn!(reason = %message, "tray: recording toggle refused");
             show_window(&app, "/recordings");
             if let Some(window) = app.get_webview_window("main") {
                 let text = serde_json::to_string(&message).unwrap_or_else(|_| "\"\"".into());

@@ -396,7 +396,7 @@ opt-in's bargain (§2), and it is why the owner's lasting remedy is the opt-in.
 **On a supervised Mac** the GUI worker builds each session from its own file,
 which a push to the root's row never reaches. So the daemon sends its entries
 along with each session (`SessionParams::media_legacy`,
-`agents/roomlerd/src/delegate.rs:697`, from `media_legacy_for_delegate`,
+`agents/roomlerd/src/delegate.rs:704`, from `media_legacy_for_delegate`,
 `agents/roomlerd/src/remote_config.rs:310`). The worker adds them to its own
 before it decides the session's paths. Adding legacy entries can only send a path
 back, so this never turns code on, and a daemon older than the field sends
@@ -567,7 +567,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:342-401`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:346-405`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -648,7 +648,7 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3365`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3382`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check

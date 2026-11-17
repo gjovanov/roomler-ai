@@ -631,6 +631,64 @@ impl LinkLoop {
     }
 }
 
+/// FR-79 V5b — how far the bytes written must run ahead of the arrival rate to
+/// count as the sender feeding the queue: [`QUEUE_GROWTH_MS`] of a one-second
+/// window. A FIFO that grew that much was fed at least 1.1 × what it delivered, so
+/// the rule stops only what the report itself says is not the sender's doing.
+///
+/// ⚠️ Not a wider slack. 1.2 × would also drop true reports between the two, and at
+/// the nominal 1.5 M floor the age loop cannot cut, so a path at 1.25–1.5 M would
+/// have no reading, no floor relief and an fps-cap sawtooth.
+pub const OFFERED_PCT: u64 = 110;
+
+/// FR-79 V5b — did this window's writes run ahead of what arrived? Strict, so a
+/// window that sent nothing and received nothing is no offer.
+pub fn offered_over_arrival(sent_bps: u32, rx_bps: u32) -> bool {
+    u64::from(sent_bps) * 100 > u64::from(rx_bps) * OFFERED_PCT
+}
+
+/// FR-79 V5b — the [`LinkLoop`]'s own warning, applied to its verdict: `rx_bps` is
+/// what the pipe carries only while the agent overdrives it, and `queue_ms` alone
+/// cannot show that it is. Field 2026-11-02, jupiter: an idle session wrote
+/// 9,120 bps, the viewer read 145 ms of growth twice at 9,489 bps arriving, and that
+/// trickle became the pipe. The target fell 6.2 M → 200 kbps, FR-59 P6 abandoned the
+/// ceiling, and the pair was remembered at 3.3 kbps. Why the queue read as growing
+/// is not known (a viewer at 96 % CPU reads as one), and this rule does not need it:
+/// a sender that offered no more than arrived has nothing to cut.
+///
+/// So a congested verdict counts once [`QUEUE_OVER_WINDOWS`] windows in a row each
+/// offered. Per window and not summed, and two and not one, for what a keyframe
+/// does: one sent at the end of a window offers 214 KB while the viewer still
+/// reports a trickle, and jupiter's report came 5 s after one. A real overdrive still
+/// passes, at worst a window later, and the age loop acts meanwhile. The caller asks
+/// only where a report exists, so a silent window keeps the streak, as
+/// `growth_streak` does.
+///
+/// ⚠️ What was written is not all that was offered. `bytes_written` counts what left
+/// the pump's own channel and the frames are stamped before it, so a queue growing
+/// INSIDE that channel reads sent ≈ rx. The caller counts a window the plane
+/// classifier calls `Overproduced` as an offer for that reason.
+///
+/// ⚠️ The two streaks can sit a queue apart: the growth a report reads is about
+/// frames made a queue's depth ago. A sustained overdrive lines them up; a burst
+/// shorter than the queue may not, and by then the sender has stopped.
+#[derive(Debug, Default)]
+pub struct OfferLoop {
+    streak: u8,
+}
+
+impl OfferLoop {
+    /// One reported window. True once the last [`QUEUE_OVER_WINDOWS`] each offered.
+    pub fn observe(&mut self, offering: bool) -> bool {
+        self.streak = if offering {
+            self.streak.saturating_add(1)
+        } else {
+            0
+        };
+        self.streak >= QUEUE_OVER_WINDOWS
+    }
+}
+
 /// P2 — a session sitting at this multiple of its own one-way delay is
 /// over-queued no matter what floor it managed to learn. Without an
 /// absolute rule, a session that starts congested teaches the loop that
@@ -1270,5 +1328,42 @@ mod tests {
         assert_eq!(f.viewer_hz(), Some(144), "reading it takes nothing");
         f.store_viewer_hz(60);
         assert_eq!(f.viewer_hz(), Some(60));
+    }
+
+    /// FR-79 V5b — a week's congested reports across 10 agents, all three of them,
+    /// which is a thin sample. Only jupiter's idle session wrote less than arrived.
+    #[test]
+    fn the_offer_reads_the_fields_three_reports() {
+        assert!(!offered_over_arrival(9_120, 9_489), "jupiter, 2026-11-02");
+        assert!(
+            offered_over_arrival(1_107_067, 581_546),
+            "CORPLAP-2, 2026-10-30 12:04:05: false, and a later delivery says so"
+        );
+        assert!(
+            offered_over_arrival(145_305, 12_070),
+            "CORPLAP-2, 2026-10-30 12:19:50: a true collapse"
+        );
+    }
+
+    #[test]
+    fn the_offer_is_strict_at_its_edge() {
+        assert!(
+            !offered_over_arrival(0, 0),
+            "nothing sent, nothing received"
+        );
+        assert!(!offered_over_arrival(1_100_000, 1_000_000));
+        assert!(offered_over_arrival(1_100_001, 1_000_000));
+        assert!(!offered_over_arrival(u32::MAX, u32::MAX), "and no overflow");
+    }
+
+    #[test]
+    fn the_offer_takes_two_windows_running() {
+        let mut offer = OfferLoop::default();
+        assert!(!offer.observe(true), "one window is a keyframe");
+        assert!(offer.observe(true));
+        assert!(offer.observe(true), "it stands while the sender offers");
+        assert!(!offer.observe(false), "a window that does not resets it");
+        assert!(!offer.observe(true));
+        assert!(offer.observe(true));
     }
 }
