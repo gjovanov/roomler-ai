@@ -2325,26 +2325,43 @@ const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(25
 
 /// #3864 — the rest of [`ensure_running`]'s verdict, asked fresh at every
 /// prompt, beside the tray's own: whether a question this daemon asks gets to
-/// the tray at all. Off a one-row Mac's root daemon the tray asks this daemon
-/// itself, and it does. On one, the tray asks the worker, which lists the
-/// root daemon's questions only while the road is open
+/// the tray at all. Off a Mac's root daemon the tray asks this daemon
+/// itself, and it does. On a one-row Mac's, the tray asks the worker, which
+/// lists the root daemon's questions only while the road is open
 /// ([`crate::consent_relay::reach`]): closed, the tray is not the question's
-/// surface, and a window nobody answers ends as `no_prompt_surface`.
+/// surface, and a window nobody answers ends as `no_prompt_surface`. #3967 —
+/// on a two-row Mac's root half the same, through the per-user half that
+/// announced it relays.
 async fn reaches_the_tray() -> bool {
     // A test stands the road in with the tray's start.
     #[cfg(all(test, any(target_os = "windows", unix)))]
-    let reach = match tray_stand_in::now().and_then(|stood| stood.road) {
-        Some(road) => road.reach().await,
-        None => crate::consent_relay::reach().await,
+    let (reach, one_row) = match tray_stand_in::now().map(|stood| (stood.road, stood.two_rows)) {
+        Some((Some(road), _)) => (road.reach().await, true),
+        Some((None, Some(announced))) => (announced.reach().await, false),
+        _ => (
+            crate::consent_relay::reach().await,
+            crate::consent_relay::one_row(),
+        ),
     };
     #[cfg(not(all(test, any(target_os = "windows", unix))))]
-    let reach = crate::consent_relay::reach().await;
+    let (reach, one_row) = (
+        crate::consent_relay::reach().await,
+        crate::consent_relay::one_row(),
+    );
     if let crate::consent_relay::Reach::Closed(why) = &reach {
-        tracing::info!(
-            why = %why,
-            "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
-             (#3864); `roomlerd consent` still answers it"
-        );
+        if one_row {
+            tracing::info!(
+                why = %why,
+                "a one-row Mac's question cannot reach the menu-bar app, which is not its surface \
+                 (#3864); `roomlerd consent` still answers it"
+            );
+        } else {
+            tracing::info!(
+                why = %why,
+                "a two-row Mac's root-half question cannot reach the menu-bar app, which is not \
+                 its surface (#3967); `roomlerd consent` still answers it"
+            );
+        }
     }
     reach.open()
 }
@@ -2367,6 +2384,10 @@ mod tray_stand_in {
         /// the tray, stood in. `None`: this daemon is not a one-row Mac's
         /// root, and the tray asks it directly.
         pub(super) road: Option<crate::consent_relay::stand_in::Road>,
+        /// #3967 — a two-row Mac's road from the root half's question to the
+        /// tray, stood in. `None` with `road` `None`: this daemon is no Mac's
+        /// root half.
+        pub(super) two_rows: Option<crate::consent_relay::stand_in::Announced>,
     }
 
     impl StandIn {
@@ -2376,6 +2397,7 @@ mod tray_stand_in {
                 starts: Box::leak(Box::new(TrayStarts::new("tray-start"))),
                 verdicts: Box::leak(Box::new(EnsureVerdicts::new())),
                 road: None,
+                two_rows: None,
             }
         }
 
@@ -2383,6 +2405,15 @@ mod tray_stand_in {
         pub(super) fn on_one_row(self, road: crate::consent_relay::stand_in::Road) -> Self {
             Self {
                 road: Some(road),
+                ..self
+            }
+        }
+
+        /// #3967 — this daemon as a two-row Mac's root half, with what its
+        /// person socket knows of the console person's per-user half.
+        pub(super) fn on_two_rows(self, road: crate::consent_relay::stand_in::Announced) -> Self {
+            Self {
+                two_rows: Some(road),
                 ..self
             }
         }
@@ -3097,6 +3128,86 @@ mod tray_start_tests {
         }
     }
 
+    /// #3967 — on a two-row Mac the root half asks its own row's questions,
+    /// and the tray reads the console person's per-user half. A tray that is
+    /// up is the question's surface only while that per-user half has said
+    /// it lists the root half's questions (`consent_relaying`, held on its
+    /// connection) and the person socket answers a list in time. Otherwise it
+    /// is not counted, and a window nobody answered ends as
+    /// `no_prompt_surface`: an older per-user half (it says nothing), none
+    /// running for the console person, a person socket that is gone (it is
+    /// switched off, or the seat moved) or stalled. Nothing is shared without
+    /// an answer.
+    ///
+    /// Red before #3967: a two-row Mac's root half counted a tray that was up
+    /// whatever reached it, and the window's end read as the person's
+    /// timeout.
+    #[test]
+    fn a_two_row_tray_is_the_surface_only_while_its_per_user_half_announces() {
+        use crate::consent::Decision;
+        use crate::consent_relay::stand_in::{Announced, Answers};
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let rt = runtime();
+        let works = Host::default();
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let reason_at_the_windows_end = |road: Announced| {
+            let ind = ind.clone();
+            let stood = StandIn::new(host_steps(&works)).on_two_rows(road);
+            rt.block_on(asking(stood, async move {
+                let surfaces = crate::signaling::RcSurfaces {
+                    native: false,
+                    marker: true,
+                    behind: Some((start_for_prompt().await, rc_view("j9"))),
+                    mark_up: None,
+                };
+                let (outbound, _inbox) = tokio::sync::mpsc::channel(1);
+                let have_surface =
+                    crate::signaling::rc_surfaces_up(surfaces, &ind, || true, "j9", &outbound)
+                        .await;
+                crate::signaling::consent_reply(Decision::Timeout, have_surface)
+                    .and_then(|reply| reply.reason)
+            }))
+        };
+        let announced = Announced {
+            uid: Some(501),
+            answers: Answers::Yes,
+        };
+        assert_eq!(
+            reason_at_the_windows_end(announced),
+            Some(ConsentDenyReason::HostTimeout),
+            "announced: the tray shows the question, and nobody answered"
+        );
+        for (road, what) in [
+            (
+                Announced {
+                    uid: None,
+                    ..announced
+                },
+                "no per-user half announced (an older one, or none for the console person)",
+            ),
+            (
+                Announced {
+                    answers: Answers::No,
+                    ..announced
+                },
+                "a person socket that does not answer (gone)",
+            ),
+            (
+                Announced {
+                    answers: Answers::Never,
+                    ..announced
+                },
+                "a person socket that never answers (stalled)",
+            ),
+        ] {
+            assert_eq!(
+                reason_at_the_windows_end(road),
+                Some(ConsentDenyReason::NoPromptSurface),
+                "{what}: nobody could be asked"
+            );
+        }
+    }
+
     /// #3888 — a question withdrawn while the tray's start is held (a
     /// `Terminate` the loop reads meanwhile, which finds nothing on the screen
     /// to take down) gets no notification once the start runs out of time: no
@@ -3774,6 +3885,66 @@ mod tray_start_tests {
                 ),
             }
         }
+    }
+
+    /// An exec question, open for 30 s.
+    fn exec_view(request_id: &str) -> crate::indicator::PromptView {
+        crate::indicator::PromptView {
+            session_hex: request_id.into(),
+            title: "Command execution request".into(),
+            lead: "Alice wants to run a command on this device.".into(),
+            detail: "uptime".into(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        }
+    }
+
+    /// #3982 — an exec question that no surface showed (no native panel, no
+    /// companion, no notification) ends with SSH's "nobody could be asked"
+    /// words once its window is out, naming the execution policy, and so
+    /// does one whose companion is up with no marker to read. One the
+    /// companion showed, which nobody answered, still ends "did not approve
+    /// the command (Timeout)". The surfaces go up as the WS loop's task puts
+    /// them up ([`crate::signaling::exec_surfaces_up`]), and the answer is
+    /// worded as the command's task words it
+    /// ([`crate::signaling::exec_refusal`]).
+    ///
+    /// Red before #3982: every unanswered exec question ended "did not
+    /// approve the command (Timeout)", whether anything showed it or not.
+    #[test]
+    fn an_exec_question_no_surface_showed_says_nobody_could_be_asked() {
+        use crate::consent::Decision;
+        let rt = runtime();
+        let none = Host::default();
+        none.not_installed.store(true, SeqCst);
+        let works = Host::default();
+        // No native panel and no notification: the companion alone decides.
+        let ind = crate::indicator::ViewerIndicator::disabled();
+        let words_at_the_windows_end = |host: &Host, marker: bool| {
+            let ind = ind.clone();
+            rt.block_on(asking(StandIn::new(host_steps(host)), async move {
+                let have_surface =
+                    crate::signaling::exec_surfaces_up(marker, &ind, exec_view("k1")).await;
+                crate::signaling::exec_refusal(Decision::Timeout, have_surface)
+            }))
+        };
+        let nobody = crate::consent::nobody_could_be_asked("execution");
+        assert_eq!(
+            words_at_the_windows_end(&none, true),
+            nobody,
+            "no companion: nobody could be asked"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&works, false),
+            nobody,
+            "a companion with no marker to read shows nothing"
+        );
+        assert_eq!(
+            words_at_the_windows_end(&works, true),
+            "the operator at this device did not approve the command (Timeout)",
+            "a companion that showed it: nobody answered"
+        );
     }
 }
 
