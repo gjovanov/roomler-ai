@@ -232,11 +232,105 @@ async fn person_socket_answers(uid: u32) -> bool {
     }
 }
 
+/// #3967 — the road from a two-row Mac's root half to the console person's
+/// app: open while that person's per-user half has said it lists the root
+/// half's questions (`announced`, [`Announcements::current`]), and the person
+/// socket for that person answers a list within [`RELAY_WITHIN`]. `answers`
+/// asks it.
+pub async fn reach_two_rows<F, Fut>(announced: Option<u32>, answers: F) -> Reach
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let _ = (announced, answers);
+    Reach::Direct
+}
+
+/// #3967 — the per-user halves that told this root daemon, over its person
+/// socket, that they list its consent questions to their person's app
+/// ([`tunnel_core::localapi::Request::ConsentRelaying`]): one entry for each
+/// connection that said so, for as long as it stays open.
+#[derive(Debug, Default)]
+pub struct Announcements {
+    live: std::sync::Mutex<Vec<(u64, u32)>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Announcements {
+    /// `uid`'s per-user half said so, on a connection that holds the answer
+    /// until it ends.
+    pub fn announce(
+        self: &std::sync::Arc<Self>,
+        uid: u32,
+    ) -> tunnel_core::localapi::HeldForTheConnection {
+        let _ = uid;
+        tunnel_core::localapi::HeldForTheConnection::new(|_| {})
+    }
+
+    /// The person whose per-user half said so last, while its connection is
+    /// open.
+    pub fn current(&self) -> Option<u32> {
+        None
+    }
+}
+
+/// #3967 — this process's [`Announcements`]: what a two-row Mac's root half
+/// takes over its person socket, and reads at every prompt ([`reach`]).
+pub fn announcements() -> std::sync::Arc<Announcements> {
+    static BOOK: OnceLock<std::sync::Arc<Announcements>> = OnceLock::new();
+    BOOK.get_or_init(Default::default).clone()
+}
+
+/// #3967 — how soon a per-user half dials its root half again after a dial
+/// found no root half to tell: from this, doubling to [`ANNOUNCE_AGAIN_MOST`].
+pub const ANNOUNCE_AGAIN_FIRST: Duration = Duration::from_secs(1);
+
+/// #3967 — the longest a per-user half waits between its dials while its
+/// root half is out of reach (someone else is at the screen, or the root
+/// daemon is down). The person socket follows the seat every 5 s
+/// (`person_socket::POLL`), so a person who comes to the screen is counted
+/// within about 10 s.
+pub const ANNOUNCE_AGAIN_MOST: Duration = Duration::from_secs(5);
+
+/// #3967 — how long a per-user half waits for its root half's answer.
+pub const ANNOUNCE_ANSWER_WITHIN: Duration = Duration::from_secs(5);
+
+/// #3967 — how long a per-user half waits before it dials again a root half
+/// that refused it and then closed the connection at once. An older root half
+/// keeps the connection open (0.4.223 and 0.4.224 answer "unknown variant"
+/// and read on), and that connection is held, so it is never dialled again
+/// until it ends.
+pub const ANNOUNCE_AFTER_A_REFUSAL: Duration = Duration::from_secs(60);
+
+/// #3967 — a connection held this long is a steady one: when it ends (the
+/// root half restarted, or the seat moved) the next dial waits
+/// [`ANNOUNCE_AGAIN_FIRST`] again.
+pub const HELD_STEADY: Duration = Duration::from_secs(30);
+
+/// #3967 — a two-row Mac's per-user half tells its root half, over each
+/// connection `dial` makes to the root half's person socket for this
+/// person, that it lists the root half's questions to its person's app
+/// ([`tunnel_core::localapi::Request::ConsentRelaying`]), and holds that
+/// connection until it ends or `shutdown` flips.
+pub(crate) async fn keep_telling<D, F, S>(dial: D, mut shutdown: tokio::sync::watch::Receiver<bool>)
+where
+    D: FnMut() -> F,
+    F: Future<Output = Option<S>>,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let _ = dial;
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// A one-row Mac's road, stood in for a test of the root daemon's verdict
 /// (`companion::ensure_running`, under its tray stand-in).
 #[cfg(test)]
 pub(crate) mod stand_in {
-    use super::{Reach, Worker, reach_from};
+    use super::{Reach, Worker, reach_from, reach_two_rows};
 
     /// How the stood-in person socket answers.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +350,28 @@ pub(crate) mod stand_in {
     impl Road {
         pub(crate) async fn reach(self) -> Reach {
             reach_from(Some(self.worker), |_| async move {
+                match self.answers {
+                    Answers::Yes => true,
+                    Answers::No => false,
+                    Answers::Never => std::future::pending().await,
+                }
+            })
+            .await
+        }
+    }
+
+    /// #3967 — a two-row Mac's road, as its root half knows it: the person
+    /// whose per-user half announced, if any, and how that person's socket
+    /// answers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Announced {
+        pub(crate) uid: Option<u32>,
+        pub(crate) answers: Answers,
+    }
+
+    impl Announced {
+        pub(crate) async fn reach(self) -> Reach {
+            reach_two_rows(self.uid, |_| async move {
                 match self.answers {
                     Answers::Yes => true,
                     Answers::No => false,
@@ -454,5 +570,376 @@ mod tests {
             waited_its_bound(waited, RELAY_WITHIN),
             "a socket that never answers was waited for {waited:?}, its bound is {RELAY_WITHIN:?}"
         );
+    }
+
+    /// #3967 — a two-row Mac's root half: the road to the console person's
+    /// app is open only while that person's per-user half has announced, and
+    /// the person socket for that person answers a list in time. With no
+    /// announcement (an older per-user half, or none running for that
+    /// person) the socket is not even asked.
+    ///
+    /// Red before #3967: a two-row Mac's root half looked at no road.
+    #[tokio::test(start_paused = true)]
+    async fn the_two_row_road_is_open_only_while_its_person_has_announced_and_the_list_answers() {
+        use super::stand_in::Announced;
+        let asked = AtomicUsize::new(0);
+        let answers = |yes: bool| {
+            let asked = &asked;
+            move |_uid: u32| async move {
+                asked.fetch_add(1, SeqCst);
+                yes
+            }
+        };
+        let r = reach_two_rows(None, answers(true)).await;
+        assert!(
+            matches!(&r, Reach::Closed(why) if why.contains("consent_relaying")),
+            "nobody announced: {r:?}"
+        );
+        assert_eq!(
+            asked.load(SeqCst),
+            0,
+            "with nobody announced, nothing is asked"
+        );
+        assert_eq!(
+            reach_two_rows(Some(501), answers(true)).await,
+            Reach::Relayed(501)
+        );
+        let r = reach_two_rows(Some(501), answers(false)).await;
+        assert!(
+            matches!(&r, Reach::Closed(why) if why.contains("uid 501")),
+            "{r:?}"
+        );
+
+        let asked = tokio::time::Instant::now();
+        let r = Announced {
+            uid: Some(501),
+            answers: Answers::Never,
+        }
+        .reach()
+        .await;
+        assert!(!r.open(), "{r:?}");
+        let waited = asked.elapsed();
+        assert!(
+            waited_its_bound(waited, RELAY_WITHIN),
+            "a socket that never answers was waited for {waited:?}, its bound is {RELAY_WITHIN:?}"
+        );
+    }
+
+    /// #3967 — an announcement lives exactly as long as its connection: the
+    /// root half reads the person whose per-user half said so last, while
+    /// that connection is open, and nobody once every one has ended. A
+    /// per-user half that restarted holds two for a moment, and the seat's
+    /// old person's are dropped before the new person's socket is served.
+    ///
+    /// Red before #3967: nothing was kept.
+    #[test]
+    fn an_announcement_lives_as_long_as_its_connection() {
+        let book = std::sync::Arc::new(Announcements::default());
+        assert_eq!(book.current(), None);
+        let first = book.announce(501);
+        assert_eq!(book.current(), Some(501));
+        let second = book.announce(501);
+        drop(first);
+        assert_eq!(book.current(), Some(501), "one is still open");
+        drop(second);
+        assert_eq!(book.current(), None, "every one has ended");
+
+        let ana = book.announce(501);
+        let bob = book.announce(502);
+        assert_eq!(book.current(), Some(502), "the last said");
+        drop(bob);
+        assert_eq!(book.current(), Some(501));
+        drop(ana);
+        assert_eq!(book.current(), None);
+    }
+
+    /// What the stood-in root half's person socket does at a dial.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AtTheDial {
+        /// A root half of this release: it takes the announcement.
+        Takes,
+        /// An older root half (0.4.223, 0.4.224): "unknown variant", and it
+        /// reads on.
+        Older,
+        /// A root half that refuses, and closes the connection at once.
+        RefusesAndCloses,
+        /// It accepts the connection, and never answers.
+        Silent,
+        /// No socket to dial: someone else is at the screen, or the root
+        /// daemon is down.
+        Gone,
+    }
+
+    /// The root half's state behind its person socket, as this release's
+    /// takes an announcement: into `0`.
+    struct Takes(std::sync::Arc<Announcements>);
+
+    #[async_trait::async_trait]
+    impl tunnel_core::localapi::LocalApiState for Takes {
+        fn status(&self) -> tunnel_core::localapi::NodeStatus {
+            serde_json::from_str(
+                r#"{"node_id":"d","name":"mac","version":"0.4.0","mode":"service","connected":true}"#,
+            )
+            .unwrap()
+        }
+        fn peers(&self) -> Vec<tunnel_core::localapi::PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<tunnel_core::localapi::FlowInfo> {
+            Vec::new()
+        }
+        fn consent_relaying(
+            &self,
+            uid: u32,
+        ) -> Option<tunnel_core::localapi::HeldForTheConnection> {
+            Some(self.0.announce(uid))
+        }
+    }
+
+    /// The root half a per-user half of uid 501 dials, stood in: what each
+    /// dial reaches (`Gone` once the plan is spent), when it was dialled,
+    /// and the connections it serves.
+    struct StoodRoot {
+        book: std::sync::Arc<Announcements>,
+        plan: std::sync::Mutex<std::collections::VecDeque<AtTheDial>>,
+        dials: std::sync::Mutex<Vec<tokio::time::Instant>>,
+        serving: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    }
+
+    impl StoodRoot {
+        fn new(plan: &[AtTheDial]) -> std::sync::Arc<Self> {
+            let root = std::sync::Arc::new(Self {
+                book: Default::default(),
+                plan: Default::default(),
+                dials: Default::default(),
+                serving: Default::default(),
+            });
+            root.plan(plan);
+            root
+        }
+
+        fn plan(&self, plan: &[AtTheDial]) {
+            self.plan.lock().unwrap().extend(plan.iter().copied());
+        }
+
+        /// A dial, as the per-user half makes it.
+        fn dial(&self) -> Option<tokio::io::DuplexStream> {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            self.dials.lock().unwrap().push(tokio::time::Instant::now());
+            let next = self.plan.lock().unwrap().pop_front();
+            let at = next.unwrap_or(AtTheDial::Gone);
+            if at == AtTheDial::Gone {
+                return None;
+            }
+            let (ours, theirs) = tokio::io::duplex(4096);
+            let book = self.book.clone();
+            let served = tokio::spawn(async move {
+                match at {
+                    AtTheDial::Takes => {
+                        let person = tunnel_core::localapi::ClientPeer {
+                            uid: Some(501),
+                            gid: Some(20),
+                            ..tunnel_core::localapi::ClientPeer::UNKNOWN
+                        };
+                        let scope = tunnel_core::localapi::Scope::Person { owner_uid: 501 };
+                        let _ = tunnel_core::localapi::serve_connection_scoped(
+                            theirs,
+                            &Takes(book),
+                            person,
+                            scope,
+                        )
+                        .await;
+                    }
+                    AtTheDial::Older | AtTheDial::RefusesAndCloses => {
+                        let (rd, mut wr) = tokio::io::split(theirs);
+                        let mut lines = tokio::io::BufReader::new(rd).lines();
+                        while let Ok(Some(_)) = lines.next_line().await {
+                            // What 0.4.223 and 0.4.224 answer a verb they do
+                            // not know, from serde's own error.
+                            let e = serde_json::from_str::<Request>(r#"{"t":"a_verb_from_later"}"#)
+                                .unwrap_err();
+                            let answer = Response::Error {
+                                message: format!("bad request: {e}"),
+                            };
+                            let mut line = serde_json::to_vec(&answer).unwrap();
+                            line.push(b'\n');
+                            if wr.write_all(&line).await.is_err() {
+                                return;
+                            }
+                            if at == AtTheDial::RefusesAndCloses {
+                                return;
+                            }
+                        }
+                    }
+                    AtTheDial::Silent => {
+                        let _held = theirs;
+                        std::future::pending::<()>().await;
+                    }
+                    AtTheDial::Gone => unreachable!("no connection"),
+                }
+            });
+            self.serving.lock().unwrap().push(served);
+            Some(ours)
+        }
+
+        /// The dialler a per-user half's [`keep_telling`] is given.
+        fn dialler(
+            self: &std::sync::Arc<Self>,
+        ) -> impl FnMut() -> std::future::Ready<Option<tokio::io::DuplexStream>> + use<> {
+            let root = self.clone();
+            move || std::future::ready(root.dial())
+        }
+
+        fn dialled(&self) -> usize {
+            self.dials.lock().unwrap().len()
+        }
+
+        /// How long each dial since `since` came after the one before it.
+        fn gaps_since(&self, since: tokio::time::Instant) -> Vec<Duration> {
+            let mut last = since;
+            let mut gaps = Vec::new();
+            for &at in self.dials.lock().unwrap().iter().filter(|&&at| at >= since) {
+                gaps.push(at - last);
+                last = at;
+            }
+            gaps
+        }
+
+        /// The root half stops serving every connection it holds: it
+        /// restarted, or the seat moved (`serve_person_listener` aborts them).
+        async fn stops_serving(&self) {
+            let serving: Vec<_> = self.serving.lock().unwrap().drain(..).collect();
+            for served in serving {
+                served.abort();
+                let _ = served.await;
+            }
+        }
+    }
+
+    /// Wait on the paused clock, `within` at most, until `holds`.
+    async fn until(what: &str, within: Duration, holds: impl Fn() -> bool) {
+        let by = tokio::time::Instant::now() + within;
+        while !holds() {
+            assert!(
+                tokio::time::Instant::now() < by,
+                "{what}: not within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whether each gap is the one expected, as the timer wheel keeps it.
+    fn the_gaps_are(gaps: &[Duration], secs: &[u64]) -> bool {
+        gaps.len() == secs.len()
+            && gaps
+                .iter()
+                .zip(secs)
+                .all(|(&gap, &s)| waited_its_bound(gap, Duration::from_secs(s)))
+    }
+
+    /// #3967 — a two-row Mac's per-user half tells its root half at once and
+    /// holds the connection, so a held one is never dialled again. When the
+    /// root half stops serving it (it restarted, or the seat moved) the
+    /// announcement goes with it, and the per-user half dials again after
+    /// 1 s, then 2, 4, 5 and 5 s while the root half is out of reach, and
+    /// tells it again once it is back. When the per-user half stops, its
+    /// announcement goes with its connection.
+    ///
+    /// Red before #3967: a per-user half told its root half nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_per_user_half_tells_its_root_half_and_tells_it_again_once_it_is_back() {
+        use AtTheDial::*;
+        let root = StoodRoot::new(&[Takes]);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let telling = tokio::spawn(keep_telling(root.dialler(), shutdown));
+        until("told at once", Duration::from_secs(1), || {
+            root.book.current() == Some(501)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(root.book.current(), Some(501), "held");
+        assert_eq!(root.dialled(), 1, "a held connection is not dialled again");
+
+        root.plan(&[Gone, Gone, Gone, Gone, Takes]);
+        let lost = tokio::time::Instant::now();
+        root.stops_serving().await;
+        assert_eq!(root.book.current(), None, "gone with its connection");
+        until("told again", Duration::from_secs(30), || {
+            root.book.current() == Some(501)
+        })
+        .await;
+        let gaps = root.gaps_since(lost);
+        assert!(the_gaps_are(&gaps, &[1, 2, 4, 5, 5]), "{gaps:?}");
+
+        stop.send(true).unwrap();
+        telling.await.unwrap();
+        until(
+            "gone with the per-user half",
+            Duration::from_secs(1),
+            || root.book.current().is_none(),
+        )
+        .await;
+    }
+
+    /// #3967 — an older root half (0.4.223, 0.4.224) answers "unknown variant"
+    /// and keeps the connection open, so the per-user half holds it and does
+    /// not dial again, however long it stands; the older root half logs
+    /// nothing for it. Once that root half is replaced (the connection ends
+    /// after a long hold), the next dial comes 1 s later and tells it. A root
+    /// half that refuses and closes at once is dialled once a minute, and
+    /// one that never answers is let go after 5 s and dialled again.
+    ///
+    /// Red before #3967: a per-user half told its root half nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_refuses_or_never_answers_is_not_dialled_in_a_loop() {
+        use AtTheDial::*;
+        let root = StoodRoot::new(&[Older]);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let telling = tokio::spawn(keep_telling(root.dialler(), shutdown));
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(root.dialled(), 1, "an older root half is dialled once");
+        assert_eq!(root.book.current(), None, "and takes nothing");
+        root.plan(&[Takes]);
+        let replaced = tokio::time::Instant::now();
+        root.stops_serving().await;
+        until(
+            "told the root half that replaced it",
+            Duration::from_secs(5),
+            || root.book.current() == Some(501),
+        )
+        .await;
+        let gaps = root.gaps_since(replaced);
+        assert!(the_gaps_are(&gaps, &[1]), "{gaps:?}");
+        stop.send(true).unwrap();
+        telling.await.unwrap();
+
+        let root = StoodRoot::new(&[RefusesAndCloses, RefusesAndCloses, Takes]);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let telling = tokio::spawn(keep_telling(root.dialler(), shutdown));
+        until("told after two refusals", Duration::from_secs(180), || {
+            root.book.current() == Some(501)
+        })
+        .await;
+        let gaps = root.gaps_since(started);
+        assert!(the_gaps_are(&gaps, &[0, 60, 60]), "{gaps:?}");
+        stop.send(true).unwrap();
+        telling.await.unwrap();
+
+        let root = StoodRoot::new(&[Silent, Takes]);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let telling = tokio::spawn(keep_telling(root.dialler(), shutdown));
+        until("told after a silent one", Duration::from_secs(30), || {
+            root.book.current() == Some(501)
+        })
+        .await;
+        let gaps = root.gaps_since(started);
+        assert!(
+            the_gaps_are(&gaps, &[0, ANNOUNCE_ANSWER_WITHIN.as_secs() + 1]),
+            "{gaps:?}"
+        );
+        stop.send(true).unwrap();
+        telling.await.unwrap();
     }
 }

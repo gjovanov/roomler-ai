@@ -1450,6 +1450,14 @@ pub enum Request {
     /// ([`peer_may_decide_for_the_screen`]); on the person socket only from
     /// whoever is at the seat now (#3845). Anyone else is refused in words.
     ConsentDecide { session_id: String, allow: bool },
+    /// #3967 — a two-row Mac's per-user half tells its root half, over the
+    /// root half's person socket, that it lists the root half's consent
+    /// questions to its person's app and sends their answers back. Taken only
+    /// there, and only from that socket's own person, never root
+    /// ([`LocalApiState::consent_relaying`]). The root half keeps it for as
+    /// long as the connection stays open ([`HeldForTheConnection`]), and
+    /// counts that person's app as its questions' surface only meanwhile.
+    ConsentRelaying,
     /// FR-27 — remote-control sessions currently LIVE on this device.
     RcSessions,
     /// FR-27 — end a live remote-control session from the device side. This is
@@ -1897,6 +1905,11 @@ pub enum Response {
     ConsentDecided {
         ok: bool,
     },
+    /// #3967 — a [`Request::ConsentRelaying`] was taken, for as long as the
+    /// connection that said it stays open. A daemon that does not take it
+    /// answers [`Response::Error`]; one older than the verb answers "unknown
+    /// variant" ([`is_unknown_verb`]) and keeps the connection open.
+    ConsentRelayingTaken,
     /// FR-27 — live remote-control sessions.
     RcSessions(Vec<RcSessionInfo>),
     /// FR-27 — result of [`Request::RcDisconnect`]; `ok` = a session with that
@@ -2934,6 +2947,59 @@ pub struct OverlayView {
     pub derp_inbound_drops: Option<(u64, u64)>,
 }
 
+/// #3967 — how a connection that holds something ([`HeldForTheConnection`])
+/// ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEnd {
+    /// Its far end closed it, or reading or writing it failed: the process
+    /// that dialled is gone, or let it go.
+    ClosedByThePeer,
+    /// The daemon stopped serving it: the person socket's listener stopped
+    /// (the person at the seat changed, or the daemon is stopping).
+    Dropped,
+}
+
+/// #3967 — what a daemon keeps for one connection, for as long as that
+/// connection is open ([`LocalApiState::consent_relaying`]). The connection's
+/// loop holds it, and `on_end` runs once when the connection ends, saying how
+/// ([`ConnectionEnd`]).
+pub struct HeldForTheConnection {
+    on_end: Option<Box<dyn FnOnce(ConnectionEnd) + Send>>,
+}
+
+impl HeldForTheConnection {
+    /// Held until the connection ends; `on_end` is told how.
+    pub fn new(on_end: impl FnOnce(ConnectionEnd) + Send + 'static) -> Self {
+        Self {
+            on_end: Some(Box::new(on_end)),
+        }
+    }
+
+    /// The connection ended `how`.
+    fn end(mut self, how: ConnectionEnd) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(how);
+        }
+    }
+}
+
+impl Drop for HeldForTheConnection {
+    /// Dropped without [`Self::end`]: the loop that held it was cut short.
+    fn drop(&mut self) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(ConnectionEnd::Dropped);
+        }
+    }
+}
+
+impl std::fmt::Debug for HeldForTheConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldForTheConnection")
+            .field("held", &self.on_end.is_some())
+            .finish()
+    }
+}
+
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
 /// gathers this from its live overlay / tunnel / forward state; the trait keeps
 /// the protocol unit-testable with a mock and free of daemon internals.
@@ -2993,6 +3059,21 @@ pub trait LocalApiState: Send + Sync {
         Response::ConsentDecided {
             ok: self.consent_decide(session_id, allow),
         }
+    }
+    /// #3967 — a [`Request::ConsentRelaying`] from `uid`, the person socket's
+    /// own person (the dispatcher admits nobody else, root included): that
+    /// person's per-user half lists this daemon's consent questions to their
+    /// app. `Some` takes it, kept until the connection ends; `None` refuses
+    /// it. Default: refused. A two-row Mac's root half takes it.
+    fn consent_relaying(&self, _uid: u32) -> Option<HeldForTheConnection> {
+        None
+    }
+    /// #3967 — whether this daemon is a two-row Mac's per-user half, which
+    /// lists its root half's questions to its person's app and so tells the
+    /// root half ([`Request::ConsentRelaying`]) for as long as it runs.
+    /// Default: no.
+    fn announces_consent_relay(&self) -> bool {
+        false
     }
     /// FR-27 — remote-control sessions currently LIVE on this device. Distinct
     /// from [`Self::consent_pending`], which is about sessions not yet allowed
@@ -3660,6 +3741,7 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
+        | Request::ConsentRelaying
         | Request::RestartDaemon { .. } => false,
     }
 }
@@ -3880,6 +3962,7 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
         | Request::Mesh { .. }
+        | Request::ConsentRelaying
         | Request::RestartDaemon { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
@@ -10595,6 +10678,162 @@ mod tests {
             matches!(&r, Response::Error { message } if message.contains("This caller is none of those")),
             "{r:?}"
         );
+    }
+
+    /// #3967 — a daemon that takes a relay announcement, as a two-row Mac's
+    /// root half does, and writes down each one it takes and how it ends.
+    #[derive(Clone, Default)]
+    struct TakesRelays {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl LocalApiState for TakesRelays {
+        fn status(&self) -> NodeStatus {
+            Mock.status()
+        }
+        fn peers(&self) -> Vec<PeerInfo> {
+            Vec::new()
+        }
+        fn flows(&self) -> Vec<FlowInfo> {
+            Vec::new()
+        }
+        fn consent_relaying(&self, uid: u32) -> Option<HeldForTheConnection> {
+            self.log.lock().unwrap().push(format!("taken {uid}"));
+            let log = self.log.clone();
+            Some(HeldForTheConnection::new(move |how| {
+                log.lock().unwrap().push(format!("ended {uid} {how:?}"));
+            }))
+        }
+    }
+
+    /// One connection `state` serves for `peer` under `scope`, asked line by
+    /// line, as a client that keeps it open between its requests.
+    struct HeldOpen {
+        wr: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        served: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl HeldOpen {
+        fn open<S: LocalApiState + 'static>(state: S, scope: Scope, peer: ClientPeer) -> Self {
+            let (client, server) = tokio::io::duplex(4096);
+            let served =
+                tokio::spawn(
+                    async move { serve_connection_scoped(server, &state, peer, scope).await },
+                );
+            let (rd, wr) = tokio::io::split(client);
+            Self {
+                wr,
+                lines: tokio::io::BufReader::new(rd).lines(),
+                served,
+            }
+        }
+
+        async fn ask(&mut self, line: &str) -> Response {
+            self.wr
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            let answer = self.lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str(&answer).unwrap()
+        }
+
+        /// The client closes its end, and the daemon's loop finishes.
+        async fn close(self) {
+            drop(self.wr);
+            drop(self.lines);
+            self.served.await.unwrap().unwrap();
+        }
+    }
+
+    /// #3967 — a two-row Mac's per-user half says `consent_relaying` over the
+    /// root half's person socket, and the root half takes it from that
+    /// socket's own person for exactly as long as the connection stays open:
+    /// until the per-user half closes it (it stopped, or restarted), or until
+    /// the listener stops serving it (the seat changed: `serve_person_listener`
+    /// aborts every connection it holds). One connection holds one, however
+    /// often it says so. Nobody else is taken: not root, not another account,
+    /// not a caller on the daemon's own endpoint. A daemon that does not take
+    /// it refuses it, and keeps the connection open for the next request, as
+    /// an older daemon does with a verb it does not know.
+    ///
+    /// Red before #3967: the person socket refused the verb.
+    #[tokio::test]
+    async fn a_relay_announcement_is_held_for_its_connections_life() {
+        let ana = ClientPeer {
+            uid: Some(501),
+            gid: Some(20),
+            ..ClientPeer::UNKNOWN
+        };
+        let say = r#"{"t":"consent_relaying"}"#;
+        let list = r#"{"t":"consent_pending"}"#;
+
+        // Taken, and the per-user half closes the connection.
+        let state = TakesRelays::default();
+        let log = state.log.clone();
+        let mut conn = HeldOpen::open(state, SEAT, ana.clone());
+        assert_eq!(conn.ask(say).await, Response::ConsentRelayingTaken);
+        assert_eq!(
+            conn.ask(say).await,
+            Response::ConsentRelayingTaken,
+            "said again"
+        );
+        assert!(
+            matches!(conn.ask(list).await, Response::ConsentPending(_)),
+            "the connection serves its next request"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["taken 501"],
+            "one held, while it is open"
+        );
+        conn.close().await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["taken 501", "ended 501 ClosedByThePeer"]
+        );
+
+        // Taken, and the listener stops serving it.
+        let state = TakesRelays::default();
+        let log = state.log.clone();
+        let mut conn = HeldOpen::open(state, SEAT, ana.clone());
+        assert_eq!(conn.ask(say).await, Response::ConsentRelayingTaken);
+        conn.served.abort();
+        let _ = (&mut conn.served).await;
+        assert_eq!(*log.lock().unwrap(), ["taken 501", "ended 501 Dropped"]);
+
+        // Refused, and nothing is held: root and another account on the
+        // person socket, and a caller on the daemon's own endpoint.
+        let root = ClientPeer {
+            uid: Some(0),
+            ..ana.clone()
+        };
+        let bob = ClientPeer {
+            uid: Some(502),
+            ..ana.clone()
+        };
+        let ana_elevated = ClientPeer {
+            elevated: Some(true),
+            ..ana.clone()
+        };
+        for (scope, peer, what) in [
+            (SEAT, root, "root on the person socket"),
+            (SEAT, bob, "another account on the person socket"),
+            (Scope::Full, ana_elevated, "the daemon's own endpoint"),
+        ] {
+            let state = TakesRelays::default();
+            let log = state.log.clone();
+            let r = ask_state_scoped_as(state, scope, peer, say).await;
+            assert!(matches!(r, Response::Error { .. }), "{what}: {r:?}");
+            assert!(log.lock().unwrap().is_empty(), "{what}: nothing is held");
+        }
+
+        // A daemon that does not take it refuses it, and the connection
+        // serves its next request.
+        let mut conn = HeldOpen::open(Mock, SEAT, ana);
+        assert!(matches!(conn.ask(say).await, Response::Error { .. }));
+        assert!(matches!(conn.ask(list).await, Response::ConsentPending(_)));
+        conn.close().await;
     }
 
     /// A daemon that counts the consent answers and the Disconnects that
