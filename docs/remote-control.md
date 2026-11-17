@@ -2585,7 +2585,11 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    half so over the person socket (`consent_relaying`, held on that
    connection). The root counts the tray only while that announcement is
    live and the person socket answers within 1 s; otherwise the same floor
-   (`docs/desktop-companion.md` §10.8.1).
+   (`docs/desktop-companion.md` §10.8.1). On either, the road is asked after
+   the tray's start, within its own 1 s and outside the start's 3 s budget, so
+   a slow start and a slow road that each answer in time still show the
+   question. The window then starts at most 4 s after the question goes up
+   (#3983, `docs/desktop-companion.md` §10.8).
 3. **notification** (Linux, FR-93 P6f) — the desktop's own notification with
    **Approve** and **Deny**, where the companion cannot show the question: none
    is installed, or there is no marker for it to read. Posted from inside the

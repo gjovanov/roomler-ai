@@ -632,6 +632,23 @@ pub(crate) mod stand_in {
         Yes,
         No,
         Never,
+        /// #3983 — yes, after this long: a person socket slow to answer.
+        After(std::time::Duration),
+    }
+
+    impl Answers {
+        /// The stood-in person socket's answer to a list.
+        async fn answer(self) -> bool {
+            match self {
+                Self::Yes => true,
+                Self::No => false,
+                Self::Never => std::future::pending().await,
+                Self::After(after) => {
+                    tokio::time::sleep(after).await;
+                    true
+                }
+            }
+        }
     }
 
     /// The worker as the root daemon knows it, and its person socket.
@@ -643,14 +660,7 @@ pub(crate) mod stand_in {
 
     impl Road {
         pub(crate) async fn reach(self) -> Reach {
-            reach_from(Some(self.worker), |_| async move {
-                match self.answers {
-                    Answers::Yes => true,
-                    Answers::No => false,
-                    Answers::Never => std::future::pending().await,
-                }
-            })
-            .await
+            reach_from(Some(self.worker), |_| self.answers.answer()).await
         }
     }
 
@@ -665,14 +675,7 @@ pub(crate) mod stand_in {
 
     impl Announced {
         pub(crate) async fn reach(self) -> Reach {
-            reach_two_rows(self.uid, |_| async move {
-                match self.answers {
-                    Answers::Yes => true,
-                    Answers::No => false,
-                    Answers::Never => std::future::pending().await,
-                }
-            })
-            .await
+            reach_two_rows(self.uid, |_| self.answers.answer()).await
         }
     }
 }

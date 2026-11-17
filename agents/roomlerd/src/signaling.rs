@@ -329,15 +329,15 @@ pub(crate) async fn close_within_budget(
     }
 }
 
-/// FR-27 — how long to wait for `companion::ensure_running` before deciding
-/// this host has no on-screen prompt surface.
-///
-/// Bounded because the probe shells out (`launchctl`, `loginctl`,
-/// `systemd-run`, `tasklist`) and the attended prompt is already counting down
-/// against a 30 s window the controller shares: spending a large slice of it
-/// waiting on a wedged helper would turn a slow answer into no answer. A
-/// timeout is treated as "no surface", which is the same thing the operator
-/// experiences.
+/// FR-27 — how long to wait for the tray's start before deciding this host has
+/// no on-screen prompt surface. #3983: the road to the tray is asked after it,
+/// not inside it (`companion::up_for_a_question`, which asserts that both stay
+/// under `CONSENT_VERDICT_GRACE`, `crates/remote_control/src/consent.rs:149`).
+/// Bounded because the probe shells out (`launchctl`, `loginctl`, `systemd-run`,
+/// `tasklist`) and the attended prompt is already counting down against a 30 s
+/// window the controller shares: a large slice of it spent on a wedged helper
+/// would turn a slow answer into no answer. A timeout is treated as "no
+/// surface", which is the same thing the operator experiences.
 pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
 /// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
