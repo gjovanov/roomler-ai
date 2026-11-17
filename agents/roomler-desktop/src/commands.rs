@@ -2541,34 +2541,79 @@ pub async fn cmd_open_config_dir() -> Result<(), String> {
 /// owns the profile-correct sentinel dir, so this works even when the agent runs
 /// as SYSTEM — where the tray writing the sentinel itself would land in the
 /// wrong profile and the agent would never see it.
+///
+/// #3873 — `session` is the question the page shows, `None` when it shows
+/// none: that click is logged too ([`answer_click`]).
 #[tauri::command]
-pub async fn cmd_consent_approve(session: String) -> Result<String, String> {
-    consent_decide(&session, true).await
+pub async fn cmd_consent_approve(session: Option<String>) -> Result<String, String> {
+    consent_decide(session.as_deref(), true).await
 }
 
 /// Deny a pending operator-consent prompt over the LocalAPI.
 #[tauri::command]
-pub async fn cmd_consent_deny(session: String) -> Result<String, String> {
-    consent_decide(&session, false).await
+pub async fn cmd_consent_deny(session: Option<String>) -> Result<String, String> {
+    consent_decide(session.as_deref(), false).await
 }
 
 /// Send an Approve/Deny decision to the daemon over the LocalAPI.
-async fn consent_decide(session: &str, allow: bool) -> Result<String, String> {
-    let mut client = localapi::connect()
-        .await
-        .map_err(|e| format!("Device service unreachable: {e}"))?;
-    let ok = client
-        .consent_decide(session, allow)
-        .await
-        .map_err(|e| format!("LocalAPI error: {e}"))?;
-    if ok {
-        Ok(if allow {
+async fn consent_decide(session: Option<&str>, allow: bool) -> Result<String, String> {
+    answer_click(
+        session,
+        allow,
+        CONSENT_ANSWER_WITHIN,
+        |session, allow| async move {
+            let mut client = localapi::connect().await.map_err(AskError::Connect)?;
+            client
+                .consent_decide(&session, allow)
+                .await
+                .map_err(AskError::Request)
+        },
+    )
+    .await
+}
+
+/// #3873 — how long a click's answer may take, from the connect to the
+/// daemon's reply.
+const CONSENT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
+/// #3873 — what the page shows for a click with no question on it.
+const NO_QUESTION: &str = "No question is waiting for an answer here, so nothing was sent.";
+
+/// #3873 — the consent read's name in the refresh ledger.
+const CONSENT_PENDING_SURFACE: &str = "consent_pending";
+
+/// Why a click's answer did not come back from the daemon.
+#[derive(Debug)]
+enum AskError {
+    /// The LocalAPI endpoint could not be reached.
+    Connect(std::io::Error),
+    /// Reached, and the request failed: the daemon's own refusal
+    /// (`localapi error: …`), or the connection.
+    Request(std::io::Error),
+}
+
+/// #3873 — one click on Approve or Deny, from the page to the daemon.
+async fn answer_click<F, Fut>(
+    session: Option<&str>,
+    allow: bool,
+    _within: Duration,
+    ask: F,
+) -> Result<String, String>
+where
+    F: FnOnce(String, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, AskError>>,
+{
+    match ask(session.unwrap_or_default().to_string(), allow).await {
+        Ok(true) => Ok(if allow {
             "approved".into()
         } else {
             "denied".into()
-        })
-    } else {
-        Err("The device service rejected the decision (unknown or invalid session).".into())
+        }),
+        Ok(false) => {
+            Err("The device service rejected the decision (unknown or invalid session).".into())
+        }
+        Err(AskError::Connect(e)) => Err(format!("Device service unreachable: {e}")),
+        Err(AskError::Request(e)) => Err(format!("LocalAPI error: {e}")),
     }
 }
 
@@ -2579,11 +2624,22 @@ async fn consent_decide(session: &str, allow: bool) -> Result<String, String> {
 /// serialises to the same `{session_id, controller_name, permissions,
 /// timeout_secs}` shape the SPA already consumes.
 #[tauri::command]
-pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
-    match localapi::connect().await {
-        Ok(mut c) => c.consent_pending().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
+    let read = match localapi::connect().await {
+        Ok(mut c) => c
+            .consent_pending()
+            .await
+            .map_err(|e| ("consent_pending", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    pending_answer(read)
+}
+
+/// The page's read of the questions.
+fn pending_answer(
+    read: Result<Vec<ConsentRequest>, (&'static str, std::io::Error)>,
+) -> Result<Vec<ConsentRequest>, String> {
+    Ok(read.unwrap_or_default())
 }
 
 /// #2815 — must the main window's modal ask the question itself? Only when
@@ -4901,6 +4957,345 @@ mod tests {
         assert_eq!(
             no_handler_message("mailto"),
             "Nothing on this computer opens mailto: links."
+        );
+    }
+
+    // ─── #3873 — a click on the consent prompt is acted on, or logged ────
+
+    /// A session the daemon could be asking about.
+    const SESSION: &str = "6af8596776312ccaab1e7b9f";
+
+    /// The lines the code under test logs, as the desktop log writes them.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+        }
+    }
+
+    /// This thread's log lines while the guard lives. The tests below are
+    /// `#[tokio::test]`s, on the current thread, so a click's lines land here.
+    fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let out = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (out, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// #3873 — a click whose answer never comes back ends at the bound, with
+    /// its reason on the page and in the log. On 0.4.221 nothing bounded it:
+    /// the page stayed "sending" for good, and its next click, 3 min later,
+    /// was dropped without a line anywhere.
+    #[tokio::test]
+    async fn a_click_whose_answer_never_comes_ends_at_the_bound() {
+        let (log, _guard) = capture();
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            answer_click(Some(SESSION), true, Duration::from_millis(50), |_, _| {
+                std::future::pending::<Result<bool, AskError>>()
+            }),
+        )
+        .await
+        .expect("5 s on, the click still waited for its answer: nothing bounds it");
+        let shown = answered.expect_err("no answer is not an approval");
+        assert!(
+            shown.starts_with("No answer from the device service within"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(text.contains("consent: a click arrived"), "{text}");
+        assert!(
+            text.contains("WARN") && text.contains("consent: no answer from the device service"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+    }
+
+    /// #3873 — every click is in the log when it arrives and again with its
+    /// outcome, and the page gets the daemon's own words where it gave some.
+    #[tokio::test]
+    async fn every_click_is_logged_when_it_arrives_and_with_its_outcome() {
+        let within = Duration::from_secs(5);
+
+        let (log, guard) = capture();
+        let taken = answer_click(Some(SESSION), true, within, |session, allow| async move {
+            assert_eq!((session.as_str(), allow), (SESSION, true));
+            Ok(true)
+        })
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
+        let text = log.text();
+        assert!(
+            text.contains("consent: a click arrived") && text.contains("Approve"),
+            "{text}"
+        );
+        assert!(
+            text.contains("consent: the device service took the answer"),
+            "{text}"
+        );
+
+        // Refused by the daemon, in its own words (#3845's seat check).
+        let words = "The answer was not taken: only the person signed in at this device's own \
+                     screen answers a request to see or control it, and that is not this account \
+                     right now (the seat changed since this connection opened).";
+        let (log, guard) = capture();
+        let refused = answer_click(Some(SESSION), false, within, |_, _| async move {
+            Err(AskError::Request(std::io::Error::other(format!(
+                "localapi error: {words}"
+            ))))
+        })
+        .await;
+        drop(guard);
+        assert_eq!(
+            refused,
+            Err(words.to_string()),
+            "the page shows the daemon's words"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("consent: a click arrived") && text.contains("Deny"),
+            "{text}"
+        );
+        assert!(
+            text.contains("WARN") && text.contains("consent: the answer was not taken"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the seat changed"),
+            "the daemon's words are in the log: {text}"
+        );
+
+        // No such question any more: answered, withdrawn or expired.
+        let (log, guard) = capture();
+        let gone = answer_click(Some(SESSION), true, within, |_, _| async { Ok(false) }).await;
+        drop(guard);
+        let shown = gone.expect_err("not taken");
+        assert!(shown.contains("no longer waiting"), "{shown}");
+        let text = log.text();
+        assert!(text.contains("consent: the answer was not taken"), "{text}");
+
+        // The device service could not be reached.
+        let (log, guard) = capture();
+        let unreachable = answer_click(Some(SESSION), true, within, |_, _| async {
+            Err(AskError::Connect(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+        })
+        .await;
+        drop(guard);
+        let shown = unreachable.expect_err("not sent");
+        assert!(
+            shown.starts_with("Could not reach the device service"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("consent: the answer was not taken") && text.contains("connect: "),
+            "{text}"
+        );
+    }
+
+    /// #3873 — a click with no question on the page reaches the app and is
+    /// logged; nothing goes to the daemon.
+    #[tokio::test]
+    async fn a_click_with_no_question_is_logged_and_sends_nothing() {
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, _guard) = capture();
+        let shown = answer_click(None, true, Duration::from_secs(5), |_, _| {
+            sent.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(true) }
+        })
+        .await
+        .expect_err("a click with no question is not an approval");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert_eq!(shown, NO_QUESTION);
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click with no question on the page"),
+            "{text}"
+        );
+    }
+
+    /// The refresh ledger's count for the page's read of the questions.
+    fn consent_pending_failures() -> u32 {
+        REFRESH_LEDGER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .streaks
+            .get(CONSENT_PENDING_SURFACE)
+            .map_or(0, |s| s.failures)
+    }
+
+    /// #3873 — the page's read of the questions. An empty list clears the
+    /// question the page shows; a read that FAILED is an error the page keeps
+    /// its question on, and it is in the log. On 0.4.221 a failed read was an
+    /// empty list: the page let go of the question while it stayed on screen,
+    /// and a click on it was dropped. A daemon that is not running is quiet,
+    /// as on every other surface.
+    #[test]
+    fn a_failed_read_of_the_questions_is_an_error_and_in_the_log() {
+        assert_eq!(pending_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let before = consent_pending_failures();
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = pending_answer(Err(("consent_pending", closed)))
+            .expect_err("a failed read is not 'no question'");
+        assert!(shown.starts_with("consent_pending: "), "{shown}");
+        assert_eq!(
+            consent_pending_failures(),
+            before + 1,
+            "in the refresh ledger"
+        );
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(pending_answer(Err(("connect", gone))).is_err());
+        assert_eq!(
+            consent_pending_failures(),
+            before + 1,
+            "a daemon that is not running is not a failure"
+        );
+        assert_eq!(pending_answer(Ok(Vec::new())), Ok(Vec::new()));
+        assert_eq!(
+            consent_pending_failures(),
+            0,
+            "a read that worked ends the streak"
+        );
+    }
+
+    /// The text of the function `head` starts in a page's script, to its
+    /// closing brace at the IIFE's indentation (two spaces). Line ends are
+    /// `\n` whatever the checkout wrote.
+    fn js_function(src: &str, head: &str) -> String {
+        let src = src.replace("\r\n", "\n");
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("no `{head}` in the page"));
+        let end = src[start..]
+            .find("\n  }\n")
+            .unwrap_or_else(|| panic!("`{head}` has no end"));
+        src[start..start + end].to_string()
+    }
+
+    /// A page's own limit on an answer (`PAGE_LIMIT_MS`), in milliseconds.
+    fn page_limit_ms(js: &str) -> u64 {
+        const DECL: &str = "const PAGE_LIMIT_MS = ";
+        let at = js.find(DECL).expect("the page has no limit of its own");
+        js[at + DECL.len()..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("PAGE_LIMIT_MS is a number")
+    }
+
+    /// #3873 — the prompt window sends every Approve and Deny to the app,
+    /// which logs it, and never drops one without a word: nothing returns
+    /// before it sends; its buttons are off only while there is no question,
+    /// an answer is on its way or this window answered it; and the status
+    /// line, its own element, says which. On 0.4.221 `decide()` returned
+    /// silently while `busy`, and its "Approving…" and "Failed: …" went into
+    /// the countdown, which repaints every second.
+    #[test]
+    fn the_prompt_sends_every_click_and_says_why_its_buttons_are_off() {
+        let html = include_str!("front/panel-consent.html");
+        let js = include_str!("front/panel-consent.js");
+        let decide = js_function(js, "async function decide(");
+        let sends = decide.find("invoke(").expect("decide() sends nothing");
+        assert!(
+            !decide[..sends].contains("return"),
+            "decide() returns before it sends: {decide}"
+        );
+        assert!(
+            html.contains(r#"id="p-status""#),
+            "no status line of its own"
+        );
+        assert!(
+            !decide.contains("p-countdown"),
+            "decide() writes into the countdown: {decide}"
+        );
+        assert!(decide.contains("setStatus("), "{decide}");
+        let paint = js_function(js, "function paintButtons(");
+        assert!(
+            paint.contains("!active || sending || answered === active"),
+            "{paint}"
+        );
+        assert!(
+            js.contains("e.key === 'Escape' && !$('p-deny').disabled"),
+            "Escape acts as the Deny button does"
+        );
+        // The page's own limit covers the app's: it fires only when the app
+        // itself never answers.
+        assert!(decide.contains("PAGE_LIMIT_MS"), "{decide}");
+        assert!(Duration::from_millis(page_limit_ms(js)) > CONSENT_ANSWER_WITHIN);
+    }
+
+    /// #3873 — the prompt keeps the question it shows when a read of the
+    /// questions fails, and clears it on an empty list only.
+    #[test]
+    fn the_prompt_keeps_its_question_on_a_failed_read() {
+        let js = include_str!("front/panel-consent.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("clear(") && !block.contains("active = null"),
+            "a failed read lets go of the question: {block}"
+        );
+        assert!(
+            poll.contains("pending.length === 0") && poll.contains("clear()"),
+            "{poll}"
+        );
+    }
+
+    /// #3873 — the main window's fallback modal sends every click too, with
+    /// the same limit of its own.
+    #[test]
+    fn the_fallback_modal_sends_every_click_too() {
+        let js = include_str!("front/consent.js");
+        let decide = js_function(js, "async function decide(");
+        let sends = decide.find("invoke(").expect("decide() sends nothing");
+        assert!(
+            !decide[..sends].contains("return"),
+            "decide() returns before it sends: {decide}"
+        );
+        assert!(
+            decide.contains("paintButtons()") && decide.contains("PAGE_LIMIT_MS"),
+            "{decide}"
+        );
+        assert_eq!(
+            page_limit_ms(js),
+            page_limit_ms(include_str!("front/panel-consent.js"))
         );
     }
 }
