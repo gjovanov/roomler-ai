@@ -4615,90 +4615,25 @@ async fn handle_server_msg(
                 }
             }
             if let Some(prompt) = prompt {
-                let outbound = outbound_tx.clone();
-                let ind = indicator.clone();
                 // FR-52 P4 — only an external session carries the config in.
                 let external_cfg = external_consent.map(|_| remote_cfg.clone());
-                let broker = consent_broker.clone();
-                tokio::spawn(async move {
-                    // #3857, #3888 — the companion's start the loop started,
-                    // and the notification where the companion cannot show
-                    // the question: their verdicts, here, before the prompt's
-                    // clock starts at its first look below, as when the loop
-                    // waited for them. A socket that closes first drops the
-                    // notification (`notification_shown`), and a `Terminate`
-                    // takes it down from the loop, or here once the start's
-                    // verdict is in (`rc_surfaces_up`).
-                    let have_surface = match surfaces {
-                        Some(surfaces) => {
-                            rc_surfaces_up(
-                                surfaces,
-                                &ind,
-                                || broker.is_asking(&session_hex),
-                                &session_hex,
-                                &outbound,
-                            )
-                            .await
-                        }
-                        // No question is asked on this host: an auto-grant,
-                        // whose answer is ready at once.
-                        None => true,
-                    };
-                    let decision =
-                        await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
-                    // FR-27 — take the native panel down however the question
-                    // was answered: the click here, the CLI, the companion,
-                    // the window simply expiring, or the session ending first.
-                    // This is the ONE place every one of those paths
-                    // converges, so it is the only place that cannot miss one
-                    // — a panel still on screen for a resolved session is its
-                    // own bug, and a stale Approve button is a dangerous one.
-                    ind.hide_prompt(&session_hex);
-                    let Some(mut reply) = consent_reply(decision, have_surface) else {
-                        // #1632 — the session was terminated while the
-                        // question stood. The server forgot it when it sent
-                        // the Terminate; there is nobody to answer to. (An
-                        // external binding ended with that Terminate, ahead
-                        // of the delegation gate.)
-                        tracing::info!(
-                            session = %session_hex,
-                            ?decision,
-                            ?effective_mode,
-                            "consent prompt withdrawn — the session ended before an answer; no rc:consent sent"
-                        );
-                        return;
-                    };
-                    // FR-52 P4 — an external grant is recorded BEFORE it leaves:
-                    // the offer it unlocks must never overtake it to
-                    // `check_offer`. A binding that ended while the question
-                    // stood cannot be granted any more; anything but a grant
-                    // ends the binding here.
-                    if let Some(cfg) = &external_cfg {
-                        if reply.granted {
-                            reply.granted = crate::extauth::grant_consent(cfg, session_id);
-                        } else {
-                            crate::extauth::end_session(cfg, session_id);
-                        }
-                    }
-                    tracing::info!(
-                        session = %session_hex,
-                        ?decision,
-                        ?effective_mode,
-                        granted = reply.granted,
-                        reason = reply.reason.map(|r| r.wire()),
-                        "consent decision → sending rc:consent"
-                    );
-                    if let Err(e) = outbound
-                        .send(ClientMsg::Consent {
-                            session_id,
-                            granted: reply.granted,
-                            reason: reply.reason.map(|r| r.wire().to_string()),
-                        })
-                        .await
-                    {
-                        tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
-                    }
-                });
+                let surfaces_up = rc_surfaces_verdict(
+                    surfaces,
+                    indicator.clone(),
+                    consent_broker.clone(),
+                    session_hex.clone(),
+                    outbound_tx.clone(),
+                );
+                tokio::spawn(rc_consent_task(
+                    prompt,
+                    surfaces_up,
+                    indicator.clone(),
+                    outbound_tx.clone(),
+                    session_id,
+                    session_hex,
+                    external_cfg,
+                    effective_mode,
+                ));
             } else {
                 info!(
                     %session_id, ?consent_mode,
@@ -7658,6 +7593,104 @@ pub(crate) async fn notification_shown(
     }
 }
 
+/// #4000 — an RC prompt's surfaces as its consent task reads them: whether
+/// one showed the question ([`rc_surfaces_up`]), or `true` where none is asked
+/// (an auto-grant, whose answer is ready at once). It owns what it reads, so it
+/// can run on a task of its own.
+async fn rc_surfaces_verdict(
+    surfaces: Option<RcSurfaces>,
+    indicator: ViewerIndicator,
+    broker: crate::consent::ConsentBroker,
+    session_hex: String,
+    outbound: mpsc::Sender<ClientMsg>,
+) -> bool {
+    let Some(surfaces) = surfaces else {
+        return true;
+    };
+    rc_surfaces_up(
+        surfaces,
+        &indicator,
+        || broker.is_asking(&session_hex),
+        &session_hex,
+        &outbound,
+    )
+    .await
+}
+
+/// An RC prompt's consent task, which the WS loop spawns: the person's
+/// decision, whether a surface showed the question (`surfaces_up`,
+/// [`rc_surfaces_verdict`]), and the `rc:consent` that says so.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rc_consent_task(
+    prompt: impl std::future::Future<Output = crate::consent::Decision>,
+    surfaces_up: impl std::future::Future<Output = bool> + Send + 'static,
+    ind: ViewerIndicator,
+    outbound: mpsc::Sender<ClientMsg>,
+    session_id: bson::oid::ObjectId,
+    session_hex: String,
+    external_cfg: Option<crate::remote_config::RemoteConfigServices>,
+    effective_mode: crate::consent::Mode,
+) {
+    // #3857, #3888 — the companion's start the loop started, and the
+    // notification where the companion cannot show the question: their
+    // verdicts, here, before the prompt's clock starts at its first look
+    // below, as when the loop waited for them. A socket that closes first
+    // drops the notification (`notification_shown`), and a `Terminate` takes
+    // it down from the loop, or here once the start's verdict is in
+    // (`rc_surfaces_up`).
+    let have_surface = surfaces_up.await;
+    let decision = await_prompt_or_socket_end(prompt, &outbound, &session_hex).await;
+    // FR-27 — take the native panel down however the question was answered:
+    // the click here, the CLI, the companion, the window simply expiring, or
+    // the session ending first. This is the ONE place every one of those
+    // paths converges, so it is the only place that cannot miss one — a panel
+    // still on screen for a resolved session is its own bug, and a stale
+    // Approve button is a dangerous one.
+    ind.hide_prompt(&session_hex);
+    let Some(mut reply) = consent_reply(decision, have_surface) else {
+        // #1632 — the session was terminated while the question stood. The
+        // server forgot it when it sent the Terminate; there is nobody to
+        // answer to. (An external binding ended with that Terminate, ahead of
+        // the delegation gate.)
+        tracing::info!(
+            session = %session_hex,
+            ?decision,
+            ?effective_mode,
+            "consent prompt withdrawn — the session ended before an answer; no rc:consent sent"
+        );
+        return;
+    };
+    // FR-52 P4 — an external grant is recorded BEFORE it leaves: the offer it
+    // unlocks must never overtake it to `check_offer`. A binding that ended
+    // while the question stood cannot be granted any more; anything but a
+    // grant ends the binding here.
+    if let Some(cfg) = &external_cfg {
+        if reply.granted {
+            reply.granted = crate::extauth::grant_consent(cfg, session_id);
+        } else {
+            crate::extauth::end_session(cfg, session_id);
+        }
+    }
+    tracing::info!(
+        session = %session_hex,
+        ?decision,
+        ?effective_mode,
+        granted = reply.granted,
+        reason = reply.reason.map(|r| r.wire()),
+        "consent decision → sending rc:consent"
+    );
+    if let Err(e) = outbound
+        .send(ClientMsg::Consent {
+            session_id,
+            granted: reply.granted,
+            reason: reply.reason.map(|r| r.wire().to_string()),
+        })
+        .await
+    {
+        tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
+    }
+}
+
 /// #3982 — the surfaces of an exec question that no native panel showed, in
 /// SSH's order: the desktop companion, started if it is not running
 /// ([`crate::companion::ensure_running`]), which shows the question when it
@@ -8420,6 +8453,182 @@ mod tests {
         )
         .await;
         assert!(waited.is_err(), "still standing after ten minutes");
+    }
+
+    /// #4000 — the `rc:consent` an RC prompt's task sends, as the hub reads it.
+    async fn said_to_the_hub(
+        hub: &mut mpsc::Receiver<ClientMsg>,
+        by: Duration,
+    ) -> (bool, Option<String>) {
+        match tokio::time::timeout(by, hub.recv()).await {
+            Ok(Some(ClientMsg::Consent {
+                granted, reason, ..
+            })) => (granted, reason),
+            Ok(other) => panic!("not an rc:consent: {other:?}"),
+            Err(_) => panic!("no rc:consent within {by:?}"),
+        }
+    }
+
+    /// #4000 — an RC prompt's verdict leaves when its window ends, however long
+    /// the surfaces take to go up, so it reaches the hub before the hub's own
+    /// timer, which runs `CONSENT_VERDICT_GRACE` past the window it announced.
+    /// The surfaces are held to their worst case per OS: the tray's start
+    /// (Windows, 3 s), the start and then the road to the tray (a Mac's root
+    /// daemon, 4 s), the start and then the notification's session walk, a
+    /// root's account lookup and the show (a Linux root daemon, 3 + 1.5 + 1.5 +
+    /// 5 = 11 s: `SESSION_WALK_WAIT`, `ACCOUNT_LOOKUP_WAIT`, `SHOW_BUDGET`).
+    /// Nothing showed the question, so the verdict says nobody could be asked.
+    /// The broker's prompt starts its clock at its first look; this one at its
+    /// first poll, on the test's clock.
+    ///
+    /// Red before #4000: the window started once the surfaces had answered, so a
+    /// Linux root daemon's verdict left 11 s past the window, after the hub's
+    /// timer, which then answered a bare timeout.
+    #[tokio::test(start_paused = true)]
+    async fn an_rc_verdict_leaves_at_the_windows_end_whatever_the_surfaces_take() {
+        use roomler_ai_remote_control::consent::{CONSENT_VERDICT_GRACE, ConsentDenyReason};
+        let window = Duration::from_secs(300);
+        let notification = Duration::from_millis(1500 + 1500 + 5000);
+        // The hosts whose verdict the hub's timer beat, and the ones whose
+        // verdict left later than the window's end.
+        let (mut beaten, mut late) = (Vec::new(), Vec::new());
+        for (os, held) in [
+            ("Windows", COMPANION_START_BUDGET),
+            (
+                "a Mac's root daemon",
+                COMPANION_START_BUDGET + crate::consent_relay::RELAY_WITHIN,
+            ),
+            ("a Linux root daemon", COMPANION_START_BUDGET + notification),
+        ] {
+            let id = bson::oid::ObjectId::new();
+            let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+            let asked = tokio::time::Instant::now();
+            tokio::spawn(rc_consent_task(
+                async move {
+                    tokio::time::sleep(window).await;
+                    crate::consent::Decision::Timeout
+                },
+                async move {
+                    tokio::time::sleep(held).await;
+                    false
+                },
+                ViewerIndicator::disabled(),
+                outbound,
+                id,
+                id.to_hex(),
+                None,
+                crate::consent::Mode::Prompt { timeout: window },
+            ));
+            let hubs_timer = window + CONSENT_VERDICT_GRACE;
+            let Ok(said) = tokio::time::timeout(hubs_timer, hub.recv()).await else {
+                beaten.push(os);
+                continue;
+            };
+            let (granted, reason) = match said {
+                Some(ClientMsg::Consent {
+                    granted, reason, ..
+                }) => (granted, reason),
+                other => panic!("{os}: not an rc:consent: {other:?}"),
+            };
+            assert!(!granted, "{os}");
+            assert_eq!(
+                reason.as_deref(),
+                Some(ConsentDenyReason::NoPromptSurface.wire()),
+                "{os}: the surfaces had answered by then"
+            );
+            let took = asked.elapsed();
+            if took >= window + Duration::from_millis(500) {
+                late.push((os, took));
+            }
+        }
+        assert!(
+            beaten.is_empty(),
+            "the hub's timer answered before the agent's verdict for {beaten:?}"
+        );
+        assert!(
+            late.is_empty(),
+            "the verdict left after the {window:?} window that runs from the request: {late:?}"
+        );
+    }
+
+    /// #4000 — surfaces that are still going up when the window ends do not
+    /// hold the verdict: it leaves then, and counts the question as shown
+    /// (`timeout`, exec's rule), since a surface may yet have shown it.
+    #[tokio::test(start_paused = true)]
+    async fn surfaces_still_going_up_at_the_windows_end_count_as_shown() {
+        use roomler_ai_remote_control::consent::ConsentDenyReason;
+        let window = Duration::from_secs(2);
+        let id = bson::oid::ObjectId::new();
+        let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+        let asked = tokio::time::Instant::now();
+        tokio::spawn(rc_consent_task(
+            async move {
+                tokio::time::sleep(window).await;
+                crate::consent::Decision::Timeout
+            },
+            async {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                false
+            },
+            ViewerIndicator::disabled(),
+            outbound,
+            id,
+            id.to_hex(),
+            None,
+            crate::consent::Mode::Prompt { timeout: window },
+        ));
+        let (granted, reason) = said_to_the_hub(&mut hub, window + Duration::from_secs(1)).await;
+        assert!(!granted);
+        assert_eq!(
+            reason.as_deref(),
+            Some(ConsentDenyReason::HostTimeout.wire())
+        );
+        assert!(asked.elapsed() < window + Duration::from_millis(500));
+    }
+
+    /// #4000 — an answer given while the surfaces are still going up decides
+    /// at once. Every surface answers through the broker's `record_decision`:
+    /// the native panel and the notification through the loop's consent arm
+    /// (`consent_rx`), the tray and `roomlerd consent` over the LocalAPI
+    /// (`consent_decide`, `localapi_state.rs`). The surfaces are held to a
+    /// Linux root daemon's worst case, 11 s, and the answer comes at 1 s.
+    ///
+    /// Red before #4000: the prompt took its first look once the surfaces had
+    /// answered, so the answer waited for them.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_given_while_the_surfaces_go_up_decides_at_once() {
+        for allow in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mode = crate::consent::Mode::Prompt {
+                timeout: Duration::from_secs(300),
+            };
+            let broker =
+                crate::consent::ConsentBroker::new(mode, dir.path().to_path_buf()).unwrap();
+            let id = bson::oid::ObjectId::new();
+            let hex = id.to_hex();
+            let (outbound, mut hub) = mpsc::channel::<ClientMsg>(4);
+            tokio::spawn(rc_consent_task(
+                broker.request_with_mode(&hex, mode),
+                async {
+                    tokio::time::sleep(Duration::from_secs(11)).await;
+                    false
+                },
+                ViewerIndicator::disabled(),
+                outbound,
+                id,
+                hex.clone(),
+                None,
+                mode,
+            ));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                broker.record_decision(&hex, allow),
+                "the question takes the answer"
+            );
+            let (granted, reason) = said_to_the_hub(&mut hub, Duration::from_secs(1)).await;
+            assert_eq!(granted, allow);
+            assert_eq!(reason, None, "an answer carries no reason");
+        }
     }
 
     /// #1632 — `Cancelled` is the ONE decision that puts nothing on the wire:
