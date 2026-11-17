@@ -2728,6 +2728,28 @@ pub mod test_support {
         got.sort();
         protected(sddl) && got == want
     }
+
+    /// #3956 — `path`, read through a handle as [`super::repair`] reads it,
+    /// has what the repair leaves on a key file, or on the keys folder
+    /// (`folder`): an owner it never takes over (SYSTEM or Administrators) and
+    /// exactly the seal, not inheriting ([`super::is_sealed`], the repair's
+    /// own predicate).
+    pub fn as_the_repair_leaves(path: &Path, folder: bool) -> bool {
+        let (kind, flags) = if folder {
+            (
+                super::win::Kind::Dir,
+                super::OBJECT_INHERIT | super::CONTAINER_INHERIT,
+            )
+        } else {
+            (super::win::Kind::File, 0)
+        };
+        let entry = super::win::open(path, kind, false, false)
+            .unwrap_or_else(|why| panic!("{why}"))
+            .unwrap_or_else(|| panic!("{} is not there", path.display()));
+        let sd = super::win::read_sd(&entry.file)
+            .unwrap_or_else(|e| panic!("{}: reading its security: {e}", path.display()));
+        super::trusted(&sd.owner) && super::is_sealed(&sd, flags)
+    }
 }
 
 #[cfg(test)]

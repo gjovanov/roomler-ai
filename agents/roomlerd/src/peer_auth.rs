@@ -2401,6 +2401,7 @@ mod tests {
     mod sealed_folder {
         use super::*;
         use roomler_node_core::machine_tree::test_support as ts;
+        use roomler_node_core::machine_tree::{self, Repairs};
 
         /// `BUILTIN\Guests`: an account that is neither SYSTEM nor an
         /// administrator.
@@ -2872,6 +2873,98 @@ mod tests {
             assert_sealed(&dir.path().join(DIR_NAME), true);
             assert_eq!(ts::sddl(&elsewhere), as_found);
             assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+        }
+
+        /// #3956 — the machine config's folder, which the machine tree repairs
+        /// and checks (`Plain::MachineFolder`, the SYSTEM service's): a
+        /// browser key remembered, a new enrollment's device key, and the
+        /// `peer-auth` folder the daemon makes for them come out as the repair
+        /// leaves them, so the next start's repair changes nothing, owner or
+        /// DACL, and logs no `machine tree: repaired` line. #3666's stand-in
+        /// tree, enrolled as an elevated save leaves it, then repaired as a
+        /// start repairs it.
+        #[test]
+        fn the_machine_folders_key_files_are_written_as_the_repair_leaves_them() {
+            if !ts::elevated_or_skip(
+                "the_machine_folders_key_files_are_written_as_the_repair_leaves_them",
+            ) {
+                return;
+            }
+            for folder_made_here in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let tree = ts::enrolled_tree(root.path());
+                if folder_made_here {
+                    // A machine enrollment's first hello: no keys yet.
+                    std::fs::remove_dir_all(tree.keys()).unwrap();
+                }
+                machine_tree::repair(&tree, false);
+                let cfg = tree.config();
+                let user = ObjectId::new();
+                kept_as(Keeping::Plain(Plain::MachineFolder), || {
+                    assert_eq!(
+                        remember(&cfg, TENANT_A, user, &browser().key),
+                        Ok(Pinned::Now)
+                    );
+                    let key = hello_key(&cfg, TENANT_B);
+                    assert!(peer_auth_key_is_well_formed(&key));
+                    // A restart reads both back as they were written.
+                    let again = load_at(&key_path(&cfg, TENANT_B).unwrap()).unwrap();
+                    assert_eq!(again.public_b64(), key);
+                    let folder = Folder::of(&cfg, keeping_for(&cfg)).unwrap();
+                    let pins = load_pins(&folder, &file_name(&pins_path(&cfg, TENANT_A).unwrap()));
+                    assert!(pins.unwrap().users.contains_key(&user.to_hex()));
+                });
+                let written = [
+                    (pins_path(&cfg, TENANT_A).unwrap(), false),
+                    (key_path(&cfg, TENANT_B).unwrap(), false),
+                    (tree.keys(), true),
+                ];
+                let not_as_left: Vec<String> = written
+                    .iter()
+                    .filter(|(path, folder)| !ts::as_the_repair_leaves(path, *folder))
+                    .map(|(path, _)| format!("{} {}", path.display(), ts::sddl(path)))
+                    .collect();
+                let next_start = machine_tree::repair(&tree, false);
+                assert!(
+                    not_as_left.is_empty() && next_start == Repairs::default(),
+                    "folder made here: {folder_made_here}; not as the repair leaves them: \
+                     {not_as_left:#?}; the next start's repair: {next_start:#?}"
+                );
+                // Written whole and renamed into place: no temp file stays.
+                let names = named(&tree.keys(), "");
+                assert!(
+                    names.iter().all(|p| !p.to_string_lossy().ends_with(".tmp")),
+                    "{names:?}"
+                );
+            }
+        }
+
+        /// #3956 — a junction at the machine folder's `peer-auth` is never
+        /// followed: nothing is written where it leads, the hello offers no
+        /// key this run (a key that cannot be kept is never offered), and no
+        /// browser key is remembered. The machine tree's check refuses such a
+        /// folder anyway; this is the daemon's own write.
+        #[test]
+        fn a_link_at_the_machine_folders_keys_is_never_followed() {
+            if !ts::elevated_or_skip("a_link_at_the_machine_folders_keys_is_never_followed") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = ts::enrolled_tree(root.path());
+            std::fs::remove_dir_all(tree.keys()).unwrap();
+            let elsewhere = root.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            ts::junction(&tree.keys(), &elsewhere);
+            let cfg = tree.config();
+            kept_as(Keeping::Plain(Plain::MachineFolder), || {
+                assert_eq!(hello_key(&cfg, TENANT_B), "", "no key offered");
+                assert!(remember(&cfg, TENANT_A, ObjectId::new(), &browser().key).is_err());
+            });
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).unwrap().count(),
+                0,
+                "nothing written where it leads"
+            );
         }
     }
 }
