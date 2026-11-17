@@ -1732,8 +1732,8 @@ the base (`peer.rs:3405`).
 FR-148 P1, step 2 (#3953). **A shadow: nothing reads the new file to drive a rate.**
 The opener reads today's `rate_memory.json` in every mode, and that file is written
 byte for byte as before (`todays_file_is_written_byte_for_byte_as_master`). Beside it,
-a constrained session keeps a second memory for the path model, `path_memory.json`,
-under a key that names the path. Two lines a session say what the open read and what
+a constrained session of the FFmpeg data-channel pump keeps a second memory for the
+path model, `path_memory.json`, under a key that names the path. Two lines a session say what the open read and what
 the close wrote, and the open line writes the opening the model would take beside the
 one today's rule took.
 
@@ -1855,7 +1855,10 @@ just above the floor does not end it: on the slow-link replay the record ends tr
 whichever side of the floor the link last refused
 (`a_slow_link_ends_trusted_whichever_side_of_the_floor_it_last_refused`).
 
-### What a close writes (`pair_memory::close`, `pair_memory.rs:816`)
+### What a close writes
+
+`pair_memory::close` (`agents/roomlerd/src/encode/pair_memory.rs:816`) decides, case by
+case, from the entry the session opened from and its last would-be write:
 
 | The session | `wrote` | `why` |
 |---|---|---|
@@ -1900,7 +1903,8 @@ takes today's (`taken=today`) in every mode.
 
 ### The two lines
 
-Both are at INFO, and only on a constrained session with the switch not `off`.
+Both are at INFO, and only on a constrained session of the FFmpeg data-channel pump with
+the switch not `off`.
 `FR-148 P1 path memory: the pair's entry at the open` is written once the governor is
 built (`ModelGuard::open_line`, `media_pair_memory.rs:319`).
 `FR-148 P1 path memory: what the close wrote` is written as the pump drops, after
