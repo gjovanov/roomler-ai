@@ -1086,6 +1086,36 @@ pub(crate) fn nobody_could_be_asked(policy: &str) -> String {
     )
 }
 
+impl ConsentBroker {
+    /// #4000 — [`Self::write_prompt`], only while `session_hex`'s question is
+    /// on the books, and under their lock. An RC question's surfaces go up
+    /// beside its window, so the notification's marker rewrite can come after
+    /// the question ended: its release took the marker away under the same
+    /// lock, and a rewrite then would leave a question nobody asks on the
+    /// companion's screen and in `roomlerd consent --list`. `Ok(false)` = the
+    /// question had ended, and nothing was written.
+    pub fn write_prompt_while_asking(
+        &self,
+        session_hex: &str,
+        prompt: &PendingPrompt<'_>,
+    ) -> Result<bool> {
+        let mut books = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !books.asking.contains_key(session_hex) {
+            return Ok(false);
+        }
+        let body = prompt.to_body(session_hex);
+        if self.inner.sentinel_dir.is_none() {
+            books.marks.insert(session_hex.to_string(), body);
+            return Ok(true);
+        }
+        self.write_pending(session_hex, &body).map(|_| true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1165,43 @@ mod tests {
         .to_body("6a00000000000000000000aa");
         let req: tunnel_core::localapi::ConsentRequest = serde_json::from_str(&body).unwrap();
         assert_eq!(req.surface, "native");
+    }
+
+    /// #4000 — a marker is rewritten only while its question stands. An RC
+    /// question's notification can come up after the question was answered,
+    /// and its rewrite then must not put back a question nobody asks.
+    #[tokio::test]
+    async fn a_marker_is_rewritten_only_while_its_question_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = Mode::Prompt {
+            timeout: Duration::from_secs(300),
+        };
+        let broker = ConsentBroker::new(mode, dir.path().to_path_buf()).unwrap();
+        let hex = "6ad3d602aabbccddeeff4000";
+        let shown = PendingPrompt {
+            kind: PromptKind::RemoteControl,
+            asked_by: "Alice",
+            permissions: "VIEW".into(),
+            detail: String::new(),
+            org: String::new(),
+            timeout: Duration::from_secs(300),
+            surface: PromptSurface::Notification,
+        };
+        let marker = broker.pending_path(hex).expect("a folder for markers");
+        let asking = broker.request_with_mode(hex, mode);
+        assert!(
+            broker.write_prompt_while_asking(hex, &shown).unwrap(),
+            "it stands"
+        );
+        assert!(marker.exists());
+        assert!(broker.record_decision(hex, true));
+        assert_eq!(asking.await, Decision::Granted);
+        assert!(!marker.exists(), "its end took the marker away");
+        assert!(
+            !broker.write_prompt_while_asking(hex, &shown).unwrap(),
+            "nothing is written for a question that ended"
+        );
+        assert!(!marker.exists(), "no marker for a question nobody asks");
     }
 
     #[test]

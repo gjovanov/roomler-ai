@@ -343,7 +343,7 @@ pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
 `crates/remote_control/src/models.rs:9690`); a prefix match would refuse the
-kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing.
+kill switch along with the switch. `qsv_rate_mode`, FR-148 P2's switch that opens a QSV encoder off constant bitrate ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)), is not pushable for the same reason: `DesiredConfig` has no such field, and it is not one of `DeviceSwitch`'s keys yet, so a push naming it is dropped unread with the body's other unknown keys and answers 200 having changed nothing. `rc_carrier_rank`, FR-148 P4's switch that ranks a session's mesh candidates below every TURN relay ([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)), is not pushable the same way.
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
 restart after it.** A device that is offline picks it up at its next connect, and
@@ -662,11 +662,11 @@ which the daemon still refuses on the same terms as a local request.
    instead of another daemon's — on a two-half Mac the machine-side rows come
    from the root half and the session rows from the worker
    (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`;
-   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:636`; the table
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:669`; the table
    in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
    than design A, which still refuses the listing, gets the administrator's
    path in place of rows (`root_daemon_only`,
-   `agents/roomler-desktop/src/commands.rs:1054`). Whether the person at the
+   `agents/roomler-desktop/src/commands.rs:1087`). Whether the person at the
    seat may switch gate 4 on a root-mode install — Windows' pipe lets every
    interactive user — is the policy call still open on #2871.
 

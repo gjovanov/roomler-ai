@@ -757,7 +757,7 @@ mod parent {
             let (closed_said, closed_end) = (closed.clone(), closed);
             let on_said = move |said: &Said| match said {
                 Said::Action(k) if k == DISCONNECT => {
-                    let ended = registry.disconnect(&session);
+                    let ended = registry.disconnect(&session, crate::rc_sessions::Via::Notification);
                     tracing::info!(%session, ended, "the person at the screen pressed Disconnect on the being-viewed notification (FR-93 P6g)");
                 }
                 Said::Closed(2) => closed_said.store(true, Ordering::Relaxed),

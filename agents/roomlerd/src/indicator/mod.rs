@@ -34,12 +34,12 @@
 use anyhow::Result;
 
 /// Channel the overlay's "Disconnect" control uses to ask the signaling
-/// loop to tear down a session, identified by its `ObjectId`. Created
+/// loop to tear down a session: its `ObjectId`, and what asked (#4001). Created
 /// once in `run()` and handed to [`ViewerIndicator::new`]; the receiver
 /// is polled by `connect_once`'s `select!`. `run()` retains its own
 /// clone so the channel never fully closes (which would busy-spin the
 /// select!) even when the overlay is disabled.
-pub type KillSender = tokio::sync::mpsc::Sender<bson::oid::ObjectId>;
+pub type KillSender = crate::rc_sessions::KillSender;
 
 /// FR-27 — where an operator's Approve/Deny click on a NATIVE prompt comes
 /// back: `(session hex, allowed)`.

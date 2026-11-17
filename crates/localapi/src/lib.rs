@@ -6694,6 +6694,51 @@ pub struct LanCaptureStatus {
     pub via_name: Option<String>,
 }
 
+/// #3998 — whether this account's OWN endpoint is gone: the first one
+/// [`connect`] tries, the per-user socket, is not there or nothing listens on
+/// it. On a Linux system install that socket is the person socket its root
+/// daemon serves the person at the seat; on a Mac it is the per-user half's,
+/// or a one-row Mac's screen worker's. Each goes with its daemon.
+///
+/// With it gone, no device service is there for this account, whatever a
+/// later endpoint answered. `connect` returns its LAST endpoint's error, and
+/// on a Linux system install or a Mac that is the system socket, in a folder
+/// only root may enter: a stopped daemon reads there as `PermissionDenied`,
+/// exactly as a running one does. `false` with no own endpoint to look at.
+#[cfg(unix)]
+pub async fn own_endpoint_gone() -> bool {
+    match per_user_socket_path() {
+        Some(path) => endpoint_gone(&path).await,
+        None => false,
+    }
+}
+
+/// #3998 — on Windows the pipe is [`connect`]'s only endpoint, and its own
+/// `NotFound` already says that no service is there.
+#[cfg(windows)]
+pub async fn own_endpoint_gone() -> bool {
+    false
+}
+
+/// #3998 — how long [`endpoint_gone`] waits for a connect: a unix socket
+/// answers at once, or is there and busy.
+#[cfg(unix)]
+const ENDPOINT_GONE_WITHIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// #3998 — whether nothing a client could reach is at `path`: no socket, or
+/// one that nothing listens on (a daemon that stopped and left it behind).
+/// A socket that a service listens on is not gone, however busy or silent.
+#[cfg(unix)]
+pub(crate) async fn endpoint_gone(path: &std::path::Path) -> bool {
+    match tokio::time::timeout(ENDPOINT_GONE_WITHIN, tokio::net::UnixStream::connect(path)).await {
+        Ok(Err(e)) => matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        Ok(Ok(_)) | Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12552,6 +12597,32 @@ mod tests {
                 held.push(stream);
             }
         })
+    }
+
+    /// #3998 — an endpoint is gone when nothing is at its path, or nothing
+    /// listens on what is there: a daemon that stopped and left its socket
+    /// behind. One that a service listens on is not, busy or silent. On a
+    /// Linux system install and a Mac this is what tells a stopped daemon
+    /// from a refusal: `connect` returns its last endpoint's error, the
+    /// system socket's `PermissionDenied`, whether or not the daemon runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_endpoint_missing_or_left_behind_is_gone_and_a_served_one_is_not() {
+        let dir = test_socket_dir("3998-gone");
+        let missing = dir.join("missing.sock");
+        assert!(endpoint_gone(&missing).await, "nothing at the path");
+        let left = dir.join("left.sock");
+        drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+        assert!(left.exists(), "the socket stays behind its listener");
+        assert!(endpoint_gone(&left).await, "nothing listens on it");
+        let served = dir.join("served.sock");
+        let held = hold_silently(tokio::net::UnixListener::bind(&served).unwrap());
+        assert!(
+            !endpoint_gone(&served).await,
+            "a service listens on it, silent or not"
+        );
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The real kernel credentials, for a caller that is NOT the account
