@@ -2543,24 +2543,40 @@ pub async fn cmd_open_config_dir() -> Result<(), String> {
 /// wrong profile and the agent would never see it.
 ///
 /// #3873 — `session` is the question the page shows, `None` when it shows
-/// none: that click is logged too ([`answer_click`]).
+/// none: that click is logged too ([`answer_click`]). #3987 — `shown` is how
+/// long, in ms, the page has shown that question.
 #[tauri::command]
-pub async fn cmd_consent_approve(session: Option<String>) -> Result<String, String> {
-    consent_decide(session.as_deref(), true).await
+pub async fn cmd_consent_approve(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), true, shown).await
 }
 
 /// Deny a pending operator-consent prompt over the LocalAPI.
 #[tauri::command]
-pub async fn cmd_consent_deny(session: Option<String>) -> Result<String, String> {
-    consent_decide(session.as_deref(), false).await
+pub async fn cmd_consent_deny(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), false, shown).await
 }
 
 /// Send an Approve/Deny decision to the daemon over the LocalAPI.
-async fn consent_decide(session: Option<&str>, allow: bool) -> Result<String, String> {
+async fn consent_decide(
+    session: Option<&str>,
+    allow: bool,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    // #3987 — how long the click's question has been in front of the person.
+    let in_front = crate::panels::in_front_for(
+        crate::panels::consent_raised_ago(std::time::Instant::now()),
+        shown_for(shown),
+    );
     answer_click(
         session,
         allow,
-        None,
+        in_front,
         CONSENT_ANSWER_WITHIN,
         |session, allow| async move {
             let mut client = localapi::connect().await.map_err(AskError::Connect)?;
@@ -2584,6 +2600,13 @@ const CONSENT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// #3873 — what the page shows for a click with no question on it.
 const NO_QUESTION: &str = "No question is waiting for an answer here, so nothing was sent.";
 
+/// #3987 — the page's `shown`, in ms, as a time. Anything but a finite
+/// number at or above zero is not known.
+fn shown_for(ms: Option<f64>) -> Option<Duration> {
+    ms.filter(|m| m.is_finite() && *m >= 0.0)
+        .and_then(|m| Duration::try_from_secs_f64(m / 1000.0).ok())
+}
+
 /// #3873 — the consent read's name in the refresh ledger.
 const CONSENT_PENDING_SURFACE: &str = "consent_pending";
 
@@ -2601,6 +2624,8 @@ enum AskError {
 /// log when it arrives and again with its outcome, and given `within` for the
 /// daemon's answer. `ask` is the round trip ([`consent_decide`]'s LocalAPI
 /// call). Returns what the page shows: `approved` / `denied`, or the reason.
+/// #3987 — `in_front` is how long the click's question has been in front of
+/// the person ([`crate::panels::in_front_for`]).
 ///
 /// Until #3873 no step of a click logged anything and none had a bound: on a
 /// Linux system install two clicks on a question the prompt window showed
@@ -2609,7 +2634,7 @@ enum AskError {
 async fn answer_click<F, Fut>(
     session: Option<&str>,
     allow: bool,
-    _in_front: Option<Duration>,
+    in_front: Option<Duration>,
     within: Duration,
     ask: F,
 ) -> Result<String, String>
@@ -2625,6 +2650,24 @@ where
         );
         return Err(NO_QUESTION.into());
     };
+    // #3987 — a click this soon after its question came to the front may
+    // have been aimed at what was under the pointer before it: in the log
+    // with why, and never sent. The page shows why, and the next click goes.
+    if !crate::panels::click_armed(in_front) {
+        let after = in_front.unwrap_or_default();
+        tracing::warn!(
+            verb,
+            session,
+            ?after,
+            arming = ?crate::panels::CONSENT_ARMING,
+            "consent: a click arrived too soon after the question came to the front; nothing was sent"
+        );
+        return Err(format!(
+            "Nothing was sent: this click came {:.1} s after the question came up, too soon to \
+             be sure it was meant for it. Click again to answer.",
+            after.as_secs_f64()
+        ));
+    }
     tracing::info!(
         verb,
         session,
@@ -5310,6 +5353,20 @@ mod tests {
         .await;
         drop(guard);
         assert_eq!(taken.as_deref(), Ok("approved"));
+    }
+
+    /// #3987 — the page's `shown` is a time only when it is a finite number
+    /// at or above zero; anything else is not known, and the app's own show
+    /// or raise of the window then decides alone.
+    #[test]
+    fn the_pages_shown_time_is_read_only_when_it_is_a_time() {
+        assert_eq!(shown_for(Some(300.0)), Some(Duration::from_millis(300)));
+        assert_eq!(shown_for(Some(0.0)), Some(Duration::ZERO));
+        assert_eq!(shown_for(None), None);
+        assert_eq!(shown_for(Some(-5.0)), None);
+        assert_eq!(shown_for(Some(f64::NAN)), None);
+        assert_eq!(shown_for(Some(f64::INFINITY)), None);
+        assert_eq!(shown_for(Some(f64::MAX)), None, "too large for a time");
     }
 
     /// The refresh ledger's count for the page's read of the questions.
