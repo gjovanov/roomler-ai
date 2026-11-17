@@ -1,8 +1,8 @@
 //! roomler (FR-148 P0): the association's acknowledgement clock, counted where
 //! it happens and read without the association's lock.
 //!
-//! Two things are counted. The bytes the peer acknowledged, in the SACK
-//! handler, over every stream: that is the clock a delivery rate is read from,
+//! Two things are counted. The bytes the peer acknowledged it received, in the
+//! SACK handler, over every stream: that is the clock a delivery rate is read from,
 //! not the write call, which returns once SCTP has queued the bytes. And the
 //! moments the queue of written, not yet sent chunks fills and runs empty, in
 //! the pending queue: a reader learns from them whether the sender had more
@@ -14,19 +14,40 @@ use std::sync::Arc;
 use portable_atomic::AtomicU64;
 
 /// The counters, kept by the pending queue (fills and empties) and by the
-/// SACK handler (acknowledged bytes).
+/// SACK handler (acknowledged bytes, and the loss mark that decides them).
 #[derive(Debug, Default)]
 pub(crate) struct DeliveryCounters {
     acked_bytes: AtomicU64,
     queue_fills: AtomicU64,
     queue_empties: AtomicU64,
+    /// [`Self::loss_mark`], plus one; 0 is none.
+    loss_mark: AtomicU64,
 }
 
 impl DeliveryCounters {
-    /// `n` bytes of user data newly acknowledged by one SACK, its cumulative
-    /// point and its gap blocks, over every stream.
+    /// `n` bytes of user data that one SACK newly acknowledged the peer
+    /// received, by its cumulative point and its gap blocks, over every
+    /// stream.
     pub(crate) fn on_acked(&self, n: u64) {
         self.acked_bytes.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// The SACK handler's evidence of loss: every chunk still outstanding
+    /// below this TSN was reported missing by a SACK (a gap block above it)
+    /// or was outstanding when T3-rtx expired. An abandoned chunk below it
+    /// that the cumulative point passes is not counted: a FORWARD TSN may
+    /// have skipped it. Kept by the association under its lock; no reader
+    /// of the clock sees it.
+    pub(crate) fn loss_mark(&self) -> Option<u32> {
+        match self.loss_mark.load(Ordering::SeqCst) {
+            0 => None,
+            m => u32::try_from(m - 1).ok(),
+        }
+    }
+
+    pub(crate) fn set_loss_mark(&self, mark: Option<u32>) {
+        let m = mark.map_or(0, |m| u64::from(m) + 1);
+        self.loss_mark.store(m, Ordering::SeqCst);
     }
 
     /// The pending queue went from empty to holding bytes.
@@ -44,9 +65,13 @@ impl DeliveryCounters {
 /// the association's start, so two readings give an interval.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Delivery {
-    /// Bytes of user data the peer has acknowledged, each chunk once, over
-    /// every stream. A chunk abandoned under partial reliability counts once
-    /// the peer's cumulative point passes it.
+    /// Bytes of user data the peer acknowledged it received, each chunk once,
+    /// over every stream: by a gap block, or by the cumulative point. A chunk
+    /// abandoned under partial reliability that a SACK reported missing, or
+    /// that was outstanding when T3-rtx expired, is left out when the
+    /// cumulative point passes it, as a FORWARD TSN may have skipped it. One
+    /// lost with no such evidence still counts: SCTP does not tell a sender
+    /// which skipped chunks arrived.
     pub acked_bytes: u64,
     /// Times the queue of written, not yet sent chunks went from empty to not.
     pub queue_fills: u64,
