@@ -362,7 +362,7 @@ fn recorder_running(answer: Option<Option<&roomler_localapi::RecordingState>>, w
 
 /// FR-85 — whether any session carries a recording mark, or what the last
 /// answer said when the poll failed (`None`).
-fn remote_marked(answer: Option<&[roomler_localapi::RcSessionInfo]>, was: bool) -> bool {
+pub(crate) fn remote_marked(answer: Option<&[roomler_localapi::RcSessionInfo]>, was: bool) -> bool {
     answer.map_or(was, |sessions| sessions.iter().any(|s| s.recording))
 }
 
@@ -440,7 +440,7 @@ fn spawn_recording_watch<R: Runtime>(app: AppHandle<R>, item: MenuItem<R>) {
         loop {
             // `Some(Some(state))` answered; `Some(None)` there is no service
             // at all; `None` the poll failed.
-            let answer = match roomler_localapi::connect().await {
+            let answer = match crate::commands::connect_service().await {
                 Ok(mut c) => c.record_status().await.ok().map(Some),
                 Err(e) if no_service(&e) => Some(None),
                 Err(_) => None,

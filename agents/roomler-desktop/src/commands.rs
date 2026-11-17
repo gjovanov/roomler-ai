@@ -2579,7 +2579,7 @@ async fn consent_decide(
         in_front,
         CONSENT_ANSWER_WITHIN,
         |session, allow| async move {
-            let mut client = localapi::connect().await.map_err(AskError::Connect)?;
+            let mut client = connect_service().await.map_err(AskError::Connect)?;
             client
                 .consent_decide(&session, allow)
                 .await
@@ -2685,6 +2685,11 @@ where
             "the device service has no such question waiting (answered, withdrawn or expired)"
                 .to_string(),
         ),
+        // #3998 — no service at all, said plainly.
+        Ok(Err(AskError::Connect(e))) if crate::tray::no_service(&e) => (
+            "Could not reach the device service: it is not running.".to_string(),
+            describe_io("connect", &e),
+        ),
         Ok(Err(AskError::Connect(e))) => (
             format!("Could not reach the device service: {e}"),
             describe_io("connect", &e),
@@ -2724,7 +2729,7 @@ where
 /// ([`pending_answer`]): both pages stay quiet on it and keep what they show.
 #[tauri::command]
 pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
-    let read = match localapi::connect().await {
+    let read = match connect_service().await {
         Ok(mut c) => c
             .consent_pending()
             .await
@@ -2771,14 +2776,53 @@ pub fn cmd_consent_modal_needed() -> bool {
 /// FR-27 — remote-control sessions currently LIVE on this device, for the
 /// "Being viewed by …" banner.
 ///
-/// Never errors, for the same reason as [`cmd_get_pending_consents`]: an empty
-/// list and a daemon-down are the same *render* (no banner), and the Overview
-/// already surfaces daemon-down properly.
+/// #3998 — a read that fails is an `Err`, not an empty list
+/// ([`sessions_answer`]): the banner keeps its words on it, and the session
+/// watch in `main.rs` decides whether the banner stays up.
 #[tauri::command]
-pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
+pub async fn cmd_rc_sessions() -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    let read = match connect_service().await {
+        Ok(mut c) => c.rc_sessions().await.map_err(|e| ("rc_sessions", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    sessions_answer(read)
+}
+
+/// #3998 — what the banner page gets for its read of the sessions: the list,
+/// or, for a read that failed, why. Until #3998 a failed read was an empty
+/// list, and the banner said "Being viewed" with no name and offered a
+/// Disconnect that ended nothing.
+fn sessions_answer(
+    read: Result<Vec<roomler_localapi::RcSessionInfo>, (&'static str, std::io::Error)>,
+) -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    read.map_err(|(stage, e)| describe_io(stage, &e))
+}
+
+/// #3998 — [`localapi::connect`] for the consent prompt, the session banner
+/// and the tray's red: a connect that failed while this person's own
+/// endpoint is gone comes back as no service ([`proven`]).
+pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     match localapi::connect().await {
-        Ok(mut c) => c.rc_sessions().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(client) => Ok(client),
+        Err(e) => Err(proven(e, localapi::own_endpoint_gone().await)),
+    }
+}
+
+/// #3998 — a failed connect's error, or, when this person's own endpoint is
+/// gone (`own_endpoint_gone`), `NotFound`: no device service is there for
+/// them, which the tray reads as an answer ([`crate::tray::no_service`]).
+/// On a Linux system install and on a Mac, `connect`'s error is its last
+/// endpoint's, the system socket in a folder only root may enter, so a
+/// stopped daemon read there as `PermissionDenied` (os error 13), the words
+/// a click's status line showed in the 0.4.224 Linux lab.
+pub(crate) fn proven(e: std::io::Error, own_endpoint_gone: bool) -> std::io::Error {
+    if own_endpoint_gone && !crate::tray::no_service(&e) {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the device service is not running: this account's own LocalAPI endpoint is gone",
+        )
+    } else {
+        e
     }
 }
 
@@ -5566,11 +5610,82 @@ mod tests {
                 "{page}: {decide}"
             );
         }
+        let main = flat(include_str!("main.rs"));
         assert!(
-            flat(include_str!("main.rs")).contains(
-                "ifpending.difference(&seen).next().is_some(){panels::show_consent(&app);"
-            ),
+            main.contains("letshow_prompt=self.questions.difference(&seen).next().is_some();")
+                && main.contains("ifchange.show_prompt{panels::show_consent(&app);"),
             "the app raises the prompt only for a question it has not seen"
         );
+    }
+
+    /// #3998 — a click while the device service is stopped says so. In the
+    /// 0.4.224 Linux lab, `systemctl stop roomlerd` with a question up and
+    /// an Approve gave "Could not reach the device service: Permission denied
+    /// (os error 13)": the system socket's words, the last endpoint tried,
+    /// while the person's own endpoint was gone.
+    #[tokio::test]
+    async fn a_click_with_the_service_stopped_says_it_is_not_running() {
+        let (log, _guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            Duration::from_secs(5),
+            |_, _| async {
+                Err(AskError::Connect(proven(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Permission denied (os error 13)",
+                    ),
+                    true,
+                )))
+            },
+        )
+        .await
+        .expect_err("nothing was sent");
+        assert_eq!(
+            shown,
+            "Could not reach the device service: it is not running."
+        );
+        let text = log.text();
+        assert!(
+            text.contains("device service not running") && !text.contains("Permission denied"),
+            "{text}"
+        );
+    }
+
+    /// #3998 — the banner page's read of the sessions: a list, or, for a
+    /// read that failed, an error the page keeps its words on. Until #3998
+    /// a failed read was an empty list, and the banner read "Being viewed"
+    /// with no name and a Disconnect that ended nothing.
+    #[test]
+    fn a_failed_read_of_the_sessions_is_an_error() {
+        let live = vec![roomler_localapi::RcSessionInfo {
+            session_id: SESSION.into(),
+            ..Default::default()
+        }];
+        assert_eq!(sessions_answer(Ok(live.clone())), Ok(live));
+        assert_eq!(sessions_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = sessions_answer(Err(("rc_sessions", closed)))
+            .expect_err("a failed read is not 'no session'");
+        assert!(shown.starts_with("rc_sessions: "), "{shown}");
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(sessions_answer(Err(("connect", gone))).is_err());
+    }
+
+    /// #3998 — the banner keeps its words when a read of the sessions fails,
+    /// and paints only an answer.
+    #[test]
+    fn the_banner_keeps_its_words_on_a_failed_read() {
+        let js = include_str!("front/panel-viewing.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("sessions =") && !block.contains("paint("),
+            "a failed read changes the banner's words: {block}"
+        );
+        assert!(poll.contains("paint()"), "{poll}");
     }
 }

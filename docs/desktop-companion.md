@@ -78,7 +78,7 @@ while the prompt window asks a question:
 | device view (`Status` + `Peers`) | `src/front/app.js:192` → `cmd_device_view`, `src/commands.rs:335` | 2 s | 1 |
 | Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:2838` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:200` | 1.5 s | 1 |
-| consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
+| consent watcher (Rust; a failed read keeps the screen, §10.9.2) | `src/main.rs:320` | 750 ms, each poll 5 s at most | 1 |
 | consent (the prompt window, §10.9) | `src/front/panel-consent.js:210` | 750 ms | 1 |
 
 **What went wrong (field, 2026-09-25):** the Routes page's tables appeared and disappeared
@@ -1844,8 +1844,8 @@ sequenceDiagram
   An exec question waits for neither: its surfaces go up beside its window, and `ensure_running`
   gives it the start and then the road, with no budget, as before.
 - **One viewer, with the native panel up.** The app now receives that question too, marked
-  `native`, and filters it out (`consent_watch_loop`,
-  [`main.rs:338`](../agents/roomler-desktop/src/main.rs#L338); the prompt window,
+  `native`, and filters it out (the watch's `on_the_prompt`,
+  [`main.rs:410`](../agents/roomler-desktop/src/main.rs#L410); the prompt window,
   `panel-consent.js:191`), as a Windows SYSTEM install's tray does with a question its own panel
   shows. A Linux system daemon has no native panel, so its tray shows every question. There is
   one Approve on the screen, the panel's: the app shows no button for that question.
@@ -2076,7 +2076,7 @@ sequenceDiagram
 | the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2634`](../agents/roomler-desktop/src/commands.rs#L2634) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`). Since #3987 a click whose question came to the front under 1 s ago is logged as one WARN, `consent: a click arrived too soon after the question came to the front; nothing was sent`, and nothing is sent (§10.9.1) |
 | the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2598`](../agents/roomler-desktop/src/commands.rs#L2598): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
 | the page | `decide`, [`panel-consent.js:138`](../agents/roomler-desktop/src/front/panel-consent.js#L138); `paintButtons`, [`:71`](../agents/roomler-desktop/src/front/panel-consent.js#L71); `PAGE_LIMIT_MS`, [`:54`](../agents/roomler-desktop/src/front/panel-consent.js#L54); the status line, `panel-consent.html:103` | the click is sent before anything else can stop it, with how long its question has been shown (`shown`, #3987). The buttons are off only while no question is shown, an answer is on its way, or this window answered the question, and the status line says which. It is an element of its own (`p-status`), so the countdown never overwrites it, and its words stay until the next click or question. The page's own 15 s limit fires only when the app never replies, and the buttons then come back. Escape acts as the Deny button does |
-| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2726`](../agents/roomler-desktop/src/commands.rs#L2726) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
+| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2731`](../agents/roomler-desktop/src/commands.rs#L2731) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
 | the fallback modal | `decide`, [`consent.js:70`](../agents/roomler-desktop/src/front/consent.js#L70) | the same: the click is sent first, the buttons are off while an answer is on its way, the same 15 s limit, and an answered question is not shown again |
 
 - **The WARN at every start** (`refresh failed surface="encoder_caps" … person-at-the-device
@@ -2084,7 +2084,8 @@ sequenceDiagram
   serves `encoder_caps`, and an older daemon's refusal reads `root_only` with no WARN (§8).
 - **Unchanged:** what the daemon decides and how (`consent_decide_view`, #3845's seat check),
   the prompt's window and placement (both changed later, in #3987: §10.9.1), the watch that shows
-  and hides it (`consent_watch_loop`), and the words a viewer reads.
+  and hides it (`consent_watch_loop`; changed later, in #3998: §10.9.2), and the words a viewer
+  reads.
 - **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop
   companion on Windows — clippy + unit tests (#3940)": `a_click_whose_answer_never_comes_ends_at_the_bound`,
   `every_click_is_logged_when_it_arrives_and_with_its_outcome`, `a_click_with_no_question_is_logged_and_sends_nothing`,
@@ -2169,7 +2170,8 @@ What starts that second again, and what does not:
 | the app raises a prompt that is up, for a question its watch has not seen | yes | `show` |
 | the app raises the main window for the fallback modal (#2815) | yes | `show` |
 | a new question replaces the one under the pointer | yes | `shownAt`, set in `render` (`panel-consent.js`) and `show` (`consent.js`) |
-| a poll that changes nothing, the page's or the watch's | no | the page puts a question up only once the one it shows is gone. The watch raises the prompt only for a question it has not seen (`consent_watch_loop`, `agents/roomler-desktop/src/main.rs:361`) |
+| a poll that changes nothing, the page's or the watch's | no | the page puts a question up only once the one it shows is gone. The watch raises the prompt only for a question it has not seen (`SessionWatch::poll`, `agents/roomler-desktop/src/main.rs:516`) |
+| a read of the questions that failed, the page's or the watch's | no | both keep the question they show (§10.9.2) |
 
 Each click sends `shown`, the time in ms that the page has shown its question. The app counts
 from the later of that and its own last show or raise of the window (`in_front_for`,
@@ -2182,10 +2184,10 @@ Escape denies.
 
 **#3973 (GNOME on Xwayland: the prompt at the work area's top-left).** The code shows a likely
 path, not a proven one. Before #3987, a prompt shown again was not placed again, and GTK forgets
-a hidden window's position, so the window manager placed it as a new window. The tray's watch
-hides the prompt when a read of the questions fails and shows it again on the next good read
-(`consent_watch_loop`, `agents/roomler-desktop/src/main.rs:326-365`). The prompt is now placed
-each time it comes up from hidden. Whether that is all of #3973 is for the lab to read.
+a hidden window's position, so the window manager placed it as a new window. Until #3998 the
+tray's watch hid the prompt when a read of the questions failed and showed it again on the next
+good read. The prompt is now placed each time it comes up from hidden, and since #3998 a failed
+read no longer hides it at all (§10.9.2). Whether that is all of #3973 is for the lab to read.
 
 - **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop
   companion on Windows — clippy + unit tests (#3940)":
@@ -2208,6 +2210,101 @@ each time it comes up from hidden. Whether that is all of #3973 is for the lab t
   overlay holding question 1, the app's prompt for question 2 opens in the middle, clear of the
   overlay. On GNOME (Xwayland), the lab reads where the prompt opens after a failed read
   (#3973; read only).
+
+#### 10.9.2 A failed read changes nothing on the screen (#3998)
+
+The session watch asks the device service for the questions and the live sessions every 750 ms
+(`consent_watch_loop`, [`main.rs:320`](../agents/roomler-desktop/src/main.rs#L320)). Until #3998
+it read a failed read as an empty answer: a connect that failed, a failed read of the questions,
+a failed read of the sessions. One such read took the prompt and the banner down, and the next
+good read put the question up again, placed and armed again (§10.9.1). A busy pipe, a broken
+reply or a restarting service was enough. The banner's own page did the same with its read: it
+said "Being viewed" with no name, beside a Disconnect that ended nothing.
+
+Now the watch keeps the service's last answer, list by list (`SessionWatch`,
+[`main.rs:444`](../agents/roomler-desktop/src/main.rs#L444)):
+
+| A poll | The prompt | The banner, and the tray's red |
+|---|---|---|
+| answers a list | follows it | follows it |
+| fails: a busy pipe, a broken or refused reply, a poll past 5 s | keeps its question and its place for 10 s of failed reads at most (`QUESTIONS_KEPT_FOR`, `main.rs:366`), then comes down | keep what they show for as long as no answer comes |
+| proves that no service is there | comes down at once | come down at once |
+
+The two differ on purpose. A question the service cannot decide must not linger: a click on it
+can only fail, and the daemon's own window ends the question anyway. The banner and the red are
+privacy indicators: a banner a few seconds too long is better than a live session with none, and
+a LocalAPI stall during a live session (#3822) would otherwise take them down.
+
+**Proven no service.** The connect failed, and this person's own endpoint, the first one
+`connect` tries, is gone: nothing at its path, or nothing listening on what is there. A service
+that is not there asks nothing and holds no session, so this is an answer of none, as it always
+was for the tray (FR-85).
+
+| Host | The own endpoint | What `connect` returns with the daemon stopped |
+|---|---|---|
+| Windows | the pipe, its only endpoint | `NotFound`, which says it already |
+| Linux, a per-user install | the daemon's socket in the person's runtime folder | `NotFound` or `ConnectionRefused` |
+| Linux, a system install | the person socket the root daemon serves the person at the seat (§12) | `PermissionDenied` (os error 13): the system socket's, the last endpoint tried, in a folder only root may enter |
+| a Mac | the per-user half's socket, or a one-row Mac's screen worker's | `PermissionDenied`, as on a Linux system install |
+
+`connect` returns its last endpoint's error, and a running daemon's system socket answers the
+person `PermissionDenied` as well. So the own endpoint decides, asked again when a connect fails
+(`own_endpoint_gone`, [`crates/localapi/src/lib.rs:6709`](../crates/localapi/src/lib.rs#L6709);
+`endpoint_gone`, [`:6732`](../crates/localapi/src/lib.rs#L6732)). Until #3998 a click on
+Approve with the daemon stopped read "Could not reach the device service: Permission denied (os
+error 13)" (the 0.4.224 Linux lab), and on those hosts the tray's red never came down with a
+stopped daemon.
+
+```mermaid
+flowchart TD
+    P[a poll: every 750 ms, 5 s at most] --> C{the connect}
+    C -- failed, and the own endpoint is gone --> N[no service: an answer of none.<br/>The prompt, the banner and the red come down]
+    C -- failed otherwise, or no answer in 5 s --> F[a failed read]
+    C -- connected --> L{each list}
+    L -- answered --> A[the screen follows the answer]
+    L -- failed --> F
+    F --> Q{the prompt's questions unanswered for 10 s?}
+    Q -- no --> K[nothing changes on the screen]
+    Q -- yes --> D[the prompt comes down.<br/>The banner and the red stay until an answer]
+```
+
+| Part | What it does | Where |
+|---|---|---|
+| the watch | one poll at a time, each list its own answer, and a list that failed keeps the last answer's | `SessionWatch::poll`, [`main.rs:459`](../agents/roomler-desktop/src/main.rs#L459) |
+| the poll's bound | 5 s for the connect and both lists (`WATCH_READ_WITHIN`, `main.rs:361`). A poll past it is a failed one. Until #3998 nothing bounded it, and a read that never ended stopped the watch with whatever it showed | `read_within`, [`main.rs:377`](../agents/roomler-desktop/src/main.rs#L377) |
+| the proof | a connect that failed while the own endpoint is gone comes back as `NotFound`, which the tray reads as no service (`tray::no_service`, unchanged) | `connect_service` and `proven`, [`commands.rs:2804`](../agents/roomler-desktop/src/commands.rs#L2804), [`:2818`](../agents/roomler-desktop/src/commands.rs#L2818) |
+| the tray's red | the same answer as the banner (`tray_answer`, `main.rs:396`). The recording watch connects through the same proof, so the red comes down with a stopped daemon on every host | `spawn_recording_watch`, `tray.rs:437` |
+| the banner's page | `cmd_rc_sessions` answers an error for a failed read, and the page keeps its words | `sessions_answer`, [`commands.rs:2795`](../agents/roomler-desktop/src/commands.rs#L2795); `poll`, `panel-viewing.js:68` |
+| a click with no service | "Could not reach the device service: it is not running." on the prompt's status line, and `device service not running` in the log | `answer_click`, [`commands.rs:2689`](../agents/roomler-desktop/src/commands.rs#L2689) |
+
+- **Logs.** A run of failed reads with something on the screen is logged once, at INFO:
+  `session watch: a read of the device service failed; the screen keeps what its last answer said`,
+  with the reason, the number of questions and whether the banner is up. When the prompt comes
+  down after 10 s, at WARN: `session watch: the device service has not answered for its
+  questions; the prompt comes down, and the banner stays until it answers`.
+- **Unchanged:** the tray's own rule (only an answer moves the red, and no service at all is
+  one), the page's read of the questions (§10.9), and where the prompt opens and when it arms
+  (§10.9.1).
+- **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop
+  companion on Windows — clippy + unit tests (#3940)":
+  - `a_failed_read_between_two_good_ones_changes_nothing_on_the_screen`, a stand-in service
+    failing at the connect, at the questions and at the sessions;
+  - `a_long_run_of_failed_reads_keeps_the_banner_and_the_red_and_ends_the_prompt`;
+  - `proven_no_service_takes_the_prompt_the_banner_and_the_red_down_at_once`;
+  - `a_person_whose_own_endpoint_is_gone_has_no_service`;
+  - `each_list_is_its_own_answer` and `a_read_that_never_ends_is_a_failed_one`;
+  - `a_click_with_the_service_stopped_says_it_is_not_running`,
+    `a_failed_read_of_the_sessions_is_an_error` and `the_banner_keeps_its_words_on_a_failed_read`.
+
+  The own endpoint's probe is `tests::an_endpoint_missing_or_left_behind_is_gone_and_a_served_one_is_not`
+  in `roomler-localapi`, Unix only, in rust-unit's "Run the remaining crates' unit tests" and
+  the macOS job's "cargo test the LocalAPI on a real Mac (#3736)".
+- **Field cells:**
+  - A Linux system install with a question and a session's banner up: `systemctl stop roomlerd`
+    takes the prompt, the banner and the tray's red down at once, and an Approve clicked just
+    before reads "it is not running".
+  - A LocalAPI held busy for 3 s with both up: nothing on the screen moves. Held for 15 s: the
+    prompt goes after 10 s, and the banner and the red stay until the service answers.
 
 ## 11. Testing it
 
@@ -2299,7 +2396,7 @@ dialog's **Approve**. Now the capture open's wait hook marks its session `asking
 dialog is the wait (`agents/roomlerd/src/peer.rs:5887`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1370`), and the banner comes up only for a session that sees the
-screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:389`). The mark goes
+screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:535`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
 
@@ -2318,6 +2415,7 @@ also keeps a system install's Wayland capture opt-in.
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
 | Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:382` |
+| Stays through a failed read | a read of the sessions that fails, or a LocalAPI stall, never takes it down: only an answer with no live session does, or proven no service (§10.9.2) | `SessionWatch`, `agents/roomler-desktop/src/main.rs:444` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
 | Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:531` |
 
@@ -2538,7 +2636,7 @@ Who calls them, and how each is read:
 
 | Caller | Runs | Taken as |
 |---|---|---|
-| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2549`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2789`) | as the person, in their session | the screen's session |
+| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2549`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2833`) | as the person, in their session | the screen's session |
 | `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2507`; `rc_cmd`, `:2404`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
