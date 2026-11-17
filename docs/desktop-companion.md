@@ -1898,7 +1898,7 @@ says so to the root half. The root half counts the app only while that announcem
 | Part | What it does | Where |
 |---|---|---|
 | the per-user half's list and answers | as §10.8's worker: its own questions, then the root half's, over the root half's person socket for this person, 1 s at most. An answer to an id its own broker is not asking goes to the root half, 5 s at most. Every Mac daemon that runs as a person relays: a one-row Mac's worker and a two-row Mac's per-user half | `relays_the_root_half`, [`localapi_state.rs:711`](../agents/roomlerd/src/localapi_state.rs#L711); `consent_pending_view`, [`:2229`](../agents/roomlerd/src/localapi_state.rs#L2229); `consent_decide_view`, [`:2241`](../agents/roomlerd/src/localapi_state.rs#L2241) |
-| the announcement | a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) says `consent_relaying` over the root half's person socket for its person, then holds that connection. It dials again after the connection ends or a dial finds no socket: 1 s, doubling to 5 s while the root half is out of reach. A root half that refused and closed the connection is dialled once a minute. Each change of state is logged once, never a retry | `keep_telling`, [`consent_relay.rs:421`](../agents/roomlerd/src/consent_relay.rs#L421); `tell_the_root_half`, [`:598`](../agents/roomlerd/src/consent_relay.rs#L598); started by `person_socket::run`, [`person_socket.rs:630`](../agents/roomlerd/src/person_socket.rs#L630), for `announces_consent_relay`, [`localapi_state.rs:2264`](../agents/roomlerd/src/localapi_state.rs#L2264) |
+| the announcement | a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) says `consent_relaying` over the root half's person socket for its person, then holds that connection. It dials again after the connection ends or a dial finds no socket: 1 s, doubling to 5 s while the root half is out of reach. A root half that refused, and whose connection then ended within 30 s (`HELD_STEADY`), is dialled on that backoff too: at an update the per-user half restarts about 3 s before the root half and meets the old one. Only a second such refusal in a row, with no take between them, waits a minute (`ANNOUNCE_AFTER_A_REFUSAL`, [`consent_relay.rs:404`](../agents/roomlerd/src/consent_relay.rs#L404); the dial's end, [`:450`](../agents/roomlerd/src/consent_relay.rs#L450)). Each change of state is logged once, never a retry | `keep_telling`, [`consent_relay.rs:428`](../agents/roomlerd/src/consent_relay.rs#L428); `tell_the_root_half`, [`:622`](../agents/roomlerd/src/consent_relay.rs#L622); started by `person_socket::run`, [`person_socket.rs:630`](../agents/roomlerd/src/person_socket.rs#L630), for `announces_consent_relay`, [`localapi_state.rs:2264`](../agents/roomlerd/src/localapi_state.rs#L2264) |
 | what the root half keeps | the announcement, in memory, for as long as that connection stays open. It is taken only on the person socket and only from that socket's own person, never root. The connection's loop holds it, and it ends when the per-user half closes the connection (it stopped or restarted), or when the listener stops serving the connection (the seat changed, or the daemon is stopping) | `Request::ConsentRelaying`, [`crates/localapi/src/lib.rs:1460`](../crates/localapi/src/lib.rs#L1460); the dispatcher's arm, [`:4061`](../crates/localapi/src/lib.rs#L4061); `HeldForTheConnection`, [`:2966`](../crates/localapi/src/lib.rs#L2966); `Announcements`, [`consent_relay.rs:309`](../agents/roomlerd/src/consent_relay.rs#L309); `consent_relaying`, [`localapi_state.rs:2257`](../agents/roomlerd/src/localapi_state.rs#L2257) |
 | the root half's verdict | the app is a question's surface only while an announcement is live for the person at the screen and that person's socket answers a list within 1 s. Asked fresh at every prompt, after the tray's own verdict and outside the start's 3 s budget, within its own 1 s (§10.8, #3983) | `reach`, [`consent_relay.rs:237`](../agents/roomlerd/src/consent_relay.rs#L237); `reach_two_rows`, [`:287`](../agents/roomlerd/src/consent_relay.rs#L287); `reaches_the_tray`, [`companion.rs:2371`](../agents/roomlerd/src/companion.rs#L2371) |
 
@@ -1951,7 +1951,9 @@ sequenceDiagram
     `ConsentPending` and `ConsentDecide` (`person_may`), so its questions are listed and answered
     through the per-user half, and it counts the app as 0.4.224 did. It answers the announcement
     "unknown variant" and keeps the connection, logging nothing. The per-user half holds that
-    connection and does not dial again until it ends.
+    connection and does not dial again until it ends. When it ends soon after (the older root half
+    stops at an update), the next dial comes on the backoff, so the root half that replaces it is
+    told within seconds.
 - **Both halves at once.** Each question's id is an ObjectId: the server's session or request id for
   remote control and exec, or one the asking daemon minted for SSH and recording. So an id is asked by
   one half's broker only. The per-user half answers an id itself only while its own broker asks it,
@@ -1991,6 +1993,8 @@ sequenceDiagram
   - the announcer, the road and the registry, in `consent_relay::tests`:
     - `a_per_user_half_tells_its_root_half_and_tells_it_again_once_it_is_back`;
     - `a_root_half_that_refuses_or_never_answers_is_not_dialled_in_a_loop`;
+    - `a_root_half_that_refused_and_then_stopped_is_dialled_again_on_the_backoff` (the update's
+      order);
     - `the_two_row_road_is_open_only_while_its_person_has_announced_and_the_list_answers`;
     - `an_announcement_lives_as_long_as_its_connection`.
 
