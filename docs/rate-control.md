@@ -1481,7 +1481,7 @@ its next sample spans the quiet time and reads application-limited.
 **What a sample cannot tell.**
 
 - A sample partly stalled reads as a low backlogged rate: the class covers the whole
-  sample (the shaped link's first run showed three, below). FR-148 §4.1 keeps FR-71's
+  sample (the shaped link's first runs showed it, below). FR-148 §4.1 keeps FR-71's
   classifier and FR-79's gate for stalled windows.
 - A viewer that stops reading closes SCTP's receive window. The queue stays full, and
   the sample reads backlogged or stalled though the path is fine.
@@ -1518,21 +1518,23 @@ adds `shadow` to it, and it is deleted in P5. Its ledger row is `p0:PATH-1`
 | `a_queue_that_held_bytes_throughout_and_delivered_is_backlogged`, `a_queue_that_ran_empty_once_is_application_limited`, `bytes_that_waited_with_nothing_acknowledged_are_a_stall`, `an_idle_association_is_application_limited_not_stalled` | the three classes, and an idle association |
 | `samples_tile_the_readings_from_the_first_on`, `the_line_comes_every_ten_seconds_and_folds_its_samples`, `a_dropped_sampler_writes_its_last_samples` | the boundaries: the first reading, `SAMPLE_MIN`, the line's fold and its 10 s |
 | `an_idle_trickle_yields_only_application_limited_samples` | the jupiter chain of 2026-11-02 as a cell: a still screen's keepalives give only application-limited samples, so none of them can stand for the path |
-| `shaped_link::backlogged_at_{0_4,2,8}_mbps_reads_the_link`, `shaped_link::a_trickle_at_{0_4,2,8}_mbps_is_application_limited` | two in-process SCTP associations over a link the test shapes (serialised at its rate, 10 ms each way, a drop-tail queue of 200 ms, a viewer window of 7/8 of that queue and at least 48 KiB): a writer that always has more reads backlogged at the link's rate within 20 %; a 164 kbit/s trickle reads application-limited at every rate |
+| `shaped_link::backlogged_at_{0_4,2,8}_mbps_reads_the_link`, `shaped_link::a_trickle_at_{0_4,2,8}_mbps_is_application_limited` | two in-process SCTP associations over a link the test shapes (serialised at its rate, 10 ms each way, a drop-tail queue of 200 ms, a viewer window of 7/8 of that queue, and messages that fit it): a writer that always has more reads backlogged at the link's rate within 20 %; a 164 kbit/s trickle reads application-limited at every rate |
 | `shaped_link::a_new_association_starts_a_new_sample` | a new clock starts over, and a held slot keeps the clock the sampler has |
 
 The shaped link proves the classes and the rate on a known pipe. It does not prove a real
 carrier's loss, jitter, reordering or stalls, a browser's SCTP at the far end, or DTLS
 and ICE beneath SCTP: those are FR-148 P0's standing relay cell (its step 5). Its first
-run, with SCTP's default window of 1 MB, showed the first limitation above: at 8 Mbit/s
-three backlogged samples read 3.6, 0.9 and 6.9 Mbit/s. The likely cause, inferred and
-not traced, is slow start overrunning the 200 ms queue and the retransmission timeouts
-after it (1 s at least) idling the link inside the samples. The window now keeps what
-is in flight under the queue at 8 Mbit/s (175,000 bytes against 200,000) and at
-2 Mbit/s (the floor, 49,152 bytes against 50,000), so those cells measure the sampler,
-not SCTP's loss recovery. The floor is three of the writer's 16 KiB messages, as the
-receiver needs a message whole. At 0.4 Mbit/s the queue holds 10,000 bytes, under the
-floor, so drops still happen there; the rate still read within 5 %.
+runs showed the first limitation above, twice. With SCTP's default window of 1 MB,
+three backlogged samples at 8 Mbit/s read 3.6, 0.9 and 6.9 Mbit/s. The likely cause,
+inferred and not traced, is slow start overrunning the 200 ms queue and the
+retransmission timeouts after it (1 s at least) idling the link inside the samples.
+With a 48 KiB window over the 10,000 bytes the 0.4 Mbit/s queue holds, one sample read
+68 % of the link during a run of the whole suite. The window is now 7/8 of the queue
+at every rate (8,750, 43,750 and 175,000 bytes), and the writer's messages are a
+quarter of it, at most 16 KiB: the receiver counts a message's chunks against its
+window before the message is whole, and drops new data once the window is full. So
+what is in flight stays under the queue, and the cells measure the sampler, not SCTP's
+loss recovery.
 
 ## Config / env reference
 

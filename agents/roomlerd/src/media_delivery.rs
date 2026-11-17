@@ -591,13 +591,13 @@ mod tests {
 /// few seconds.
 ///
 /// The viewer's receive window ([`rwnd`]) is 7/8 of what the link's queue
-/// holds, and at least 48 KiB, so what is in flight stays under the queue at 2
-/// and 8 Mbit/s. With SCTP's 1 MB default, backlogged samples at 8 Mbit/s
-/// read 0.9 to 6.9 Mbit/s, most likely slow start overrunning the 200 ms
-/// queue and the retransmission timeouts after it (1 s at least) idling the
-/// link inside the samples. A path recovering from loss reads as a low
-/// backlogged rate: a sample carries what the path delivered, not what it
-/// could have.
+/// holds, so what is in flight stays under the queue at every rate, and the
+/// writer's messages ([`message_len`]) fit that window. A lossy link measures
+/// SCTP's loss recovery, not the sampler: with SCTP's 1 MB default window,
+/// backlogged samples at 8 Mbit/s read 0.9 to 6.9 Mbit/s, and with a 48 KiB
+/// window over 0.4 Mbit/s's 10,000-byte queue one sample under load read 68 %.
+/// A path recovering from loss reads as a low backlogged rate: a sample
+/// carries what the path delivered, not what it could have.
 ///
 /// What it does not prove: a real carrier's loss, jitter, reordering and
 /// stalls, a browser's SCTP at the far end, and DTLS and ICE beneath SCTP.
@@ -626,14 +626,18 @@ mod shaped_link {
 
     /// The viewer's receive window on a `bps` link: 7/8 of what the link's
     /// queue holds, so a sender that fills the window never overruns the
-    /// queue, and never under 48 KiB, three of the writer's messages (the
-    /// receiver drops a message's chunks once the window is full, so a
-    /// message must fit the window whole).
+    /// queue, at every rate.
     fn rwnd(bps: u64) -> u32 {
         let queue = bps / 8 * QUEUE_MS / 1000;
-        u32::try_from(queue * 7 / 8)
-            .unwrap_or(u32::MAX)
-            .max(48 * 1024)
+        u32::try_from(queue * 7 / 8).unwrap_or(u32::MAX)
+    }
+
+    /// The backlogged writer's message on a `bps` link: a quarter of the
+    /// window, at most 16 KiB. The receiver counts a message's chunks against
+    /// its window before the message is whole, and drops new DATA once the
+    /// window is full, so a message must fit the window with room to spare.
+    fn message_len(bps: u64) -> usize {
+        (usize::try_from(rwnd(bps)).unwrap_or(usize::MAX) / 4).clamp(1024, 16 * 1024)
     }
 
     /// One direction of the link.
@@ -819,7 +823,7 @@ mod shaped_link {
     async fn backlogged_reads_the_link(bps: u64) {
         let samples = sample_while(bps, Duration::from_secs(3), 3, |stream| {
             tokio::spawn(async move {
-                let msg = Bytes::from(vec![0x5a; 16 * 1024]);
+                let msg = Bytes::from(vec![0x5a; message_len(bps)]);
                 while stream.write(&msg).await.is_ok() {}
             })
         })
