@@ -947,11 +947,13 @@ mod shaped_link {
     ///
     /// It is not exact. A lost chunk that no later DATA follows before a
     /// FORWARD TSN covering it reaches the viewer is never reported missing,
-    /// and the clock counts it. Three runs here counted 11,000 to 19,000 bytes
-    /// over what the viewer took, of about 215,000 lost. So at each sample's
-    /// end the clock has counted less than the viewer took plus a quarter of
-    /// what was lost, and at least nine tenths of what the viewer took: the
-    /// samples read backlogged.
+    /// and the clock counts it. How often that happens depends on the timing.
+    /// At the third sample's end, of about 215,000 bytes lost, four runs on a
+    /// Windows box counted 11,000 to 21,000 over what the viewer took, and two
+    /// on CI's Linux runners, under the whole suite, 75,000 and 70,000. So at
+    /// each sample's end the clock has counted less than the viewer took plus
+    /// two thirds of what was lost, and at least nine tenths of what the viewer
+    /// took: the samples read backlogged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lossy_unordered_channel_counts_what_the_viewer_took() {
         const SAMPLE: Duration = Duration::from_secs(2);
@@ -994,7 +996,7 @@ mod shaped_link {
         let _ = viewer.close().await;
         println!("a lossy unordered channel, (sample, acked, viewer took, lost): {ends:?}");
         for (sample, acked, took, lost) in &ends {
-            assert!(*acked < took + lost / 4, "counted {acked}: {ends:?}");
+            assert!(*acked < took + lost * 2 / 3, "counted {acked}: {ends:?}");
             assert!(
                 *acked >= took * 9 / 10,
                 "counted {acked} of {took}: {ends:?}"
