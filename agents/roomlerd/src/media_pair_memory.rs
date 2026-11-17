@@ -479,7 +479,6 @@ pub fn nominal_bps(priority: u8) -> u32 {
 /// The pump's pair memories, from its open to its end. Dropped with the pump:
 /// today's file is written first, then the model's.
 pub struct PumpMemory {
-    session_id: ObjectId,
     codec_label: &'static str,
     mode: Mode,
     hi_bps: u32,
@@ -564,7 +563,6 @@ where
         None
     };
     PumpMemory {
-        session_id,
         codec_label,
         mode,
         hi_bps,
@@ -795,7 +793,6 @@ mod tests {
     /// nothing, the model's writes only its line.
     fn pump(model: ModelGuard, seed: Option<u32>) -> PumpMemory {
         PumpMemory {
-            session_id: model.session_id,
             codec_label: "AV1",
             mode: Mode::Shadow,
             hi_bps: 8_000_000,

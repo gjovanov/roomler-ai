@@ -1110,12 +1110,19 @@ mod tests {
             }}}}"#,
             NOW + 1
         );
-        let m = PathMemory::parse(json.as_bytes(), NOW);
+        let mut m = PathMemory::parse(json.as_bytes(), NOW);
         assert_eq!(m.pairs.keys().collect::<Vec<_>>(), ["good"]);
         for k in ["huge", "low", "word", "shape", "record"] {
             assert_eq!(m.dropped.get(k), Some(&Dropped::Invalid), "{k}");
             assert_eq!(m.state(k, NOW), EntryState::Invalid);
         }
+        // AC7 — what was dropped is never written: the next write keeps the
+        // good entry and the new one, and no class but the two measured ones.
+        m.write("next", entry(2_100_000, NOW), NOW);
+        let written = String::from_utf8(m.to_bytes()).unwrap();
+        let back = PathMemory::parse(written.as_bytes(), NOW);
+        assert_eq!(back.pairs.keys().collect::<Vec<_>>(), ["good", "next"]);
+        assert!(back.dropped.is_empty() && !written.contains("assumed"));
         let master = format!(
             r#"{{"entries":{{"good":{{"stable_bps":2000000,"at_unix":{NOW},"provenance":"measured"}},
                "huge":{{"stable_bps":5000000000,"at_unix":{NOW},"provenance":"measured"}}}}}}"#

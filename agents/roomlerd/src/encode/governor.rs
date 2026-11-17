@@ -5837,6 +5837,30 @@ mod tests {
         assert_eq!(master.offer(s.t).map(|f| f.bps), Some(6_000_000), "master");
     }
 
+    /// FR-148 P1 (AC7, D24) — a session whose every window the gate rejected
+    /// writes nothing: the opener's burst, and then the session ends. Master's
+    /// model, fed the same deliveries, would offer the burst as a floor.
+    #[test]
+    fn a_session_of_rejected_windows_writes_nothing() {
+        use crate::encode::pair_memory::{Why, close};
+        use crate::encode::pipe::PathModel;
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let start = s.t;
+        let mut master = PathModel::default();
+        for _ in 0..3 {
+            let link = viewer_rate::pack_link(6_000_000, 0);
+            s.window(750_000, Some(28), link, true);
+            master.delivered(6_000_000, Basis::AppLimited, s.t);
+        }
+        let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+        let c = s.g.memory().closing(s.t, unix);
+        assert!(!c.measured, "{c:?}");
+        assert_eq!((c.floor, c.record, c.best), (None, None, None));
+        assert_eq!(close(None, &c), (None, Why::NothingMeasured));
+        assert_eq!(master.offer(s.t).map(|f| f.bps), Some(6_000_000), "master");
+    }
+
     /// FR-148 P1 (D25 corrected) — a slow link replayed through the governor:
     /// arrivals near 0.6 Mbit/s, the viewer's queue growing in runs of three
     /// windows while the pump offers 1 Mbit/s, so the link loop refuses the
