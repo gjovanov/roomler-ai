@@ -3175,3 +3175,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run the decision on every case
         run: bash scripts/job-steps-ended-test.sh
+
+  vendored-ice:
+    # FR-148 P4 — the webrtc-ice fork's own tests, which ran in no lane: the
+    # fork is not a workspace member, so no `cargo test` here builds them, and
+    # the drift check in rust-lint compares text only. Since P4 the fork holds
+    # the carrier rank, and agent_carrier_rank_test.rs is its only proof: the
+    # candidates' priorities, the pair order, the follow gate and the checks
+    # after the first selection, against a real TURN server on vnet. Seeded
+    # from the workspace's Cargo.lock, as vendored-sctp is. The upstream mDNS
+    # cells are skipped: the fork's patch never touches mDNS, and one of them
+    # hung for minutes on a Windows box (measured 2026-11-17). Not in the
+    # `rust` aggregator's needs, for vendored-sctp's reason.
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: Vendored webrtc-ice tests
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Test the fork against the workspace's pinned versions
+        run: |
+          cp Cargo.lock crates/vendored/webrtc-ice/Cargo.lock
+          cargo test --manifest-path crates/vendored/webrtc-ice/Cargo.toml --lib -- --skip mdns::

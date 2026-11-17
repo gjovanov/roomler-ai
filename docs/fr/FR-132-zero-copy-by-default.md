@@ -39,7 +39,7 @@ opens. An encoder then opens the GPU form only for a cell the probe's `gpu` chil
 (`agents/roomlerd/src/capture/gpu_frame.rs:52-59`) and `zero_copy_deny` does not name
 (`agents/roomlerd/src/encode/ffmpeg/gpu_hint.rs:142-169`), and otherwise reports CPU frames and the reason
 (`gpu_hint.rs:85-97`). The config surface offers both keys locally, restart-applied
-(`crates/agent-core/src/config_surface.rs:1763-1786`).
+(`crates/agent-core/src/config_surface.rs:1771-1794`).
 
 ### 2.3 The server cannot turn a cell off
 
@@ -154,7 +154,7 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 |---|---|---|
 | decode errors per session-hour | `rc:session.stats` (3b) | no rise (open decision 3) |
 | keyframe requests per session-hour | `rc:session.stats` | no rise |
-| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:10258-10272`) | `gpu` on every session of the cell; no `open_failed` that persists |
+| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:10238-10252`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 The capture + encode row reads moving and idle windows apart, with under 5 fps captured as idle. FR-118 measured its

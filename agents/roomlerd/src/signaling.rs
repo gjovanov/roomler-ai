@@ -4755,7 +4755,7 @@ async fn handle_server_msg(
             // process that builds the peer (a delegated GUI worker runs this
             // handler too): one LocalAPI lookup, bounded at 400 ms. The peer
             // then sees a plain on/off, filtered exactly as ever.
-            let rc_overlay = rc_overlay.decide(session_id).await;
+            let rc_overlay = rc_overlay.decide(session_id, &ice_servers).await;
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after
