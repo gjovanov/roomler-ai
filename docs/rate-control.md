@@ -1574,8 +1574,9 @@ bit for bit. The heartbeat lines and the `path delivery` line are unchanged.
 A fourth word, `remembered`, is the pair memory's seed: measured, but in an earlier
 session. The entry does not keep its class, so the model reads it as the weaker one,
 application-limited, aged from the entry's `at_unix`. FR-148 P1 stores the class beside
-the value. A stalled window is none of the three: FR-79's gate keeps it out of every
-number, so it never gets a tag.
+the value. A stalled window is none of the three: FR-79's gate keeps it from setting a
+reading, a capacity or a step. The one number it still gives, its arrival rate as a
+delivery, can only raise a floor, and it carries its window's class like any other.
 
 ```mermaid
 flowchart LR
@@ -1590,7 +1591,7 @@ flowchart LR
 ```
 
 **How each number is tagged.** Each field is the heartbeat's field of the same name, read
-by the same accessor at the same instant; a test checks that at every window of the
+by the same accessor at the same heartbeat; a test checks that at every window of the
 replays (`same_numbers`).
 
 | Field | The number | Its tag | Its age runs from |
