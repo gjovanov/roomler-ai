@@ -21,6 +21,12 @@
 #     connection's) close behind it. They take turns on a `send_lock` of
 #     their own instead, which `close()` and `buffered_amount()` never take:
 #     the slot lock was the only thing ordering a channel's writes.
+#   - src/sctp_transport/mod.rs (FR-148 P0): `delivery_clock()`, the
+#     association's acknowledgement clock (`Association::delivery_clock`, a
+#     patch of the vendored webrtc-sctp) for a caller outside this crate,
+#     since `association()` is crate-private. It never waits for the slot:
+#     `stop()` holds it across the association's close, so a held slot
+#     answers `None`.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only
