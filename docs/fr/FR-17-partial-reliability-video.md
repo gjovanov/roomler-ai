@@ -1,6 +1,6 @@
 # FR-17: Video rides a reliable + ordered DataChannel
 
-Status: **stages A + B shipped; stage C's reorder buffer shipped as FR-59 P7 (#1169,
+Status: **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). Stages A and B stay, inert behind their opt-in. The default on constrained paths, the storm bound and the RustDesk A/B moved to FR-148 P4, where the unreliable channel becomes the second of two video channels. FR-148 §12 maps each open criterion. At the close: **stages A + B shipped; stage C's reorder buffer shipped as FR-59 P7 (#1169,
 2026-09-01) and its gap signal repaired in #3112 (2026-10-29), its measurement open**
 (2026-10-29; proposed 2026-08-27). Stage B was
 field-measured twice on 2026-08-28/29 with no benefit — on the strict stage-A receiver
@@ -222,7 +222,7 @@ path says `true` (`:264`). The flag stays once per MESSAGE while the counter say
 frames died. Nothing changes on the ordered default (a test over an in-order stream of
 mixed chunk counts pins it), and the forced-IDR rate stays bounded where it was — the
 worker's 250 ms debounce and the agent's 500 ms `MIN_KF_GAP` on `rc:keyframe`
-(`agents/roomlerd/src/peer.rs:11457`), at most 2/s per session — now reachable under
+(`agents/roomlerd/src/peer.rs:11455`), at most 2/s per session — now reachable under
 heavy loss instead of never. Unit evidence, red then green: master's spec was 15/15 green
 against the defective module; the new spec failed 4 of 19 against it (the overtaken-frame
 test, completion on the last chunk, the collision, and the seeded property at

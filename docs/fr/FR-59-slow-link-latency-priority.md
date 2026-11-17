@@ -1,6 +1,6 @@
 # FR-59 — Slow-link latency priority: make delay the controlled variable
 
-**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1 and AC3 met on the 2026-11-02 read, AC2 and AC5 partial, AC4 moved to FR-63; **AC6 unit-verified 2026-10-29** ·
+**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). P1 to P4 and P7 (the viewer's reorder buffer) stay live. P5, P6 and P8 go in FR-148: the slow-link profile becomes a live plan field in its P2. AC2 and AC5 are read in its P3. FR-148 §12 maps each open criterion. At the close: P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1 and AC3 met on the 2026-11-02 read, AC2 and AC5 partial, AC4 moved to FR-63; **AC6 unit-verified 2026-10-29** ·
 **Parent/siblings:** FR-1 (drag smoothness), FR-14 (direct jitter), FR-15 (age feedback),
 FR-17 (partial-reliability video), FR-35 (relay ceiling learns the pair)
 
@@ -41,13 +41,13 @@ therefore **increased**.
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
    (`agents/roomlerd/src/encode/mod.rs:229`); on a constrained path `area_min_bitrate_bps()`
-   (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
+   (`:215`) returns exactly it, and `governor.rs:353` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
    not allowed to reach.
 
 2. **The measured-goodput clamp is off on exactly the path that needs it.**
-   `governor.rs:309` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
+   `governor.rs:324` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
    for relay on 2026-08-27 because lumpy TURN-TCP samples crashed the down-fast EWMA. So the
    relay path has **no rate anchor at all**. And `derived_ceiling_bps` is itself
    `.max(1_000_000)` (`goodput.rs:107`), so even re-enabled it could not describe a 395 kbps

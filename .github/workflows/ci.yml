@@ -1860,7 +1860,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
-    timeout-minutes: 40
+    # #3940 — about 1.5 times a cold run, publish included (docs/build-caches.md):
+    # cold runs took up to 32 min before the companion's step joined them.
+    timeout-minutes: 55
     # #3352 — bash, not the runner's pwsh. pwsh's wrapper exits with the LAST
     # native command's code, so `cargo clippy … -D warnings` followed by
     # `cargo test` passed whatever clippy found. GitHub runs bash with
@@ -1898,7 +1900,10 @@ jobs:
           family: windows-clippy
           # #3116's wizard step took its pruned target to 4,440 MB, over the
           # default 4000: every restore dropped it and every run built cold.
-          max-target-mb: "6000"
+          # #3940 — from 2026-11-03 a cold build pruned to 6,248-6,510 MB, over
+          # 6000, with the same result (20-32 min a run, against 9-13 warm). The
+          # companion's step adds its own Tauri tree: 2,686 MB pruned at most.
+          max-target-mb: "11000"
       - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
         run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
       # `ssh-server` is in the set because this is the ONLY lane that lints the
@@ -1974,6 +1979,19 @@ jobs:
         run: |
           cargo build -p roomler-setup --bin roomler-setup
           pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path target/debug/roomler-setup.exe -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll,wtsapi32.dll'
+      # #3940 — the desktop companion's Windows half ran in NO lane: its unit
+      # tests run on Linux and its `cargo check` on macOS, so every
+      # `#[cfg(windows)]` item (the login start in the Run key, the service
+      # start's spawn with no inherited handles, the panels' capture exclusion,
+      # the machine-wide config path) first compiled in the release build. No
+      # features, as release-agent.yml builds it; its Tauri 2 tree is the
+      # wizard's plus `tray-icon` and `protocol-asset`. The test binary is
+      # `roomler_desktop-<hash>.exe`: no word UAC's installer detection elevates.
+      - name: The desktop companion on Windows — clippy + unit tests (#3940)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomler-desktop --all-targets -- -D warnings
+          cargo test -p roomler-desktop --bins
       # The agent's Windows unit tests run in their own job,
       # windows-agent-sessions, below (FR-6 wave 27).
 

@@ -61,7 +61,7 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   live row with no field. ⚠️ A removed device must still be told it was removed:
   the revocation checks keep the tombstone reader, or the device retries a bare
   401 forever.
-- **Call media is authorized by the caller's call seat (`call/join`), never by org membership.** Every `media:*` frame checks the seat, and losing the membership revokes it.
+- **Call media is authorized by the caller's call seat (`call/join`), never by org membership.** Every `media:*` frame checks the seat, and losing the membership revokes it. The pod serving a call also ends a seat whose admission reads gone twice in a row (`conference/src/seat_check.rs`), so a seat no membership admits by design (a recorder, a bot) must be skipped there.
 - **A 403 is an answer, not an expired credential.** It never ends a session, on any
   method. The only 403 with a navigation is `not_a_member`, matched on a
   **server-sent code**, never a message-string sniff — chat's

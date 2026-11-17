@@ -1,6 +1,6 @@
 # FR-18: Carrier queue discipline
 
-Status: **in progress** (2026-08-27; updated 2026-11-02). Tracking issue: `FR-18` (#801).
+Status: **closed not planned 2026-11-16**: superseded by [FR-148](FR-148-path-measured-plan-follows.md) ([#3953](https://github.com/gjovanov/roomler-ai/issues/3953)). The age bound, the send-buffer cap and the counters stay live. The open field reads moved to FR-148 P4, which joins this FR's drops to FR-17's channel. FR-148 §12 maps each open criterion. At the close: **in progress** (2026-08-27; updated 2026-11-02). Tracking issue: `FR-18` (#801).
 Child of FR-1; the lever that matters most for corp-VPN hosts. Shipped in 0.4.10 (#802)
 as a partial pass. On 2026-10-30 the `/derp` send-buffer cap gained a read-back (#3151,
 released in 0.4.189) and the docs AC was met. On 2026-10-31 the fleet read met AC4's field

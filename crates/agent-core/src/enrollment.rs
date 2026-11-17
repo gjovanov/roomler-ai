@@ -511,6 +511,7 @@ fn fresh_config(issued: Issued) -> AgentConfig {
         seed_contradiction: None,
         viewer_rate_clamp: None,
         queue_drain: None,
+        measured_evidence: None,
         slow_link_profile: None,
         slow_link_profile_bps: None,
         bg_rebuild: None,

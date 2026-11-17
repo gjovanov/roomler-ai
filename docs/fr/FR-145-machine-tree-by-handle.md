@@ -71,7 +71,7 @@ Sealing closes the write side only. Every reader below keeps working.
 | Folder | Read by | Anchor |
 |---|---|---|
 | `service-logs` | the tray's log view, "Open Logs Folder" and the log tail, as the signed-in person | `agents/roomler-desktop/src/commands.rs:179-190`, `:1916-1921` |
-| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder | `agents/roomlerd/src/app.rs:2308-2318`, `crash_recorder.rs:343-359`, `crash_uploader.rs:18-21` |
+| `crashes` | a worker that runs as the signed-in person: its uploader drains the supervisor's records from that folder. It may not delete one there, so since #3799 the service removes what that worker's ledger says it sent | `agents/roomlerd/src/app.rs:2308-2318`, `crash_recorder.rs:345-361`, `crash_uploader.rs:18-23` |
 | the SystemContext attempt record | Setup, as the person who started it (Users read, `record_aces`) | `machine_tree.rs:537-551` |
 
 ## Design
@@ -194,18 +194,18 @@ Notes on the calls:
 
 ### P1: crash records
 
-`crashes_dir_for(ctx)` (`crash_recorder.rs:345-357`) answers one of two: the machine tree, on Windows when the
+`crashes_dir_for(ctx)` (`crash_recorder.rs:347-359`) answers one of two: the machine tree, on Windows when the
 writer runs as SYSTEM (the supervisor's records, `:359-362`, and a SYSTEM process's own below
 `service-logs\crashes`); or a plain path otherwise (the person's own daemon in its profile; macOS and Linux
 unchanged).
 
 | Site | Today | After |
 |---|---|---|
-| `record_inner` (`crash_recorder.rs:231-341`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
+| `record_inner` (`crash_recorder.rs:233-343`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
 | `scan_dir`, `should_suppress` (`:581-583`, `:858-859`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
 | `quarantine` (`:724-733`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
-| the uploader's deletes (`crash_uploader.rs:126`, `:141`, `:344-345`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
-| the uploader's verdicts ledger, `crash-verdicts.txt` in the uploading process's log folder (a SYSTEM worker's `service-logs`; before, `crash_uploader.rs:269-293` at `0c5c1dbe6`) | `OpenOptions` create and append, `read_to_string`, by path | as built after review: `crash_recorder::append_verdict` (`crash_recorder.rs:750`): `HeldPath::machine(&log_dir, Seal::Readable)`, then `append_file("crash-verdicts.txt", Seal::Readable)`; `read_verdicts` (`:780`) reads it below the held folder with `read_file`. A refusal is one WARN per process start, not counted |
+| the uploader's deletes (`crash_uploader.rs:130`, `:146`, `:390-391`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
+| the uploader's verdicts ledger, `crash-verdicts.txt` in the uploading process's log folder (a SYSTEM worker's `service-logs`; before, `crash_uploader.rs:269-293` at `0c5c1dbe6`) | `OpenOptions` create and append, `read_to_string`, by path | as built after review: `crash_recorder::append_verdict` (`crash_recorder.rs:752`): `HeldPath::machine(&log_dir, Seal::Readable)`, then `append_file("crash-verdicts.txt", Seal::Readable)`; `read_verdicts` (`:782`) reads it below the held folder with `read_file`. A refusal is one WARN per process start, not counted |
 
 A refusal is logged once per process start (`crash_recorder: crash records left alone: <at> is a link`, or
 `… ends elsewhere (<final path>)`). A refused write is counted with the suppression tally, and the crash goes
@@ -290,7 +290,7 @@ above).
 | the machine attention file (`crates/agent-core/src/notify.rs:113-138`, `:166-177`, `:210-214`, `:234-244`) | `create_dir_all`, `fs::write`, `remove_file` | `write_file` and `remove_file`, `Seal::Readable`; a person's own attention file in their profile is unchanged |
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
 | the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7432`) reads through the same `HeldPath` (D4) |
-| the machine config's saves (`crates/agent-core/src/config.rs:3783`, `:4525`, `:4711`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
+| the machine config's saves (`crates/agent-core/src/config.rs:3794`, `:4536`, `:4722`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
 | the repair's and the adoption's opens (`machine_tree.rs:619-621`, `:859-861`) | `win::open` of the whole path | `HeldPath::walk` |
 | the one-time segment move (`appdirs.rs:673`, `:933`, `:956`, `:1054`, `:1169`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
@@ -331,9 +331,9 @@ them.
 - GitHub's Windows runners set `TEMP` to an 8.3 short path, so T4's control pins the `GetLongPathNameW` compare;
   without it every tempdir-based case would fail in CI.
 - ⚠️ `roomler-node-core`'s Windows cases run elevated in one step only, filtered to `machine_tree::tests` and three
-  others (`.github/workflows/ci.yml:2091-2093`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:2047`). P1 adds
+  others (`.github/workflows/ci.yml:2230-2232`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:2186`). P1 adds
   `machine_tree::held::tests` and `crash_recorder::tests` to that filter, or the new cases never run on Windows.
-  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:1968-1972`).
+  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:2107-2111`).
 
 | # | Test | Where | What it holds | Elevated | RED at the seam |
 |---|---|---|---|---|---|
@@ -392,7 +392,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:2093`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
+| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:2232`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
 | P2 | service logs: `HeldRollingWriter` and every other `service-logs` writer (the prune, the panic and stderr files, the caps cache, the install outcome, the wedged MSI log, the update marker) | the same switch: `RollingFileAppender` and today's writers | not started |
 | P3 | the rest: the attempt record, the machine attention file, the launch marker, the presence lock, the machine config's saves, the repair's and the adoption's opens; the segment move (D7); the gate (D8) | the same switch | not started |
 | Docs | the docs below, each in the PR of the phase it describes, the rest by P3 | none | not started |
@@ -405,12 +405,12 @@ The docs:
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
 - `docs/security-baseline.md`: a rule beside "A Windows machine config is the machine's only as found"
-  (`docs/security-baseline.md:525`): a privileged process acts on the machine folder only through
+  (`docs/security-baseline.md:581`): a privileged process acts on the machine folder only through
   `machine_tree::HeldPath`, with the walk as a mermaid flow, the two seals and the leaf policy.
 - `.claude/rules/security.md`: the one-line rule for new code.
 - `docs/operator-systemcontext-smoke.md` (`:302-305`, `:401-402`): the folders are sealed (SYSTEM and
   Administrators write, Users read), and what a `<name>.moved-<unix>` entry means.
-- The module docs: `machine_tree.rs:3-77`, `install_cleanup.rs:19-47`, `crash_recorder.rs:17-60`,
+- The module docs: `machine_tree.rs:3-77`, `install_cleanup.rs:19-47`, `crash_recorder.rs:17-62`,
   `win_identity.rs:16-20`.
 - `docs/README.md`: the `security-baseline.md` row names the rule.
 - FR specs that mention these folders are dated history and stay as they are.
@@ -476,7 +476,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
   as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
-  drains the supervisor's records from that folder (`app.rs:2308-2318`, `crash_recorder.rs:566`); without read
+  drains the supervisor's records from that folder (`app.rs:2308-2318`, `crash_recorder.rs:568`); without read
   those records would stay on the device. Only the write side closes.
 
 ## Out of scope

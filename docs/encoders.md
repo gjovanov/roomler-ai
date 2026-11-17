@@ -301,7 +301,7 @@ and telling nobody (`agents/roomlerd/src/signaling.rs:4089`), and the viewer ign
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10381`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
-watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
+watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:446`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
 its own fallback to the RTP track, which is safe only because that pick also forces
 `preferredCodec: 'h264'`. HEVC, AV1 and VP9 carry no codec, so their RTP track would
@@ -344,6 +344,81 @@ with the other chroma form of the same codec (`FfmpegDcCodec::pipeline_label`:
 `HEVC-444`, `H264-444`, `VP9-444`), and `rc:video-info` reports the chroma the
 pipeline really runs, so a rejected 4:4:4 open that fell back to 4:2:0 is never
 mistaken for the cell that was asked for.
+
+### The stored choice: one value per pair (#3651)
+
+The two dropdowns are two axes, and the page stores one flat value for them, from
+one list: `RC_CODEC_CHOICES` (`ui/src/composables/useRemoteControl.ts:2410`). The
+type `RcCodecChoice` and the per-device allow-list both derive from it. Every pair the
+picker offers has a value of its own there, so a pair keeps its chroma through
+storage and a reload, except on AV1, which has one chroma in a session.
+`choiceFromPicker` and `pickerFromChoice` (`ui/src/composables/videoCells.ts:161`,
+`:181`) map the axes to the value and back. Their switches, and
+`codecChoiceToSettings`'s, have no `default`, so a codec or a value added to its list
+without a case fails the type check. The unit test asserts the round trip as a
+property over `PICKER_CODECS` × `PICKER_CHROMAS`
+(`ui/src/__tests__/composables/videoCells.spec.ts`).
+
+⚠️ Until #3651, HEVC and H.264 had no 4:2:0 value. "Standard (4:2:0)" was stored as
+plain `hevc` / `h264`, which follows the Priority dial: the dropdown snapped back to
+"Auto (follows Priority)", and on Sharper, the default dial (`:3812`), a pair that can
+do 4:4:4 opened in 4:4:4. A plain `hevc` / `h264` stored before still means chroma
+Auto and still follows the dial.
+
+```mermaid
+flowchart LR
+    PK["the two dropdowns<br/>codec × colour detail"] -->|choiceFromPicker| CH["one stored value<br/>from RC_CODEC_CHOICES"]
+    CH -->|"at connect"| PD["per device<br/>roomler-rc-codec.v1:agent-id"]
+    CH -->|codecChoiceToSettings| ST["four refs, also the per-browser default<br/>transport · chroma · preferred codec · render path"]
+    PD -->|"the next connect"| ST
+    ST -->|settingsToCodecChoice| SH["the value shown"]
+    SH -->|pickerFromChoice| PK
+    ST -->|"connect: resolveChroma(chroma, dial, pairCan444)"| RQ["rc:session.request<br/>preferred_transport · chroma_pref"]
+```
+
+| Codec × colour detail | Stored value | Settings: transport · chroma (`codecChoiceToSettings`, `:3881`) | What the request carries |
+|---|---|---|---|
+| HEVC × Auto | `hevc` | `data-channel-hevc` · `auto` | `chroma_pref: yuv444` on Sharper when both ends do HEVC 4:4:4, else none (4:2:0) |
+| HEVC × Standard (4:2:0) | `hevc-420` | `data-channel-hevc` · `yuv420` | no `chroma_pref` (4:2:0), whatever the dial: the request HEVC × Auto sends on Balanced |
+| HEVC × Crisp text (4:4:4) | `hevc-444` | `data-channel-hevc` · `yuv444` | `chroma_pref: yuv444` when both ends do it, else none |
+| H.264 × Auto | `h264` | `data-channel-h264` · `auto` | as HEVC × Auto, with H.264 High 4:4:4 (software decode here) |
+| H.264 × Standard (4:2:0) | `h264-420` | `data-channel-h264` · `yuv420` | no `chroma_pref`: the 4:2:0 cell, which the browser decodes in hardware |
+| H.264 × Crisp text (4:4:4) | `h264-444` | `data-channel-h264` · `yuv444` | `chroma_pref: yuv444` when both ends do it |
+| VP9 × Auto / 4:2:0 / 4:4:4 | `vp9` / `vp9-420` / `vp9-444` | `data-channel-vp9-444` · `auto` / `yuv420` / `yuv444` | Auto follows the dial; an explicit chroma is sent as `chroma_pref` |
+| Auto × Auto / 4:2:0 / 4:4:4 | `auto` / `auto-420` / `auto-444` | `auto` · `auto` / `yuv420` / `yuv444` | the auto rank; an explicit chroma pins it (`pickAutoTransport`, `:3687`) |
+| AV1 × any | `av1` | `data-channel-av1` · `auto` | none: AV1 has one chroma in a session |
+
+With the legacy H.264 mapping (`roomler-rc-h264-rtp=1`, `:2956`), `h264` and
+`h264-420` take the RTP track and `<video>` (`webrtc` · `auto` / `yuv420`). That track
+is 4:2:0 only, so both send the same request. `h264-444` ignores the flag, because the
+RTP track cannot carry 4:4:4.
+
+A choice that cannot run on the device keeps its chroma through the fallback:
+`hevc-420` on a device without HEVC runs the auto rank pinned to 4:2:0
+(`transportForSession`, `ui/src/composables/videoCells.ts:446`), software HEVC decode
+falls back to VP9 4:2:0, and H.264 without its data channel takes the RTP track.
+
+Two stores hold the choice:
+
+| Store | What it holds | Written | Read |
+|---|---|---|---|
+| per device | `roomler-rc-codec.v1:<agent id>` = the value | at connect, for a pick made on this page (`codecConnectAction`, `:2458`; `persistCodecChoice`, `:2442`) | at connect, through the persist-free apply path (`readStoredCodecChoice`, `:2430`; `applyCodecChoiceSettings`, `:8269`); a value not in the list reads as no override |
+| per browser, the default of a device with no override of its own | the settings, in four keys: `roomler-rc-video-transport.v2`, `roomler-rc-vp9-chroma`, `roomler-rc-preferred-codec`, `roomler-rc-render-path` | by the picker's setter (`codecChoice`, `:8251`) | at page load: the dropdowns show `settingsToCodecChoice(transport, chroma)` (`:3962`), which reads an explicit chroma back on every transport that can carry it |
+
+⚠️ **The transport key's reader drops `data-channel-h264`** (`readStoredVideoTransport`,
+`:3063`). Every H.264 per-browser default (`h264`, `h264-444`, `h264-420`) therefore
+reads back as transport `auto` on a device with no override of its own. The chroma is a
+key of its own and survives, so an H.264 4:2:0 default runs the auto rank pinned to
+4:2:0; the codec does not survive. The device where the pick was made restores it from
+its own override. #3651 leaves the reader as it is: accepting the value would change
+what such a device opens with on upgrade, which waits for a decision.
+
+A page from before #3651 that reads what a newer page stored (a tab in a session does
+not reload, and a roll can go back) stays safe. The per-device `hevc-420` / `h264-420`
+read as no override there and stay stored. The per-browser keys hold only values that
+page knows: `hevc-420` shows as HEVC × Auto and still asks for 4:2:0, because connect
+reads the chroma key directly (`resolveChroma`, `:11663` for HEVC, `:11559` for H.264),
+and `h264-420` shows as Auto × Standard (4:2:0) and runs the auto rank at 4:2:0.
 
 ## The probe lifecycle
 
@@ -1638,7 +1713,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10376-10409`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10374-10407`):
 
 | Field | Meaning |
 |---|---|
@@ -1745,11 +1820,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:855`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:870`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:839`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:854`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until the operator decides it per OS on P3's numbers
     ([below](#what-the-numbers-recommend)). `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
@@ -1761,7 +1836,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:824`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:839`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### The clock on macOS and Windows (FR-112 P3)

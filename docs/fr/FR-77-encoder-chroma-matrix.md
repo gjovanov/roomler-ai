@@ -25,7 +25,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   string `vp9_chroma` (`:165`) and a list `hevc_chroma` (`:177`). The session request
   carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:995,641`).
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
-  (`agents/roomlerd/src/peer.rs:5596-5603`); the ONLY hardware 4:4:4 path is
+  (`agents/roomlerd/src/peer.rs:5601-5608`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:770-787`),
   advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:1765-1768`).
 - The picker (`ui/src/views/remote/RemoteControl.vue:3042-3050`) is a hard-coded list
@@ -208,7 +208,9 @@ flowchart LR
   dial-following `vp9` choice (it read as 4:2:0 while the agent, given no
   `chroma_pref`, ran profile 1), and chroma Auto on an explicit VP9/HEVC pick follows
   the Priority dial (balanced ⇒ 4:2:0). Stored choices gained `vp9`, `auto-444`,
-  `auto-420`; the per-agent persistence is unchanged.
+  `auto-420`; the per-agent persistence is unchanged. Later, #3651 added `hevc-420`
+  and `h264-420`, so "Standard (4:2:0)" holds on HEVC and H.264 too:
+  [encoders.md § The stored choice](../encoders.md#the-stored-choice-one-value-per-pair-3651).
 - **Decode failures are remembered per device × cell** under the browser build that
   failed (`roomler-rc-cell-failed.v1:<agent>`); a 4:4:4 failure bans only the 4:4:4
   cell. The page-scoped transport ban stays as the first-response mechanism.
