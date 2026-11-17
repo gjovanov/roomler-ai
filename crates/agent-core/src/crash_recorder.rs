@@ -46,6 +46,8 @@
 //!   handle. The scan lists and reads below the folder's handle, a record
 //!   that does not parse is renamed into `malformed` by handle, and the
 //!   uploader deletes through the folder it read from ([`Sidecar::remove`]).
+//! - A record a person's worker sent but may not delete there is removed by
+//!   the service, by its signature in that worker's ledger (`sweep_settled`, #3799).
 //! - A link on the way leaves the crash unrecorded, with one WARN per
 //!   process start (`crash records left alone: …`), counted with the
 //!   suppression tally. It is never written anywhere else.
@@ -823,12 +825,15 @@ fn signature_of(len: u64, modified_unix: i64, name: &str) -> String {
 
 /// #3799 — a name the recorder gives a record, `<digits>-<digits>.json`
 /// ([`record_inner_at`]): the only name the service's sweep removes.
+#[cfg(any(windows, test))]
 fn is_record_name(name: &str) -> bool {
-    let _ = name;
-    false
+    name.strip_suffix(".json")
+        .and_then(|stem| stem.split_once('-'))
+        .is_some_and(|(at, pid)| all_digits(at) && all_digits(pid))
 }
 
 /// One or more ASCII digits, and nothing else.
+#[cfg(any(windows, test))]
 fn all_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
@@ -839,13 +844,30 @@ fn all_digits(text: &str) -> bool {
 /// may be negative). Any other line is dropped here and goes no further.
 /// `whole`: the text starts at the ledger's start; otherwise its first line
 /// may be cut, and is dropped too.
+#[cfg(any(windows, test))]
+fn settled_lines(text: &str, whole: bool) -> impl Iterator<Item = &str> {
+    text.lines()
+        .skip(usize::from(!whole))
+        .map(str::trim)
+        .filter(|line| {
+            line.split_once(' ').is_some_and(|(head, name)| {
+                is_record_name(name)
+                    && head.split_once(':').is_some_and(|(len, mtime)| {
+                        all_digits(len) && all_digits(mtime.strip_prefix('-').unwrap_or(mtime))
+                    })
+            })
+        })
+}
+
+/// [`settled_lines`], kept.
+#[cfg(test)]
 fn settled_in(text: &str, whole: bool) -> std::collections::HashSet<String> {
-    let _ = (text, whole, all_digits(""));
-    std::collections::HashSet::new()
+    settled_lines(text, whole).map(str::to_owned).collect()
 }
 
 /// #3799 — one entry of a listing the service made itself, as the sweep
 /// compares it.
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy)]
 struct Listed<'a> {
     name: &'a str,
@@ -860,12 +882,17 @@ struct Listed<'a> {
 /// signature, from the listing, is one of `settled`. A ledger's lines are
 /// only ever compared with those signatures: nothing in them names what is
 /// removed.
+#[cfg(any(windows, test))]
 fn settled_names<'a>(
     listing: impl IntoIterator<Item = Listed<'a>>,
     settled: &std::collections::HashSet<String>,
 ) -> Vec<&'a str> {
-    let _ = (listing.into_iter().count(), settled);
-    Vec::new()
+    listing
+        .into_iter()
+        .filter(|e| !e.is_dir && !e.is_link && is_record_name(e.name))
+        .filter(|e| settled.contains(&signature_of(e.len, e.modified_unix, e.name)))
+        .map(|e| e.name)
+        .collect()
 }
 
 /// #3799 — what one sweep did: counts, and the names of the records it
@@ -907,8 +934,96 @@ pub const SWEEP_LEDGER_MAX_BYTES: u64 = 1024 * 1024;
 /// - With no record in `crashes`, no ledger is read.
 #[cfg(windows)]
 pub fn sweep_settled(profiles: &[PathBuf]) -> Swept {
-    let _ = profiles;
-    Swept::default()
+    use crate::machine_tree::HeldPath;
+    use std::collections::HashSet;
+    let mut swept = Swept::default();
+    let program_data = crate::appdirs::machine_program_data();
+    let machine = crate::appdirs::machine_global_dir();
+    let crashes = match HeldPath::below(&program_data, &machine.join("crashes")) {
+        Ok(Some(held)) => held,
+        Ok(None) => return swept,
+        Err(refused) => {
+            let _ = left_alone(refused);
+            return swept;
+        }
+    };
+    let Ok(entries) = crashes.entries() else {
+        return swept;
+    };
+    let listing: Vec<Listed> = entries
+        .iter()
+        .map(|e| Listed {
+            name: &e.name,
+            is_dir: e.is_dir,
+            is_link: e.is_link,
+            len: e.len,
+            modified_unix: e.modified_unix,
+        })
+        .collect();
+    // The signatures of the records listed: a ledger line is kept only when
+    // it is one of them, so what a ledger holds besides costs nothing.
+    let wanted: HashSet<String> = listing
+        .iter()
+        .filter(|e| !e.is_dir && !e.is_link && is_record_name(e.name))
+        .map(|e| signature_of(e.len, e.modified_unix, e.name))
+        .collect();
+    if wanted.is_empty() {
+        return swept;
+    }
+    let mut settled: HashSet<String> = HashSet::new();
+    let mut read = |ledger: Result<Option<HeldPath>, crate::machine_tree::held::Refusal>| {
+        let tail = ledger.and_then(|held| match held {
+            Some(held) => held.read_file_tail(VERDICTS_FILE, SWEEP_LEDGER_MAX_BYTES),
+            None => Ok(None),
+        });
+        match tail {
+            Ok(Some((bytes, whole))) => {
+                swept.ledgers_read += 1;
+                let text = String::from_utf8_lossy(&bytes);
+                for line in settled_lines(&text, whole) {
+                    if let Some(hit) = wanted.get(line) {
+                        settled.insert(hit.clone());
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => swept.ledgers_refused += 1,
+        }
+    };
+    // A SystemContext worker's, in the machine folder.
+    read(HeldPath::below(
+        &program_data,
+        &machine.join("service-logs"),
+    ));
+    // Each profile's, in either tree its account's processes may use.
+    for profile in profiles {
+        match HeldPath::base(profile) {
+            Ok(base) => {
+                for segment in [crate::appdirs::NEW_APP, crate::appdirs::OLD_APP] {
+                    read(base.walk(&[
+                        "AppData",
+                        "Local",
+                        crate::appdirs::ORG,
+                        segment,
+                        "data",
+                        "logs",
+                    ]));
+                }
+            }
+            Err(refused) => read(Err(refused)),
+        }
+    }
+    let names = settled_names(listing, &settled);
+    swept.kept = wanted.len() - names.len();
+    for name in names {
+        match crashes.remove_file(name) {
+            Ok(true) => swept.removed.push(name.to_string()),
+            // Gone meanwhile: a drainer that may delete it did.
+            Ok(false) => {}
+            Err(_) => swept.failed += 1,
+        }
+    }
+    swept
 }
 
 // ─── Crash-loop suppression ────────────────────────────────────────────────
@@ -2452,7 +2567,7 @@ mod tests {
                 assert!(crashes.join(kept).is_file(), "{kept} stays");
             }
             assert!(beside.is_file(), "nothing beside crashes is removed");
-            assert_eq!(swept.removed, [first.clone()], "{swept:?}");
+            assert_eq!(swept.removed, std::slice::from_ref(&first), "{swept:?}");
             assert_eq!((swept.ledgers_read, swept.failed), (1, 0), "{swept:?}");
             let report = format!("{swept:?}");
             assert!(
@@ -2529,7 +2644,11 @@ mod tests {
 
             let control = profile_with_ledger(&root, "control", &line);
             let swept = sweep_settled(&[control]);
-            assert_eq!(swept.removed, [record.clone()], "control: {swept:?}");
+            assert_eq!(
+                swept.removed,
+                std::slice::from_ref(&record),
+                "control: {swept:?}"
+            );
             assert!(!crashes.join(&record).exists());
             println!("{CHECKED}");
         }

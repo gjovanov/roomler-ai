@@ -6297,11 +6297,11 @@ is silent while it waits.
   own log line about 1 stall in 6, measured on a Windows dev box on
   2026-10-19.
 - The sidecar is fsync'd before its rename
-  (`crates/agent-core/src/crash_recorder.rs:332`, #2955). Without that,
+  (`crates/agent-core/src/crash_recorder.rs:334`, #2955). Without that,
   a power loss could persist a NUL-filled file that no parser reads; one
   was seen, skipped at every start for two weeks. A sidecar that does
   not parse is now moved once into `crashes/malformed/`
-  (`crash_recorder.rs:724`), so it is kept but not re-warned.
+  (`crash_recorder.rs:726`), so it is kept but not re-warned.
 
 **What the first named stall found** (#2551). The first stall to name
 its stage came on 2026-10-22, under 0.4.151, and read
@@ -6374,7 +6374,7 @@ sequenceDiagram
 | Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:392` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
 | Condensed per thread to the leaf end of its heaviest path, 16 frames, with identical stacks folded and a 24 KiB cap | `condense_sample` `:191`, `condense_procfs` `:412` |
-| Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:148` |
+| Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:150` |
 | The whole report stays beside the log as `stall-<unix>-<pid>.threads.txt`, the newest 3 | `FULL_REPORTS_KEPT`, `thread_dump.rs:46` |
 
 - The summary reads `runtime stalled: the async watchdog has not
@@ -6856,7 +6856,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
-| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1115)) | `EndedByItsHost` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1116)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
 | Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
@@ -7394,8 +7394,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1470`). Again in
-  the `Stop` arm (`supervisor.rs:1612`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1475`). Again in
+  the `Stop` arm (`supervisor.rs:1617`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

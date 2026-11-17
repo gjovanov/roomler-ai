@@ -687,10 +687,11 @@ const NETD_REAP_WAIT: Duration = TERMINATE_WAIT;
 
 /// #2010 — the longest this supervisor's shutdown takes from the moment Stop or
 /// Preshutdown is posted: up to one [`POLL_INTERVAL`] before the loop sees it,
-/// the graceful budget, then `TerminateProcess` and its reap wait, then netd's
-/// kill and its reap wait (#2087). The host's `STOP_PENDING` wait hint is built
-/// from this, so raising a budget here raises the hint with it.
+/// the crash sweep a start waits for (#3799), the graceful budget, then
+/// `TerminateProcess` and its reap wait, then netd's kill and its reap wait
+/// (#2087). The `STOP_PENDING` wait hint is built from this and grows with it.
 pub(super) const SHUTDOWN_BOUND: Duration = POLL_INTERVAL
+    .saturating_add(crash_sweep::BEFORE_START_WAIT)
     .saturating_add(WORKER_GRACEFUL_STOP_BUDGET)
     .saturating_add(TERMINATE_WAIT)
     .saturating_add(NETD_REAP_WAIT);
@@ -1449,6 +1450,10 @@ pub fn run(
     // #3289 — how the last worker ended, when this host saw it and it was not the
     // worker failing. The next spawn hands it over, however long after.
     let mut prior_end: Option<&'static str> = None;
+    // #3799 — the crash sweep: its thread, the SID of the person whose worker
+    // started last, and when that person's ledger was last swept.
+    let crash_sweep = crash_sweep::CrashSweep::start();
+    let (mut last_person, mut last_person_sweep) = (None::<String>, Instant::now());
 
     // #2465 — a crash ends a host, not its worker. A worker an earlier host of
     // this service left running holds this config's single-instance lock, so
@@ -1745,6 +1750,14 @@ pub fn run(
             }
         }
 
+        // #3799 — once a minute while a person's worker runs, what that
+        // person's ledger settled leaves `crashes`, on the sweep's thread.
+        let person = current
+            .as_ref()
+            .filter(|w| !w.is_system_context)
+            .and(last_person.as_deref());
+        crash_sweep::every_minute(crash_sweep.as_ref(), person, &mut last_person_sweep);
+
         // Decide whether to spawn. ⚠️ `keep_stream_alive` is NOT
         // controller presence: since 0.3.0-rc.7 it is
         // `ROOMLERD_ENABLE_SYSTEM_SWAP`, and the `peer_presence` marker
@@ -1893,6 +1906,7 @@ pub fn run(
                         // its duplicated elevated linked token; both
                         // OwnedHandles outlive this call. CreateProcessAsUserW
                         // duplicates any handles it needs.
+                        crash_sweep::before_start(crash_sweep.as_ref()); // #3799
                         match unsafe { spawn_in_session(spawn_handle, &worker_exe, &spawn_args) } {
                             Ok(p) => {
                                 tracing::info!(
@@ -1902,6 +1916,7 @@ pub fn run(
                                     system_context_waiting,
                                     "supervisor: spawned worker"
                                 );
+                                last_person = crate::win_token::user_sid_of(p.process.raw());
                                 current = Some(ActiveWorker {
                                     process: p,
                                     session: sid,
@@ -2048,6 +2063,7 @@ pub fn run(
                 spawn_args.extend(pin_args.iter().map(String::as_str));
                 spawn_args.extend(end_args.iter().map(String::as_str));
                 let cmdline = winlogon_token::build_cmdline(&worker_exe, &spawn_args);
+                crash_sweep::before_start(crash_sweep.as_ref()); // #3799
                 let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
                     let Some(pid) = winlogon_token::find_winlogon_pid_in_session(sid)
                         .context("find_winlogon_pid_in_session")?
@@ -3024,6 +3040,11 @@ pub(crate) fn merge_env_block(
     block.push(0);
     Ok(block)
 }
+
+/// #3799 — the host removes from the machine's `crashes` what a person's
+/// worker sent but may not delete, before every worker start and once a
+/// minute, on a thread of its own.
+mod crash_sweep;
 
 #[cfg(test)]
 mod tests {

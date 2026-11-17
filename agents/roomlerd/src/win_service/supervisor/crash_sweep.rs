@@ -37,7 +37,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The longest a worker's start waits for the sweep before it: the bound for
 /// a sweep that hangs on a profile's disk. Part of the supervisor's
@@ -46,6 +46,26 @@ pub(super) const BEFORE_START_WAIT: Duration = Duration::from_secs(3);
 
 /// How often a running person's ledger is swept.
 pub(super) const PERSON_SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// The supervisor, right before it spawns a worker of either kind: the
+/// sweep against every ledger, waited for [`BEFORE_START_WAIT`] at most.
+pub(super) fn before_start(sweep: Option<&CrashSweep>) {
+    if let Some(sweep) = sweep {
+        sweep.before_start();
+    }
+}
+
+/// The supervisor's loop, on each pass: while the person with the SID
+/// `person` runs a worker, a sweep of that person's ledger every
+/// [`PERSON_SWEEP_EVERY`], never waited for.
+pub(super) fn every_minute(sweep: Option<&CrashSweep>, person: Option<&str>, last: &mut Instant) {
+    if let (Some(sweep), Some(sid)) = (sweep, person)
+        && last.elapsed() >= PERSON_SWEEP_EVERY
+    {
+        sweep.person(sid);
+        *last = Instant::now();
+    }
+}
 
 /// What a sweep reads its ledgers from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,8 +141,22 @@ impl CrashSweep {
     pub(super) fn before_start(&self) -> bool {
         let mut state = lock(&self.shared);
         state.full_asked += 1;
-        let _ = self.wait;
-        false
+        let asked = state.full_asked;
+        self.shared.changed.notify_all();
+        let (state, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, self.wait, |s| s.full_done < asked)
+            .unwrap_or_else(PoisonError::into_inner);
+        let done = state.full_done >= asked;
+        drop(state);
+        if !done {
+            tracing::warn!(
+                bound_ms = self.wait.as_millis() as u64,
+                "crash sweep: still running; the worker starts without waiting for it"
+            );
+        }
+        done
     }
 
     /// While the person with `sid` runs a worker: a sweep against their
@@ -288,7 +322,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::time::Instant;
 
     /// A start waits for the sweep it asked for: the sweep has run when
     /// `before_start` returns.
@@ -412,7 +445,7 @@ mod tests {
     /// spawn.
     #[test]
     fn every_worker_start_asks_for_the_sweep_first() {
-        let source = include_str!("supervisor.rs");
+        let source = include_str!("../supervisor.rs");
         let spawns = [
             "unsafe { spawn_in_session(spawn_handle,",
             "winlogon_token::spawn_system_in_session(&token,",
@@ -424,7 +457,7 @@ mod tests {
             let arm = &source[..at];
             let arm = &arm[arm.rfind("SpawnDecision::").unwrap_or(0)..];
             assert!(
-                arm.contains("before_start()"),
+                arm.contains("crash_sweep::before_start("),
                 "the arm that spawns with {spawn:?} asks for the sweep first"
             );
         }
