@@ -227,6 +227,13 @@ graph LR
 That uniformity is why adding DERP touched no WireGuard code: `DerpConn` is just
 another `RelayConn`.
 
+A remote-desktop session can read the carrier too. Behind `ROOMLERD_RC_CARRIER_RANK`
+(FR-148 P4, off by default), a session asks LocalAPI `peers` at its offer for the
+carrier to the viewer's device. Unless that carrier is `Direct`, neither upgrading nor
+stalled, every candidate only the mesh carries ranks below every TURN relay, so the
+video crosses the mesh only when nothing else connects
+([remote-control.md](remote-control.md#the-carrier-rank-fr-148-p4)).
+
 ### The direct carrier's socket buffers (FR-110)
 
 A direct carrier is one UDP socket, and the kernel holds whatever arrives

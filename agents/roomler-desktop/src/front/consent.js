@@ -16,6 +16,7 @@
   let activeSession = null // session id currently shown in the modal
   let sending = false // an answer is on its way
   let answered = null // the question this modal answered: not shown again
+  let shownAt = 0 // #3987: performance.now() when the question shown came up
 
   // #3873 — how long the modal waits for the app's reply to a click: the
   // prompt window's limit (panel-consent.js), above the app's own 10 s.
@@ -83,7 +84,12 @@
       )
     })
     try {
-      await Promise.race([invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session }), limit])
+      // #3987 — with how long the question has been shown: the app holds
+      // back a click within a second of a new question coming up.
+      await Promise.race([
+        invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session, shown: Math.round(performance.now() - shownAt) }),
+        limit,
+      ])
       answered = session
       hide()
     } catch (e) {
@@ -121,6 +127,7 @@
   function show(pc) {
     const el = ensureModal()
     activeSession = pc.session_id
+    shownAt = performance.now()
     const kind = KINDS[pc.kind] || KINDS.rc
     document.getElementById('consent-title').textContent = kind.title
     document.getElementById('consent-verb').textContent = kind.verb

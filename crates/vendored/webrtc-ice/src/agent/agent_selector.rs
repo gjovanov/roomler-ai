@@ -53,13 +53,7 @@ const FOLLOW_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// Unparseable remotes (mDNS names) are conservatively treated as
 /// overlay-possible. Env overrides: `ROOMLER_ICE_FOLLOW_RENOMINATION=0`
 /// never follows (rc.262 semantics), `=1` always follows (rc.260 semantics).
-fn should_follow_renomination(new_pair: &CandidatePair, current: &CandidatePair) -> bool {
-    let new_remote_is_real_path = new_pair
-        .remote
-        .address()
-        .parse::<std::net::IpAddr>()
-        .map(|ip| !crate::agent::agent_gather::is_roomler_overlay_ip(&ip))
-        .unwrap_or(false);
+pub(crate) fn should_follow_renomination(new_pair: &CandidatePair, current: &CandidatePair) -> bool {
     let current_stale = std::time::SystemTime::now()
         .duration_since(current.remote.last_received())
         .map(|elapsed| elapsed > FOLLOW_STALE_AFTER)
@@ -68,23 +62,38 @@ fn should_follow_renomination(new_pair: &CandidatePair, current: &CandidatePair)
         std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION")
             .ok()
             .as_deref(),
-        new_remote_is_real_path,
-        new_pair.priority() > current.priority(),
+        outranks_on_a_real_path(new_pair, current),
         current_stale,
     )
+}
+
+/// The follow gate's upward test: `pair`'s remote parses to an address off the
+/// overlay range, and `pair` ranks strictly above `selected` by this agent's
+/// own numbers.
+///
+/// Roomler patch (FR-148 P4): also the only test the controlled agent's checks
+/// after its first selection use ([`AgentInternal::check_pairs_above_selection`]),
+/// so the agent never validates a pair this gate would refuse to follow.
+pub(crate) fn outranks_on_a_real_path(pair: &CandidatePair, selected: &CandidatePair) -> bool {
+    let remote_is_real_path = pair
+        .remote
+        .address()
+        .parse::<std::net::IpAddr>()
+        .map(|ip| !crate::agent::agent_gather::is_roomler_overlay_ip(&ip))
+        .unwrap_or(false);
+    remote_is_real_path && pair.priority() > selected.priority()
 }
 
 /// Pure decision core of [`should_follow_renomination`] — unit-tested.
 fn follow_renomination_policy(
     env: Option<&str>,
-    new_remote_is_real_path: bool,
-    new_prio_higher: bool,
+    outranks_on_a_real_path: bool,
     current_stale: bool,
 ) -> bool {
     match env {
         Some("0") => false,
         Some("1") => true,
-        _ => (new_remote_is_real_path && new_prio_higher) || current_stale,
+        _ => outranks_on_a_real_path || current_stale,
     }
 }
 
@@ -141,6 +150,57 @@ impl AgentInternal {
             ControlledSelector::ping_candidate(self, &local, &remote).await;
         }
     }
+
+    /// Roomler patch (FR-148 P4): with the carrier rank set, the controlled
+    /// agent keeps checking after its first selection: every pair the follow
+    /// gate would follow ([`outranks_on_a_real_path`]), bounded the way
+    /// [`AgentInternal::ping_all_candidates`] bounds a check. Upstream checks
+    /// nothing after the first selection, so a relay candidate gathered later
+    /// never sends from its relay: its TURN client asks for a permission only
+    /// when it first sends to a peer, and the server discards the far side's
+    /// checks to it until then. The first check from the relay creates the
+    /// permission. Without the rank this does nothing.
+    pub(crate) async fn check_pairs_above_selection(&self) {
+        if self.carrier_rank.is_none() {
+            return;
+        }
+        let Some(selected) = self.agent_conn.get_selected_pair() else {
+            return;
+        };
+        let pairs: Vec<_> = {
+            let checklist = self.agent_conn.checklist.lock().await;
+            let mut pairs = vec![];
+            for p in checklist.iter() {
+                if !outranks_on_a_real_path(p, &selected) {
+                    continue;
+                }
+                let p_state = p.state.load(Ordering::SeqCst);
+                if p_state == CandidatePairState::Waiting as u8 {
+                    p.state
+                        .store(CandidatePairState::InProgress as u8, Ordering::SeqCst);
+                } else if p_state != CandidatePairState::InProgress as u8 {
+                    continue;
+                }
+                if p.binding_request_count.load(Ordering::SeqCst) > self.max_binding_requests {
+                    p.state
+                        .store(CandidatePairState::Failed as u8, Ordering::SeqCst);
+                } else {
+                    p.binding_request_count.fetch_add(1, Ordering::SeqCst);
+                    pairs.push((p.local.clone(), p.remote.clone()));
+                }
+            }
+            pairs
+        };
+        for (local, remote) in pairs {
+            log::trace!(
+                "[{}]: check above the selection {} -> {}",
+                self.get_name(),
+                local,
+                remote
+            );
+            ControlledSelector::ping_candidate(self, &local, &remote).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,20 +209,21 @@ mod follow_renomination_tests {
 
     #[test]
     fn v2_1_policy_matrix() {
-        // args: (env, new_remote_is_real_path, new_prio_higher, current_stale)
+        // args: (env, outranks_on_a_real_path, current_stale)
         // Default: real-path remotes followed ONLY upward (strictly higher
         // pair priority); overlay remotes only as failover off a stale pair.
-        assert!(follow_renomination_policy(None, true, true, false)); // host→srflx upgrade
-        assert!(!follow_renomination_policy(None, true, false, false)); // equal-prio sibling: NO thrash
-        assert!(!follow_renomination_policy(None, false, true, false)); // overlay remote, healthy current
-        assert!(follow_renomination_policy(None, false, false, true)); // stale failover, any pair
-        assert!(follow_renomination_policy(None, true, false, true)); // stale failover, sibling ok
+        // Which pairs are upward is `outranks_on_a_real_path`'s own matrix
+        // (FR-148 P4, agent_carrier_rank_test.rs).
+        assert!(follow_renomination_policy(None, true, false)); // host→srflx upgrade
+        assert!(!follow_renomination_policy(None, false, false)); // sibling or overlay remote: NO thrash
+        assert!(follow_renomination_policy(None, false, true)); // stale failover, any pair
+        assert!(follow_renomination_policy(None, true, true)); // stale failover, upward too
         // Env pins: 0 = never (rc.262), 1 = always (rc.260).
-        assert!(!follow_renomination_policy(Some("0"), true, true, true));
-        assert!(follow_renomination_policy(Some("1"), false, false, false));
+        assert!(!follow_renomination_policy(Some("0"), true, true));
+        assert!(follow_renomination_policy(Some("1"), false, false));
         // Garbage env falls back to the v2.1 rule.
-        assert!(follow_renomination_policy(Some("x"), true, true, false));
-        assert!(!follow_renomination_policy(Some("x"), true, false, false));
+        assert!(follow_renomination_policy(Some("x"), true, false));
+        assert!(!follow_renomination_policy(Some("x"), false, false));
     }
 }
 
@@ -607,6 +668,8 @@ impl ControlledSelector for AgentInternal {
                 log::trace!("[{}]: checking keepalive", self.get_name());
                 self.check_keepalive().await;
                 self.warm_standby_pairs().await;
+                // Roomler patch (FR-148 P4): a no-op without the carrier rank.
+                self.check_pairs_above_selection().await;
             }
         } else {
             self.ping_all_candidates().await;

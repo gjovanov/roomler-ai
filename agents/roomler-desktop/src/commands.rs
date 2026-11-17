@@ -457,6 +457,25 @@ pub async fn cmd_enroll(
     Ok(status_report())
 }
 
+/// FR-43 P3a, #3996 — what a re-enroll says when this account's config holds
+/// no enrollment, or is not there: the device service holds it. A one-row
+/// Mac's person has no file at all; nor has a Windows background-service
+/// install's person, whose machine-wide file only administrators read.
+fn enrollment_elsewhere() -> String {
+    if cfg!(target_os = "macos") {
+        "The root daemon holds this Mac's enrollment. Refresh it with \
+         `sudo roomlerd re-enroll --token <token>`."
+    } else if cfg!(windows) {
+        "The device service holds this device's enrollment, in its machine-wide \
+         configuration. Refresh it from an elevated shell with \
+         `roomlerd re-enroll --token <token>`."
+    } else {
+        "The device service holds this device's enrollment, in its system \
+         configuration. Refresh it with `sudo roomlerd re-enroll --token <token>`."
+    }
+    .to_string()
+}
+
 /// Refresh the token using an existing config. Mirrors the CLI's
 /// `re-enroll --token` subcommand. Targets the config the daemon
 /// actually reads (machine-global first) — writing the per-user copy
@@ -474,15 +493,11 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         .unwrap_or(false);
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-    // FR-43 P3a — this file has nothing to refresh.
-    if !existing.has_primary_enrollment() {
-        return Err(
-            "The root daemon holds this Mac's enrollment. Refresh it with \
-             `sudo roomlerd re-enroll --token <token>`."
-                .to_string(),
-        );
-    }
+    // FR-43 P3a — this file has nothing to refresh. #3996 — nor has a file
+    // that is not there: the device service holds the enrollment.
+    let Some(existing) = load_if_there(&path)?.filter(AgentConfig::has_primary_enrollment) else {
+        return Err(enrollment_elsewhere());
+    };
     let fresh = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
         enrollment_token: &trimmed,
@@ -600,14 +615,32 @@ pub async fn cmd_config_entries() -> Result<ConfigListing, String> {
     tokio::task::spawn_blocking(|| {
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
-        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        Ok(ConfigListing {
-            entries: roomler_node_core::config_surface::entries(&cfg),
-            machine_merged: false,
-        })
+        entries_from_file(&path)
     })
     .await
     .map_err(|e| format!("task join: {e}"))?
+}
+
+/// The configuration page's rows from the file at `path`, when no device
+/// service answered the listing. #3996 — no file there is said so, with
+/// nothing in the log: the Welcome reads this listing as it opens, and a
+/// start with no service answering logged "the host must be re-enrolled"
+/// for a one-row Mac's person or a host not enrolled yet.
+fn entries_from_file(path: &PathBuf) -> Result<ConfigListing, String> {
+    let cfg = load_if_there(path)?.ok_or_else(|| no_config_here(path))?;
+    Ok(ConfigListing {
+        entries: roomler_node_core::config_surface::entries(&cfg),
+        machine_merged: false,
+    })
+}
+
+/// #3996 — what a page reads when no device service answered and no config
+/// file is there to fall back on.
+fn no_config_here(path: &Path) -> String {
+    format!(
+        "There is no configuration file at {} yet, and the device service did not answer.",
+        path.display()
+    )
 }
 
 /// #2871 — is `key` the root half's on a two-half Mac
@@ -898,7 +931,7 @@ fn config_set_blocking(
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    let mut cfg = load_if_there(&path)?.ok_or_else(|| no_config_here(&path))?;
     roomler_node_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     roomler_node_core::config_surface::entry_for(&cfg, &key)
@@ -1832,18 +1865,29 @@ fn no_handler_message(scheme: &str) -> String {
 pub fn server_origin_blocking() -> Result<String, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
+    server_origin_from(&path, daemon_node_status_blocking)
+}
+
+/// [`server_origin_blocking`] for the config at `path`, asking the daemon
+/// (`daemon`) when that file holds no enrollment. #3996 — or is not there: a
+/// one-row Mac's person never has one. Until #3996 a missing file ended here
+/// as "not enrolled", with `config::load`'s "must be re-enrolled" in the log,
+/// and the daemon was never asked.
+fn server_origin_from(
+    path: &PathBuf,
+    daemon: impl FnOnce() -> Option<NodeStatus>,
+) -> Result<String, String> {
     let not_enrolled = || "This device isn't enrolled yet — no server to open.".to_string();
-    let cfg = config::load(&path).map_err(|_| not_enrolled())?;
+    let cfg = load_if_there(path).map_err(|_| not_enrolled())?;
     // FR-43 P3a — on a one-row Mac the server is in the root daemon's enrollment,
     // not in the person's file.
-    let server = if cfg.has_primary_enrollment() {
-        cfg.server_url
-    } else {
-        daemon_node_status_blocking()
+    let server = match cfg.filter(AgentConfig::has_primary_enrollment) {
+        Some(cfg) => cfg.server_url,
+        None => daemon()
             .as_ref()
             .and_then(daemon_identity)
             .and_then(|id| id.server_url)
-            .ok_or_else(not_enrolled)?
+            .ok_or_else(not_enrolled)?,
     };
     let server = server.trim().trim_end_matches('/').to_string();
     if !server.starts_with("https://") && !server.starts_with("http://") {
@@ -1890,13 +1934,15 @@ pub async fn cmd_open_remote(
     let url = tokio::task::spawn_blocking(move || {
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
-        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        let (server, tid) = if cfg.has_primary_enrollment() {
-            remote_target(&cfg, org.as_deref())?
-        } else {
-            let status = daemon_node_status_blocking()
-                .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
-            daemon_remote_target(&status, org.as_deref())?
+        // #3996 — no file is a file with no enrollment: ask the daemon.
+        let (server, tid) = match load_if_there(&path)?.filter(AgentConfig::has_primary_enrollment)
+        {
+            Some(cfg) => remote_target(&cfg, org.as_deref())?,
+            None => {
+                let status = daemon_node_status_blocking()
+                    .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
+                daemon_remote_target(&status, org.as_deref())?
+            }
         };
         Ok::<String, String>(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
     })
@@ -2055,7 +2101,7 @@ fn set_device_name_blocking(name: String) -> Result<StatusReport, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
-    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    let mut cfg = load_if_there(&path)?.ok_or_else(|| no_config_here(&path))?;
     cfg.machine_name = trimmed;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
@@ -2543,26 +2589,43 @@ pub async fn cmd_open_config_dir() -> Result<(), String> {
 /// wrong profile and the agent would never see it.
 ///
 /// #3873 — `session` is the question the page shows, `None` when it shows
-/// none: that click is logged too ([`answer_click`]).
+/// none: that click is logged too ([`answer_click`]). #3987 — `shown` is how
+/// long, in ms, the page has shown that question.
 #[tauri::command]
-pub async fn cmd_consent_approve(session: Option<String>) -> Result<String, String> {
-    consent_decide(session.as_deref(), true).await
+pub async fn cmd_consent_approve(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), true, shown).await
 }
 
 /// Deny a pending operator-consent prompt over the LocalAPI.
 #[tauri::command]
-pub async fn cmd_consent_deny(session: Option<String>) -> Result<String, String> {
-    consent_decide(session.as_deref(), false).await
+pub async fn cmd_consent_deny(
+    session: Option<String>,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    consent_decide(session.as_deref(), false, shown).await
 }
 
 /// Send an Approve/Deny decision to the daemon over the LocalAPI.
-async fn consent_decide(session: Option<&str>, allow: bool) -> Result<String, String> {
+async fn consent_decide(
+    session: Option<&str>,
+    allow: bool,
+    shown: Option<f64>,
+) -> Result<String, String> {
+    // #3987 — how long the click's question has been in front of the person.
+    let in_front = crate::panels::in_front_for(
+        crate::panels::consent_raised_ago(std::time::Instant::now()),
+        shown_for(shown),
+    );
     answer_click(
         session,
         allow,
+        in_front,
         CONSENT_ANSWER_WITHIN,
         |session, allow| async move {
-            let mut client = localapi::connect().await.map_err(AskError::Connect)?;
+            let mut client = connect_service().await.map_err(AskError::Connect)?;
             client
                 .consent_decide(&session, allow)
                 .await
@@ -2583,6 +2646,13 @@ const CONSENT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// #3873 — what the page shows for a click with no question on it.
 const NO_QUESTION: &str = "No question is waiting for an answer here, so nothing was sent.";
 
+/// #3987 — the page's `shown`, in ms, as a time. Anything but a finite
+/// number at or above zero is not known.
+fn shown_for(ms: Option<f64>) -> Option<Duration> {
+    ms.filter(|m| m.is_finite() && *m >= 0.0)
+        .and_then(|m| Duration::try_from_secs_f64(m / 1000.0).ok())
+}
+
 /// #3873 — the consent read's name in the refresh ledger.
 const CONSENT_PENDING_SURFACE: &str = "consent_pending";
 
@@ -2600,6 +2670,8 @@ enum AskError {
 /// log when it arrives and again with its outcome, and given `within` for the
 /// daemon's answer. `ask` is the round trip ([`consent_decide`]'s LocalAPI
 /// call). Returns what the page shows: `approved` / `denied`, or the reason.
+/// #3987 — `in_front` is how long the click's question has been in front of
+/// the person ([`crate::panels::in_front_for`]).
 ///
 /// Until #3873 no step of a click logged anything and none had a bound: on a
 /// Linux system install two clicks on a question the prompt window showed
@@ -2608,6 +2680,7 @@ enum AskError {
 async fn answer_click<F, Fut>(
     session: Option<&str>,
     allow: bool,
+    in_front: Option<Duration>,
     within: Duration,
     ask: F,
 ) -> Result<String, String>
@@ -2623,6 +2696,24 @@ where
         );
         return Err(NO_QUESTION.into());
     };
+    // #3987 — a click this soon after its question came to the front may
+    // have been aimed at what was under the pointer before it: in the log
+    // with why, and never sent. The page shows why, and the next click goes.
+    if !crate::panels::click_armed(in_front) {
+        let after = in_front.unwrap_or_default();
+        tracing::warn!(
+            verb,
+            session,
+            ?after,
+            arming = ?crate::panels::CONSENT_ARMING,
+            "consent: a click arrived too soon after the question came to the front; nothing was sent"
+        );
+        return Err(format!(
+            "Nothing was sent: this click came {:.1} s after the question came up, too soon to \
+             be sure it was meant for it. Click again to answer.",
+            after.as_secs_f64()
+        ));
+    }
     tracing::info!(
         verb,
         session,
@@ -2639,6 +2730,11 @@ where
                 .to_string(),
             "the device service has no such question waiting (answered, withdrawn or expired)"
                 .to_string(),
+        ),
+        // #3998 — no service at all, said plainly.
+        Ok(Err(AskError::Connect(e))) if crate::tray::no_service(&e) => (
+            "Could not reach the device service: it is not running.".to_string(),
+            describe_io("connect", &e),
         ),
         Ok(Err(AskError::Connect(e))) => (
             format!("Could not reach the device service: {e}"),
@@ -2679,7 +2775,7 @@ where
 /// ([`pending_answer`]): both pages stay quiet on it and keep what they show.
 #[tauri::command]
 pub async fn cmd_get_pending_consents() -> Result<Vec<ConsentRequest>, String> {
-    let read = match localapi::connect().await {
+    let read = match connect_service().await {
         Ok(mut c) => c
             .consent_pending()
             .await
@@ -2726,14 +2822,53 @@ pub fn cmd_consent_modal_needed() -> bool {
 /// FR-27 — remote-control sessions currently LIVE on this device, for the
 /// "Being viewed by …" banner.
 ///
-/// Never errors, for the same reason as [`cmd_get_pending_consents`]: an empty
-/// list and a daemon-down are the same *render* (no banner), and the Overview
-/// already surfaces daemon-down properly.
+/// #3998 — a read that fails is an `Err`, not an empty list
+/// ([`sessions_answer`]): the banner keeps its words on it, and the session
+/// watch in `main.rs` decides whether the banner stays up.
 #[tauri::command]
-pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
+pub async fn cmd_rc_sessions() -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    let read = match connect_service().await {
+        Ok(mut c) => c.rc_sessions().await.map_err(|e| ("rc_sessions", e)),
+        Err(e) => Err(("connect", e)),
+    };
+    sessions_answer(read)
+}
+
+/// #3998 — what the banner page gets for its read of the sessions: the list,
+/// or, for a read that failed, why. Until #3998 a failed read was an empty
+/// list, and the banner said "Being viewed" with no name and offered a
+/// Disconnect that ended nothing.
+fn sessions_answer(
+    read: Result<Vec<roomler_localapi::RcSessionInfo>, (&'static str, std::io::Error)>,
+) -> Result<Vec<roomler_localapi::RcSessionInfo>, String> {
+    read.map_err(|(stage, e)| describe_io(stage, &e))
+}
+
+/// #3998 — [`localapi::connect`] for the consent prompt, the session banner
+/// and the tray's red: a connect that failed while this person's own
+/// endpoint is gone comes back as no service ([`proven`]).
+pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     match localapi::connect().await {
-        Ok(mut c) => c.rc_sessions().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(client) => Ok(client),
+        Err(e) => Err(proven(e, localapi::own_endpoint_gone().await)),
+    }
+}
+
+/// #3998 — a failed connect's error, or, when this person's own endpoint is
+/// gone (`own_endpoint_gone`), `NotFound`: no device service is there for
+/// them, which the tray reads as an answer ([`crate::tray::no_service`]).
+/// On a Linux system install and on a Mac, `connect`'s error is its last
+/// endpoint's, the system socket in a folder only root may enter, so a
+/// stopped daemon read there as `PermissionDenied` (os error 13), the words
+/// a click's status line showed in the 0.4.224 Linux lab.
+pub(crate) fn proven(e: std::io::Error, own_endpoint_gone: bool) -> std::io::Error {
+    if own_endpoint_gone && !crate::tray::no_service(&e) {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the device service is not running: this account's own LocalAPI endpoint is gone",
+        )
+    } else {
+        e
     }
 }
 
@@ -3466,10 +3601,29 @@ fn refresh_ok(surface: &'static str) {
 /// enrolled.
 fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
     let path = active_config_path(is_scm).ok()?;
+    load_if_there(&path).ok().flatten()
+}
+
+/// #3996 — the config at `path`, for a caller to whom no file there is a
+/// normal state. The companion never runs on a config (the device service
+/// does), so that is every read it makes. A one-row Mac's person never has a
+/// file: the root daemon holds the enrollment (FR-43). A host that is not
+/// enrolled yet has none, and the person at a Windows background-service
+/// install cannot see the machine-wide one.
+///
+/// No file is `Ok(None)`, with nothing logged. A file that is there goes
+/// through [`config::load`], so a broken one still logs its ERROR and is
+/// recovered from its `.prev`; [`config::read_if_present`] would hide it
+/// (FR-66). Until #3996 most of these reads went straight to `config::load`,
+/// and a start with no device service answering logged "the host must be
+/// re-enrolled" about a healthy one-row Mac.
+fn load_if_there(path: &PathBuf) -> Result<Option<AgentConfig>, String> {
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    config::load(&path).ok()
+    config::load(path)
+        .map(Some)
+        .map_err(|e| format!("Loading config: {e}"))
 }
 
 /// A `Command` that never flashes a console window on Windows. The tray is a GUI
@@ -3878,6 +4032,74 @@ mod tests {
         );
         assert_eq!(r.agent_id.as_deref(), Some("from-file"));
         assert_eq!(r.server_url.as_deref(), Some("https://file.example"));
+    }
+
+    /// #3996 — a start while no device service answers, on a host whose
+    /// person holds no config (a one-row Mac, or one not enrolled yet), logs
+    /// no ERROR and no "must be re-enrolled". The Welcome reads the
+    /// configuration listing as it opens, and with no service answering the
+    /// listing falls back to the file. Open Roomler falls back to the daemon,
+    /// which a missing file no longer keeps it from asking. On 0.4.224 each
+    /// start of a one-row Mac's script install logged the ERROR.
+    #[test]
+    fn a_start_with_no_config_and_no_service_logs_no_error() {
+        // A second live dispatcher, so that no other test thread's visit
+        // caches `config::load`'s callsites as never logged (see
+        // `first_run::tests::a_reopen_logs_what_it_shows`).
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        let (log, guard) = capture();
+        let listing = entries_from_file(&path).map(|l| l.entries.len());
+        let no_service = server_origin_from(&path, || None);
+        let one_row = server_origin_from(&path, || {
+            Some(daemon_status(
+                "6ab7a24f352abff7547c5062",
+                Some("6a975e17971e2d55ddcdedb2"),
+            ))
+        });
+        drop(guard);
+        let shown = listing.expect_err("no file and no service: nothing to list");
+        assert!(
+            shown.starts_with("There is no configuration file at"),
+            "{shown}"
+        );
+        assert_eq!(
+            no_service,
+            Err("This device isn't enrolled yet — no server to open.".to_string())
+        );
+        assert_eq!(
+            one_row.as_deref(),
+            Ok("https://roomler.ai"),
+            "a one-row Mac's server is its root daemon's"
+        );
+        let text = log.text();
+        assert!(
+            !text.contains("ERROR") && !text.contains("re-enrolled"),
+            "{text}"
+        );
+    }
+
+    /// #3996 — a config that IS there and is broken still logs its ERROR:
+    /// that line is what a really broken config writes, and a missing file
+    /// must not be read the same way, nor hide it.
+    #[test]
+    fn a_broken_config_still_logs_its_error() {
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        // All NUL, as an unclean shutdown once left one (`config::load`).
+        std::fs::write(&path, [0u8; 64]).expect("the broken file");
+        let (log, guard) = capture();
+        let listing = entries_from_file(&path).map(|l| l.entries.len());
+        drop(guard);
+        let shown = listing.expect_err("a broken file lists nothing");
+        assert!(shown.starts_with("Loading config: "), "{shown}");
+        let text = log.text();
+        assert!(
+            text.contains("ERROR") && text.contains("the host must be re-enrolled"),
+            "{text}"
+        );
     }
 
     // #1681 — stdout as `roomlerd service status [--as-service]` really prints
@@ -5091,9 +5313,13 @@ mod tests {
         let (log, _guard) = capture();
         let answered = tokio::time::timeout(
             Duration::from_secs(5),
-            answer_click(Some(SESSION), true, Duration::from_millis(50), |_, _| {
-                std::future::pending::<Result<bool, AskError>>()
-            }),
+            answer_click(
+                Some(SESSION),
+                true,
+                None,
+                Duration::from_millis(50),
+                |_, _| std::future::pending::<Result<bool, AskError>>(),
+            ),
         )
         .await
         .expect("5 s on, the click still waited for its answer: nothing bounds it");
@@ -5121,10 +5347,16 @@ mod tests {
         let within = Duration::from_secs(5);
 
         let (log, guard) = capture();
-        let taken = answer_click(Some(SESSION), true, within, |session, allow| async move {
-            assert_eq!((session.as_str(), allow), (SESSION, true));
-            Ok(true)
-        })
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            within,
+            |session, allow| async move {
+                assert_eq!((session.as_str(), allow), (SESSION, true));
+                Ok(true)
+            },
+        )
         .await;
         drop(guard);
         assert_eq!(taken.as_deref(), Ok("approved"));
@@ -5143,7 +5375,7 @@ mod tests {
                      screen answers a request to see or control it, and that is not this account \
                      right now (the seat changed since this connection opened).";
         let (log, guard) = capture();
-        let refused = answer_click(Some(SESSION), false, within, |_, _| async move {
+        let refused = answer_click(Some(SESSION), false, None, within, |_, _| async move {
             Err(AskError::Request(std::io::Error::other(format!(
                 "localapi error: {words}"
             ))))
@@ -5171,7 +5403,10 @@ mod tests {
 
         // No such question any more: answered, withdrawn or expired.
         let (log, guard) = capture();
-        let gone = answer_click(Some(SESSION), true, within, |_, _| async { Ok(false) }).await;
+        let gone = answer_click(Some(SESSION), true, None, within, |_, _| async {
+            Ok(false)
+        })
+        .await;
         drop(guard);
         let shown = gone.expect_err("not taken");
         assert!(shown.contains("no longer waiting"), "{shown}");
@@ -5180,7 +5415,7 @@ mod tests {
 
         // The device service could not be reached.
         let (log, guard) = capture();
-        let unreachable = answer_click(Some(SESSION), true, within, |_, _| async {
+        let unreachable = answer_click(Some(SESSION), true, None, within, |_, _| async {
             Err(AskError::Connect(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused,
             )))
@@ -5205,7 +5440,7 @@ mod tests {
     async fn a_click_with_no_question_is_logged_and_sends_nothing() {
         let sent = std::sync::atomic::AtomicBool::new(false);
         let (log, _guard) = capture();
-        let shown = answer_click(None, true, Duration::from_secs(5), |_, _| {
+        let shown = answer_click(None, true, None, Duration::from_secs(5), |_, _| {
             sent.store(true, std::sync::atomic::Ordering::SeqCst);
             async { Ok(true) }
         })
@@ -5221,6 +5456,94 @@ mod tests {
             text.contains("WARN") && text.contains("consent: a click with no question on the page"),
             "{text}"
         );
+    }
+
+    /// #3987 — a click that comes too soon after its question came to the
+    /// front (the app showed or raised the prompt, or the page put a new
+    /// question under the pointer) is logged with why and never sent, and
+    /// the page shows the reason. Escape, the Deny button's key, is held
+    /// back the same way. Once the question has been up for the arming
+    /// time, the click goes.
+    #[tokio::test]
+    async fn a_click_too_soon_after_the_question_came_up_is_logged_and_not_sent() {
+        let within = Duration::from_secs(5);
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            Some(Duration::from_millis(300)),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        let shown = shown.expect_err("a click 0.3 s after the question came up approves nothing");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert!(
+            shown.starts_with("Nothing was sent") && shown.contains("0.3 s"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click arrived too soon"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+
+        let (_log, guard) = capture();
+        let escape = answer_click(
+            Some(SESSION),
+            false,
+            Some(Duration::ZERO),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        assert!(
+            escape.is_err(),
+            "a Deny as the question comes up is held back too"
+        );
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (_log, guard) = capture();
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            Some(crate::panels::CONSENT_ARMING),
+            within,
+            |_, _| async { Ok(true) },
+        )
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
+    }
+
+    /// #3987 — the page's `shown` is a time only when it is a finite number
+    /// at or above zero; anything else is not known, and the app's own show
+    /// or raise of the window then decides alone.
+    #[test]
+    fn the_pages_shown_time_is_read_only_when_it_is_a_time() {
+        assert_eq!(shown_for(Some(300.0)), Some(Duration::from_millis(300)));
+        assert_eq!(shown_for(Some(0.0)), Some(Duration::ZERO));
+        assert_eq!(shown_for(None), None);
+        assert_eq!(shown_for(Some(-5.0)), None);
+        assert_eq!(shown_for(Some(f64::NAN)), None);
+        assert_eq!(shown_for(Some(f64::INFINITY)), None);
+        assert_eq!(shown_for(Some(f64::MAX)), None, "too large for a time");
     }
 
     /// The refresh ledger's count for the page's read of the questions.
@@ -5370,5 +5693,132 @@ mod tests {
             page_limit_ms(js),
             page_limit_ms(include_str!("front/panel-consent.js"))
         );
+    }
+
+    /// #3987 — each page tells the app, with every click, how long the
+    /// question under the pointer has been shown, and that time starts again
+    /// only when the question changes: it is set where a new question is
+    /// put up and nowhere else, which happens only once the question shown
+    /// is gone. The app raises the prompt only for a question it has not
+    /// seen. A poll that changes nothing arms nothing again, or a person
+    /// could never click.
+    #[test]
+    fn a_poll_that_changes_nothing_does_not_arm_the_question_again() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        for (page, js, put_up, guard) in [
+            (
+                "panel-consent.js",
+                include_str!("front/panel-consent.js"),
+                "function render(",
+                "if(!active||!pending.some((p)=>p.session_id===active))render(pending[0])",
+            ),
+            (
+                "consent.js",
+                include_str!("front/consent.js"),
+                "function show(",
+                "if(!activeSession||!pending.some((p)=>p.session_id===activeSession)){show(pending[0])}",
+            ),
+        ] {
+            assert_eq!(
+                js.matches("shownAt = performance.now()").count(),
+                1,
+                "{page}: the time a question is shown is set in one place"
+            );
+            let body = js_function(js, put_up);
+            assert!(
+                body.contains("shownAt = performance.now()"),
+                "{page}: {body}"
+            );
+            let call = put_up.trim_start_matches("function ");
+            assert_eq!(
+                js.matches(call).count(),
+                2,
+                "{page}: `{call}` is defined and called once"
+            );
+            let poll = js_function(js, "async function poll(");
+            assert!(flat(&poll).contains(guard), "{page}: {poll}");
+            let decide = js_function(js, "async function decide(");
+            assert!(
+                flat(&decide).contains("{session,shown:Math.round(performance.now()-shownAt)}"),
+                "{page}: {decide}"
+            );
+        }
+        let main = flat(include_str!("main.rs"));
+        assert!(
+            main.contains("letshow_prompt=self.questions.difference(&seen).next().is_some();")
+                && main.contains("ifchange.show_prompt{panels::show_consent(&app);"),
+            "the app raises the prompt only for a question it has not seen"
+        );
+    }
+
+    /// #3998 — a click while the device service is stopped says so. In the
+    /// 0.4.224 Linux lab, `systemctl stop roomlerd` with a question up and
+    /// an Approve gave "Could not reach the device service: Permission denied
+    /// (os error 13)": the system socket's words, the last endpoint tried,
+    /// while the person's own endpoint was gone.
+    #[tokio::test]
+    async fn a_click_with_the_service_stopped_says_it_is_not_running() {
+        let (log, _guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            Duration::from_secs(5),
+            |_, _| async {
+                Err(AskError::Connect(proven(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Permission denied (os error 13)",
+                    ),
+                    true,
+                )))
+            },
+        )
+        .await
+        .expect_err("nothing was sent");
+        assert_eq!(
+            shown,
+            "Could not reach the device service: it is not running."
+        );
+        let text = log.text();
+        assert!(
+            text.contains("device service not running") && !text.contains("Permission denied"),
+            "{text}"
+        );
+    }
+
+    /// #3998 — the banner page's read of the sessions: a list, or, for a
+    /// read that failed, an error the page keeps its words on. Until #3998
+    /// a failed read was an empty list, and the banner read "Being viewed"
+    /// with no name and a Disconnect that ended nothing.
+    #[test]
+    fn a_failed_read_of_the_sessions_is_an_error() {
+        let live = vec![roomler_localapi::RcSessionInfo {
+            session_id: SESSION.into(),
+            ..Default::default()
+        }];
+        assert_eq!(sessions_answer(Ok(live.clone())), Ok(live));
+        assert_eq!(sessions_answer(Ok(Vec::new())), Ok(Vec::new()));
+        let closed = std::io::Error::other("localapi: connection closed before a response");
+        let shown = sessions_answer(Err(("rc_sessions", closed)))
+            .expect_err("a failed read is not 'no session'");
+        assert!(shown.starts_with("rc_sessions: "), "{shown}");
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket");
+        assert!(sessions_answer(Err(("connect", gone))).is_err());
+    }
+
+    /// #3998 — the banner keeps its words when a read of the sessions fails,
+    /// and paints only an answer.
+    #[test]
+    fn the_banner_keeps_its_words_on_a_failed_read() {
+        let js = include_str!("front/panel-viewing.js");
+        let poll = js_function(js, "async function poll(");
+        let caught = poll.find("catch (_) {").expect("a failed read is caught");
+        let block = &poll[caught..caught + poll[caught..].find("\n    }").expect("its end")];
+        assert!(
+            !block.contains("sessions =") && !block.contains("paint("),
+            "a failed read changes the banner's words: {block}"
+        );
+        assert!(poll.contains("paint()"), "{poll}");
     }
 }

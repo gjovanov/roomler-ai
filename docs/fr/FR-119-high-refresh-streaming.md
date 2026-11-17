@@ -23,8 +23,8 @@ latency side; this FR is the cadence side.
 | What | Where | Consequence |
 |---|---|---|
 | The hardware target is a constant 60 | `TARGET_FPS_HW` `agents/roomlerd/src/peer.rs:105` | By default every RTP and DC session is capped at 60 |
-| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9867`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
-| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10285` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
+| The FFmpeg DC pump already accepts more, from the environment only | `ffmpeg_target_fps` `peer.rs:9846`: `ROOMLERD_FFMPEG_FPS` clamped 1–240; default 60 direct, 30 constrained | Above 60 is a host-wide override today, not a session decision, and nothing checks the host can carry it |
+| The viewer cannot ask, and the agent cannot say what the screen refreshes at | no fps message among the control-channel handlers (`rc:resolution` `peer.rs:10264` is the model); `DisplayInfo` has no refresh rate (`crates/remote_control/src/models.rs:195`) | No picker is possible without a wire change |
 | pts were whole milliseconds (**fixed in P2a**, §4.2) | master `28156b3af` had `TIME_BASE_DEN = 1000` and `pts = monotonic_us / 1000`; now `TIME_BASE_DEN` is 1 000 000 (`encode/ffmpeg/encoder.rs:94`) and `live_pts` returns the capture time (`:97`) | At 144 fps (6.9 ms period), two frames delivered within 1 ms of each other carried equal pts |
 | The encoder's frame rate is fixed at open, and a replacement copies it | `set_frame_rate` `encoder.rs:1779`; `rebuild_spec` / `rebuild_spec_at_dims` copy `fps` (`:2285`; the second is `rebuild_spec_at` since P2b-2, which takes the rate, `:2308`) | A change of fps is an encoder rebuild. FR-70 M2's make-before-break covers dims and rate, not fps (until P2b-2, §4.4) |
 | The direct ceiling law was linear in fps and clamped at 48 Mbps (**reshaped above 60 in P2a**, §4.2) | `ffmpeg_maxrate_bps_scaled` `encode/rate_profile.rs:219`: W·H·fps·0.25, clamped to [3, 48] M × the codec factor; above 60 it now follows `rate_law_fps` | Before P2a, 1920×1080 at 144 fps computed 74.6 M and clamped to 48 M: 333 kbit per frame, where 60 fps gets 518 kbit, so above 60 the picture got softer per frame |
@@ -65,7 +65,7 @@ latency side; this FR is the cadence side.
 
 Above 60 fps only when **all** of these hold, re-checked whenever any of them moves:
 
-1. The transport is not constrained (`detect_constrained_transport`, `peer.rs:1977`). Relayed paths wait for
+1. The transport is not constrained (`detect_constrained_transport`, `peer.rs:1967`). Relayed paths wait for
    [FR-17](FR-17-partial-reliability-video.md) stage C, [FR-63](FR-63-one-delay-based-rate-controller.md) and
    FR-70 M3, and stay at their current cap.
 2. The host has **proven the rate class** (§3.3) for this capture backend, display refresh, encoder and geometry.
@@ -563,25 +563,25 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
 
 - **The gate ran on constrained windows only.** A direct window was evidence by definition, so FR-119's grant (which
   only runs on a direct path) read capacity claims nothing had gated. The gate now runs on every window
-  (`encode/governor.rs:1071`). On a direct window the classifier does not run, so its state is `Unknown` with no
+  (`encode/governor.rs:1093`). On a direct window the classifier does not run, so its state is `Unknown` with no
   predecessor, and only the agent's own stall and the opening apply.
 - **The opening is not evidence** (`encode/evidence.rs:73`). The session's first keyframe, meeting a transport still
   ramping, blocked sends for 43–82 ms, and the drain rate folded as a capacity of 14–22 Mbps against the 104 Mbps
   ceiling at 120. `Reason::Opening` rejects any window a pass of which fell inside FR-35's opener window: at least
   2 s from the first keyframe and until the send ledger drains, at most 3 s, now kept for every session
-  (`peer.rs:8847`). FR-35 already declined to cut for that burst, so it is not congestion either. Its counter is
+  (`peer.rs:8826`). FR-35 already declined to cut for that burst, so it is not congestion either. Its counter is
   appended to `evidence_rejected` (fifth), so the first four positions keep their meaning.
 - **The window was one pass long.** The pump hands its sender facts to the governor on every pass, as deltas since
   the previous pass, and each call overwrote the last. A stalled pass anywhere but in a window's last iteration
   never reached `AgentStalled`, and `frames_sent` and `gate_skips` read 0–2 where the window held 30–120.
-  `WindowSenderStats::absorb` (`governor.rs:372`, called from `note_window_sender`, `:1433`) folds the passes: counts
+  `WindowSenderStats::absorb` (`governor.rs:375`, called from `note_window_sender`, `:1474`) folds the passes: counts
   add, the longest wait wins, the average is weighted by frames sent (the send task records a wait for every frame
   it writes), `opening` ORs, and the levels are the latest.
   ⚠️ This also corrects the inputs FR-71's classifier reads on constrained sessions: a gate skip anywhere in a window
   now classifies it `overproduced`, and the silent-viewer gap rule sees real frame counts. That is what the
   classifier's tests always encoded; it was never what the field ran. Watch the relay fleet's `pipe_states` and
   `evidence_rejected` after the release that carries it.
-- **Tests** (`governor.rs:3733`, `:3774`, `:3805`, `evidence.rs` tests). A window is the sum of its passes. A stalled
+- **Tests** (`governor.rs:4003`, `:4044`, `:4075`, `evidence.rs` tests). A window is the sum of its passes. A stalled
   pass early in a window still rejects it, which is red on the overwrite. A direct window in the opening folds no
   capacity, and the same window after the opening folds as before, which is red with the gate constrained-only. The
   negative controls, each alone, fail exactly their test. CI's `ffmpeg-encoder` clippy lane compiles the pump change,
@@ -613,7 +613,7 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
   P2b-6's bucket paces the asks. A simulation of that loop against a regular 120 Hz source shows neither bunching
   frames by itself, and with the job Interactive both stayed as they are.
 - ⚠️ **What the two timestamps mean.** The trial's is the capture worker's receipt (`frame.monotonic_us`). The wire
-  header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9446`). So a trial that
+  header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9425`). So a trial that
   passes at p99 16.4 ms says the host CAN keep up; it says nothing about the cadence the viewer gets.
 - **Guards.** CI's macOS packaging lint (`ci.yml:1311`) fails if the daemon, agent or desktop job loses
   `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1168`) asserts that launchd loaded the

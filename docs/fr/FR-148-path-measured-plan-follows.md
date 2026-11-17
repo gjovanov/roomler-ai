@@ -1,10 +1,12 @@
 # FR-148: The path is measured, and the plan follows it
 
-**Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** claimed 2026-11-16; nothing built. The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
+**Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16, P1 and P2 have their first steps merged, P1's remaining steps are designed, and P4's first step is in build (§6). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
 **Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244). §12 says what moved where
 **Works beside:** [FR-135](FR-135-one-rc-media-pipeline.md) (#3293), which owns the pipeline's shape (§13)
 
-Anchors are against master `df905bbc1` (2026-11-16).
+Each anchor is at the commit its sentence was written on, and it is not moved when the code moves: the plan's
+at master `df905bbc1` (2026-11-16), a later sentence's at the merge that wrote it. §2 names the code that
+failed, and this FR's own merges change that code.
 
 ## 1. Goal
 
@@ -226,7 +228,9 @@ capacity?", `docs/fr/FR-135-one-rc-media-pipeline.md:1526`) and an under-drive c
 
 - **Ranking.** ICE ranks an overlay pair by the mesh link's actual carrier: a direct mesh link like a host pair,
   TURN over UDP next, the relayed mesh link as the fallback. If the browser does not follow a lowered priority
-  (AC4 reads it), the agent holds the relayed-mesh candidate back until relay gathering has ended.
+  (AC4 reads it), the agent holds the relayed-mesh candidate back until relay gathering has ended. The design
+  report of 2026-11-17 changed three things here (D12, D13, D16): the rank is by address and has two levers, the
+  agent keeps checking after its first selection, and hold-back is built only if the experiment fails with both.
 - **The live move.** When the carrier under a session changes class, or a better one appears, the session moves by
   ICE restart. This reopens FR-128's D4 (D3).
 - **Two video channels.** The viewer creates both at the offer: the reliable, ordered channel of today and a
@@ -271,11 +275,11 @@ retiring it (§13).
 
 | # | Phase | Kill switch | Proof | Status |
 |---|---|---|---|---|
-| P0 | Measure, in shadow | `ROOMLERD_PATH_MODEL=off` | AC1 to AC5 | running since 2026-11-16; AC1 and AC5 met; steps 1 and 6 done, step 2 merged on 2026-11-17 (#3968, #3980); step 3 in work |
-| P1 | The model drives the open and the memory | `ROOMLERD_PATH_MODEL=shadow` | AC6 to AC9 | step 1 (#3374) and the first part of step 2 (#3969) merged on 2026-11-17 and released that day in `0.4.224`, not yet read in the field; the rest not started |
-| P2 | The plan is live, and its moves have a cost | `ROOMLERD_PLAN_ADOPT=quiet` | AC10 to AC15 | the QSV step in work since 2026-11-17, behind a switch of its own (D10); the rest not started |
+| P0 | Measure, in shadow | `ROOMLERD_PATH_MODEL=off` | AC1 to AC5 | running since 2026-11-16; AC1 and AC5 met; steps 1 and 6 done, steps 2 and 3 merged on 2026-11-17 (#3968, #3980, #3995), step 3's line not yet read in the field; step 5's cell designed on paper on 2026-11-17, nothing booted |
+| P1 | The model drives the open and the memory | `ROOMLERD_PATH_MODEL=shadow` | AC6 to AC9 | step 1 (#3374) and the first part of step 2 (#3969) merged on 2026-11-17, released that day in `0.4.224` and read on both laptops (§15): each pair's entry from an earlier release was passed over, and CORPLAP-2 opened at 2.55 Mbit/s, 1920×1200 and 30 fps; the rest designed and ruled on 2026-11-17 (D22 to D28), not built |
+| P2 | The plan is live, and its moves have a cost | `ROOMLERD_PLAN_ADOPT=quiet` | AC10 to AC15 | the QSV step merged on 2026-11-17 (#3989), behind a switch of its own that is off by default (D10), and not yet read on Intel hardware; the rest not started |
 | P3 | Probes in a session; the bracket replaces the fixed caps | `ROOMLERD_PATH_PROBE=open` | AC16 to AC21 | not started |
-| P4 | The carrier | `ROOMLERD_RC_CARRIER_RANK=0`, a viewer flag | AC22 to AC27 | not started |
+| P4 | The carrier | `ROOMLERD_RC_CARRIER_RANK=0`, a viewer flag | AC22 to AC27 | the first half designed and ruled on 2026-11-17 (D12 to D21); step 1, the rank behind its switch, in build; nothing merged |
 | P5 | One controller, then the deletions | `ROOMLERD_RATECTL=shadow` | AC28 to AC30 | not started |
 | P6 | Docs | none | AC31 | not started |
 
@@ -293,7 +297,15 @@ retiring it (§13).
    TSN passed after a SACK reported it missing or its retransmission timer expired. On a reliable channel, which
    is the default, the count is exact. On the viewer's unordered opt-in it can still read high by a share of
    what was lost (§15).
-3. Provenance and age on every input of `Pipe`, on the path model's own line (D9).
+3. Provenance and age on every input of `Pipe`, on the path model's own line (D9). Merged on 2026-11-17 (#3995,
+   `docs/rate-control.md` § Path numbers and their provenance): the line is
+   `path model (FR-148 P0, shadow, ≈10s)`, on both data-channel pumps (D11). It repeats each path number the
+   heartbeat carries, and each says how it was obtained (measured while the sender had more to send, measured
+   while the path took all that was offered, assumed, or remembered from an earlier session) and how old it is.
+   Three more fields show what a model that reads those tags holds: a floor that any measurement raises and only
+   a backlogged one lowers, a capacity that only a backlogged push-back moves, and a stand-in that never stands
+   below the floor. No decision reads a tag, and the old laws are pinned bit for bit. Not yet read in the field:
+   the line rides the release after `0.4.224`.
 4. The open-time train, logged and read by nothing.
 5. The standing relay cell: a shaped lab pair at 0.4, 2 and 8 Mbit/s over TURN/UDP, TURN/TLS and the mesh relay,
    with and without injected stalls, and the two laptops as the natural cells.
@@ -314,13 +326,25 @@ retiring it (§13).
    one. Its switch is `ROOMLERD_MEASURED_EVIDENCE` (D8).
 2. The memory stores the model, keyed by the pair and the carrier. An entry from before this phase is read as
    assumed. The second sentence merged on 2026-11-17 (#3969): an entry carries its provenance, one without it
-   seeds nothing, and the device's next measured write drops it. The first is not built.
-3. The opener reads the model: a known pair opens at its demonstrated floor, and the train's result may raise the
-   opening inside the bracket.
-4. The slow-link profile engages at the open only on a demonstrated low floor.
+   seeds nothing, and the device's next measured write drops it. The first is not built. Both merged steps were
+   read on the two laptops on `0.4.224` the same day (§15). The first is designed and not built (D22 to D24):
+   the key is the carrier, the controlling user and the viewer's network; the model has a file of its own; and
+   it takes a delivery only from a window the validity gate accepts. P1 keeps today's scope, a constrained path
+   on the FFmpeg pump: a direct path and the VP9-444 pump have no memory today and get none here. AC7's field
+   week is read on the close line this step adds, which says why each write happened; today's write line also
+   appears when nothing was measured.
+3. The opener reads the model: a known pair opens at 0.85 × its demonstrated floor (D25), and the train's result
+   may raise the opening inside the bracket. It ships with the switch's default at `shadow` (D28).
+4. The slow-link profile engages at the open only on a demonstrated low floor, which is a push-back that is
+   trusted (D25, D26). Steps 3 and 4 ship in one release.
 
 **P2, the plan is live.** QSV off constant bitrate, built first, beside P0 and behind a switch of its own (D4,
-D10). Then cost-budgeted adoption in today's pump (D5), frame rate by pacing, the profile as a plan field, motion
+D10). Merged on 2026-11-17 (#3989, `docs/encoders.md` § QSV off constant bitrate): with `qsv_rate_mode = qvbr`,
+which is off by default and set at the device, an HEVC or H.264 QSV encoder opens at QVBR with its target at
+0.9 × the cap, and a driver that refuses it opens as before. Its read on Intel hardware is AC13. The in-place
+rate arm is unchanged and stays off by default.
+
+After it: cost-budgeted adoption in today's pump (D5), frame rate by pacing, the profile as a plan field, motion
 from damage.
 
 **P3, probes in a session.** The probe scheduler. The relay caps become bounds on the probe and then go. The
@@ -329,6 +353,13 @@ frame-rate grant reads the model (FR-135 D12). On a direct path the bits-per-pix
 
 **P4, the carrier.** Ranking or hold-back, the live move, the two channels with bounded loss recovery (O6), the
 flag split.
+
+1. The rank, in the agent only, behind `ROOMLERD_RC_CARRIER_RANK` with the values `0`, `prio` and `1` (D12, D13,
+   D15, D17, D18). AC4's experiment on the browser runs on this build, one value at a time.
+2. The live move, after a design report of its own (D19).
+3. The SCTP packet size, after the split is read (D20).
+4. The carrier's recorded vocabulary and the viewer's report of its own leg (D21), then the flag split.
+5. The two video channels (§4.4, O6).
 
 **P5, one controller.** FR-63's B2 flips on the model under the amended criterion. B3 and B4's deletions follow.
 FR-135's fallback stands: if the flip is not live four weeks after R7's shadow week ends, R8 proceeds on the governor
@@ -355,7 +386,10 @@ index row.
 - [ ] **AC3 (P0)** — Every path number in the heartbeat carries how it was obtained and its age. The jupiter chain
       of 2026-11-02 and the CORPLAP-2 chain of 2026-11-11 replay as unit cells: each fails on master's laws and
       passes on the model's. It is read on the path model's own line, which names every path number the heartbeat
-      carries (D9), and "master's laws" are those of 2026-11-16, before V5b merged.
+      carries (D9), and "master's laws" are those of 2026-11-16, before V5b merged. **Built on 2026-11-17**
+      (#3995), on the two data-channel pumps (D11). Both chains are cells. On the laws of 2026-11-16 the floor
+      each path had demonstrated falls, from 15,915,240 to 7,962,364 bit/s on jupiter's chain and from 1,399,272
+      to 982,068 on CORPLAP-2's, and the model keeps it. The line's read on a real session is owed.
 - [ ] **AC4 (P0)** — Each mechanism §11 lists as inferred is measured or struck: SCTP's 1 s retransmit floor under
       the mesh relay's age drop, the MTU split of a full SCTP packet into two WireGuard frames, whether the browser
       follows a lowered candidate priority, and what `auto` chooses on the two laptops.
@@ -366,8 +400,8 @@ index row.
       [The report](https://github.com/gjovanov/roomler-ai/issues/3953#issuecomment-6932207141) is on the issue,
       and the numbers are in §15.
 - [ ] **AC6 (P1)** — A reconnect never opens below what the pair last demonstrated on that carrier: 20 reconnects
-      in a row on each laptop, each opening at 0.85 × the demonstrated floor or higher. Fails first on the current
-      release.
+      in a row on each laptop, each opening at 0.85 × the demonstrated floor or higher, or at the relay cap while
+      that cap stands (D25). Fails first on the current release.
 - [ ] **AC7 (P1)** — Nothing assumed is written to the pair memory, and nothing assumed holds the plan below a
       demonstrated value: V5b's cells and the two replay cells are green, and one field week shows no memory write
       without a measurement behind it. An entry written before this phase is read as assumed.
@@ -402,9 +436,9 @@ index row.
       cold and remembered, on both laptops' relay paths.
 - [ ] **AC21 (P3)** — No regression on direct paths and healthy relays: age p50 and p90, frame rate and skips
       within noise of the P0 baseline, taken with the same instrument.
-- [ ] **AC22 (P4)** — CORPLAP-2 on its VPN with the mesh allowed lands on TURN over UDP whenever it allocates, 20
-      sessions of 20, and its stalled windows stay under 2 % (today 5.7 to 13.4 % on the mesh relay). Fails first
-      on the current release.
+- [ ] **AC22 (P4)** — CORPLAP-2 on its VPN with the mesh allowed lands on a TURN relay whenever one allocates, over
+      whichever transport its own leg reaches (D14; the transport is recorded), 20 sessions of 20, and its stalled
+      windows stay under 2 % (today 5.7 to 13.4 % on the mesh relay). Fails first on the current release.
 - [ ] **AC23 (P4)** — With the far TURN unreachable in the lab, a session is on the mesh relay within 5 s, on the
       deadline-limited channel: `send_wait` p99 under 250 ms with no sample over 1 s, age p99 under 300 ms under
       FR-16's fast-motion profile, and `dropped_stale` above zero under load while the delivered frame rate holds.
@@ -427,7 +461,7 @@ index row.
 
 ## 8. Decisions taken
 
-D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D10 are this FR's owner's.
+D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D28 are this FR's owner's.
 
 | # | Decision |
 |---|---|
@@ -441,15 +475,33 @@ D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D10 are th
 | D8 | P1's first two merges (#3374, #3969) ship without the phase's switch. They stop a number that nobody measured from being stored or read, and they make nothing drive a rate; the fallback is the open of a pair with no entry, which is how every pair opened before the memory existed. The phase's switch, `ROOMLERD_PATH_MODEL=shadow`, arrives with step 3, where the opener starts to read the model. Step 1 keeps V5b's own switch, `ROOMLERD_MEASURED_EVIDENCE`. A rollback is safe: the release before them ignores an entry's new field and reads a file it cannot parse as an empty memory. Taken by this FR's owner on 2026-11-17, before the release that carries them was cut |
 | D9 | P0's numbers are written on lines of their own, `path delivery` and `path model`, about every 10 s, and not as heartbeat fields. FR-135's ratchet counts the lines of each pump, so every heartbeat field is a line of debt, while a line of its own costs one call per pump, whatever it carries. AC3 is read on the `path model` line, which names every path number the heartbeat carries. Taken by this FR's owner on 2026-11-17, at the merge of step 2 (#3968) and in step 3's brief |
 | D10 | P2's QSV step (D4: FR-62's A5) is built beside P0 and does not wait for P1. It reads nothing from the path model, it sits behind a switch of its own that is off by default, and its failing "before" is read: AC1's second failure, 0 rate moves in 4.6 hours on `hevc_qsv`. What it changes is the encoder's rate-control mode. Under constant bitrate a frame of an unchanged screen is `maxrate ÷ fps ÷ 8` bytes like every other, so on such a host the pump's wait for a moment without motion never ends (§2.3). AC13 is its field read. AC10 stays with the adoption rule, which follows it. Taken by this FR's owner on 2026-11-17 |
+| D11 | AC3's scope is the two data-channel pumps, which are the pumps with a rate governor: every path number their heartbeats carry is on the `path model` line. The RTP pump has no governor. Its one path number is the browser's own estimate (REMB), which the pump applies as its rate, and that estimate arrives with nothing that says how it was obtained. P0 gives that pump no line. What measures the path on the RTP sink is O2. Taken by this FR's owner on 2026-11-17, at the merge of step 3 (#3995) |
+| D12 | The rank is by address and has two levers. When the mesh link to the viewer's device is not direct, every candidate of the agent that can only be reached over the mesh is signalled with priority 255, the lowest there is, and with `network-cost 999`: a host candidate on a mesh address, a server-reflexive candidate whose mapped address is a mesh address, and a relay candidate whose relayed address or TURN server is on the mesh. Chrome compares a pair's network cost before its priority, and the agent's own follow rule compares priority, so each lever covers what the other cannot. "A mesh address" is one inside the mesh's own blocks, never the whole of 100.64.0.0/10, which is also a carrier's address space. The design report of 2026-11-17 named two of the three kinds. The third is in the field log (§15): on CORPLAP-2 each session gathers two server-reflexive candidates with a mesh address, and today they rank above the mesh host. Taken by this FR's owner on 2026-11-17 |
+| D13 | The agent keeps checking after its first selection. As the controlled side it stops checking pairs once it has selected one, and its TURN client asks the server for a permission only when it first sends to a peer. A relay candidate that arrives after the selection therefore never sends, the server discards the browser's checks toward it, and no TURN pair validates: a lowered priority alone moves nothing. With the rank on, the agent keeps checking every pair that ranks above its selection and whose remote is on a real path. That is the test its follow rule already applies, and the two share one predicate, so the agent never validates a pair it would refuse to follow. This is read in the code and not yet measured: AC4's experiment reads it at the switch's `0`. Taken by this FR's owner on 2026-11-17 |
+| D14 | AC22 is read as "on a TURN relay, over whichever transport the agent's leg reaches". On 2026-11-16 CORPLAP-2's leg reached the far TURN over TLS on port 443 (by elimination, §11). If TURN over UDP never allocates there, the words "TURN over UDP whenever it allocates" are met without one session moving. The transport is recorded with the session. The same read answers O3: if those sessions' stalled share is not below the mesh relay's, the order of TURN over TLS and the relayed mesh is reversed, and the deadline-limited channel is the fix for both. Taken by this FR's owner on 2026-11-17 |
+| D15 | The order of carriers: a native host or server-reflexive pair, then a direct mesh link, then TURN over UDP, then TURN over TLS or TCP, then a relayed mesh link. §4.4's "a direct mesh link like a host pair" means among the direct pairs: it keeps today's rank, below a native pair and above every relay, because the mesh's MTU splits a full SCTP packet (D20) and a native pair does not. A link whose class is unknown, or that is in the middle of an upgrade, reads as relayed: that keeps connectivity and fails toward TURN. Its cost is a session that sits on TURN while the mesh turns direct underneath, until the live move exists. So the agent logs the link's class again 10 s after the open, and that number gates the default (D18). Taken by this FR's owner on 2026-11-17 |
+| D16 | No hold-back, unless AC4's experiment fails with both levers. Holding the mesh candidate back until relay gathering ends has no clean end: gathering has no bound over TLS, and a deadline short enough for AC23 loses to a TURN server that answers late, which is CORPLAP-2's case. A candidate that is only not signalled also comes back as a peer-reflexive pair. This replaces §4.4's hold-back as the first answer. Taken by this FR's owner on 2026-11-17 |
+| D17 | In the first step the agent learns the viewer's devices from the offer's ICE servers: each relay of the viewer is a TURN URL on that device's mesh address. The server names the devices only under `auto` today, and it names them under every policy in a later step, additively. Taken by this FR's owner on 2026-11-17 |
+| D18 | With the rank on, `auto` behaves as `on`: the mesh is allowed whenever the device's policy is not `off`, and the rank decides what the session rides. The far-TURN hint is not read. The switch's default changes only when three things hold: AC4's experiment is green; the lab cells are green (TURN reachable, TURN blocked, one LAN); and over a field week the class read at the open agrees with the class 10 s later in at least 95 of 100 sessions, or the live move exists. O4's question about new devices stays open until then. Taken by this FR's owner on 2026-11-17 |
+| D19 | The live move's shape: the agent asks, the viewer restarts ICE and offers again, the server forwards that offer on an active session, the agent applies it to the live peer, and the agent's ICE restart keeps the old selected pair as the send path until the new generation has selected one. None of it is built before a design report of its own. That report says why the server admits one offer per session today and what bounds a second one, and what the make-before-break restart costs in the vendored ICE agent. Taken by this FR's owner on 2026-11-17 |
+| D20 | The agent's SCTP packets shrink from 1,228 to 1,191 bytes, for every association. A full packet today is 1,293 bytes on the mesh's IPv4 and 1,313 on its IPv6, against the mesh's 1,280. 1,191 is the size the browser's own SCTP stack uses, for the same reason: 1,280 less 40 for IPv6, 8 for UDP, 37 for DTLS and 4 for TURN's channel framing. The design report's 1,195 leaves those 4 out, and one of the mesh's carriers, the viewer's own relay, has them. The cost is about 3 % more packets on every path. It is a change of its own, made after the split is read on the viewer's reassembly counters (AC4). Taken by this FR's owner on 2026-11-17 |
+| D21 | `turn` keeps its meaning in the carrier's recorded vocabulary: a TURN relay. The transport of the agent's leg is an additive field beside it, and the viewer reports the relay protocol of its own selected candidate additively. A new value such as `turn_tls` would silently take sessions out of every count that reads `turn`. Taken by this FR's owner on 2026-11-17 |
+| D22 | The memory key is the carrier, the controlling user and the viewer's network, which decides O1. The relay worker's address leaves the key: it is why one pair had three entries in one day (AC8). The viewer's network is the /24 of its server-reflexive candidate, or the /48 on IPv6, a public address before a private one and never an overlay address. Without such a candidate it is the selected remote address when that is the viewer's own, then the viewer's overlay address, which names a device, then unknown. Without the controlling user or a known carrier there is no key, and nothing is read or written. An overlay carrier and any other carrier never share a word. The agent's own network is not in the key: the carrier separates most of its situations, and what is left, a floor learned in the office and read at home, costs one opening that is too high (D27). A log line carries a hash of the key and the kind of its network part, never the key. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D23 | The model is stored in a file of its own, `path_memory.json`, beside today's `rate_memory.json`, which is written exactly as before until P5. D8's "a rollback is safe" stands for #3374 and #3969. For the model it would not stand inside today's file: the release before it rewrites that file from its own shape at its first save, which drops every field it does not know and every entry not marked measured; an entry without today's rate field makes it read the whole file as empty; and an entry marked measured would open it at an application-limited floor, which is §2.1 again. A file of its own is never opened by an earlier release and survives a rollback. Each entry is checked on its own when read (a rate from 50 kbit/s to 100 Mbit/s, a time at most 300 s ahead, a known class), and a bad one drops alone. The floor keeps 7 days from the reading that set it, and a close never writes back a floor that is still the remembered one: the model's `offer` is made to do what its doc says. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D24 | The model takes a delivery only from a window the validity gate accepts. Today every window's arrival rate reaches it before the gate rules. The opener's burst and the drain after a stall deliver more in one window than the path carries, and a floor stored from one would open later sessions at up to the relay cap. This changes what P0's `path model` line shows, to the floor of valid windows; `Pipe`'s own numbers do not move. Both AC3 cells stay green unchanged. If one turns red, its floor came from a rejected window, and the change stops there. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D25 | The opening is 0.85 × the entry's floor, at most the relay cap while that cap stands (P3), and never under the nominal opening unless a push-back is trusted. A push-back is kept as a record of its own, apart from the floor: its rate is the highest sample it counted. It is trusted when its newest sample is at most 24 hours old and it counted at least three valid windows spread over at least 10 s, across sessions while it stands. A sample counts when it is at least half of the highest delivery its session has measured in a valid window, and the record ends when a valid window delivers more than twice its rate. Both are one test: a refusal that carried less than half of what the same session carried elsewhere is a dip, and the factor is the one the in-session seed contradiction uses. A delivery that only raises the floor leaves the record standing. With a trusted push-back the opening is 0.85 × the damped floor, which may sit under the nominal one. The design report proposed that one sample suffices. It does not: the floor the model held on CORPLAP-2 on 2026-11-17 was application-limited and near 2.2 Mbit/s; one sample at or under 0.15 Mbit/s halves that floor to under 1.18 Mbit/s; and the next session would open on the slow-link profile, from a single window. A lifetime of 7 days would open a recovered path small for a week of still screens. Three windows and 10 s are this FR's owner's numbers, to be read again on the shaped cell: a real link of 0.6 and of 1.5 Mbit/s must be trusted within its first minute of motion, and an injected dip of 3 s must not be. What the rule cannot tell apart is a path that turned slow from a session with a still screen throughout on a relay that stalls: both leave a low record under a floor demonstrated earlier. The governor already asks that a refusal be backlogged: the agent's own sends blocked, or two windows in a row in which the sender offered a tenth more than arrived. That narrows the second case and does not exclude it. How often it happens is read on the fleet's shadow lines before the default changes (D28), and in the shaped cell, where a 6 Mbit/s link with injected stalls under a still screen must leave no trusted record. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4, and corrected the same day. The first wording asked that a backlogged push-back had last moved the floor, and ended the record at any delivery above the floor. The governor takes every window's arrival rate as a delivery first and as a push-back second, at the same rate, and the damped floor converges on the push-back from above. So on a link that really is slow, a refused window that arrives a little above the floor raises it as a delivery and then moves nothing as a push-back, and that wording would have ended the record there and opened the next session at the nominal rate |
+| D26 | The slow-link profile engages at the open only on a trusted push-back at or below the profile's threshold (1 Mbit/s), and only when the opening it leads to is at or below that threshold too. An application-limited floor never engages it, whatever its value: the entry of 281,732 bit/s in §2.1 was application-limited at best. Steps 3 and 4 ship in one release, so a slow link never loses its profile between them. Until P2 makes the profile a live plan field, a profile engaged at the open lasts the session, which is why the open asks for this much evidence. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D27 | The constrained opener's grace stays in P1: FR-35 P3's 2 s, 3 s at most, ended at 1.2 s when nothing drains. "A decrease never waits" is AC11's, about the encoder applying a lower rate, and it holds after the grace. So an opening that is too high, from a key that merged two paths or a path slower than last time, costs the grace plus the time the cut takes: seconds of delay, once, after which the floor is damped. That cost is inferred, not measured; the shaped cell reads it with an entry at the cap and the link at 2 Mbit/s. What bounds it by design is the open-time train (P0 step 4, P3), which measures before the opener commits. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
+| D28 | Step 3 ships with the switch's default at `shadow`: today's opener, pinned bit for bit by a twin test, while the model is written and every constrained open logs both openings, the model's and today's. The values are `off` (the release before, exactly), `shadow` and `on`. A device is switched on by `path_model = on` in its config: `roomler config set`, then a restart. The default becomes `on` in the following release when two reads hold. On the fleet's shadow lines the model's opening stands more than 30 % above the trusted push-back the session then measured no more often than today's opening does, and under 0.85 × the floor the session then wrote less often. And AC6 and AC8 hold on the two laptops, switched on by hand. After the flip the kill switch is `ROOMLERD_PATH_MODEL=shadow`, per device. The design report proposed `on` from the first release; `shadow` first costs the fleet one release and the two laptops nothing. Taken by this FR's owner on 2026-11-17, on the design report for P1's steps 2 to 4 |
 
 ## 9. Open decisions
 
 | # | Question | Recommendation |
 |---|---|---|
-| O1 | What identifies the viewer's end in the memory key? | The controlling user and the viewer's reflexive network prefix, beside the carrier. P0 reads how often one user's sessions differ by network |
+| O1 | What identifies the viewer's end in the memory key? | The controlling user and the viewer's reflexive network prefix, beside the carrier. P0 reads how often one user's sessions differ by network. Decided on 2026-11-17: D22 |
 | O2 | The probe on the RTP sink | Transport-wide feedback there, the SCTP clock on the DataChannel sinks. Decide after P0's read of the SCTP samples |
-| O3 | Which comes first, TURN over TLS or the relayed mesh link? | TURN over TLS: one reliable layer fewer and an allocation of its own. The standing cell reads both |
-| O4 | After P4, are `auto` and `on` one policy, and what do new devices get (#3357)? | One policy, "mesh allowed, ranked by carrier", beside `off`. Decide the default on P4's field read |
+| O3 | Which comes first, TURN over TLS or the relayed mesh link? | TURN over TLS: one reliable layer fewer and an allocation of its own. The standing cell reads both, and AC22's read on CORPLAP-2 decides it (D14) |
+| O4 | After P4, are `auto` and `on` one policy, and what do new devices get (#3357)? | One policy, "mesh allowed, ranked by carrier", beside `off`. Decide the default on P4's field read; D18 says what that read must show |
 | O5 | The stall budget of an adoption and the byte budget of a probe | 200 ms of the bracket's low edge for an adoption; a train of at most 250 ms of the high edge. Both set from P0's cell |
 | O6 | Loss recovery on the deadline-limited channel | A keyframe under the existing minimum gap, sized by the same cost rule. Intra-refresh where the backend has it, if P0 reads loss above one frame in ten seconds |
 
@@ -474,8 +526,11 @@ to learn what its path carries.
 
 - SCTP's retransmit floor of 1 s turns the mesh relay's age drops into the stalled windows of §2.2.
 - The mesh's 1280-byte MTU splits each full SCTP packet into two WireGuard frames, doubling a frame's exposure to
-  one drop.
-- Chrome follows a lowered candidate priority when it nominates.
+  one drop. By arithmetic a full packet is 1,293 bytes on the mesh's IPv4 and 1,313 on its IPv6 (D20). That the
+  operating system splits it, and does not refuse it, is what the read must show.
+- Chrome follows a lowered candidate priority when it nominates. Read in the code on 2026-11-17 and not yet
+  measured: a lowered priority alone cannot move such a session, because the agent stops checking pairs at its
+  first selection (D13).
 - What `auto` chooses on these laptops. **Measured on CORPLAP-2 on 2026-11-16 (§15):** it chose the mesh relay,
   on the hint `far_turn=Some(false)`, while a TURN relay carried a session under `off` half an hour later (TURN
   over TLS on port 443, by elimination). The hint reads UDP reach only. CORPLAP-1 is not read yet.
@@ -555,6 +610,9 @@ of the counts meet this FR, read on master `1c584fb7e`:
 | `pump_lines_ffmpeg_dc`: the length of the FFmpeg DC pump | 3,959 | 3,959 | P2's adoption rule, which D5 puts in today's pump, from its first added line |
 | `viewer_knobs`: distinct `roomler-rc-*` storage keys in the viewer's media files | 33 | 33 | P4's viewer flag, if it is such a key |
 
+On master `1ca52c37e` (2026-11-17), after this FR's first merges, the three read 180 of a baseline of 180,
+3,953 of 3,953 and 33 of 33.
+
 So a PR of this FR that raises a count appends its own row at the end of the ledger, with file-only anchors as
 the ledger's later rows have (`r0:FPS-1`, `r0:CLOCK-1`), and its phase column names the phase of this FR that
 retires it. Rows that retire with another FR's phase are in the ledger already: 48 read `FR-63 B2, B3`, which
@@ -580,3 +638,7 @@ does not list.
 | 2026-11-17 | 0.4.224's candidate `d48065068` | the release lab's cells for this FR, read by the release owner from the log of the process that sends the picture: seven sessions over the VP9-444 data channel, three on macOS and two each on Windows and Linux, every host upgraded from 0.4.223 | Not a field result. The cells read green on all three platforms, and nothing in them held the tag. Every `path delivery` line had `stalled_ms=0`. On macOS and Linux every sample of the still lab screen was application-limited (`delivery_samples=(0, n, 0)`, `backlogged_bps=None`), the healthy reading there. No pair had an entry: each open had none of the memory's lines, no session wrote one at its close, and no open seeded a ceiling or engaged the slow-link profile. No session ran on the FFmpeg pump, which carries nearly every session of the two laptops: their read follows the roll. **Found by the lab, on macOS:** a session that opened on a relay pair logged "constrained (relay-TCP) transport", and about 5 s later it moved to a direct pair and the clamp lifted, as designed. The line says that for every relay pair. The predicate reads the candidate's type only, and a relay candidate's protocol is that of the relayed address, always UDP. So the agent cannot tell a viewer's TURN leg over UDP from one over TLS. The wording is corrected with step 3. P4's ranking needs the difference, so the viewer has to report the protocol of its own relay leg |
 | 2026-11-17 | master `0659bbe3e` | merged that day: #3980, the fix for what the review of #3968 found | Not a field result. The delivery clock leaves out a partially reliable chunk that a FORWARD TSN passes after a SACK reported it missing, or after it was outstanding at a retransmission timeout. On a reliable channel the count is unchanged and exact. On an unordered channel with no retransmissions, at 2 Mbit/s with one full packet in ten lost, the clock had counted 2,128,000 bytes against 1,920,000 that arrived, with 216,000 lost. It now counts 11,000 to 21,000 over what arrived on a Windows box and 70,000 to 75,000 on CI's runners, of about 215,000 lost. **What stays:** a lost chunk that nothing follows before the FORWARD TSN reaches the viewer is never reported missing, and SCTP does not tell a sender which skipped chunks arrived. A chunk reported missing that arrives late is left out, which reads low. **What follows for P4:** on the deadline-limited channel the sender's clock is an estimate, and the viewer's own count of what arrived is the measurement |
 | 2026-11-17 | 0.4.223 | the saved rows of the read of 2026-11-16, 45 sessions of the two laptops, read again offline with the report as #3984 leaves it. No new production read | **What the report's new columns show on the same week.** F1 and F2 are unchanged: 16 of 40 and 2 of 11. **F3, a slow-link profile that never left:** raised in 3 of 3 judged sessions, of 8, 38 and 63 minutes. Each opened at 1280×800 and 15 fps and never showed a picture both larger and faster, while its plan stood above 1 Mbit/s for 7, 37 and 61 minutes. This is AC14's failing "before". **The plan against the relay's 3 Mbit/s:** of 30 sessions that opened on a relay below it, 16 reached it (seven at 14 s, then at 16, 46 and 57 s, and six at 126 to 165 s), 12 never did and 2 left the relay first. Four sessions changed path while they ran: three left the relay and one entered it. **Opened without the pair's entry:** 7 of 36 judged opens read no entry, although the pair's last write with evidence, at most 7 days old, had left one: 1.16, 0.21, 0.28 and 0.28 Mbit/s on the mesh relay, and 3.54, 7.01 and 7.45 on TURN. The lines cannot say why (O1): the key differed, no key was formed, or the open ran in a process that keeps its memory in another data directory. The laptops ran 0.4.223, so no session had a delivery sample or the line of an entry passed over |
+| 2026-11-17 | 0.4.224 | the release lab's switch cell on the released build, read by the release owner from the log of the process that sends the picture: two sessions over the VP9-444 data channel on one guest, 51 s with `ROOMLERD_PATH_MODEL=off` and 52 s with it on again | Not a field result. Off: no `path delivery` line, and the picture decoded at 13 to 14 frames a second. On again: 5 lines, each with `stalled_ms=0` and `delivery_samples=(0, 5, 0)`. So the switch silences the samples and leaves the session alone. The lab could not read the line that passes over an entry as assumed: no pair there had an entry from `0.4.223`. The two laptops read it the same day (the next row) |
+| 2026-11-17 | 0.4.224, on both laptops since about 10:50Z | production `agent_logs`, read-only, two bounded reads of the two laptops' lines since 10:45Z: `scripts/rc-path-report.sh --mars --yes --rows` at 11:08Z (no session yet) and at 12:42Z (196 lines, 2 sessions). The database pod: no restart, no out-of-memory event, memory at 76.4 % of its limit before and after the first read and 77.2 % before and after the second | **P1's first steps, read on both laptops (#3374, #3969).** Each open wrote the line that says the pair's entry has no measured provenance and is read as assumed: 281,732 bit/s on CORPLAP-2, written 18.4 hours earlier, and 6,512,314 bit/s on CORPLAP-1, 17.6 hours earlier. Neither open seeded a ceiling, and neither engaged the slow-link profile. **CORPLAP-2**, on the mesh relayed over DERP, `av1_nvenc`, 4 min 53 s: it opened at 2.55 Mbit/s, 1920×1200 and 30 fps, where the same pair opened at 0.200 to 0.282 Mbit/s, 1280×800 and 15 fps on `0.4.223` (AC1's row). The plan stood at the relay's nominal 3 Mbit/s 17 s after the open. The quantiser was 14 at the median and at the 90th percentile, and the viewer's age 73 ms and 98 ms. The screen was still: 8.5 MB in the whole session, 0.24 Mbit/s on average, and 142 of 143 delivery samples application-limited, the highest at 2.17 Mbit/s. So this session shows the open. It does not show what the path carries under motion. **CORPLAP-1**, on a TURN relay, `hevc_qsv`, 20 s: it opened at 2.55 Mbit/s, 1920×1200 and 30 fps. Its entry was a rate from before entries carried provenance, so the pair opens at the nominal rate until a session measures one (D8). Its 8 delivery samples were application-limited, the highest at 4.17 Mbit/s. Neither session wrote the memory at its close: neither had measured a rate, which is V5b's rule. **Found, a stall read as a backlogged sample:** at 12:20:53Z the CORPLAP-2 path stalled for about four seconds. The viewer's age reached 2,276 ms, the classifier called six windows transit-stalled, and the plan held at 3.19 Mbit/s. The delivery sampler read that span as one backlogged sample of 55,859 bit/s with `stalled_ms=0`: a few bytes were acknowledged in it, so it is not the sampler's stalled class. A backlogged sample inside a transit stall is no evidence of capacity, and no floor may fall on it (AC9). The model of #3995 does not read these samples; the step that does must class them by the window's verdict. **Read with it:** the encoder's applied rate read 2.55 Mbit/s for the whole CORPLAP-2 session under a plan of 3.19. That is no missed move: both snap to the 3 Mbit/s rung of the encoder's rate ladder (`coarsen_bitrate`). **Still owed:** AC6's 20 reconnects, a session with motion on either laptop, and AC7's field week |
+| 2026-11-17 | master `1ca52c37e` | merged that day: #3995 (P0 step 3), the `path model` line | Not a field result. On both data-channel pumps the line carries every path number of the heartbeat with its provenance and its age, and what a model that reads them would hold. A line is at most 610 bytes, one about every 10 s, and `ROOMLERD_PATH_MODEL=off` silences it together with the delivery samples. The two chains of AC3 are unit cells. Its read follows the next release: on a still screen the viewer's arrival should read application-limited, and the model should hold no capacity |
+| 2026-11-17 | 0.4.223 | the saved rows of the read of 2026-11-16, read again offline for three CORPLAP-2 sessions under `on`: the lines `ICE: gathered local candidate`, `per-session ICE path detected` and `session carrier recorded`. No new read of production | Each session gathered one host candidate on a mesh address and two on private addresses, two server-reflexive candidates whose address is a mesh address, two relay candidates whose relayed address is a mesh address (the viewer's own relay) and two relay candidates on the far TURN. The first selection was the mesh host pair, 215 ms after the offer in the first session, and the far TURN's candidates arrived 250 ms after it. In the second session one of them arrived 40 ms before the selection, and the session stayed on the mesh pair all the same. The mesh link read relayed throughout, with an upgrade attempt about every 20 s that never succeeded. So the far TURN allocates on this laptop in under half a second and the session never uses it, and three kinds of the agent's candidates ride the mesh, of which today's rank lowers one (D12, D13) |

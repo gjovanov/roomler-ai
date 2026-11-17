@@ -111,7 +111,9 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   `granted:false` — "nobody was at the machine" reaching the controller as "a human
   refused you"; the hub waits 5 s **longer** than the window it announces, because
   with equal timers its own fallback fired ~130 ms before the agent's reasoned
-  verdict. ⚠️ A server directive must never override a device's
+  verdict. ⚠️ So an RC prompt's window runs from the request, its surfaces beside it
+  (#4000): never make it wait for them again. On a Linux root daemon they take up to
+  11 s, and the hub's timer then answers a bare timeout first. ⚠️ A server directive must never override a device's
   `auto_grant_session=false` — `consent::strictest_of` makes the local setting a
   floor. ⚠️ The folder whose files can answer a prompt is the daemon's own
   (`ConsentBroker::for_daemon`, #3939) or there is none: then the file channel is off

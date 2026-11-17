@@ -90,6 +90,9 @@ pub struct AgentInternal {
     pub(crate) keepalive_interval: Duration,
     // How often should we run our internal taskLoop to check for state changes when connecting
     pub(crate) check_interval: Duration,
+    // Roomler patch (FR-148 P4): the carrier rank, read where a candidate is
+    // made and by the controlled agent's checks after its first selection.
+    pub(crate) carrier_rank: Arc<Option<CarrierRank>>,
 }
 
 impl AgentInternal {
@@ -167,6 +170,8 @@ impl AgentInternal {
 
             // AgentConn
             agent_conn: Arc::new(AgentConn::new()),
+
+            carrier_rank: Arc::clone(&config.carrier_rank),
         };
 
         let chan_receivers = ChanReceivers {

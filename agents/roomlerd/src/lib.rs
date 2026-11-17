@@ -39,6 +39,9 @@ pub mod audio;
 /// FR-97 P3c — what "computer audio" may open, and why it opened nothing.
 pub mod audio_source;
 pub mod capture;
+/// FR-148 P4 — the carrier rank inside a session: the candidate lines and
+/// the opening's wait for the move off a ranked-last pair.
+pub mod carrier_rank;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
 pub mod clock;

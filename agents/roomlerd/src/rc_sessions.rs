@@ -81,8 +81,8 @@ fn asking(session: &ObjectId) -> bool {
 /// The channel a signalling loop polls for "the person at this device wants
 /// this session gone" — the same one the Windows overlay's Disconnect button
 /// fires through, so a LocalAPI disconnect and an overlay click take the
-/// identical teardown path.
-pub type KillSender = tokio::sync::mpsc::Sender<ObjectId>;
+/// identical teardown path. Each order names what asked ([`Via`], #4001).
+pub type KillSender = tokio::sync::mpsc::Sender<KillOrder>;
 
 #[derive(Clone)]
 struct Entry {
@@ -258,15 +258,15 @@ impl RcSessionRegistry {
         out.into_iter().map(|(_, s)| s).collect()
     }
 
-    /// Ask the owning signalling loop to tear `session` down. `false` = no such
-    /// live session (already gone, or never on this device).
+    /// Ask the owning signalling loop to tear `session` down, for `via`.
+    /// `false` = no such live session (already gone, or never on this device).
     ///
     /// Deliberately does NOT remove the entry: the signalling loop owns the
     /// lifecycle and clears it through `hide_session` once the peer is
     /// actually closed. Removing it here would make the banner disappear
     /// before the session had, which is the wrong way round for a control the
     /// operator is watching for an effect.
-    pub fn disconnect(&self, session: &ObjectId) -> bool {
+    pub fn disconnect(&self, session: &ObjectId, via: Via) -> bool {
         // FR-85 P3b-3 — a DETACHED entry has no session left to tear down
         // (only its recording remains, which the banner's Stop ends).
         let Some(kill) = self
@@ -282,7 +282,7 @@ impl RcSessionRegistry {
         // `try_send` on purpose: this runs on the LocalAPI's sync dispatch, and
         // a full 4-slot kill queue means several teardowns are already in
         // flight — reporting that honestly beats blocking the control socket.
-        match kill.try_send(*session) {
+        match kill.try_send((*session, via)) {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(%session, %e, "rc disconnect could not be queued");
@@ -290,6 +290,50 @@ impl RcSessionRegistry {
             }
         }
     }
+}
+
+/// #4001 — what at this device asked for a session's end, as far as the
+/// daemon can tell. A LocalAPI caller is named as such: its request does not
+/// say whether the companion's banner or `roomlerd rc --disconnect` sent it,
+/// and the daemon does not guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// The Disconnect on the Windows overlay's badge.
+    OverlayBadge,
+    /// A LocalAPI client: the companion's banner, or `roomlerd rc --disconnect`.
+    LocalApi,
+    /// The Disconnect on the being-viewed notification (Linux, FR-93 P6g).
+    Notification,
+    /// The desktop's own control over the screen share: Stop on GNOME's
+    /// indicator, End on KDE's (FR-93 P6c).
+    ShareStop,
+    /// A pump with no encoder (#3245). No person asked: the signalling loop
+    /// reads the session's own flag and names that end `no_video`.
+    NoVideo,
+}
+
+impl Via {
+    /// The `via` field of [`log_host_ended`]'s line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OverlayBadge => "overlay_badge",
+            Self::LocalApi => "localapi",
+            Self::Notification => "being_viewed_notification",
+            Self::ShareStop => "desktop_share_stop",
+            Self::NoVideo => "no_video",
+        }
+    }
+}
+
+/// What a kill channel carries: the session, and what asked for its end.
+pub type KillOrder = (ObjectId, Via);
+
+/// #4001 — the line the signalling loop logs when the person at this device
+/// ends a session, with what asked. Until #4001 it read `viewee requested
+/// disconnect via overlay badge` for every one of them, though only Windows
+/// has a badge. Field reads grep this text: change it with its test.
+pub fn log_host_ended(session_id: ObjectId, via: Via) {
+    tracing::info!(%session_id, via = via.label(), "the person at the device ended the session");
 }
 
 #[cfg(test)]
@@ -301,7 +345,7 @@ mod tests {
     ) -> (
         RcSessionRegistry,
         Vec<ObjectId>,
-        tokio::sync::mpsc::Receiver<ObjectId>,
+        tokio::sync::mpsc::Receiver<KillOrder>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let reg = RcSessionRegistry::new();
@@ -321,8 +365,9 @@ mod tests {
     #[tokio::test]
     async fn disconnect_routes_to_the_owning_loop() {
         let (reg, ids, mut rx) = reg_with(2);
-        assert!(reg.disconnect(&ids[1]));
-        assert_eq!(rx.recv().await, Some(ids[1]));
+        assert!(reg.disconnect(&ids[1], Via::LocalApi));
+        // #4001 — the order names what asked, for the loop's line.
+        assert_eq!(rx.recv().await, Some((ids[1], Via::LocalApi)));
         // The entry SURVIVES the request — the signalling loop clears it once
         // the peer is really closed, so the banner does not vanish early.
         assert_eq!(reg.list().len(), 2);
@@ -331,7 +376,63 @@ mod tests {
     #[tokio::test]
     async fn disconnecting_an_unknown_session_is_a_clean_false() {
         let (reg, _ids, _rx) = reg_with(1);
-        assert!(!reg.disconnect(&ObjectId::new()));
+        assert!(!reg.disconnect(&ObjectId::new(), Via::LocalApi));
+    }
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// #4001 — a session the person at the device ended says so, and names
+    /// what asked as a field. Until #4001 every one of them, the banner's and
+    /// `roomlerd rc --disconnect`'s too, read "via overlay badge", and only
+    /// Windows has a badge. Field reads grep this text.
+    #[test]
+    fn the_host_ended_line_says_the_person_ended_it_and_names_what_asked() {
+        let session = ObjectId::new();
+        let id = format!("session_id={session}");
+        for (via, field) in [
+            (Via::OverlayBadge, r#"via="overlay_badge""#),
+            (Via::LocalApi, r#"via="localapi""#),
+            (Via::Notification, r#"via="being_viewed_notification""#),
+            (Via::ShareStop, r#"via="desktop_share_stop""#),
+        ] {
+            let line = logged(|| log_host_ended(session, via));
+            for want in [
+                "INFO",
+                "the person at the device ended the session",
+                id.as_str(),
+                field,
+            ] {
+                assert!(line.contains(want), "{want:?} not in {line:?}");
+            }
+            assert!(!line.contains("overlay badge"), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        }
     }
 
     /// A dead loop (its receiver dropped) must report failure rather than
@@ -340,7 +441,7 @@ mod tests {
     async fn a_closed_kill_channel_reports_failure() {
         let (reg, ids, rx) = reg_with(1);
         drop(rx);
-        assert!(!reg.disconnect(&ids[0]));
+        assert!(!reg.disconnect(&ids[0], Via::OverlayBadge));
     }
 
     #[test]
@@ -409,7 +510,7 @@ mod tests {
         assert!(listed[0].recording && listed[0].reconnecting, "{listed:?}");
         // Nothing to disconnect: the session is gone, only the recording is
         // left, and the banner's Stop ends that.
-        assert!(!reg.disconnect(&ids[1]));
+        assert!(!reg.disconnect(&ids[1], Via::LocalApi));
 
         assert!(
             reg.recording_ended(&ids[1]),

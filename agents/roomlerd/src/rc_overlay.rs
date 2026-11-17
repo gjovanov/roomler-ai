@@ -22,12 +22,25 @@
 //!
 //! On, nothing is filtered beyond the name rule: the behaviour from before
 //! the switch existed.
+//!
+//! FR-148 P4 adds the carrier rank, behind its own switch ([`RankMode`],
+//! `ROOMLERD_RC_CARRIER_RANK`, default `0`). With it on, a session the mesh
+//! may carry reads the mesh link to the viewer's device at its offer
+//! ([`RcOverlay::rank_with`]); unless that link is direct, every candidate only
+//! the mesh carries ranks below every relay ([`RcOverlay::ice_rank`]), so the
+//! session lands on TURN whenever TURN connects. The session's half of it (the
+//! candidate lines, the opening's wait) is in [`crate::carrier_rank`].
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::{Duration, Instant};
 
 use roomler_ai_remote_control::signaling::{IceServer, RcOverlayAutoWire};
 use serde::{Deserialize, Serialize};
+use tunnel_core::localapi::{ConnectionType, PeerInfo};
 use tunnel_core::overlay_footprint as footprint;
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::ice::agent::agent_config::{CarrierRank, MeshAddrFn};
 
 /// The overlay decision for ONE session, resolved when it is requested.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -58,13 +71,81 @@ pub struct RcOverlay {
     /// The overlay's v4 blocks, snapshotted by the DAEMON when the session is
     /// requested. Carried rather than re-read so a delegated session's GUI
     /// worker, which runs no overlay of its own, filters the same addresses.
+    /// In rank mode they are carried when the mesh is allowed too: the rank
+    /// needs them to know a mesh address.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v4_nets: Vec<(Ipv4Addr, u8)>,
+    /// FR-148 P4 — the carrier rank's switch, read by the DAEMON when the
+    /// session is requested and carried, as the blocks are: a delegated GUI
+    /// worker has neither the daemon's environment nor its config. Absent
+    /// (switch `0`, or an older daemon) reads `0`, and switch `0` costs no
+    /// byte on the delegation channel.
+    #[serde(default, skip_serializing_if = "RankMode::is_off")]
+    pub carrier_rank: RankMode,
+    /// FR-148 P4 — decided at the offer in rank mode: the mesh link to the
+    /// viewer's device is not direct, so every candidate only the mesh carries
+    /// ranks last ([`Self::ice_rank`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh_last: bool,
 }
 
 /// FR-128 — `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`.
 pub fn auto_enabled() -> bool {
     tunnel_core::env::flag("RC_OVERLAY_AUTO", true)
+}
+
+/// FR-148 P4 — `ROOMLERD_RC_CARRIER_RANK` (config key `rc_carrier_rank`):
+/// may a session whose mesh link to the viewer is not direct rank its mesh
+/// candidates below every relay?
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RankMode {
+    /// `0`, the default: no rank, and nothing a session does or sends changes.
+    #[default]
+    #[serde(rename = "0")]
+    Off,
+    /// `prio`: the rank, by priority alone.
+    #[serde(rename = "prio")]
+    Prio,
+    /// `1`: the rank, and each ranked-last candidate's line also ends with
+    /// ` network-cost 999`, Chrome's own lever.
+    #[serde(rename = "1")]
+    Cost,
+}
+
+impl RankMode {
+    /// The switch as this process reads it: the environment, then the config
+    /// key. Read once per session, where the session is resolved.
+    pub fn read() -> Self {
+        Self::parse(tunnel_core::env::node_env("RC_CARRIER_RANK").as_deref())
+    }
+
+    /// `0`, `prio` or `1`; anything else, unset included, reads `0`.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("prio") => Self::Prio,
+            Some("1") => Self::Cost,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+
+    /// The value as it is set.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "0",
+            Self::Prio => "prio",
+            Self::Cost => "1",
+        }
+    }
+}
+
+impl fmt::Display for RankMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl RcOverlay {
@@ -76,8 +157,20 @@ impl RcOverlay {
 
     /// [`Self::resolve`] with FR-128's third value, `auto` (the server's
     /// hints present). It stands only while `allow` is off and
-    /// [`auto_enabled`] holds; it starts as off, and the offer decides.
+    /// [`auto_enabled`] holds; it starts as off, and the offer decides. The
+    /// carrier rank's switch is read here, once per session.
     pub fn resolve_mode(allow: bool, auto: Option<&RcOverlayAutoWire>) -> Self {
+        Self::resolve_ranked(allow, auto, RankMode::read(), footprint::v4_nets())
+    }
+
+    /// [`Self::resolve_mode`] with the carrier rank's switch and this
+    /// process's overlay blocks passed in.
+    pub fn resolve_ranked(
+        allow: bool,
+        auto: Option<&RcOverlayAutoWire>,
+        carrier_rank: RankMode,
+        blocks: Vec<(Ipv4Addr, u8)>,
+    ) -> Self {
         let auto = auto.filter(|_| !allow && auto_enabled());
         let mut viewers: Vec<IpAddr> = Vec::new();
         for v in auto.map(|a| a.viewers.as_slice()).unwrap_or_default() {
@@ -93,11 +186,13 @@ impl RcOverlay {
             viewers,
             far_turn: auto.and_then(|a| a.far_turn),
             exclude: Vec::new(),
-            v4_nets: if allow {
+            v4_nets: if allow && carrier_rank.is_off() {
                 Vec::new()
             } else {
-                footprint::v4_nets()
+                blocks
             },
+            carrier_rank,
+            mesh_last: false,
         }
     }
 
@@ -109,9 +204,136 @@ impl RcOverlay {
     /// carrier is worse (`exclude`), so ICE cannot pick a relay behind it.
     /// Anything that is not `auto` comes back as it went in. One line in the
     /// log names the inputs.
-    pub async fn decide(self, session: impl std::fmt::Display) -> Self {
-        self.decide_with(session, mesh_carriers_of, own_far_turn)
-            .await
+    ///
+    /// FR-148 P4 — in rank mode the carrier rank decides instead
+    /// ([`Self::rank_with`]), from the session's ICE `servers` too, and a
+    /// second line about 10 s on reads the same link again.
+    pub async fn decide(self, session: impl fmt::Display, servers: &[IceServer]) -> Self {
+        if self.carrier_rank.is_off() {
+            return self
+                .decide_with(session, mesh_carriers_of, own_far_turn)
+                .await;
+        }
+        let session = session.to_string();
+        let (decided, viewers, link) = self.rank_with(&session, servers, mesh_links_of).await;
+        if !viewers.is_empty() {
+            tokio::spawn(link_again_later(session, viewers, link));
+        }
+        decided
+    }
+
+    /// FR-148 P4 — the decision at the offer in rank mode, with the link
+    /// lookup passed in for tests. `auto` behaves as `on`, and the far-TURN
+    /// hint is not read: the mesh is allowed unless the policy is off, and the
+    /// rank does the rest. The viewer's devices are the ones the server named,
+    /// else the TURN servers of the offer that sit on the mesh: each viewer
+    /// relay is a TURN server on its device's mesh address, and under `on` the
+    /// server names none. The best of their links decides: only a direct one
+    /// keeps today's rank; relayed, a tunnel, upgrading, stalled, unknown, no
+    /// answer and no device known all rank the mesh last. One line in the log
+    /// names it all. Also returns the devices read and the link that decided.
+    pub async fn rank_with<F, Fut>(
+        self,
+        session: &str,
+        servers: &[IceServer],
+        lookup: F,
+    ) -> (Self, Vec<IpAddr>, Link)
+    where
+        F: FnOnce(Vec<IpAddr>) -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<MeshLink>>>,
+    {
+        let allow = self.allow || self.auto;
+        let (viewers, from) = if allow {
+            self.viewer_devices(servers)
+        } else {
+            (Vec::new(), ViewersFrom::None)
+        };
+        let started = Instant::now();
+        let link = if !allow {
+            Link::Off
+        } else if viewers.is_empty() {
+            Link::NoViewer
+        } else {
+            Link::best(lookup(viewers.clone()).await)
+        };
+        let read = started.elapsed();
+        let decided = Self {
+            allow,
+            exclude: Vec::new(),
+            mesh_last: allow && !link.is_direct(),
+            ..self
+        };
+        decided.log_rank(session, link, (viewers.len(), from), read);
+        (decided, viewers, link)
+    }
+
+    /// The viewer's devices, and where they came from (see [`Self::rank_with`]).
+    fn viewer_devices(&self, servers: &[IceServer]) -> (Vec<IpAddr>, ViewersFrom) {
+        if !self.viewers.is_empty() {
+            return (self.viewers.clone(), ViewersFrom::Named);
+        }
+        let mut viewers: Vec<IpAddr> = Vec::new();
+        for url in servers.iter().flat_map(|s| &s.urls) {
+            if (url.starts_with("turn:") || url.starts_with("turns:"))
+                && let Some(ip) = url_host_ip(url)
+                && footprint::is_overlay_addr(&self.v4_nets, ip)
+                && !viewers.contains(&ip)
+            {
+                viewers.push(ip);
+            }
+        }
+        let from = if viewers.is_empty() {
+            ViewersFrom::None
+        } else {
+            ViewersFrom::RelayUrls
+        };
+        (viewers, from)
+    }
+
+    /// FR-148 P4 — the carrier rank this session's ICE agent gets: `None`
+    /// under switch `0`. In rank mode a relay allocated over TCP or TLS ranks
+    /// below one over UDP, and the agent keeps checking the pairs it would
+    /// follow; with `mesh_last`, every local candidate on the mesh's own
+    /// blocks or the derived-v6 ULA ([`footprint::is_overlay_addr`], never the
+    /// whole CGNAT `/10`) ranks last.
+    pub fn ice_rank(&self) -> Option<CarrierRank> {
+        if self.carrier_rank.is_off() {
+            return None;
+        }
+        let mesh_last = self.mesh_last.then(|| {
+            let nets = self.v4_nets.clone();
+            Box::new(move |ip: IpAddr| footprint::is_overlay_addr(&nets, ip)) as MeshAddrFn
+        });
+        Some(CarrierRank { mesh_last })
+    }
+
+    /// [`Self::ice_rank`], set on the session's `SettingEngine`.
+    pub fn rank_ice(&self, setting: &mut SettingEngine) {
+        if let Some(rank) = self.ice_rank() {
+            setting.set_ice_carrier_rank(rank);
+        }
+    }
+
+    /// The offer's line in rank mode.
+    fn log_rank(&self, session: &str, link: Link, viewers: (usize, ViewersFrom), read: Duration) {
+        let ranked_last = if self.mesh_last {
+            "host,srflx,relay"
+        } else {
+            "none"
+        };
+        tracing::info!(
+            session = %session,
+            carrier_rank = %self.carrier_rank,
+            link = %link,
+            upgrading = link.upgrading(),
+            stalled = link.stalled(),
+            viewers = viewers.0,
+            viewers_from = %viewers.1,
+            read_ms = read.as_millis() as u64,
+            %ranked_last,
+            mesh_blocks = %MeshBlocks(&self.v4_nets),
+            "rc ICE: carrier rank (FR-148 P4)"
+        );
     }
 
     /// [`Self::decide`] with both lookups passed in, for tests. The carrier
@@ -308,32 +530,203 @@ pub fn auto_allows(carrier: MeshCarrier, far_turn: bool) -> bool {
 /// bound the relay-tier guard uses. Ungated, unlike that guard, because any
 /// session can be `auto`. No answer in time reads every address as unknown.
 pub async fn mesh_carriers_of(addrs: Vec<IpAddr>) -> Vec<MeshCarrier> {
+    let peers = peers_answer().await;
+    addrs
+        .iter()
+        .map(|addr| match &peers {
+            Some(peers) => MeshCarrier::of(peer_at(peers, addr).map(|p| p.connection)),
+            None => MeshCarrier::Unknown,
+        })
+        .collect()
+}
+
+/// ONE LocalAPI `peers` call within 400 ms. `None`: no answer in time.
+async fn peers_answer() -> Option<Vec<PeerInfo>> {
     let query = async {
         let mut client = tunnel_core::localapi::connect().await.ok()?;
         client.peers().await.ok()
     };
-    let peers = tokio::time::timeout(std::time::Duration::from_millis(400), query)
+    tokio::time::timeout(Duration::from_millis(400), query)
         .await
         .ok()
-        .flatten();
-    addrs
-        .iter()
-        .map(|addr| {
-            let addr = addr.to_string();
-            let Some(peers) = &peers else {
-                return MeshCarrier::Unknown;
-            };
-            MeshCarrier::of(
-                peers
-                    .iter()
-                    .find(|p| {
-                        p.overlay_ip.as_deref() == Some(addr.as_str())
-                            || p.overlay_ip6.as_deref() == Some(addr.as_str())
-                    })
-                    .map(|p| p.connection),
-            )
+        .flatten()
+}
+
+/// The peer whose overlay address, v4 or v6, is `addr`.
+fn peer_at<'a>(peers: &'a [PeerInfo], addr: &IpAddr) -> Option<&'a PeerInfo> {
+    let addr = addr.to_string();
+    peers.iter().find(|p| {
+        p.overlay_ip.as_deref() == Some(addr.as_str())
+            || p.overlay_ip6.as_deref() == Some(addr.as_str())
+    })
+}
+
+/// FR-148 P4 — the mesh link to the peer that owns each of `addrs`, in
+/// order, from the same ONE `peers` call within 400 ms as
+/// [`mesh_carriers_of`]. `None`: no answer in time.
+pub async fn mesh_links_of(addrs: Vec<IpAddr>) -> Option<Vec<MeshLink>> {
+    let peers = peers_answer().await?;
+    Some(
+        addrs
+            .iter()
+            .map(|addr| MeshLink::of(peer_at(&peers, addr)))
+            .collect(),
+    )
+}
+
+/// FR-148 P4 — one viewer device's mesh link, as LocalAPI `peers` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshLink {
+    /// `None`: the device is not in the answer.
+    pub connection: Option<ConnectionType>,
+    /// A direct upgrade is being tried: the link is still relayed.
+    pub upgrading: bool,
+    /// The carrier is installed but silently one-way.
+    pub stalled: bool,
+}
+
+impl MeshLink {
+    fn of(peer: Option<&PeerInfo>) -> Self {
+        Self {
+            connection: peer.map(|p| p.connection),
+            upgrading: peer.is_some_and(|p| p.upgrading),
+            stalled: peer.is_some_and(|p| p.stalled),
+        }
+    }
+
+    /// Direct, and neither upgrading nor stalled: the one link that keeps
+    /// today's rank.
+    pub fn is_direct(&self) -> bool {
+        self.connection == Some(ConnectionType::Direct) && !self.upgrading && !self.stalled
+    }
+
+    /// Which of several devices' links is best.
+    fn rank(&self) -> u8 {
+        match self.connection {
+            _ if self.is_direct() => 5,
+            Some(ConnectionType::Direct) => 4,
+            Some(ConnectionType::Relay) => 3,
+            Some(ConnectionType::Tunnel) => 2,
+            Some(ConnectionType::Blocked | ConnectionType::Offline) => 1,
+            None => 0,
+        }
+    }
+}
+
+/// FR-148 P4 — the link that decided a session's rank, as its lines name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    /// The policy is off: no mesh, nothing read.
+    Off,
+    /// No viewer device known: nothing to read.
+    NoViewer,
+    /// The daemon did not answer within 400 ms.
+    NoAnswer,
+    /// The best viewer device's link.
+    Read(MeshLink),
+}
+
+impl Link {
+    /// The best of a `peers` answer's links; `None` is no answer.
+    pub fn best(links: Option<Vec<MeshLink>>) -> Self {
+        match links {
+            None => Self::NoAnswer,
+            Some(links) => links
+                .into_iter()
+                .max_by_key(MeshLink::rank)
+                .map_or(Self::NoViewer, Self::Read),
+        }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Read(l) if l.is_direct())
+    }
+
+    pub fn upgrading(&self) -> bool {
+        matches!(self, Self::Read(l) if l.upgrading)
+    }
+
+    pub fn stalled(&self) -> bool {
+        matches!(self, Self::Read(l) if l.stalled)
+    }
+}
+
+impl fmt::Display for Link {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::NoViewer => "no-viewer",
+            Self::NoAnswer => "no-answer",
+            Self::Read(l) => match l.connection {
+                Some(ConnectionType::Direct) => "direct",
+                Some(ConnectionType::Relay) => "relay",
+                Some(ConnectionType::Tunnel) => "tunnel",
+                Some(ConnectionType::Blocked) => "blocked",
+                Some(ConnectionType::Offline) => "offline",
+                None => "unknown",
+            },
         })
-        .collect()
+    }
+}
+
+/// FR-148 P4 — where a session's viewer devices came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewersFrom {
+    /// The server named them (`auto`).
+    Named,
+    /// The offer's TURN servers on a mesh address.
+    RelayUrls,
+    /// Neither.
+    None,
+}
+
+impl fmt::Display for ViewersFrom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Named => "named",
+            Self::RelayUrls => "relay-urls",
+            Self::None => "none",
+        })
+    }
+}
+
+/// The blocks a mesh address is in, as the offer's line names them: the
+/// carried v4 blocks and the derived-v6 ULA.
+struct MeshBlocks<'a>(&'a [(Ipv4Addr, u8)]);
+
+impl fmt::Display for MeshBlocks<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (net, len) in self.0 {
+            write!(f, "{net}/{len},")?;
+        }
+        f.write_str("fd72:6f6f:6d6c::/96")
+    }
+}
+
+/// FR-148 P4 — how long after the offer the link is read again.
+const LINK_AGAIN_AFTER: Duration = Duration::from_secs(10);
+
+/// FR-148 P4 — the line about 10 s after the open: the same viewer devices'
+/// link then, beside the one that decided at the offer. How often a link that
+/// read relayed at the offer is direct a moment later decides the switch's
+/// default.
+async fn link_again_later(session: String, viewers: Vec<IpAddr>, at_offer: Link) {
+    tokio::time::sleep(LINK_AGAIN_AFTER).await;
+    let started = Instant::now();
+    let now = Link::best(mesh_links_of(viewers).await);
+    log_link_again(&session, at_offer, now, started.elapsed());
+}
+
+fn log_link_again(session: &str, at_offer: Link, now: Link, read: Duration) {
+    tracing::info!(
+        session = %session,
+        link_at_offer = %at_offer,
+        link = %now,
+        upgrading = now.upgrading(),
+        stalled = now.stalled(),
+        read_ms = read.as_millis() as u64,
+        "rc ICE: carrier rank, the mesh link 10 s on (FR-148 P4)"
+    );
 }
 
 /// FR-128 D8 — how old this machine's netcheck may be and still count: the
@@ -805,5 +1198,451 @@ mod tests {
                 .await;
             assert_eq!(d, p);
         }
+    }
+
+    // ---- FR-148 P4: the carrier rank ----
+
+    use tunnel_core::localapi::ConnectionType as C;
+
+    /// The blocks a daemon snapshots in these cells.
+    fn blocks() -> Vec<(Ipv4Addr, u8)> {
+        vec![(Ipv4Addr::new(100, 65, 4, 0), 22)]
+    }
+
+    fn link(connection: Option<C>, upgrading: bool, stalled: bool) -> MeshLink {
+        MeshLink {
+            connection,
+            upgrading,
+            stalled,
+        }
+    }
+
+    fn relayed() -> MeshLink {
+        link(Some(C::Relay), false, false)
+    }
+
+    fn server(urls: &[&str]) -> IceServer {
+        IceServer {
+            urls: urls.iter().map(|u| u.to_string()).collect(),
+            username: Some("u".into()),
+            credential: Some("c".into()),
+        }
+    }
+
+    /// An `on` session in rank mode, as the daemon resolves it.
+    fn ranked_on() -> RcOverlay {
+        RcOverlay::resolve_ranked(true, None, RankMode::Prio, blocks())
+    }
+
+    /// The offer's TURN servers: coturn, and the viewer's own relay on its
+    /// mesh address.
+    fn with_viewer_relay() -> Vec<IceServer> {
+        vec![
+            server(&["turn:turn.roomler.ai:3478?transport=udp"]),
+            server(&["turn:100.65.4.33:47989"]),
+        ]
+    }
+
+    #[test]
+    fn the_rank_switch_reads_0_prio_or_1_and_anything_else_as_0() {
+        assert_eq!(RankMode::parse(None), RankMode::Off);
+        for v in ["0", "", " ", "on", "true", "2", "yes", "prio1", "cost"] {
+            assert_eq!(RankMode::parse(Some(v)), RankMode::Off, "{v:?}");
+        }
+        assert_eq!(RankMode::parse(Some("prio")), RankMode::Prio);
+        assert_eq!(RankMode::parse(Some(" PRIO ")), RankMode::Prio);
+        assert_eq!(RankMode::parse(Some("1")), RankMode::Cost);
+        for m in [RankMode::Off, RankMode::Prio, RankMode::Cost] {
+            assert_eq!(RankMode::parse(Some(m.as_str())), m);
+        }
+    }
+
+    /// `RcOverlay` before FR-148 P4, as an older daemon or GUI worker has it:
+    /// the fields and their attributes, copied.
+    #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
+    struct Before {
+        allow: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        auto: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        viewers: Vec<IpAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        far_turn: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<IpAddr>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        v4_nets: Vec<(Ipv4Addr, u8)>,
+    }
+
+    impl Before {
+        fn of(p: &RcOverlay) -> Self {
+            Self {
+                allow: p.allow,
+                auto: p.auto,
+                viewers: p.viewers.clone(),
+                far_turn: p.far_turn,
+                exclude: p.exclude.clone(),
+                v4_nets: p.v4_nets.clone(),
+            }
+        }
+    }
+
+    /// Switch `0` costs no byte on the delegation channel: every shape a
+    /// session resolves or decides to serializes exactly as before. In rank
+    /// mode the switch and the blocks cross, `on` included, so a delegated
+    /// worker ranks on the daemon's blocks; and an older worker still reads
+    /// the frame, as the `on` it always was.
+    #[tokio::test]
+    async fn switch_0_serializes_as_before_and_an_older_worker_reads_rank_mode() {
+        let hints = RcOverlayAutoWire {
+            viewers: vec!["100.65.4.33".into()],
+            far_turn: Some(true),
+        };
+        let decided = auto(&["100.65.4.33", "100.65.4.40"], None)
+            .decide_with(
+                "s",
+                |_| async { vec![MeshCarrier::Direct, MeshCarrier::Relayed] },
+                || async { None },
+            )
+            .await;
+        for p in [
+            RcOverlay::resolve_ranked(false, None, RankMode::Off, blocks()),
+            RcOverlay::resolve_ranked(true, None, RankMode::Off, blocks()),
+            RcOverlay::resolve_ranked(false, Some(&hints), RankMode::Off, blocks()),
+            decided,
+            RcOverlay::default(),
+        ] {
+            let now = serde_json::to_string(&p).unwrap();
+            assert_eq!(now, serde_json::to_string(&Before::of(&p)).unwrap());
+            assert!(
+                !now.contains("carrier_rank") && !now.contains("mesh_last"),
+                "{now}"
+            );
+            assert_eq!(serde_json::from_str::<RcOverlay>(&now).unwrap(), p);
+        }
+        assert_eq!(
+            serde_json::to_string(&RcOverlay::resolve_ranked(
+                true,
+                None,
+                RankMode::Off,
+                blocks()
+            ))
+            .unwrap(),
+            r#"{"allow":true}"#,
+            "`on` at switch 0 carries no blocks, as before"
+        );
+
+        let ranked = RcOverlay::resolve_ranked(true, None, RankMode::Cost, blocks());
+        let json = serde_json::to_string(&ranked).unwrap();
+        assert_eq!(
+            json,
+            r#"{"allow":true,"v4_nets":[["100.65.4.0",22]],"carrier_rank":"1"}"#
+        );
+        assert_eq!(serde_json::from_str::<RcOverlay>(&json).unwrap(), ranked);
+        let older: Before = serde_json::from_str(&json).unwrap();
+        assert!(older.allow && older.v4_nets == blocks(), "{older:?}");
+        let prio = RcOverlay {
+            mesh_last: true,
+            ..RcOverlay::resolve_ranked(false, Some(&hints), RankMode::Prio, blocks())
+        };
+        let json = serde_json::to_string(&prio).unwrap();
+        assert!(
+            json.ends_with(r#""carrier_rank":"prio","mesh_last":true}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<RcOverlay>(&json).unwrap(), prio);
+    }
+
+    /// Under `on` the server names no viewer device. In rank mode they are
+    /// the offer's TURN servers on a mesh address, each once; a STUN server, a
+    /// name, and an address outside the blocks (a carrier's CGNAT) are none.
+    /// Devices the server named (`auto`) win.
+    #[tokio::test]
+    async fn under_on_the_viewer_devices_are_the_offers_turn_servers_on_the_mesh() {
+        let servers = vec![
+            server(&[
+                "stun:turn.roomler.ai:3478",
+                "turn:turn.roomler.ai:3478?transport=udp",
+                "turns:turn.roomler.ai:443?transport=tcp",
+            ]),
+            server(&[
+                "turn:100.65.4.33:47989",
+                "turns:100.65.4.33:47990?transport=tcp",
+            ]),
+            server(&[
+                "turn:[fd72:6f6f:6d6c::6441:428]:47989",
+                "stun:100.65.4.40:3478",
+                "turn:100.80.1.9:3478",
+                "turn:203.0.113.7:3478",
+            ]),
+        ];
+        let (d, viewers, link) = ranked_on()
+            .rank_with("s", &servers, |addrs: Vec<IpAddr>| async move {
+                Some(vec![relayed(); addrs.len()])
+            })
+            .await;
+        assert_eq!(
+            viewers,
+            vec![ip("100.65.4.33"), ip("fd72:6f6f:6d6c::6441:428")]
+        );
+        assert_eq!(link, Link::Read(relayed()));
+        assert!(d.allow && d.mesh_last, "{d:?}");
+
+        let named = RcOverlay {
+            carrier_rank: RankMode::Prio,
+            ..auto(&["100.65.4.40"], None)
+        };
+        let (_, viewers, _) = named
+            .rank_with("s", &servers, |addrs: Vec<IpAddr>| async move {
+                Some(vec![relayed(); addrs.len()])
+            })
+            .await;
+        assert_eq!(viewers, vec![ip("100.65.4.40")], "named win");
+
+        // No viewer relay at all: no device known, nothing read, ranked last.
+        let (d, viewers, link) = ranked_on()
+            .rank_with("s", &servers[..1], |_| async {
+                panic!("no device, no read")
+            })
+            .await;
+        assert!(viewers.is_empty() && link == Link::NoViewer && d.mesh_last);
+    }
+
+    /// Only a direct link keeps today's rank (the mesh host's type 90): every
+    /// other answer ranks the mesh last, and so does no answer.
+    #[tokio::test]
+    async fn only_a_direct_link_keeps_todays_rank() {
+        let ranked = |answer: Option<Vec<MeshLink>>| async move {
+            ranked_on()
+                .rank_with("s", &with_viewer_relay(), move |_| async move { answer })
+                .await
+                .0
+        };
+        let direct = ranked(Some(vec![link(Some(C::Direct), false, false)])).await;
+        assert!(direct.allow && !direct.mesh_last);
+        let rank = direct.ice_rank().expect("rank mode");
+        assert!(rank.mesh_last.is_none(), "direct: nothing ranked last");
+        for (what, answer) in [
+            ("relayed", Some(vec![relayed()])),
+            ("a tunnel", Some(vec![link(Some(C::Tunnel), false, false)])),
+            ("upgrading", Some(vec![link(Some(C::Relay), true, false)])),
+            (
+                "direct mid-upgrade",
+                Some(vec![link(Some(C::Direct), true, false)]),
+            ),
+            ("stalled", Some(vec![link(Some(C::Direct), false, true)])),
+            ("blocked", Some(vec![link(Some(C::Blocked), false, false)])),
+            ("offline", Some(vec![link(Some(C::Offline), false, false)])),
+            ("not in the answer", Some(vec![link(None, false, false)])),
+            ("no answer within 400 ms", None),
+        ] {
+            let d = ranked(answer).await;
+            assert!(d.allow && d.mesh_last, "{what}: {d:?}");
+            let rank = d.ice_rank().expect("rank mode");
+            let mesh = rank.mesh_last.expect("ranked last");
+            assert!(mesh(ip("100.65.4.34")), "{what}: a mesh address");
+            assert!(mesh(ip("fd72:6f6f:6d6c::6441:422")), "{what}: the ULA");
+            assert!(!mesh(ip("100.80.1.2")), "{what}: a carrier's CGNAT");
+            assert!(!mesh(ip("192.168.1.20")) && !mesh(ip("203.0.113.7")));
+        }
+        // Two devices: the best link decides.
+        let d = ranked(Some(vec![relayed(), link(Some(C::Direct), false, false)])).await;
+        assert!(!d.mesh_last);
+        let d = ranked(Some(vec![relayed(), link(None, false, false)])).await;
+        assert!(d.mesh_last);
+    }
+
+    /// In rank mode `auto` behaves as `on` whatever the far-TURN hint: the
+    /// mesh is allowed, nothing is excluded, and the blocks stay for the rank.
+    #[tokio::test]
+    async fn in_rank_mode_auto_is_on_whatever_the_hint() {
+        for hint in [Some(true), Some(false), None] {
+            let a = RcOverlay {
+                carrier_rank: RankMode::Prio,
+                ..auto(&["100.65.4.33", "100.65.4.40"], hint)
+            };
+            let (d, viewers, _) = a
+                .rank_with("s", &[], |_| async {
+                    Some(vec![link(Some(C::Direct), false, false), relayed()])
+                })
+                .await;
+            assert!(d.allow && d.auto && !d.mesh_last, "{hint:?}: {d:?}");
+            assert!(d.exclude.is_empty(), "as `on`: no device left out");
+            assert_eq!(d.v4_nets, blocks());
+            assert!(d.keeps_local(ip("100.65.4.34")) && d.filters_nothing());
+            assert_eq!(viewers.len(), 2);
+            let (d, _, _) = RcOverlay {
+                carrier_rank: RankMode::Cost,
+                ..auto(&["100.65.4.33"], hint)
+            }
+            .rank_with("s", &[], |_| async { Some(vec![relayed()]) })
+            .await;
+            assert!(
+                d.allow && d.mesh_last,
+                "{hint:?}: relayed, and still allowed"
+            );
+        }
+    }
+
+    /// An `off` policy stays off in rank mode: nothing is read, nothing ranked
+    /// last, the filters hold; the agent's half of the rank (TLS below UDP,
+    /// the checks after the selection) still applies.
+    #[tokio::test]
+    async fn in_rank_mode_an_off_policy_stays_off_and_reads_nothing() {
+        let p = RcOverlay::resolve_ranked(false, None, RankMode::Cost, blocks());
+        let (d, viewers, link) = p
+            .rank_with("s", &with_viewer_relay(), |_| async {
+                panic!("off: no read")
+            })
+            .await;
+        assert!(!d.allow && !d.mesh_last && viewers.is_empty() && link == Link::Off);
+        assert!(!d.keeps_local(ip("100.65.4.34")), "filtered as ever");
+        assert!(d.ice_rank().unwrap().mesh_last.is_none());
+    }
+
+    /// Switch `0`: no rank reaches ICE, and an `on` session's offer reads
+    /// nothing.
+    #[tokio::test]
+    async fn switch_0_hands_ice_nothing_and_its_offer_reads_nothing() {
+        for p in [on(), off(), RcOverlay::default()] {
+            assert!(p.ice_rank().is_none());
+            assert_eq!(p.clone().decide("s", &with_viewer_relay()).await, p);
+        }
+    }
+
+    /// What `f` logs, as the daemon's log file writes it: the same capture as
+    /// `media_delivery`'s cells.
+    fn logged(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one: with one, a callsite's interest is taken
+        // once for every thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// `wants`, in this order, on the one line `out` holds.
+    fn in_order(out: &str, wants: &[&str]) {
+        let mut rest = out;
+        for want in wants {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+    }
+
+    /// The offer's line, field by field.
+    #[test]
+    fn the_offer_line_names_its_fields() {
+        let d = RcOverlay {
+            mesh_last: true,
+            ..RcOverlay::resolve_ranked(true, None, RankMode::Cost, blocks())
+        };
+        let upgrading = Link::Read(link(Some(C::Relay), true, false));
+        let out = logged(|| {
+            d.log_rank(
+                "65a1b2c3d4e5f60718293a4b",
+                upgrading,
+                (1, ViewersFrom::RelayUrls),
+                Duration::from_millis(12),
+            )
+        });
+        in_order(
+            &out,
+            &[
+                " INFO ",
+                "rc ICE: carrier rank (FR-148 P4)",
+                "session=65a1b2c3d4e5f60718293a4b",
+                "carrier_rank=1",
+                "link=relay",
+                "upgrading=true",
+                "stalled=false",
+                "viewers=1",
+                "viewers_from=relay-urls",
+                "read_ms=12",
+                "ranked_last=host,srflx,relay",
+                "mesh_blocks=100.65.4.0/22,fd72:6f6f:6d6c::/96",
+            ],
+        );
+        let kept = RcOverlay {
+            carrier_rank: RankMode::Prio,
+            mesh_last: false,
+            ..d.clone()
+        };
+        let direct = Link::Read(link(Some(C::Direct), false, false));
+        let out = logged(|| kept.log_rank("s", direct, (2, ViewersFrom::Named), Duration::ZERO));
+        in_order(
+            &out,
+            &[
+                "carrier_rank=prio",
+                "link=direct",
+                "viewers=2",
+                "viewers_from=named",
+                "read_ms=0",
+                "ranked_last=none",
+            ],
+        );
+        for (l, word) in [
+            (Link::Off, "link=off"),
+            (Link::NoViewer, "link=no-viewer"),
+            (Link::NoAnswer, "link=no-answer"),
+            (Link::Read(link(None, false, false)), "link=unknown"),
+            (
+                Link::Read(link(Some(C::Tunnel), false, false)),
+                "link=tunnel",
+            ),
+        ] {
+            let out = logged(|| kept.log_rank("s", l, (0, ViewersFrom::None), Duration::ZERO));
+            assert!(
+                out.contains(word) && out.contains("viewers_from=none"),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// The line about 10 s on, field by field.
+    #[test]
+    fn the_line_10_s_on_names_its_fields() {
+        let out = logged(|| {
+            log_link_again(
+                "65a1b2c3d4e5f60718293a4b",
+                Link::Read(relayed()),
+                Link::Read(link(Some(C::Direct), false, false)),
+                Duration::from_millis(3),
+            )
+        });
+        in_order(
+            &out,
+            &[
+                " INFO ",
+                "rc ICE: carrier rank, the mesh link 10 s on (FR-148 P4)",
+                "session=65a1b2c3d4e5f60718293a4b",
+                "link_at_offer=relay",
+                "link=direct",
+                "upgrading=false",
+                "stalled=false",
+                "read_ms=3",
+            ],
+        );
     }
 }

@@ -4,7 +4,7 @@ mod setting_engine_test;
 use std::sync::Arc;
 
 use dtls::extension::extension_use_srtp::SrtpProtectionProfile;
-use ice::agent::agent_config::{InterfaceFilterFn, IpFilterFn};
+use ice::agent::agent_config::{CarrierRank, InterfaceFilterFn, IpFilterFn};
 use ice::mdns::MulticastDnsMode;
 use ice::network_type::NetworkType;
 use ice::udp_network::UDPNetwork;
@@ -45,6 +45,9 @@ pub struct Candidates {
     pub username_fragment: String,
     pub password: String,
     pub include_loopback_candidate: bool,
+    /// Roomler patch (FR-148 P4): the ICE agent's carrier rank. `None`, the
+    /// default, changes nothing.
+    pub carrier_rank: Arc<Option<CarrierRank>>,
 }
 
 #[derive(Default, Clone)]
@@ -207,6 +210,13 @@ impl SettingEngine {
     /// the amount of information you wish to expose to the remote peer
     pub fn set_ip_filter(&mut self, filter: IpFilterFn) {
         self.candidates.ip_filter = Arc::new(Some(filter));
+    }
+
+    /// Roomler patch (FR-148 P4): sets the ICE agent's carrier rank
+    /// (`ice::agent::agent_config::CarrierRank`), carried to the agent the way
+    /// the IP filter is.
+    pub fn set_ice_carrier_rank(&mut self, rank: CarrierRank) {
+        self.candidates.carrier_rank = Arc::new(Some(rank));
     }
 
     /// set_nat_1to1_ips sets a list of external IP addresses of 1:1 (D)NAT

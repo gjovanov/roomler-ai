@@ -1206,6 +1206,13 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub ice_relay_tcp: Option<bool>,
+    /// FR-148 P4 — the carrier rank: `0` (unset; off, as before), `prio` or
+    /// `1`. With it on, a remote-desktop session whose mesh link to the
+    /// viewer is not direct ranks its mesh candidates below every relay; `1`
+    /// also marks them ` network-cost 999`. Env `ROOMLERD_RC_CARRIER_RANK`,
+    /// read once per session. Local only. Temporary: FR-148 P5 deletes it.
+    #[serde(default)]
+    pub rc_carrier_rank: Option<String>,
     /// Bitrate ceiling for a CONSTRAINED (relay) remote-control transport,
     /// kbps. Built-in default 3000; clamped 100-100000. See `relay_max_kbps`
     /// in the config surface.
@@ -2995,6 +3002,7 @@ pub fn test_fixture() -> AgentConfig {
         measured_ceiling: None,
         encoder_inplace_rate: None,
         ice_relay_tcp: None,
+        rc_carrier_rank: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,
@@ -3426,6 +3434,10 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // child's included.
     if let Some(v) = &cfg.qsv_rate_mode {
         fallbacks.insert("QSV_RATE_MODE".to_string(), v.clone());
+    }
+    // FR-148 P4 — the carrier rank, read once per session.
+    if let Some(v) = &cfg.rc_carrier_rank {
+        fallbacks.insert("RC_CARRIER_RANK".to_string(), v.clone());
     }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
@@ -4830,6 +4842,7 @@ mod tests {
         cfg.zero_copy_deny = Some("hevc_qsv:gpu".into());
         cfg.nvenc_split = Some("off".into());
         cfg.qsv_rate_mode = Some("qvbr".into());
+        cfg.rc_carrier_rank = Some("prio".into());
         // FR-130 — default ON, so the direction worth bridging is the off.
         cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
@@ -4840,6 +4853,7 @@ mod tests {
         assert_eq!(get("ZERO_COPY_DENY"), Some("hevc_qsv:gpu"));
         assert_eq!(get("NVENC_SPLIT"), Some("off"));
         assert_eq!(get("QSV_RATE_MODE"), Some("qvbr"));
+        assert_eq!(get("RC_CARRIER_RANK"), Some("prio"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),

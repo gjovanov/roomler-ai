@@ -70,10 +70,10 @@
       const next = await invoke('cmd_rc_sessions')
       sessions = Array.isArray(next) ? next : []
     } catch (_) {
-      // Daemon down: keep the last known text rather than blanking the strip.
-      // The window is hidden by the watcher moments later anyway, and an
-      // indicator that flickers to empty is worse than one that is briefly
-      // stale.
+      // #3998 — a read that failed keeps the words: an indicator that
+      // flickers to empty is worse than one that is briefly stale. The
+      // session watch decides whether the window stays up: a failed read
+      // never takes it down, and a device service that is not there does.
       return
     }
     paint()
