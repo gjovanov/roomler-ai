@@ -543,6 +543,7 @@ fn fresh_config(issued: Issued) -> AgentConfig {
         rc_media_legacy: None,
         rc_media_canary: None,
         nvenc_split: None,
+        qsv_rate_mode: None,
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,

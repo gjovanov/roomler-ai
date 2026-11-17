@@ -741,7 +741,7 @@ Three rules keep them from stepping on each other:
   ≥4 KB in the last 1.2 s (the motion clock; caret/keystroke deltas at
   0.5–3 KB never hold it) and flushes once quiet — the rebuild then stalls a
   static image nobody can see, and its first-frame IDR doubles as the
-  post-motion refresh.
+  post-motion refresh. ⚠️ At constant bitrate QSV pads every frame to `maxrate ÷ fps ÷ 8` bytes (10,638 at 2.55 Mbit/s), so every real frame, a caret blink's too, reads as motion, the clock never goes quiet while anything on the screen changes, and a deferred apply waits for good: [FR-148](fr/FR-148-path-measured-plan-follows.md) measured 0 rate moves in 16,719 s, and a still screen spending about 0.9 Mbit/s on keepalive filler. `qsv_rate_mode = qvbr` (FR-148 P2) opens QSV off constant bitrate, so a frame can be as small as its content ([encoders.md](encoders.md#qsv-off-constant-bitrate-fr-148-p2)); whether a still QSV frame then falls under 4 KB is FR-148 AC13's read, owed.
 - **A rebuild bumps the send epoch** (rc.445): the send task discards
   queued frames from the previous encoder, so the fresh IDR ships
   immediately instead of behind up to 450 ms of obsolete motion.
@@ -1566,6 +1566,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `ROOMLERD_SW_PACE_UP_MARGIN` | 2.5 | Env only. FR-112 P2d: how far (fps) a software encoder's estimate must clear a higher step before its pace moves up to it (0–10). `0` = 0.4.142's pace, which steps up as soon as the estimate quantises higher ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
 | `ROOMLERD_RATECTL` | shadow | Env only (B1). FR-63 B1 — whether the shadow rate controller runs beside the governor; `off` stops it, any other value is `shadow`. It drives NOTHING — its only output is the `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). The config-surface tribool and the `live` value are B2 |
 | `ROOMLERD_PATH_MODEL` | on | Env only. FR-148 P0 — whether the data-channel pumps take delivery samples from SCTP's acknowledgement clock and write the `path delivery` line; `off` takes none and writes none, any other value samples. It drives NOTHING ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)). FR-148 P1 adds `shadow` |
+| `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` | `cbr` | FR-148 P2 — `qvbr` opens an HEVC or H.264 QSV encoder off constant bitrate: its target at 0.9 × the cap, under `maxrate` at the cap, at the session's quality (QVBR), so a frame is no longer padded to the cap. A driver that refuses it opens at `cbr`. Every rebuild and reopen follows. This device only: not pushable ([`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
@@ -1601,7 +1602,7 @@ heuristic which rations rate moves is dead weight on NVENC but load-bearing on Q
 so every retirement is gated on the backend it is retired for.
 
 **The switches.** Each one is `ROOMLERD_<KEY>` in the environment and the lowercase
-key in the config (`roomler config set`), except the three marked *env only*. A
+key in the config (`roomler config set`), except the four marked *env only*. A
 default of *on* guards shipped behaviour. A default of *off* means the behaviour is
 still waiting for its evidence.
 
@@ -1627,6 +1628,7 @@ still waiting for its evidence.
 | `RATECTL` (env only) | `:597` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
 | `SHARED_RATE_SPLIT` (env only) | `:910` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
 | `PATH_MODEL` (env only) | `agents/roomlerd/src/media_delivery.rs:53`, not `encode/mod.rs` | FR-148 P0 | on | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)); nothing reads them | FR-148 P1 turns it into `shadow` and on; P5 deletes it with the composition it measures | FR-148 P5 | — |
+| `QSV_RATE_MODE` | `agents/roomlerd/src/encode/ffmpeg/encoder.rs:3471`, not `encode/mod.rs` | FR-148 P2 (FR-62 A5) | `cbr` | constant bitrate on QSV: `qvbr` opens HEVC and H.264 QSV at QVBR, the target at 0.9 × the cap, and falls back to `cbr` on a refusal (`QsvRateOpen`, [`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) | FR-148 AC13 read with it on: a QSV keepalive no longer `maxrate ÷ fps ÷ 8` bytes, a still screen under 0.3 Mbit/s. FR-148 P5 then deletes the constant-bitrate path, and the switch with it | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
 Each one retires through this table too, and its deletion PR cites the precondition below.

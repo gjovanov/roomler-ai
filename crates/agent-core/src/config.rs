@@ -1530,6 +1530,14 @@ pub struct AgentConfig {
     /// `fps_deny`.
     #[serde(default)]
     pub nvenc_split: Option<String>,
+    /// FR-148 P2 (FR-62 A5) — the rate control an HEVC or H.264 QSV encoder
+    /// opens in: `cbr` (unset; constant bitrate, as before) or `qvbr` (the
+    /// target at 0.9 × the cap, under the cap, at the open's quality; a driver
+    /// that refuses it opens as `cbr`). Env `ROOMLERD_QSV_RATE_MODE`, read at
+    /// every encoder open. Local only: turning new encoder code on stays the
+    /// device's decision, or a release's. Temporary: FR-148 P5 deletes it.
+    #[serde(default)]
+    pub qsv_rate_mode: Option<String>,
     /// FR-77 P4 — pin the VAAPI render node (`ROOMLERD_VAAPI_DEVICE`,
     /// e.g. `/dev/dri/renderD129`). Unset = the first node libva opens, in
     /// order `/dev/dri/renderD128`…`renderD135`. Read once per process at
@@ -3031,6 +3039,7 @@ pub fn test_fixture() -> AgentConfig {
         rc_media_legacy: None,
         rc_media_canary: None,
         nvenc_split: None,
+        qsv_rate_mode: None,
         vaapi_device: None,
         d3d12_adapter: None,
         vulkan_device: None,
@@ -3412,6 +3421,11 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     // every encoder open.
     if let Some(v) = &cfg.nvenc_split {
         fallbacks.insert("NVENC_SPLIT".to_string(), v.clone());
+    }
+    // FR-148 P2 — QSV's rate control, read at every encoder open, the probe
+    // child's included.
+    if let Some(v) = &cfg.qsv_rate_mode {
+        fallbacks.insert("QSV_RATE_MODE".to_string(), v.clone());
     }
     // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
     // probe child too.
@@ -4815,6 +4829,7 @@ mod tests {
         cfg.zero_copy = Some(true);
         cfg.zero_copy_deny = Some("hevc_qsv:gpu".into());
         cfg.nvenc_split = Some("off".into());
+        cfg.qsv_rate_mode = Some("qvbr".into());
         // FR-130 — default ON, so the direction worth bridging is the off.
         cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
@@ -4824,6 +4839,7 @@ mod tests {
         assert_eq!(get("COLOR_DESCRIPTION"), Some("0"));
         assert_eq!(get("ZERO_COPY_DENY"), Some("hevc_qsv:gpu"));
         assert_eq!(get("NVENC_SPLIT"), Some("off"));
+        assert_eq!(get("QSV_RATE_MODE"), Some("qvbr"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
             get("UINPUT"),

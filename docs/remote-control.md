@@ -6865,7 +6865,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2643`](../crates/agent-core/src/config.rs#L2643))
+([`crates/agent-core/src/config.rs:2651`](../crates/agent-core/src/config.rs#L2651))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |
