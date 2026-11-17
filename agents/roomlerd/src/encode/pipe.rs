@@ -164,6 +164,9 @@ pub struct Pipe {
     capacity_basis: Option<Basis>,
     /// FR-148 P0 — FR-148 §4.1's laws over the same inputs, in shadow.
     model: PathModel,
+    /// FR-148 P1 — the pair memory's side of this session: the same laws from
+    /// the entry's floor, and the push-back record (`pair_memory`).
+    memory: super::pair_memory::SessionMemory,
 }
 
 impl Pipe {
@@ -184,10 +187,28 @@ impl Pipe {
     /// the floor it sets and fed to the shadow model; nothing it says changes
     /// what this returns or any number this type gives.
     pub fn observe_delivered(&mut self, bps: u32, basis: Basis, now: Instant) -> bool {
+        self.observe_delivered_in(bps, basis, true, now)
+    }
+
+    /// FR-148 P1 (D24) — [`Self::observe_delivered`] for a window the validity
+    /// gate ruled on. This type's own law takes every window, as it always has;
+    /// the shadow model and the pair memory take a delivery only from a `valid`
+    /// one, because the opener's burst and the drain after a stall deliver more
+    /// in one window than the path carries.
+    pub fn observe_delivered_in(
+        &mut self,
+        bps: u32,
+        basis: Basis,
+        valid: bool,
+        now: Instant,
+    ) -> bool {
         if bps == 0 {
             return false;
         }
-        self.model.delivered(bps, basis, now);
+        if valid {
+            self.model.delivered(bps, basis, now);
+            self.memory.delivered(bps, basis, now);
+        }
         self.delivered_n = self.delivered_n.saturating_add(1);
         match self.floor {
             Some((best, _)) if bps <= best => false,
@@ -223,7 +244,10 @@ impl Pipe {
         if bps == 0 {
             return;
         }
+        // Every caller is a valid window: the goodput fold and the link loop
+        // both act only on one (`governor`).
         self.model.pushed_back(bps, basis, now);
+        self.memory.pushed_back(bps, basis, now);
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
         self.capacity_basis = Some(basis);
@@ -343,6 +367,27 @@ impl Pipe {
     /// they never took a seed.
     pub fn remember(&mut self, bps: u32, now: Instant) {
         self.model.remembered(bps, now);
+    }
+
+    /// FR-148 P1 — the pair memory's side of this session.
+    pub fn memory(&self) -> &super::pair_memory::SessionMemory {
+        &self.memory
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_mut(&mut self) -> &mut super::pair_memory::SessionMemory {
+        &mut self.memory
+    }
+
+    /// FR-148 P1 — open the pair memory's side from the pair's entry. This
+    /// type's own numbers and the shadow model do not move.
+    pub fn open_memory(
+        &mut self,
+        entry: Option<&super::pair_memory::PairEntry>,
+        now_unix: u64,
+        now: Instant,
+    ) {
+        self.memory.open(entry, now_unix, now);
     }
 }
 
@@ -560,8 +605,12 @@ impl PathModel {
     /// What it would offer the pair memory at a session's end: its floor, with
     /// the tag of the reading that set it, or nothing when the session measured
     /// nothing. Never an assumed value, since none enters.
+    ///
+    /// FR-148 P1 (D23) — and nothing while the floor is still the remembered
+    /// one: a session whose readings never passed the seed offers nothing, so
+    /// a writer that trusts this never writes the seed back as a new reading.
     pub fn offer(&self, now: Instant) -> Option<PathNumber> {
-        self.floor(now)
+        self.floor(now).filter(|f| !f.remembered)
     }
 }
 
@@ -905,11 +954,9 @@ mod tests {
         p.remember(3_322, now);
         assert_eq!((p.floor_bps(now), p.capacity_bps(now)), (None, None));
         let seed = PathNumber::remembered(3_322, Duration::ZERO);
-        assert_eq!(
-            p.model().offer(now),
-            Some(seed),
-            "measured nothing: the seed"
-        );
+        assert_eq!(p.model().floor(now), Some(seed), "the seed is the floor");
+        // FR-148 P1 (D23): until 2026-11-17 this offered the seed itself.
+        assert_eq!(p.model().offer(now), None, "measured nothing: no offer");
         let t = now + Duration::from_secs(2);
         p.observe_capacity(2_000, Basis::AppLimited, t);
         assert_eq!(

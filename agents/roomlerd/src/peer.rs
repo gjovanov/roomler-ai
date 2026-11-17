@@ -256,6 +256,10 @@ pub struct AgentPeer {
     /// connected, and the overlay that draws the curtain). Set once by
     /// [`Self::set_privacy_ctx`] before the offer is answered.
     privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>>,
+    /// FR-148 P1 — what the pair memory's key needs from this session's viewer:
+    /// the controlling user ([`Self::set_pair_user`]) and its server-reflexive
+    /// candidates, as they are trickled. The FFmpeg pump finds it by session.
+    pair_facts: Arc<crate::media_pair_memory::PairFacts>,
     /// Fires when this session ends: [`Self::close`] or the drop, whichever
     /// comes first. The DataChannel handlers that hold something past their
     /// channel (the cursor poller, the clipboard watch, an upload's open
@@ -1205,6 +1209,9 @@ impl AgentPeer {
         let privacy_ctx: Arc<std::sync::OnceLock<crate::privacy::PrivacyCtx>> =
             Arc::new(std::sync::OnceLock::new());
         let privacy_ctx_for_callback = privacy_ctx.clone();
+        // FR-148 P1 — registered before the pump is spawned, which finds it by
+        // the session's id.
+        let pair_facts = crate::media_pair_memory::PairFacts::register(session_id);
         let session_end_for_callback = session_end.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -1691,6 +1698,7 @@ impl AgentPeer {
             #[cfg(feature = "recording")]
             record_ctx,
             privacy_ctx,
+            pair_facts,
             session_end: {
                 construction_guard.disarm();
                 session_end
@@ -1750,6 +1758,13 @@ impl AgentPeer {
     /// every request as `unavailable`.
     pub fn set_privacy_ctx(&self, ctx: crate::privacy::PrivacyCtx) {
         let _ = self.privacy_ctx.set(ctx);
+    }
+
+    /// FR-148 P1 — the controlling user, for the pair memory's key. Call
+    /// before [`Self::handle_offer`]; a pump that opens without it keeps no
+    /// path memory (`no_user`).
+    pub fn set_pair_user(&self, user: bson::oid::ObjectId) {
+        self.pair_facts.set_user(user);
     }
 
     /// Wave 2 — a telemetry sample for `rc:session.stats`.
@@ -1848,6 +1863,9 @@ impl AgentPeer {
             other => serde_json::from_value(other)
                 .map_err(|e| anyhow!("bad ICE candidate shape: {e}"))?,
         };
+        // FR-148 P1 — the viewer's server-reflexive addresses name its network
+        // in the pair memory's key.
+        self.pair_facts.note_candidate(&init.candidate);
         // #1882 — a candidate on a mesh address is an overlay pair waiting to
         // happen even though this side offered no overlay candidate: the
         // srflx and relay sockets are bound to `0.0.0.0`, so a check to it
@@ -2063,87 +2081,6 @@ async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
-}
-
-/// FR-79 V2 — the carrier under an overlay pair, as the memory key's second
-/// half. Asks the same LocalAPI the constrained-transport probe asks; a
-/// non-overlay remote (a TURN server's own address, say) is already its own
-/// key, and anything unknown or mid-churn returns `None`, which leaves the
-/// bare-address key this had before.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-async fn overlay_carrier_tag(remote_addr: &str) -> Option<String> {
-    if !addr_is_overlay_range(remote_addr) {
-        return None;
-    }
-    let query = async {
-        let mut client = tunnel_core::localapi::connect().await.ok()?;
-        let peers = client.peers().await.ok()?;
-        peers.into_iter().find(|p| {
-            p.overlay_ip.as_deref() == Some(remote_addr)
-                || p.overlay_ip6.as_deref() == Some(remote_addr)
-        })
-    };
-    let peer = tokio::time::timeout(Duration::from_millis(400), query)
-        .await
-        .ok()??;
-    let connection = format!("{:?}", peer.connection).to_lowercase();
-    crate::encode::rate_memory::carrier_tag(
-        &connection,
-        peer.relay_kind.as_deref(),
-        peer.relay_transport.as_deref(),
-    )
-}
-
-/// FR-35 P2 — persists the session's stable rate for its peer when the pump
-/// ends, whichever way it ends. The pump stores the governor's current stable
-/// rate into `stable` once per viewer window; `0` = nothing worth keeping.
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-struct RateMemoryGuard {
-    path: Option<std::path::PathBuf>,
-    peer: Option<String>,
-    stable: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// FR-79 V4 — what the OPENER measured about this carrier, when its burst
-    /// queued enough for the estimator to say anything. Second-choice
-    /// evidence: the session belief above is the whole session's answer.
-    opener_measured: std::sync::Arc<std::sync::atomic::AtomicU32>,
-}
-
-#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-impl Drop for RateMemoryGuard {
-    fn drop(&mut self) {
-        let (Some(path), Some(peer)) = (self.path.as_ref(), self.peer.as_ref()) else {
-            return;
-        };
-        // FR-79 V4 — a session writes what it MEASURED about this carrier, or
-        // nothing at all. The belief the validity gate accepted is the
-        // session's own answer; the opener's measurement stands in for a
-        // session too short to have produced one. With neither, the entry
-        // keeps its value AND its age, because refreshing a timestamp on no
-        // evidence would keep a stale number alive past its TTL.
-        let evidence = [
-            self.stable.load(std::sync::atomic::Ordering::Relaxed),
-            self.opener_measured
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ]
-        .into_iter()
-        .find(|v| *v > 0);
-        let mut mem = crate::encode::rate_memory::RateMemory::load(path);
-        let kept = mem.record_session(peer, evidence, crate::encode::rate_memory::now_unix());
-        if kept == 0 {
-            return;
-        }
-        match mem.save(path) {
-            Ok(()) => info!(
-                peer,
-                evidence_bps = ?evidence,
-                kept_bps = kept,
-                "FR-79 V4 rate memory: the carrier's measured rate remembered for the pair"
-            ),
-            Err(e) => {
-                warn!(peer, %e, "FR-35 rate memory: could not persist (memory stays off for this pair)")
-            }
-        }
-    }
 }
 
 /// Relay-escape — mid-session re-read of the selected ICE pair. The DC
@@ -6666,68 +6603,21 @@ async fn media_pump_ffmpeg_dc(
     // and follows a mid-session renomination (see the block at the loop top).
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
     let mut last_transport_check = std::time::Instant::now();
-    // FR-35 P2 — per-peer rate memory: the pair's remembered stable rate
-    // seeds the opening ceiling (85 % of it), so the opening keyframe is
-    // sized by what the pair proved, not by the fleet constant. Keyed by the
-    // nominated pair's remote address (the viewer host).
+    // FR-35 P2 / FR-148 P1 — the pair memories (`media_pair_memory`): today's
+    // seeds the opening ceiling exactly as before; the path model's is only
+    // read for its line, and written when the pump ends.
     let rate_hi_bps = crate::encode::relay_max_hi_bps();
-    let rate_peer_key = if constrained && rate_hi_bps > 0 {
-        // The pair may not be nominated yet at pump start (the 0.4.27 field
-        // run's first packet came 4 s in): no key then means no seed AND no
-        // write-back, i.e. the memory silently off for the session. Poll
-        // briefly; the pump has nothing to send before the DC opens anyway.
-        let mut key = None;
-        for _ in 0..20 {
-            key = nominated_remote_ip(&pc).await;
-            if key.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if key.is_none() {
-            info!(
-                %session_id,
-                "FR-35 rate memory: no nominated pair within 4 s of pump start — memory off for this session"
-            );
-        }
-        // FR-79 V2 — the carrier is half the key: one overlay address can be
-        // carried by a direct path, a UDP relay or DERP over TLS on different
-        // days, with four times the capacity between the ends of that range.
-        match key {
-            Some(addr) => {
-                let tag = overlay_carrier_tag(&addr).await;
-                Some(crate::encode::rate_memory::memory_key(
-                    &addr,
-                    tag.as_deref(),
-                ))
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    let rate_memory_path = crate::encode::rate_memory::default_path();
-    let (rate_seed, seed_age) = match (&rate_peer_key, &rate_memory_path) {
-        (Some(peer), Some(path)) => crate::media_delivery::seed_at_open(path, peer),
-        _ => (None, None),
-    };
-    if let Some(seed) = rate_seed {
-        info!(
-            %session_id,
-            codec_label,
-            peer = rate_peer_key.as_deref().unwrap_or("-"),
-            seed_bps = seed,
-            hi_bps = rate_hi_bps,
-            "FR-35 rate memory: opening ceiling seeded from the pair's remembered stable rate"
-        );
-    }
-    let rate_memory_guard = RateMemoryGuard {
-        path: rate_memory_path,
-        peer: rate_peer_key,
-        stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-
-        opener_measured: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-    };
+    let mut pair_memory = crate::media_pair_memory::open(
+        &pc,
+        session_id,
+        codec_label,
+        delivery.mode(),
+        constrained,
+        rate_hi_bps,
+        || nominated_remote_ip(&pc),
+    )
+    .await;
+    let (rate_seed, seed_age) = (pair_memory.seed(), pair_memory.seed_age());
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
     // encoder AND reopens the capturer at the new profile fps — pre-P3 a
@@ -7317,6 +7207,9 @@ async fn media_pump_ffmpeg_dc(
              remembered rate, floor relief seeded from it, refine lift held while the profile is on"
         );
     }
+    // FR-148 P1 — the path model's entry, and its open line.
+    let dial = priority.load(std::sync::atomic::Ordering::Relaxed);
+    pair_memory.at_open(&mut governor, dial, slow_link_profile.is_some());
     // FR-70 M3a — the PLAN, in SHADOW (`encode::plan`). At the top of every
     // pass the pump computes the plan ONCE from the facts it has at that
     // instant and compares it, field by field, against the inline values it
@@ -9443,12 +9336,7 @@ async fn media_pump_ffmpeg_dc(
                     "FR-35 ceiling learner: the pair carried the ceiling — stepping it up"
                 );
             }
-            rate_memory_guard.stable.store(
-                governor
-                    .session_evidence_bps(std::time::Instant::now(), constrained)
-                    .unwrap_or(0),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            pair_memory.window(&governor, constrained);
         }
         if let Some(vw) = viewer_window
             && (vw.changed
@@ -9539,9 +9427,7 @@ async fn media_pump_ffmpeg_dc(
             // 2026-09-08 — every opener there had a 0 ms worst wait).
             let target = measured.unwrap_or(0).min(rate_hi_bps.max(1));
             if constrained {
-                rate_memory_guard
-                    .opener_measured
-                    .store(target, std::sync::atomic::Ordering::Relaxed);
+                pair_memory.opener_measured(target);
                 info!(
                     %session_id,
                     codec_label,

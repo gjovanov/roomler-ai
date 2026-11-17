@@ -640,6 +640,23 @@ impl RateGovernor {
         self.learner.learned_bps()
     }
 
+    /// FR-148 P1 — the pair memory's side of this session, which the pump's
+    /// guard reads at each viewer window. Nothing here drives a rate.
+    pub fn memory(&self) -> &super::pair_memory::SessionMemory {
+        self.belief.memory()
+    }
+
+    /// FR-148 P1 — open the pair memory's side from the pair's entry, right
+    /// after the governor is built. Nothing the session acts on moves.
+    pub fn open_memory(
+        &mut self,
+        entry: Option<&super::pair_memory::PairEntry>,
+        now_unix: u64,
+        now: Instant,
+    ) {
+        self.belief.open_memory(entry, now_unix, now);
+    }
+
     /// FR-35 P2 — the session's stable rate when it beats the nominal.
     pub fn stable_bps(&self) -> Option<u32> {
         self.learner.stable_bps()
@@ -1336,11 +1353,6 @@ impl RateGovernor {
                 || viewer_rate::offered_over_arrival(sent_bps, rx_bps);
             (rx_bps, Basis::of_window(backlogged))
         });
-        let floor_raised = delivered
-            .is_some_and(|(rx_bps, basis)| self.belief.observe_delivered(rx_bps, basis, now));
-        if let Some((rx_bps, basis)) = delivered {
-            self.path.arrival = Some((rx_bps, basis, now));
-        }
         let rejection = super::evidence::rejected(super::evidence::WindowFacts {
             state,
             prev_state,
@@ -1363,6 +1375,15 @@ impl RateGovernor {
             self.evidence.note(r);
         }
         let valid = rejection.is_none();
+        // FR-148 P1 (D24) — the delivery is folded once the gate has ruled, which
+        // reads only the window's facts: `Pipe` takes it whatever the verdict, the
+        // shadow model and the pair memory only from a valid window.
+        let floor_raised = delivered.is_some_and(|(rx_bps, basis)| {
+            self.belief.observe_delivered_in(rx_bps, basis, valid, now)
+        });
+        if let Some((rx_bps, basis)) = delivered {
+            self.path.arrival = Some((rx_bps, basis, now));
+        }
         // FR-79 V5 — the gate says whether this window MEASURES the pipe. It
         // was also being read as whether the window says anything at all, and
         // for a stalled transport those differ: the stall is the pipe pushing
@@ -5769,6 +5790,133 @@ mod tests {
         let rest = &intervals[used.div_ceil(2)..];
         assert!(!rest.is_empty());
         assert!(rest.iter().all(|i| i.1 < delivered));
+    }
+
+    /// FR-148 P1 — a time the pair memory's cells close at.
+    const P1_NOW_UNIX: u64 = 1_795_000_000;
+
+    /// FR-148 P1 (D24) — the pair memory takes a delivery only from a window the
+    /// validity gate accepted. The opener's burst (rejected `Opening`) and the
+    /// drain in a stall's shadow (rejected `StallShadow`) each deliver more than
+    /// the path carries once settled, and neither reaches the floor a close would
+    /// write. `Pipe`'s own floor still takes every window, as #3995 pinned it.
+    /// Master's model took every window too: its twin here, fed the same
+    /// deliveries, would offer the burst.
+    #[test]
+    fn the_opener_burst_and_a_stall_drain_set_no_stored_floor() {
+        use crate::encode::pair_memory::FloorBasis;
+        use crate::encode::pipe::PathModel;
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let start = s.t;
+        let mut master = PathModel::default();
+        let mut window = |s: &mut V5bSession, rx: u32, opening: bool| {
+            let link = viewer_rate::pack_link(rx, 0);
+            s.window(u64::from(rx) / 8, Some(28), link, opening);
+            master.delivered(rx, Basis::AppLimited, s.t);
+        };
+        for _ in 0..3 {
+            window(&mut s, 6_000_000, true);
+        }
+        for _ in 0..5 {
+            window(&mut s, 1_200_000, false);
+        }
+        s.stall();
+        window(&mut s, 5_000_000, false);
+        window(&mut s, 1_200_000, false);
+        let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+        let c = s.g.memory().closing(s.t, unix);
+        assert_eq!(
+            c.floor.map(|f| (f.bps, f.basis)),
+            Some((1_200_000, FloorBasis::AppLimited))
+        );
+        assert_eq!(c.best, Some((1_200_000, FloorBasis::AppLimited)));
+        let p0 = s.g.belief.model().floor(s.t).map(|f| f.bps);
+        assert_eq!(p0, Some(1_200_000), "the P0 model is gated the same way");
+        assert_eq!(s.g.belief_bps(s.t).1, Some(6_000_000), "Pipe's floor");
+        assert_eq!(master.offer(s.t).map(|f| f.bps), Some(6_000_000), "master");
+    }
+
+    /// FR-148 P1 (AC7, D24) — a session whose every window the gate rejected
+    /// writes nothing: the opener's burst, and then the session ends. Master's
+    /// model, fed the same deliveries, would offer the burst as a floor.
+    #[test]
+    fn a_session_of_rejected_windows_writes_nothing() {
+        use crate::encode::pair_memory::{Why, close};
+        use crate::encode::pipe::PathModel;
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(None, P1_NOW_UNIX, s.t);
+        let start = s.t;
+        let mut master = PathModel::default();
+        for _ in 0..3 {
+            let link = viewer_rate::pack_link(6_000_000, 0);
+            s.window(750_000, Some(28), link, true);
+            master.delivered(6_000_000, Basis::AppLimited, s.t);
+        }
+        let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+        let c = s.g.memory().closing(s.t, unix);
+        assert!(!c.measured, "{c:?}");
+        assert_eq!((c.floor, c.record, c.best), (None, None, None));
+        assert_eq!(close(None, &c), (None, Why::NothingMeasured));
+        assert_eq!(master.offer(s.t).map(|f| f.bps), Some(6_000_000), "master");
+    }
+
+    /// FR-148 P1 (D25 corrected) — a slow link replayed through the governor:
+    /// arrivals near 0.6 Mbit/s, the viewer's queue growing in runs of three
+    /// windows while the pump offers 1 Mbit/s, so the link loop refuses the
+    /// second and third of each run, some above the damped floor and some below
+    /// it. The clean windows between the runs deliver a little above the floor.
+    /// The record counts every refusal and ends trusted, whichever side of the
+    /// floor the last refusal was on. On D25's first wording ("a delivery above
+    /// the floor ends the record") each clean run ends it, and the session ends
+    /// with two samples a second apart: not trusted.
+    #[test]
+    fn a_slow_link_ends_trusted_whichever_side_of_the_floor_it_last_refused() {
+        use crate::encode::pair_memory::{Closing, trusted};
+        let replay = |last_run: u32, first_wording: bool| -> (Closing, u64) {
+            let mut s = V5bSession::open(true, None);
+            s.g.open_memory(None, P1_NOW_UNIX, s.t);
+            if first_wording {
+                s.g.belief.memory_mut().set_end_above_floor();
+            }
+            let start = s.t;
+            let clean = |s: &mut V5bSession, rx: u32, windows: usize| {
+                for _ in 0..windows {
+                    let link = viewer_rate::pack_link(rx, 0);
+                    s.window(u64::from(rx) / 8, Some(56), link, false);
+                }
+            };
+            let refused = |s: &mut V5bSession, rx: u32| {
+                for _ in 0..3 {
+                    let link = viewer_rate::pack_link(rx, 145);
+                    s.window(125_000, Some(224), link, false);
+                }
+            };
+            // The floor: 620 k, damped to 590 k by the first run (below it),
+            // raised to 610 k, then 640 k by the second run (above it), then
+            // 650 k, and the last run either side of that.
+            clean(&mut s, 620_000, 10);
+            refused(&mut s, 580_000);
+            clean(&mut s, 610_000, 5);
+            refused(&mut s, 640_000);
+            clean(&mut s, 650_000, 5);
+            refused(&mut s, last_run);
+            let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+            (s.g.memory().closing(s.t, unix), unix)
+        };
+        for (last_run, side) in [(670_000, "above"), (600_000, "below")] {
+            let (c, unix) = replay(last_run, false);
+            let r = c.record.expect("a record");
+            assert_eq!((r.windows, r.span_s()), (6, 17), "{side}");
+            assert!(trusted(&r, unix), "{side}");
+            assert!(!c.ended, "{side}");
+            assert_eq!(c.not_counted, 0, "{side}");
+            let (first, unix) = replay(last_run, true);
+            assert!(first.ended, "{side}");
+            let r = first.record.expect("the last run's samples");
+            assert_eq!((r.windows, r.span_s()), (2, 1), "{side}");
+            assert!(!trusted(&r, unix), "{side}: the first wording fails it");
+        }
     }
 
     /// FR-148 P0 — what the line reads on a healthy session: the jupiter replay

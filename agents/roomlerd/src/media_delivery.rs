@@ -56,17 +56,51 @@ pub const LINE_EVERY: Duration = Duration::from_secs(10);
 /// The line's message, which a field read greps for.
 pub const LINE: &str = "path delivery (FR-148 P0, shadow, ≈10s)";
 
-/// FR-148 P0's kill switch, read once per pump: `ROOMLERD_PATH_MODEL=off` takes
-/// no sample and writes no line. Read through `tunnel_core::env::node_env`, as
-/// the other media switches are.
-pub fn enabled() -> bool {
-    enabled_by(tunnel_core::env::node_env("PATH_MODEL").as_deref())
+/// FR-148's switch, `ROOMLERD_PATH_MODEL` (D28): `off` is the release before
+/// P0 exactly (no delivery sample, no path memory, no line); `shadow` and `on`
+/// sample and keep the path memory. Until P1 step 3, `on` behaves as `shadow`:
+/// the opener reads today's rate memory in every mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    Shadow,
+    On,
+}
+
+impl Mode {
+    pub fn word(self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::Shadow => "shadow",
+            Mode::On => "on",
+        }
+    }
+
+    /// Anything but `off` takes delivery samples and keeps the path memory.
+    pub fn samples(self) -> bool {
+        self != Mode::Off
+    }
+}
+
+/// The switch, read once per pump. Read through `tunnel_core::env`, as the
+/// other media switches are: the one read of it.
+pub fn mode() -> Mode {
+    mode_of(tunnel_core::env::node_env("PATH_MODEL").as_deref())
+}
+
+/// `off` and `on` as written; unset or any other value is `shadow`.
+pub fn mode_of(value: Option<&str>) -> Mode {
+    match value {
+        Some("off") => Mode::Off,
+        Some("on") => Mode::On,
+        _ => Mode::Shadow,
+    }
 }
 
 /// `off` is the only value that stops the sampler; any other value, or none,
-/// samples. (P1 adds `shadow`.)
+/// samples.
 pub fn enabled_by(value: Option<&str>) -> bool {
-    value != Some("off")
+    mode_of(value).samples()
 }
 
 /// What a sample says about the path.
@@ -179,6 +213,8 @@ impl Fold {
 #[derive(Debug)]
 pub struct DeliverySampler {
     on: bool,
+    /// FR-148 P1 — the switch as this pump read it, for the pair memory.
+    mode: Mode,
     clock: Option<DeliveryClock>,
     /// The reading the next sample starts from.
     base: Option<(Instant, Delivery)>,
@@ -193,14 +229,23 @@ pub struct DeliverySampler {
 }
 
 impl DeliverySampler {
-    /// On unless `ROOMLERD_PATH_MODEL=off`.
+    /// On unless `ROOMLERD_PATH_MODEL=off`: the pump's one read of the switch.
     pub fn from_env() -> Self {
-        Self::new(enabled())
+        let mode = mode();
+        let mut sampler = Self::new(mode.samples());
+        sampler.mode = mode;
+        sampler
+    }
+
+    /// FR-148 P1 — the switch as this pump read it.
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     pub fn new(on: bool) -> Self {
         Self {
             on,
+            mode: if on { Mode::Shadow } else { Mode::Off },
             clock: None,
             base: None,
             fold: Fold::default(),
@@ -593,6 +638,20 @@ mod tests {
         assert!(enabled_by(Some("shadow")));
         assert!(enabled_by(Some("on")));
         assert!(enabled_by(Some("")));
+    }
+
+    /// FR-148 P1 (D28) — three modes; unset or unknown is `shadow`.
+    #[test]
+    fn the_switch_has_three_modes_and_defaults_to_shadow() {
+        assert_eq!(mode_of(Some("off")), Mode::Off);
+        assert_eq!(mode_of(Some("shadow")), Mode::Shadow);
+        assert_eq!(mode_of(Some("on")), Mode::On);
+        for unknown in [None, Some(""), Some("OFF"), Some("1"), Some("true")] {
+            assert_eq!(mode_of(unknown), Mode::Shadow, "{unknown:?}");
+        }
+        assert!(Mode::On.samples() && Mode::Shadow.samples() && !Mode::Off.samples());
+        assert_eq!(DeliverySampler::new(false).mode(), Mode::Off);
+        assert_eq!(DeliverySampler::new(true).mode(), Mode::Shadow);
     }
 
     #[test]
