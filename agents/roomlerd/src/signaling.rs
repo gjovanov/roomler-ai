@@ -4880,6 +4880,11 @@ async fn handle_server_msg(
             // companion are THIS process's — the person's own, in their GUI
             // session. Only a daemon older than P1e-mac sends none, and the
             // channel then refuses `unavailable`.
+            // FR-148 P1 — the controlling user names the pair memory's key, set
+            // before the answer as the contexts below are.
+            if let Some(meta) = record_meta {
+                peer.set_pair_user(meta.controller_user_id);
+            }
             #[cfg(feature = "recording")]
             if let Some(meta) = record_meta {
                 peer.set_record_ctx(crate::recording::remote::SessionCtx {
