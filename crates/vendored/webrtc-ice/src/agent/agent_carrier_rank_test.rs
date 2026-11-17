@@ -17,9 +17,7 @@ use stun::message::{Message, BINDING_REQUEST};
 use stun::textattrs::Username;
 use util::vnet::*;
 
-use super::agent_gather::{
-    host_priority, overlay_host_priority_override, relay_priority, srflx_priority,
-};
+use super::agent_gather::{host_priority, relay_priority, srflx_priority};
 use super::agent_selector::{outranks_on_a_real_path, should_follow_renomination};
 use super::agent_vnet_test::*;
 use super::*;
@@ -115,6 +113,14 @@ fn chrome(type_preference: u32, local_preference: u32) -> u32 {
     (type_preference << 24) | (local_preference << 8) | 255
 }
 
+/// What today's overlay-host override answers for an address of the /10 or the
+/// ULA: type 90, or 0 while `overlay_priority_tests` holds its escape hatch on.
+/// That env is process-wide and the cells run in parallel, so no cell here
+/// compares two reads of it.
+fn todays_overlay_host(priority: u32) -> bool {
+    priority == TYPE_90 || priority == 0
+}
+
 /// Done means 1: the priorities, set where each candidate is made.
 #[test]
 fn candidates_only_the_mesh_carries_rank_last_and_tls_relays_rank_below_udp() {
@@ -151,25 +157,25 @@ fn candidates_only_the_mesh_carries_rank_last_and_tls_relays_rank_below_udp() {
     let tls = relay("203.0.113.7", 4, relay_priority(r, &public, "turn.example.org", true, 1));
     assert_eq!((udp.priority(), tls.priority()), (UDP_RELAY, TLS_RELAY));
     // ... and so it does with the rank on and the mesh link direct, where the
-    // mesh host keeps today's type 90. (Compared with today's function, not
-    // the constant: `overlay_priority_tests` flips its env escape hatch.)
+    // mesh host keeps today's type 90.
     let direct = CarrierRank::default();
-    assert_eq!(
-        host_priority(Some(&direct), &mesh_v4, 1),
-        overlay_host_priority_override(&mesh_v4, 1),
-        "type 90 kept"
-    );
+    assert!(todays_overlay_host(host_priority(Some(&direct), &mesh_v4, 1)), "type 90 kept");
+    assert_eq!(srflx_priority(Some(&direct), &mesh_v4, 1), 0);
     assert_eq!(relay_priority(Some(&direct), &public, "100.65.4.33", true, 1), TLS_RELAY);
+    assert_eq!(relay_priority(Some(&direct), &mesh_v4, "100.65.4.33", false, 1), 0);
 
     // An address of the /10 outside the blocks keeps its ordinary priority.
-    assert_eq!(host_priority(r, &cgnat, 1), overlay_host_priority_override(&cgnat, 1));
-    assert_ne!(host_priority(r, &cgnat, 1), 255);
+    assert!(todays_overlay_host(host_priority(r, &cgnat, 1)));
     assert_eq!(srflx_priority(r, &cgnat, 1), 0, "computed: 1,694,498,815");
     assert_eq!(relay_priority(r, &cgnat, "100.80.1.9", false, 1), 0);
+    assert_eq!(relay_priority(r, &cgnat, "turn.example.org", true, 1), TLS_RELAY);
 
     // Without the rank every candidate is made exactly as before.
+    for addr in [mesh_v4, mesh_v6, cgnat] {
+        assert!(todays_overlay_host(host_priority(None, &addr, 1)), "{addr}");
+    }
+    assert_eq!(host_priority(None, &public, 1), 0);
     for addr in [mesh_v4, mesh_v6, cgnat, public] {
-        assert_eq!(host_priority(None, &addr, 1), overlay_host_priority_override(&addr, 1));
         assert_eq!(srflx_priority(None, &addr, 1), 0, "{addr}");
         assert_eq!(relay_priority(None, &addr, "100.65.4.33", true, 1), 0, "{addr}");
     }
@@ -602,4 +608,103 @@ async fn with_the_rank_a_turn_pair_after_the_first_selection_validates_and_is_fo
 #[tokio::test]
 async fn without_the_rank_a_turn_pair_after_the_first_selection_never_validates() -> Result<()> {
     turn_pair_after_the_first_selection(false).await
+}
+
+/// A STUN and TURN server the agent reaches over the mesh.
+const MESH_SERVER_IP: &str = "100.65.4.1";
+
+/// Done means 1, through the gather itself: a STUN and TURN server on a mesh
+/// address. The host on the mesh, the srflx whose STUN answer maps it to the
+/// mesh, and the relay that server allocates (relayed at an address off the
+/// mesh, so its server alone decides) are all made at 255, and so are the
+/// lines they are signalled with.
+#[tokio::test]
+async fn a_gather_through_a_mesh_addressed_server_makes_every_candidate_at_255() -> Result<()> {
+    let lan = Arc::new(Mutex::new(router::Router::new(router::RouterConfig {
+        cidr: MESH_LAN.to_owned(),
+        ..Default::default()
+    })?));
+    let server_net = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: vec![MESH_SERVER_IP.to_owned()],
+        ..Default::default()
+    })));
+    let agent_net = Arc::new(net::Net::new(Some(net::NetConfig {
+        static_ips: vec![AGENT_MESH_IP.to_owned()],
+        ..Default::default()
+    })));
+    connect_net2router(&server_net, &lan).await?;
+    connect_net2router(&agent_net, &lan).await?;
+    start_router(&lan).await?;
+    let conn = server_net
+        .bind(SocketAddr::new(ip(MESH_SERVER_IP), VNET_STUN_SERVER_PORT))
+        .await?;
+    let server = turn::server::Server::new(turn::server::config::ServerConfig {
+        conn_configs: vec![turn::server::config::ConnConfig {
+            conn,
+            relay_addr_generator: Box::new(turn::relay::relay_static::RelayAddressGeneratorStatic {
+                relay_address: ip("203.0.113.7"),
+                address: "0.0.0.0".to_owned(),
+                net: Arc::clone(&server_net),
+            }),
+        }],
+        realm: "webrtc.rs".to_owned(),
+        auth_handler: Arc::new(TestAuthHandler::new()),
+        channel_bind_timeout: Duration::from_secs(0),
+        alloc_close_notify: None,
+    })
+    .await?;
+
+    let url = |scheme| Url {
+        scheme,
+        host: MESH_SERVER_IP.to_owned(),
+        port: VNET_STUN_SERVER_PORT,
+        username: "user".to_owned(),
+        password: "pass".to_owned(),
+        proto: ProtoType::Udp,
+    };
+    let agent = Agent::new(AgentConfig {
+        urls: vec![url(SchemeType::Stun), url(SchemeType::Turn)],
+        network_types: vec![NetworkType::Udp4],
+        multicast_dns_mode: MulticastDnsMode::Disabled,
+        net: Some(Arc::clone(&agent_net)),
+        carrier_rank: Arc::new(Some(mesh_last())),
+        ..Default::default()
+    })
+    .await?;
+    let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+    let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+    agent.on_candidate(Box::new(move |c: Option<Cand>| {
+        let done_tx = Arc::clone(&done_tx);
+        Box::pin(async move {
+            if c.is_none() {
+                done_tx.lock().await.take();
+            }
+        })
+    }));
+    agent.gather_candidates()?;
+    let _ = done_rx.recv().await;
+
+    let candidates = agent.get_local_candidates().await?;
+    for typ in [
+        CandidateType::Host,
+        CandidateType::ServerReflexive,
+        CandidateType::Relay,
+    ] {
+        let c = candidates
+            .iter()
+            .find(|c| c.candidate_type() == typ)
+            .unwrap_or_else(|| panic!("no {typ} among {} candidates", candidates.len()));
+        assert_eq!(c.priority(), 255, "{c}");
+        assert_eq!(unmarshal_candidate(&c.marshal())?.priority(), 255, "{}", c.marshal());
+    }
+    let relay = candidates
+        .iter()
+        .find(|c| c.candidate_type() == CandidateType::Relay)
+        .unwrap();
+    assert_eq!(relay.address(), "203.0.113.7", "relayed off the mesh");
+
+    agent.close().await?;
+    server.close().await?;
+    lan.lock().await.stop().await?;
+    Ok(())
 }

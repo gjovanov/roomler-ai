@@ -489,6 +489,8 @@ impl AgentPeer {
             let keep = rc_overlay.clone();
             setting.set_ip_filter(Box::new(move |ip| keep.keeps_local(ip)));
         }
+        // FR-148 P4 — the carrier rank, when its switch is on (`rc_overlay`).
+        rc_overlay.rank_ice(&mut setting);
         // FR-101 P1 — GCM-only DTLS, with its switch back, and the SRTP/SRTCP
         // replay windows pinned at 64 (webrtc-srtp's session default too).
         let transport = crate::rc_transport::Policy::from_env();
@@ -883,6 +885,7 @@ impl AgentPeer {
         {
             let tx = outbound.clone();
             let tally = Arc::new(GatherTally::default());
+            let rank = rc_overlay.carrier_rank;
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let tx = tx.clone();
                 let tally = tally.clone();
@@ -893,23 +896,10 @@ impl AgentPeer {
                         return;
                     };
                     tally.note(c.typ);
-                    info!(
-                        %session_id,
-                        typ = %c.typ,
-                        protocol = %c.protocol,
-                        address = %c.address,
-                        port = c.port,
-                        related = %format_args!("{}:{}", c.related_address, c.related_port),
-                        "ICE: gathered local candidate"
-                    );
-                    let json = match c.to_json() {
-                        Ok(j) => j,
-                        Err(e) => {
-                            warn!(%e, "failed to serialize ICE candidate");
-                            return;
-                        }
-                    };
-                    let Ok(candidate) = serde_json::to_value(&json) else {
+                    // The line, and its payload (FR-148 P4: under switch `1`
+                    // a ranked-last line ends with ` network-cost 999`).
+                    let Some(candidate) = crate::carrier_rank::gathered(session_id, &c, rank)
+                    else {
                         return;
                     };
                     let _ = tx
@@ -2030,6 +2020,8 @@ async fn detect_constrained_transport(
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
+            // FR-148 P4 — a ranked-last pair waits up to 1.5 s for the move.
+            let (pair, opening) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             let local = pair.local();
             let remote = pair.remote();
             // Loopback-TURN corp-relay (Phase 3): a relay candidate at a
@@ -2040,21 +2032,7 @@ async fn detect_constrained_transport(
                 && !crate::encode::relay_addr_is_fast_local(&local.address))
                 || (remote.typ == RTCIceCandidateType::Relay
                     && !crate::encode::relay_addr_is_fast_local(&remote.address));
-            // Relay-escape — log the ADDRESSES, not just the types: a
-            // "direct" Srflx↔Prflx pair whose remote is the router's WAN IP
-            // is a NAT hairpin, while a 192.168.x remote is the true LAN
-            // path. Types alone couldn't tell them apart in the field.
-            info!(
-                %session_id,
-                relay,
-                local_typ = ?local.typ,
-                local_proto = ?local.protocol,
-                local_addr = %format!("{}:{}", local.address, local.port),
-                remote_typ = ?remote.typ,
-                remote_proto = ?remote.protocol,
-                remote_addr = %format!("{}:{}", remote.address, remote.port),
-                "per-session ICE path detected (adaptive bitrate)"
-            );
+            crate::carrier_rank::path_detected(session_id, relay, local, remote, opening);
             return relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2078,6 +2056,8 @@ async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
+            // FR-148 P4 — the rest of the opening's wait, shared with detect.
+            let (pair, _) = crate::carrier_rank::opening_pair(pc, ice, pair).await;
             return Some(pair.remote().address.clone());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

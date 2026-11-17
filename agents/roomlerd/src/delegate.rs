@@ -3857,6 +3857,21 @@ mod params_tests {
             DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
             other => panic!("expected SessionParams, got {other:?}"),
         }
+        // FR-148 P4 — in rank mode an `on` session's switch and blocks cross
+        // too: the worker ranks on the daemon's blocks.
+        p.rc_overlay = Some(crate::rc_overlay::RcOverlay::resolve_ranked(
+            true,
+            None,
+            crate::rc_overlay::RankMode::Prio,
+            vec![(std::net::Ipv4Addr::new(100, 65, 4, 0), 22)],
+        ));
+        let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
+            .expect("serialises");
+        assert!(wire.contains(r#""carrier_rank":"prio""#), "{wire}");
+        match serde_json::from_str::<DelegateFrame>(&wire).expect("round-trips") {
+            DelegateFrame::SessionParams(back) => assert_eq!(back.rc_overlay, p.rc_overlay),
+            other => panic!("expected SessionParams, got {other:?}"),
+        }
 
         p.rc_overlay = None;
         let older = serde_json::to_string(&p).unwrap();

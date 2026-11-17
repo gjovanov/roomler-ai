@@ -56,7 +56,7 @@ const RANK_TCP_RELAY_LOCAL_PREFERENCE: u32 = 32767;
 /// names `ip`; otherwise exactly [`overlay_host_priority_override`].
 pub(crate) fn host_priority(rank: Option<&CarrierRank>, ip: &std::net::IpAddr, component: u16) -> u32 {
     match rank {
-        Some(rank) if rank.ranks_last(&[*ip]) => ranked_last_priority(component),
+        Some(rank) if rank.ranks_last(*ip) => ranked_last_priority(component),
         _ => overlay_host_priority_override(ip, component),
     }
 }
@@ -67,7 +67,7 @@ pub(crate) fn host_priority(rank: Option<&CarrierRank>, ip: &std::net::IpAddr, c
 /// server-reflexive candidate it would rank above the mesh host itself.
 pub(crate) fn srflx_priority(rank: Option<&CarrierRank>, mapped: &std::net::IpAddr, component: u16) -> u32 {
     match rank {
-        Some(rank) if rank.ranks_last(&[*mapped]) => ranked_last_priority(component),
+        Some(rank) if rank.ranks_last(*mapped) => ranked_last_priority(component),
         _ => 0,
     }
 }
@@ -91,7 +91,7 @@ pub(crate) fn relay_priority(
         .trim_start_matches('[')
         .trim_end_matches(']')
         .parse::<std::net::IpAddr>();
-    if rank.ranks_last(&[*relayed]) || server.is_ok_and(|server| rank.ranks_last(&[server])) {
+    if rank.ranks_last(*relayed) || server.is_ok_and(|server| rank.ranks_last(server)) {
         ranked_last_priority(component)
     } else if over_tcp {
         (1 << 8) * RANK_TCP_RELAY_LOCAL_PREFERENCE + (256 - u32::from(component))

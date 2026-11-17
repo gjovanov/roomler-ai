@@ -1432,6 +1432,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. WARNING: on a VIRTUAL-DESKTOP host with a hostile NAT the vd startup auto-pins this to 1, and its check for an explicit operator override reads the OS env var ONLY - so setting this key to false there does not defeat the auto-pin; use a real ROOMLERD_ICE_RELAY_TCP=0 for that one case. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
     },
     KeyMeta {
+        key: "rc_carrier_rank",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:0|prio|1",
+        description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio` or `1`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. On, a relay over TCP or TLS also ranks below one over UDP, and the agent keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
         key: "relay_max_kbps",
         group: Group::VideoRate,
         tier: Tier::Advanced,
@@ -2128,6 +2136,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
         "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
+        "rc_carrier_rank" => cfg.rc_carrier_rank.clone(),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
@@ -2704,6 +2713,16 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
         "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
+        "rc_carrier_rank" => {
+            cfg.rc_carrier_rank = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() || v == "0" => None,
+                Some(v) if v == "prio" || v == "1" => Some(v),
+                Some(v) => {
+                    return Err(format!("rc_carrier_rank must be 0, prio or 1 (got {v:?})"));
+                }
+            }
+        }
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "media_thread" => cfg.media_thread = parse_tribool(value)?,
@@ -5000,6 +5019,41 @@ mod tests {
         for bad in ["on", "1", "vbr", "icq", "qvbr2"] {
             assert!(
                 apply(&mut cfg, "qsv_rate_mode", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P4 — `rc_carrier_rank`: `prio` and `1` are stored, `0` and
+    /// blank clear the key (off), and anything else is refused rather than
+    /// stored and read as `0` without a word. It reaches the daemon's env
+    /// fallbacks under the switch's own name.
+    #[test]
+    fn rc_carrier_rank_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "rc_carrier_rank"), None);
+        apply(&mut cfg, "rc_carrier_rank", Some(" PRIO ")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank.as_deref(), Some("prio"));
+        assert_eq!(
+            entry_for(&cfg, "rc_carrier_rank").unwrap().value.as_deref(),
+            Some("prio")
+        );
+        apply(&mut cfg, "rc_carrier_rank", Some("1")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank.as_deref(), Some("1"));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("RC_CARRIER_RANK")
+                .map(String::as_str),
+            Some("1")
+        );
+        apply(&mut cfg, "rc_carrier_rank", Some("0")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank, None, "0 is the default");
+        apply(&mut cfg, "rc_carrier_rank", Some("prio")).unwrap();
+        apply(&mut cfg, "rc_carrier_rank", Some("")).unwrap();
+        assert_eq!(cfg.rc_carrier_rank, None, "blank clears to the default");
+        for bad in ["on", "true", "2", "cost", "prio1"] {
+            assert!(
+                apply(&mut cfg, "rc_carrier_rank", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

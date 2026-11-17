@@ -68,21 +68,20 @@ pub type MeshAddrFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
 ///   pair the follow gate would follow, and nothing else
 ///   (`agent_selector::outranks_on_a_real_path`);
 /// - with `mesh_last` set (the mesh link is not direct), every local candidate
-///   on an address it names is signalled at type preference 0 and local
-///   preference 0 ([`ranked_last_priority`]). No other candidate on either side
-///   can rank that low, so every pair it is in ranks below every pair it is
-///   not in, for both roles.
+///   on an address it names has type preference 0 and local preference 0
+///   ([`ranked_last_priority`]). That is the candidate's own priority: its
+///   pairs, the follow gate and its signalled line all read it. No other
+///   candidate on either side can rank that low, so every pair it is in ranks
+///   below every pair it is not in, for both roles.
 #[derive(Default)]
 pub struct CarrierRank {
     pub mesh_last: Option<MeshAddrFn>,
 }
 
 impl CarrierRank {
-    /// Does this rank put a candidate on any of `addrs` last?
-    pub(crate) fn ranks_last(&self, addrs: &[IpAddr]) -> bool {
-        self.mesh_last
-            .as_ref()
-            .is_some_and(|mesh| addrs.iter().any(|ip| mesh(*ip)))
+    /// Does this rank put a candidate on `ip` last?
+    pub(crate) fn ranks_last(&self, ip: IpAddr) -> bool {
+        self.mesh_last.as_ref().is_some_and(|mesh| mesh(ip))
     }
 }
 
