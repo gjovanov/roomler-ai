@@ -1183,10 +1183,13 @@ mod tests {
     /// not dial again, however long it stands; the older root half logs
     /// nothing for it. Once that root half is replaced (the connection ends
     /// after a long hold), the next dial comes 1 s later and tells it. A root
-    /// half that refuses and closes at once is dialled once a minute, and
-    /// one that never answers is let go after 5 s and dialled again.
+    /// half that refuses and closes at once is dialled again on the backoff,
+    /// 1 s later, and after a second refusal in a row once a minute. One that
+    /// never answers is let go after 5 s and dialled again.
     ///
-    /// Red before #3967: a per-user half told its root half nothing.
+    /// Red before #3967: a per-user half told its root half nothing. And
+    /// before the update's order was read: the first refusal that closed
+    /// waited a minute too (gaps of 0, 60 and 60 s).
     #[tokio::test(start_paused = true)]
     async fn a_root_half_that_refuses_or_never_answers_is_not_dialled_in_a_loop() {
         use AtTheDial::*;
@@ -1219,7 +1222,10 @@ mod tests {
         })
         .await;
         let gaps = root.gaps_since(started);
-        assert!(the_gaps_are(&gaps, &[0, 60, 60]), "{gaps:?}");
+        assert!(
+            the_gaps_are(&gaps, &[0, 1, ANNOUNCE_AFTER_A_REFUSAL.as_secs()]),
+            "{gaps:?}"
+        );
         stop.send(true).unwrap();
         telling.await.unwrap();
 
@@ -1236,6 +1242,62 @@ mod tests {
             the_gaps_are(&gaps, &[0, ANNOUNCE_ANSWER_WITHIN.as_secs() + 1]),
             "{gaps:?}"
         );
+        stop.send(true).unwrap();
+        telling.await.unwrap();
+    }
+
+    /// #3967 — the update's order. The installer restarts a two-row Mac's
+    /// per-user half about 3 s before its root half, so the new per-user half
+    /// meets the old root half, which refuses ("unknown variant") and holds
+    /// the connection until it stops. The next dial comes on the backoff,
+    /// 1 s later, and tells the root half that replaced it. Where that root
+    /// half is not up yet, the dials go on 1, 2 and 4 s apart until it is:
+    /// the refusal is still on the books, but only a second refusal in a row
+    /// waits a minute, and a take is no refusal.
+    ///
+    /// Red before: a refusal whose connection ended within [`HELD_STEADY`]
+    /// waited [`ANNOUNCE_AFTER_A_REFUSAL`], a minute, so the root half's
+    /// questions in that minute got the floor, once per Mac per update.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_refused_and_then_stopped_is_dialled_again_on_the_backoff() {
+        use AtTheDial::*;
+        // The root half that replaced it is up at the next dial.
+        let root = StoodRoot::new(&[Older]);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let telling = tokio::spawn(keep_telling(root.dialler(), shutdown));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(root.dialled(), 1, "the older root half is dialled once");
+        assert_eq!(root.book.current(), None, "and takes nothing");
+        root.plan(&[Takes]);
+        let replaced = tokio::time::Instant::now();
+        root.stops_serving().await;
+        until(
+            "told the root half that replaced it",
+            ANNOUNCE_AGAIN_MOST,
+            || root.book.current() == Some(501),
+        )
+        .await;
+        let gaps = root.gaps_since(replaced);
+        assert!(the_gaps_are(&gaps, &[1]), "{gaps:?}");
+        stop.send(true).unwrap();
+        telling.await.unwrap();
+
+        // It is not up for the next two dials.
+        let root = StoodRoot::new(&[Older]);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let telling = tokio::spawn(keep_telling(root.dialler(), shutdown));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        root.plan(&[Gone, Gone, Takes]);
+        let replaced = tokio::time::Instant::now();
+        root.stops_serving().await;
+        until(
+            "told the root half once it is up",
+            Duration::from_secs(30),
+            || root.book.current() == Some(501),
+        )
+        .await;
+        let gaps = root.gaps_since(replaced);
+        assert!(the_gaps_are(&gaps, &[1, 2, 4]), "{gaps:?}");
         stop.send(true).unwrap();
         telling.await.unwrap();
     }
