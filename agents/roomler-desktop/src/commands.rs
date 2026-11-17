@@ -2560,6 +2560,7 @@ async fn consent_decide(session: Option<&str>, allow: bool) -> Result<String, St
     answer_click(
         session,
         allow,
+        None,
         CONSENT_ANSWER_WITHIN,
         |session, allow| async move {
             let mut client = localapi::connect().await.map_err(AskError::Connect)?;
@@ -2608,6 +2609,7 @@ enum AskError {
 async fn answer_click<F, Fut>(
     session: Option<&str>,
     allow: bool,
+    _in_front: Option<Duration>,
     within: Duration,
     ask: F,
 ) -> Result<String, String>
@@ -5091,9 +5093,13 @@ mod tests {
         let (log, _guard) = capture();
         let answered = tokio::time::timeout(
             Duration::from_secs(5),
-            answer_click(Some(SESSION), true, Duration::from_millis(50), |_, _| {
-                std::future::pending::<Result<bool, AskError>>()
-            }),
+            answer_click(
+                Some(SESSION),
+                true,
+                None,
+                Duration::from_millis(50),
+                |_, _| std::future::pending::<Result<bool, AskError>>(),
+            ),
         )
         .await
         .expect("5 s on, the click still waited for its answer: nothing bounds it");
@@ -5121,10 +5127,16 @@ mod tests {
         let within = Duration::from_secs(5);
 
         let (log, guard) = capture();
-        let taken = answer_click(Some(SESSION), true, within, |session, allow| async move {
-            assert_eq!((session.as_str(), allow), (SESSION, true));
-            Ok(true)
-        })
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            None,
+            within,
+            |session, allow| async move {
+                assert_eq!((session.as_str(), allow), (SESSION, true));
+                Ok(true)
+            },
+        )
         .await;
         drop(guard);
         assert_eq!(taken.as_deref(), Ok("approved"));
@@ -5143,7 +5155,7 @@ mod tests {
                      screen answers a request to see or control it, and that is not this account \
                      right now (the seat changed since this connection opened).";
         let (log, guard) = capture();
-        let refused = answer_click(Some(SESSION), false, within, |_, _| async move {
+        let refused = answer_click(Some(SESSION), false, None, within, |_, _| async move {
             Err(AskError::Request(std::io::Error::other(format!(
                 "localapi error: {words}"
             ))))
@@ -5171,7 +5183,10 @@ mod tests {
 
         // No such question any more: answered, withdrawn or expired.
         let (log, guard) = capture();
-        let gone = answer_click(Some(SESSION), true, within, |_, _| async { Ok(false) }).await;
+        let gone = answer_click(Some(SESSION), true, None, within, |_, _| async {
+            Ok(false)
+        })
+        .await;
         drop(guard);
         let shown = gone.expect_err("not taken");
         assert!(shown.contains("no longer waiting"), "{shown}");
@@ -5180,7 +5195,7 @@ mod tests {
 
         // The device service could not be reached.
         let (log, guard) = capture();
-        let unreachable = answer_click(Some(SESSION), true, within, |_, _| async {
+        let unreachable = answer_click(Some(SESSION), true, None, within, |_, _| async {
             Err(AskError::Connect(std::io::Error::from(
                 std::io::ErrorKind::ConnectionRefused,
             )))
@@ -5205,7 +5220,7 @@ mod tests {
     async fn a_click_with_no_question_is_logged_and_sends_nothing() {
         let sent = std::sync::atomic::AtomicBool::new(false);
         let (log, _guard) = capture();
-        let shown = answer_click(None, true, Duration::from_secs(5), |_, _| {
+        let shown = answer_click(None, true, None, Duration::from_secs(5), |_, _| {
             sent.store(true, std::sync::atomic::Ordering::SeqCst);
             async { Ok(true) }
         })
@@ -5221,6 +5236,80 @@ mod tests {
             text.contains("WARN") && text.contains("consent: a click with no question on the page"),
             "{text}"
         );
+    }
+
+    /// #3987 — a click that comes too soon after its question came to the
+    /// front (the app showed or raised the prompt, or the page put a new
+    /// question under the pointer) is logged with why and never sent, and
+    /// the page shows the reason. Escape, the Deny button's key, is held
+    /// back the same way. Once the question has been up for the arming
+    /// time, the click goes.
+    #[tokio::test]
+    async fn a_click_too_soon_after_the_question_came_up_is_logged_and_not_sent() {
+        let within = Duration::from_secs(5);
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let (log, guard) = capture();
+        let shown = answer_click(
+            Some(SESSION),
+            true,
+            Some(Duration::from_millis(300)),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        let shown = shown.expect_err("a click 0.3 s after the question came up approves nothing");
+        assert!(
+            !sent.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing goes to the daemon"
+        );
+        assert!(
+            shown.starts_with("Nothing was sent") && shown.contains("0.3 s"),
+            "{shown}"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("WARN") && text.contains("consent: a click arrived too soon"),
+            "{text}"
+        );
+        assert!(
+            text.contains(SESSION),
+            "the line names the question: {text}"
+        );
+
+        let (_log, guard) = capture();
+        let escape = answer_click(
+            Some(SESSION),
+            false,
+            Some(Duration::ZERO),
+            within,
+            |_, _| {
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(true) }
+            },
+        )
+        .await;
+        drop(guard);
+        assert!(
+            escape.is_err(),
+            "a Deny as the question comes up is held back too"
+        );
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (_log, guard) = capture();
+        let taken = answer_click(
+            Some(SESSION),
+            true,
+            Some(crate::panels::CONSENT_ARMING),
+            within,
+            |_, _| async { Ok(true) },
+        )
+        .await;
+        drop(guard);
+        assert_eq!(taken.as_deref(), Ok("approved"));
     }
 
     /// The refresh ledger's count for the page's read of the questions.
@@ -5369,6 +5458,62 @@ mod tests {
         assert_eq!(
             page_limit_ms(js),
             page_limit_ms(include_str!("front/panel-consent.js"))
+        );
+    }
+
+    /// #3987 — each page tells the app, with every click, how long the
+    /// question under the pointer has been shown, and that time starts again
+    /// only when the question changes: it is set where a new question is
+    /// put up and nowhere else, which happens only once the question shown
+    /// is gone. The app raises the prompt only for a question it has not
+    /// seen. A poll that changes nothing arms nothing again, or a person
+    /// could never click.
+    #[test]
+    fn a_poll_that_changes_nothing_does_not_arm_the_question_again() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        for (page, js, put_up, guard) in [
+            (
+                "panel-consent.js",
+                include_str!("front/panel-consent.js"),
+                "function render(",
+                "if(!active||!pending.some((p)=>p.session_id===active))render(pending[0])",
+            ),
+            (
+                "consent.js",
+                include_str!("front/consent.js"),
+                "function show(",
+                "if(!activeSession||!pending.some((p)=>p.session_id===activeSession)){show(pending[0])}",
+            ),
+        ] {
+            assert_eq!(
+                js.matches("shownAt = performance.now()").count(),
+                1,
+                "{page}: the time a question is shown is set in one place"
+            );
+            let body = js_function(js, put_up);
+            assert!(
+                body.contains("shownAt = performance.now()"),
+                "{page}: {body}"
+            );
+            let call = put_up.trim_start_matches("function ");
+            assert_eq!(
+                js.matches(call).count(),
+                2,
+                "{page}: `{call}` is defined and called once"
+            );
+            let poll = js_function(js, "async function poll(");
+            assert!(flat(&poll).contains(guard), "{page}: {poll}");
+            let decide = js_function(js, "async function decide(");
+            assert!(
+                flat(&decide).contains("{session,shown:Math.round(performance.now()-shownAt)}"),
+                "{page}: {decide}"
+            );
+        }
+        assert!(
+            flat(include_str!("main.rs")).contains(
+                "ifpending.difference(&seen).next().is_some(){panels::show_consent(&app);"
+            ),
+            "the app raises the prompt only for a question it has not seen"
         );
     }
 }
