@@ -297,8 +297,22 @@ pub fn log_reopen(
 }
 
 /// #3996 — the tray's one line when its icon or its Device status opens the
-/// window.
-pub fn log_tray_open(_item: &str, _tour_held: bool, _view: &str) {}
+/// window, beside a reopen's ([`log_reopen`]): what it shows, the tour a start
+/// for a prompt held back or the Overview ([`tray_open_view`]). Until #3996
+/// that click logged nothing.
+pub fn log_tray_open(item: &str, tour_held: bool, view: &str) {
+    tracing::info!(
+        item,
+        tour_held,
+        view,
+        "a tray click shows {}",
+        if view == "welcome" {
+            "the tour"
+        } else {
+            "the Overview"
+        }
+    );
+}
 
 /// Show the window as a person's opening of the running companion decided
 /// (#3941): a second launch forwarded on Windows and Linux, a reopen on

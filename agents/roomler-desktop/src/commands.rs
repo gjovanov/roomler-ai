@@ -3601,15 +3601,26 @@ fn refresh_ok(surface: &'static str) {
 /// enrolled.
 fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
     let path = active_config_path(is_scm).ok()?;
-    if !path.exists() {
-        return None;
-    }
-    config::load(&path).ok()
+    load_if_there(&path).ok().flatten()
 }
 
 /// #3996 — the config at `path`, for a caller to whom no file there is a
-/// normal state.
+/// normal state. The companion never runs on a config (the device service
+/// does), so that is every read it makes. A one-row Mac's person never has a
+/// file: the root daemon holds the enrollment (FR-43). A host that is not
+/// enrolled yet has none, and the person at a Windows background-service
+/// install cannot see the machine-wide one.
+///
+/// No file is `Ok(None)`, with nothing logged. A file that is there goes
+/// through [`config::load`], so a broken one still logs its ERROR and is
+/// recovered from its `.prev`; [`config::read_if_present`] would hide it
+/// (FR-66). Until #3996 most of these reads went straight to `config::load`,
+/// and a start with no device service answering logged "the host must be
+/// re-enrolled" about a healthy one-row Mac.
 fn load_if_there(path: &PathBuf) -> Result<Option<AgentConfig>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
     config::load(path)
         .map(Some)
         .map_err(|e| format!("Loading config: {e}"))
