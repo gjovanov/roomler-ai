@@ -2027,10 +2027,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:4253`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:4401`) — the same `loginctl` walk the FR-27
 consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
-most (`graphical_session_within`, `companion.rs:8224`). It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4306-4309`),
+most (`graphical_session_within`, `companion.rs:8372`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4454-4457`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
@@ -2544,7 +2544,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1170-1257`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3186-3196`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3195-3205`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

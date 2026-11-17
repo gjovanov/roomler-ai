@@ -100,8 +100,8 @@ pub fn show_consent<R: Runtime>(app: &AppHandle<R>) {
         CONSENT,
         "panel-consent.html",
         "Roomler — permission needed",
-        460.0,
-        260.0,
+        CONSENT_W,
+        CONSENT_H,
         // Focused: this one is a question, and a prompt nobody's keyboard can
         // reach is the failure mode we are here to fix.
         true,
@@ -323,6 +323,12 @@ fn show<R: Runtime>(
     if let Some(win) = app.get_webview_window(label) {
         if label == CONSENT {
             CONSENT_PANEL_FAILED.store(false, Ordering::SeqCst);
+            // #3987 — placed again only when it comes up from hidden; its
+            // question comes to the front either way.
+            if placed_on_show(win.is_visible().ok()) {
+                position_consent(&win, w, h);
+            }
+            note_consent_raised();
         }
         present(&win, focus);
         return;
@@ -341,13 +347,12 @@ fn show<R: Runtime>(
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(focus)
-        // #1852 — a panel shown WITHOUT focus must take its first click, or
-        // that click is spent making the window key and the button under it
-        // does nothing: on macOS the banner's Disconnect and Stop recording
-        // needed two clicks (FR-27 P9 field check, 2026-10-08). The consent
-        // prompt is shown focused and keeps the default — a click-through on
-        // an approval surface is not wanted. macOS only; a no-op elsewhere.
-        .accept_first_mouse(takes_first_click(focus))
+        // #1852, #3987 — a panel takes its first click, or that click is
+        // spent making the window key and the button under it does nothing:
+        // the banner's Disconnect needed two clicks (FR-27 P9 field check,
+        // 2026-10-08), and so did the prompt's Approve once the person had
+        // answered the daemon's panel (0.4.224 lab). macOS only.
+        .accept_first_mouse(takes_first_click(label))
         .visible(false)
         .build();
     let win = match built {
@@ -368,47 +373,60 @@ fn show<R: Runtime>(
             if let Some(main) = app.get_webview_window("main") {
                 let _ = main.show();
                 let _ = main.set_focus();
+                if label == CONSENT {
+                    // #3987 — the fallback modal's question came to the front.
+                    note_consent_raised();
+                }
             }
             return;
         }
     };
     exclude_from_capture(&win);
-    // #2286 — on Linux only the banner sits at the top. The daemon's own X11
-    // consent panel already holds the top centre there, and with the
-    // companion on Xwayland (GNOME) a consent window placed there too landed
-    // right under it when two questions were pending; a question goes in the
-    // middle, where a Wayland compositor puts it anyway.
-    if label == VIEWING || !cfg!(target_os = "linux") {
+    // #2286, #3987 — the banner sits at the top. The consent prompt goes in
+    // the middle, clear of the daemon's own panel, which holds the top centre
+    // on every OS (`consent_origin`).
+    if label == VIEWING {
         position_top_centre(&win, w);
     } else {
-        position_centre(&win, w, h);
+        position_consent(&win, w, h);
+        note_consent_raised();
     }
     present(&win, focus);
 }
 
-/// #2286 — the middle of the primary monitor, computed as the top centre is.
-/// (`WebviewWindow::center` put the window's CORNER at the middle under
-/// Xwayland at 2×, half a window off.)
-fn position_centre<R: Runtime>(win: &tauri::WebviewWindow<R>, logical_w: f64, logical_h: f64) {
+/// #2286, #3987 — the consent prompt where [`consent_origin`] puts it on the
+/// primary monitor, computed as the top centre is. (`WebviewWindow::center`
+/// put the window's CORNER at the middle under Xwayland at 2×, half a window
+/// off.)
+fn position_consent<R: Runtime>(win: &tauri::WebviewWindow<R>, logical_w: f64, logical_h: f64) {
     let Ok(Some(monitor)) = win.primary_monitor() else {
         return;
     };
     let scale = monitor.scale_factor();
     let size = monitor.size().to_logical::<f64>(scale);
     let pos = monitor.position().to_logical::<f64>(scale);
-    let x = pos.x + (size.width - logical_w) / 2.0;
-    let y = pos.y + (size.height - logical_h) / 2.0;
+    let screen = Area {
+        x: pos.x,
+        y: pos.y,
+        w: size.width,
+        h: size.height,
+    };
+    let (x, y) = consent_origin(screen, logical_w, logical_h, daemon_panel(screen));
     let _ = win.set_position(tauri::LogicalPosition::new(x, y));
 }
 
 /// Whether a panel's webview takes the FIRST click while its window is
-/// inactive (`accept_first_mouse`). Derived from how the panel is shown, so
-/// the two cannot drift apart: a panel brought up without focus — the session
-/// banner, `show_without_focus` — is one the person clicks INTO from another
-/// app, so its first click must act; a panel brought up focused — the consent
-/// prompt — already has the keyboard and must not be click-through (#1852).
-fn takes_first_click(focus: bool) -> bool {
-    !focus
+/// inactive (`accept_first_mouse`). Both panels do, and neither lets a first
+/// click grant anything without the app's arming. The banner is shown
+/// without focus, so a click INTO it from another app must act (#1852), and
+/// its buttons only end a session or a recording. The consent prompt does
+/// since #3987: a first click spent on making it key also ate a deliberate
+/// one seconds later, once the person had clicked anything else (the
+/// daemon's own panel, in the 0.4.224 lab). Its guard against a click as it
+/// appears is the app's arming ([`click_armed`]). Any other window keeps
+/// AppKit's default.
+fn takes_first_click(label: &str) -> bool {
+    label == VIEWING || label == CONSENT
 }
 
 /// Show a panel. A focused one takes the keyboard (a question needs it); an
@@ -621,6 +639,128 @@ mod frame {
     pub fn hide<R: Runtime>(_app: &AppHandle<R>) {}
 }
 
+// ── #3987: where the consent prompt opens, and a click as it appears ──────
+
+/// The consent prompt's size, in logical units.
+const CONSENT_W: f64 = 460.0;
+const CONSENT_H: f64 = 260.0;
+
+/// #3987 — a rectangle on the screen in logical units, its origin top-left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Area {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+impl Area {
+    fn bottom(self) -> f64 {
+        self.y + self.h
+    }
+
+    /// Whether the two overlap, or come within `gap` of each other.
+    fn near(self, other: Area, gap: f64) -> bool {
+        self.x < other.x + other.w + gap
+            && other.x < self.x + self.w + gap
+            && self.y < other.bottom() + gap
+            && other.y < self.bottom() + gap
+    }
+}
+
+/// #3987 — the box the daemon's own consent panel sits in, on every OS: the
+/// top centre of the main screen, 48 down, at most 480 × 240 logical. macOS
+/// draws 480 × 240 pt (`indicator/mac.rs`), X11 480 × 236 at the desktop's
+/// scale (`indicator/x11.rs`), Windows 460 × 232 physical px
+/// (`indicator/win.rs`), which is no larger in logical units.
+const PANEL_TOP: f64 = 48.0;
+const PANEL_W: f64 = 480.0;
+const PANEL_H: f64 = 240.0;
+/// #3987 — the room the prompt keeps from the daemon's panel.
+const PANEL_GAP: f64 = 16.0;
+
+fn daemon_panel(screen: Area) -> Area {
+    Area {
+        x: screen.x + (screen.w - PANEL_W) / 2.0,
+        y: screen.y + PANEL_TOP,
+        w: PANEL_W,
+        h: PANEL_H,
+    }
+}
+
+/// #3987 — where the consent prompt opens, on every OS: the middle of the
+/// screen, unless that comes within [`PANEL_GAP`] of the daemon's panel; then
+/// that far below it. On a screen too short for that, its bottom stays on the
+/// screen, and its buttons with it.
+///
+/// Until #3987 it opened at the top centre, 48 down, on macOS and Windows,
+/// where the daemon's panel is too. On a Mac that panel is at the screen-saver
+/// level and covered the prompt but for a 20-pt strip; on Windows the prompt,
+/// shown later and focused, covered the overlay. Linux had the middle since
+/// #2286, which on a 1280 × 800 screen still meets the X11 panel.
+fn consent_origin(screen: Area, w: f64, h: f64, panel: Area) -> (f64, f64) {
+    let x = screen.x + (screen.w - w) / 2.0;
+    let middle = screen.y + (screen.h - h) / 2.0;
+    let y = if (Area { x, y: middle, w, h }).near(panel, PANEL_GAP) {
+        panel.bottom() + PANEL_GAP
+    } else {
+        middle
+    };
+    (x, y.min(screen.bottom() - h).max(screen.y))
+}
+
+/// #3987 — whether showing the prompt places it. A prompt that was hidden is
+/// placed again: GTK forgets a hidden window's position, and the window
+/// manager would put it where it likes (on GNOME, #3973's top-left is a likely
+/// case). One that is up stays where it is, where the person may have moved
+/// it. Not known counts as hidden.
+fn placed_on_show(visible: Option<bool>) -> bool {
+    visible != Some(true)
+}
+
+/// #3987 — how long a question must be in front of the person before a click
+/// on it is taken. A sooner click may have been aimed at what was under the
+/// pointer before the question came up: one already on its way when it
+/// appeared (a reaction takes about a quarter of a second), or the second
+/// half of a double click (0.5 s by default on macOS and Windows). Nobody
+/// reads a question and answers it that fast.
+pub const CONSENT_ARMING: Duration = Duration::from_secs(1);
+
+/// #3987 — when the app last showed a consent question's window or brought
+/// it to the front: the prompt, or the main window when the prompt could not
+/// be created (#2815).
+static CONSENT_RAISED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn note_consent_raised() {
+    *CONSENT_RAISED_AT.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+}
+
+/// #3987 — how long ago, as of `now`, the app last showed or raised a
+/// consent question's window; `None` before it ever did.
+pub fn consent_raised_ago(now: Instant) -> Option<Duration> {
+    CONSENT_RAISED_AT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .map(|t| now.saturating_duration_since(t))
+}
+
+/// #3987 — how long the question a click answers has been in front of the
+/// person: since the later of the app's last show or raise of its window
+/// (`raised`) and the page's putting that question up (`question`). A new
+/// question in a window that stays up is new to the person.
+pub fn in_front_for(raised: Option<Duration>, question: Option<Duration>) -> Option<Duration> {
+    match (raised, question) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// #3987 — whether a click is taken: its question has been in front of the
+/// person for [`CONSENT_ARMING`] at least. Nothing known holds no click back.
+pub fn click_armed(in_front: Option<Duration>) -> bool {
+    in_front.is_none_or(|d| d >= CONSENT_ARMING)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,18 +867,239 @@ mod tests {
         assert_eq!(hidden.step(t0, None, false), Some(true));
     }
 
+    /// #1852, #3987 — an inactive macOS window spends its first click on
+    /// activation unless its view accepts first mouse. Both panels take it,
+    /// and neither opens a click-through on something that grants without
+    /// the app's arming: the banner's buttons only end a session or a
+    /// recording, and the prompt's answers go through `answer_click`, which
+    /// holds back a click that comes too soon (`commands.rs` tests). Any
+    /// other window keeps AppKit's default. The builder needs a live Tauri
+    /// runtime, so the decision is what this pins.
     #[test]
-    fn the_unfocused_banner_takes_its_first_click_the_consent_prompt_does_not() {
-        // #1852: an inactive macOS window spends its first click on activation
-        // unless its view accepts first mouse. The banner is shown without
-        // focus (P9), so Disconnect / Stop recording must fire on ONE click;
-        // the consent prompt is shown focused and must not be click-through.
-        // The builder itself needs a live Tauri runtime, so the decision is
-        // what this pins.
-        assert!(takes_first_click(false), "the banner (shown without focus)");
-        assert!(
-            !takes_first_click(true),
-            "the consent prompt (shown focused)"
+    fn every_panel_takes_its_first_click() {
+        assert!(takes_first_click(VIEWING), "the banner");
+        assert!(takes_first_click(CONSENT), "the consent prompt (#3987)");
+        assert!(!takes_first_click("main"), "a window that is no panel");
+
+        // The banner's page grants nothing: every command it calls reads the
+        // sessions, or ends one or its recording.
+        let banner = include_str!("front/panel-viewing.js");
+        for call in banner.split("invoke('").skip(1) {
+            let name = call.split('\'').next().unwrap_or_default();
+            assert!(
+                ["cmd_rc_sessions", "cmd_record_stop", "cmd_rc_disconnect"].contains(&name),
+                "the banner calls {name}: a click into it from another app acts on the \
+                 first click, so nothing on it may grant"
+            );
+        }
+        // The prompt's page answers through the two consent commands alone.
+        let prompt = include_str!("front/panel-consent.js");
+        assert!(prompt.contains("invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny'"));
+        for call in prompt.split("invoke('").skip(1) {
+            let name = call.split('\'').next().unwrap_or_default();
+            assert_eq!(name, "cmd_get_pending_consents", "the prompt calls {name}");
+        }
+    }
+
+    fn screen(w: f64, h: f64) -> Area {
+        Area {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+        }
+    }
+
+    fn prompt_on(screen: Area) -> Area {
+        let (x, y) = consent_origin(screen, CONSENT_W, CONSENT_H, daemon_panel(screen));
+        Area {
+            x,
+            y,
+            w: CONSENT_W,
+            h: CONSENT_H,
+        }
+    }
+
+    /// #3987 — the 0.4.224 lab's Mac: a 1024-pt-wide main screen, the
+    /// daemon's panel 480 × 240 at (272, 48) and the app's prompt 460 × 260 at
+    /// (282, 48), under it but for a 20-pt strip. Even the middle of a
+    /// 768-pt screen (y 254) meets the panel, so the prompt opens below it.
+    #[test]
+    fn the_prompt_opens_clear_of_the_daemons_panel_on_the_labs_mac() {
+        let s = screen(1024.0, 768.0);
+        assert_eq!(
+            daemon_panel(s),
+            Area {
+                x: 272.0,
+                y: 48.0,
+                w: 480.0,
+                h: 240.0
+            },
+            "the panel the lab read"
         );
+        let p = prompt_on(s);
+        assert_eq!((p.x, p.y), (282.0, 304.0));
+        assert!(!p.near(daemon_panel(s), PANEL_GAP - 0.5), "{p:?}");
+        assert!(p.bottom() <= s.bottom(), "{p:?}");
+    }
+
+    /// #2286, #3987 — where the middle of the screen is clear of the panel,
+    /// the prompt opens there, as on Linux since #2286.
+    #[test]
+    fn the_prompt_opens_in_the_middle_where_that_is_clear_of_the_panel() {
+        assert_eq!(
+            prompt_on(screen(1920.0, 1080.0)),
+            Area {
+                x: 730.0,
+                y: 410.0,
+                w: CONSENT_W,
+                h: CONSENT_H
+            }
+        );
+        // A second monitor's coordinates: the same rule, from its corner.
+        let side = Area {
+            x: -1440.0,
+            y: -100.0,
+            w: 1440.0,
+            h: 900.0,
+        };
+        let p = prompt_on(side);
+        assert_eq!((p.x, p.y), (-1440.0 + 490.0, -100.0 + 320.0));
+    }
+
+    /// #3987 — a screen too short to hold the prompt below the panel keeps
+    /// the prompt's bottom on it, and with it the row of buttons, which then
+    /// stays clear of the panel.
+    #[test]
+    fn on_a_short_screen_the_prompts_buttons_stay_on_it() {
+        let s = screen(1024.0, 500.0);
+        let p = prompt_on(s);
+        assert_eq!(p.bottom(), s.bottom(), "{p:?}");
+        // The buttons' row: the bottom 48 of the prompt.
+        let buttons = Area {
+            y: p.bottom() - 48.0,
+            h: 48.0,
+            ..p
+        };
+        assert!(!buttons.near(daemon_panel(s), 0.0), "{p:?}");
+    }
+
+    /// #3987 — on every screen tall enough for both, the prompt keeps clear
+    /// of the daemon's panel and stays on the screen.
+    #[test]
+    fn the_prompt_never_meets_the_panel_on_a_screen_tall_enough_for_both() {
+        let tall_enough = PANEL_TOP + PANEL_H + PANEL_GAP + CONSENT_H;
+        for (ox, oy) in [(0.0, 0.0), (-1280.0, 0.0), (1920.0, -360.0)] {
+            for w in (800..=3840).step_by(64) {
+                for h in (tall_enough as i32..=2160).step_by(4) {
+                    let s = Area {
+                        x: ox,
+                        y: oy,
+                        w: f64::from(w),
+                        h: f64::from(h),
+                    };
+                    let p = prompt_on(s);
+                    assert!(!p.near(daemon_panel(s), PANEL_GAP - 0.5), "{s:?}: {p:?}");
+                    assert!(p.y >= s.y && p.bottom() <= s.bottom(), "{s:?}: {p:?}");
+                    assert!(p.x >= s.x && p.x + p.w <= s.x + s.w, "{s:?}: {p:?}");
+                }
+            }
+        }
+    }
+
+    /// The number a declaration in a daemon source file starts with.
+    fn declared(src: &str, decl: &str) -> f64 {
+        let at = src
+            .find(decl)
+            .unwrap_or_else(|| panic!("no `{decl}` in the daemon's panel"));
+        src[at + decl.len()..]
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("`{decl}` is not a number"))
+    }
+
+    /// #3987 — the box the prompt keeps clear of holds the daemon's own
+    /// consent panel on every OS: the top centre, 48 down, no wider or taller
+    /// than the box. Read from the daemon's sources, so a panel that moves or
+    /// grows fails here, not on a person's screen. (Windows draws in physical
+    /// pixels, which are no larger in logical units.)
+    #[test]
+    fn the_daemons_panels_fit_the_box_the_prompt_keeps_clear_of() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        let mac = include_str!("../../roomlerd/src/indicator/mac.rs");
+        let x11 = include_str!("../../roomlerd/src/indicator/x11.rs");
+        let win = include_str!("../../roomlerd/src/indicator/win.rs");
+        let sizes = [
+            (
+                "macOS",
+                declared(mac, "const W: f64 = "),
+                declared(mac, "const H: f64 = "),
+            ),
+            (
+                "X11",
+                declared(x11, "const W: u16 = "),
+                declared(x11, "const H: u16 = "),
+            ),
+            (
+                "Windows",
+                declared(win, "const CONSENT_W: i32 = "),
+                declared(win, "const CONSENT_H: i32 = "),
+            ),
+        ];
+        for (os, w, h) in sizes {
+            assert!(w <= PANEL_W && h <= PANEL_H, "{os}: {w} × {h}");
+        }
+        // Each at the top centre, PANEL_TOP down.
+        let top = PANEL_TOP.to_string();
+        assert!(flat(mac).contains("frame.origin.x+(frame.size.width-W)/2.0"));
+        assert!(flat(mac).contains(&format!("frame.origin.y+frame.size.height-H-{top}.0")));
+        assert!(flat(x11).contains("(screen.width_in_pixelsasi32-(W*k)asi32)/2"));
+        assert!(flat(x11).contains(&format!("({top}*k)asi16")));
+        assert!(flat(win).contains(&format!("(screen_w-CONSENT_W)/2,{top},")));
+    }
+
+    /// #3987 — a prompt that was hidden is placed again when it comes back
+    /// (GTK forgets a hidden window's position); one that is up stays where
+    /// it is, where the person may have moved it.
+    #[test]
+    fn a_prompt_already_up_stays_where_it_is_and_a_hidden_one_is_placed_again() {
+        assert!(!placed_on_show(Some(true)), "up: left where it is");
+        assert!(placed_on_show(Some(false)), "hidden: placed again");
+        assert!(placed_on_show(None), "not known: placed");
+    }
+
+    /// #1852, #3987 — a click is taken once its question has been in front
+    /// of the person for the arming time; one sooner may have been aimed at
+    /// what was under the pointer before the question came up.
+    #[test]
+    fn a_click_within_the_arming_time_is_not_taken() {
+        assert_eq!(CONSENT_ARMING, Duration::from_secs(1));
+        assert!(!click_armed(Some(Duration::ZERO)));
+        assert!(!click_armed(Some(Duration::from_millis(300))));
+        assert!(!click_armed(Some(Duration::from_millis(999))));
+        assert!(click_armed(Some(CONSENT_ARMING)));
+        assert!(click_armed(Some(Duration::from_secs(55))));
+        assert!(click_armed(None), "nothing known holds no click back");
+    }
+
+    /// #3987 — what arms the prompt again: the app showing it or bringing it
+    /// to the front, and a new question in a window that stays up, the one
+    /// now under the person's pointer. The later of the two counts.
+    #[test]
+    fn a_new_question_under_the_pointer_arms_the_prompt_again() {
+        let long = Some(Duration::from_secs(60));
+        let just = Some(Duration::from_millis(300));
+        // The window up for a minute; its question replaced 0.3 s ago.
+        assert_eq!(in_front_for(long, just), just);
+        assert!(!click_armed(in_front_for(long, just)));
+        // The question shown for a minute; the window raised 0.3 s ago.
+        assert_eq!(in_front_for(just, long), just);
+        assert!(!click_armed(in_front_for(just, long)));
+        // Both a minute ago: taken.
+        assert!(click_armed(in_front_for(long, long)));
+        // Only one known: that one counts.
+        assert_eq!(in_front_for(None, just), just);
+        assert_eq!(in_front_for(just, None), just);
     }
 }

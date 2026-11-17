@@ -19,6 +19,9 @@
  * send. The buttons are off only while no question is shown, an answer is on
  * its way, or this window answered the question, and the status line says
  * which. It is an element of its own: the countdown repaints every second.
+ *
+ * #3987 — each click also says how long its question has been shown. The app
+ * holds back a click within a second of a new question coming up.
  */
 ;(function () {
   const invoke = (name, payload) => window.__TAURI__.core.invoke(name, payload || {})
@@ -55,6 +58,7 @@
   let expiresAt = 0 // unix ms, 0 = unknown
   let sending = false // an answer is on its way
   let answered = null // the question this window answered
+  let shownAt = 0 // #3987: performance.now() when the question shown came up
 
   function setStatus(text) {
     const el = $('p-status')
@@ -73,6 +77,7 @@
   function render(pc) {
     active = pc.session_id
     answered = null
+    shownAt = performance.now()
     const kind = KINDS[pc.kind] || KINDS.rc
     $('p-title').textContent = kind.title
     $('p-verb').textContent = kind.verb
@@ -149,7 +154,10 @@
       )
     })
     try {
-      await Promise.race([invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session }), limit])
+      await Promise.race([
+        invoke(approve ? 'cmd_consent_approve' : 'cmd_consent_deny', { session, shown: Math.round(performance.now() - shownAt) }),
+        limit,
+      ])
       answered = session
       setStatus(approve ? 'Approved.' : 'Denied.')
     } catch (e) {
