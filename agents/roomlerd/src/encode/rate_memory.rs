@@ -6,7 +6,7 @@
 //! peer so the NEXT session on the same pair opens at 85 % of it instead of
 //! at the fleet constant — which is what sizes the opening keyframe and the
 //! repair speed on an NVENC relay session (FR-31). Entries expire after
-//! [`TTL`]; a pair never seen, or seen too long ago, opens at the constant.
+//! [`TTL`]; a pair never seen, seen too long ago or assumed opens at the constant.
 //!
 //! Storage is one JSON file in the daemon's data dir, written whole and
 //! atomically (temp + rename), read once per session start. It is a cache,
@@ -87,11 +87,68 @@ pub fn damp(old: u32, measured: u32) -> u32 {
 }
 const FILE_NAME: &str = "rate_memory.json";
 
+/// FR-148 §4.1 — how a remembered rate was obtained. A measured rate may open
+/// a session. An assumed one "is never stored, and it never holds the plan
+/// below a demonstrated value".
+///
+/// On disk it is a string, and anything but `"measured"` is read as
+/// [`Provenance::Assumed`]. That covers a missing field, which is every entry
+/// written before FR-148 P1, and a value written by a later agent that this
+/// one does not know.
+///
+/// ⚠️ Why (FR-148 §2.1): on 2026-11-16 the operator's pair was remembered at
+/// 281,732 bit/s, which grew from a placeholder that had been written as
+/// evidence before V5b. An entry under 1 Mbit/s opens on the slow-link
+/// profile, and the sessions such an entry opens can only creep it upward.
+/// V5b stops new placeholders. Reading the old entries as assumed lifts the
+/// ones already on disk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum Provenance {
+    /// Nothing this agent can vouch for. It seeds nothing, it is no base for
+    /// [`damp`], and the next [`RateMemory::record`] drops it.
+    #[default]
+    Assumed,
+    /// What a session measured about the carrier: the write-back's evidence,
+    /// which since V5b is a reading or nothing.
+    Measured,
+}
+
+impl From<String> for Provenance {
+    fn from(s: String) -> Self {
+        if s == "measured" {
+            Self::Measured
+        } else {
+            Self::Assumed
+        }
+    }
+}
+
+impl From<Provenance> for String {
+    fn from(p: Provenance) -> Self {
+        match p {
+            Provenance::Assumed => "assumed",
+            Provenance::Measured => "measured",
+        }
+        .to_string()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub stable_bps: u32,
     /// Unix seconds when the rate was recorded.
     pub at_unix: u64,
+    /// FR-148 P1. An entry written before that phase has no such field, so it
+    /// is read as [`Provenance::Assumed`].
+    #[serde(default)]
+    pub provenance: Provenance,
+}
+
+impl Entry {
+    fn fresh(&self, now_unix: u64) -> bool {
+        now_unix.saturating_sub(self.at_unix) <= TTL.as_secs()
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,22 +158,46 @@ pub struct RateMemory {
 }
 
 impl RateMemory {
-    /// The remembered stable rate for `peer`, if fresh.
+    /// The remembered stable rate for `peer`, if fresh and measured. An
+    /// assumed entry seeds nothing (FR-148 P1): the pair opens as one never
+    /// seen, so with no slow-link profile and no opening below the floor.
     pub fn seed_for(&self, peer: &str, now_unix: u64) -> Option<u32> {
         let e = self.entries.get(peer)?;
-        let fresh = now_unix.saturating_sub(e.at_unix) <= TTL.as_secs();
-        fresh.then_some(e.stable_bps)
+        (e.provenance == Provenance::Measured && e.fresh(now_unix)).then_some(e.stable_bps)
     }
 
-    /// Record `stable_bps` for `peer`, dropping expired entries as we go.
+    /// The seed a session opens from, which is [`Self::seed_for`]'s. When the
+    /// pair's fresh entry is assumed, one line says so. That line is the
+    /// field's evidence that an entry from before FR-148 P1 no longer opens
+    /// the pair.
+    pub fn seed_at_open(&self, peer: &str, now_unix: u64) -> Option<u32> {
+        if let Some(e) = self.entries.get(peer)
+            && e.provenance == Provenance::Assumed
+            && e.fresh(now_unix)
+        {
+            tracing::info!(
+                peer,
+                assumed_bps = e.stable_bps,
+                age_s = now_unix.saturating_sub(e.at_unix),
+                "FR-148 P1 rate memory: the pair's entry has no measured provenance, so it is read \
+                 as assumed: no seed and no slow-link profile, the pair opens as one never seen"
+            );
+        }
+        self.seed_for(peer, now_unix)
+    }
+
+    /// Record a measured `stable_bps` for `peer`. The file is written whole,
+    /// so this also drops every entry that may not be written again: an
+    /// expired one, and an assumed one (FR-148 §4.1: never stored).
     pub fn record(&mut self, peer: &str, stable_bps: u32, now_unix: u64) {
         self.entries
-            .retain(|_, e| now_unix.saturating_sub(e.at_unix) <= TTL.as_secs());
+            .retain(|_, e| e.provenance == Provenance::Measured && e.fresh(now_unix));
         self.entries.insert(
             peer.to_string(),
             Entry {
                 stable_bps,
                 at_unix: now_unix,
+                provenance: Provenance::Measured,
             },
         );
     }
@@ -132,7 +213,9 @@ impl RateMemory {
     ///
     /// A measurement moves the entry in EITHER direction, damped with the same
     /// asymmetry the goodput estimator uses inside a session — believe a drop
-    /// quickly, a rise slowly. Returns the value now on record.
+    /// quickly, a rise slowly. Returns the measured value now on record. It is
+    /// 0 when there is none: no entry, a stale one or an assumed one. The
+    /// write-back then saves nothing.
     ///
     /// ⚠️ Until FR-79 V4 this kept the **maximum** of the old value, the
     /// learner's rate and an opener "growth target", and a lower value needed a
@@ -149,9 +232,10 @@ impl RateMemory {
             return self.seed_for(peer, now_unix).unwrap_or(0);
         };
         let value = match self.seed_for(peer, now_unix) {
-            // First evidence for this pair and carrier: adopt it outright.
-            // Seeding from a constant would bias every later reading toward a
-            // number nothing measured.
+            // First evidence for this pair and carrier, or the first after an
+            // assumed entry: adopt it outright. Seeding from a constant, or
+            // damping toward a placeholder, would bias every later reading
+            // toward a number nothing measured.
             None => measured,
             Some(old) => damp(old, measured),
         };
@@ -337,5 +421,148 @@ mod tests {
         assert_eq!(m.record_session("p", None, now), 0);
         assert_eq!(m.record_session("p", Some(0), now), 0);
         assert!(m.entries.is_empty());
+    }
+
+    /// FR-148 P1 — a memory file as every agent before this phase wrote it:
+    /// `save`'s shape, with no provenance on any entry.
+    fn pre_phase_file(test: &str, entries: &[(&str, u32, u64)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rate-memory-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut map = serde_json::Map::new();
+        for (key, bps, at) in entries {
+            map.insert(
+                (*key).to_string(),
+                serde_json::json!({ "stable_bps": bps, "at_unix": at }),
+            );
+        }
+        let path = dir.join(FILE_NAME);
+        let body = serde_json::json!({ "entries": map });
+        std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+        path
+    }
+
+    /// A pair on the mesh relay, keyed as FR-79 V2 keys it.
+    const PAIR: &str = "100.65.4.2|relay:derp/tcp";
+
+    /// FR-148 P1 step 2 — an entry from before this phase is read as assumed.
+    /// 281,732 bit/s is what the operator's pair was remembered at on
+    /// 2026-11-16, grown from a placeholder written before V5b, and the
+    /// sessions such an entry opens can only creep it (FR-148 §2.1). An
+    /// assumed entry seeds nothing: the session opens as a pair never seen,
+    /// with no slow-link profile and no opening below the floor.
+    #[test]
+    fn an_entry_from_before_this_phase_is_read_as_assumed() {
+        let now = 1_793_000_000u64;
+        let path = pre_phase_file("assumed", &[(PAIR, 281_732, now - 3_600)]);
+        let mut m = RateMemory::load(&path);
+        assert_eq!(m.entries.len(), 1, "the old file still reads");
+        assert_eq!(
+            m.seed_for(PAIR, now),
+            None,
+            "an assumed entry seeds nothing"
+        );
+        assert_eq!(m.seed_at_open(PAIR, now), None);
+        assert_eq!(
+            m.entries[PAIR].provenance,
+            Provenance::Assumed,
+            "no field reads as assumed"
+        );
+        // A session that measured nothing has nothing on record to keep: the
+        // write-back saves nothing, and the entry stays as it was until it
+        // ages out.
+        let before = m.clone();
+        assert_eq!(m.record_session(PAIR, None, now), 0);
+        assert_eq!(m, before, "no evidence, no write");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The first measurement after an assumed entry replaces it outright. It
+    /// is not damped toward the placeholder: rising a tenth of the way from
+    /// 281,732 would have kept the pair at 454,086 bit/s.
+    #[test]
+    fn the_first_measurement_replaces_an_assumed_entry_outright() {
+        let now = 1_793_000_000u64;
+        let path = pre_phase_file("replaced", &[(PAIR, 281_732, now - 3_600)]);
+        let mut m = RateMemory::load(&path);
+        // What the same carrier measured for another viewer that day.
+        assert_eq!(m.record_session(PAIR, Some(2_005_279), now), 2_005_279);
+        assert_eq!(m.seed_for(PAIR, now), Some(2_005_279));
+        assert_eq!(m.seed_at_open(PAIR, now), Some(2_005_279));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// AC7 — nothing assumed is written to the pair memory. The file is
+    /// written whole, so a write for one pair must not carry another pair's
+    /// assumed entry along with it. What is written is marked measured.
+    #[test]
+    fn nothing_assumed_is_written_back() {
+        let now = 1_793_000_000u64;
+        let other = memory_key("100.65.0.5", Some("direct"));
+        let path = pre_phase_file(
+            "written",
+            &[
+                (PAIR, 281_732, now - 3_600),
+                (other.as_str(), 8_000_000, now - 60),
+            ],
+        );
+        let mut m = RateMemory::load(&path);
+        m.record_session(PAIR, Some(2_005_279), now);
+        m.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains(&other),
+            "the other pair's assumed entry is not written again:\n{text}"
+        );
+        assert!(
+            text.contains("\"provenance\": \"measured\""),
+            "a written entry says how it was obtained:\n{text}"
+        );
+        let back = RateMemory::load(&path);
+        assert_eq!(back.seed_for(PAIR, now), Some(2_005_279));
+        assert_eq!(back.seed_for(&other, now), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A provenance this agent does not know, written by a later one, is read
+    /// as assumed, and the file still reads. A value nobody here can vouch
+    /// for opens nothing.
+    #[test]
+    fn a_provenance_this_agent_does_not_know_is_read_as_assumed() {
+        let now = 1_793_000_000u64;
+        let json = format!(
+            r#"{{"entries":{{"{PAIR}":{{"stable_bps":5000000,"at_unix":{now},"provenance":"measured-backlogged"}}}}}}"#
+        );
+        let m: RateMemory = serde_json::from_str(&json).expect("the file still reads");
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.seed_for(PAIR, now), None);
+    }
+
+    /// The door opens both ways. An older agent reads this file, because its
+    /// entry does not deny unknown fields, and writes it back whole without
+    /// the field. After a re-upgrade those entries are read as assumed, which
+    /// costs one session of learning per pair and carrier.
+    #[test]
+    fn a_downgrade_reads_the_file_and_its_rewrite_reads_back_as_assumed() {
+        /// The entry of every agent before this phase.
+        #[derive(Serialize, Deserialize)]
+        struct OldEntry {
+            stable_bps: u32,
+            at_unix: u64,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct OldMemory {
+            #[serde(default)]
+            entries: BTreeMap<String, OldEntry>,
+        }
+        let now = 1_793_000_000u64;
+        let mut m = RateMemory::default();
+        m.record_session(PAIR, Some(1_440_672), now);
+        let bytes = serde_json::to_vec_pretty(&m).unwrap();
+        let old: OldMemory = serde_json::from_slice(&bytes).expect("an older agent reads the file");
+        assert_eq!(old.entries[PAIR].stable_bps, 1_440_672);
+        let rewritten = serde_json::to_vec_pretty(&old).unwrap();
+        let back: RateMemory = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(back.entries.len(), 1);
+        assert_eq!(back.seed_for(PAIR, now), None);
     }
 }

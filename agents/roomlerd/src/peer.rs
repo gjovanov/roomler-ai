@@ -6726,7 +6726,7 @@ async fn media_pump_ffmpeg_dc(
     let rate_memory_path = crate::encode::rate_memory::default_path();
     let rate_seed = match (&rate_peer_key, &rate_memory_path) {
         (Some(peer), Some(path)) => crate::encode::rate_memory::RateMemory::load(path)
-            .seed_for(peer, crate::encode::rate_memory::now_unix()),
+            .seed_at_open(peer, crate::encode::rate_memory::now_unix()),
         _ => None,
     };
     if let Some(seed) = rate_seed {
