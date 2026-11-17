@@ -76,10 +76,10 @@ while the prompt window asks a question:
 |---|---|---|---|
 | service status | `src/front/app.js:190` | 10 s | 0 (reads config, runs `roomlerd service status`) |
 | device view (`Status` + `Peers`) | `src/front/app.js:192` → `cmd_device_view`, `src/commands.rs:335` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:2793` | 2 s, visible only | 1 |
-| consent (in-window) | `src/front/consent.js:193` | 1.5 s | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:550` → `cmd_tunnels_view`, `src/commands.rs:2838` | 2 s, visible only | 1 |
+| consent (in-window) | `src/front/consent.js:200` | 1.5 s | 1 |
 | consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
-| consent (the prompt window, §10.9) | `src/front/panel-consent.js:202` | 750 ms | 1 |
+| consent (the prompt window, §10.9) | `src/front/panel-consent.js:210` | 750 ms | 1 |
 
 **What went wrong (field, 2026-09-25):** the Routes page's tables appeared and disappeared
 every few seconds while the daemon's data was steady. Three raw back-to-back opens of the
@@ -1846,7 +1846,7 @@ sequenceDiagram
 - **One viewer, with the native panel up.** The app now receives that question too, marked
   `native`, and filters it out (`consent_watch_loop`,
   [`main.rs:338`](../agents/roomler-desktop/src/main.rs#L338); the prompt window,
-  `panel-consent.js:183`), as a Windows SYSTEM install's tray does with a question its own panel
+  `panel-consent.js:191`), as a Windows SYSTEM install's tray does with a question its own panel
   shows. A Linux system daemon has no native panel, so its tray shows every question. There is
   one Approve on the screen, the panel's: the app shows no button for that question.
   Whatever ends the question takes the panel down (`hide_prompt`), and the app's next poll no
@@ -2052,30 +2052,35 @@ sequenceDiagram
     participant D as roomlerd
     P->>W: Approve
     W->>W: buttons off, "Approving…" on the status line
-    W->>A: cmd_consent_approve(the question shown, or none)
-    A->>A: log "consent: a click arrived"
-    A->>D: ConsentDecide, 10 s for connect and reply
-    D-->>A: taken, refused in its words, or nothing
-    A->>A: log the outcome
-    A-->>W: "approved", or the reason
+    W->>A: cmd_consent_approve(the question shown, or none, and how long it has been shown)
+    alt its question came to the front under 1 s ago (§10.9.1)
+        A->>A: log WARN "consent: a click arrived too soon …"
+        A-->>W: "Nothing was sent: …", and nothing goes to the daemon
+    else in front for 1 s or more
+        A->>A: log "consent: a click arrived"
+        A->>D: ConsentDecide, 10 s for connect and reply
+        D-->>A: taken, refused in its words, or nothing
+        A->>A: log the outcome
+        A-->>W: "approved", or the reason
+    end
     W->>P: "Approved.", or the reason, until the next click or question
     Note over W: no reply from the app in 15 s:<br/>the page's own limit, the buttons come back
 ```
 
 | Piece | Where | What |
 |---|---|---|
-| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2608`](../agents/roomler-desktop/src/commands.rs#L2608) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`) |
-| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2581`](../agents/roomler-desktop/src/commands.rs#L2581): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
-| the page | `decide`, [`panel-consent.js:133`](../agents/roomler-desktop/src/front/panel-consent.js#L133); `paintButtons`, [`:67`](../agents/roomler-desktop/src/front/panel-consent.js#L67); `PAGE_LIMIT_MS`, [`:51`](../agents/roomler-desktop/src/front/panel-consent.js#L51); the status line, `panel-consent.html:103` | the click is sent before anything else can stop it. The buttons are off only while no question is shown, an answer is on its way, or this window answered the question, and the status line says which. It is an element of its own (`p-status`), so the countdown never overwrites it, and its words stay until the next click or question. The page's own 15 s limit fires only when the app never replies, and the buttons then come back. Escape acts as the Deny button does |
-| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2681`](../agents/roomler-desktop/src/commands.rs#L2681) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
-| the fallback modal | `decide`, [`consent.js:69`](../agents/roomler-desktop/src/front/consent.js#L69) | the same: the click is sent first, the buttons are off while an answer is on its way, the same 15 s limit, and an answered question is not shown again |
+| the click, in the log | `answer_click`, [`agents/roomler-desktop/src/commands.rs:2634`](../agents/roomler-desktop/src/commands.rs#L2634) | `consent: a click arrived` with the verb and the question's id, then `consent: the device service took the answer`, or a WARN with the reason: `consent: the answer was not taken` (the daemon's own words, `connect: …`, or no such question any more) or `consent: no answer from the device service in time`. A click with no question on the page is logged, and nothing is sent (the commands take `Option<String>`). Since #3987 a click whose question came to the front under 1 s ago is logged as one WARN, `consent: a click arrived too soon after the question came to the front; nothing was sent`, and nothing is sent (§10.9.1) |
+| the bound | `CONSENT_ANSWER_WITHIN`, [`commands.rs:2598`](../agents/roomler-desktop/src/commands.rs#L2598): 10 s | the connect and the daemon's reply. Above the daemon's own bounds on an answer: who is at the seat (1.5 s, #3796) and a Mac's relay (5 s, §10.8, §10.8.1) |
+| the page | `decide`, [`panel-consent.js:138`](../agents/roomler-desktop/src/front/panel-consent.js#L138); `paintButtons`, [`:71`](../agents/roomler-desktop/src/front/panel-consent.js#L71); `PAGE_LIMIT_MS`, [`:54`](../agents/roomler-desktop/src/front/panel-consent.js#L54); the status line, `panel-consent.html:103` | the click is sent before anything else can stop it, with how long its question has been shown (`shown`, #3987). The buttons are off only while no question is shown, an answer is on its way, or this window answered the question, and the status line says which. It is an element of its own (`p-status`), so the countdown never overwrites it, and its words stay until the next click or question. The page's own 15 s limit fires only when the app never replies, and the buttons then come back. Escape acts as the Deny button does |
+| the read | `cmd_get_pending_consents` and `pending_answer`, [`commands.rs:2726`](../agents/roomler-desktop/src/commands.rs#L2726) | a failed read is an error, not an empty list. The page keeps the question it shows and clears it only on an empty list. The failure is in the log through the refresh ledger (`refresh failed surface="consent_pending"`, once a streak; §3); a daemon that is not running is quiet |
+| the fallback modal | `decide`, [`consent.js:70`](../agents/roomler-desktop/src/front/consent.js#L70) | the same: the click is sent first, the buttons are off while an answer is on its way, the same 15 s limit, and an answered question is not shown again |
 
 - **The WARN at every start** (`refresh failed surface="encoder_caps" … person-at-the-device
   socket of a system install`, in the same lab) is gone since #3891 (0.4.223): the person socket
   serves `encoder_caps`, and an older daemon's refusal reads `root_only` with no WARN (§8).
 - **Unchanged:** what the daemon decides and how (`consent_decide_view`, #3845's seat check),
-  the prompt's window and placement, the watch that shows and hides it (`consent_watch_loop`), and
-  the words a viewer reads.
+  the prompt's window and placement (both changed later, in #3987: §10.9.1), the watch that shows
+  and hides it (`consent_watch_loop`), and the words a viewer reads.
 - **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop
   companion on Windows — clippy + unit tests (#3940)": `a_click_whose_answer_never_comes_ends_at_the_bound`,
   `every_click_is_logged_when_it_arrives_and_with_its_outcome`, `a_click_with_no_question_is_logged_and_sends_nothing`,
@@ -2087,6 +2092,118 @@ sequenceDiagram
   arrival and outcome lines in the tray's log and the outcome on the window's status line. A click
   with the daemon stopped reads its reason within 10 s, and the buttons come back. The control is
   the release before, with no line at the click.
+
+#### 10.9.1 Where the prompt opens, and a click as it appears (#3987)
+
+Read in the 0.4.224 lab on a Mac (the default two-row install, macOS 15 on Apple Silicon). Two
+viewers asked for the same device about 20 s apart. The daemon's native panel showed the first
+question and the app's prompt the second. While both stood, the window list had the panel,
+480×240 at (272, 48) on layer 1000, and the prompt, 460×260 at (282, 48) on layer 5. The panel
+covered the prompt except for a strip about 20 pt high at its bottom edge. Deny on the panel
+closed the panel. One click on the prompt's Approve 55 s later left no line in `desktop.log` and
+no decision in the daemon's log. In the next run, a click on the prompt window and then one on
+Approve granted the session.
+
+| | Until #3987 | Since |
+|---|---|---|
+| Where the prompt opens | on macOS and Windows, the top centre, 48 down: where the daemon's own panel is. On a Mac that panel is at the screen-saver level and covers the prompt. On Windows the prompt, shown later and focused, covers the overlay. Linux has opened it in the middle since #2286 (§12.2) | the middle of the main screen on every OS. Where the middle comes within 16 of the daemon's panel, 16 below the panel instead (`consent_origin`, `panels.rs:701`) |
+| When it is placed | when its window is built | each time it comes up from hidden. A prompt that is already up stays where it is (`placed_on_show`, `panels.rs:717`) |
+| A click while it is not the key window | AppKit spent the click on making the window key, so the page never saw it and nothing logged it. The prompt is key when shown, and stops being key at the person's next click anywhere else, such as on the daemon's panel | acted on: both panels take their first click (`takes_first_click`, `panels.rs:428`) |
+| A click as it appears | held back by the rule above, which also held back a deliberate click 55 s later | held back for 1 s after its question came to the front, logged with the reason, and the page says why (`CONSENT_ARMING`, `panels.rs:727`) |
+
+**The place.** Every daemon panel fits in one box: the top centre of the main screen, 48 down,
+at most 480 × 240 logical.
+
+| Daemon panel | Size | Where |
+|---|---|---|
+| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:72`, `:477` |
+| X11 | 480 × 236 at the desktop's scale | `agents/roomlerd/src/indicator/x11.rs:67`, `:299` |
+| Windows | 460 × 232 physical px, no larger in logical units | `agents/roomlerd/src/indicator/win.rs:135`, `:611` |
+
+The prompt opens in the middle of the main screen. Where the middle comes within 16 of that
+box, the prompt opens 16 below it instead, at y 304. On a screen too short for that, the
+prompt's bottom edge sits on the screen's bottom edge, so its buttons stay in view. On any
+screen from 564 to 867 tall the prompt therefore opens at y 304, and 1024 × 768, as wide as the
+lab's Mac, is one of them.
+`the_daemons_panels_fit_the_box_the_prompt_keeps_clear_of` reads the three panels' sizes and
+places from the daemon's sources, so a panel that moves or grows fails a test before it reaches
+anyone's screen.
+
+```mermaid
+flowchart TD
+    S[the app shows the prompt] --> V{already up?}
+    V -- yes --> K[it stays where it is]
+    V -- no, or not known --> M[the middle of the main screen]
+    M --> N{within 16 of the daemon's panel?<br/>the top centre, 48 down, 480 × 240}
+    N -- no --> P[it opens there]
+    N -- yes --> B[16 below the panel, at y 304]
+    B --> C{does its bottom fit on the screen?}
+    C -- yes --> P2[it opens there]
+    C -- no --> E[its bottom on the screen's bottom edge,<br/>so the buttons stay in view]
+```
+
+**The click.** Both panels take their first click. Neither lets a first click grant anything
+without the arming below. The banner's buttons only end a session or a recording. The prompt
+answers through `cmd_consent_approve` and `cmd_consent_deny` alone, and both pass through
+`answer_click`. A click, or Escape (the Deny button's key), is held back while its question has
+been in front of the person for less than `CONSENT_ARMING`, 1 s. A click that early may have been
+aimed at whatever was under the pointer before the question came up: one already on its way when
+the question appeared (a reaction takes about a quarter of a second), or the second half of a
+double click (0.5 s by default on macOS and Windows). Nobody reads a question and answers it
+faster than that. The click is still logged when it arrives:
+`consent: a click arrived too soon after the question came to the front; nothing was sent`,
+with the verb, the question's id and how long after the question came up the click came
+(`after`). The page's status line reads
+`Nothing was sent: this click came 0.3 s after the question came up …`. The buttons come back at
+once, and the next click is sent.
+
+What starts that second again, and what does not:
+
+| Event | Arms again | Where |
+|---|---|---|
+| the app shows the prompt: built, or up from hidden | yes | `show`, `panels.rs:314` |
+| the app raises a prompt that is up, for a question its watch has not seen | yes | `show` |
+| the app raises the main window for the fallback modal (#2815) | yes | `show` |
+| a new question replaces the one under the pointer | yes | `shownAt`, set in `render` (`panel-consent.js`) and `show` (`consent.js`) |
+| a poll that changes nothing, the page's or the watch's | no | the page puts a question up only once the one it shows is gone. The watch raises the prompt only for a question it has not seen (`consent_watch_loop`, `agents/roomler-desktop/src/main.rs:361`) |
+
+Each click sends `shown`, the time in ms that the page has shown its question. The app counts
+from the later of that and its own last show or raise of the window (`in_front_for`,
+`panels.rs:751`).
+
+**Key.** The prompt still becomes the key window when it is shown, as before. Keys typed into
+another app after it appears go to the prompt and are dropped. No button has focus, so typing
+cannot approve. An Escape in the prompt's first second is held back like a click; after that,
+Escape denies.
+
+**#3973 (GNOME on Xwayland: the prompt at the work area's top-left).** The code shows a likely
+path, not a proven one. Before #3987, a prompt shown again was not placed again, and GTK forgets
+a hidden window's position, so the window manager placed it as a new window. The tray's watch
+hides the prompt when a read of the questions fails and shows it again on the next good read
+(`consent_watch_loop`, `agents/roomler-desktop/src/main.rs:326-365`). The prompt is now placed
+each time it comes up from hidden. Whether that is all of #3973 is for the lab to read.
+
+- **Tested** in rust-unit's "Test the desktop companion (roomler-desktop)" and in "The desktop
+  companion on Windows — clippy + unit tests (#3940)":
+  `the_prompt_opens_clear_of_the_daemons_panel_on_the_labs_mac`,
+  `the_prompt_opens_in_the_middle_where_that_is_clear_of_the_panel`,
+  `on_a_short_screen_the_prompts_buttons_stay_on_it`,
+  `the_prompt_never_meets_the_panel_on_a_screen_tall_enough_for_both`,
+  `the_daemons_panels_fit_the_box_the_prompt_keeps_clear_of`,
+  `a_prompt_already_up_stays_where_it_is_and_a_hidden_one_is_placed_again`,
+  `every_panel_takes_its_first_click`, `a_click_within_the_arming_time_is_not_taken`,
+  `a_new_question_under_the_pointer_arms_the_prompt_again`,
+  `a_click_too_soon_after_the_question_came_up_is_logged_and_not_sent`,
+  `a_poll_that_changes_nothing_does_not_arm_the_question_again` and
+  `the_pages_shown_time_is_read_only_when_it_is_a_time`. The macOS arms (`show_without_focus`,
+  the capture exclusion, the frame) compile in "macOS overlay compile check", step "cargo check
+  the desktop companion"; no test runs there.
+- **Field cells:** a two-row and a one-row Mac with two questions pending: the first is answered
+  on the panel, then ONE click on the second's Approve in the app connects the session. A click
+  as the prompt appears is logged and not acted on, and so is an Escape. On Windows with the
+  overlay holding question 1, the app's prompt for question 2 opens in the middle, clear of the
+  overlay. On GNOME (Xwayland), the lab reads where the prompt opens after a failed read
+  (#3973; read only).
 
 ## 11. Testing it
 
@@ -2193,12 +2310,12 @@ also keeps a system install's Wayland capture opt-in.
 
 | | Behaviour | Where |
 |---|---|---|
-| Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:127`, `:416` |
+| Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:127`, `:434` |
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
 | Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:382` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
-| Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:513` |
+| Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:531` |
 
 ```mermaid
 stateDiagram-v2
@@ -2216,7 +2333,7 @@ watch thread; its six unit tests are the spec.
 Every session's banner therefore took key status from the window the person was using, and
 their next click into it was spent making it key again and did nothing else (measured
 2026-10-06: the first click into roomler-desktop after each new session was lost). The banner
-is now brought up with `orderFrontRegardless` (`show_without_focus`, `panels.rs:432`), the way
+is now brought up with `orderFrontRegardless` (`show_without_focus`, `panels.rs:450`), the way
 the native consent panel shows itself.
 
 ⚠️ **The pointer cannot always be read** (a Wayland session keeps it to itself, and under
@@ -2253,7 +2370,7 @@ WS, the way the session's answer did.
 
 ### 12.2 Pinned to the top on Wayland (#2286)
 
-`position_top_centre` (`panels.rs:455`) asks for the top centre of the primary monitor.
+`position_top_centre` (`panels.rs:473`) asks for the top centre of the primary monitor.
 Windows, macOS and X11 grant it. **A Wayland compositor ignores it**, because a client
 cannot place its own window there. Measured on Plasma 6.6 and GNOME (2026-10-16), both put
 the banner in the middle of the screen for the whole session. That is where the controller
@@ -2264,7 +2381,7 @@ the one placement it allows a client (`agents/roomler-desktop/src/pin.rs`):
 |---|---|---|
 | **KDE Plasma** (Wayland) | A KWin script, loaded into the running KWin over D-Bus (`org.kde.kwin.Scripting`). It finds the banner by its title (`BANNER_TITLE`), puts it at the top centre of its screen, 48 px down, and keeps it above everything and out of the task switchers. It places the banner again each time it maps, because a hidden banner comes back as a new window. Nothing is written to the person's KWin configuration, and the script goes when that KWin does. | `pin.rs:120`, the script `pin.rs:82` |
 | **GNOME** (Wayland) | mutter offers no placement, no layer-shell and no scripting. The companion runs under **Xwayland** instead (`GDK_BACKEND=x11`), where an X11 window places itself and stays above. It is set as `main`'s first statement: GTK reads it when it starts, and an environment variable may only be set while no other thread exists. | `pin.rs:63`, `agents/roomler-desktop/src/main.rs:53` |
-| X11, Windows, macOS | Unchanged: the window places itself. | `panels.rs:455` |
+| X11, Windows, macOS | Unchanged: the window places itself. | `panels.rs:473` |
 
 ```mermaid
 flowchart LR
@@ -2281,14 +2398,15 @@ a hidden banner back would never be seen. The pointer is treated as unreadable t
 
 ⚠️ **A non-resizable GTK window takes its webview's natural height.** The banner asked for
 76 px and came out 198 px tall, the rest of it empty. On Linux the panels are resizable with
-min = max, which is the same fixed size without that (`panels.rs:333-339`).
+min = max, which is the same fixed size without that (`panels.rs:339-345`).
 
-⚠️ **On Linux the consent window goes in the middle, not at the top.** The daemon's own X11
-consent panel holds the top centre (`agents/roomlerd/src/indicator/x11.rs`). With the
-companion on Xwayland, a consent window placed there too landed right under it when both
-were asking. `WebviewWindow::center` put the window's corner at the middle under Xwayland at
-2×, half a window off, so the centre is computed the way the top centre is
-(`position_centre`, `panels.rs:392`).
+⚠️ **The consent window goes in the middle, not at the top**: on Linux since #2286, and on
+every OS since #3987, which also keeps it 16 below the daemon's panel where the middle meets it
+(§10.9.1). The daemon's own X11 consent panel holds the top centre
+(`agents/roomlerd/src/indicator/x11.rs`). With the companion on Xwayland, a consent window
+placed there too landed right under it when both were asking. `WebviewWindow::center` put the
+window's corner at the middle under Xwayland at 2×, half a window off, so the place is computed
+the way the top centre is (`position_consent`, `panels.rs:401`).
 
 Measured on Fedora Asahi Remix 42 (an Apple M2 Pro Mac mini), 2026-10-16:
 
@@ -2416,7 +2534,7 @@ Who calls them, and how each is read:
 
 | Caller | Runs | Taken as |
 |---|---|---|
-| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2548`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2744`) | as the person, in their session | the screen's session |
+| the tray's Approve and Deny (`cmd_consent_approve`, `agents/roomler-desktop/src/commands.rs:2549`) and the banner's Disconnect (`cmd_rc_disconnect`, `:2789`) | as the person, in their session | the screen's session |
 | `roomlerd consent --session <id> --approve` and `roomler rc --disconnect <id>` (`consent_cmd`, `agents/roomlerd/src/app.rs:2507`; `rc_cmd`, `:2404`) from the person's own shell | the same | the screen's session, and from an elevated prompt as an elevated administrator too |
 | the native consent panel and the Windows badge's Disconnect | in the daemon | never on the pipe |
 
