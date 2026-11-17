@@ -6043,6 +6043,11 @@ async fn handle_server_msg(
             // ⚠️ The command is redacted BEFORE it goes anywhere near a marker
             // file that a GUI will render — same redactor that scrubs exec
             // output leaving the host, for the same reason.
+            //
+            // #3982 — whether a surface showed the question: sent by what puts
+            // it up, and read by its answer at the window's end
+            // ([`shown_by_now`]). An auto-granted command asks nobody.
+            let (surface_tx, surface) = tokio::sync::oneshot::channel();
             if matches!(consent_mode, crate::consent::Mode::Prompt { .. }) {
                 let shown = crate::exec::redactor().apply(&command);
                 let detail: String = shown.chars().take(512).collect();
@@ -6089,17 +6094,21 @@ async fn handle_server_msg(
                         false
                     }
                 };
-                if !native {
+                if native {
+                    info!(%request_id, native, "consent prompt surface (exec)");
+                    let _ = surface_tx.send(true);
+                } else {
                     // FR-93 P6f — and where the companion cannot show it, a
                     // desktop notification. In the background, as the
                     // companion's start always was here: the command waits on
-                    // the broker below, not on its surfaces. The marker is not
-                    // rewritten for it, because by the time the notification
+                    // the broker below, not on its surfaces, and its answer
+                    // reads what they came to (#3982). The marker is not
+                    // rewritten for the notification, because by the time it
                     // is up the question may be over, and a marker written
                     // then would outlive it.
                     let ind = indicator.clone();
                     tokio::spawn(async move {
-                        exec_surfaces_up(marker, &ind, view).await;
+                        let _ = surface_tx.send(exec_surfaces_up(marker, &ind, view).await);
                     });
                 }
             }
@@ -6135,9 +6144,11 @@ async fn handle_server_msg(
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
                 let outcome = if !decision.granted() {
-                    warn!(%request_id, ?caller, ?decision, "rc:rpc.exec denied at the device");
+                    // #3982 — what the surfaces came to, never waited for.
+                    let have_surface = shown_by_now(surface);
+                    warn!(%request_id, ?caller, ?decision, have_surface, "rc:rpc.exec denied at the device");
                     crate::exec::ExecOutcome {
-                        error: Some(exec_refusal(decision, true)),
+                        error: Some(exec_refusal(decision, have_surface)),
                         ..Default::default()
                     }
                 } else if via_service {
@@ -7647,26 +7658,57 @@ pub(crate) async fn notification_shown(
     }
 }
 
-/// #3982 — the surfaces of an exec question that no native panel showed:
-/// the desktop companion, started if it is not running
-/// ([`crate::companion::ensure_running`]), and FR-93 P6f's desktop
-/// notification where the companion cannot show it. Whether either showed
-/// the question. Run on a task of its own: the command waits on the broker
-/// alone, never on this.
+/// #3982 — the surfaces of an exec question that no native panel showed, in
+/// SSH's order: the desktop companion, started if it is not running
+/// ([`crate::companion::ensure_running`]), which shows the question when it
+/// is up and the marker landed; else FR-93 P6f's desktop notification.
+/// Whether either showed it, which the command's answer reads at the
+/// window's end ([`shown_by_now`], [`exec_refusal`]). Run on a task of its
+/// own: the command waits on the broker alone, never on this. Logs the
+/// question's surfaces, as an SSH or a remote-control question's are.
 pub(crate) async fn exec_surfaces_up(
     marker: bool,
     indicator: &ViewerIndicator,
     view: crate::indicator::PromptView,
 ) -> bool {
+    let request_id = view.session_hex.clone();
     let companion = crate::companion::ensure_running().await;
-    let notified = !companion && indicator.show_notification_prompt(view).await;
-    (companion && marker) || notified
+    // A companion that is up with the marker to read IS a surface. One with
+    // no marker has nothing to show, so the notification is asked for then
+    // too, as for SSH.
+    let notified = !(companion && marker) && indicator.show_notification_prompt(view).await;
+    let have_surface = (companion && marker) || notified;
+    info!(
+        %request_id, native = false, companion, marker, notified, have_surface,
+        "consent prompt surface (exec)"
+    );
+    have_surface
+}
+
+/// #3982 — whether a surface showed an exec question, read when its window
+/// ends and never waited for: [`exec_surfaces_up`]'s verdict, which comes
+/// within seconds of a 30 s window's start. `true` while it is not known yet,
+/// or when nothing will send one (an auto-granted command asks nobody; a task
+/// that ended without one): only a known "nothing showed it" changes the
+/// command's words.
+pub(crate) fn shown_by_now(mut verdict: tokio::sync::oneshot::Receiver<bool>) -> bool {
+    verdict.try_recv().unwrap_or(true)
 }
 
 /// #3982 — what an exec command's caller reads when the person at the
-/// device did not approve it.
-pub(crate) fn exec_refusal(decision: crate::consent::Decision, _have_surface: bool) -> String {
-    format!("the operator at this device did not approve the command ({decision:?})")
+/// device did not approve it. A window that ran out with no surface to show
+/// the question says so, in SSH's words naming the execution policy
+/// ([`crate::consent::nobody_could_be_asked`]): the caller then answers it
+/// with `roomlerd consent` there, or changes the device's policy, instead of
+/// reading it as a person who said nothing. Every other refusal reads as
+/// before.
+pub(crate) fn exec_refusal(decision: crate::consent::Decision, have_surface: bool) -> String {
+    match decision {
+        crate::consent::Decision::Timeout if !have_surface => {
+            crate::consent::nobody_could_be_asked("execution")
+        }
+        _ => format!("the operator at this device did not approve the command ({decision:?})"),
+    }
 }
 
 #[cfg(test)]
@@ -9212,11 +9254,31 @@ mod notification_off_the_loop_tests {
 }
 
 /// #3982 — what an exec command's caller reads when the person at the device
-/// did not approve it ([`exec_refusal`]).
+/// did not approve it ([`exec_refusal`]), and when it reads what the
+/// question's surfaces came to ([`shown_by_now`]).
 #[cfg(test)]
 mod exec_answer_tests {
-    use super::exec_refusal;
+    use super::{exec_refusal, shown_by_now};
     use crate::consent::Decision;
+
+    /// The verdict is read when the window ends, never waited for. One that
+    /// came says what it says. One not known yet, or one nothing will send
+    /// (an auto-granted command; a task that ended without one), reads as a
+    /// surface, so the words stay "did not approve the command".
+    #[test]
+    fn a_verdict_not_known_by_the_windows_end_keeps_todays_words() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(false).unwrap();
+        assert!(!shown_by_now(rx), "nothing showed it");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(true).unwrap();
+        assert!(shown_by_now(rx), "a surface showed it");
+        let (_tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        assert!(shown_by_now(rx), "not known yet");
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(tx);
+        assert!(shown_by_now(rx), "nothing will say");
+    }
 
     /// A window that ran out with no surface to show the question says that
     /// nobody could be asked, in SSH's words naming the execution policy. One
