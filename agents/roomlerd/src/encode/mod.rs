@@ -81,6 +81,10 @@ pub mod clock;
 /// evidence about the PIPE? (pure; no clock, no I/O, and no kill switch —
 /// it replaced three).
 pub mod evidence;
+/// FR-148 P1 — the pair memory's path model: the key that names the path, its
+/// own file (`path_memory.json`), the write at a close and the opening the
+/// model would take (pure).
+pub mod pair_memory;
 /// FR-79 V3b / FR-74 — ONE belief about what the path carries, split into a
 /// DEMONSTRATED floor (what arrived; available every window on every carrier)
 /// and a pushed-back CAPACITY estimate (only when the path resisted). Pure.
