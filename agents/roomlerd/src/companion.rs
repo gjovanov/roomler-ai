@@ -1156,9 +1156,17 @@ const NEW_SUFFIX: &str = "roomler-desktop.exe.new";
 /// report a TIMEOUT, and "nobody answered in 30 s" and "there is nobody to
 /// ask, and there never was" need different things done about them.
 pub async fn ensure_running() -> bool {
+    tray_up().await && reaches_the_tray().await
+}
+
+/// #3983 — the tray's half of [`ensure_running`]'s verdict: whether the tray
+/// is up, started if it was not, within the start's own wait, and kept as
+/// [`EnsureVerdicts`] keeps it. The road to the tray ([`reaches_the_tray`]) is
+/// the other half, asked after it.
+async fn tray_up() -> bool {
     let verdicts = ensure_verdicts();
     if let Some(up) = verdicts.standing() {
-        return up && reaches_the_tray().await;
+        return up;
     }
 
     let (up, stands) = match ensure_running_inner().await {
@@ -1188,7 +1196,7 @@ pub async fn ensure_running() -> bool {
         }
     };
     verdicts.keep(up, stands);
-    up && reaches_the_tray().await
+    up
 }
 
 /// One attempt per this interval, process-wide, after a verdict that cannot
@@ -1259,16 +1267,46 @@ fn ensure_verdicts() -> &'static EnsureVerdicts {
     &VERDICTS
 }
 
+/// #3983 — the companion's verdict for a consent question that waits for it
+/// before its window starts: an RC prompt's consent task ([`start_for_prompt`])
+/// and an SSH session's or a recording's question ([`Companion::up`]). The
+/// tray's start gets [`crate::signaling::COMPANION_START_BUDGET`]. The road to
+/// the tray ([`reaches_the_tray`]) is asked after it, within its own
+/// [`crate::consent_relay::RELAY_WITHIN`], outside that budget. Until #3983 the
+/// budget held both, so on a Mac's root daemon a first start of about 2.5 s
+/// and a person socket slow to answer ran out of it, and a question the tray
+/// could show read as having no surface. Off a Mac's root daemon the road is
+/// direct and answers at once, so the wait is the start's alone, as before.
+async fn up_for_a_question() -> bool {
+    tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, tray_up())
+        .await
+        .unwrap_or(false)
+        && reaches_the_tray().await
+}
+
+// #3983 — the longest a question waits for `up_for_a_question` before its
+// window starts (#3888): the start's budget, then the road's. The hub waits
+// `CONSENT_VERDICT_GRACE` (crates/remote_control/src/consent.rs:149) past the
+// window it announced for the agent's verdict, so this wait stays under it:
+// longer, and the hub's backstop would answer a bare timeout first, throwing
+// away the agent's reason ("nobody answered" or "nobody could be asked").
+const _: () = assert!(
+    crate::signaling::COMPANION_START_BUDGET.as_millis()
+        + crate::consent_relay::RELAY_WITHIN.as_millis()
+        < roomler_ai_remote_control::consent::CONSENT_VERDICT_GRACE.as_millis()
+);
+
 /// #3888 — the companion's start for a consent prompt, as the WS loop asks
-/// for it ([`ensure_running`], [`crate::signaling::COMPANION_START_BUDGET`]
-/// at most): STARTED, on a task of its own, and never waited for here. The
+/// for it ([`up_for_a_question`]: the start within
+/// [`crate::signaling::COMPANION_START_BUDGET`], then the road to the tray):
+/// STARTED, on a task of its own, and never waited for here. The
 /// start asks other processes (logind, the process list, launchd), and the
 /// loop reads its next frame meanwhile. Its verdict is the session's consent
 /// task's to wait for ([`Starting::up`]), before the question's window
 /// starts, so a start that failed or ran out of time is still
 /// `no_prompt_surface`, as when the loop waited for it.
 pub(crate) async fn start_for_prompt() -> Starting {
-    let start = tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running());
+    let start = up_for_a_question();
     // A test stands the tray's start in for its own task; the start runs on a
     // task of its own, so the stand-in goes with it.
     #[cfg(all(test, any(target_os = "windows", unix)))]
@@ -1281,7 +1319,7 @@ pub(crate) async fn start_for_prompt() -> Starting {
             }
         }
     };
-    Starting(tokio::spawn(async move { start.await.unwrap_or(false) }))
+    Starting(tokio::spawn(start))
 }
 
 /// #3888 — a companion's start for a prompt ([`start_for_prompt`]).
@@ -1303,7 +1341,7 @@ impl Starting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Companion {
     /// Ask the system: start the companion if it is installed and not
-    /// running ([`ensure_running`], bounded).
+    /// running ([`up_for_a_question`], bounded).
     System,
     /// A fixed answer — for tests, which must never launch the real app.
     Fixed(bool),
@@ -1320,7 +1358,8 @@ pub enum Companion {
 
 impl Companion {
     /// Is the companion up to show the question? [`Self::System`] waits for
-    /// a start at most [`crate::signaling::COMPANION_START_BUDGET`].
+    /// a start at most [`crate::signaling::COMPANION_START_BUDGET`], then for
+    /// the road to the tray at most its own 1 s ([`up_for_a_question`]).
     ///
     /// Compiled where something asks through it: a remote recording, and an
     /// SSH session. Built without either, it is dead code, and every
@@ -1328,11 +1367,7 @@ impl Companion {
     #[cfg(any(feature = "recording", feature = "ssh-server"))]
     pub(crate) async fn up(self) -> bool {
         match self {
-            Self::System => {
-                tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running())
-                    .await
-                    .unwrap_or(false)
-            }
+            Self::System => up_for_a_question().await,
             Self::Fixed(up) => up,
             Self::Timed { .. } => true,
             Self::Starting(after) => {
@@ -2324,7 +2359,8 @@ fn start_tray(
 const TRAY_START_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// #3864 — the rest of [`ensure_running`]'s verdict, asked fresh at every
-/// prompt, beside the tray's own: whether a question this daemon asks gets to
+/// prompt after the tray's own ([`tray_up`]; since #3983 outside the start's
+/// budget, [`up_for_a_question`]): whether a question this daemon asks gets to
 /// the tray at all. Off a Mac's root daemon the tray asks this daemon
 /// itself, and it does. On a one-row Mac's, the tray asks the worker, which
 /// lists the root daemon's questions only while the road is open
@@ -3213,12 +3249,12 @@ mod tray_start_tests {
     /// question's verdict waits for the tray's start, within its 3 s budget
     /// ([`crate::signaling::COMPANION_START_BUDGET`]), and then for the road
     /// to the tray, within its own 1 s ([`crate::consent_relay::RELAY_WITHIN`]),
-    /// outside that budget. A start of about 2.1 s and a road of about 0.95 s,
-    /// each within its own wait: on one row an RC question's window ends as
-    /// the person's timeout, and on two rows an SSH session's or a
-    /// recording's companion is up. The control: after the same start, a
-    /// road that never answers is no surface, and its verdict comes within
-    /// the budget and the road's wait.
+    /// outside that budget ([`up_for_a_question`]). A start of about 2.1 s and
+    /// a road of about 0.95 s, each within its own wait: on one row an RC
+    /// question's window ends as the person's timeout, and on two rows an SSH
+    /// session's or a recording's companion is up. The control: after the
+    /// same start, a road that never answers is no surface, and its verdict
+    /// comes within the budget and the road's wait.
     ///
     /// Red before #3983: the start's budget held the road too, ran out at
     /// 3 s, and the question read as having no surface.
