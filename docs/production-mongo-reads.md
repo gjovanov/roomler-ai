@@ -175,7 +175,7 @@ can prevent it:
 | `scripts/rc-shadow-report.sh` + `.cjs` | FR-63's shadow report and its verdict: the flip criterion's agreement, and FR-148's under-drive clause (per class, spent ≤ 1.25 × shadow in ≥ 90 % of the clean windows at the class's gate, 2 Mbit/s direct and 0.5 Mbit/s constrained, over ≥ 20 sessions), whose thresholds were published on 2026-11-02, before the seven-day read (`docs/rate-control.md`) | the same shape (`scripts/rc-shadow-report.sh:142`) |
 | `scripts/fr97-caps-census.sh` | FR-97's capability words by OS | on mars. The aggregation goes to the runner on stdin with `--db` (`scripts/fr97-caps-census.sh:78`). It no longer reads the app's database URL, which holds the password, from `roomler2` |
 | `scripts/fr138-roll-read.sh` | FR-138's roll read | the same (`scripts/fr138-roll-read.sh:539`). `--mars` ships itself and the runner in one `roomler ssh` |
-| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8) | the same shape (`scripts/rc-path-report.sh:164`). `--mars` ships both files and the runner in one `roomler ssh` |
+| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8). With `--timeline`, `scripts/rc-path-timeline.cjs`: one device's window, line by line (§8a) | the same shape (`scripts/rc-path-report.sh:188`). `--mars` ships both files and the runner in one `roomler ssh` |
 | By hand | the growth-observability field check, the `rc.connect` mining in `docs/remote-control.md`, the pairing audit in `docs/device-pairing.md` | `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` … `JS`, with `db` already open |
 
 ```bash
@@ -288,3 +288,78 @@ bash scripts/rc-path-report.sh --mars --yes --rows > rows.ndjson; node scripts/r
 
 ⚠️ `agent_logs` deletes a batch 7 days after it arrives. Read a chain before its first batches
 turn 7 days old.
+
+### 8a. One device's window, line by line (`--timeline`)
+
+The report above folds the fleet into one row per session. `--timeline` reads the other way:
+one agent of one org over a window of at most 24 h, with every FR-148 line in time order, so a
+target move, a pipe state, a stall and the path memory's close can be read in sequence
+(`scripts/rc-path-timeline.cjs`). It gives field evidence for AC3, AC6 to AC8, AC13, AC22 and
+AC23 and judges none of them. Message texts and field names come from the call sites below, and
+the self-test checks each message's text against the agent's source.
+
+```bash
+node scripts/rc-path-timeline.cjs --self-test     # 92 cases: every line kind, the counters, both generations of the memory lines, masking, TRUNCATED, the query's shape
+bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
+     --from 2026-11-18T07:00:00Z --to 2026-11-18T18:15:00Z         # one device, one window
+bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
+     --from ISO --to ISO --rows > rows.ndjson
+node scripts/rc-path-timeline.cjs --intervals rows.ndjson          # the same rows offline, every heartbeat interval
+bash scripts/rc-path-report.sh --timeline --docker NAME --seed seed.ejson --tenant HEX --agent HEX --from ISO --to ISO   # a rehearsal on §8's seed
+```
+
+| Section | Lines read | What it prints | Serves |
+|---|---|---|---|
+| Carrier | `session carrier recorded (FR-102 P9c)` (`agents/roomlerd/src/session_carrier.rs:260`), `per-session ICE path detected` (`agents/roomlerd/src/carrier_rank.rs:247`), `rc ICE: overlay …` (`agents/roomlerd/src/peer.rs:513`), `rc ICE: carrier rank (FR-148 P4)` and its 10 s line (`agents/roomlerd/src/rc_overlay.rs:335`, `:728`) | each line at its time; when the carrier was recorded, counted from the session's first line | AC22, AC23 |
+| Encoder | `ffmpeg encoder opened (…)` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1702`), `FR-148: the QSV encoder opened at QVBR…` (`:3588`), `ffmpeg open_as_with rejected the quality options…` (`:2025`) | every open with its size, frame rate and cap, a later open as `REOPEN`, the QVBR open's rate and cap, each rejected option set | AC13 |
+| Rate | `FFmpeg DC pump heartbeat` and `VP9-444 DC pump heartbeat` (`agents/roomlerd/src/peer.rs:10354`, `:5382`) | the sent bit rate and frame rate from the cumulative `bytes_written` and `frames_sent`, per minute (each interval with `--intervals`). A counter that drops is a new pump or a reopen, and the interval across it is not rated. Every target move is its own row. So is every change of `pipe_state`, `readings_refuted` or `link_unoffered`, with `pipe_measured` | AC6, AC8 (the opening), AC22 (transit-stalled windows) |
+| Delivery | `path delivery (FR-148 P0, shadow, ≈10s)` and `path model (…)` (`agents/roomlerd/src/media_delivery.rs:57`, `:399`) | each window with stalled time as a row; the windows, the stalled ones, their share and the longest stall; `viewer_rx_bps` with its basis and age and `model_capacity_bps` with its basis, as a row where a basis changes | AC3, AC22 |
+| Path memory | `FR-148 P1 path memory: the pair's entry at the open` and `…: what the close wrote` (`agents/roomlerd/src/media_pair_memory.rs:48`, `:50`), `FR-148 P1 rate memory: …` (`agents/roomlerd/src/encode/rate_memory.rs:182`) | every field the line carries, as it is, so a field or a `why` value added later prints too. Both generations read. Release 0.4.225's close carries `samples_not_counted` only; #4029 adds the counted and set-aside counts and `taken_why` (`CLOSE_FIELDS`, `agents/roomlerd/src/media_pair_memory.rs:1412`) | AC7, O7 |
+| Keepalive | the heartbeat's `frames_keepalive` and `keepalive_bytes`, counted per window (`agents/roomlerd/src/media_window.rs:320` resets them) | frames, bytes, and bytes per frame beside `maxrate ÷ fps ÷ 8` | AC13 |
+
+A field a line does not carry prints `-`, never 0. The heartbeat is matched at the start of its
+message. The capture-timing line `system-context capture: worker-side scrap frame() timing
+(compare to pump heartbeat …)` (`agents/roomlerd/src/system_context/capture_pump.rs:551`) names
+"pump heartbeat" in its text but carries none of the heartbeat's fields. It is counted apart, and
+the code gives it no byte count. A query that matched "pump heartbeat" anywhere in the message
+printed `undefined` and NaN for it.
+
+| Summary | Numbers |
+|---|---|
+| Per session | start, end and duration; the sent rate over the whole session, after its first 30 s and over its last 60 s; the frame rate; the opening target; the highest target; the share of time at the encoder's cap (`target_bps` equal to the heartbeat's `maxrate_bps`) and at 3 Mbit/s or more; the heartbeat windows by pipe state |
+| Per device and window | sessions; sessions by carrier, from the agent's lines and from the server's record (`remote_sessions.carrier`); sessions with the carrier rank on that rode `turn` (AC22's "N of N"); stalled delivery windows and `transit-stalled` heartbeat windows over all sessions; path-memory closes by `wrote` and `why`; O7's counted samples by window state and each set-aside count, summed over the closes that carry them, beside the number of closes that do not |
+
+| Bound | What it is | Where |
+|---|---|---|
+| Scope | one `--tenant` and exactly one `--agent`, and both ends of the window. The wrapper refuses anything else, and `--json` | `scripts/rc-path-report.sh:137`, `scripts/rc-path-timeline.cjs:856` |
+| Window | at most 24 h from `--from` to `--to`. A longer day is read in parts | `scripts/rc-path-timeline.cjs:866` |
+| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:871`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at` | `scripts/rc-path-timeline.cjs:808` |
+| Match | `tenant_id`, `agent_id`, and `created_at` from 10 min before the window to 10 min after it (a batch is stored after its lines). Each line's `ts` is then compared as a BSON Date | `scripts/rc-path-timeline.cjs:759`, `:773` |
+| Memory | `allowDiskUse: false`. After the match only streaming stages run (`$project` with `$filter`, `$unwind`, `$project`, `$limit`), with no `$group` | `scripts/rc-path-timeline.cjs:751` |
+| Time | `maxTimeMS` 240,000 | `scripts/rc-path-timeline.cjs:808` |
+| Rows | `$limit` of 60,000 + 1 by default (`--limit` up to 200,000). A read that reaches it prints `TRUNCATED` at the top and bottom of the report, and in `--rows` | `scripts/rc-path-timeline.cjs:804`, `:919` |
+| What leaves | named fields only, plus the two path-memory lines' fields minus every key that could name an address, a host or a person. Ids print as their last 4 hex, and every printed line is scrubbed of addresses and 24-hex ids | `scripts/rc-path-timeline.cjs:795`, `:294` |
+| Carrier record | one `$group` by `carrier` over this agent's `remote_sessions` created in the window, on `agent_id_1_created_at_-1` (`crates/modules/remote/src/lib.rs:291`), `maxTimeMS` 30,000. That is tens of rows a day | `scripts/rc-path-timeline.cjs:818`, `:825` |
+
+The estimate is for a ten-hour window with eight hours of FFmpeg sessions. That is about 14,400
+heartbeats (one every 2 s), 2,880 delivery and 2,880 model lines (one each every 10 s), 960
+capture-timing lines (one every 30 s of capture) and a few dozen other lines a session: about
+21,200 rows. That is about 11 MB through `--rows` (about 600 bytes a heartbeat, 300 for the
+others), and a report of a few thousand lines. The documents examined are this agent's batches in
+the window, about 6,000 at ten a minute while a session runs, all through the index. A VP9-444
+pump doubles the heartbeats.
+
+What the lines cannot tell:
+
+- **Why a target moved.** The governor sets the applied target in `record_applied`
+  (`agents/roomlerd/src/encode/governor.rs:2053`) and no line says why, so a move prints
+  "reason: not logged".
+- **Which session owns a line that names none.** The encoder lines and the rate-memory line carry
+  no session id. Such a line goes to the session whose lines span its time, from 10 s before the
+  session's first line to 30 s after its last; when two sessions qualify, the later-started one
+  wins. Otherwise it is counted as being in no session.
+- **Whether a session ended.** A session whose last line falls within 30 s of the window's end
+  prints as open at the window's end.
+
+**Not rehearsed, not run on production.** The self-test and a local fold of two hosts' own log
+text are the evidence so far. The `--docker` rehearsal on §8's seed has not run for the timeline.

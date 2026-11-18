@@ -46,6 +46,14 @@
 #   --explain                    print the plan of one day's query (the index it
 #                                uses, and whether a blocking SORT stage appears)
 #                                instead of reading
+#   --timeline                   ONE device's window line by line, every session
+#                                in time order (rc-path-timeline.cjs). Needs
+#                                --tenant, ONE --agent and --from/--to, at most
+#                                24 h apart (split a longer day). --rows and
+#                                --explain work as above; --json does not.
+#   --from ISO --to ISO          the same as --since and --until
+#   --limit N                    --timeline only: stop after N rows (default
+#                                60,000) and print TRUNCATED
 #
 # A production read (--kubectl / --mars) is refused without --yes: it is a
 # bounded read of the live database, and still the operator's to start. The
@@ -86,6 +94,11 @@ AGENTS=""
 LABELS=""
 PASS=()      # options handed on unchanged to the --kubectl run on mars
 ENVS=()      # RC_PATH_* for the mongosh run
+TIMELINE=0
+NTENANT=0
+NAGENTS=0
+NWINDOW=0
+JSON=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -94,26 +107,37 @@ while [ $# -gt 0 ]; do
     --mars)    TARGET=mars; shift ;;
     --seed)    SEED="${2:?--seed needs a file}"; shift 2 ;;
     --yes)     YES=1; shift ;;
-    --since)   ENVS+=("RC_PATH_SINCE=${2:?}"); PASS+=("$1" "$2"); shift 2 ;;
-    --until)   ENVS+=("RC_PATH_UNTIL=${2:?}"); PASS+=("$1" "$2"); shift 2 ;;
+    --since|--from) ENVS+=("RC_PATH_SINCE=${2:?}"); PASS+=("$1" "$2"); NWINDOW=$((NWINDOW + 1)); shift 2 ;;
+    --until|--to)   ENVS+=("RC_PATH_UNTIL=${2:?}"); PASS+=("$1" "$2"); NWINDOW=$((NWINDOW + 1)); shift 2 ;;
     --tenant)
       [[ "${2:-}" =~ $HEX24 ]] || die "--tenant takes a 24-hex tenant id"
-      ENVS+=("RC_PATH_TENANT=$2"); PASS+=("$1" "$2"); shift 2 ;;
+      ENVS+=("RC_PATH_TENANT=$2"); PASS+=("$1" "$2"); NTENANT=$((NTENANT + 1)); shift 2 ;;
     --agent)
       [[ "${2:-}" =~ $HEX24 ]] || die "--agent takes a 24-hex agent id"
-      AGENTS="${AGENTS:+$AGENTS,}$2"; PASS+=("$1" "$2"); shift 2 ;;
+      AGENTS="${AGENTS:+$AGENTS,}$2"; PASS+=("$1" "$2"); NAGENTS=$((NAGENTS + 1)); shift 2 ;;
     --label)
       [[ "${2:-}" =~ $LABEL ]] || die "--label takes HEX=NAME (HEX up to 24 hex digits; NAME letters, digits, '.', '_' or '-')"
       LABELS="${LABELS:+$LABELS,}$2"; PASS+=("$1" "$2"); shift 2 ;;
-    --json)    ENVS+=("RC_PATH_JSON=1"); PASS+=("$1"); shift ;;
+    --json)    ENVS+=("RC_PATH_JSON=1"); PASS+=("$1"); JSON=1; shift ;;
     --rows)    ENVS+=("RC_PATH_EMIT=rows"); PASS+=("$1"); shift ;;
     --explain) ENVS+=("RC_PATH_EXPLAIN=1"); PASS+=("$1"); shift ;;
-    -h|--help) sed -n '2,53p' "$0"; exit 0 ;;
+    --timeline) TIMELINE=1; PASS+=("$1"); shift ;;
+    --limit)
+      [[ "${2:-}" =~ ^[1-9][0-9]{0,5}$ ]] || die "--limit takes a row count (1 to 200000)"
+      ENVS+=("RC_PATH_LIMIT=$2"); PASS+=("$1" "$2"); shift 2 ;;
+    -h|--help) sed -n '2,61p' "$0"; exit 0 ;;
     *)         die "unknown argument: $1 (--help)" ;;
   esac
 done
 [ -z "$AGENTS" ] || ENVS+=("RC_PATH_AGENTS=$AGENTS")
 [ -z "$LABELS" ] || ENVS+=("RC_PATH_LABELS=$LABELS")
+if [ "$TIMELINE" = 1 ]; then
+  # One device, one window: the read rc-path-timeline.cjs is bounded for.
+  JS="$HERE/rc-path-timeline.cjs"
+  [ "$NTENANT" = 1 ] && [ "$NAGENTS" = 1 ] || die "--timeline reads one device: --tenant HEX and ONE --agent HEX"
+  [ "$NWINDOW" = 2 ] || die "--timeline needs the window: --from ISO --to ISO"
+  [ "$JSON" = 0 ] || die "--json is not available with --timeline"
+fi
 
 [ -n "$TARGET" ] || die "pick a target: --docker NAME, --kubectl --yes or --mars --yes (--help)"
 [ -f "$JS" ] || die "missing $JS"
@@ -173,7 +197,7 @@ case "$TARGET" in
     OPTS=""
     [ "${#PASS[@]}" = 0 ] || OPTS="$(printf '%q ' "${PASS[@]}")"
     rc=0
-    tar -C "$HERE" -cf - rc-path-report.cjs rc-path-report.sh prod-mongo-read.sh |
+    tar -C "$HERE" -cf - rc-path-report.cjs rc-path-timeline.cjs rc-path-report.sh prod-mongo-read.sh |
       roomler ssh mars -- "D=\$(mktemp -d ~/fr148-path.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/rc-path-report.sh\" --kubectl --yes $OPTS; rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
     exit "$rc"
     ;;
