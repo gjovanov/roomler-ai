@@ -57,7 +57,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 - **The companion** (code): a banner shown only while something is missing, with two rows ("Screen Recording —
   the remote screen will be blank", "Accessibility — remote keyboard and mouse will do nothing"), an Open
   Settings button each, and Restart roomlerd (`agents/roomler-desktop/src/front/index.html:102-130`), re-read on
-  window focus (`overview.js:656-678`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2434-2441`,
+  window focus (`overview.js:656-678`). The grants are the agent's own (`agents/roomler-desktop/src/commands.rs:2402-2409`,
   `agents/roomlerd/src/localapi_state.rs:460-473`). Its Screen Recording read is not live: it stays false after
   the grant until a restart (`crates/localapi/src/lib.rs:537-549`). No row for prompts 4 or 5, no stale state, no
   "Allowed" state. For its first 30 s after the install it says "Not enrolled yet" (#3700).
