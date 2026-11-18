@@ -238,7 +238,8 @@ fn spawn_keep_busy_watch<R: Runtime>(item: MenuItem<R>) {
 fn toggle_keep_busy<R: Runtime>(_app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let outcome: std::io::Result<(bool, roomler_localapi::KeepBusyInfo)> = async {
-            let mut c = roomler_localapi::connect().await?;
+            // #4020 — its error is logged: a stopped service says so.
+            let mut c = crate::commands::connect_service().await?;
             let stopping = c.keep_busy_status().await?.on;
             let s = if stopping {
                 c.keep_busy_off().await?
@@ -508,7 +509,8 @@ fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let outcome: Result<(), String> = async {
-            let mut client = roomler_localapi::connect()
+            // #4020 — its error is shown: a stopped service says so.
+            let mut client = crate::commands::connect_service()
                 .await
                 .map_err(|e| format!("connecting to the device service: {e}"))?;
             let state = client.record_status().await.map_err(|e| e.to_string())?;

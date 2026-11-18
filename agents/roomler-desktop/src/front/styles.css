@@ -478,6 +478,35 @@ textarea {
 .dv-toolbar select { width: auto; }
 .dv-size { display: inline-flex; align-items: center; gap: 6px; }
 .dv-note { margin: 0 0 8px; }
+/* #4019 — the list's notes (`dv-grid-status`, and `dv-grid-error`, the
+ * stale-data line a failed refresh shows) sit in ONE slot whose height never
+ * depends on what it shows: in the flow the line came and went above the
+ * rows, which moved by its height while a person aimed at one, and two
+ * "View screen" clicks in the 0.4.225 lab landed on row padding. Two lines
+ * tall, so a narrow window still reads most of a reason; a longer note is
+ * cut with "…" and reads whole on hover (its `title`). With both notes up,
+ * one line each (`.both`). */
+.dv-notes {
+  height: 32px;
+  overflow: hidden;
+  margin: 0 0 8px;
+}
+.dv-notes > p {
+  margin: 0;
+  line-height: 16px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.dv-notes.both > p { -webkit-line-clamp: 1; }
+.dv-stale {
+  padding: 0 8px;
+  border-left: 3px solid var(--warn);
+  border-radius: 0 4px 4px 0;
+  background: rgba(180, 83, 9, 0.1);
+}
 #dv-cols-btn.is-custom { border-color: var(--primary); color: var(--primary); }
 
 /* The grid keeps its natural widths and scrolls sideways in a narrow window;
