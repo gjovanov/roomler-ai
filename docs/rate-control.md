@@ -549,9 +549,9 @@ flowchart LR
 | piece | rule | anchor |
 |---|---|---|
 | the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `media_pair_memory.rs:163`, `:140` |
-| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `media_pair_memory.rs:563` |
+| the provenance | FR-148 P1. Every entry written carries `"provenance": "measured"`. An entry with no provenance, which is every entry written before this release, or with a value this agent does not know, is **assumed**. An assumed entry seeds nothing, so the pair opens as one never seen: no slow-link profile and no opening below the floor. It is no base for `damp`, so the first measurement replaces it outright. The next write for any pair drops it, because the file is written whole and an assumed value is never stored (FR-148 §4.1). A session that measured nothing leaves it as it is, unread, until it ages out. At the open, a fresh assumed entry logs `FR-148 P1 rate memory: … read as assumed …` with `assumed_bps` and `age_s`. **Rollback:** an older agent ignores the field and reads every entry again. Its whole-file write drops the field, so after a re-upgrade those entries are assumed: one session of learning per pair and carrier | `rate_memory.rs:107`, `:164`, `:173`, `:192`; `media_pair_memory.rs:566` |
 | the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9414` (`opener_measured_bps`) |
-| the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `media_pair_memory.rs:700`; `governor.rs:800` |
+| the evidence | `RateGovernor::session_evidence_bps`: first `stable_bps()`, the highest AIMD target that held 10 s with no decrease, when above the nominal and, since V5b, carried by a valid window; then a live reading; then the last reading the session took; else 0 = nothing. ⚠️ Before V5b the first was a hold of the *target*, not a measurement: an idle session held the opener's seed for its whole length and wrote 0.85 × the memory back as evidence, and the second was `pipe_bps`, whose last source is the prior's stand-in, so a prior that stood low was written back too (field rows below) | `media_pair_memory.rs:703`; `governor.rs:800` |
 | the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence, or the first after an assumed entry ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:230`, `:79`; `media_pair_memory.rs:238` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days, or an assumed one, never seeds and is pruned on the next write | `rate_memory.rs:269`, `:22` |
 | the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `media_pair_memory.rs:247` |
@@ -589,7 +589,7 @@ is a hold, not a measurement, and on the connect-look-leave sessions this fleet
 actually has it writes the opener's own seed back as evidence. The asymmetry
 that protects against a flooded opener (believe a drop fast) then compounds it:
 the pair that carried 6–7.6 Mbps windows is remembered at 4.4 M. A fix belongs
-with the governor (`media_pair_memory.rs:700`: require the hold to have been *carried*, or
+with the governor (`media_pair_memory.rs:703`: require the hold to have been *carried*, or
 route the first-choice evidence through the gate); nothing here is changed yet.
 The 2026-10-25 → 10-30 row is the same defect at scale: every write on that pair,
 not only the idle sessions.
@@ -666,8 +666,8 @@ evidence the old `min(goodput, link_rx)` averaged together:
 | evidence | meaning | source | accessor |
 |---|---|---|---|
 | a **delivery** | *"the path carried at least X"* — a lower bound, available every window on every carrier | the viewer's arrival rate (`governor.rs:1391`) | `floor_bps` — a MAX for the session, lowered only by contrary evidence, never by time |
-| a **push-back** | *"the path refused above X"* — a limit | an accepted goodput fold (`governor.rs:1501`), or the arrival rate while the viewer's queue grows (`:1639`) | `capacity_bps` (`pipe.rs:303`), 60 s TTL |
-| the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:329`) |
+| a **push-back** | *"the path refused above X"* — a limit | an accepted goodput fold (`governor.rs:1501`), or the arrival rate while the viewer's queue grows (`:1639`) | `capacity_bps` (`pipe.rs:305`), 60 s TTL |
+| the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:331`) |
 
 ⚠️ **It is a shadow, with one exception.** The heartbeat prints `pipe_belief=(anchor,
 floor, capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8506`), and
@@ -1515,8 +1515,9 @@ its next sample spans the quiet time and reads application-limited.
 - Not sampled: the RTP pump (its media rides SRTP, not SCTP), and a shared pipeline's
   followers, whose packets the owner's pump fans out over their own associations.
 
-**The switch** is `ROOMLERD_PATH_MODEL` (env only), read once per pump at its start
-through `tunnel_core::env::node_env` (`agents/roomlerd/src/media_delivery.rs:89`). `off`
+**The switch** is `ROOMLERD_PATH_MODEL` (since P1 also the config key `path_model`), read
+once per pump at its start through `tunnel_core::env::node_env`
+(`agents/roomlerd/src/media_delivery.rs:89`). `off`
 reads no clock, takes no sample and writes no line, which a test shows
 (`off_takes_no_sample_and_writes_no_line`). Any other value, or none, samples. Since
 FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
@@ -1718,7 +1719,7 @@ the base (`peer.rs:3405`).
 
 | Where | Anchor |
 |---|---|
-| the tags and the model | `agents/roomlerd/src/encode/pipe.rs:418` (`Basis`), `:453` (`PathNumber`), `:519` (`PathModel`), `:637` (`PathView`); `Pipe` takes the class at `:189` (`observe_delivered`) and `:243` (`observe_capacity`) |
+| the tags and the model | `agents/roomlerd/src/encode/pipe.rs:420` (`Basis`), `:455` (`PathNumber`), `:521` (`PathModel`), `:639` (`PathView`); `Pipe` takes the class at `:189` (`observe_delivered`) and `:243` (`observe_capacity`) |
 | the governor's tags and the view | `agents/roomlerd/src/encode/governor.rs:1441` (a delivery, classed), `:1639` (an arrival-rate push-back, classed), `:2069` (`path_view`), `:2200` (`PathTags`) |
 | the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:346` (`on_view`), `:416` (`emit_model`), `:439` (`seed_at_open`) |
 | the pumps | `agents/roomlerd/src/peer.rs:5384` (VP9-444), `:10356` (FFmpeg), `:6620` (the FFmpeg pump's seed and its age) |
@@ -1853,29 +1854,43 @@ So the opener's burst, the drain after a stall, and a rejected window set no sto
 floor (`the_opener_burst_and_a_stall_drain_set_no_stored_floor`,
 `a_session_of_rejected_windows_writes_nothing`).
 
-`SessionMemory` (`agents/roomlerd/src/encode/pair_memory.rs:783`) opens from the pair's
+`SessionMemory` (`agents/roomlerd/src/encode/pair_memory.rs:828`) opens from the pair's
 entry, with its floor as remembered and its record while that is fresh:
 
 | A valid window's reading | The floor | The push-back record |
 |---|---|---|
 | a delivery, either measured class | raises it (`PathModel`'s law) | ends it only when the delivery carries more than twice the record's rate (`ceiling_learn::CONTRADICTION_FACTOR`) |
 | a push-back, `backlogged`, counted | lowers it as `Pipe` does (D30) | a sample |
-| a push-back, `backlogged`, not counted | stays | stays; the close line counts it: `samples_unread`, `samples_under_plan` or `samples_not_counted` |
+| a push-back, `backlogged`, not counted | stays | stays; the close line counts it: `samples_unread`, `samples_viewer_late`, `samples_under_plan` or `samples_not_counted` |
 | a push-back, `app-limited` | a delivery | a delivery |
 | anything assumed | never enters | never enters |
 
 **One definition of counted evidence (D29).** A backlogged push-back counts for the
-memory only when all three hold, in this order (`pair_memory::Take::of`):
+memory only when all four hold, in this order (`pair_memory::Take::of`):
 
 | Test | Set aside as | Why |
 |---|---|---|
 | the classifier read the window: not `Unknown`, and for `Clear`, `TransitStalled` or `ViewerLate` a plausible viewer age, at least half the round trip (`viewer_rate::age_is_plausible`); `Overproduced` is always read | `samples_unread` | a still screen on a relay that stalls, with no viewer age, left a trusted record of tens of kbit/s on 24 of 336 swept sessions (`a_still_screen_on_a_stalling_relay_leaves_no_trusted_record`) |
+| the classifier did not blame the window on the viewer: not `ViewerLate` (the browser's share of the age 100 ms or more over its floor, or the viewer reported `struggling`) | `samples_viewer_late` | the key names the path (the carrier, the user, the viewer's network), not the viewer's device: a record from a slow browser would open the same user's other devices on that network low (`a_window_the_classifier_blames_on_the_viewer_is_not_a_reading_of_the_path`) |
 | the sender pushed against the plan: it wrote at least half the target the window ran with (`applied_bps`), or the window is `Overproduced` (`pushing_against_plan`) | `samples_under_plan` | a 40 kbit/s screen whose viewer age stays flat while its link report says the queue grows (`the_screens_families_on_r1_r2_and_the_plan_limited_test`) |
 | D25's: at least half the session's best valid delivery | `samples_not_counted` | a dip beside a real delivery |
 
 Inside the session nothing changes: a sample set aside still feeds `Pipe`, P0's model and
-the governor as before. The read test can only make a true record rarer, never a false
-one likelier: it sets samples aside and adds none.
+the governor as before. Setting samples aside never creates a trusted record where there
+was none. It can lower a record's rate, though: with a higher sample set aside, the record's
+`P` is the highest of the samples left, and `P ≤ T` is one of D26's two conditions, so the
+slow-link profile can engage where the release before left it off (for example counted
+samples of 0.8 Mbit/s beside an unread one of 1.2 Mbit/s).
+
+**What a counted sample's window was.** After the gate (which rejects a `TransitStalled`
+window and the one after it) and the tests above, a counted sample comes from one of two
+states, and the close line counts each (`Read`, `counted_samples_split_by_their_windows_state_and_a_late_viewer_reads_nothing`):
+`samples_counted_overproduced`, the sender's own counters (its queue at the budget, a
+frame the budget gate skipped, a blocked send, a send that waited 100 ms or more), and
+`samples_counted_clear`, a window whose transit share sat under 200 ms over its floor and
+the browser's under 100 ms over its own, where only the viewer's link report said the
+queue grew. The second is the open class (FR-148 §9, O7): a measurement, not a rule. On
+the slow-link replay all five counted refusals are `clear`.
 
 The record is `{bps, at_unix, first_at_unix, windows}`: the highest sample it counted, the
 time of its newest and of its first, and how many windows it counted. A session's
@@ -1888,7 +1903,7 @@ whichever side of the floor the link last refused
 
 ### What a close writes
 
-`pair_memory::close` (`agents/roomlerd/src/encode/pair_memory.rs:1119`) decides, case by
+`pair_memory::close` (`agents/roomlerd/src/encode/pair_memory.rs:1194`) decides, case by
 case, from the entry the session opened from and its last would-be write:
 
 | The session | `wrote` | `why` |
@@ -1912,10 +1927,15 @@ in the session and at the close (`a_quiet_session_keeps_the_remembered_floor`,
 down only on a counted sample, `floor_kept` is a guard the close keeps rather than a case
 a session reaches.
 
-**A sample at or after the close** reaches no record: the close writes the last viewer
-window the pump took, and the delivery sampler's samples feed no memory, only their line,
-which the pump writes after the close
-(`a_delivery_sample_at_the_close_neither_starts_nor_extends_a_record`).
+**A sample at or after the close** reaches no record, by construction, so no test pins it
+(a cell that tried could not fail). The guard writes the closing of the last viewer window
+the pump handed it (`PumpMemory::window`, right after each window), a copy taken then, so
+nothing that happens after that window reaches the write. The delivery sampler holds no
+reference to the governor, the session's memory or the guard: its heartbeat drops the
+sample it takes and writes only its own lines, and its one look at the governor is a
+shared borrow (`RateGovernor::path_view`). The pump drops the guard before the sampler
+(`peer.rs` declares `pair_memory` after `delivery`), so the sampler's last line comes after
+the close line.
 
 A floor is written with the class and time of the reading that set it, never the close's
 time. The remembered floor is never written back as if this session had measured it:
@@ -1948,7 +1968,7 @@ profile = trusted && P ≤ T && O ≤ T
 
 | Symbol | Is |
 |---|---|
-| `N` | `nominal_bps`: the relay cap at the session's Priority dial, at least `MIN_BITRATE_BPS` (`media_pair_memory.rs:479`) |
+| `N` | `nominal_bps`: the relay cap at the session's Priority dial, at least `MIN_BITRATE_BPS` (`media_pair_memory.rs:482`) |
 | `hi` | the constrained learner's ceiling, `relay_max_hi_bps` |
 | `D` | the entry's floor |
 | `P` | the record's rate |
@@ -1959,8 +1979,8 @@ open line writes `O` and the profile beside today's rule's opening, in every mod
 
 ### Which rule opens the session (step 3)
 
-`Taken::decide` (`agents/roomlerd/src/encode/pair_memory.rs:673`), once, at the pump's
-open (`PumpMemory::decide`, `agents/roomlerd/src/media_pair_memory.rs:608`):
+`Taken::decide` (`agents/roomlerd/src/encode/pair_memory.rs:685`), once, at the pump's
+open (`PumpMemory::decide`, `agents/roomlerd/src/media_pair_memory.rs:611`):
 
 | Switch | Key | The pair's entry | Opens by | `taken` | `taken_why` |
 |---|---|---|---|---|---|
@@ -1974,7 +1994,7 @@ open (`PumpMemory::decide`, `agents/roomlerd/src/media_pair_memory.rs:608`):
 
 Today's rule is FR-35's and FR-59 P8's: the measured seed of `rate_memory.json`, so an
 entry written before #3374 is read as assumed and seeds nothing (AC7). How each consumer
-of the opening takes it (`OpenPlan`, `pair_memory.rs:588`; `RateGovernor::new_with`,
+of the opening takes it (`OpenPlan`, `pair_memory.rs:600`; `RateGovernor::new_with`,
 `agents/roomlerd/src/encode/governor.rs:477`):
 
 | What the session acts on | Today's rule, seed `s` | The model, floor `D` |
@@ -1984,8 +2004,15 @@ of the opening takes it (`OpenPlan`, `pair_memory.rs:588`; `RateGovernor::new_wi
 | the floor relief and the prior (P8) | `s` under 1.5 Mbit/s, the relief on | `O` under 1.5 Mbit/s, the relief on |
 | the shadow controller, and the rate P0's model remembers | `s` | `D` |
 | the slow-link profile, resolved once at the open | `s ≤ T` | D26: a trusted push-back at or under `T`, and `O ≤ T` |
-| the viewer's cap detail, "remembered N kbps" | `s` | `O` |
+| the viewer's cap detail, "remembered N kbps" | `s` | `O` when D26 engages the profile; else none (`PumpMemory::seed`) |
 | the heartbeat's seed age | the entry's | the floor's |
+
+Two lines say "remembered" when the model opened the session (ledger `p1:OPENER-3`): the
+cap detail above, and FR-59 P8's open line, "the pair is remembered slower than the
+nominal floor: opening at the remembered rate" (`agents/roomlerd/src/peer.rs:7201`), which
+under the model fires when its trusted opening is under 1.5 Mbit/s. Its `seed_bps` is then
+`O`, not a remembered rate; the open line's `taken=model` tells them apart. Its words stay
+until P5, since `scripts/rc-path-report.cjs` matches them.
 
 N does not enter what drives the session: after a trusted push-back the opening is
 `clamp(⌊0.85·D⌋, 200 kbit/s, hi)`, and without one the learner seeded with `D` gives the
@@ -2038,17 +2065,20 @@ today's file (`media_pair_memory.rs:381`). A test pins the names and their order
 | `best_bps`, `best_basis` | the session's highest valid delivery |
 | `push_back_bps`, `push_back_windows`, `push_back_span_s` | the record as it stands |
 | `samples_counted` | backlogged push-backs that counted (D29) |
+| `samples_counted_overproduced`, `samples_counted_clear` | the counted ones by the state of their window: the sender's own counters, or `Clear`, where only the link report said the queue grew (the open class, FR-148 O7); they sum to `samples_counted` |
 | `samples_not_counted` | backlogged push-backs under half the best delivery |
 | `samples_unread` | backlogged push-backs from a window the classifier could not read (D29) |
+| `samples_viewer_late` | backlogged push-backs from a window the classifier blamed on the viewer, `ViewerLate` (D29) |
 | `samples_under_plan` | backlogged push-backs from a window whose sender wrote under half its target (D29) |
 | `record_ended` | a delivery over twice the record's rate ended the record |
 | `frozen` | the path changed during the session |
 
-A session pushed back three times, and the session after it (the test prints both with
-`--nocapture`; each line is 439 to 531 bytes, two a session):
+A session pushed back three times, once in an `Overproduced` window and twice in `Clear`
+ones, with a late viewer's push-back beside them, and the session after it (the test
+prints both with `--nocapture`; each line is 494 to 550 bytes, two a session):
 
 ```text
-FR-148 P1 path memory: what the close wrote session_id=… key_id=b2eb8bbf6a9f key_carrier=turn key_net=srflx wrote=floor_and_push_back why=pushed_back floor_bps=Some(722500) floor_basis=backlogged floor_age_s=Some(7) best_bps=Some(1200000) best_basis=app_limited push_back_bps=Some(640000) push_back_windows=Some(3) push_back_span_s=Some(13) samples_counted=3 samples_not_counted=0 samples_unread=0 samples_under_plan=0 record_ended=false frozen=false
+FR-148 P1 path memory: what the close wrote session_id=… key_id=b2eb8bbf6a9f key_carrier=turn key_net=srflx wrote=floor_and_push_back why=pushed_back floor_bps=Some(722500) floor_basis=backlogged floor_age_s=Some(7) best_bps=Some(1200000) best_basis=app_limited push_back_bps=Some(640000) push_back_windows=Some(3) push_back_span_s=Some(13) samples_counted=3 samples_counted_overproduced=1 samples_counted_clear=2 samples_not_counted=0 samples_unread=0 samples_viewer_late=1 samples_under_plan=0 record_ended=false frozen=false
 FR-148 P1 path memory: the pair's entry at the open session_id=… codec_label="AV1" mode=shadow key_id=b2eb8bbf6a9f key_carrier=turn key_net=srflx no_key=- entry=fresh floor_bps=Some(722500) floor_basis=backlogged floor_age_s=Some(7) push_back_bps=Some(640000) push_back_age_s=Some(7) push_back_windows=Some(3) push_back_span_s=Some(13) model_trusted=true nominal_bps=2550000 model_open_bps=614125 model_profile=true today_seed_bps=None today_open_bps=2550000 today_profile=false taken=today taken_why=shadow
 ```
 
@@ -2072,9 +2102,14 @@ memory is not under the switch: it seeds and writes as before in every mode.
 
 **The config key** is built as `rc_carrier_rank`'s was (#4013): the field, its env
 fallback, the key's metadata, its echo and its check
-(`crates/agent-core/src/config.rs`, `crates/agent-core/src/config_surface.rs`). The
-person at the device runs `roomler config set path_model on`, then `roomler restart`;
-`roomler config set path_model shadow` and a restart take the device back. A set
+(`crates/agent-core/src/config.rs`, `crates/agent-core/src/config_surface.rs`).
+⚠️ **`on` is set on no device until FR-148's open decision O7 is ruled**; until then it is
+for tests. One false record under `on` lowers the pair's floor with it, and every session
+on that key for up to 24 h (renewed by each push-back that counts) then opens at about
+0.85 of it, on the slow-link profile for the whole session when the record is under the
+profile's threshold, as a false slow record is (D26). A device found at `on` is
+taken back with `roomler config set path_model shadow`, then `roomler restart`; a device
+with `ROOMLERD_PATH_MODEL` set loses the variable as well. A set
 `ROOMLERD_PATH_MODEL` wins over the key, and the value is checked: anything but `off`,
 `shadow` or `on` is refused at `config set`. `shadow` is stored, not cleared, so a device
 taken back stays at `shadow` when a release changes the default. Remote config cannot
@@ -2083,11 +2118,11 @@ in `media_delivery`, so the env-read count of the FR-135 ratchet does not move.
 
 | Where | Anchor |
 |---|---|
-| the key, the file, the session, the close, the opening | `agents/roomlerd/src/encode/pair_memory.rs:248` (`pair_key`), `:226` (`viewer_net`), `:416` (`PathMemory`), `:507` (`PathMemory::update`, the lock), `:388` (the entry's check), `:783` (`SessionMemory`), `:1119` (`close`), `:551` (`model_opening`), `:588` (`OpenPlan`), `:673` (`Taken::decide`) |
-| counted evidence (D29) | `agents/roomlerd/src/encode/pair_memory.rs:717` (`window_read`), `:738` (`pushing_against_plan`), `:759` (`Take::of`); `viewer_rate::age_is_plausible` at `agents/roomlerd/src/encode/viewer_rate.rs:709` |
-| the glue: facts, guards, the lines | `agents/roomlerd/src/media_pair_memory.rs:61` (`PairFacts`), `:210` (`RateMemoryGuard`), `:262` (`ModelGuard`), `:326` (the open line), `:381` (the write and the close line), `:510` (`open`), `:608` (`decide`), `:652` (`plan`), `:664` (`at_open`), `:697` (`window`) |
+| the key, the file, the session, the close, the opening | `agents/roomlerd/src/encode/pair_memory.rs:248` (`pair_key`), `:226` (`viewer_net`), `:416` (`PathMemory`), `:515` (`PathMemory::update`, the lock), `:388` (the entry's check), `:828` (`SessionMemory`), `:1194` (`close`), `:563` (`model_opening`), `:600` (`OpenPlan`), `:685` (`Taken::decide`) |
+| counted evidence (D29) | `agents/roomlerd/src/encode/pair_memory.rs:729` (`window_read`), `:750` (`pushing_against_plan`), `:796` (`Take::of`); `viewer_rate::age_is_plausible` at `agents/roomlerd/src/encode/viewer_rate.rs:709` |
+| the glue: facts, guards, the lines | `agents/roomlerd/src/media_pair_memory.rs:61` (`PairFacts`), `:210` (`RateMemoryGuard`), `:262` (`ModelGuard`), `:326` (the open line), `:381` (the write and the close line), `:513` (`open`), `:611` (`decide`), `:655` (`plan`), `:667` (`at_open`), `:700` (`window`) |
 | the governor's opening | `agents/roomlerd/src/encode/governor.rs:477` (`new_with`), `:585` (`open_at_bps`), `:594` (`opening_of`) |
-| the gate's verdict before the fold | `agents/roomlerd/src/encode/governor.rs:1441`; `Pipe` at `agents/roomlerd/src/encode/pipe.rs:198` (`observe_delivered_in`), `:628` (`PathModel::offer`) |
+| the gate's verdict before the fold | `agents/roomlerd/src/encode/governor.rs:1441`; `Pipe` at `agents/roomlerd/src/encode/pipe.rs:198` (`observe_delivered_in`), `:630` (`PathModel::offer`) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:6610` (open), `:7192` (`new_with`), `:7212` (`at_open`), `:9339` (`window`), `:9430` (`opener_measured`) |
 
 **The tests** (`cargo test -p roomlerd --lib -- pair_memory governor:: media_delivery`):
@@ -2104,8 +2139,9 @@ in `media_delivery`, so the env-read count of the FR-135 ratchet does not move.
 | `the_screens_families_on_r1_r2_and_the_plan_limited_test` | D29's plan test, on the ruling's three families: shallower slowdowns, the viewer's age flat while its queue grows, a steady offer under the target; each family's count of sessions that leave a trusted record or a lowered floor, with and without the plan test (`set_plan_any`) |
 | `encode::pair_memory::tests::a_quiet_session_keeps_the_remembered_floor`, `a_counted_push_back_lowers_the_floor_and_a_dip_beside_it_does_not`, `the_close_keeps_the_higher_floor_inside_its_ttl` | D30 |
 | `pumps_that_end_at_once_each_keep_their_key` | the lock: eight pumps end at once, twenty times; every key is kept |
+| `a_file_held_without_read_sharing_keeps_every_other_key` | a close whose read fails other than on a missing file saves nothing, and every other pair's entry stays (Windows: a handle with no read sharing, OS error 32) |
+| `counted_samples_split_by_their_windows_state_and_a_late_viewer_reads_nothing`, `encode::governor::tests::a_window_the_classifier_blames_on_the_viewer_is_not_a_reading_of_the_path` | D29's viewer test and the close line's split: a late viewer's push-backs reach the session's belief and not the memory, and the classifier's tie stays `TransitStalled`, rejected by the gate |
 | `media_pair_memory::tests::a_srflx_candidate_line_gives_its_address`, `a_sessions_facts_live_as_long_as_its_peer`, `todays_tag_is_formed_as_before`, `a_change_of_path_freezes_the_offer`, `the_two_lines_name_their_fields` | the glue: the facts, today's key unchanged, the freeze, the lines |
-| `a_delivery_sample_at_the_close_neither_starts_nor_extends_a_record` | the close writes the last window the pump took; a delivery sample feeds no memory |
 | `a_move_between_relay_tiers_keeps_the_write` | a relay-tier move is kept, not frozen |
 | `media_delivery::tests::the_switch_has_three_modes_and_defaults_to_shadow` | the switch |
 
@@ -2118,7 +2154,25 @@ ledger as `p1:MEMORY-1`, the pump's four calls into them as `p1:MEMORY-2`, and t
 opener's two rules as `p1:OPENER-1` (`docs/plans/rc-media-debt.tsv`). Under `on`, a
 screen of about 300 kbit/s whose viewer age stays flat while its link report says the
 queue grows can still leave a false record (D29); no test against the target a window
-ran with separates it from a real slow link, and it is read on the fleet's shadow lines.
+ran with separates it from a real slow link. That is the open class, FR-148 O7: the close
+line's `samples_counted_clear` measures it on the fleet's shadow lines, and `on` is set on
+no device until it is ruled ([§ The switch](#the-switch-d28)).
+
+**Limits.**
+- The record's and the floor's times are the session's monotonic clock, turned into Unix
+  time at each viewer window. On Linux and macOS that clock stops during a host suspend,
+  so a window taken after the agent's host wakes, with the session still open, writes them
+  younger by the time it slept, and the record stays trusted that much longer (ledger
+  `p1:MEMORY-3`).
+- The lock serializes the close's file I/O: when several pumps end at once, each close
+  blocks its runtime worker while the others read, write and rename the file. It is
+  bounded, since nothing awaits under the lock and nothing nests, and today's memory does
+  the same.
+- The twin test (`shadow_is_todays_opener_exactly`) holds at one `N` (2.55 Mbit/s) and
+  one `hi` (8 Mbit/s), with the flags the cell sets rather than `from_env`'s, and compares
+  the opening seed and the first tick. Under today's rule `open_at_bps` equals the seed by
+  construction; the pump's two encoder opens that read it are under no test (ledger
+  `p1:OPENER-4`).
 
 ## Config / env reference
 
@@ -2147,7 +2201,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `ROOMLERD_ENCODER_CLOCK` | on (Linux), off (Windows, macOS) | FR-112 P1, P3 — the encoding and capture threads ask for their clock (Linux: a `uclamp_min`; macOS: a QoS class; Windows: out of power throttling); `0` = the scheduler's default, `1` opts Windows or macOS in until their own numbers decide ([`encoders.md`](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) |
 | `ROOMLERD_SW_PACE_UP_MARGIN` | 2.5 | Env only. FR-112 P2d: how far (fps) a software encoder's estimate must clear a higher step before its pace moves up to it (0–10). `0` = 0.4.142's pace, which steps up as soon as the estimate quantises higher ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
 | `ROOMLERD_RATECTL` | shadow | Env only (B1). FR-63 B1 — whether the shadow rate controller runs beside the governor; `off` stops it, any other value is `shadow`. It drives NOTHING — its only output is the `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). The config-surface tribool and the `live` value are B2 |
-| `ROOMLERD_PATH_MODEL` (config key `path_model`) | shadow | FR-148 P0, P1 (D28) — `off` is the release before P0: no delivery sample, no path number, no path memory, none of their lines. `shadow` (unset, or any value but `off` and `on`) takes the samples and the tagged path numbers ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)) and keeps the path model's memory ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)); the opener reads today's rate memory. `on` is `shadow`, and a constrained session of the FFmpeg data-channel pump whose pair has a key and a fresh entry opens from the path memory ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)). A set variable wins over the key; remote config cannot set it |
+| `ROOMLERD_PATH_MODEL` (config key `path_model`) | shadow | FR-148 P0, P1 (D28) — `off` is the release before P0: no delivery sample, no path number, no path memory, none of their lines. `shadow` (unset, or any value but `off` and `on`) takes the samples and the tagged path numbers ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)) and keeps the path model's memory ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)); the opener reads today's rate memory. `on` is `shadow`, and a constrained session of the FFmpeg data-channel pump whose pair has a key and a fresh entry opens from the path memory ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ it is set on no device until FR-148's O7 is ruled ([§ The switch](#the-switch-d28)). A set variable wins over the key; remote config cannot set it |
 | `qsv_rate_mode` / `ROOMLERD_QSV_RATE_MODE` | `cbr` | FR-148 P2 — `qvbr` opens an HEVC or H.264 QSV encoder off constant bitrate: its target at 0.9 × the cap, under `maxrate` at the cap, at the session's quality (QVBR), so a frame is no longer padded to the cap. A driver that refuses it opens at `cbr`. Every rebuild and reopen follows. This device only: not pushable ([`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
@@ -2184,7 +2238,7 @@ heuristic which rations rate moves is dead weight on NVENC but load-bearing on Q
 so every retirement is gated on the backend it is retired for.
 
 **The switches.** Each one is `ROOMLERD_<KEY>` in the environment and the lowercase
-key in the config (`roomler config set`), except the four marked *env only*. A
+key in the config (`roomler config set`), except the three marked *env only*. A
 default of *on* guards shipped behaviour. A default of *off* means the behaviour is
 still waiting for its evidence.
 
@@ -2209,7 +2263,7 @@ still waiting for its evidence.
 | `RATE_SLOW_START` | `:573` | FR-63 | off | a session opens with slow start instead of a constant | B2's evidence flips it, or it is deleted | FR-63 | — |
 | `RATECTL` (env only) | `:613` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
 | `SHARED_RATE_SPLIT` (env only) | `:926` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
-| `PATH_MODEL` (env only) | `agents/roomlerd/src/media_delivery.rs:89`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)); nothing reads them to drive a rate. Three values since P1 (D28): `off`, `shadow`, `on` (`shadow` until a later P1 step) | P5 deletes it with the composition it measures | FR-148 P5 | — |
+| `PATH_MODEL` | `agents/roomlerd/src/media_delivery.rs:89`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)). Three values since P1 (D28): `off`, `shadow` (the default) and `on`, under which the path memory opens a constrained session of the FFmpeg data-channel pump ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ `on` is set on no device until FR-148's O7 is ruled | P5 deletes it with the composition it measures | FR-148 P5 | — |
 | `QSV_RATE_MODE` | `agents/roomlerd/src/encode/ffmpeg/encoder.rs:3471`, not `encode/mod.rs` | FR-148 P2 (FR-62 A5) | `cbr` | constant bitrate on QSV: `qvbr` opens HEVC and H.264 QSV at QVBR, the target at 0.9 × the cap, and falls back to `cbr` on a refusal (`QsvRateOpen`, [`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) | FR-148 AC13 read with it on: a QSV keepalive no longer `maxrate ÷ fps ÷ 8` bytes, a still screen under 0.3 Mbit/s. FR-148 P5 then deletes the constant-bitrate path, and the switch with it | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
