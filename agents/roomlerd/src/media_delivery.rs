@@ -1593,4 +1593,1043 @@ pub(crate) mod shaped_link {
     fn at(t0: Instant, ms: u64) -> Instant {
         t0 + Duration::from_millis(ms)
     }
+
+    /// FR-148 O11 — what the delivery classifier, SCTP's gauges and the
+    /// viewer see on the shape a TCP carrier gives SCTP (TURN over TCP 443): a
+    /// deep queue that loses nothing, because the kernel's send buffer and
+    /// TCP's own retransmissions hold what the link has not carried yet. The
+    /// control is the UDP carrier's shape: a router queue of 100 ms that drops
+    /// at its tail.
+    ///
+    /// Each cell writes 1.5 times the link's rate in frames at 30 fps, each
+    /// stamped with its write time, over the default 1 MiB windows at a 60 ms
+    /// round trip, and records 20 one-second samples: the class, SCTP's
+    /// gauges, the link's queue and what the viewer read. A second is loaded
+    /// when the link's queue never fell under 500 ms in it. The hypothesis,
+    /// asserted last in each deep cell: fewer than half the loaded seconds
+    /// read backlogged. Measured on Windows, debug build; four runs gave the
+    /// same classes, and peaks within 1 %:
+    ///
+    /// | deep cell | loaded seconds | backlogged | link queue, peak | |
+    /// |---|---|---|---|---|
+    /// | 0.4 Mbit/s, path I | 19 | 0 | 11.06 s | green |
+    /// | 2 Mbit/s, path I, skipping over 256 KiB as the VP9-444 pump does | 19 | 0 | 1.06 s | green |
+    /// | 2 Mbit/s, path I | 19 | 12 | 4.23 s | red: the peer's window binds at 8 s |
+    /// | 0.4 Mbit/s, path C | 12 | 12 | 0.92 s | red |
+    /// | 2 Mbit/s, path C, with the skip or without | 0 | 19 of all 20 | 0.37 s | red: never loaded |
+    ///
+    /// Path I's slow start runs to the peer's window, and its congestion
+    /// window grows only while chunks wait, so it stays a few KB over what is
+    /// in flight, and the queue of unsent chunks runs empty 20 to 30 times a
+    /// second: every sample is application-limited while seconds of queue
+    /// stand on the link, until the peer's window binds. The pump's skip
+    /// keeps the buffered amount near 256 KiB, so the window never binds, the
+    /// classifier never sees the queue, and the queue stands still at a
+    /// second, where the viewer's transit growth stops reading it after 3 s.
+    /// The governor's own class for a window's delivery (writes over 1.1
+    /// times what arrived) reads 2 of that cell's 19 windows, because the
+    /// skip writes what the path drains. Path C runs congestion avoidance
+    /// from the first byte (no INIT ACK sets its threshold), one MTU a round
+    /// trip, so the backlog waits in SCTP's own queue, and the classifier
+    /// reads it.
+    ///
+    /// The candidate signals over the 69 loaded seconds of the four deep cells
+    /// that had any, and the 80 seconds of the four controls (0.4 and 2
+    /// Mbit/s, paths I and C, 11 to 69 tail drops each), the least and the
+    /// most of four runs:
+    ///
+    /// | signal | deep, loaded | controls (false) |
+    /// |---|---|---|
+    /// | SCTP's acknowledgement delay over its least ≥ 250 ms | 69 | 0 (at most 65 ms) |
+    /// | in flight ≥ 3 × delivered × the least delay | 69 | 7 to 11 |
+    /// | the viewer's transit over its least ≥ 200 ms (FR-71's) | 69 | 35 to 37 |
+    /// | the stream's buffered amount over 256 KiB | 38 to 40 | 0 |
+    /// | transit growth ≥ 100 ms | 35 | 19 to 23 |
+    /// | the link loop congested | 32 | 6 to 8 |
+    /// | backlogged | 24 | 76 |
+    ///
+    /// The acknowledgement delay holds only the link's queue. The viewer's
+    /// transit also holds the wait in SCTP's own queue (128 KiB, 2.7 s at 0.4
+    /// Mbit/s), so it reads the controls' backlog as well. The deep cells
+    /// assert the first row on every loaded second and the controls assert
+    /// its absence: pins of these numbers, not fail-first.
+    ///
+    /// The stall cells hold the viewer's deliveries for 0.8 s every 3.3 s, as
+    /// a TCP receiver holds what waits behind a lost segment, and fold the
+    /// viewer's stats windows (closed as `rc-dc-worker.ts` closes them) into
+    /// a real [`Pipe`], whose floor takes every window. The window after a
+    /// stall carries the stall's bytes on top of its own. Under a writer at
+    /// 80 % of the link, path I's floor ends at 2,857 to 3,030 kbit/s in six
+    /// runs, 1.46 to 1.55 times the link's 1,954, by where the stalls fall in
+    /// the windows; path C's congestion window caps what the link carries in
+    /// a stall, and its floor ends at 2,475 to 2,505 in five runs, 1.27 to
+    /// 1.28 times (red at 20 s: it rises stall by stall, 2,090 to 2,501 over
+    /// five, as the window grows). Under the pump's skip at 1.5 times the
+    /// link, the standing queue already holds what a stall carries:
+    /// each window after a stall reads 3,363 to 3,476, and the floor ends at
+    /// 3,470 to 3,476 in three runs, 1.78 times the link, about 1 plus the
+    /// stall over the window. No capacity is taken in any stall cell. The
+    /// controls' windows can pass the link too, by SCTP's own release of what
+    /// waited behind a loss: 695 to 697 kbit/s on 0.4 Mbit/s's 390, and up to
+    /// 3,389 on 2 Mbit/s's 1,954. There the fold overstates the product's
+    /// floor: it leaves out the `Overproduced` screen, by which a window with
+    /// a blocked send is valid and its goodput damps the floor.
+    ///
+    /// `cargo test -p roomlerd --lib media_delivery::shaped_link::tcp_shape --
+    /// --skip clipboard:: --nocapture --test-threads=1 --include-ignored`
+    mod tcp_shape {
+        use tokio::time::MissedTickBehavior;
+
+        use super::*;
+        use crate::encode::goodput::{GoodputEstimator, GoodputSink};
+        use crate::encode::pipe::{Basis, Pipe};
+        use crate::encode::viewer_rate::{LinkLoop, OfferLoop, offered_over_arrival};
+
+        /// The lab slice's round trip.
+        const RTT: Duration = Duration::from_millis(60);
+        /// A queue no run fills: nothing is dropped.
+        const DEEP: Duration = Duration::from_secs(60);
+        /// The control's queue, dropping at its tail.
+        const SHALLOW: Duration = Duration::from_millis(100);
+        const SAMPLE: Duration = Duration::from_secs(1);
+        const SAMPLES: u32 = 20;
+        const FPS: u32 = 30;
+        /// How often a second's link queue is read, for its least and most.
+        const POLL: Duration = Duration::from_millis(10);
+        /// A second whose link queue never fell under this is loaded.
+        const LOADED_MS: u64 = 500;
+        /// The candidate signals' thresholds: the second's least
+        /// acknowledgement delay over the least yet; what is in flight over
+        /// what the second's delivery rate fills in that least delay.
+        const RTT_OVER_MS: u64 = 250;
+        const BDP_PCT: u64 = 300;
+        /// FR-71's transit slack (`pipe_state::TRANSIT_SLACK_MS`), and FR-59's
+        /// growth (`viewer_rate::QUEUE_GROWTH_MS`).
+        const TRANSIT_OVER_MS: u64 = 200;
+        const GROWTH_MS: i64 = 100;
+        /// The VP9-444 pump's relay watermark on `dc.buffered_amount()`: over
+        /// it, a frame is skipped and a keyframe asked for (`peer.rs`).
+        const OVERFLOW: u64 = 256 * 1024;
+        /// What one full packet carries: 1,200 bytes of payload in 1,228.
+        const PAYLOAD: u64 = 1_200;
+        const PACKET: u64 = 1_228;
+        /// The stall cells' head-of-line stalls: one this long this often, so
+        /// that they fall at different points of the viewer's ≈1 s windows.
+        /// Only a stall across a window's close lifts a window: at 4 s, one
+        /// run of two had none, and its floor ended at 1.08 times the link.
+        const STALL_EVERY: Duration = Duration::from_millis(3_300);
+        const STALL_FOR: Duration = Duration::from_millis(800);
+
+        /// One cell at a time: the cells are timed.
+        static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        #[derive(Debug, Clone, Copy)]
+        struct Shape {
+            bps: u64,
+            queue: Duration,
+            path: OpenPath,
+            /// The writer's offer, percent of the link's rate.
+            offer_pct: u64,
+            /// The writer skips a frame while the stream's buffered amount is
+            /// over [`OVERFLOW`], as the VP9-444 pump does on a relay.
+            skip_over: bool,
+            /// Head-of-line stalls on the agent's direction: how often, how long.
+            stalls: Option<(Duration, Duration)>,
+        }
+
+        impl Shape {
+            fn name(&self) -> String {
+                let path = match self.path {
+                    OpenPath::InitAck => "I",
+                    OpenPath::CookieEcho => "C",
+                };
+                let queue = if self.queue >= DEEP {
+                    "deep"
+                } else {
+                    "shallow"
+                };
+                let skip = if self.skip_over {
+                    ", skip over 256 KiB"
+                } else {
+                    ""
+                };
+                let stalls = match self.stalls {
+                    Some((every, stall)) => format!(", a {stall:?} stall every {every:?}"),
+                    None => String::new(),
+                };
+                format!(
+                    "{} Mbit/s, {queue} queue, path {path}, offer {} %{skip}{stalls}",
+                    self.bps as f64 / 1e6,
+                    self.offer_pct
+                )
+            }
+
+            /// The link's payload rate.
+            fn payload_bps(&self) -> u64 {
+                self.bps * PAYLOAD / PACKET
+            }
+
+            fn frame_len(&self) -> usize {
+                usize::try_from(self.bps * self.offer_pct / 100 / 8 / u64::from(FPS)).unwrap()
+            }
+        }
+
+        /// One message the viewer read: when it arrived and when it was
+        /// written (microseconds from the cell's start), and its length.
+        #[derive(Debug, Clone, Copy)]
+        struct Arrival {
+            at_us: u64,
+            sent_us: u64,
+            len: u64,
+        }
+
+        fn transit_ms(x: &Arrival) -> u64 {
+            x.at_us.saturating_sub(x.sent_us) / 1000
+        }
+
+        /// One second of a run, as the agent and the viewer saw it.
+        #[derive(Debug, Clone, Copy)]
+        struct Second {
+            t: u32,
+            class: Class,
+            /// What SCTP saw acknowledged, bit/s.
+            acked_bps: u64,
+            /// The least and the most a packet would have waited in the link's
+            /// queue during the second.
+            q_lo_ms: u64,
+            q_hi_ms: u64,
+            inflight: u64,
+            cwnd: u32,
+            ssthresh: u32,
+            rwnd: u32,
+            pending: u64,
+            /// Times the queue of written, unsent chunks ran empty.
+            empties: u64,
+            /// The stream's buffered amount: written, not yet acknowledged.
+            buffered: u64,
+            /// The second's least acknowledgement delay.
+            ack_min_ms: Option<u64>,
+            /// What the writer wrote and what the viewer read, bit/s.
+            sent_bps: u64,
+            rx_bps: u64,
+            /// The newest arrival's transit, write to read, and its growth
+            /// since the second before's.
+            transit_ms: Option<u64>,
+            growth_ms: Option<i64>,
+            /// The writer's blocked sends (`goodput::MIN_BLOCKED_SEND` each),
+            /// and the goodput estimate when the window qualified.
+            blocked_ms: u64,
+            goodput_bps: Option<u32>,
+            fast_rtx: u64,
+            t3: u64,
+        }
+
+        /// The candidate signals of a standing queue for one second, each
+        /// against the least seen so far, as a live reader would hold it.
+        #[derive(Debug, Clone, Copy)]
+        struct Signals {
+            bdp_pct: Option<u64>,
+            rtt_over_ms: Option<u64>,
+            transit_over_ms: Option<u64>,
+        }
+
+        fn signals_of(rows: &[Second]) -> Vec<Signals> {
+            let mut rtt_min: Option<u64> = None;
+            let mut transit_min: Option<u64> = None;
+            rows.iter()
+                .map(|r| {
+                    rtt_min = match (rtt_min, r.ack_min_ms) {
+                        (Some(m), Some(a)) => Some(m.min(a)),
+                        (m, a) => m.or(a),
+                    };
+                    transit_min = match (transit_min, r.transit_ms) {
+                        (Some(m), Some(t)) => Some(m.min(t)),
+                        (m, t) => m.or(t),
+                    };
+                    let bdp_pct = rtt_min
+                        .filter(|&m| m > 0 && r.acked_bps > 0)
+                        .map(|m| r.inflight * 100 * 8_000 / (r.acked_bps * m));
+                    Signals {
+                        bdp_pct,
+                        rtt_over_ms: r.ack_min_ms.zip(rtt_min).map(|(a, m)| a - m),
+                        transit_over_ms: r.transit_ms.zip(transit_min).map(|(t, m)| t - m),
+                    }
+                })
+                .collect()
+        }
+
+        /// One stats window of the viewer's, as `rc-dc-worker.ts` closes it:
+        /// at the first arrival a second or more after the last close, that
+        /// arrival's bytes counted in the window it closes.
+        #[derive(Debug, Clone, Copy)]
+        struct ViewerWindow {
+            end_us: u64,
+            ms: u64,
+            rx_bps: u32,
+            sent_bps: u32,
+            /// The transit queue's growth over the window (the worker's
+            /// `QueueDrift`, read at arrival), its mean transit, and that over
+            /// the least window mean yet.
+            growth_ms: i64,
+            transit_ms: u64,
+            excess_ms: u64,
+        }
+
+        fn viewer_windows(
+            arrivals: &[Arrival],
+            frames: &[(u64, u64)],
+            from_us: u64,
+        ) -> Vec<ViewerWindow> {
+            let mut out = Vec::new();
+            let mut opened: Option<(u64, u64)> = None;
+            let (mut bytes, mut transit_sum, mut n) = (0u64, 0u64, 0u64);
+            let mut floor: Option<u64> = None;
+            for x in arrivals.iter().filter(|x| x.at_us >= from_us) {
+                let Some((since, transit_before)) = opened else {
+                    opened = Some((x.at_us, transit_ms(x)));
+                    continue;
+                };
+                bytes += x.len;
+                transit_sum += transit_ms(x);
+                n += 1;
+                let elapsed = x.at_us - since;
+                if elapsed < 1_000_000 {
+                    continue;
+                }
+                let sent: u64 = frames
+                    .iter()
+                    .filter(|f| f.0 > since && f.0 <= x.at_us)
+                    .map(|f| f.1)
+                    .sum();
+                let mean = transit_sum / n;
+                let low = floor.map_or(mean, |f| f.min(mean));
+                floor = Some(low);
+                let bps = |b: u64| u32::try_from(b * 8_000_000 / elapsed).unwrap_or(u32::MAX);
+                out.push(ViewerWindow {
+                    end_us: x.at_us,
+                    ms: elapsed / 1000,
+                    rx_bps: bps(bytes),
+                    sent_bps: bps(sent),
+                    growth_ms: transit_ms(x) as i64 - transit_before as i64,
+                    transit_ms: mean,
+                    excess_ms: mean - low,
+                });
+                opened = Some((x.at_us, transit_ms(x)));
+                (bytes, transit_sum, n) = (0, 0, 0);
+            }
+            out
+        }
+
+        /// The session's path belief over a run's viewer windows, folded by
+        /// the real [`Pipe`] the way the governor folds it: every window's
+        /// arrival rate is a delivery; a valid window's goodput, and a valid,
+        /// congested and offered window's arrival rate, are capacities. Valid
+        /// is FR-79's gate cut to its transit rule: a window whose transit is
+        /// [`TRANSIT_OVER_MS`] over the least is `TransitStalled`, and the
+        /// window after one is its shadow. The sender-side screen that would
+        /// call a window `Overproduced` first is not modelled.
+        #[derive(Debug, Default, Clone, Copy)]
+        struct Belief {
+            floor: Option<u32>,
+            capacity: Option<u32>,
+            anchor: Option<u32>,
+            max_rx: u32,
+            windows: u32,
+            /// Windows whose writes ran over what arrived
+            /// ([`offered_over_arrival`]): the class the governor gives a
+            /// window's delivery, and so the shadow model's.
+            offered: u32,
+            invalid: u32,
+            congested: u32,
+            link_capacities: u32,
+            goodput_capacities: u32,
+        }
+
+        fn belief_of(windows: &[ViewerWindow], goodput: &[(u64, u32)], t0: Instant) -> Belief {
+            let mut pipe = Pipe::default();
+            let mut link = LinkLoop::new();
+            let mut offer = OfferLoop::default();
+            let mut goodput = goodput.iter().peekable();
+            let mut prev_stalled = false;
+            let mut b = Belief::default();
+            for w in windows {
+                let at = t0 + Duration::from_micros(w.end_us);
+                let stalled = w.excess_ms >= TRANSIT_OVER_MS;
+                let valid = !stalled && !prev_stalled;
+                prev_stalled = stalled;
+                b.windows += 1;
+                if !valid {
+                    b.invalid += 1;
+                }
+                while let Some(&(_, bps)) = goodput.next_if(|g| g.0 <= w.end_us) {
+                    if valid {
+                        pipe.observe_capacity(bps, Basis::Backlogged, at);
+                        b.goodput_capacities += 1;
+                    }
+                }
+                let offered = offered_over_arrival(w.sent_bps, w.rx_bps);
+                if offered {
+                    b.offered += 1;
+                }
+                let offer_held = offer.observe(offered);
+                pipe.observe_delivered_in(w.rx_bps, Basis::of_window(offered), valid, at);
+                let growth = i16::try_from(w.growth_ms.clamp(-30_000, 30_000)).unwrap();
+                if link.observe(w.rx_bps, growth).congested {
+                    b.congested += 1;
+                    if valid && offer_held {
+                        pipe.observe_capacity(w.rx_bps, Basis::Backlogged, at);
+                        b.link_capacities += 1;
+                    }
+                }
+                b.max_rx = b.max_rx.max(w.rx_bps);
+            }
+            let end = windows
+                .last()
+                .map_or(t0, |w| t0 + Duration::from_micros(w.end_us));
+            b.floor = pipe.floor_bps(end);
+            b.capacity = pipe.capacity_bps(end);
+            b.anchor = pipe.ceiling_anchor_bps(end);
+            b
+        }
+
+        #[derive(Debug)]
+        struct TcpRun {
+            shape: Shape,
+            rows: Vec<Second>,
+            windows: Vec<ViewerWindow>,
+            belief: Belief,
+            peak_queue: Duration,
+            tail_drops: u64,
+        }
+
+        fn us(d: Duration) -> u64 {
+            u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+        }
+
+        fn ms(d: Duration) -> u64 {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        }
+
+        /// How long a packet sent now would wait in `c`'s queue.
+        fn queue_now(c: &ShapedConn) -> Duration {
+            c.out
+                .next_free
+                .lock()
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+        }
+
+        /// When a packet due at `due` reaches the far end: when due, or at the
+        /// end of the stall it fell due in. A stall starts each `every` after
+        /// `t0` and lasts `stall`.
+        fn held_until(due: Instant, t0: Instant, every: Duration, stall: Duration) -> Instant {
+            let k = due.saturating_duration_since(t0).as_nanos() / every.as_nanos();
+            match u32::try_from(k) {
+                Ok(k @ 1..) => (t0 + every * k + stall).max(due),
+                _ => due,
+            }
+        }
+
+        /// As [`shaped`], and the viewer's end receives nothing during each
+        /// stall: what fell due in it is handed over at its end, at once and
+        /// in order, as a TCP receiver releases what waited behind a lost
+        /// segment. The link carries on at its rate meanwhile.
+        fn stalling(
+            bps: u64,
+            queue: Duration,
+            t0: Instant,
+            every: Duration,
+            stall: Duration,
+        ) -> (ShapedConn, ShapedConn) {
+            let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+            let (inbox_tx, b_inbox) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Some((due, p)) = due_rx.recv().await {
+                    let release = held_until(due, t0, every, stall);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(release)).await;
+                    if inbox_tx.send(p).is_err() {
+                        break;
+                    }
+                }
+            });
+            let a_out = Shaper {
+                bps,
+                one_way: RTT / 2,
+                queue,
+                next_free: StdMutex::new(Instant::now()),
+                due: due_tx,
+                drop_every: 0,
+                full_packets: AtomicU64::new(0),
+                peak_wait_ns: AtomicU64::new(0),
+                tail_drops: AtomicU64::new(0),
+            };
+            let (b_out, a_inbox) = direction(bps, RTT / 2, queue, 0, None);
+            let (a, b): (SocketAddr, SocketAddr) = (
+                "10.0.0.1:5000".parse().unwrap(),
+                "10.0.0.2:5000".parse().unwrap(),
+            );
+            (
+                ShapedConn {
+                    out: a_out,
+                    inbox: Mutex::new(a_inbox),
+                    local: a,
+                    remote: b,
+                },
+                ShapedConn {
+                    out: b_out,
+                    inbox: Mutex::new(b_inbox),
+                    local: b,
+                    remote: a,
+                },
+            )
+        }
+
+        /// As [`pair_opened`] with the default windows (1 MiB), and the viewer
+        /// logs when each message arrived and the write time it carries in
+        /// its first 8 bytes.
+        async fn pair_timed(
+            a: Arc<dyn Conn + Send + Sync>,
+            b: Arc<dyn Conn + Send + Sync>,
+            path: OpenPath,
+            t0: Instant,
+            log: Arc<StdMutex<Vec<Arrival>>>,
+        ) -> (Association, Arc<Association>) {
+            let config = |net_conn, name: &str| Config {
+                net_conn,
+                max_receive_buffer_size: 0,
+                max_message_size: 0,
+                name: name.to_owned(),
+            };
+            let (agent, viewer) = match path {
+                OpenPath::InitAck => {
+                    let agent = tokio::spawn(Association::client(config(a, "agent")));
+                    let viewer = Association::server(config(b, "viewer")).await;
+                    (agent.await.unwrap().unwrap(), viewer.unwrap())
+                }
+                OpenPath::CookieEcho => {
+                    let viewer = tokio::spawn(Association::client(config(b, "viewer")));
+                    let agent = Association::server(config(a, "agent")).await;
+                    (agent.unwrap(), viewer.await.unwrap().unwrap())
+                }
+            };
+            let viewer = Arc::new(viewer);
+            let reader = Arc::clone(&viewer);
+            tokio::spawn(async move {
+                while let Some(stream) = reader.accept_stream().await {
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_536];
+                        while let Ok(n @ 8..) = stream.read(&mut buf).await {
+                            let at_us = us(t0.elapsed());
+                            let sent_us = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                            log.lock().unwrap().push(Arrival {
+                                at_us,
+                                sent_us,
+                                len: n as u64,
+                            });
+                        }
+                    });
+                }
+            });
+            (agent, viewer)
+        }
+
+        /// A writer offering `shape`'s rate in frames at [`FPS`], each
+        /// stamped with its write time, for [`SAMPLES`] seconds of samples.
+        async fn run(shape: Shape) -> TcpRun {
+            let _turn = TURN.lock().await;
+            #[cfg(target_os = "windows")]
+            let _timer = crate::win_timer::TimerResolutionGuard::request_1ms();
+            let t0 = Instant::now();
+            let (a, b) = match shape.stalls {
+                None => shaped(shape.bps, RTT / 2, shape.queue),
+                Some((every, stall)) => stalling(shape.bps, shape.queue, t0, every, stall),
+            };
+            let a = Arc::new(a);
+            let arrivals: Arc<StdMutex<Vec<Arrival>>> = Arc::default();
+            let (agent, viewer) = pair_timed(
+                a.clone(),
+                Arc::new(b),
+                shape.path,
+                t0,
+                Arc::clone(&arrivals),
+            )
+            .await;
+            let stream = agent
+                .open_stream(1, PayloadProtocolIdentifier::Binary)
+                .await
+                .unwrap();
+            let sink = GoodputSink::new();
+            let frames: Arc<StdMutex<Vec<(u64, u64)>>> = Arc::default();
+            let writer = {
+                let stream = Arc::clone(&stream);
+                let sink = sink.clone();
+                let frames = Arc::clone(&frames);
+                let len = shape.frame_len();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(SAMPLE / FPS);
+                    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    let mut frame = vec![0x6b_u8; len];
+                    loop {
+                        tick.tick().await;
+                        if shape.skip_over && stream.buffered_amount() as u64 > OVERFLOW {
+                            continue;
+                        }
+                        let stamp = us(t0.elapsed());
+                        frame[..8].copy_from_slice(&stamp.to_le_bytes());
+                        let began = Instant::now();
+                        if stream.write(&Bytes::copy_from_slice(&frame)).await.is_err() {
+                            break;
+                        }
+                        sink.record(len as u64, began.elapsed());
+                        frames.lock().unwrap().push((stamp, len as u64));
+                    }
+                })
+            };
+            let clock = agent.delivery_clock();
+            let gauges = agent.gauges();
+            let mut goodput = GoodputEstimator::new();
+            let mut goodput_at = Vec::new();
+            let mut rows = Vec::new();
+            let (mut seen_rx, mut seen_tx) = (0, 0);
+            let mut last_transit: Option<u64> = None;
+            let start = Instant::now();
+            let _ = gauges.take();
+            let _ = sink.drain();
+            let mut prev = (start, clock.read());
+            for i in 1..=SAMPLES {
+                let end = start + SAMPLE * i;
+                let (mut q_lo, mut q_hi) = (Duration::MAX, Duration::ZERO);
+                loop {
+                    let q = queue_now(&a);
+                    q_lo = q_lo.min(q);
+                    q_hi = q_hi.max(q);
+                    let now = Instant::now();
+                    if now >= end {
+                        break;
+                    }
+                    let next = (now + POLL).min(end);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
+                }
+                let now = Instant::now();
+                let d = clock.read();
+                let g = gauges.take();
+                let sample = Sample::between(prev.1, d, ms(now - prev.0));
+                let blocked = sink.drain();
+                let blocked_ms = ms(blocked.iter().map(|s| s.elapsed).sum::<Duration>());
+                let goodput_bps = if goodput.observe_window(&blocked, now) {
+                    goodput.estimate_bps(now)
+                } else {
+                    None
+                };
+                if let Some(bps) = goodput_bps {
+                    goodput_at.push((us(now - t0), bps));
+                }
+                let (rx, newest) = {
+                    let log = arrivals.lock().unwrap();
+                    let fresh = &log[seen_rx..];
+                    seen_rx = log.len();
+                    (
+                        fresh.iter().map(|x| x.len).sum::<u64>(),
+                        fresh.last().map(transit_ms),
+                    )
+                };
+                let sent = {
+                    let log = frames.lock().unwrap();
+                    let fresh = &log[seen_tx..];
+                    seen_tx = log.len();
+                    fresh.iter().map(|f| f.1).sum::<u64>()
+                };
+                let growth_ms = newest.zip(last_transit).map(|(t, l)| t as i64 - l as i64);
+                if newest.is_some() {
+                    last_transit = newest;
+                }
+                let span = sample.ms.max(1);
+                rows.push(Second {
+                    t: i,
+                    class: sample.class,
+                    acked_bps: sample.bps().unwrap_or(0),
+                    q_lo_ms: ms(q_lo),
+                    q_hi_ms: ms(q_hi),
+                    inflight: g.inflight_bytes,
+                    cwnd: g.cwnd,
+                    ssthresh: g.ssthresh,
+                    rwnd: g.rwnd,
+                    pending: g.pending_bytes,
+                    empties: d.queue_empties.saturating_sub(prev.1.queue_empties),
+                    buffered: stream.buffered_amount() as u64,
+                    ack_min_ms: g.ack_delay_min.map(ms),
+                    sent_bps: sent * 8_000 / span,
+                    rx_bps: rx * 8_000 / span,
+                    transit_ms: newest,
+                    growth_ms,
+                    blocked_ms,
+                    goodput_bps,
+                    fast_rtx: g.fast_retransmits,
+                    t3: g.t3_expiries,
+                });
+                prev = (now, d);
+            }
+            writer.abort();
+            let peak_queue = a.peak_wait();
+            let tail_drops = a.tail_drops();
+            let arrivals = arrivals.lock().unwrap().clone();
+            let frames = frames.lock().unwrap().clone();
+            let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
+            let windows = viewer_windows(&arrivals, &frames, us(start - t0));
+            let belief = belief_of(&windows, &goodput_at, t0);
+            TcpRun {
+                shape,
+                rows,
+                windows,
+                belief,
+                peak_queue,
+                tail_drops,
+            }
+        }
+
+        fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
+            v.map_or_else(|| "-".to_owned(), |v| v.to_string())
+        }
+
+        fn kbps(bps: u64) -> u64 {
+            bps / 1000
+        }
+
+        /// (Loaded seconds a signal read on, loaded seconds, other seconds it
+        /// read on, other seconds.)
+        type Count = (usize, usize, usize, usize);
+
+        /// What each candidate signal read.
+        fn readings(r: &TcpRun) -> Vec<(&'static str, Count)> {
+            let sig = signals_of(&r.rows);
+            let mut link = LinkLoop::new();
+            let congested: Vec<bool> = r
+                .rows
+                .iter()
+                .map(|s| {
+                    let growth = s.growth_ms.unwrap_or(0).clamp(-30_000, 30_000);
+                    let rx = u32::try_from(s.rx_bps).unwrap_or(u32::MAX);
+                    link.observe(rx, i16::try_from(growth).unwrap()).congested
+                })
+                .collect();
+            type Read = fn(&Second, &Signals) -> bool;
+            let reads: [(&'static str, Read); 6] = [
+                ("backlogged (the classifier)", |s, _| {
+                    s.class == Class::Backlogged
+                }),
+                ("rtt over its least >= 250 ms", |_, g| {
+                    g.rtt_over_ms.is_some_and(|v| v >= RTT_OVER_MS)
+                }),
+                ("inflight >= 3 x delivered x least rtt", |_, g| {
+                    g.bdp_pct.is_some_and(|v| v >= BDP_PCT)
+                }),
+                ("transit over its least >= 200 ms", |_, g| {
+                    g.transit_over_ms.is_some_and(|v| v >= TRANSIT_OVER_MS)
+                }),
+                ("transit growth >= 100 ms", |s, _| {
+                    s.growth_ms.is_some_and(|v| v >= GROWTH_MS)
+                }),
+                ("buffered amount > 256 KiB", |s, _| s.buffered > OVERFLOW),
+            ];
+            let loaded: Vec<bool> = r.rows.iter().map(|s| s.q_lo_ms > LOADED_MS).collect();
+            let count = |read: &dyn Fn(usize) -> bool| {
+                let on = |want: bool| {
+                    let of = (0..r.rows.len()).filter(|&i| loaded[i] == want);
+                    let n = of.clone().count();
+                    (of.filter(|&i| read(i)).count(), n)
+                };
+                let ((a, b), (c, d)) = (on(true), on(false));
+                (a, b, c, d)
+            };
+            let mut out: Vec<_> = reads
+                .iter()
+                .map(|&(name, read)| (name, count(&|i| read(&r.rows[i], &sig[i]))))
+                .collect();
+            out.push(("the link loop: congested", count(&|i| congested[i])));
+            out
+        }
+
+        fn print_run(r: &TcpRun) {
+            let link = r.shape.payload_bps();
+            println!(
+                "== {} (payload {} kbit/s): peak queue {:?}, tail drops {}",
+                r.shape.name(),
+                kbps(link),
+                r.peak_queue,
+                r.tail_drops
+            );
+            println!(
+                " t class      acked  q_lo..q_hi ms  inflight    cwnd  ssthresh    rwnd  pending emp \
+                 buffered ackmin  sent    rx transit growth blk_ms goodput fr t3 | bdp% rtt+ tr+"
+            );
+            for (s, g) in r.rows.iter().zip(signals_of(&r.rows)) {
+                let class = format!("{:?}", s.class);
+                println!(
+                    "{:>2} {class:<10} {:>5} {:>6}..{:<6} {:>9} {:>7} {:>9} {:>7} {:>8} {:>3} {:>8} {:>6} {:>5} {:>5} {:>7} {:>6} {:>6} {:>7} {:>2} {:>2} | {:>4} {:>4} {:>4}",
+                    s.t,
+                    kbps(s.acked_bps),
+                    s.q_lo_ms,
+                    s.q_hi_ms,
+                    s.inflight,
+                    s.cwnd,
+                    s.ssthresh,
+                    s.rwnd,
+                    s.pending,
+                    s.empties,
+                    s.buffered,
+                    opt(s.ack_min_ms),
+                    kbps(s.sent_bps),
+                    kbps(s.rx_bps),
+                    opt(s.transit_ms),
+                    opt(s.growth_ms),
+                    s.blocked_ms,
+                    opt(s.goodput_bps.map(|b| b / 1000)),
+                    s.fast_rtx,
+                    s.t3,
+                    opt(g.bdp_pct),
+                    opt(g.rtt_over_ms),
+                    opt(g.transit_over_ms),
+                );
+            }
+            for (name, (a, b, c, d)) in readings(r) {
+                println!("   {name:<40} loaded {a:>2}/{b:<2} other {c:>2}/{d:<2}");
+            }
+            let b = &r.belief;
+            println!(
+                "   viewer windows {}: offered over arrival {}; max rx {} kbit/s; invalid {}, \
+                 congested {}, capacities link {} goodput {}; pipe (anchor, floor, capacity) = \
+                 ({}, {}, {}) kbit/s",
+                b.windows,
+                b.offered,
+                b.max_rx / 1000,
+                b.invalid,
+                b.congested,
+                b.link_capacities,
+                b.goodput_capacities,
+                opt(b.anchor.map(|v| v / 1000)),
+                opt(b.floor.map(|v| v / 1000)),
+                opt(b.capacity.map(|v| v / 1000)),
+            );
+        }
+
+        fn print_windows(r: &TcpRun) {
+            for w in &r.windows {
+                println!(
+                    "   window to {:>6} ms ({:>4} ms): rx {:>5} sent {:>5} kbit/s, \
+                     growth {:>5} ms, transit {:>5} ms (+{})",
+                    w.end_us / 1000,
+                    w.ms,
+                    w.rx_bps / 1000,
+                    w.sent_bps / 1000,
+                    w.growth_ms,
+                    w.transit_ms,
+                    w.excess_ms
+                );
+            }
+        }
+
+        fn shape(bps: u64, queue: Duration, path: OpenPath) -> Shape {
+            Shape {
+                bps,
+                queue,
+                path,
+                offer_pct: 150,
+                skip_over: false,
+                stalls: None,
+            }
+        }
+
+        /// The hypothesis: on the deep, lossless queue, fewer than half the
+        /// loaded seconds read backlogged.
+        async fn deep(shape: Shape) {
+            let r = run(shape).await;
+            print_run(&r);
+            assert_eq!(
+                r.tail_drops,
+                0,
+                "{}: the deep queue drops nothing",
+                shape.name()
+            );
+            let loaded: Vec<&Second> = r.rows.iter().filter(|s| s.q_lo_ms > LOADED_MS).collect();
+            let backlogged = loaded
+                .iter()
+                .filter(|s| s.class == Class::Backlogged)
+                .count();
+            let all = r
+                .rows
+                .iter()
+                .filter(|s| s.class == Class::Backlogged)
+                .count();
+            assert!(
+                !loaded.is_empty(),
+                "{}: the link's queue never stayed over {LOADED_MS} ms for a second; \
+                 {all} of {} seconds read backlogged",
+                shape.name(),
+                r.rows.len()
+            );
+            // A pin of the first run's numbers, not fail-first: SCTP's own
+            // acknowledgement delay over its least reads every loaded second.
+            let queued = r
+                .rows
+                .iter()
+                .zip(signals_of(&r.rows))
+                .filter(|(s, g)| {
+                    s.q_lo_ms > LOADED_MS && g.rtt_over_ms.is_some_and(|v| v >= RTT_OVER_MS)
+                })
+                .count();
+            assert_eq!(
+                queued,
+                loaded.len(),
+                "{}: the acknowledgement delay read {queued} of {} loaded seconds",
+                shape.name(),
+                loaded.len()
+            );
+            // The hypothesis, last.
+            assert!(
+                backlogged * 2 < loaded.len(),
+                "{}: {backlogged} of {} loaded seconds read backlogged",
+                shape.name(),
+                loaded.len()
+            );
+        }
+
+        /// The UDP shape: the same writer over a queue that drops.
+        async fn control(shape: Shape) {
+            let r = run(shape).await;
+            print_run(&r);
+            assert!(r.tail_drops > 0, "{}: the control drops", shape.name());
+            assert!(
+                r.rows.iter().all(|s| s.q_hi_ms <= LOADED_MS),
+                "{}: the control's queue passed {LOADED_MS} ms",
+                shape.name()
+            );
+            // A pin of the first run's numbers: no false reading here.
+            let worst = signals_of(&r.rows)
+                .iter()
+                .filter_map(|g| g.rtt_over_ms)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst < RTT_OVER_MS,
+                "{}: the acknowledgement delay rose {worst} ms over its least",
+                shape.name()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: the peer's 1 MiB window binds at 8 s, then 12 of 19 loaded seconds read backlogged"]
+        async fn deep_2_mbps_path_i_reads_under_half_backlogged() {
+            deep(shape(2_000_000, DEEP, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: path C keeps the backlog in SCTP's queue: never loaded, 19 of 20 seconds backlogged"]
+        async fn deep_2_mbps_path_c_reads_under_half_backlogged() {
+            deep(shape(2_000_000, DEEP, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn deep_0_4_mbps_path_i_reads_under_half_backlogged() {
+            deep(shape(400_000, DEEP, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: path C reads backlogged on 12 of 12 loaded seconds"]
+        async fn deep_0_4_mbps_path_c_reads_under_half_backlogged() {
+            deep(shape(400_000, DEEP, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn deep_2_mbps_path_i_with_the_pump_skip_reads_under_half_backlogged() {
+            let shape = Shape {
+                skip_over: true,
+                ..shape(2_000_000, DEEP, OpenPath::InitAck)
+            };
+            deep(shape).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: as without the skip: never loaded, 19 of 20 seconds backlogged"]
+        async fn deep_2_mbps_path_c_with_the_pump_skip_reads_under_half_backlogged() {
+            let shape = Shape {
+                skip_over: true,
+                ..shape(2_000_000, DEEP, OpenPath::CookieEcho)
+            };
+            deep(shape).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_2_mbps_path_i_control() {
+            control(shape(2_000_000, SHALLOW, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_2_mbps_path_c_control() {
+            control(shape(2_000_000, SHALLOW, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_0_4_mbps_path_i_control() {
+            control(shape(400_000, SHALLOW, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn shallow_0_4_mbps_path_c_control() {
+            control(shape(400_000, SHALLOW, OpenPath::CookieEcho)).await;
+        }
+
+        /// The stall cells' shape: a lossless link that stalls, under a writer
+        /// that never offers the link's rate.
+        fn stalled(path: OpenPath) -> Shape {
+            Shape {
+                offer_pct: 80,
+                stalls: Some((STALL_EVERY, STALL_FOR)),
+                ..shape(2_000_000, DEEP, path)
+            }
+        }
+
+        /// Head-of-line stalls on a lossless link: the viewer window after a
+        /// stall carries the stall's bytes too, and `Pipe`'s floor takes
+        /// every window.
+        async fn stalls(shape: Shape) {
+            let r = run(shape).await;
+            print_run(&r);
+            print_windows(&r);
+            let link = shape.payload_bps();
+            let floor = u64::from(r.belief.floor.unwrap_or(0));
+            assert!(
+                floor * 10 > link * 13,
+                "{}: floor {floor} bit/s on a link of {link}",
+                shape.name()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stalls_2_mbps_path_i_lift_the_floor_over_the_link() {
+            stalls(stalled(OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "red: path C's window caps what the link carries in a stall: floor 1.27 to 1.28 x the link in 20 s"]
+        async fn stalls_2_mbps_path_c_lift_the_floor_over_the_link() {
+            stalls(stalled(OpenPath::CookieEcho)).await;
+        }
+
+        /// The lab's shape on TCP: 1.5 times the link under the pump's skip,
+        /// whose watermark holds a standing queue of about a second, and the
+        /// stalls under it. What a stall holds is already queued, so the
+        /// window after it carries the link's rate for the stall's length on
+        /// top of its own second.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stalls_under_the_pump_skip_2_mbps_path_i_lift_the_floor_over_the_link() {
+            stalls(Shape {
+                offer_pct: 150,
+                skip_over: true,
+                ..stalled(OpenPath::InitAck)
+            })
+            .await;
+        }
+    }
 }
