@@ -409,6 +409,7 @@ impl Drop for ModelGuard {
             samples_counted = c.map_or(0, |c| c.counted),
             samples_not_counted = c.map_or(0, |c| c.not_counted),
             samples_unread = c.map_or(0, |c| c.unread),
+            samples_under_plan = c.map_or(0, |c| c.under_plan),
             record_ended = c.is_some_and(|c| c.ended),
             frozen = self.frozen,
             "{CLOSE_LINE}"
@@ -723,6 +724,7 @@ mod tests {
             best: Some((bps, pm::FloorBasis::AppLimited)),
             not_counted: 0,
             unread: 0,
+            under_plan: 0,
             counted: 0,
             ended: false,
             measured: true,
@@ -863,7 +865,7 @@ mod tests {
         "taken",
     ];
 
-    const CLOSE_FIELDS: [&str; 19] = [
+    const CLOSE_FIELDS: [&str; 20] = [
         "session_id",
         "key_id",
         "key_carrier",
@@ -881,6 +883,7 @@ mod tests {
         "samples_counted",
         "samples_not_counted",
         "samples_unread",
+        "samples_under_plan",
         "record_ended",
         "frozen",
     ];

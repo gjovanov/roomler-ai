@@ -1375,13 +1375,16 @@ impl RateGovernor {
             self.evidence.note(r);
         }
         let valid = rejection.is_none();
-        // FR-148 P1 (R1) — did the classifier READ this window? Its push-backs act
-        // in the session either way; the pair memory counts one only from a read
-        // window (`pair_memory::window_read`). The age is a reading by the age
-        // loop's own test, the half round trip it observes against below.
-        let read = super::pair_memory::window_read(
+        // FR-148 P1 (R1, R3) — did the classifier READ this window, and did the
+        // sender push against the target it ran with? Its push-backs act in the
+        // session either way; the pair memory counts one only when both hold
+        // (`pair_memory::Take`). The age is a reading by the age loop's own test,
+        // the half round trip it observes against below.
+        let take = super::pair_memory::Take::of(
             state,
             report.is_some_and(|(_, min, rtt)| viewer_rate::age_is_plausible(min, rtt / 2)),
+            sent_bps,
+            self.applied_bps,
         );
         // FR-148 P1 (D24) — the delivery is folded once the gate has ruled, which
         // reads only the window's facts: `Pipe` takes it whatever the verdict, the
@@ -1453,7 +1456,7 @@ impl RateGovernor {
                 && let Some(bps) = self.goodput.estimate_bps(now)
             {
                 self.belief
-                    .observe_capacity_in(bps, Basis::Backlogged, read, now);
+                    .observe_capacity_in(bps, Basis::Backlogged, take, now);
             }
         }
         // FR-35 — a send blocked ≥ `HARD_STALL` is a hard stall: ×0.5, bypassing
@@ -1584,7 +1587,7 @@ impl RateGovernor {
                     // FR-148 P0 — with the switch off it gets here unoffered, and
                     // is then application-limited (the jupiter chain's trickle).
                     let basis = Basis::of_window(offer_held);
-                    self.belief.observe_capacity_in(rx_bps, basis, read, now);
+                    self.belief.observe_capacity_in(rx_bps, basis, take, now);
                     self.link_rx_bps = Some((rx_bps, now));
                     self.path.link_rx = basis;
                 }
@@ -5875,10 +5878,16 @@ mod tests {
     /// windows while the pump offers 1 Mbit/s, so the link loop refuses the
     /// second and third of each run, some above the damped floor and some below
     /// it. The clean windows between the runs deliver a little above the floor.
-    /// The record counts every refusal and ends trusted, whichever side of the
-    /// floor the last refusal was on. On D25's first wording ("a delivery above
-    /// the floor ends the record") each clean run ends it, and the session ends
-    /// with two samples a second apart: not trusted.
+    /// The record counts every refusal but the first and ends trusted, whichever
+    /// side of the floor the last refusal was on. On D25's first wording ("a
+    /// delivery above the floor ends the record") each clean run ends it, and
+    /// the session ends with two samples a second apart: not trusted.
+    ///
+    /// R3 — the first refusal runs under the session's opening target of
+    /// 3 Mbit/s while the pump writes 1 Mbit/s: under half its plan, so the
+    /// record does not take it (`under_plan`). The link clamp cuts the target
+    /// to 522 kbit/s in that window, and every later refusal is taken. Before
+    /// R3 the record held six windows over 17 s.
     #[test]
     fn a_slow_link_ends_trusted_whichever_side_of_the_floor_it_last_refused() {
         use crate::encode::pair_memory::{Closing, trusted};
@@ -5916,7 +5925,8 @@ mod tests {
         for (last_run, side) in [(670_000, "above"), (600_000, "below")] {
             let (c, unix) = replay(last_run, false);
             let r = c.record.expect("a record");
-            assert_eq!((r.windows, r.span_s()), (6, 17), "{side}");
+            assert_eq!((r.windows, r.span_s()), (5, 16), "{side}");
+            assert_eq!(c.under_plan, 1, "{side}");
             assert!(trusted(&r, unix), "{side}");
             assert!(!c.ended, "{side}");
             assert_eq!(c.not_counted, 0, "{side}");
@@ -5951,7 +5961,7 @@ mod tests {
     /// slowdown is followed by one window that delivers the backlog, so no
     /// byte is lost, and the viewer's link report reads the queue growing by
     /// what each slowdown window did not deliver.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Screen {
         content: u32,
         /// R3's V3: the encoder's output is this share of the target the
@@ -5988,10 +5998,20 @@ mod tests {
         }
     }
 
-    /// Replays `v` through the governor, closes it, and reads the next
-    /// opening (N 2.55 Mbit/s, hi 8 Mbit/s, T 1 Mbit/s). `master` is the law
-    /// before R1: every push-back offered to the record.
-    fn screen(v: Screen, master: bool) -> Screened {
+    /// Which law the pair memory takes push-backs by, in a screened session.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Law {
+        /// Master's, before R1: every push-back offered to the record.
+        Master,
+        /// R1 and R2, before R3: a push-back under the plan is offered.
+        BeforeR3,
+        /// R1, R2 and R3.
+        Now,
+    }
+
+    /// Replays `v` through the governor under `law`, closes it, and reads the
+    /// next opening (N 2.55 Mbit/s, hi 8 Mbit/s, T 1 Mbit/s).
+    fn screen(v: Screen, law: Law) -> Screened {
         use crate::encode::pair_memory::{
             Floor, FloorBasis, PairEntry, close, model_opening, trusted,
         };
@@ -6039,8 +6059,11 @@ mod tests {
         });
         let mut s = V5bSession::open(true, None);
         s.g.open_memory(entry.as_ref(), P1_NOW_UNIX, s.t);
-        if master {
+        if law == Law::Master {
             s.g.belief.memory_mut().set_read_any();
+        }
+        if law != Law::Now {
+            s.g.belief.memory_mut().set_plan_any();
         }
         let start = s.t;
         let floor_age = |delay: u32| match v.age {
@@ -6140,26 +6163,29 @@ mod tests {
             }
         }
         assert_eq!(variants.len(), 336);
-        let red = |master: bool| -> Vec<String> {
+        let red = |law: Law| -> Vec<String> {
             variants
                 .iter()
                 .filter_map(|v| {
-                    let r = screen(*v, master);
+                    let r = screen(*v, law);
                     (!r.opens_at_nominal()).then(|| format!("{v:?}: {r:?}"))
                 })
                 .collect()
         };
-        let on_master = red(true);
+        let on_master = red(Law::Master);
         assert_eq!(on_master.len(), 24, "{on_master:#?}");
-        let with_r1 = red(false);
+        // R1 alone is enough for them, and the law as it now stands keeps them.
+        let with_r1 = red(Law::BeforeR3);
         assert!(with_r1.is_empty(), "{with_r1:#?}");
+        let now = red(Law::Now);
+        assert!(now.is_empty(), "{now:#?}");
         // The class, exactly: no age, no busy minute, slowdowns of 80 % or
         // more, and a drain that does not deliver twice the sample:
         // 1 + n·(1 − k) ≤ 2·k.
         for v in &variants {
             let survives = 100 + v.len * (100 - v.depth_pct) <= 2 * v.depth_pct;
             let class = v.age == ScreenAge::Absent && !v.busy && v.depth_pct >= 80 && survives;
-            assert_eq!(!screen(*v, true).opens_at_nominal(), class, "{v:?}");
+            assert_eq!(!screen(*v, Law::Master).opens_at_nominal(), class, "{v:?}");
         }
         // With R1 those windows' samples are counted as unread on the close line.
         let r = screen(
@@ -6172,11 +6198,112 @@ mod tests {
                 busy: false,
                 prior: None,
             },
-            false,
+            Law::Now,
         );
         assert_eq!(r.closing.record, None);
         assert!(r.closing.unread > 0, "{r:?}");
         assert_eq!(r.next.bps, SCREEN_N);
+    }
+
+    /// FR-148 P1 (R3) — the screen's three families, on R1 and R2, and then
+    /// with the plan-limited test (`pair_memory::pushing_against_plan`). Pass:
+    /// no trusted record, the remembered floor not lowered, and the next open
+    /// under `on` at N or above with no profile.
+    ///
+    /// | family | sessions | red on R1 + R2 | red with R3 |
+    /// |---|---|---|---|
+    /// | V1: slowdowns that deliver 88 to 98 %, the age growing or absent | 240 | 0 | 0 |
+    /// | V2: the age flat, or creeping under the stall threshold, while the link report grows | 336 | 84 | 42 |
+    /// | V3: a steady offer at 55 % or 80 % of the target, 80 to 95 % slowdowns, the age growing or absent | 192 | 0 | 0 |
+    /// | V3 with V2's flat age (beyond the ruling) | 96 | 20 | 20 |
+    ///
+    /// V2 is red on R1 and R2: the classifier reads a window `Clear` on a flat
+    /// age, the link loop pushes back at the slowdown's arrival rate, and the
+    /// samples count. R3 clears the 40 kbit/s screen: its output stays under
+    /// half of every target the session runs with (the slow-link floor keeps
+    /// the target at 200 kbit/s or more). It cannot clear the 300 kbit/s
+    /// screen: the session's own link clamp cuts the target to 0.9 of the
+    /// slowdown's arrival within the first slowdown (about 230 kbit/s), and
+    /// from then on the screen writes more than half of it. The slow-link cell
+    /// above has the same shape (its first refusal runs under the 3 Mbit/s
+    /// opening and is not taken, the later ones run under the clamp and are),
+    /// so no test against the target a window ran with can tell the two
+    /// apart. That is the finding, pinned here so a change shows. V3 with a
+    /// flat age writes 55 % or more of its target by construction.
+    #[test]
+    fn the_screens_families_on_r1_r2_and_the_plan_limited_test() {
+        let pass = |v: &Screen, law: Law| {
+            let r = screen(*v, law);
+            r.opens_at_nominal() && v.prior.is_none_or(|p| r.floor.is_some_and(|f| f >= p))
+        };
+        let mut v1 = Vec::new();
+        let mut v2 = Vec::new();
+        let mut v3 = Vec::new();
+        let mut v3_flat = Vec::new();
+        for busy in [false, true] {
+            for len in [3u32, 4, 5] {
+                for prior in [None, Some(2_200_000u32)] {
+                    let at = |content, offer_pct, depth_pct, age| Screen {
+                        content,
+                        offer_pct,
+                        depth_pct,
+                        len,
+                        age,
+                        busy,
+                        prior,
+                    };
+                    for content in [40_000u32, 300_000] {
+                        for depth_pct in [88u32, 90, 92, 95, 98] {
+                            for age in [ScreenAge::Grows, ScreenAge::Absent] {
+                                v1.push(at(content, None, depth_pct, age));
+                            }
+                        }
+                        for depth_pct in [0u32, 20, 50, 70, 80, 85, 88] {
+                            for age in [ScreenAge::Flat, ScreenAge::Creeps] {
+                                v2.push(at(content, None, depth_pct, age));
+                            }
+                        }
+                    }
+                    for offer_pct in [55u32, 80] {
+                        for depth_pct in [80u32, 85, 90, 95] {
+                            for age in [ScreenAge::Grows, ScreenAge::Absent] {
+                                v3.push(at(40_000, Some(offer_pct), depth_pct, age));
+                            }
+                            v3_flat.push(at(40_000, Some(offer_pct), depth_pct, ScreenAge::Flat));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            (v1.len(), v2.len(), v3.len(), v3_flat.len()),
+            (240, 336, 192, 96)
+        );
+        let red = |vs: &[Screen], law: Law| -> Vec<Screen> {
+            vs.iter().copied().filter(|v| !pass(v, law)).collect()
+        };
+        for (name, vs) in [("V1", &v1), ("V3", &v3)] {
+            assert!(red(vs, Law::BeforeR3).is_empty(), "{name} on R1 + R2");
+            assert!(red(vs, Law::Now).is_empty(), "{name} with R3");
+        }
+        let before = red(&v2, Law::BeforeR3);
+        let now = red(&v2, Law::Now);
+        assert_eq!((before.len(), now.len()), (84, 42));
+        // R3 clears the 40 kbit/s screen, and nothing it did not see red.
+        assert!(now.iter().all(|v| v.content == 300_000), "{now:#?}");
+        let as_300 = |v: &Screen| Screen {
+            content: 300_000,
+            ..*v
+        };
+        for v in &before {
+            assert_eq!(now.contains(v), v.content == 300_000, "{v:?}");
+            if v.content == 40_000 {
+                // Its 300 kbit/s twin is the one that stays red.
+                assert!(!pass(&as_300(v), Law::Now), "{v:?}");
+            }
+        }
+        assert_eq!(red(&v3_flat, Law::BeforeR3).len(), 20);
+        assert_eq!(red(&v3_flat, Law::Now).len(), 20);
     }
 
     /// FR-148 P0 — what the line reads on a healthy session: the jupiter replay

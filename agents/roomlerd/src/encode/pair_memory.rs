@@ -583,6 +583,51 @@ pub fn window_read(state: PipeState, age_plausible: bool) -> bool {
     }
 }
 
+/// FR-148 P1 (R3) — the plan-limited test: was the sender pushing against its
+/// plan in this window? Yes when it wrote at least half the target the window
+/// ran with (`sent_bps`, `target_bps`), and in any window the classifier calls
+/// `Overproduced`, whose own counters show the sender pushing against the path
+/// (what it wrote there is what the path took, not what the encoder made). A
+/// target of 0, none applied yet, passes.
+///
+/// A still screen writes tens of kbit/s under a target of megabits. What
+/// arrives then measures the screen, not the path, and with a viewer whose
+/// paint age stays flat while its link report says the queue grows (R3's V2,
+/// `governor::tests::the_screens_families_leave_the_path_as_it_was`) the
+/// classifier reads such a window `Clear`: before this test a still screen's
+/// slowdowns left a trusted record at a few hundred kbit/s.
+pub fn pushing_against_plan(state: PipeState, sent_bps: u32, target_bps: u32) -> bool {
+    state == PipeState::Overproduced || u64::from(sent_bps) * 2 >= u64::from(target_bps)
+}
+
+/// FR-148 P1 — what the pair memory takes from a push-back in a valid window.
+/// One definition of counted evidence: a sample counts only from a window the
+/// classifier read (R1) in which the sender pushed against its plan (R3), and
+/// then only when D25's test counts it. Inside the session every push-back acts
+/// exactly as before, whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// A sample: D25 counts it, or calls it a dip.
+    Sample,
+    /// R1 — the classifier could not read the window ([`window_read`]).
+    Unread,
+    /// R3 — the sender wrote under half its target ([`pushing_against_plan`]).
+    UnderPlan,
+}
+
+impl Take {
+    /// The window's verdict, R1 first.
+    pub fn of(state: PipeState, age_plausible: bool, sent_bps: u32, target_bps: u32) -> Self {
+        if !window_read(state, age_plausible) {
+            Take::Unread
+        } else if !pushing_against_plan(state, sent_bps, target_bps) {
+            Take::UnderPlan
+        } else {
+            Take::Sample
+        }
+    }
+}
+
 /// The samples a session counted itself, since the last end of the record.
 #[derive(Debug, Clone, Copy)]
 struct Own {
@@ -609,6 +654,9 @@ pub struct SessionMemory {
     /// R1 — backlogged push-backs from windows the classifier could not read
     /// ([`window_read`]): never offered to the record.
     unread: u32,
+    /// R3 — backlogged push-backs from windows where the sender wrote under
+    /// half its target ([`pushing_against_plan`]): never offered to the record.
+    under_plan: u32,
     /// R2 — counted samples in the whole session, whether the record ended
     /// since or not: the close lowers a remembered floor only when this is
     /// above zero.
@@ -625,6 +673,10 @@ pub struct SessionMemory {
     /// record, to show the screen's cell fails on it.
     #[cfg(test)]
     read_any: bool,
+    /// Test only: the law before R3, a push-back under the plan offered to the
+    /// record, to show the screen's families fail on it.
+    #[cfg(test)]
+    plan_any: bool,
 }
 
 /// What a close would write, taken at a viewer window.
@@ -639,6 +691,8 @@ pub struct Closing {
     pub not_counted: u32,
     /// R1 — samples from windows the classifier could not read.
     pub unread: u32,
+    /// R3 — samples from windows where the sender wrote under half its target.
+    pub under_plan: u32,
     /// R2 — counted samples in the whole session.
     pub counted: u32,
     pub ended: bool,
@@ -661,6 +715,8 @@ impl SessionMemory {
             end_above_floor: self.end_above_floor,
             #[cfg(test)]
             read_any: self.read_any,
+            #[cfg(test)]
+            plan_any: self.plan_any,
             ..Self::default()
         };
         if let Some(e) = entry.filter(|e| e.fresh(now_unix)) {
@@ -756,18 +812,27 @@ impl SessionMemory {
         }
     }
 
-    /// R1 — a push-back from a window the classifier could not read
-    /// ([`window_read`]). Counted for the close line, and nothing more: it is
-    /// not a sample, it moves neither the record nor the floor, and its bytes
-    /// already reached [`Self::delivered`] as the same window's delivery.
-    pub fn unread_push_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+    /// A push-back in a valid window, as the window's [`Take`] says. A sample
+    /// goes to [`Self::pushed_back`]. One from a window the classifier could
+    /// not read (R1), or in which the sender wrote under half its target (R3),
+    /// is counted for the close line and nothing more: it moves neither the
+    /// record nor the floor, and its bytes already reached [`Self::delivered`]
+    /// as the same window's delivery.
+    pub fn pushed_back_in(&mut self, bps: u32, basis: Basis, take: Take, now: Instant) {
         #[cfg(test)]
-        if self.read_any {
-            return self.pushed_back(bps, basis, now);
-        }
-        let _ = now;
-        if basis == Basis::Backlogged && bps > 0 {
-            self.unread = self.unread.saturating_add(1);
+        let take = match take {
+            Take::Unread if self.read_any => Take::Sample,
+            Take::UnderPlan if self.plan_any => Take::Sample,
+            take => take,
+        };
+        let backlogged = basis == Basis::Backlogged && bps > 0;
+        match take {
+            Take::Sample => self.pushed_back(bps, basis, now),
+            Take::Unread if backlogged => self.unread = self.unread.saturating_add(1),
+            Take::UnderPlan if backlogged => {
+                self.under_plan = self.under_plan.saturating_add(1);
+            }
+            Take::Unread | Take::UnderPlan => {}
         }
     }
 
@@ -811,6 +876,7 @@ impl SessionMemory {
                 .and_then(|(bps, b)| FloorBasis::of(b).map(|b| (bps, b))),
             not_counted: self.not_counted,
             unread: self.unread,
+            under_plan: self.under_plan,
             counted: self.counted,
             ended: self.ended,
             measured: self.measured,
@@ -836,6 +902,13 @@ impl SessionMemory {
     #[cfg(test)]
     pub(crate) fn set_read_any(&mut self) {
         self.read_any = true;
+    }
+
+    /// Test only: offer a push-back under the plan to the record, as the law
+    /// did before R3.
+    #[cfg(test)]
+    pub(crate) fn set_plan_any(&mut self) {
+        self.plan_any = true;
     }
 }
 
@@ -1692,6 +1765,7 @@ mod tests {
             best: Some((bps, FloorBasis::AppLimited)),
             not_counted: 0,
             unread: 0,
+            under_plan: 0,
             counted,
             ended: false,
             measured: true,
