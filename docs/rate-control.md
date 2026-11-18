@@ -1611,7 +1611,7 @@ packets and 76,168 bytes, and the two runs were the same. The same script losing
 fourth packet instead of the third sends differently, so the comparison does see a
 change of one packet. Two more fork tests pin the acknowledgement delay: the newest
 chunk sent once is the one that counts (`:1131`), and a clock that went backwards
-stores nothing (`:1167`).
+stores nothing (`:1203`).
 
 **A step**, in the order the machine takes it:
 

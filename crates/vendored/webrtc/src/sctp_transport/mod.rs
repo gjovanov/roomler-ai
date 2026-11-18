@@ -439,6 +439,14 @@ impl RTCSctpTransport {
         sctp_association.as_ref().map(|a| a.delivery_clock())
     }
 
+    /// roomler patch (FR-148 O10): the association's congestion gauges, once
+    /// there is an association. Never waits, for `delivery_clock`'s reason: a
+    /// held slot answers `None`.
+    pub fn gauges(&self) -> Option<sctp::association::gauges::GaugeReader> {
+        let sctp_association = self.sctp_association.try_lock().ok()?;
+        sctp_association.as_ref().map(|a| a.gauges())
+    }
+
     pub(crate) fn data_channels_accepted(&self) -> u32 {
         self.data_channels_accepted.load(Ordering::SeqCst)
     }
