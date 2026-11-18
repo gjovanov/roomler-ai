@@ -10,12 +10,13 @@
 //! |---|---|---|
 //! | file | `rate_memory.json`, written exactly as before | `path_memory.json`, its own |
 //! | key | the selected remote and the overlay's carrier tag | the carrier, the controlling user and the viewer's network (D22) |
-//! | read at the open | seeds the opener, as before | the open line only: nothing drives a rate in this step |
-//! | written at the close | as before | what the session measured in valid windows (D24, D25) |
+//! | read at the open | seeds the opener, as before, unless the model decides | under `on`, with a key and a fresh entry, decides the opening (D25) and the slow-link profile (D26); else the open line only |
+//! | written at the close | as before | what the session measured in valid windows (D24, D25), under one lock |
 //! | lines | as before | [`OPEN_LINE`] and [`CLOSE_LINE`] |
 //!
 //! The switch at `off` keeps the path model's side out entirely: no read, no
-//! write, no line (`media_delivery::Mode`).
+//! write, no line (`media_delivery::Mode`). At `shadow`, the default (D28),
+//! the opener is today's byte for byte.
 //!
 //! The viewer's facts reach the pump through [`PairFacts`], which the session's
 //! peer registers under its id: the controlling user, set before the offer is
@@ -270,6 +271,10 @@ struct ModelGuard {
     last: Option<Closing>,
     /// A viewer window saw the path change: nothing after it is taken.
     frozen: bool,
+    /// Which rule opened the session (step 3), and when the open read the
+    /// entry.
+    taken: pm::Taken,
+    opened_unix: u64,
 }
 
 impl ModelGuard {
@@ -282,6 +287,8 @@ impl ModelGuard {
             entry: None,
             last: None,
             frozen: false,
+            taken: pm::Taken::Today(pm::TodayWhy::Shadow),
+            opened_unix: 0,
         }
     }
 
@@ -314,8 +321,8 @@ impl ModelGuard {
             .map_or_else(|_| "none".to_string(), PairKey::id)
     }
 
-    /// The open line: the pair's entry, and what the model would open at
-    /// beside what today's rule opened at.
+    /// The open line: the pair's entry, what the model opens at beside what
+    /// today's rule opens at, and which of the two the session took.
     fn open_line(&self, o: &OpenFacts, now_unix: u64) {
         let opening = pm::model_opening(
             o.nominal,
@@ -349,7 +356,8 @@ impl ModelGuard {
             today_seed_bps = ?o.today_seed,
             today_open_bps = o.today_open,
             today_profile = o.today_profile,
-            taken = %"today",
+            taken = %self.taken.word(),
+            taken_why = %self.taken.why(),
             "{OPEN_LINE}"
         );
     }
@@ -365,7 +373,7 @@ struct OpenFacts {
     /// The slow-link threshold as today's rule reads it; 0 = never.
     threshold: u32,
     today_seed: Option<u32>,
-    /// What today's rule opened the session at.
+    /// What today's rule opens the session at.
     today_open: u32,
     today_profile: bool,
 }
@@ -375,9 +383,10 @@ impl Drop for ModelGuard {
         let (next, why) = self.verdict();
         let now_unix = rate_memory::now_unix();
         if let (Some(next), Ok(key), Some(path)) = (next, &self.key, &self.path) {
-            let mut memory = PathMemory::load(path, now_unix);
-            memory.write(key.text(), next, now_unix);
-            if let Err(e) = memory.save(path) {
+            let written = PathMemory::update(path, now_unix, |memory| {
+                memory.write(key.text(), next, now_unix);
+            });
+            if let Err(e) = written {
                 warn!(
                     session_id = %self.session_id,
                     %e,
@@ -406,7 +415,13 @@ impl Drop for ModelGuard {
             push_back_bps = ?record.map(|r| r.bps),
             push_back_windows = ?record.map(|r| r.windows),
             push_back_span_s = ?record.map(|r| r.span_s()),
+            samples_counted = c.map_or(0, |c| c.counted),
+            samples_counted_overproduced = c.map_or(0, |c| c.counted_overproduced),
+            samples_counted_clear = c.map_or(0, |c| c.counted_clear),
             samples_not_counted = c.map_or(0, |c| c.not_counted),
+            samples_unread = c.map_or(0, |c| c.unread),
+            samples_viewer_late = c.map_or(0, |c| c.viewer_late),
+            samples_under_plan = c.map_or(0, |c| c.under_plan),
             record_ended = c.is_some_and(|c| c.ended),
             frozen = self.frozen,
             "{CLOSE_LINE}"
@@ -482,6 +497,9 @@ pub struct PumpMemory {
     codec_label: &'static str,
     mode: Mode,
     hi_bps: u32,
+    /// The slow-link threshold as today's rule reads it; 0 = never.
+    threshold: u32,
+    /// Today's seed and its age.
     seed: Option<u32>,
     seed_age: Option<Duration>,
     today: RateMemoryGuard,
@@ -490,7 +508,8 @@ pub struct PumpMemory {
 
 /// The pump's open: today's key and seed exactly as the pump formed them, and,
 /// on a constrained session the switch has not turned `off`, the path model's
-/// key and entry. `remote_ip` is the pump's own read of the selected remote.
+/// key and entry, and which rule opens the session. `remote_ip` is the pump's
+/// own read of the selected remote.
 pub async fn open<F, Fut>(
     pc: &RTCPeerConnection,
     session_id: ObjectId,
@@ -562,10 +581,16 @@ where
     } else {
         None
     };
-    PumpMemory {
+    let mut memory = PumpMemory {
         codec_label,
         mode,
         hi_bps,
+        // As today's rule reads it.
+        threshold: if crate::encode::slow_link_profile_enabled() {
+            crate::encode::rate_profile::slow_link_profile_bps()
+        } else {
+            0
+        },
         seed,
         seed_age,
         today: RateMemoryGuard {
@@ -575,47 +600,93 @@ where
             opener_measured: AtomicU32::new(0),
         },
         model,
-    }
+    };
+    memory.decide(rate_memory::now_unix());
+    memory
 }
 
 impl PumpMemory {
-    /// Today's seed, which opens the session as before.
-    pub fn seed(&self) -> Option<u32> {
-        self.seed
+    /// Step 3 — which rule opens the session: the model's under `on` with a
+    /// key and a fresh entry, else today's.
+    fn decide(&mut self, now_unix: u64) {
+        let on = self.mode == Mode::On;
+        if let Some(m) = self.model.as_mut() {
+            m.taken = pm::Taken::decide(on, m.key.is_ok(), m.state);
+            m.opened_unix = now_unix;
+        }
     }
 
-    /// How old today's entry was at the open.
+    /// The entry and the opening that drive the session, when the model
+    /// decided it. N does not enter them: after a trusted push-back the
+    /// opening is `clamp(⌊0.85·D⌋, 200 k, hi)`, and without one the session
+    /// opens at the ceiling, which the learner seeded with D makes
+    /// `max(N, min(⌊0.85·D⌋, hi))` at the plan's own N. Only the open line
+    /// needs N, for the model's opening it logs.
+    fn driving(&self) -> Option<(PairEntry, pm::ModelOpening)> {
+        let m = self.model.as_ref()?;
+        let entry = m.entry.filter(|_| m.taken == pm::Taken::Model)?;
+        let opening =
+            pm::model_opening(0, self.hi_bps, Some(&entry), self.threshold, m.opened_unix);
+        Some((entry, opening))
+    }
+
+    /// The remembered rate the slow-link profile and the viewer's cap detail
+    /// read: today's seed, or, when the model decided, its opening when D26
+    /// engages the profile (and nothing otherwise).
+    pub fn seed(&self) -> Option<u32> {
+        match self.driving() {
+            Some((_, opening)) => opening.profile.then_some(opening.bps),
+            None => self.seed,
+        }
+    }
+
+    /// The age of what the P0 model remembers at the open: today's entry's,
+    /// or the model's floor's when the model decided.
     pub fn seed_age(&self) -> Option<Duration> {
-        self.seed_age
+        match (self.driving(), self.model.as_ref()) {
+            (Some((entry, _)), Some(m)) => Some(Duration::from_secs(
+                m.opened_unix.saturating_sub(entry.floor.at_unix),
+            )),
+            _ => self.seed_age,
+        }
+    }
+
+    /// What the governor is built from: today's seed, or the model's plan.
+    pub fn plan(&self) -> pm::OpenPlan {
+        match self.driving() {
+            Some((entry, opening)) => pm::OpenPlan::model(&entry, opening),
+            None => pm::OpenPlan::Today(self.seed),
+        }
     }
 
     /// Right after the governor is built: open its memory side from the
-    /// pair's entry, and write the open line, with what the model would open
-    /// at beside what today's rule opens at. `today_profile` is whether
-    /// today's slow-link profile engaged.
-    pub fn at_open(&mut self, governor: &mut RateGovernor, priority: u8, today_profile: bool) {
+    /// pair's entry, and write the open line: what the model opens at beside
+    /// what today's rule opens at, and which the session took.
+    /// `profile_engaged` is whether the session opened on the slow-link
+    /// profile, which is today's rule's unless the model decided.
+    pub fn at_open(&mut self, governor: &mut RateGovernor, priority: u8, profile_engaged: bool) {
         let Some(model) = self.model.as_ref() else {
             return;
         };
         let now_unix = rate_memory::now_unix();
         governor.open_memory(model.entry.as_ref(), now_unix, Instant::now());
         let nominal = nominal_bps(priority);
-        // The slow-link threshold, as today's rule reads it (0 = never).
-        let threshold = if crate::encode::slow_link_profile_enabled() {
-            crate::encode::rate_profile::slow_link_profile_bps()
-        } else {
-            0
+        let today_profile = match model.taken {
+            pm::Taken::Today(_) => profile_engaged,
+            pm::Taken::Model => crate::encode::rate_profile::slow_link_profile(
+                self.seed,
+                crate::encode::slow_link_profile_enabled(),
+            )
+            .is_some(),
         };
-        let today_open = governor
-            .open_seed_bps()
-            .unwrap_or_else(|| governor.ceiling_for(nominal, true));
+        let today_open = governor.opening_of(&pm::OpenPlan::Today(self.seed), nominal);
         model.open_line(
             &OpenFacts {
                 codec_label: self.codec_label,
                 mode: self.mode,
                 nominal,
                 hi_bps: self.hi_bps,
-                threshold,
+                threshold: self.threshold,
                 today_seed: self.seed,
                 today_open,
                 today_profile,
@@ -720,8 +791,15 @@ mod tests {
             record: None,
             best: Some((bps, pm::FloorBasis::AppLimited)),
             not_counted: 0,
+            unread: 0,
+            viewer_late: 0,
+            under_plan: 0,
+            counted: 0,
+            counted_overproduced: 0,
+            counted_clear: 0,
             ended: false,
             measured: true,
+            at_unix: 1_795_000_000,
         }
     }
 
@@ -761,6 +839,402 @@ mod tests {
         assert_eq!(idle.verdict(), (None, pm::Why::NothingMeasured));
     }
 
+    /// Master's opener (base `01e8455ab`, `RateGovernor::new(…, seed, …)`),
+    /// recorded before step 3 changed a line, for each of today's seeds: with
+    /// the relief on and the shadow controller, with the relief off, and with
+    /// slow start on and no shadow controller. The fields are [`Opened`]'s.
+    #[rustfmt::skip]
+    const MASTER: [(Option<u32>, [Opened; 3]); 8] = {
+        const fn s(v: u32) -> Option<u32> { Some(v) }
+        const N: Option<u32> = None;
+        [
+            (None, [
+                (N, 0, 2_550_000, N, N, s(2_550_000), N, s(200_000)),
+                (N, 0, 2_550_000, N, N, s(2_550_000), N, s(200_000)),
+                (N, 0, 2_550_000, N, N, s(300_000), s(300_000), N),
+            ]),
+            (s(200_000), [
+                (s(200_000), 170_000, 2_550_000, s(200_000), s(200_000), s(200_000), s(200_000), s(200_000)),
+                (N, 170_000, 2_550_000, N, N, s(2_550_000), N, s(200_000)),
+                (s(200_000), 170_000, 2_550_000, s(200_000), s(200_000), s(200_000), s(200_000), N),
+            ]),
+            (s(900_000), [
+                (s(900_000), 765_000, 2_550_000, s(900_000), s(900_000), s(900_000), s(765_000), s(765_000)),
+                (N, 765_000, 2_550_000, N, N, s(2_550_000), N, s(765_000)),
+                (s(900_000), 765_000, 2_550_000, s(900_000), s(900_000), s(900_000), s(765_000), N),
+            ]),
+            (s(1_200_000), [
+                (s(1_200_000), 1_020_000, 2_550_000, s(1_200_000), s(1_200_000), s(1_200_000), s(1_020_000), s(1_020_000)),
+                (N, 1_020_000, 2_550_000, N, N, s(2_550_000), N, s(1_020_000)),
+                (s(1_200_000), 1_020_000, 2_550_000, s(1_200_000), s(1_200_000), s(1_200_000), s(1_020_000), N),
+            ]),
+            (s(1_600_000), [
+                (N, 1_360_000, 2_550_000, N, N, s(2_550_000), N, s(1_360_000)),
+                (N, 1_360_000, 2_550_000, N, N, s(2_550_000), N, s(1_360_000)),
+                (N, 1_360_000, 2_550_000, N, N, s(300_000), s(300_000), N),
+            ]),
+            (s(2_000_000), [
+                (N, 1_700_000, 2_550_000, N, N, s(2_550_000), N, s(1_700_000)),
+                (N, 1_700_000, 2_550_000, N, N, s(2_550_000), N, s(1_700_000)),
+                (N, 1_700_000, 2_550_000, N, N, s(300_000), s(300_000), N),
+            ]),
+            (s(3_500_000), [
+                (N, 2_975_000, 2_975_000, N, N, s(2_975_000), N, s(2_975_000)),
+                (N, 2_975_000, 2_975_000, N, N, s(2_975_000), N, s(2_975_000)),
+                (N, 2_975_000, 2_975_000, N, N, s(300_000), s(300_000), N),
+            ]),
+            (s(9_400_000), [
+                (N, 7_990_000, 7_990_000, N, N, s(7_990_000), N, s(7_990_000)),
+                (N, 7_990_000, 7_990_000, N, N, s(7_990_000), N, s(7_990_000)),
+                (N, 7_990_000, 7_990_000, N, N, s(300_000), s(300_000), N),
+            ]),
+        ]
+    };
+
+    /// The three governor set-ups [`MASTER`] was recorded under.
+    const SETUPS: [(bool, bool, crate::encode::RatectlMode); 3] = [
+        (true, false, crate::encode::RatectlMode::Shadow),
+        (false, false, crate::encode::RatectlMode::Shadow),
+        (true, true, crate::encode::RatectlMode::Off),
+    ];
+
+    /// D28's twin test: under `shadow` and `off` the opener is master's, bit
+    /// for bit, whatever the path model holds. For each of today's seeds (none,
+    /// 0.2 to 9.4 Mbit/s) and each model entry (none, a floor, a trusted
+    /// push-back that would open under the profile), the pump's plan is
+    /// today's seed, its profile seed and age are today's, and the governor
+    /// built from it acts on master's recorded values, `open_at_bps` (what
+    /// the pump's two encoder opens read; on master they read the seed)
+    /// included; the open line's `today_open_bps` is master's expression.
+    /// Change one filter (the 1.5 Mbit/s bound of P8) and a row goes red.
+    /// One `N` and one `hi`: master's values for others were not recorded.
+    #[test]
+    fn shadow_is_todays_opener_exactly() {
+        let now_unix = rate_memory::now_unix();
+        let floor = pm::Floor {
+            bps: 2_200_000,
+            basis: pm::FloorBasis::AppLimited,
+            at_unix: now_unix - 86_400,
+        };
+        let pushed = PairEntry {
+            floor: pm::Floor {
+                bps: 850_000,
+                basis: pm::FloorBasis::Backlogged,
+                ..floor
+            },
+            push_back: Some(pm::PushBack {
+                bps: 400_000,
+                at_unix: now_unix - 60,
+                first_at_unix: now_unix - 120,
+                windows: 3,
+            }),
+        };
+        let entries = [
+            (EntryState::None, None),
+            (
+                EntryState::Fresh,
+                Some(PairEntry {
+                    floor,
+                    push_back: None,
+                }),
+            ),
+            (EntryState::Fresh, Some(pushed)),
+        ];
+        for (seed, master) in MASTER {
+            for (state, entry) in entries {
+                for mode in [Mode::Shadow, Mode::Off] {
+                    let guard = (mode != Mode::Off).then(|| guard_with(state, entry));
+                    let p = pump_in(mode, guard, seed);
+                    let at = format!("{mode:?} seed {seed:?} entry {entry:?}");
+                    assert_eq!(p.plan(), pm::OpenPlan::Today(seed), "{at}");
+                    assert_eq!(p.seed(), seed, "{at}");
+                    assert_eq!(p.seed_age(), seed.map(|_| Duration::from_secs(3_600)));
+                    for ((relief, slow_start, ratectl), want) in SETUPS.into_iter().zip(master) {
+                        let (got, g) = opened(&p.plan(), relief, slow_start, ratectl);
+                        assert_eq!(got, want, "{at} relief {relief} slow start {slow_start}");
+                        // What the pump's two encoder opens read: `open_at_bps`
+                        // here, `open_seed_bps` on master.
+                        assert_eq!(g.open_at_bps(), want.0, "{at} relief {relief}: open_at");
+                        // The open line's `today_open_bps`, as master wrote it.
+                        assert_eq!(
+                            g.opening_of(&pm::OpenPlan::Today(seed), 2_550_000),
+                            want.0.unwrap_or(want.2),
+                            "{at}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Steps 3 and 4 under `on` (design §3.3 and §4; N = 2.55 Mbit/s, hi =
+    /// 8 Mbit/s): the governor built from the pump's plan opens where the
+    /// model says, and the slow-link profile engages on a fresh trusted low
+    /// push-back only. Beside each, what master opens the same pair at from
+    /// today's seed, which `shadow` keeps.
+    #[test]
+    fn on_opens_where_the_model_says() {
+        use crate::encode::RatectlMode::Shadow;
+        use crate::encode::rate_profile::slow_link_profile;
+        let now_unix = rate_memory::now_unix();
+        let floor = |bps, basis| pm::Floor {
+            bps,
+            basis,
+            at_unix: now_unix - 3_600,
+        };
+        let record = |bps, age: u64| {
+            Some(pm::PushBack {
+                bps,
+                at_unix: now_unix - age,
+                first_at_unix: now_unix - age - 60,
+                windows: 3,
+            })
+        };
+        let (app, back) = (pm::FloorBasis::AppLimited, pm::FloorBasis::Backlogged);
+        // (floor, record, master's seed for the pair, the opening, profile)
+        let rows = [
+            // AC3's CORPLAP-2 chain: master wrote 179,980 and opens there,
+            // on the profile.
+            (floor(1_399_272, app), None, Some(179_980), 2_550_000, false),
+            // The other chain: master wrote 3,322 and opens at the relief
+            // floor, on the profile.
+            (floor(15_915_240, app), None, Some(3_322), 8_000_000, false),
+            // §2.1: an application-limited floor engages no profile; master
+            // engages it at a measured 281,732.
+            (floor(281_732, app), None, Some(281_732), 2_550_000, false),
+            (floor(2_170_000, app), None, None, 2_550_000, false),
+            (floor(6_500_000, back), None, None, 5_525_000, false),
+            (
+                floor(2_500_000, back),
+                record(1_000_000, 60),
+                None,
+                2_125_000,
+                false,
+            ),
+            (
+                floor(1_300_000, back),
+                record(400_000, 60),
+                None,
+                1_105_000,
+                false,
+            ),
+            (
+                floor(850_000, back),
+                record(400_000, 60),
+                None,
+                722_500,
+                true,
+            ),
+            // The same push-back 25 h later: a floor, at N.
+            (
+                floor(850_000, back),
+                record(400_000, 25 * 3_600),
+                None,
+                2_550_000,
+                false,
+            ),
+        ];
+        for (floor, push_back, master_seed, open_bps, profile) in rows {
+            let entry = PairEntry { floor, push_back };
+            let p = pump_in(
+                Mode::On,
+                Some(guard_with(EntryState::Fresh, Some(entry))),
+                master_seed,
+            );
+            let at = format!("{entry:?}");
+            assert_eq!(p.model.as_ref().unwrap().taken.word(), "model", "{at}");
+            let ((_, _, _, _, _, tick, _, _), g) = opened(&p.plan(), true, false, Shadow);
+            assert_eq!(tick, Some(open_bps), "{at}");
+            assert_eq!(
+                g.open_at_bps(),
+                (open_bps < 2_550_000).then_some(open_bps),
+                "the first encoder opens there too: {at}"
+            );
+            assert_eq!(slow_link_profile(p.seed(), true).is_some(), profile, "{at}");
+            let age = p.seed_age().map(|a| a.as_secs());
+            assert!(
+                age.is_some_and(|a| (3_600..3_603).contains(&a)),
+                "the floor's: {age:?}"
+            );
+            // Master on the same pair.
+            if let Some(s) = master_seed {
+                let ((_, _, _, _, _, master_tick, _, _), _) =
+                    opened(&pm::OpenPlan::Today(Some(s)), true, false, Shadow);
+                assert!(master_tick.unwrap() < open_bps, "{at}: {master_tick:?}");
+                assert!(slow_link_profile(Some(s), true).is_some(), "{at}");
+            }
+        }
+        // With the relief off, an opening under the nominal floor is lifted
+        // to it at the open, where the AIMD would lift it a tick later.
+        let entry = PairEntry {
+            floor: floor(850_000, back),
+            push_back: record(400_000, 60),
+        };
+        let p = pump_in(
+            Mode::On,
+            Some(guard_with(EntryState::Fresh, Some(entry))),
+            None,
+        );
+        let ((open_seed, _, _, _, _, tick, _, _), g) = opened(&p.plan(), false, false, Shadow);
+        assert_eq!(tick, Some(crate::encode::MIN_BITRATE_BPS));
+        assert_eq!(g.open_at_bps(), Some(crate::encode::MIN_BITRATE_BPS));
+        assert_eq!(open_seed, None, "P8's seed needs the relief");
+    }
+
+    /// Ruling 3: the open line says which rule opened the session and, for
+    /// today's under `on`, why. Every `today` opens from today's seed, as
+    /// master does.
+    #[test]
+    fn the_open_line_says_which_rule_opened_and_why() {
+        let _env = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now_unix = rate_memory::now_unix();
+        let entry = PairEntry {
+            floor: pm::Floor {
+                bps: 2_200_000,
+                basis: pm::FloorBasis::AppLimited,
+                at_unix: now_unix - 3_600,
+            },
+            push_back: None,
+        };
+        let no_user = || Err(pm::NoKey::NoUser);
+        let cases = [
+            (
+                Mode::On,
+                turn_key(),
+                EntryState::Fresh,
+                Some(entry),
+                "model",
+                "-",
+            ),
+            (
+                Mode::On,
+                turn_key(),
+                EntryState::None,
+                None,
+                "today",
+                "no_entry",
+            ),
+            (
+                Mode::On,
+                turn_key(),
+                EntryState::Invalid,
+                None,
+                "today",
+                "entry_invalid",
+            ),
+            (
+                Mode::On,
+                turn_key(),
+                EntryState::Future,
+                None,
+                "today",
+                "entry_invalid",
+            ),
+            (
+                Mode::On,
+                turn_key(),
+                EntryState::Expired,
+                None,
+                "today",
+                "floor_expired",
+            ),
+            (
+                Mode::On,
+                no_user(),
+                EntryState::None,
+                None,
+                "today",
+                "no_key",
+            ),
+            (
+                Mode::Shadow,
+                turn_key(),
+                EntryState::Fresh,
+                Some(entry),
+                "today",
+                "shadow",
+            ),
+        ];
+        for (mode, key, state, entry, taken, why) in cases {
+            let mut g = ModelGuard::new(ObjectId::new(), key);
+            g.state = state;
+            g.entry = entry;
+            let mut p = pump_in(mode, Some(g), Some(900_000));
+            let line = open_line(&mut p, Instant::now());
+            let says = format!(" taken={taken} taken_why={why}");
+            assert!(line.contains(&says), "{says} in {line}");
+            if taken == "today" {
+                assert_eq!(p.plan(), pm::OpenPlan::Today(Some(900_000)), "{line}");
+                assert_eq!(p.seed(), Some(900_000));
+            }
+        }
+    }
+
+    /// AC6 under `on` (design §7): one session delivers 6.5 Mbit/s, then
+    /// twenty sessions of a still screen, application-limited at 2.17 Mbit/s
+    /// at most. Each opens at 5.525 Mbit/s or more, and the entry's floor and
+    /// its time do not move. Read and written through the file, as the pump
+    /// reads and writes it.
+    #[test]
+    fn twenty_still_screens_keep_the_floor_and_its_age() {
+        use crate::encode::RatectlMode::Shadow;
+        use crate::encode::pipe::Basis;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(pm::FILE_NAME);
+        let t0 = Instant::now();
+        let now_unix = rate_memory::now_unix();
+        let text = turn_key().unwrap().text().to_string();
+        let session = |delivered: u32| {
+            // The open, as `model_open` reads the file.
+            let memory = PathMemory::load(&path, now_unix);
+            let mut g = guard_with(
+                memory.state(&text, now_unix),
+                memory.fresh(&text, now_unix).copied(),
+            );
+            g.path = Some(path.clone());
+            let mut p = pump_in(Mode::On, Some(g), None);
+            let ((_, _, _, _, _, tick, _, _), _) = opened(&p.plan(), true, false, Shadow);
+            let model = p.model.as_mut().unwrap();
+            let mut mem = pm::SessionMemory::default();
+            mem.open(model.entry.as_ref(), now_unix, t0);
+            mem.delivered(delivered, Basis::AppLimited, t0 + Duration::from_secs(20));
+            model.take(mem.closing(t0 + Duration::from_secs(60), now_unix), true);
+            drop(p);
+            tick.unwrap()
+        };
+        assert_eq!(session(6_500_000), 2_550_000, "the pair's first session");
+        let first = PathMemory::load(&path, now_unix).pairs[&text];
+        assert_eq!(first.floor.bps, 6_500_000);
+        for n in 1..=20 {
+            let tick = session(2_170_000);
+            assert!(tick >= 5_525_000, "session {n} opened at {tick}");
+            assert_eq!(PathMemory::load(&path, now_unix).pairs[&text], first, "{n}");
+        }
+    }
+
+    /// Ruling 4: a move between two relay tiers inside a session (TURN to the
+    /// mesh's relay, or back) keeps the path constrained, so it is no freeze:
+    /// the close writes the last window under the opening carrier's key. Only
+    /// a move off the relay freezes (design §2.7). Kept, not frozen: the pump
+    /// reads relay-or-not at each recheck, not the carrier (docs).
+    #[test]
+    fn a_move_between_relay_tiers_keeps_the_write() {
+        let mut g = ModelGuard::new(ObjectId::new(), turn_key());
+        let opening_key = g.key_id();
+        g.take(closing(2_000_000), true);
+        // The pair moves to the mesh's relay: still constrained.
+        g.take(closing(4_000_000), true);
+        assert!(!g.frozen);
+        assert_eq!(g.verdict().0.map(|e| e.floor.bps), Some(4_000_000));
+        assert_eq!(g.key_id(), opening_key, "under the opening carrier's key");
+        // A move to a direct pair freezes: nothing after it is taken.
+        g.take(closing(15_000_000), false);
+        assert!(g.frozen);
+        assert_eq!(g.verdict().0.map(|e| e.floor.bps), Some(4_000_000));
+    }
+
     /// What `f` logs, as the daemon's log file writes it (time, level,
     /// message, fields; no target), as `media_delivery`'s cells read theirs.
     fn logged(f: impl FnOnce()) -> String {
@@ -789,33 +1263,109 @@ mod tests {
         String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
     }
 
-    /// A pump's memories with no file on either side: today's guard writes
-    /// nothing, the model's writes only its line.
+    /// A pump's memories with no file on either side, under `shadow`: today's
+    /// guard writes nothing, the model's writes only its line.
     fn pump(model: ModelGuard, seed: Option<u32>) -> PumpMemory {
-        PumpMemory {
+        pump_in(Mode::Shadow, Some(model), seed)
+    }
+
+    /// The same under `mode` (no guard under `off`, as `open` builds it),
+    /// decided at the open as `open` decides, with a slow-link threshold of
+    /// 1 Mbit/s. Today's entry, when there is one, is an hour old.
+    fn pump_in(mode: Mode, model: Option<ModelGuard>, seed: Option<u32>) -> PumpMemory {
+        let mut p = PumpMemory {
             codec_label: "AV1",
-            mode: Mode::Shadow,
+            mode,
             hi_bps: 8_000_000,
+            threshold: 1_000_000,
             seed,
-            seed_age: None,
+            seed_age: seed.map(|_| Duration::from_secs(3_600)),
             today: RateMemoryGuard {
                 path: None,
                 peer: None,
                 stable: AtomicU32::new(0),
                 opener_measured: AtomicU32::new(0),
             },
-            model: Some(model),
-        }
+            model,
+        };
+        p.decide(rate_memory::now_unix());
+        p
+    }
+
+    /// A guard on the TURN key whose open read `state` and `entry`.
+    fn guard_with(state: EntryState, entry: Option<PairEntry>) -> ModelGuard {
+        let mut g = ModelGuard::new(ObjectId::new(), turn_key());
+        g.state = state;
+        g.entry = entry;
+        g
+    }
+
+    /// What a session acts on at its open, from a governor built from `plan`
+    /// as the pump builds it (relay cap 8 Mbit/s, plan ceiling N): the P8
+    /// seed, the learned ceiling, the ceiling for N, the prior, the pipe
+    /// stand-in, the first tick's target, the floor in force after it and the
+    /// shadow controller's target.
+    type Opened = (
+        Option<u32>,
+        u32,
+        u32,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+    );
+
+    fn opened(
+        plan: &pm::OpenPlan,
+        relief: bool,
+        slow_start: bool,
+        ratectl: crate::encode::RatectlMode,
+    ) -> (Opened, RateGovernor) {
+        use crate::encode::governor::GovernorFlags;
+        let now = Instant::now();
+        let flags = GovernorFlags {
+            floor_relief: relief,
+            slow_start,
+            ratectl,
+            viewer_rate_clamp: true,
+            seed_contradiction: true,
+            measured_evidence: true,
+            measured_ceiling: true,
+            ..GovernorFlags::default()
+        };
+        let mut g = RateGovernor::new_with(15, 12, flags, 8_000_000, plan, now);
+        let built = (
+            g.open_seed_bps(),
+            g.learned_ceiling_bps(),
+            g.ceiling_for(2_550_000, true),
+            g.prior_bps(),
+            g.pipe_bps(now, true),
+        );
+        let tick = g
+            .pre_encode_tick(2_550_000, crate::encode::MIN_BITRATE_BPS, true, 12, now)
+            .map(|a| a.bps);
+        let o = (
+            built.0,
+            built.1,
+            built.2,
+            built.3,
+            built.4,
+            tick,
+            g.relieved_floor_bps(),
+            g.shadow_target_bps(),
+        );
+        (o, g)
     }
 
     /// The pump's open, with a governor built as the pump builds it.
     fn open_line(p: &mut PumpMemory, now: Instant) -> String {
-        let mut governor = RateGovernor::new(
+        let mut governor = RateGovernor::new_with(
             30,
             12,
             crate::encode::governor::GovernorFlags::from_env(),
             p.hi_bps,
-            p.seed,
+            &p.plan(),
             now,
         );
         logged(|| p.at_open(&mut governor, 0, false))
@@ -832,7 +1382,7 @@ mod tests {
         assert_eq!(line.lines().count(), 1, "{line:?}");
     }
 
-    const OPEN_FIELDS: [&str; 23] = [
+    const OPEN_FIELDS: [&str; 24] = [
         "session_id",
         "codec_label",
         "mode",
@@ -856,9 +1406,10 @@ mod tests {
         "today_open_bps",
         "today_profile",
         "taken",
+        "taken_why",
     ];
 
-    const CLOSE_FIELDS: [&str; 17] = [
+    const CLOSE_FIELDS: [&str; 23] = [
         "session_id",
         "key_id",
         "key_carrier",
@@ -873,7 +1424,13 @@ mod tests {
         "push_back_bps",
         "push_back_windows",
         "push_back_span_s",
+        "samples_counted",
+        "samples_counted_overproduced",
+        "samples_counted_clear",
         "samples_not_counted",
+        "samples_unread",
+        "samples_viewer_late",
+        "samples_under_plan",
         "record_ended",
         "frozen",
     ];
@@ -961,9 +1518,12 @@ mod tests {
         let mut mem = pm::SessionMemory::default();
         mem.open(Some(&entry), now_unix, t0);
         mem.delivered(1_200_000, Basis::AppLimited, at(5));
-        mem.pushed_back(620_000, Basis::Backlogged, at(10));
-        mem.pushed_back(600_000, Basis::Backlogged, at(16));
-        mem.pushed_back(640_000, Basis::Backlogged, at(23));
+        let (back, over, clear) = (Basis::Backlogged, pm::Read::Overproduced, pm::Read::Clear);
+        mem.pushed_back(620_000, back, over, at(10));
+        mem.pushed_back(600_000, back, clear, at(16));
+        mem.pushed_back(640_000, back, clear, at(23));
+        // A late viewer's push-back beside them: counted apart, not taken.
+        mem.pushed_back_in(500_000, back, pm::Take::ViewerLate, at(26));
         let c = mem.closing(at(30), now_unix);
         let (written, _) = pm::close(Some(&entry), &c);
         let written = written.expect("the push-backs are written");
@@ -974,6 +1534,14 @@ mod tests {
             "{close}"
         );
         assert!(close.contains(" push_back_bps=Some(640000) push_back_windows=Some(3) "));
+        assert!(
+            close.contains(
+                " samples_counted=3 samples_counted_overproduced=1 samples_counted_clear=2 \
+                 samples_not_counted=0 samples_unread=0 samples_viewer_late=1 \
+                 samples_under_plan=0 "
+            ),
+            "{close}"
+        );
         lines.push(("three push-backs", open, close));
         // ... and the next session reads a trusted record.
         let mut p = pump(guard(EntryState::Fresh, Some(written)), None);

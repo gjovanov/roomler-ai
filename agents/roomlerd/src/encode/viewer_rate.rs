@@ -700,6 +700,16 @@ const AGE_OVER_QUEUE_MULTIPLE: u16 = 3;
 /// genuinely bad age before the loop fires on it.
 const AGE_OVER_QUEUE_MIN_MS: u16 = 250;
 
+/// P2 — is a window's age a reading? Its floor sample (`age_min_ms`) must be at
+/// least `one_way_ms`, half the viewer's own probe round trip: a frame cannot
+/// reach the screen faster than the wire allows, so a smaller one is the clock
+/// probe skewed by the congestion it rides through ([`AgeLoop::observe`]).
+/// FR-148 P1 (R1) reads the same test: a split built on such an age is not a
+/// reading of the window (`pair_memory::window_read`).
+pub fn age_is_plausible(age_min_ms: u16, one_way_ms: u16) -> bool {
+    age_min_ms >= one_way_ms
+}
+
 /// FR-15 — the constrained-transport age loop. Feed one `observe` per
 /// viewer window; it learns the session's age floor (min over the ring —
 /// the floor is propagation+decode, not queue) and reports `true` once the
@@ -757,7 +767,7 @@ impl AgeLoop {
     /// session that begins congested — and therefore never sees a good
     /// window to learn from — is still caught.
     pub fn observe(&mut self, age_ms: u16, age_min_ms: u16, one_way_ms: u16) -> bool {
-        if age_min_ms >= one_way_ms {
+        if age_is_plausible(age_min_ms, one_way_ms) {
             self.ring[self.idx] = age_min_ms.max(1);
             self.idx = (self.idx + 1) % AGE_FLOOR_RING;
             if self.len < AGE_FLOOR_RING {

@@ -298,6 +298,11 @@ impl CeilingLearner {
         (self.stable_bps > self.nominal_bps).then_some(self.stable_bps)
     }
 
+    /// The most the learner lifts a ceiling to (0 = off).
+    pub fn hi_bps(&self) -> u32 {
+        self.hi_bps
+    }
+
     pub fn learned_bps(&self) -> u32 {
         self.learned_bps
     }

@@ -122,7 +122,7 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
       from a session that sent no age: #3566 found a tab's ages off by its page↔worker
       clock drift, and a session whose ages all read negative sent none (the fix, #3568,
       went live at 15:56Z that day). On master the
-      loop fires only with `constrained` (`agents/roomlerd/src/encode/governor.rs:1320`),
+      loop fires only with `constrained` (`agents/roomlerd/src/encode/governor.rs:1369`),
       and `age_loop_is_constrained_only_and_respects_the_kill_switch` (`:3640`, in CI's
       `roomlerd` lib lane) drives a direct session through an age history that would cut a
       constrained one and asserts `age_over` stays false and the target never moves.

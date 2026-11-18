@@ -1096,7 +1096,7 @@ sequenceDiagram
 |---|---|
 | `policy::replacement_open_bps` (`policy.rs:211`) | the applied rate (or, before the controller has applied one, the remembered seed), never above the ceiling of the dims the replacement is opened FOR |
 | the dims spawn (`peer.rs:8675`, the rate at `:8712`) | computes that ceiling at the plan dims with the same chain as the per-frame ceiling (`peer.rs:8839`–`8230`): `rate_plan` with the same native dims, fps, codec, chroma, encode factor, user-pick and dial factor → the learner's lift → the shared-pipeline split, floored at the plan dims' area floor |
-| `CeilingLearner::ceiling_for` (`ceiling_learn.rs:138`), `RateGovernor::ceiling_for` (`governor.rs:598`) | asks the learner instead of telling it: `effective_ceiling` without recording the nominal, so the learner's judgements stay on the frame actually encoded. `effective_ceiling` now delegates to it, so the two cannot drift |
+| `CeilingLearner::ceiling_for` (`ceiling_learn.rs:138`), `RateGovernor::ceiling_for` (`governor.rs:643`) | asks the learner instead of telling it: `effective_ceiling` without recording the nominal, so the learner's judgements stay on the frame actually encoded. `effective_ceiling` now delegates to it, so the two cannot drift |
 
 - **A move up changes nothing.** The applied rate already sits under the old
   ceiling, and the old ceiling sits under the new one. Only a move down, whose
@@ -1136,7 +1136,7 @@ judgement (`plan.rs:527`) would catch it, exactly as it caught this one.
   ceiling (`:332`).
 - **`encode::ceiling_learn`, +1 test.** `ceiling_for` answers as
   `effective_ceiling` would and leaves the nominal on the frame being encoded
-  (`ceiling_learn.rs:304`). The no-side-effect half is enforced by the compiler
+  (`ceiling_learn.rs:309`). The no-side-effect half is enforced by the compiler
   (`&self`). The test pins the equality, which a later re-implementation of
   either function could break.
 - **Negative control A.** `replacement_open_bps` made to ignore its ceiling in

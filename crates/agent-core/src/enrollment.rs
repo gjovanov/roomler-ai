@@ -500,6 +500,7 @@ fn fresh_config(issued: Issued) -> AgentConfig {
         encoder_inplace_rate: None,
         ice_relay_tcp: None,
         rc_carrier_rank: None,
+        path_model: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,

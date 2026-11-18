@@ -6604,8 +6604,8 @@ async fn media_pump_ffmpeg_dc(
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
     let mut last_transport_check = std::time::Instant::now();
     // FR-35 P2 / FR-148 P1 — the pair memories (`media_pair_memory`): today's
-    // seeds the opening ceiling exactly as before; the path model's is only
-    // read for its line, and written when the pump ends.
+    // seeds the opening as before, unless the switch is `on` and the path
+    // model's entry decides it (`plan`); both are written when the pump ends.
     let rate_hi_bps = crate::encode::relay_max_hi_bps();
     let mut pair_memory = crate::media_pair_memory::open(
         &pc,
@@ -7189,13 +7189,13 @@ async fn media_pump_ffmpeg_dc(
     // emits continuous bitrate targets; `FfmpegEncoder::set_bitrate`
     // coarsens them to a ladder and applies in-place (NVENC reconfigure)
     // or as a debounced QSV/AMF rebuild whose first frame is an IDR.
-    let mut governor = crate::encode::governor::RateGovernor::new(
+    let mut governor = crate::encode::governor::RateGovernor::new_with(
         target_fps,
         ffmpeg_send_depth,
         crate::encode::governor::GovernorFlags::from_env(),
         // FR-35 — the constrained ceiling learns the pair (0 = off).
         rate_hi_bps,
-        rate_seed,
+        &pair_memory.plan(),
         std::time::Instant::now(),
     );
     if let Some(seed_bps) = governor.open_seed_bps() {
@@ -8747,7 +8747,7 @@ async fn media_pump_ffmpeg_dc(
                 let bps = crate::encode::policy::replacement_open_bps(
                     target_ceiling,
                     governor.applied_bps(),
-                    governor.open_seed_bps(),
+                    governor.open_at_bps(),
                 );
                 // FR-65 — a round trip to the encoder thread: `enc_cmd`.
                 let t = watch.start();
@@ -8971,7 +8971,7 @@ async fn media_pump_ffmpeg_dc(
                 // one frame later, and an encoder opened at the ceiling
                 // would be rebuilt right there (a second blocking QSV open
                 // before the first frame).
-                0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
+                0 => governor.open_at_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
             // FR-65 — the open is BLOCKING (0.62-0.73 s measured on Iris Xe at

@@ -309,6 +309,11 @@ pub struct RateGovernor {
     /// through the floor relief AND the queue budget while nothing measured
     /// (field 2026-09-04, `6a9abc30`; see `encode::prior`).
     open_seed_bps: Option<u32>,
+    /// FR-148 P1 step 3 — where the AIMD, the first encoder and slow start
+    /// open when it sits under the ceiling: today's rule gives the P8 seed
+    /// above; the path model's gives its opening after a trusted push-back,
+    /// which may sit above the nominal floor. `None` = at the ceiling.
+    open_at_bps: Option<u32>,
     /// FR-70 P1 — the belief about the pipe while nothing measures it: the
     /// seed, then the last live measurement, decaying toward the band on
     /// clean windows. Read wherever `open_seed_bps` used to stand in.
@@ -462,6 +467,28 @@ impl RateGovernor {
         ceiling_seed_bps: Option<u32>,
         now: Instant,
     ) -> Self {
+        let plan = super::pair_memory::OpenPlan::Today(ceiling_seed_bps);
+        Self::new_with(target_fps, send_depth, flags, ceiling_hi_bps, &plan, now)
+    }
+
+    /// FR-148 P1 step 3 — [`Self::new`] from what the session opens from:
+    /// today's seed, or the path model's floor and opening. `new(…, s, …)` is
+    /// `new_with(…, &OpenPlan::Today(s), …)`.
+    pub fn new_with(
+        target_fps: u32,
+        send_depth: usize,
+        flags: GovernorFlags,
+        ceiling_hi_bps: u32,
+        plan: &super::pair_memory::OpenPlan,
+        now: Instant,
+    ) -> Self {
+        let (ceiling_seed_bps, open_at_bps) = plan.resolve(flags.floor_relief);
+        // FR-59 P8 — the relief and the prior take the opening only under the
+        // nominal floor with the relief on: at or above the band a seed never
+        // stood in for anything (the relief is inert there and the P6 check
+        // would read it as a contradiction).
+        let open_seed_bps =
+            open_at_bps.filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief);
         let mut governor = Self {
             aimd: None,
             send_depth,
@@ -496,14 +523,11 @@ impl RateGovernor {
             link_unoffered: 0,
             link_rx_bps: None,
             drain_until: None,
-            open_seed_bps: ceiling_seed_bps
-                .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
-            // Seeded with the SAME filtered value: a seed at or above the
-            // band never stood in for anything (the relief is inert there
-            // and the P6 check would read it as a contradiction).
+            open_seed_bps,
+            open_at_bps,
+            // Seeded with the SAME filtered value.
             prior: super::prior::RatePrior::new(
-                ceiling_seed_bps
-                    .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
+                open_seed_bps,
                 super::MIN_BITRATE_BPS,
                 // FR-79 V3 — the prior always decays; the switch is gone (FR-70 P1
                 // was field-verified with its own same-build control on 0.4.64).
@@ -551,6 +575,27 @@ impl RateGovernor {
     #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
     pub fn open_seed_bps(&self) -> Option<u32> {
         self.open_seed_bps
+    }
+
+    /// FR-148 P1 step 3 — where the session opens when that sits under the
+    /// ceiling (see `open_at_bps`). The pump opens its first encoder, and a
+    /// replacement before the first tick, at it. Today's rule gives
+    /// [`Self::open_seed_bps`].
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn open_at_bps(&self) -> Option<u32> {
+        self.open_at_bps
+    }
+
+    /// FR-148 P1 step 3 — the rate a session built from `plan` opens at under
+    /// a plan ceiling of `plan_ceiling_bps`, with this governor's relay cap
+    /// and floor relief: the AIMD's first target before the floor in force
+    /// clamps it. The open line logs today's rule's beside the model's.
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn opening_of(&self, plan: &super::pair_memory::OpenPlan, plan_ceiling_bps: u32) -> u32 {
+        let (seed, open_at) = plan.resolve(self.slow_link.floor_relief);
+        let ceiling = super::ceiling_learn::CeilingLearner::new(self.learner.hi_bps(), seed)
+            .ceiling_for(plan_ceiling_bps);
+        open_at.map_or(ceiling, |o| o.min(ceiling))
     }
 
     /// FR-59 P4 — is production paused for a queue drain right now?
@@ -1008,7 +1053,9 @@ impl RateGovernor {
         // at all. The floor parameter means "a rate already PROVEN", and only
         // the remembered seed is that.
         if self.slow_link.slow_start && constrained {
-            let seeded = self.open_seed_bps;
+            // FR-148 P1 step 3 — the opening, which is the P8 seed under
+            // today's rule and the model's opening after a push-back.
+            let seeded = self.open_at_bps;
             let ss = self.slow_start.get_or_insert_with(|| {
                 super::slow_start::SlowStart::new(seeded.unwrap_or(0), ceiling_bps)
             });
@@ -1086,7 +1133,7 @@ impl RateGovernor {
             _ => floor_bps,
         };
         let depth = self.send_depth;
-        let open_seed_bps = self.open_seed_bps;
+        let open_at_bps = self.open_at_bps;
         // FR-63 B1 — feed the SHADOW the same resolved domain and occupancy the
         // live AIMD below gets, and let it open on its first frame. Placed where
         // no `&mut self.aimd` borrow is live and before the `?` the AIMD takes,
@@ -1106,7 +1153,9 @@ impl RateGovernor {
             // remembered slower than the nominal floor: the ceiling is the
             // relay cap, and an opener sized by it is the burst this program
             // exists to prevent. The additive increase climbs from here.
-            let initial = open_seed_bps.map_or(ceiling_bps, |s| s.min(ceiling_bps));
+            // FR-148 P1 step 3 — or at the path model's opening after a
+            // trusted push-back (`open_at_bps`).
+            let initial = open_at_bps.map_or(ceiling_bps, |s| s.min(ceiling_bps));
             AimdController::new(initial, floor_bps, ceiling_bps, depth as u32, now)
         });
         ctrl.set_floor(floor_bps);
@@ -1375,6 +1424,17 @@ impl RateGovernor {
             self.evidence.note(r);
         }
         let valid = rejection.is_none();
+        // FR-148 P1 (R1, R3) — did the classifier READ this window, and did the
+        // sender push against the target it ran with? Its push-backs act in the
+        // session either way; the pair memory counts one only when both hold
+        // (`pair_memory::Take`). The age is a reading by the age loop's own test,
+        // the half round trip it observes against below.
+        let take = super::pair_memory::Take::of(
+            state,
+            report.is_some_and(|(_, min, rtt)| viewer_rate::age_is_plausible(min, rtt / 2)),
+            sent_bps,
+            self.applied_bps,
+        );
         // FR-148 P1 (D24) — the delivery is folded once the gate has ruled, which
         // reads only the window's facts: `Pipe` takes it whatever the verdict, the
         // shadow model and the pair memory only from a valid window.
@@ -1444,7 +1504,8 @@ impl RateGovernor {
             if self.goodput.observe_window(&samples, now)
                 && let Some(bps) = self.goodput.estimate_bps(now)
             {
-                self.belief.observe_capacity(bps, Basis::Backlogged, now);
+                self.belief
+                    .observe_capacity_in(bps, Basis::Backlogged, take, now);
             }
         }
         // FR-35 — a send blocked ≥ `HARD_STALL` is a hard stall: ×0.5, bypassing
@@ -1575,7 +1636,7 @@ impl RateGovernor {
                     // FR-148 P0 — with the switch off it gets here unoffered, and
                     // is then application-limited (the jupiter chain's trickle).
                     let basis = Basis::of_window(offer_held);
-                    self.belief.observe_capacity(rx_bps, basis, now);
+                    self.belief.observe_capacity_in(rx_bps, basis, take, now);
                     self.link_rx_bps = Some((rx_bps, now));
                     self.path.link_rx = basis;
                 }
@@ -5866,10 +5927,16 @@ mod tests {
     /// windows while the pump offers 1 Mbit/s, so the link loop refuses the
     /// second and third of each run, some above the damped floor and some below
     /// it. The clean windows between the runs deliver a little above the floor.
-    /// The record counts every refusal and ends trusted, whichever side of the
-    /// floor the last refusal was on. On D25's first wording ("a delivery above
-    /// the floor ends the record") each clean run ends it, and the session ends
-    /// with two samples a second apart: not trusted.
+    /// The record counts every refusal but the first and ends trusted, whichever
+    /// side of the floor the last refusal was on. On D25's first wording ("a
+    /// delivery above the floor ends the record") each clean run ends it, and
+    /// the session ends with two samples a second apart: not trusted.
+    ///
+    /// R3 — the first refusal runs under the session's opening target of
+    /// 3 Mbit/s while the pump writes 1 Mbit/s: under half its plan, so the
+    /// record does not take it (`under_plan`). The link clamp cuts the target
+    /// to 522 kbit/s in that window, and every later refusal is taken. Before
+    /// R3 the record held six windows over 17 s.
     #[test]
     fn a_slow_link_ends_trusted_whichever_side_of_the_floor_it_last_refused() {
         use crate::encode::pair_memory::{Closing, trusted};
@@ -5907,7 +5974,21 @@ mod tests {
         for (last_run, side) in [(670_000, "above"), (600_000, "below")] {
             let (c, unix) = replay(last_run, false);
             let r = c.record.expect("a record");
-            assert_eq!((r.windows, r.span_s()), (6, 17), "{side}");
+            assert_eq!((r.windows, r.span_s()), (5, 16), "{side}");
+            assert_eq!(c.under_plan, 1, "{side}");
+            // QR3's split: every counted refusal came from a window the
+            // classifier read `Clear`, where only the link report said the
+            // queue grew; none from the sender's own counters.
+            assert_eq!(
+                (
+                    c.counted,
+                    c.counted_overproduced,
+                    c.counted_clear,
+                    c.viewer_late
+                ),
+                (5, 0, 5, 0),
+                "{side}"
+            );
             assert!(trusted(&r, unix), "{side}");
             assert!(!c.ended, "{side}");
             assert_eq!(c.not_counted, 0, "{side}");
@@ -5917,6 +5998,484 @@ mod tests {
             assert_eq!((r.windows, r.span_s()), (2, 1), "{side}");
             assert!(!trusted(&r, unix), "{side}: the first wording fails it");
         }
+    }
+
+    /// FR-148 P1 (the coordinator's ruling on the review's finding 4) — a
+    /// window the classifier blames on the viewer is not a reading of the
+    /// path. Three runs of refusals as in the slow-link replay (the viewer's
+    /// queue growing for three windows while the pump offers 1 Mbit/s into
+    /// 580 kbit/s), in four kinds of window: `Clear` (the transit share 168 ms
+    /// over its floor), the viewer `struggling` on a flat age, the browser's
+    /// own share 150 ms over its floor, and the classifier's tie (the transit
+    /// and the browser shares each 300 ms over their floors). The link loop
+    /// pushes back on the same windows in the first three, and the session's
+    /// belief takes every push-back whatever the window; the memory counts the
+    /// late viewer's as `viewer_late` and takes none of them. The tie stays
+    /// `TransitStalled` (`transit_excess >= viewer_excess`), the gate rejects
+    /// it as before, and nothing reaches either.
+    #[test]
+    fn a_window_the_classifier_blames_on_the_viewer_is_not_a_reading_of_the_path() {
+        use crate::encode::pair_memory::Closing;
+        use crate::encode::pipe_state::PipeState;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Refused {
+            Clear,
+            Struggling,
+            ViewerShare,
+            Tie,
+        }
+        // One window: the pump wrote `wrote` bytes, and the viewer reported
+        // `link` and a paint age of `age` ms of which `arrival` ms to arrival.
+        fn win(s: &mut V5bSession, wrote: u64, link: u64, age_arrival: (u16, u16), late: bool) {
+            s.t += Duration::from_secs(1);
+            s.sent += wrote;
+            s.g.note_window_sender(v5b_sender());
+            s.g.tick_viewer_window(
+                s.t,
+                30,
+                || viewer_rate::pack_report(30, late),
+                || viewer_rate::pack_age_with_arrival(age_arrival.0, 17, 30, age_arrival.1),
+                || link,
+                true,
+                |o| o,
+                s.sent,
+            )
+            .expect("window due");
+            s.g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, s.t);
+        }
+        let replay = |how: Refused| -> (Closing, u32, Vec<PipeState>) {
+            let mut s = V5bSession::open(true, None);
+            s.g.open_memory(None, P1_NOW_UNIX, s.t);
+            let start = s.t;
+            let mut states = Vec::new();
+            for _ in 0..3 {
+                for _ in 0..8 {
+                    win(
+                        &mut s,
+                        77_500,
+                        viewer_rate::pack_link(620_000, 0),
+                        (56, 54),
+                        false,
+                    );
+                }
+                let (age_arrival, late) = match how {
+                    Refused::Clear => ((224, 222), false),
+                    Refused::Struggling => ((56, 54), true),
+                    Refused::ViewerShare => ((206, 54), false),
+                    Refused::Tie => ((656, 354), false),
+                };
+                for _ in 0..3 {
+                    let link = viewer_rate::pack_link(580_000, 145);
+                    win(&mut s, 125_000, link, age_arrival, late);
+                    states.push(s.g.pipe_state().expect("a constrained window"));
+                }
+            }
+            let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+            let c = s.g.memory().closing(s.t, unix);
+            (c, s.g.belief_counts().1, states)
+        };
+        let (clear, clear_caps, states) = replay(Refused::Clear);
+        assert!(states.iter().all(|s| *s == PipeState::Clear), "{states:?}");
+        assert!(clear.counted > 0 && clear.record.is_some(), "{clear:?}");
+        assert_eq!(clear.viewer_late, 0);
+        let pushed = clear.counted + clear.under_plan + clear.not_counted;
+        assert_eq!(
+            pushed, clear_caps,
+            "every link push-back reached the belief"
+        );
+        for how in [Refused::Struggling, Refused::ViewerShare] {
+            let (c, caps, states) = replay(how);
+            assert!(
+                states.iter().all(|s| *s == PipeState::ViewerLate),
+                "{how:?}: {states:?}"
+            );
+            assert_eq!(
+                caps, clear_caps,
+                "{how:?}: the session's belief took them all"
+            );
+            assert_eq!(c.viewer_late, pushed, "{how:?}");
+            assert_eq!((c.counted, c.under_plan, c.record), (0, 0, None), "{how:?}");
+            assert_eq!(
+                c.floor.map(|f| f.bps),
+                Some(620_000),
+                "{how:?}: the floor stands"
+            );
+        }
+        let (tie, caps, states) = replay(Refused::Tie);
+        assert!(
+            states.iter().all(|s| *s == PipeState::TransitStalled),
+            "{states:?}"
+        );
+        assert_eq!(caps, 0, "the gate rejected every tie");
+        assert_eq!((tie.counted, tie.viewer_late, tie.record), (0, 0, None));
+    }
+
+    /// FR-148 P1 — the viewer's paint age in a screened session.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ScreenAge {
+        /// None at all: the viewer's clock probe has not locked, so it sends
+        /// the link report alone.
+        Absent,
+        /// It grows with the queue, by what each slowdown window did not
+        /// deliver.
+        Grows,
+        /// It stays at its floor while the link report reads the queue growing
+        /// (R3's V2, the unordered-video shape).
+        Flat,
+        /// It creeps up with the queue, at most 150 ms over its floor: still
+        /// under the transit-stall threshold (V2 too).
+        Creeps,
+    }
+
+    /// FR-148 P1 (R1, R2, R3) — one session of the screen: a screen that sends
+    /// `content` bit/s, on a relay of about 6 Mbit/s, slowed eight times for
+    /// `len` windows to `depth_pct` of what is offered, 12 s apart. Each
+    /// slowdown is followed by one window that delivers the backlog, so no
+    /// byte is lost, and the viewer's link report reads the queue growing by
+    /// what each slowdown window did not deliver.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Screen {
+        content: u32,
+        /// R3's V3: the encoder's output is this share of the target the
+        /// window ran with, whatever the screen shows; `None` = `content`.
+        offer_pct: Option<u32>,
+        depth_pct: u32,
+        len: u32,
+        age: ScreenAge,
+        /// A busy first minute at 5.6 Mbit/s.
+        busy: bool,
+        /// The pair's entry: an application-limited floor, a day old.
+        prior: Option<u32>,
+    }
+
+    /// The nominal constrained opening the screen reads the next session at.
+    const SCREEN_N: u32 = 2_550_000;
+
+    /// What a screened session leaves for the next one.
+    #[derive(Debug)]
+    struct Screened {
+        closing: crate::encode::pair_memory::Closing,
+        trusted: bool,
+        /// The entry's floor after the close.
+        floor: Option<u32>,
+        /// The next session's opening under `on`.
+        next: crate::encode::pair_memory::ModelOpening,
+    }
+
+    impl Screened {
+        /// R1's half of the pass: no trusted record, and the next open under
+        /// `on` at N or above, with no slow-link profile.
+        fn opens_at_nominal(&self) -> bool {
+            !self.trusted && self.next.bps >= SCREEN_N && !self.next.profile
+        }
+    }
+
+    /// Which law the pair memory takes push-backs by, in a screened session.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Law {
+        /// Master's, before R1: every push-back offered to the record.
+        Master,
+        /// R1 and R2, before R3: a push-back under the plan is offered.
+        BeforeR3,
+        /// R1, R2 and R3.
+        Now,
+    }
+
+    /// Replays `v` through the governor under `law`, closes it, and reads the
+    /// next opening (N 2.55 Mbit/s, hi 8 Mbit/s, T 1 Mbit/s).
+    fn screen(v: Screen, law: Law) -> Screened {
+        use crate::encode::pair_memory::{
+            Floor, FloorBasis, PairEntry, close, model_opening, trusted,
+        };
+        // One window: the pump wrote `offer` bit/s, the viewer received `rx`,
+        // its queue grew `queue` ms, at paint age `age` (none without a report).
+        fn win(s: &mut V5bSession, offer: u32, rx: u32, queue: i16, age: Option<u16>) {
+            s.t += Duration::from_secs(1);
+            s.sent += u64::from(offer / 8);
+            s.g.note_window_sender(v5b_sender());
+            s.g.tick_viewer_window(
+                s.t,
+                30,
+                || {
+                    if rx > 0 {
+                        viewer_rate::pack_report(15, false)
+                    } else {
+                        0
+                    }
+                },
+                || match (rx > 0, age) {
+                    (true, Some(a)) => viewer_rate::pack_age_with_arrival(a, 17, 30, a - 2),
+                    _ => 0,
+                },
+                || {
+                    if rx > 0 {
+                        viewer_rate::pack_link(rx, queue)
+                    } else {
+                        0
+                    }
+                },
+                true,
+                |o| o,
+                s.sent,
+            )
+            .expect("window due");
+            s.g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, s.t);
+        }
+        let entry = v.prior.map(|bps| PairEntry {
+            floor: Floor {
+                bps,
+                basis: FloorBasis::AppLimited,
+                at_unix: P1_NOW_UNIX - 86_400,
+            },
+            push_back: None,
+        });
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(entry.as_ref(), P1_NOW_UNIX, s.t);
+        if law == Law::Master {
+            s.g.belief.memory_mut().set_read_any();
+        }
+        if law != Law::Now {
+            s.g.belief.memory_mut().set_plan_any();
+        }
+        let start = s.t;
+        let floor_age = |delay: u32| match v.age {
+            ScreenAge::Absent => None,
+            ScreenAge::Grows => Some((56 + delay).min(60_000) as u16),
+            ScreenAge::Flat => Some(56),
+            ScreenAge::Creeps => Some(56 + delay.min(150) as u16),
+        };
+        let offer = |s: &V5bSession| match v.offer_pct {
+            Some(pct) => (u64::from(s.g.applied_bps()) * u64::from(pct) / 100) as u32,
+            None => v.content,
+        };
+        if v.busy {
+            for _ in 0..30 {
+                win(&mut s, 5_600_000, 5_600_000, 0, floor_age(0));
+            }
+        }
+        for _ in 0..8 {
+            for _ in 0..12 {
+                let o = offer(&s);
+                win(&mut s, o, o, 0, floor_age(0));
+            }
+            let mut backlog: u64 = 0;
+            let mut delay: u32 = 0;
+            for _ in 0..v.len {
+                let o = offer(&s);
+                let rx = o / 100 * v.depth_pct;
+                backlog += u64::from(o - rx);
+                let growth = if rx == 0 {
+                    1_000
+                } else {
+                    ((u64::from(o - rx) * 1_000) / u64::from(rx)).min(1_000) as u32
+                };
+                delay += growth;
+                win(&mut s, o, rx, growth as i16, floor_age(delay));
+            }
+            let o = offer(&s);
+            let drain = o.saturating_add(backlog.min(u64::from(u32::MAX)) as u32);
+            let age = floor_age(delay / 2);
+            win(&mut s, o, drain, -(delay.min(1_000) as i16), age);
+        }
+        for _ in 0..10 {
+            let o = offer(&s);
+            win(&mut s, o, o, 0, floor_age(0));
+        }
+        let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+        let closing = s.g.memory().closing(s.t, unix);
+        let (written, _) = close(entry.as_ref(), &closing);
+        let stands = written.or(entry);
+        Screened {
+            closing,
+            trusted: closing.record.is_some_and(|r| trusted(&r, unix)),
+            floor: stands.map(|e| e.floor.bps),
+            next: model_opening(SCREEN_N, 8_000_000, stands.as_ref(), 1_000_000, unix + 60),
+        }
+    }
+
+    /// FR-148 P1 (R1) — the screen of W-15's brief: a still screen on a relay
+    /// that slows for a few seconds at a time leaves no trusted push-back
+    /// record, keeps the remembered floor, and the next session under `on`
+    /// opens at the nominal. 336 sessions: a still screen of 40 or 300 kbit/s,
+    /// slowdowns of 3 to 5 s to 0 to 88 % of the offer, a busy first minute or
+    /// none, a remembered 2.2 Mbit/s floor or none, and a viewer that sends its
+    /// paint age or one whose clock probe has not locked.
+    ///
+    /// On master's law 24 of them fail, all the same class: no age, so the
+    /// classifier reads `Unknown` and the gate accepts the window, a still
+    /// screen throughout, and slowdowns that deliver 80 to 88 % of the offer.
+    /// The link loop reads two growing windows that were offered, a backlogged
+    /// sample at that rate counts (it is over half the session's best
+    /// delivery), and the drain does not end the record (not twice its rate):
+    /// two slowdowns make it trusted, and the next session would open at
+    /// 200 kbit/s with the profile on a 6 Mbit/s path. With R1 such a window's
+    /// sample still acts in the session, and is not offered to the record.
+    #[test]
+    fn a_still_screen_on_a_stalling_relay_leaves_no_trusted_record() {
+        let mut variants = Vec::new();
+        for content in [40_000u32, 300_000] {
+            for depth_pct in [0u32, 20, 50, 70, 80, 85, 88] {
+                for age in [ScreenAge::Grows, ScreenAge::Absent] {
+                    for busy in [false, true] {
+                        for len in [3u32, 4, 5] {
+                            for prior in [None, Some(2_200_000u32)] {
+                                variants.push(Screen {
+                                    content,
+                                    offer_pct: None,
+                                    depth_pct,
+                                    len,
+                                    age,
+                                    busy,
+                                    prior,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(variants.len(), 336);
+        let red = |law: Law| -> Vec<String> {
+            variants
+                .iter()
+                .filter_map(|v| {
+                    let r = screen(*v, law);
+                    (!r.opens_at_nominal()).then(|| format!("{v:?}: {r:?}"))
+                })
+                .collect()
+        };
+        let on_master = red(Law::Master);
+        assert_eq!(on_master.len(), 24, "{on_master:#?}");
+        // R1 alone is enough for them, and the law as it now stands keeps them.
+        let with_r1 = red(Law::BeforeR3);
+        assert!(with_r1.is_empty(), "{with_r1:#?}");
+        let now = red(Law::Now);
+        assert!(now.is_empty(), "{now:#?}");
+        // The class, exactly: no age, no busy minute, slowdowns of 80 % or
+        // more, and a drain that does not deliver twice the sample:
+        // 1 + n·(1 − k) ≤ 2·k.
+        for v in &variants {
+            let survives = 100 + v.len * (100 - v.depth_pct) <= 2 * v.depth_pct;
+            let class = v.age == ScreenAge::Absent && !v.busy && v.depth_pct >= 80 && survives;
+            assert_eq!(!screen(*v, Law::Master).opens_at_nominal(), class, "{v:?}");
+        }
+        // With R1 those windows' samples are counted as unread on the close line.
+        let r = screen(
+            Screen {
+                content: 40_000,
+                offer_pct: None,
+                depth_pct: 85,
+                len: 4,
+                age: ScreenAge::Absent,
+                busy: false,
+                prior: None,
+            },
+            Law::Now,
+        );
+        assert_eq!(r.closing.record, None);
+        assert!(r.closing.unread > 0, "{r:?}");
+        assert_eq!(r.next.bps, SCREEN_N);
+    }
+
+    /// FR-148 P1 (R3) — the screen's three families, on R1 and R2, and then
+    /// with the plan-limited test (`pair_memory::pushing_against_plan`). Pass:
+    /// no trusted record, the remembered floor not lowered, and the next open
+    /// under `on` at N or above with no profile.
+    ///
+    /// | family | sessions | red on R1 + R2 | red with R3 |
+    /// |---|---|---|---|
+    /// | V1: slowdowns that deliver 88 to 98 %, the age growing or absent | 240 | 0 | 0 |
+    /// | V2: the age flat, or creeping under the stall threshold, while the link report grows | 336 | 84 | 42 |
+    /// | V3: a steady offer at 55 % or 80 % of the target, 80 to 95 % slowdowns, the age growing or absent | 192 | 0 | 0 |
+    /// | V3 with V2's flat age (beyond the ruling) | 96 | 20 | 20 |
+    ///
+    /// V2 is red on R1 and R2: the classifier reads a window `Clear` on a flat
+    /// age, the link loop pushes back at the slowdown's arrival rate, and the
+    /// samples count. R3 clears the 40 kbit/s screen: its output stays under
+    /// half of every target the session runs with (the slow-link floor keeps
+    /// the target at 200 kbit/s or more). It cannot clear the 300 kbit/s
+    /// screen: the session's own link clamp cuts the target to 0.9 of the
+    /// slowdown's arrival within the first slowdown (about 230 kbit/s), and
+    /// from then on the screen writes more than half of it. The slow-link cell
+    /// above has the same shape (its first refusal runs under the 3 Mbit/s
+    /// opening and is not taken, the later ones run under the clamp and are),
+    /// so no test against the target a window ran with can tell the two
+    /// apart. That is the finding, pinned here so a change shows. V3 with a
+    /// flat age writes 55 % or more of its target by construction.
+    #[test]
+    fn the_screens_families_on_r1_r2_and_the_plan_limited_test() {
+        let pass = |v: &Screen, law: Law| {
+            let r = screen(*v, law);
+            r.opens_at_nominal() && v.prior.is_none_or(|p| r.floor.is_some_and(|f| f >= p))
+        };
+        let mut v1 = Vec::new();
+        let mut v2 = Vec::new();
+        let mut v3 = Vec::new();
+        let mut v3_flat = Vec::new();
+        for busy in [false, true] {
+            for len in [3u32, 4, 5] {
+                for prior in [None, Some(2_200_000u32)] {
+                    let at = |content, offer_pct, depth_pct, age| Screen {
+                        content,
+                        offer_pct,
+                        depth_pct,
+                        len,
+                        age,
+                        busy,
+                        prior,
+                    };
+                    for content in [40_000u32, 300_000] {
+                        for depth_pct in [88u32, 90, 92, 95, 98] {
+                            for age in [ScreenAge::Grows, ScreenAge::Absent] {
+                                v1.push(at(content, None, depth_pct, age));
+                            }
+                        }
+                        for depth_pct in [0u32, 20, 50, 70, 80, 85, 88] {
+                            for age in [ScreenAge::Flat, ScreenAge::Creeps] {
+                                v2.push(at(content, None, depth_pct, age));
+                            }
+                        }
+                    }
+                    for offer_pct in [55u32, 80] {
+                        for depth_pct in [80u32, 85, 90, 95] {
+                            for age in [ScreenAge::Grows, ScreenAge::Absent] {
+                                v3.push(at(40_000, Some(offer_pct), depth_pct, age));
+                            }
+                            v3_flat.push(at(40_000, Some(offer_pct), depth_pct, ScreenAge::Flat));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            (v1.len(), v2.len(), v3.len(), v3_flat.len()),
+            (240, 336, 192, 96)
+        );
+        let red = |vs: &[Screen], law: Law| -> Vec<Screen> {
+            vs.iter().copied().filter(|v| !pass(v, law)).collect()
+        };
+        for (name, vs) in [("V1", &v1), ("V3", &v3)] {
+            assert!(red(vs, Law::BeforeR3).is_empty(), "{name} on R1 + R2");
+            assert!(red(vs, Law::Now).is_empty(), "{name} with R3");
+        }
+        let before = red(&v2, Law::BeforeR3);
+        let now = red(&v2, Law::Now);
+        assert_eq!((before.len(), now.len()), (84, 42));
+        // R3 clears the 40 kbit/s screen, and nothing it did not see red.
+        assert!(now.iter().all(|v| v.content == 300_000), "{now:#?}");
+        let as_300 = |v: &Screen| Screen {
+            content: 300_000,
+            ..*v
+        };
+        for v in &before {
+            assert_eq!(now.contains(v), v.content == 300_000, "{v:?}");
+            if v.content == 40_000 {
+                // Its 300 kbit/s twin is the one that stays red.
+                assert!(!pass(&as_300(v), Law::Now), "{v:?}");
+            }
+        }
+        assert_eq!(red(&v3_flat, Law::BeforeR3).len(), 20);
+        assert_eq!(red(&v3_flat, Law::Now).len(), 20);
     }
 
     /// FR-148 P0 — what the line reads on a healthy session: the jupiter replay

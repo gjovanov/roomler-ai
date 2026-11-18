@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-148 P1 step 2 — the pair memory stores the path model, under a key that
-//! names the path (spec §8, D22 to D26). Pure: no clock read, no I/O but the
-//! file's own load and save.
+//! FR-148 P1 steps 2 to 4 — the pair memory stores the path model, under a
+//! key that names the path, and under `on` the opener reads it (spec §8, D22
+//! to D28). Pure: no clock read, no I/O but the file's own load and save.
 //!
 //! | Part | What it is |
 //! |---|---|
 //! | the key ([`pair_key`]) | `v2|<carrier>|u:<controlling user>|<viewer network>`. The relay worker's address is not in it (AC8) |
-//! | the file ([`PathMemory`]) | `path_memory.json`, beside today's `rate_memory.json`, which is written exactly as before |
+//! | the file ([`PathMemory`]) | `path_memory.json`, beside today's `rate_memory.json`, which is written exactly as before; one lock in the process around its read-modify-write ([`PathMemory::update`]) |
 //! | an entry ([`PairEntry`]) | the model's floor, and a push-back record of its own (D25) |
-//! | the session ([`SessionMemory`]) | the floor law from the entry's floor, and the record, fed only by valid windows (D24) |
+//! | the session ([`SessionMemory`]) | the floor law from the entry's floor, and the record, fed only by counted samples of valid windows (D24, R1 to R3) |
 //! | the close ([`close`]) | what a session writes, case by case, and why |
-//! | the opening ([`model_opening`]) | what the model WOULD open at. In this step only the open line reads it |
+//! | the opening ([`model_opening`]) | what the model opens at (D25) and whether the slow-link profile engages (D26) |
+//! | the decision ([`Taken`], [`OpenPlan`]) | which rule opens the session: the model's under `on` with a key and a fresh entry, else today's, and why |
 //!
-//! ⚠️ Nothing here drives a rate in this step: the opener reads today's
-//! `rate_memory.json` in every mode (D28).
+//! ⚠️ Under `off` and `shadow` (the default, D28) nothing here drives a rate:
+//! the opener reads today's `rate_memory.json`, byte for byte.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use super::ceiling_learn::{CONTRADICTION_FACTOR, SEED_PCT};
 use super::pipe::{Basis, PathModel};
+use super::pipe_state::PipeState;
 use crate::session_carrier::{CandidateKind, SessionCarrier};
 
 /// The model's own file, in the directory of `rate_memory.json`. An earlier
@@ -496,7 +499,37 @@ impl PathMemory {
         std::fs::write(&tmp, self.to_bytes())?;
         std::fs::rename(&tmp, path)
     }
+
+    /// Read the file, change it and save it, under the one lock this process
+    /// holds for it. Two pumps that end at once would otherwise write the
+    /// same temp sibling, and the later save would drop the key the earlier
+    /// one wrote. Two sessions of ONE key still end as the later close says.
+    ///
+    /// It saves only when the read succeeded or found no file. Any other read
+    /// error is returned, the change is not made and the file stays as it
+    /// is: on Windows a scanner or a backup can hold the file without read
+    /// sharing for a moment, and a save from an empty memory then would drop
+    /// every other pair's entry (`a_file_held_without_read_sharing_keeps_every_other_key`).
+    /// A file that reads but does not parse is an empty memory, as at the
+    /// open, and the save replaces it.
+    pub fn update(
+        path: &Path,
+        now_unix: u64,
+        change: impl FnOnce(&mut PathMemory),
+    ) -> std::io::Result<()> {
+        let _held = FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut memory = match std::fs::read(path) {
+            Ok(bytes) => Self::parse(&bytes, now_unix),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e),
+        };
+        change(&mut memory);
+        memory.save(path)
+    }
 }
+
+/// The lock around [`PathMemory::update`]: one per process (ruling 2).
+static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The file's location: the directory of `rate_memory.json`.
 pub fn default_path() -> Option<PathBuf> {
@@ -525,8 +558,8 @@ pub struct ModelOpening {
 /// ```
 ///
 /// No entry, an expired floor, or an entry that failed its check (it is not
-/// in the memory then): O = N and no profile. In this step only the open line
-/// calls it.
+/// in the memory then): O = N and no profile. The open line logs it in every
+/// mode; under `on` it decides the opening ([`Taken`]).
 pub fn model_opening(
     nominal: u32,
     hi: u32,
@@ -559,8 +592,225 @@ pub fn model_opening(
 }
 
 // ---------------------------------------------------------------------------
+// Which rule opens the session (step 3)
+// ---------------------------------------------------------------------------
+
+/// FR-148 P1 step 3 — what a constrained FFmpeg-pump session opens from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenPlan {
+    /// Today's rule: the measured seed of `rate_memory.json`, if any (FR-35,
+    /// FR-59 P8). `off` and `shadow` always open from it.
+    Today(Option<u32>),
+    /// The model's (D25): the entry's floor D seeds the ceiling learner, the
+    /// shadow controller and the P0 model, so the ceiling at the first tick
+    /// is `max(N, min(⌊0.85·D⌋, hi))`; after a trusted push-back the session
+    /// opens at `open_at_bps`, which may sit under the nominal.
+    Model {
+        floor_bps: u32,
+        open_at_bps: Option<u32>,
+    },
+}
+
+impl OpenPlan {
+    /// The model's plan for `opening`, computed on `entry`.
+    pub fn model(entry: &PairEntry, opening: ModelOpening) -> Self {
+        OpenPlan::Model {
+            floor_bps: entry.floor.bps,
+            open_at_bps: opening.trusted.then_some(opening.bps),
+        }
+    }
+
+    /// `(seed, open_at)` as the governor takes them: the seed of the ceiling
+    /// learner, the shadow controller and the P0 model; and where the AIMD,
+    /// the first encoder and slow start open when that sits under the
+    /// ceiling.
+    ///
+    /// Today's is FR-59 P8 exactly: the seed when it is under the nominal
+    /// floor and the floor relief is on. The model's opening is taken as it
+    /// is, except that with the relief off one under the nominal floor is
+    /// lifted to it: the AIMD's floor would lift it at the first tick, and an
+    /// encoder opened under it would be rebuilt right there.
+    pub fn resolve(&self, floor_relief: bool) -> (Option<u32>, Option<u32>) {
+        let floor = super::MIN_BITRATE_BPS;
+        match *self {
+            OpenPlan::Today(seed) => (seed, seed.filter(|s| *s > 0 && *s < floor && floor_relief)),
+            OpenPlan::Model {
+                floor_bps,
+                open_at_bps,
+            } => (
+                Some(floor_bps),
+                open_at_bps.map(|o| if floor_relief { o } else { o.max(floor) }),
+            ),
+        }
+    }
+}
+
+/// Why today's rule opened the session: under `on`, why the model did not
+/// (ruling 3); under `shadow`, the switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodayWhy {
+    Shadow,
+    NoKey,
+    NoEntry,
+    EntryInvalid,
+    FloorExpired,
+}
+
+impl TodayWhy {
+    pub fn word(self) -> &'static str {
+        match self {
+            TodayWhy::Shadow => "shadow",
+            TodayWhy::NoKey => "no_key",
+            TodayWhy::NoEntry => "no_entry",
+            TodayWhy::EntryInvalid => "entry_invalid",
+            TodayWhy::FloorExpired => "floor_expired",
+        }
+    }
+}
+
+/// Which rule opened the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// The model's opening (D25) and profile (D26).
+    Model,
+    /// Today's rule, and why.
+    Today(TodayWhy),
+}
+
+impl Taken {
+    /// The model decides under `on` when the session has a key and its entry
+    /// is fresh and passed its check. Anything else opens by today's rule:
+    /// no entry, an entry dropped at the read (a bad value or a time ahead),
+    /// a floor older than its TTL, or no key.
+    pub fn decide(on: bool, keyed: bool, state: EntryState) -> Self {
+        let why = match state {
+            _ if !on => TodayWhy::Shadow,
+            _ if !keyed => TodayWhy::NoKey,
+            EntryState::Fresh => return Taken::Model,
+            EntryState::None => TodayWhy::NoEntry,
+            EntryState::Invalid | EntryState::Future => TodayWhy::EntryInvalid,
+            EntryState::Expired => TodayWhy::FloorExpired,
+        };
+        Taken::Today(why)
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Taken::Model => "model",
+            Taken::Today(_) => "today",
+        }
+    }
+
+    /// `-` for the model's; today's reason otherwise.
+    pub fn why(self) -> &'static str {
+        match self {
+            Taken::Model => "-",
+            Taken::Today(why) => why.word(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The session: what it measured, and what its close writes (D24, D25)
 // ---------------------------------------------------------------------------
+
+/// FR-148 P1 (R1) — could the classifier READ this window? The path memory has
+/// one kind of evidence that the path pushed back, a counted sample, and a
+/// sample counts only from a window whose state the classifier read: the
+/// sender's own counters said `Overproduced`, or an age split said anything
+/// else on an age that is a reading ([`super::viewer_rate::age_is_plausible`]).
+/// `Unknown` is a window it could not read (no age, or no arrival stamp, to
+/// split), and the gate accepts it. A `TransitStalled` verdict never reaches a
+/// sample: the gate rejects that window and the one after it.
+///
+/// Inside the session such a window still acts exactly as before: a wrong cut
+/// is undone in seconds. The memory's record stands for a day and decides the
+/// next opening, so it does not take one.
+pub fn window_read(state: PipeState, age_plausible: bool) -> bool {
+    match state {
+        PipeState::Unknown => false,
+        PipeState::Overproduced => true,
+        PipeState::Clear | PipeState::TransitStalled | PipeState::ViewerLate => age_plausible,
+    }
+}
+
+/// FR-148 P1 (R3) — the plan-limited test: was the sender pushing against its
+/// plan in this window? Yes when it wrote at least half the target the window
+/// ran with (`sent_bps`, `target_bps`), and in any window the classifier calls
+/// `Overproduced`, whose own counters show the sender pushing against the path
+/// (what it wrote there is what the path took, not what the encoder made). A
+/// target of 0, none applied yet, passes.
+///
+/// A still screen writes tens of kbit/s under a target of megabits. What
+/// arrives then measures the screen, not the path, and with a viewer whose
+/// paint age stays flat while its link report says the queue grows (R3's V2,
+/// `governor::tests::the_screens_families_on_r1_r2_and_the_plan_limited_test`) the
+/// classifier reads such a window `Clear`: before this test a still screen's
+/// slowdowns left a trusted record at a few hundred kbit/s.
+pub fn pushing_against_plan(state: PipeState, sent_bps: u32, target_bps: u32) -> bool {
+    state == PipeState::Overproduced || u64::from(sent_bps) * 2 >= u64::from(target_bps)
+}
+
+/// FR-148 P1 — the classifier's state of the window a sample came from. Once
+/// the gate, the read test and the viewer test have spoken, two are left
+/// (`TransitStalled` never reaches a sample: the gate rejects that window and
+/// the one after it). The close line counts the counted samples of each, a
+/// measurement for the open class (spec §9, O7), not a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// The sender's own counters: its queue at the budget, a skipped frame, a
+    /// blocked send or a send that waited 100 ms or more.
+    Overproduced,
+    /// The age split read no stall and no late browser: the transit share
+    /// moved by under 200 ms, so only the viewer's link report said that the
+    /// queue grew.
+    Clear,
+}
+
+/// FR-148 P1 — what the pair memory takes from a push-back in a valid window.
+/// One definition of counted evidence: a sample counts only from a window the
+/// classifier read (R1) and did not blame on the viewer, in which the sender
+/// pushed against its plan (R3), and then only when D25's test counts it.
+/// Inside the session every push-back acts exactly as before, whatever this
+/// says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// A sample, from a window read as [`Read`]: D25 counts it, or calls it a
+    /// dip.
+    Sample(Read),
+    /// R1 — the classifier could not read the window ([`window_read`]).
+    Unread,
+    /// The classifier blamed the window on the viewer (`ViewerLate`: the
+    /// browser's share of the age grew, or it reported `struggling`). The key
+    /// names the path (the carrier, the user and the viewer's network), not
+    /// the viewer's device, so such a window is not a reading of the path: a
+    /// record from it would slow the same user's other devices on that
+    /// network.
+    ViewerLate,
+    /// R3 — the sender wrote under half its target ([`pushing_against_plan`]).
+    UnderPlan,
+}
+
+impl Take {
+    /// The window's verdict: R1 first, then the viewer, then R3.
+    pub fn of(state: PipeState, age_plausible: bool, sent_bps: u32, target_bps: u32) -> Self {
+        if !window_read(state, age_plausible) {
+            return Take::Unread;
+        }
+        let read = match state {
+            PipeState::ViewerLate => return Take::ViewerLate,
+            PipeState::Overproduced => Read::Overproduced,
+            // `Unknown` is unread (above), and the gate rejects a
+            // `TransitStalled` window, so no sample comes from either.
+            PipeState::Clear | PipeState::TransitStalled | PipeState::Unknown => Read::Clear,
+        };
+        if pushing_against_plan(state, sent_bps, target_bps) {
+            Take::Sample(read)
+        } else {
+            Take::UnderPlan
+        }
+    }
+}
 
 /// The samples a session counted itself, since the last end of the record.
 #[derive(Debug, Clone, Copy)]
@@ -585,6 +835,23 @@ pub struct SessionMemory {
     best: Option<(u32, Basis)>,
     /// Backlogged push-backs under half of `best`: dips, not counted.
     not_counted: u32,
+    /// R1 — backlogged push-backs from windows the classifier could not read
+    /// ([`window_read`]): never offered to the record.
+    unread: u32,
+    /// Backlogged push-backs from windows the classifier blamed on the viewer
+    /// ([`Take::ViewerLate`]): never offered to the record.
+    viewer_late: u32,
+    /// R3 — backlogged push-backs from windows where the sender wrote under
+    /// half its target ([`pushing_against_plan`]): never offered to the record.
+    under_plan: u32,
+    /// R2 — counted samples in the whole session, whether the record ended
+    /// since or not: the close lowers a remembered floor only when this is
+    /// above zero.
+    counted: u32,
+    /// The counted samples by the state of their window ([`Read`]): they sum
+    /// to `counted`.
+    counted_overproduced: u32,
+    counted_clear: u32,
     /// A delivery ended the record in this session.
     ended: bool,
     /// A valid window gave any measured reading.
@@ -593,6 +860,14 @@ pub struct SessionMemory {
     /// record", to show the governor cell fails on it.
     #[cfg(test)]
     end_above_floor: bool,
+    /// Test only: master's law before R1, every push-back offered to the
+    /// record, to show the screen's cell fails on it.
+    #[cfg(test)]
+    read_any: bool,
+    /// Test only: the law before R3, a push-back under the plan offered to the
+    /// record, to show the screen's families fail on it.
+    #[cfg(test)]
+    plan_any: bool,
 }
 
 /// What a close would write, taken at a viewer window.
@@ -605,8 +880,22 @@ pub struct Closing {
     pub record: Option<PushBack>,
     pub best: Option<(u32, FloorBasis)>,
     pub not_counted: u32,
+    /// R1 — samples from windows the classifier could not read.
+    pub unread: u32,
+    /// Samples from windows the classifier blamed on the viewer.
+    pub viewer_late: u32,
+    /// R3 — samples from windows where the sender wrote under half its target.
+    pub under_plan: u32,
+    /// R2 — counted samples in the whole session.
+    pub counted: u32,
+    /// The counted samples from `Overproduced` windows and from `Clear` ones
+    /// (QR3's measurement of the open class): they sum to `counted`.
+    pub counted_overproduced: u32,
+    pub counted_clear: u32,
     pub ended: bool,
     pub measured: bool,
+    /// The Unix second this was taken: the close reads the entry's TTL at it.
+    pub at_unix: u64,
 }
 
 /// `at`, `now` and `now_unix` read together: `at`'s Unix second.
@@ -621,6 +910,10 @@ impl SessionMemory {
         *self = Self {
             #[cfg(test)]
             end_above_floor: self.end_above_floor,
+            #[cfg(test)]
+            read_any: self.read_any,
+            #[cfg(test)]
+            plan_any: self.plan_any,
             ..Self::default()
         };
         if let Some(e) = entry.filter(|e| e.fresh(now_unix)) {
@@ -678,7 +971,14 @@ impl SessionMemory {
     /// A push-back in a valid window. Backlogged, it is a sample, which counts
     /// when it is at least half of the highest delivery so far; an
     /// application-limited one is a delivery.
-    pub fn pushed_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+    ///
+    /// R2 — only a counted sample moves the floor. A dip moved it before R2,
+    /// so a still screen's dip under a remembered 2.2 Mbit/s floor was written
+    /// as the pair's floor (`a_quiet_session_keeps_the_remembered_floor`).
+    ///
+    /// `read` is the state of the sample's window; a counted sample is counted
+    /// under it too.
+    pub fn pushed_back(&mut self, bps: u32, basis: Basis, read: Read, now: Instant) {
         match basis {
             Basis::Assumed => {}
             Basis::AppLimited => self.delivered(bps, basis, now),
@@ -688,6 +988,13 @@ impl SessionMemory {
                     u64::from(bps) * u64::from(CONTRADICTION_FACTOR) >= u64::from(b)
                 });
                 if counts {
+                    self.counted = self.counted.saturating_add(1);
+                    match read {
+                        Read::Overproduced => {
+                            self.counted_overproduced = self.counted_overproduced.saturating_add(1);
+                        }
+                        Read::Clear => self.counted_clear = self.counted_clear.saturating_add(1),
+                    }
                     self.own = Some(match self.own {
                         Some(o) => Own {
                             bps: o.bps.max(bps),
@@ -702,12 +1009,41 @@ impl SessionMemory {
                             windows: 1,
                         },
                     });
+                    self.floor.pushed_back(bps, basis, now);
                 } else {
                     self.not_counted = self.not_counted.saturating_add(1);
                 }
-                self.floor.pushed_back(bps, basis, now);
             }
             Basis::Backlogged => {}
+        }
+    }
+
+    /// A push-back in a valid window, as the window's [`Take`] says. A sample
+    /// goes to [`Self::pushed_back`]. One from a window the classifier could
+    /// not read (R1) or blamed on the viewer, or in which the sender wrote
+    /// under half its target (R3), is counted for the close line and nothing
+    /// more: it moves neither the record nor the floor, and its bytes already
+    /// reached [`Self::delivered`] as the same window's delivery.
+    pub fn pushed_back_in(&mut self, bps: u32, basis: Basis, take: Take, now: Instant) {
+        // The test laws' samples are filed as `Clear`: no split is read
+        // under them.
+        #[cfg(test)]
+        let take = match take {
+            Take::Unread if self.read_any => Take::Sample(Read::Clear),
+            Take::UnderPlan if self.plan_any => Take::Sample(Read::Clear),
+            take => take,
+        };
+        let backlogged = basis == Basis::Backlogged && bps > 0;
+        match take {
+            Take::Sample(read) => self.pushed_back(bps, basis, read, now),
+            Take::Unread if backlogged => self.unread = self.unread.saturating_add(1),
+            Take::ViewerLate if backlogged => {
+                self.viewer_late = self.viewer_late.saturating_add(1);
+            }
+            Take::UnderPlan if backlogged => {
+                self.under_plan = self.under_plan.saturating_add(1);
+            }
+            Take::Unread | Take::ViewerLate | Take::UnderPlan => {}
         }
     }
 
@@ -750,8 +1086,15 @@ impl SessionMemory {
                 .best
                 .and_then(|(bps, b)| FloorBasis::of(b).map(|b| (bps, b))),
             not_counted: self.not_counted,
+            unread: self.unread,
+            viewer_late: self.viewer_late,
+            under_plan: self.under_plan,
+            counted: self.counted,
+            counted_overproduced: self.counted_overproduced,
+            counted_clear: self.counted_clear,
             ended: self.ended,
             measured: self.measured,
+            at_unix: now_unix,
         }
     }
 
@@ -766,6 +1109,20 @@ impl SessionMemory {
     #[cfg(test)]
     pub(crate) fn set_end_above_floor(&mut self) {
         self.end_above_floor = true;
+    }
+
+    /// Test only: offer every push-back to the record, read window or not, as
+    /// master did before R1.
+    #[cfg(test)]
+    pub(crate) fn set_read_any(&mut self) {
+        self.read_any = true;
+    }
+
+    /// Test only: offer a push-back under the plan to the record, as the law
+    /// did before R3.
+    #[cfg(test)]
+    pub(crate) fn set_plan_any(&mut self) {
+        self.plan_any = true;
     }
 }
 
@@ -788,6 +1145,15 @@ pub enum Why {
     /// The session had no key (`NoKey`). With the switch `off` there is no
     /// close line at all.
     NoKey,
+    /// R2 — the session's floor equals the entry's: written, so its age is
+    /// the session's.
+    Refreshed,
+    /// R2 — the session's floor is under the entry's and the session counted
+    /// no push-back sample: the entry's floor stands, with its own age.
+    FloorKept,
+    /// R2 — the entry's floor passed its TTL during the session: the
+    /// session's floor is written whatever it is, as before R2.
+    FloorExpired,
 }
 
 impl Why {
@@ -800,6 +1166,9 @@ impl Why {
             Why::PushedBack => "pushed_back",
             Why::CarrierFlipped => "carrier_flipped",
             Why::NoKey => "no_key",
+            Why::Refreshed => "refreshed",
+            Why::FloorKept => "floor_kept",
+            Why::FloorExpired => "floor_expired",
         }
     }
 }
@@ -807,28 +1176,44 @@ impl Why {
 /// The close, case by case: the entry to write (`None` = write nothing) and
 /// why. `entry` is the fresh entry the session opened from.
 ///
-/// | What the session measured | floor | record |
-/// |---|---|---|
-/// | nothing in a valid window | not written | not written |
-/// | only readings at or below the remembered floor | the entry's, untouched | the entry's, with any counted sample |
-/// | a delivery above the floor, or no entry yet | the highest, with its class and time | kept, unless it delivered over twice the record's rate |
-/// | a backlogged push-back | damped from the floor, `backlogged` | the sample, if it counted |
+/// R2 — a floor is a lower bound on what the path carries, and lower bounds
+/// combine by maximum: inside the entry's TTL, read at [`Closing::at_unix`],
+/// the session's floor replaces a higher one only when the session counted a
+/// push-back sample.
+///
+/// | What the session measured | floor | record | `why` |
+/// |---|---|---|---|
+/// | nothing in a valid window | not written | not written | `nothing_measured` |
+/// | only readings at or below the remembered floor | the entry's, untouched | the entry's, with any counted sample | `remembered_only` |
+/// | no entry yet | the session's, with its class and time | the session's | `first_measurement` |
+/// | a floor above the entry's | the session's | kept, unless it delivered over twice the record's rate | `raised` |
+/// | a floor equal to the entry's | the session's, so its age is the session's | as above | `refreshed` |
+/// | a floor under the entry's, and a counted sample | the session's: damped from the floor by counted samples only, `backlogged` | the samples | `pushed_back` |
+/// | a floor under the entry's, nothing counted | the entry's, with its own age | as above | `floor_kept` |
+/// | any floor, the entry's past its TTL | the session's, as before R2 | as above | `floor_expired` |
 pub fn close(entry: Option<&PairEntry>, c: &Closing) -> (Option<PairEntry>, Why) {
     if !c.measured {
         return (None, Why::NothingMeasured);
     }
-    let Some(floor) = c.floor.or(entry.map(|e| e.floor)) else {
-        return (None, Why::NothingMeasured);
+    let (floor, why) = match (c.floor, entry) {
+        (None, None) => return (None, Why::NothingMeasured),
+        (None, Some(e)) => (e.floor, Why::RememberedOnly),
+        (Some(f), None) => (f, Why::FirstMeasurement),
+        (Some(f), Some(e)) if !e.fresh(c.at_unix) => (f, Why::FloorExpired),
+        (Some(f), Some(e)) if f.bps > e.floor.bps => (f, Why::Raised),
+        (Some(f), Some(e)) if f.bps == e.floor.bps => (
+            Floor {
+                at_unix: f.at_unix.max(e.floor.at_unix),
+                ..f
+            },
+            Why::Refreshed,
+        ),
+        (Some(f), Some(_)) if c.counted > 0 => (f, Why::PushedBack),
+        (Some(_), Some(e)) => (e.floor, Why::FloorKept),
     };
     let next = PairEntry {
         floor,
         push_back: c.record,
-    };
-    let why = match (c.floor, entry) {
-        (None, _) => Why::RememberedOnly,
-        (Some(_), None) => Why::FirstMeasurement,
-        (Some(f), Some(e)) if f.bps < e.floor.bps => Why::PushedBack,
-        (Some(_), Some(_)) => Why::Raised,
     };
     if entry == Some(&next) {
         return (None, why);
@@ -1156,6 +1541,70 @@ mod tests {
         assert_eq!(master.seed_for("later", NOW), Some(2_000_000), "master");
     }
 
+    /// Ruling 2: pumps that end at once each keep their key. Eight threads,
+    /// started together, each write twenty keys of their own through
+    /// [`PathMemory::update`]; the file ends with all 160. Without the lock
+    /// two saves share the temp sibling and a load-then-save drops the other
+    /// thread's key (the red run lost keys or failed a save).
+    #[test]
+    fn pumps_that_end_at_once_each_keep_their_key() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let (threads, rounds) = (8, 20);
+        let start = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (path, start) = (path.clone(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..rounds)
+                        .map(|r| {
+                            PathMemory::update(&path, NOW, |m| {
+                                m.write(&format!("k{t}-{r}"), entry(2_000_000, NOW), NOW);
+                            })
+                            .is_ok()
+                        })
+                        .filter(|ok| !ok)
+                        .count()
+                })
+            })
+            .collect();
+        let failed: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(failed, 0, "every save went through");
+        let memory = PathMemory::load(&path, NOW);
+        assert_eq!(memory.pairs.len(), threads * rounds);
+        assert!(memory.dropped.is_empty());
+    }
+
+    /// The review's probe (finding 3): on Windows a scanner or a backup holds
+    /// `path_memory.json` without read sharing for a moment, and lets go
+    /// before the save's rename. The close's read fails (OS error 32), and the
+    /// close must then leave the file as it is: before the fix it saved a
+    /// memory holding only its own key, and every other pair's entry was gone.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_without_read_sharing_keeps_every_other_key() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        PathMemory::update(&path, NOW, |m| m.write("a", entry(2_000_000, NOW), NOW)).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let written = PathMemory::update(&path, NOW, move |m| {
+            // The holder lets go before the save.
+            drop(held);
+            m.write("b", entry(1_000_000, NOW), NOW);
+        });
+        let keys: Vec<String> = PathMemory::load(&path, NOW).pairs.into_keys().collect();
+        assert_eq!(keys, ["a"], "the other pair's entry is kept");
+        let e = written.expect_err("the read failed, so nothing was saved");
+        assert_eq!(e.raw_os_error(), Some(32), "{e}");
+    }
+
     /// A version other than 1, or a file that is not this shape, is an empty
     /// memory; unknown fields are ignored.
     #[test]
@@ -1343,7 +1792,7 @@ mod tests {
             now = start + Duration::from_secs(s);
             m.delivered(bps, Basis::of_window(refused), now);
             if refused {
-                m.pushed_back(bps, Basis::Backlogged, now);
+                m.pushed_back(bps, Basis::Backlogged, Read::Clear, now);
             }
         }
         let end = now + Duration::from_secs(1);
@@ -1513,6 +1962,212 @@ mod tests {
             super::super::rate_memory::damp(2_200_000, 400_000)
         );
         assert_eq!(wrote(Some(&e), Some(&next)), "floor_and_push_back");
+    }
+
+    // --- the floor as a maximum inside its TTL (R2) -------------------------
+
+    /// FR-148 P1 (R2) — a quiet session after a remembered 2.2 Mbit/s floor:
+    /// a still screen delivers 300 kbit/s, and three windows push back at
+    /// 120 kbit/s, under half of that, so none counts. Before R2 each dip
+    /// damped the floor and the close wrote what was left as `pushed_back`. A
+    /// floor is a lower bound on what the path carries, and it falls only on
+    /// counted evidence: the remembered 2.2 M stands, with its own age.
+    #[test]
+    fn a_quiet_session_keeps_the_remembered_floor() {
+        let e = entry(2_200_000, NOW - 86_400);
+        let (_, c) = session(
+            Some(&e),
+            NOW,
+            &[
+                (1, 300_000, false),
+                (5, 120_000, true),
+                (9, 120_000, true),
+                (13, 120_000, true),
+                (17, 300_000, false),
+            ],
+            SessionMemory::default(),
+        );
+        assert_eq!((c.counted, c.not_counted), (0, 3));
+        assert_eq!(c.floor, None, "the remembered floor stands");
+        assert_eq!(close(Some(&e), &c), (None, Why::RememberedOnly));
+    }
+
+    /// R2 — a session with counted push-back under the remembered floor
+    /// lowers it, by its counted samples only: the dips beside them move
+    /// nothing.
+    #[test]
+    fn a_counted_push_back_lowers_the_floor_and_a_dip_beside_it_does_not() {
+        let e = entry(2_200_000, NOW - 86_400);
+        let (_, c) = session(
+            Some(&e),
+            NOW,
+            &[
+                (1, 300_000, false),
+                // Counts: twice 200 k is at least the best, 300 k.
+                (5, 200_000, true),
+                // Dips: twice 120 k is under it.
+                (9, 120_000, true),
+                (13, 120_000, true),
+            ],
+            SessionMemory::default(),
+        );
+        assert_eq!((c.counted, c.not_counted), (1, 2));
+        let (next, why) = close(Some(&e), &c);
+        assert_eq!(why, Why::PushedBack);
+        let floor = next.expect("written").floor;
+        assert_eq!(
+            (floor.bps, floor.basis),
+            (
+                super::super::rate_memory::damp(2_200_000, 200_000),
+                FloorBasis::Backlogged
+            )
+        );
+    }
+
+    /// R2 at the close, against a remembered 2.2 Mbit/s floor a day old: the
+    /// session's floor replaces it when it is higher, or equal (the age is
+    /// then the session's), and a lower one replaces it only when the session
+    /// counted a push-back sample; otherwise the entry's floor stands with its
+    /// own age, and nothing is written. Past the floor's TTL the session's
+    /// floor is written whatever it is, as before R2.
+    #[test]
+    fn the_close_keeps_the_higher_floor_inside_its_ttl() {
+        let e = entry(2_200_000, NOW - 86_400);
+        let closing = |bps: u32, counted: u32, at_unix: u64| Closing {
+            floor: Some(Floor {
+                bps,
+                basis: FloorBasis::Backlogged,
+                at_unix: at_unix - 5,
+            }),
+            record: None,
+            best: Some((bps, FloorBasis::AppLimited)),
+            not_counted: 0,
+            unread: 0,
+            viewer_late: 0,
+            under_plan: 0,
+            counted,
+            counted_overproduced: 0,
+            counted_clear: counted,
+            ended: false,
+            measured: true,
+            at_unix,
+        };
+        let floor = |bps: u32, at_unix: u64| Floor {
+            bps,
+            basis: FloorBasis::Backlogged,
+            at_unix,
+        };
+        let written = |c: &Closing| {
+            let (next, why) = close(Some(&e), c);
+            (next.map(|n| n.floor), why)
+        };
+        // Higher.
+        assert_eq!(
+            written(&closing(3_000_000, 0, NOW)),
+            (Some(floor(3_000_000, NOW - 5)), Why::Raised)
+        );
+        // Equal: written, so the age is the session's.
+        assert_eq!(
+            written(&closing(2_200_000, 0, NOW)),
+            (Some(floor(2_200_000, NOW - 5)), Why::Refreshed)
+        );
+        // Lower, with a counted sample.
+        assert_eq!(
+            written(&closing(1_500_000, 1, NOW)),
+            (Some(floor(1_500_000, NOW - 5)), Why::PushedBack)
+        );
+        // Lower, nothing counted: the entry stands, so nothing is written.
+        assert_eq!(written(&closing(120_000, 0, NOW)), (None, Why::FloorKept));
+        // The same past the floor's TTL: the session's floor is written.
+        let past = e.floor.at_unix + FLOOR_TTL.as_secs() + 1;
+        assert_eq!(
+            written(&closing(120_000, 0, past)),
+            (Some(floor(120_000, past - 5)), Why::FloorExpired)
+        );
+        // On the last second of the TTL the entry still stands.
+        let last = e.floor.at_unix + FLOOR_TTL.as_secs();
+        assert_eq!(written(&closing(120_000, 0, last)), (None, Why::FloorKept));
+        // Kept with a record that ended: the entry's floor, and no record.
+        let with_record = PairEntry {
+            push_back: Some(PushBack {
+                bps: 56_000,
+                at_unix: NOW - 60,
+                first_at_unix: NOW - 90,
+                windows: 2,
+            }),
+            ..e
+        };
+        let ended = Closing {
+            ended: true,
+            ..closing(120_000, 0, NOW)
+        };
+        let (next, why) = close(Some(&with_record), &ended);
+        assert_eq!(why, Why::FloorKept);
+        assert_eq!(next, Some(e), "the entry's floor, its record gone");
+        assert_eq!(wrote(Some(&with_record), next.as_ref()), "push_back");
+    }
+
+    /// FR-148 P1 (QR3) — a counted sample is counted under the state of its
+    /// window, `Overproduced` or `Clear`, and the two sum to `counted`; a dip
+    /// is counted under neither. A window the classifier blames on the viewer
+    /// is not a reading of the path: its push-back is counted as
+    /// `viewer_late`, moves neither the record nor the floor, and a session of
+    /// such windows alone leaves no record. The verdict's order is R1, the
+    /// viewer, R3.
+    #[test]
+    fn counted_samples_split_by_their_windows_state_and_a_late_viewer_reads_nothing() {
+        use PipeState::{Clear, Overproduced, Unknown, ViewerLate};
+        let (sent, under, target) = (2_000_000, 1_000_000, 3_000_000);
+        let cases = [
+            (Overproduced, false, under, Take::Sample(Read::Overproduced)),
+            (Overproduced, true, under, Take::Sample(Read::Overproduced)),
+            (Clear, true, sent, Take::Sample(Read::Clear)),
+            (Clear, true, under, Take::UnderPlan),
+            (Clear, false, sent, Take::Unread),
+            (ViewerLate, true, sent, Take::ViewerLate),
+            (ViewerLate, true, under, Take::ViewerLate),
+            (ViewerLate, false, sent, Take::Unread),
+            (Unknown, true, sent, Take::Unread),
+        ];
+        for (state, plausible, sent, take) in cases {
+            let got = Take::of(state, plausible, sent, target);
+            assert_eq!(got, take, "{state:?} plausible {plausible} sent {sent}");
+        }
+        let t = t0();
+        let at = |s: u64| t + Duration::from_secs(s);
+        let mut m = SessionMemory::default();
+        m.open(None, NOW, t);
+        m.delivered(1_000_000, Basis::AppLimited, at(1));
+        let back = Basis::Backlogged;
+        m.pushed_back_in(900_000, back, Take::Sample(Read::Overproduced), at(2));
+        m.pushed_back_in(800_000, back, Take::Sample(Read::Clear), at(5));
+        m.pushed_back_in(850_000, back, Take::Sample(Read::Overproduced), at(13));
+        // A dip: under half the best delivery.
+        m.pushed_back_in(300_000, back, Take::Sample(Read::Clear), at(14));
+        m.pushed_back_in(700_000, back, Take::ViewerLate, at(15));
+        m.pushed_back_in(600_000, back, Take::Unread, at(16));
+        m.pushed_back_in(650_000, back, Take::UnderPlan, at(17));
+        let c = m.closing(at(20), NOW + 20);
+        assert_eq!(
+            (c.counted, c.counted_overproduced, c.counted_clear),
+            (3, 2, 1)
+        );
+        assert_eq!(
+            (c.not_counted, c.viewer_late, c.unread, c.under_plan),
+            (1, 1, 1, 1)
+        );
+        let r = c.record.expect("the three counted samples");
+        assert_eq!((r.bps, r.windows), (900_000, 3));
+        // Late-viewer windows alone, four over 18 s: no record, the floor stands.
+        let mut late = SessionMemory::default();
+        late.open(None, NOW, t);
+        late.delivered(1_000_000, Basis::AppLimited, at(1));
+        for s in [2, 8, 14, 20] {
+            late.pushed_back_in(400_000, back, Take::ViewerLate, at(s));
+        }
+        let c = late.closing(at(21), NOW + 21);
+        assert_eq!((c.record, c.counted, c.viewer_late), (None, 0, 4));
+        assert_eq!(c.floor.map(|f| f.bps), Some(1_000_000));
     }
 
     // --- the opening (D25, D26) ---------------------------------------------
