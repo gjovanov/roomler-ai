@@ -609,6 +609,10 @@ pub struct SessionMemory {
     /// R1 — backlogged push-backs from windows the classifier could not read
     /// ([`window_read`]): never offered to the record.
     unread: u32,
+    /// R2 — counted samples in the whole session, whether the record ended
+    /// since or not: the close lowers a remembered floor only when this is
+    /// above zero.
+    counted: u32,
     /// A delivery ended the record in this session.
     ended: bool,
     /// A valid window gave any measured reading.
@@ -635,8 +639,12 @@ pub struct Closing {
     pub not_counted: u32,
     /// R1 — samples from windows the classifier could not read.
     pub unread: u32,
+    /// R2 — counted samples in the whole session.
+    pub counted: u32,
     pub ended: bool,
     pub measured: bool,
+    /// The Unix second this was taken: the close reads the entry's TTL at it.
+    pub at_unix: u64,
 }
 
 /// `at`, `now` and `now_unix` read together: `at`'s Unix second.
@@ -710,6 +718,10 @@ impl SessionMemory {
     /// A push-back in a valid window. Backlogged, it is a sample, which counts
     /// when it is at least half of the highest delivery so far; an
     /// application-limited one is a delivery.
+    ///
+    /// R2 — only a counted sample moves the floor. A dip moved it before R2,
+    /// so a still screen's dip under a remembered 2.2 Mbit/s floor was written
+    /// as the pair's floor (`a_quiet_session_keeps_the_remembered_floor`).
     pub fn pushed_back(&mut self, bps: u32, basis: Basis, now: Instant) {
         match basis {
             Basis::Assumed => {}
@@ -720,6 +732,7 @@ impl SessionMemory {
                     u64::from(bps) * u64::from(CONTRADICTION_FACTOR) >= u64::from(b)
                 });
                 if counts {
+                    self.counted = self.counted.saturating_add(1);
                     self.own = Some(match self.own {
                         Some(o) => Own {
                             bps: o.bps.max(bps),
@@ -734,10 +747,10 @@ impl SessionMemory {
                             windows: 1,
                         },
                     });
+                    self.floor.pushed_back(bps, basis, now);
                 } else {
                     self.not_counted = self.not_counted.saturating_add(1);
                 }
-                self.floor.pushed_back(bps, basis, now);
             }
             Basis::Backlogged => {}
         }
@@ -798,8 +811,10 @@ impl SessionMemory {
                 .and_then(|(bps, b)| FloorBasis::of(b).map(|b| (bps, b))),
             not_counted: self.not_counted,
             unread: self.unread,
+            counted: self.counted,
             ended: self.ended,
             measured: self.measured,
+            at_unix: now_unix,
         }
     }
 
@@ -843,6 +858,15 @@ pub enum Why {
     /// The session had no key (`NoKey`). With the switch `off` there is no
     /// close line at all.
     NoKey,
+    /// R2 — the session's floor equals the entry's: written, so its age is
+    /// the session's.
+    Refreshed,
+    /// R2 — the session's floor is under the entry's and the session counted
+    /// no push-back sample: the entry's floor stands, with its own age.
+    FloorKept,
+    /// R2 — the entry's floor passed its TTL during the session: the
+    /// session's floor is written whatever it is, as before R2.
+    FloorExpired,
 }
 
 impl Why {
@@ -855,6 +879,9 @@ impl Why {
             Why::PushedBack => "pushed_back",
             Why::CarrierFlipped => "carrier_flipped",
             Why::NoKey => "no_key",
+            Why::Refreshed => "refreshed",
+            Why::FloorKept => "floor_kept",
+            Why::FloorExpired => "floor_expired",
         }
     }
 }
@@ -862,28 +889,44 @@ impl Why {
 /// The close, case by case: the entry to write (`None` = write nothing) and
 /// why. `entry` is the fresh entry the session opened from.
 ///
-/// | What the session measured | floor | record |
-/// |---|---|---|
-/// | nothing in a valid window | not written | not written |
-/// | only readings at or below the remembered floor | the entry's, untouched | the entry's, with any counted sample |
-/// | a delivery above the floor, or no entry yet | the highest, with its class and time | kept, unless it delivered over twice the record's rate |
-/// | a backlogged push-back | damped from the floor, `backlogged` | the sample, if it counted |
+/// R2 — a floor is a lower bound on what the path carries, and lower bounds
+/// combine by maximum: inside the entry's TTL, read at [`Closing::at_unix`],
+/// the session's floor replaces a higher one only when the session counted a
+/// push-back sample.
+///
+/// | What the session measured | floor | record | `why` |
+/// |---|---|---|---|
+/// | nothing in a valid window | not written | not written | `nothing_measured` |
+/// | only readings at or below the remembered floor | the entry's, untouched | the entry's, with any counted sample | `remembered_only` |
+/// | no entry yet | the session's, with its class and time | the session's | `first_measurement` |
+/// | a floor above the entry's | the session's | kept, unless it delivered over twice the record's rate | `raised` |
+/// | a floor equal to the entry's | the session's, so its age is the session's | as above | `refreshed` |
+/// | a floor under the entry's, and a counted sample | the session's: damped from the floor by counted samples only, `backlogged` | the samples | `pushed_back` |
+/// | a floor under the entry's, nothing counted | the entry's, with its own age | as above | `floor_kept` |
+/// | any floor, the entry's past its TTL | the session's, as before R2 | as above | `floor_expired` |
 pub fn close(entry: Option<&PairEntry>, c: &Closing) -> (Option<PairEntry>, Why) {
     if !c.measured {
         return (None, Why::NothingMeasured);
     }
-    let Some(floor) = c.floor.or(entry.map(|e| e.floor)) else {
-        return (None, Why::NothingMeasured);
+    let (floor, why) = match (c.floor, entry) {
+        (None, None) => return (None, Why::NothingMeasured),
+        (None, Some(e)) => (e.floor, Why::RememberedOnly),
+        (Some(f), None) => (f, Why::FirstMeasurement),
+        (Some(f), Some(e)) if !e.fresh(c.at_unix) => (f, Why::FloorExpired),
+        (Some(f), Some(e)) if f.bps > e.floor.bps => (f, Why::Raised),
+        (Some(f), Some(e)) if f.bps == e.floor.bps => (
+            Floor {
+                at_unix: f.at_unix.max(e.floor.at_unix),
+                ..f
+            },
+            Why::Refreshed,
+        ),
+        (Some(f), Some(_)) if c.counted > 0 => (f, Why::PushedBack),
+        (Some(_), Some(e)) => (e.floor, Why::FloorKept),
     };
     let next = PairEntry {
         floor,
         push_back: c.record,
-    };
-    let why = match (c.floor, entry) {
-        (None, _) => Why::RememberedOnly,
-        (Some(_), None) => Why::FirstMeasurement,
-        (Some(f), Some(e)) if f.bps < e.floor.bps => Why::PushedBack,
-        (Some(_), Some(_)) => Why::Raised,
     };
     if entry == Some(&next) {
         return (None, why);
@@ -1568,6 +1611,145 @@ mod tests {
             super::super::rate_memory::damp(2_200_000, 400_000)
         );
         assert_eq!(wrote(Some(&e), Some(&next)), "floor_and_push_back");
+    }
+
+    // --- the floor as a maximum inside its TTL (R2) -------------------------
+
+    /// FR-148 P1 (R2) — a quiet session after a remembered 2.2 Mbit/s floor:
+    /// a still screen delivers 300 kbit/s, and three windows push back at
+    /// 120 kbit/s, under half of that, so none counts. Before R2 each dip
+    /// damped the floor and the close wrote what was left as `pushed_back`. A
+    /// floor is a lower bound on what the path carries, and it falls only on
+    /// counted evidence: the remembered 2.2 M stands, with its own age.
+    #[test]
+    fn a_quiet_session_keeps_the_remembered_floor() {
+        let e = entry(2_200_000, NOW - 86_400);
+        let (_, c) = session(
+            Some(&e),
+            NOW,
+            &[
+                (1, 300_000, false),
+                (5, 120_000, true),
+                (9, 120_000, true),
+                (13, 120_000, true),
+                (17, 300_000, false),
+            ],
+            SessionMemory::default(),
+        );
+        assert_eq!((c.counted, c.not_counted), (0, 3));
+        assert_eq!(c.floor, None, "the remembered floor stands");
+        assert_eq!(close(Some(&e), &c), (None, Why::RememberedOnly));
+    }
+
+    /// R2 — a session with counted push-back under the remembered floor
+    /// lowers it, by its counted samples only: the dips beside them move
+    /// nothing.
+    #[test]
+    fn a_counted_push_back_lowers_the_floor_and_a_dip_beside_it_does_not() {
+        let e = entry(2_200_000, NOW - 86_400);
+        let (_, c) = session(
+            Some(&e),
+            NOW,
+            &[
+                (1, 300_000, false),
+                // Counts: twice 200 k is at least the best, 300 k.
+                (5, 200_000, true),
+                // Dips: twice 120 k is under it.
+                (9, 120_000, true),
+                (13, 120_000, true),
+            ],
+            SessionMemory::default(),
+        );
+        assert_eq!((c.counted, c.not_counted), (1, 2));
+        let (next, why) = close(Some(&e), &c);
+        assert_eq!(why, Why::PushedBack);
+        let floor = next.expect("written").floor;
+        assert_eq!(
+            (floor.bps, floor.basis),
+            (
+                super::super::rate_memory::damp(2_200_000, 200_000),
+                FloorBasis::Backlogged
+            )
+        );
+    }
+
+    /// R2 at the close, against a remembered 2.2 Mbit/s floor a day old: the
+    /// session's floor replaces it when it is higher, or equal (the age is
+    /// then the session's), and a lower one replaces it only when the session
+    /// counted a push-back sample; otherwise the entry's floor stands with its
+    /// own age, and nothing is written. Past the floor's TTL the session's
+    /// floor is written whatever it is, as before R2.
+    #[test]
+    fn the_close_keeps_the_higher_floor_inside_its_ttl() {
+        let e = entry(2_200_000, NOW - 86_400);
+        let closing = |bps: u32, counted: u32, at_unix: u64| Closing {
+            floor: Some(Floor {
+                bps,
+                basis: FloorBasis::Backlogged,
+                at_unix: at_unix - 5,
+            }),
+            record: None,
+            best: Some((bps, FloorBasis::AppLimited)),
+            not_counted: 0,
+            unread: 0,
+            counted,
+            ended: false,
+            measured: true,
+            at_unix,
+        };
+        let floor = |bps: u32, at_unix: u64| Floor {
+            bps,
+            basis: FloorBasis::Backlogged,
+            at_unix,
+        };
+        let written = |c: &Closing| {
+            let (next, why) = close(Some(&e), c);
+            (next.map(|n| n.floor), why)
+        };
+        // Higher.
+        assert_eq!(
+            written(&closing(3_000_000, 0, NOW)),
+            (Some(floor(3_000_000, NOW - 5)), Why::Raised)
+        );
+        // Equal: written, so the age is the session's.
+        assert_eq!(
+            written(&closing(2_200_000, 0, NOW)),
+            (Some(floor(2_200_000, NOW - 5)), Why::Refreshed)
+        );
+        // Lower, with a counted sample.
+        assert_eq!(
+            written(&closing(1_500_000, 1, NOW)),
+            (Some(floor(1_500_000, NOW - 5)), Why::PushedBack)
+        );
+        // Lower, nothing counted: the entry stands, so nothing is written.
+        assert_eq!(written(&closing(120_000, 0, NOW)), (None, Why::FloorKept));
+        // The same past the floor's TTL: the session's floor is written.
+        let past = e.floor.at_unix + FLOOR_TTL.as_secs() + 1;
+        assert_eq!(
+            written(&closing(120_000, 0, past)),
+            (Some(floor(120_000, past - 5)), Why::FloorExpired)
+        );
+        // On the last second of the TTL the entry still stands.
+        let last = e.floor.at_unix + FLOOR_TTL.as_secs();
+        assert_eq!(written(&closing(120_000, 0, last)), (None, Why::FloorKept));
+        // Kept with a record that ended: the entry's floor, and no record.
+        let with_record = PairEntry {
+            push_back: Some(PushBack {
+                bps: 56_000,
+                at_unix: NOW - 60,
+                first_at_unix: NOW - 90,
+                windows: 2,
+            }),
+            ..e
+        };
+        let ended = Closing {
+            ended: true,
+            ..closing(120_000, 0, NOW)
+        };
+        let (next, why) = close(Some(&with_record), &ended);
+        assert_eq!(why, Why::FloorKept);
+        assert_eq!(next, Some(e), "the entry's floor, its record gone");
+        assert_eq!(wrote(Some(&with_record), next.as_ref()), "push_back");
     }
 
     // --- the opening (D25, D26) ---------------------------------------------
