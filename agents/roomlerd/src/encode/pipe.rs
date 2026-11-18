@@ -241,7 +241,9 @@ impl Pipe {
     /// application-limited push-back moves this type exactly as a backlogged
     /// one does; only the model tells them apart.
     pub fn observe_capacity(&mut self, bps: u32, basis: Basis, now: Instant) {
-        self.observe_capacity_in(bps, basis, super::pair_memory::Take::Sample, now);
+        // No window behind it: filed as the sender's own reading.
+        let take = super::pair_memory::Take::Sample(super::pair_memory::Read::Overproduced);
+        self.observe_capacity_in(bps, basis, take, now);
     }
 
     /// FR-148 P1 (R1, R3) — [`Self::observe_capacity`] with the window's

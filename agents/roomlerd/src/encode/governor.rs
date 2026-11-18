@@ -5976,6 +5976,19 @@ mod tests {
             let r = c.record.expect("a record");
             assert_eq!((r.windows, r.span_s()), (5, 16), "{side}");
             assert_eq!(c.under_plan, 1, "{side}");
+            // QR3's split: every counted refusal came from a window the
+            // classifier read `Clear`, where only the link report said the
+            // queue grew; none from the sender's own counters.
+            assert_eq!(
+                (
+                    c.counted,
+                    c.counted_overproduced,
+                    c.counted_clear,
+                    c.viewer_late
+                ),
+                (5, 0, 5, 0),
+                "{side}"
+            );
             assert!(trusted(&r, unix), "{side}");
             assert!(!c.ended, "{side}");
             assert_eq!(c.not_counted, 0, "{side}");
@@ -5985,6 +5998,116 @@ mod tests {
             assert_eq!((r.windows, r.span_s()), (2, 1), "{side}");
             assert!(!trusted(&r, unix), "{side}: the first wording fails it");
         }
+    }
+
+    /// FR-148 P1 (the coordinator's ruling on the review's finding 4) — a
+    /// window the classifier blames on the viewer is not a reading of the
+    /// path. Three runs of refusals as in the slow-link replay (the viewer's
+    /// queue growing for three windows while the pump offers 1 Mbit/s into
+    /// 580 kbit/s), in four kinds of window: `Clear` (the transit share 168 ms
+    /// over its floor), the viewer `struggling` on a flat age, the browser's
+    /// own share 150 ms over its floor, and the classifier's tie (the transit
+    /// and the browser shares each 300 ms over their floors). The link loop
+    /// pushes back on the same windows in the first three, and the session's
+    /// belief takes every push-back whatever the window; the memory counts the
+    /// late viewer's as `viewer_late` and takes none of them. The tie stays
+    /// `TransitStalled` (`transit_excess >= viewer_excess`), the gate rejects
+    /// it as before, and nothing reaches either.
+    #[test]
+    fn a_window_the_classifier_blames_on_the_viewer_is_not_a_reading_of_the_path() {
+        use crate::encode::pair_memory::Closing;
+        use crate::encode::pipe_state::PipeState;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Refused {
+            Clear,
+            Struggling,
+            ViewerShare,
+            Tie,
+        }
+        // One window: the pump wrote `wrote` bytes, and the viewer reported
+        // `link` and a paint age of `age` ms of which `arrival` ms to arrival.
+        fn win(s: &mut V5bSession, wrote: u64, link: u64, age_arrival: (u16, u16), late: bool) {
+            s.t += Duration::from_secs(1);
+            s.sent += wrote;
+            s.g.note_window_sender(v5b_sender());
+            s.g.tick_viewer_window(
+                s.t,
+                30,
+                || viewer_rate::pack_report(30, late),
+                || viewer_rate::pack_age_with_arrival(age_arrival.0, 17, 30, age_arrival.1),
+                || link,
+                true,
+                |o| o,
+                s.sent,
+            )
+            .expect("window due");
+            s.g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, s.t);
+        }
+        let replay = |how: Refused| -> (Closing, u32, Vec<PipeState>) {
+            let mut s = V5bSession::open(true, None);
+            s.g.open_memory(None, P1_NOW_UNIX, s.t);
+            let start = s.t;
+            let mut states = Vec::new();
+            for _ in 0..3 {
+                for _ in 0..8 {
+                    win(
+                        &mut s,
+                        77_500,
+                        viewer_rate::pack_link(620_000, 0),
+                        (56, 54),
+                        false,
+                    );
+                }
+                let (age_arrival, late) = match how {
+                    Refused::Clear => ((224, 222), false),
+                    Refused::Struggling => ((56, 54), true),
+                    Refused::ViewerShare => ((206, 54), false),
+                    Refused::Tie => ((656, 354), false),
+                };
+                for _ in 0..3 {
+                    let link = viewer_rate::pack_link(580_000, 145);
+                    win(&mut s, 125_000, link, age_arrival, late);
+                    states.push(s.g.pipe_state().expect("a constrained window"));
+                }
+            }
+            let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+            let c = s.g.memory().closing(s.t, unix);
+            (c, s.g.belief_counts().1, states)
+        };
+        let (clear, clear_caps, states) = replay(Refused::Clear);
+        assert!(states.iter().all(|s| *s == PipeState::Clear), "{states:?}");
+        assert!(clear.counted > 0 && clear.record.is_some(), "{clear:?}");
+        assert_eq!(clear.viewer_late, 0);
+        let pushed = clear.counted + clear.under_plan + clear.not_counted;
+        assert_eq!(
+            pushed, clear_caps,
+            "every link push-back reached the belief"
+        );
+        for how in [Refused::Struggling, Refused::ViewerShare] {
+            let (c, caps, states) = replay(how);
+            assert!(
+                states.iter().all(|s| *s == PipeState::ViewerLate),
+                "{how:?}: {states:?}"
+            );
+            assert_eq!(
+                caps, clear_caps,
+                "{how:?}: the session's belief took them all"
+            );
+            assert_eq!(c.viewer_late, pushed, "{how:?}");
+            assert_eq!((c.counted, c.under_plan, c.record), (0, 0, None), "{how:?}");
+            assert_eq!(
+                c.floor.map(|f| f.bps),
+                Some(620_000),
+                "{how:?}: the floor stands"
+            );
+        }
+        let (tie, caps, states) = replay(Refused::Tie);
+        assert!(
+            states.iter().all(|s| *s == PipeState::TransitStalled),
+            "{states:?}"
+        );
+        assert_eq!(caps, 0, "the gate rejected every tie");
+        assert_eq!((tie.counted, tie.viewer_late, tie.record), (0, 0, None));
     }
 
     /// FR-148 P1 — the viewer's paint age in a screened session.

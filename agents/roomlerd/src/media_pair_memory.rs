@@ -416,8 +416,11 @@ impl Drop for ModelGuard {
             push_back_windows = ?record.map(|r| r.windows),
             push_back_span_s = ?record.map(|r| r.span_s()),
             samples_counted = c.map_or(0, |c| c.counted),
+            samples_counted_overproduced = c.map_or(0, |c| c.counted_overproduced),
+            samples_counted_clear = c.map_or(0, |c| c.counted_clear),
             samples_not_counted = c.map_or(0, |c| c.not_counted),
             samples_unread = c.map_or(0, |c| c.unread),
+            samples_viewer_late = c.map_or(0, |c| c.viewer_late),
             samples_under_plan = c.map_or(0, |c| c.under_plan),
             record_ended = c.is_some_and(|c| c.ended),
             frozen = self.frozen,
@@ -789,8 +792,11 @@ mod tests {
             best: Some((bps, pm::FloorBasis::AppLimited)),
             not_counted: 0,
             unread: 0,
+            viewer_late: 0,
             under_plan: 0,
             counted: 0,
+            counted_overproduced: 0,
+            counted_clear: 0,
             ended: false,
             measured: true,
             at_unix: 1_795_000_000,
@@ -891,7 +897,7 @@ mod tests {
             assert_eq!(g.verdict(), written, "the sample reached no memory");
             // After the last window, the session's memory takes a push-back
             // that would start or extend the record ...
-            mem.pushed_back(255_000, Basis::Backlogged, at(31));
+            mem.pushed_back(255_000, Basis::Backlogged, pm::Read::Clear, at(31));
             let late = mem.closing(at(31), now_unix).record.map(|r| r.windows);
             assert_eq!(late, Some(if entry.is_some() { 3 } else { 1 }));
             // ... and the close still writes the last window's.
@@ -1470,7 +1476,7 @@ mod tests {
         "taken_why",
     ];
 
-    const CLOSE_FIELDS: [&str; 20] = [
+    const CLOSE_FIELDS: [&str; 23] = [
         "session_id",
         "key_id",
         "key_carrier",
@@ -1486,8 +1492,11 @@ mod tests {
         "push_back_windows",
         "push_back_span_s",
         "samples_counted",
+        "samples_counted_overproduced",
+        "samples_counted_clear",
         "samples_not_counted",
         "samples_unread",
+        "samples_viewer_late",
         "samples_under_plan",
         "record_ended",
         "frozen",
@@ -1576,9 +1585,12 @@ mod tests {
         let mut mem = pm::SessionMemory::default();
         mem.open(Some(&entry), now_unix, t0);
         mem.delivered(1_200_000, Basis::AppLimited, at(5));
-        mem.pushed_back(620_000, Basis::Backlogged, at(10));
-        mem.pushed_back(600_000, Basis::Backlogged, at(16));
-        mem.pushed_back(640_000, Basis::Backlogged, at(23));
+        let (back, over, clear) = (Basis::Backlogged, pm::Read::Overproduced, pm::Read::Clear);
+        mem.pushed_back(620_000, back, over, at(10));
+        mem.pushed_back(600_000, back, clear, at(16));
+        mem.pushed_back(640_000, back, clear, at(23));
+        // A late viewer's push-back beside them: counted apart, not taken.
+        mem.pushed_back_in(500_000, back, pm::Take::ViewerLate, at(26));
         let c = mem.closing(at(30), now_unix);
         let (written, _) = pm::close(Some(&entry), &c);
         let written = written.expect("the push-backs are written");
@@ -1589,6 +1601,14 @@ mod tests {
             "{close}"
         );
         assert!(close.contains(" push_back_bps=Some(640000) push_back_windows=Some(3) "));
+        assert!(
+            close.contains(
+                " samples_counted=3 samples_counted_overproduced=1 samples_counted_clear=2 \
+                 samples_not_counted=0 samples_unread=0 samples_viewer_late=1 \
+                 samples_under_plan=0 "
+            ),
+            "{close}"
+        );
         lines.push(("three push-backs", open, close));
         // ... and the next session reads a trusted record.
         let mut p = pump(guard(EntryState::Fresh, Some(written)), None);

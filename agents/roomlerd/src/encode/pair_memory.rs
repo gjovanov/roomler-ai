@@ -739,30 +739,63 @@ pub fn pushing_against_plan(state: PipeState, sent_bps: u32, target_bps: u32) ->
     state == PipeState::Overproduced || u64::from(sent_bps) * 2 >= u64::from(target_bps)
 }
 
+/// FR-148 P1 — the classifier's state of the window a sample came from. Once
+/// the gate, the read test and the viewer test have spoken, two are left
+/// (`TransitStalled` never reaches a sample: the gate rejects that window and
+/// the one after it). The close line counts the counted samples of each, a
+/// measurement for the open class (spec §9, O7), not a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// The sender's own counters: its queue at the budget, a skipped frame, a
+    /// blocked send or a send that waited 100 ms or more.
+    Overproduced,
+    /// The age split read no stall and no late browser: the transit share
+    /// moved by under 200 ms, so only the viewer's link report said that the
+    /// queue grew.
+    Clear,
+}
+
 /// FR-148 P1 — what the pair memory takes from a push-back in a valid window.
 /// One definition of counted evidence: a sample counts only from a window the
-/// classifier read (R1) in which the sender pushed against its plan (R3), and
-/// then only when D25's test counts it. Inside the session every push-back acts
-/// exactly as before, whatever this says.
+/// classifier read (R1) and did not blame on the viewer, in which the sender
+/// pushed against its plan (R3), and then only when D25's test counts it.
+/// Inside the session every push-back acts exactly as before, whatever this
+/// says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Take {
-    /// A sample: D25 counts it, or calls it a dip.
-    Sample,
+    /// A sample, from a window read as [`Read`]: D25 counts it, or calls it a
+    /// dip.
+    Sample(Read),
     /// R1 — the classifier could not read the window ([`window_read`]).
     Unread,
+    /// The classifier blamed the window on the viewer (`ViewerLate`: the
+    /// browser's share of the age grew, or it reported `struggling`). The key
+    /// names the path (the carrier, the user and the viewer's network), not
+    /// the viewer's device, so such a window is not a reading of the path: a
+    /// record from it would slow the same user's other devices on that
+    /// network.
+    ViewerLate,
     /// R3 — the sender wrote under half its target ([`pushing_against_plan`]).
     UnderPlan,
 }
 
 impl Take {
-    /// The window's verdict, R1 first.
+    /// The window's verdict: R1 first, then the viewer, then R3.
     pub fn of(state: PipeState, age_plausible: bool, sent_bps: u32, target_bps: u32) -> Self {
         if !window_read(state, age_plausible) {
-            Take::Unread
-        } else if !pushing_against_plan(state, sent_bps, target_bps) {
-            Take::UnderPlan
+            return Take::Unread;
+        }
+        let read = match state {
+            PipeState::ViewerLate => return Take::ViewerLate,
+            PipeState::Overproduced => Read::Overproduced,
+            // `Unknown` is unread (above), and the gate rejects a
+            // `TransitStalled` window, so no sample comes from either.
+            PipeState::Clear | PipeState::TransitStalled | PipeState::Unknown => Read::Clear,
+        };
+        if pushing_against_plan(state, sent_bps, target_bps) {
+            Take::Sample(read)
         } else {
-            Take::Sample
+            Take::UnderPlan
         }
     }
 }
@@ -793,6 +826,9 @@ pub struct SessionMemory {
     /// R1 — backlogged push-backs from windows the classifier could not read
     /// ([`window_read`]): never offered to the record.
     unread: u32,
+    /// Backlogged push-backs from windows the classifier blamed on the viewer
+    /// ([`Take::ViewerLate`]): never offered to the record.
+    viewer_late: u32,
     /// R3 — backlogged push-backs from windows where the sender wrote under
     /// half its target ([`pushing_against_plan`]): never offered to the record.
     under_plan: u32,
@@ -800,6 +836,10 @@ pub struct SessionMemory {
     /// since or not: the close lowers a remembered floor only when this is
     /// above zero.
     counted: u32,
+    /// The counted samples by the state of their window ([`Read`]): they sum
+    /// to `counted`.
+    counted_overproduced: u32,
+    counted_clear: u32,
     /// A delivery ended the record in this session.
     ended: bool,
     /// A valid window gave any measured reading.
@@ -830,10 +870,16 @@ pub struct Closing {
     pub not_counted: u32,
     /// R1 — samples from windows the classifier could not read.
     pub unread: u32,
+    /// Samples from windows the classifier blamed on the viewer.
+    pub viewer_late: u32,
     /// R3 — samples from windows where the sender wrote under half its target.
     pub under_plan: u32,
     /// R2 — counted samples in the whole session.
     pub counted: u32,
+    /// The counted samples from `Overproduced` windows and from `Clear` ones
+    /// (QR3's measurement of the open class): they sum to `counted`.
+    pub counted_overproduced: u32,
+    pub counted_clear: u32,
     pub ended: bool,
     pub measured: bool,
     /// The Unix second this was taken: the close reads the entry's TTL at it.
@@ -917,7 +963,10 @@ impl SessionMemory {
     /// R2 — only a counted sample moves the floor. A dip moved it before R2,
     /// so a still screen's dip under a remembered 2.2 Mbit/s floor was written
     /// as the pair's floor (`a_quiet_session_keeps_the_remembered_floor`).
-    pub fn pushed_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+    ///
+    /// `read` is the state of the sample's window; a counted sample is counted
+    /// under it too.
+    pub fn pushed_back(&mut self, bps: u32, basis: Basis, read: Read, now: Instant) {
         match basis {
             Basis::Assumed => {}
             Basis::AppLimited => self.delivered(bps, basis, now),
@@ -928,6 +977,12 @@ impl SessionMemory {
                 });
                 if counts {
                     self.counted = self.counted.saturating_add(1);
+                    match read {
+                        Read::Overproduced => {
+                            self.counted_overproduced = self.counted_overproduced.saturating_add(1);
+                        }
+                        Read::Clear => self.counted_clear = self.counted_clear.saturating_add(1),
+                    }
                     self.own = Some(match self.own {
                         Some(o) => Own {
                             bps: o.bps.max(bps),
@@ -953,25 +1008,30 @@ impl SessionMemory {
 
     /// A push-back in a valid window, as the window's [`Take`] says. A sample
     /// goes to [`Self::pushed_back`]. One from a window the classifier could
-    /// not read (R1), or in which the sender wrote under half its target (R3),
-    /// is counted for the close line and nothing more: it moves neither the
-    /// record nor the floor, and its bytes already reached [`Self::delivered`]
-    /// as the same window's delivery.
+    /// not read (R1) or blamed on the viewer, or in which the sender wrote
+    /// under half its target (R3), is counted for the close line and nothing
+    /// more: it moves neither the record nor the floor, and its bytes already
+    /// reached [`Self::delivered`] as the same window's delivery.
     pub fn pushed_back_in(&mut self, bps: u32, basis: Basis, take: Take, now: Instant) {
+        // The test laws' samples are filed as `Clear`: no split is read
+        // under them.
         #[cfg(test)]
         let take = match take {
-            Take::Unread if self.read_any => Take::Sample,
-            Take::UnderPlan if self.plan_any => Take::Sample,
+            Take::Unread if self.read_any => Take::Sample(Read::Clear),
+            Take::UnderPlan if self.plan_any => Take::Sample(Read::Clear),
             take => take,
         };
         let backlogged = basis == Basis::Backlogged && bps > 0;
         match take {
-            Take::Sample => self.pushed_back(bps, basis, now),
+            Take::Sample(read) => self.pushed_back(bps, basis, read, now),
             Take::Unread if backlogged => self.unread = self.unread.saturating_add(1),
+            Take::ViewerLate if backlogged => {
+                self.viewer_late = self.viewer_late.saturating_add(1);
+            }
             Take::UnderPlan if backlogged => {
                 self.under_plan = self.under_plan.saturating_add(1);
             }
-            Take::Unread | Take::UnderPlan => {}
+            Take::Unread | Take::ViewerLate | Take::UnderPlan => {}
         }
     }
 
@@ -1015,8 +1075,11 @@ impl SessionMemory {
                 .and_then(|(bps, b)| FloorBasis::of(b).map(|b| (bps, b))),
             not_counted: self.not_counted,
             unread: self.unread,
+            viewer_late: self.viewer_late,
             under_plan: self.under_plan,
             counted: self.counted,
+            counted_overproduced: self.counted_overproduced,
+            counted_clear: self.counted_clear,
             ended: self.ended,
             measured: self.measured,
             at_unix: now_unix,
@@ -1689,7 +1752,7 @@ mod tests {
             now = start + Duration::from_secs(s);
             m.delivered(bps, Basis::of_window(refused), now);
             if refused {
-                m.pushed_back(bps, Basis::Backlogged, now);
+                m.pushed_back(bps, Basis::Backlogged, Read::Clear, now);
             }
         }
         let end = now + Duration::from_secs(1);
@@ -1940,8 +2003,11 @@ mod tests {
             best: Some((bps, FloorBasis::AppLimited)),
             not_counted: 0,
             unread: 0,
+            viewer_late: 0,
             under_plan: 0,
             counted,
+            counted_overproduced: 0,
+            counted_clear: counted,
             ended: false,
             measured: true,
             at_unix,
@@ -1999,6 +2065,69 @@ mod tests {
         assert_eq!(why, Why::FloorKept);
         assert_eq!(next, Some(e), "the entry's floor, its record gone");
         assert_eq!(wrote(Some(&with_record), next.as_ref()), "push_back");
+    }
+
+    /// FR-148 P1 (QR3) — a counted sample is counted under the state of its
+    /// window, `Overproduced` or `Clear`, and the two sum to `counted`; a dip
+    /// is counted under neither. A window the classifier blames on the viewer
+    /// is not a reading of the path: its push-back is counted as
+    /// `viewer_late`, moves neither the record nor the floor, and a session of
+    /// such windows alone leaves no record. The verdict's order is R1, the
+    /// viewer, R3.
+    #[test]
+    fn counted_samples_split_by_their_windows_state_and_a_late_viewer_reads_nothing() {
+        use PipeState::{Clear, Overproduced, Unknown, ViewerLate};
+        let (sent, under, target) = (2_000_000, 1_000_000, 3_000_000);
+        let cases = [
+            (Overproduced, false, under, Take::Sample(Read::Overproduced)),
+            (Overproduced, true, under, Take::Sample(Read::Overproduced)),
+            (Clear, true, sent, Take::Sample(Read::Clear)),
+            (Clear, true, under, Take::UnderPlan),
+            (Clear, false, sent, Take::Unread),
+            (ViewerLate, true, sent, Take::ViewerLate),
+            (ViewerLate, true, under, Take::ViewerLate),
+            (ViewerLate, false, sent, Take::Unread),
+            (Unknown, true, sent, Take::Unread),
+        ];
+        for (state, plausible, sent, take) in cases {
+            let got = Take::of(state, plausible, sent, target);
+            assert_eq!(got, take, "{state:?} plausible {plausible} sent {sent}");
+        }
+        let t = t0();
+        let at = |s: u64| t + Duration::from_secs(s);
+        let mut m = SessionMemory::default();
+        m.open(None, NOW, t);
+        m.delivered(1_000_000, Basis::AppLimited, at(1));
+        let back = Basis::Backlogged;
+        m.pushed_back_in(900_000, back, Take::Sample(Read::Overproduced), at(2));
+        m.pushed_back_in(800_000, back, Take::Sample(Read::Clear), at(5));
+        m.pushed_back_in(850_000, back, Take::Sample(Read::Overproduced), at(13));
+        // A dip: under half the best delivery.
+        m.pushed_back_in(300_000, back, Take::Sample(Read::Clear), at(14));
+        m.pushed_back_in(700_000, back, Take::ViewerLate, at(15));
+        m.pushed_back_in(600_000, back, Take::Unread, at(16));
+        m.pushed_back_in(650_000, back, Take::UnderPlan, at(17));
+        let c = m.closing(at(20), NOW + 20);
+        assert_eq!(
+            (c.counted, c.counted_overproduced, c.counted_clear),
+            (3, 2, 1)
+        );
+        assert_eq!(
+            (c.not_counted, c.viewer_late, c.unread, c.under_plan),
+            (1, 1, 1, 1)
+        );
+        let r = c.record.expect("the three counted samples");
+        assert_eq!((r.bps, r.windows), (900_000, 3));
+        // Late-viewer windows alone, four over 18 s: no record, the floor stands.
+        let mut late = SessionMemory::default();
+        late.open(None, NOW, t);
+        late.delivered(1_000_000, Basis::AppLimited, at(1));
+        for s in [2, 8, 14, 20] {
+            late.pushed_back_in(400_000, back, Take::ViewerLate, at(s));
+        }
+        let c = late.closing(at(21), NOW + 21);
+        assert_eq!((c.record, c.counted, c.viewer_late), (None, 0, 4));
+        assert_eq!(c.floor.map(|f| f.bps), Some(1_000_000));
     }
 
     // --- the opening (D25, D26) ---------------------------------------------
