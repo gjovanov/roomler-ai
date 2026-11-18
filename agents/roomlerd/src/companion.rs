@@ -2324,17 +2324,15 @@ fn start_tray(
         return Ok(EnsureOutcome::AlreadyRunning);
     }
     let args = [roomler_node_core::companion_autostart::FOR_PROMPT_ARG]; // #3887: for a prompt
-    // #2713 — a root daemon's system unit carries the desktop session's own environment
+    // #2713, #3973 — a root daemon's system unit carries the desktop session's own environment
     // ([`systemd_run_command`]); a per-user daemon's `--user` unit inherits its manager's.
-    let session_env = if steps.user_manager {
-        Vec::new()
+    let env = if steps.user_manager {
+        None
     } else {
         step(TrayStep::Environment);
         (steps.environment)(&sess)
-            .map(|text| session_env_pairs(&text))
-            .unwrap_or_default()
     };
-    let cmd = systemd_run_command_with(&sess, &path, &args, steps.user_manager, &session_env);
+    let cmd = systemd_run_command_with(&sess, &path, &args, steps.user_manager, env.as_deref());
     step(TrayStep::SystemdRun);
     let out = (steps.systemd_run)(cmd).map_err(|e| format!("spawning systemd-run: {e}"))?;
     if !out.status.success() {
@@ -3558,6 +3556,97 @@ mod tray_start_tests {
         assert_eq!(ran.argvs().len(), 1);
     }
 
+    /// #3973 — the start for a prompt on GNOME on Wayland, where logind has no
+    /// `Display`. A root daemon gives the companion the session's own from the
+    /// person's user manager, once, and never `GNOME_SETUP_DISPLAY`, so it runs
+    /// under Xwayland as the one the sign-in starts does. On 0.4.225 it had
+    /// none, ran Wayland-native, and mutter put its prompt at the top-left. A
+    /// per-user daemon reads nothing, and its argv is as before.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_prompts_start_on_wayland_gives_the_companion_the_sessions_display() {
+        let rt = runtime();
+        let held = Held::default();
+        let ask = |taken: TraySteps| {
+            start_on_a_worker(&rt, &StandIn::new(taken), RUNS_WITHIN)
+                .expect("a start in time is answered")
+                .0
+        };
+        let argv = |args: &[&str]| -> Vec<String> { args.iter().map(|a| a.to_string()).collect() };
+        // logind's answer for a Wayland session: no `Display`.
+        let on_wayland = || -> Result<GraphicalSession> {
+            Ok(GraphicalSession {
+                uid: 4242,
+                name: "ana".into(),
+                display: None,
+                wayland_display: Some("wayland-0".into()),
+            })
+        };
+        // The person's user manager on GNOME, as the 0.4.225 lab's had it.
+        let read = Arc::new(AtomicUsize::new(0));
+        let gnome = {
+            let read = read.clone();
+            move |_: &GraphicalSession| -> Option<String> {
+                read.fetch_add(1, SeqCst);
+                Some(
+                    "XDG_CURRENT_DESKTOP=ubuntu:GNOME\nGNOME_SETUP_DISPLAY=:1\nDISPLAY=:0\n\
+                     WAYLAND_DISPLAY=wayland-0\nXDG_SESSION_TYPE=wayland\n"
+                        .into(),
+                )
+            }
+        };
+
+        let ran = Ran::default();
+        let mut root = steps(None, &held, &ran);
+        root.session = Arc::new(on_wayland);
+        root.environment = Arc::new(gnome.clone());
+        assert_eq!(ask(root), Ok(EnsureOutcome::Started));
+        assert_eq!(
+            ran.argvs(),
+            vec![argv(&[
+                "systemd-run",
+                "--quiet",
+                "--collect",
+                "--property=KillMode=process",
+                "--uid=4242",
+                "--setenv=XDG_RUNTIME_DIR=/run/user/4242",
+                "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
+                "--setenv=DISPLAY=:0",
+                "--setenv=WAYLAND_DISPLAY=wayland-0",
+                "--setenv=XDG_CURRENT_DESKTOP=ubuntu:GNOME",
+                "--setenv=XDG_SESSION_TYPE=wayland",
+                COMPANION,
+                "--for-prompt",
+            ])],
+            "a root daemon: the session's DISPLAY, once, where logind's goes"
+        );
+        assert_eq!(read.load(SeqCst), 1);
+
+        let ran = Ran::default();
+        let mut per_user = steps(None, &held, &ran);
+        per_user.user_manager = true;
+        per_user.session = Arc::new(on_wayland);
+        per_user.environment = Arc::new(gnome);
+        assert_eq!(ask(per_user), Ok(EnsureOutcome::Started));
+        assert_eq!(
+            ran.argvs(),
+            vec![argv(&[
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--collect",
+                "--property=KillMode=process",
+                "--setenv=XDG_RUNTIME_DIR=/run/user/4242",
+                "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus",
+                "--setenv=WAYLAND_DISPLAY=wayland-0",
+                COMPANION,
+                "--for-prompt",
+            ])],
+            "a per-user daemon: as before; its unit inherits the manager's DISPLAY"
+        );
+        assert_eq!(read.load(SeqCst), 1, "a per-user daemon reads nothing");
+    }
+
     /// The control on Windows: a start whose steps answer in time does what
     /// it always did. A SYSTEM service starts the tray into the console
     /// session as its person, and a daemon that runs as the person a plain
@@ -4131,6 +4220,9 @@ pub(crate) fn linux_companion_path() -> Option<std::path::PathBuf> {
 /// person clicked View screen in. A per-user daemon's `--user` unit inherits
 /// the manager's environment already.
 ///
+/// ⚠️ #3973 — and a ROOT daemon's unit takes the session's `DISPLAY` from
+/// there too when logind gives it none ([`systemd_run_command_with`]).
+///
 /// ⚠️ #2729 — and either unit is `KillMode=process`. The companion is the
 /// unit's main process, and what it launches lands in the unit's cgroup: the
 /// person's web browser, when View screen or Open Roomler started it. Under
@@ -4150,14 +4242,12 @@ pub(crate) fn systemd_run_command(
     args: &[&str],
     user_manager: bool,
 ) -> std::process::Command {
-    let session_env = if user_manager {
-        Vec::new()
+    let env = if user_manager {
+        None
     } else {
         user_manager_environment(sess)
-            .map(|text| session_env_pairs(&text))
-            .unwrap_or_default()
     };
-    systemd_run_command_with(sess, exe, args, user_manager, &session_env)
+    systemd_run_command_with(sess, exe, args, user_manager, env.as_deref())
 }
 
 /// #2713 — the keys of the desktop session's environment that a companion
@@ -4167,10 +4257,12 @@ pub(crate) fn systemd_run_command(
 /// see [`session_env_pairs`]).
 ///
 /// ⚠️ An ALLOWLIST, not the whole environment. The values are the user's own
-/// (no privilege crosses: the companion runs as that user), but the bus,
-/// display and runtime dir keep coming from logind as before, and loader
-/// plumbing (`LD_*`, `GTK_MODULES`) has no business in a process the daemon
-/// starts. Widen it only with a measured need.
+/// (no privilege crosses: the companion runs as that user), but the bus and
+/// runtime dir keep coming from logind as before, and loader plumbing (`LD_*`,
+/// `GTK_MODULES`) has no business in a process the daemon starts. Widen it
+/// only with a measured need. `DISPLAY` is not on it: logind's comes first,
+/// and only when logind has none (a Wayland session) is the session's own
+/// taken, once ([`session_display`], #3973).
 #[cfg(all(unix, not(target_os = "macos")))]
 const SESSION_ENV_KEYS: &[&str] = &[
     "XDG_CURRENT_DESKTOP",
@@ -4208,14 +4300,36 @@ fn session_env_pairs(show_environment: &str) -> Vec<(String, String)> {
                     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
                 })
         })
-        .filter(|(_, value)| {
-            !value.is_empty()
-                && value.len() <= 4096
-                && !value.starts_with("$'")
-                && !value.chars().any(char::is_control)
-        })
+        .filter(|(_, value)| plain_value(value))
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+/// A value of the session's environment the daemon passes on: not empty, at
+/// most 4 KiB, not shell-escaped by systemd (`KEY=$'…'`) and with no control
+/// character ([`session_env_pairs`], [`session_display`]).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn plain_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.starts_with("$'")
+        && !value.chars().any(char::is_control)
+}
+
+/// #3973 — the session's `DISPLAY` out of `systemctl --user show-environment`,
+/// by [`plain_value`]'s checks, for a root daemon's unit when logind has none:
+/// logind fills its `Display` only for an X11 session, and on a Wayland one
+/// the desktop puts Xwayland's display in the user manager's environment.
+/// Only that key: never `GNOME_SETUP_DISPLAY`, the second display GNOME sets
+/// (`:1` beside `DISPLAY=:0` in the GNOME fixture), nor any other.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn session_display(show_environment: &str) -> Option<String> {
+    show_environment
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| (key == "DISPLAY").then_some(value))
+        .filter(|value| plain_value(value))
+        .map(str::to_string)
 }
 
 /// #2713 — the session user's systemd manager environment as text, read by
@@ -4294,15 +4408,17 @@ fn stdout_bounded(mut cmd: std::process::Command, limit: std::time::Duration) ->
     }
 }
 
-/// [`systemd_run_command`] over an already-read session environment: the
-/// pure half, so the argv is tested without a user manager to ask.
+/// [`systemd_run_command`] over an already-read session environment (`env`:
+/// `systemctl --user show-environment`'s text, `None` for a per-user daemon,
+/// whose `--user` unit inherits it, or when the read failed): the pure half,
+/// so the argv is tested without a user manager to ask.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn systemd_run_command_with(
     sess: &GraphicalSession,
     exe: &std::path::Path,
     args: &[&str],
     user_manager: bool,
-    session_env: &[(String, String)],
+    env: Option<&str>,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new("systemd-run");
     if user_manager {
@@ -4320,13 +4436,17 @@ fn systemd_run_command_with(
             sess.uid
         ),
     ]);
-    if let Some(display) = &sess.display {
+    // #3973 — logind's `Display` when it has one, else the session's own. Without one a
+    // companion on GNOME on Wayland runs Wayland-native (`roomler-desktop`'s `pin::prefer_x11`),
+    // where it cannot place its prompt or pin its banner. Set once, either way.
+    let logind = sess.display.clone();
+    if let Some(display) = logind.or_else(|| env.and_then(session_display)) {
         cmd.arg(format!("--setenv=DISPLAY={display}"));
     }
     if let Some(wayland) = &sess.wayland_display {
         cmd.arg(format!("--setenv=WAYLAND_DISPLAY={wayland}"));
     }
-    for (key, value) in session_env {
+    for (key, value) in env.map(session_env_pairs).unwrap_or_default() {
         cmd.arg(format!("--setenv={key}={value}"));
     }
     cmd.arg(exe.as_os_str());
@@ -7634,7 +7754,7 @@ mod tests {
                 std::path::Path::new("/usr/bin/roomler-desktop"),
                 &["--first-run"],
                 user,
-                &[],
+                None,
             );
             assert_eq!(cmd.get_program(), "systemd-run");
             cmd.get_args()
@@ -7674,13 +7794,9 @@ mod tests {
     /// #2713 — REAL `systemctl --user show-environment` output, captured on
     /// 2026-10-22 from the lab's Fedora Asahi GNOME box (its `HOSTNAME` line
     /// left out): the box where View screen, in a companion the daemon had
-    /// started, opened a text editor.
-    /// The allowlist keeps the desktop's identity, its data dirs (with the
-    /// user's own Flatpak exports), X auth, the locale and the input method,
-    /// and drops the rest, every `$'…'`-escaped value included.
-    #[test]
-    fn the_session_environment_keeps_the_allowlist_only() {
-        const REAL: &str = "\
+    /// started, opened a text editor. A Wayland session, so logind gave it no
+    /// `Display`; its own is here, `DISPLAY=:0` (#3973).
+    const GNOME_ENVIRONMENT: &str = "\
 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
 HOME=/home/wlab
 LANG=C.UTF-8
@@ -7720,7 +7836,13 @@ XDG_SESSION_DESKTOP=gnome
 XDG_SESSION_TYPE=wayland
 XMODIFIERS=@im=ibus
 ";
-        let pairs = super::session_env_pairs(REAL);
+
+    /// #2713 — the allowlist keeps the desktop's identity, its data dirs (with
+    /// the user's own Flatpak exports), X auth, the locale and the input
+    /// method, and drops the rest, every `$'…'`-escaped value included.
+    #[test]
+    fn the_session_environment_keeps_the_allowlist_only() {
+        let pairs = super::session_env_pairs(GNOME_ENVIRONMENT);
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -7779,19 +7901,14 @@ XMODIFIERS=@im=ibus
             display: None,
             wayland_display: Some("wayland-0".into()),
         };
-        let env = [
-            ("XDG_CURRENT_DESKTOP".to_string(), "GNOME".to_string()),
-            (
-                "XDG_DATA_DIRS".to_string(),
-                "/home/ana/.local/share/flatpak/exports/share:/usr/share/".to_string(),
-            ),
-        ];
+        let env = "XDG_CURRENT_DESKTOP=GNOME\n\
+                   XDG_DATA_DIRS=/home/ana/.local/share/flatpak/exports/share:/usr/share/\n";
         let cmd = super::systemd_run_command_with(
             &sess,
             std::path::Path::new("/usr/bin/roomler-desktop"),
             &[],
             false,
-            &env,
+            Some(env),
         );
         let argv: Vec<String> = cmd
             .get_args()
@@ -7812,6 +7929,121 @@ XMODIFIERS=@im=ibus
             at("--setenv=XDG_DATA_DIRS=/home/ana/.local/share/flatpak/exports/share:/usr/share/")
                 < program
         );
+    }
+
+    /// The person, as logind reports them: an X11 session's `Display`, or for
+    /// a Wayland session no `Display` and the compositor's socket.
+    fn ana(display: Option<&str>) -> super::GraphicalSession {
+        super::GraphicalSession {
+            uid: 1000,
+            name: "ana".into(),
+            display: display.map(str::to_string),
+            wayland_display: display.is_none().then(|| "wayland-0".to_string()),
+        }
+    }
+
+    /// systemd-run's arguments.
+    fn argv_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Each `DISPLAY` the argv sets.
+    fn displays(argv: &[String]) -> Vec<&str> {
+        argv.iter()
+            .filter_map(|a| a.strip_prefix("--setenv=DISPLAY="))
+            .collect()
+    }
+
+    /// A root daemon's unit for the companion in `sess`, with the session's
+    /// environment `env` as its user manager printed it.
+    fn root_unit(sess: &super::GraphicalSession, env: Option<&str>) -> Vec<String> {
+        argv_of(&super::systemd_run_command_with(
+            sess,
+            std::path::Path::new("/usr/bin/roomler-desktop"),
+            &["--for-prompt"],
+            false,
+            env,
+        ))
+    }
+
+    /// #3973 — logind has no `Display` for a Wayland session, so a root
+    /// daemon's companion takes the session's own from its user manager, once.
+    /// From GNOME's real environment that is `DISPLAY=:0`, never
+    /// `GNOME_SETUP_DISPLAY=:1`. Without it (0.4.225) the companion ran
+    /// Wayland-native on GNOME, and mutter put its prompt at the top-left.
+    #[test]
+    fn a_root_daemons_companion_takes_the_sessions_display_when_logind_has_none() {
+        for env in ["DISPLAY=:0\n", GNOME_ENVIRONMENT] {
+            let argv = root_unit(&ana(None), Some(env));
+            assert_eq!(displays(&argv), [":0"], "{argv:?}");
+        }
+    }
+
+    /// #3973 — logind's `Display` wins when it has one: `DISPLAY` is set once,
+    /// to logind's.
+    #[test]
+    fn loginds_display_wins_over_the_sessions() {
+        for env in ["DISPLAY=:0\n", GNOME_ENVIRONMENT] {
+            let argv = root_unit(&ana(Some(":1")), Some(env));
+            assert_eq!(displays(&argv), [":1"], "{argv:?}");
+        }
+    }
+
+    /// #3973 — no `Display` from logind and none in the session's environment,
+    /// or no environment read at all: no `DISPLAY`, as before.
+    #[test]
+    fn no_display_from_either_sets_none() {
+        for env in [
+            Some("XDG_CURRENT_DESKTOP=KDE\nWAYLAND_DISPLAY=wayland-0\n"),
+            Some(""),
+            None,
+        ] {
+            let argv = root_unit(&ana(None), env);
+            assert!(displays(&argv).is_empty(), "{env:?}: {argv:?}");
+        }
+    }
+
+    /// #3973 — the session's `DISPLAY` is taken only by the checks every value
+    /// passes (`session_env_pairs`): an empty one, one systemd had to
+    /// shell-escape and one with a control character are not. And only the
+    /// `DISPLAY` key counts.
+    #[test]
+    fn an_escaped_or_empty_display_is_not_taken() {
+        for env in [
+            "DISPLAY=\n",
+            "DISPLAY=$':0\\n'\n",
+            "DISPLAY=:0\u{1b}[31m\n",
+            "GNOME_SETUP_DISPLAY=:1\n",
+            "XDISPLAY=:0\n",
+            "display=:0\n",
+        ] {
+            let argv = root_unit(&ana(None), Some(env));
+            assert!(displays(&argv).is_empty(), "{env:?}: {argv:?}");
+        }
+    }
+
+    /// #3973 — only a root daemon's road changes. A per-user daemon's `--user`
+    /// unit inherits its manager's environment, `DISPLAY` with it, so
+    /// `systemd_run_command` reads nothing for it (no user manager is asked
+    /// from here) and sets logind's `DISPLAY` alone, as before.
+    #[test]
+    fn a_per_user_daemons_unit_is_unchanged() {
+        let exe = std::path::Path::new("/usr/bin/roomler-desktop");
+        let unit = |sess: super::GraphicalSession| {
+            argv_of(&super::systemd_run_command(
+                &sess,
+                exe,
+                &["--first-run"],
+                true,
+            ))
+        };
+        let wayland = unit(ana(None));
+        assert_eq!(wayland[0], "--user");
+        assert!(displays(&wayland).is_empty(), "{wayland:?}");
+        let x11 = unit(ana(Some(":1")));
+        assert_eq!(displays(&x11), [":1"], "{x11:?}");
     }
 
     /// Both samples are REAL `loginctl list-sessions --no-legend --no-pager`
