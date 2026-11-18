@@ -1064,17 +1064,112 @@ pub(crate) mod shaped_link {
         }
     }
 
-    /// One direction's delivery: each packet reaches the far inbox when due.
+    /// Scheduling noise, as a busy test runner makes it, seeded so that a
+    /// cell meets the same draws on every run. Every wake-up of a task comes
+    /// up to `jitter` late, as a timer's does; and about once every
+    /// `stall_every` the scheduler gives the task's core away for up to
+    /// `stall`, and a wake-up due then comes when it returns. On the link a
+    /// wake-up is a packet's delivery, and the packets behind a late one wait
+    /// for it, in order. No wake-up comes more than `stall + jitter` late.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Noise {
+        pub(crate) seed: u64,
+        pub(crate) jitter: Duration,
+        pub(crate) stall: Duration,
+        /// The mean time between stalls; zero for none.
+        pub(crate) stall_every: Duration,
+    }
+
+    impl Noise {
+        /// The same noise, drawn from another sequence: one per task.
+        pub(crate) fn reseeded(self, salt: u64) -> Self {
+            Self {
+                seed: self.seed ^ salt,
+                ..self
+            }
+        }
+    }
+
+    /// One task's draws of a [`Noise`].
+    #[derive(Debug)]
+    pub(crate) struct Draws {
+        noise: Noise,
+        state: u64,
+        /// The stall due next or under way: when it starts and ends.
+        stall: Option<(Instant, Instant)>,
+    }
+
+    impl Draws {
+        pub(crate) fn new(noise: Noise) -> Self {
+            Self {
+                noise,
+                state: noise.seed,
+                stall: None,
+            }
+        }
+
+        /// How late a wake-up due at `due` comes. A stall starts from 0 to
+        /// twice `stall_every` after the one before it ended (after the first
+        /// wake-up, for the first), whether or not anything was due in it.
+        pub(crate) fn late(&mut self, due: Instant) -> Duration {
+            let jitter = uniform(&mut self.state, self.noise.jitter);
+            let every = self.noise.stall_every;
+            if every.is_zero() {
+                return jitter;
+            }
+            let mut after = due;
+            loop {
+                let (start, end) = match self.stall {
+                    Some(stall) => stall,
+                    None => {
+                        let start = after + uniform(&mut self.state, 2 * every);
+                        let stall = (start, start + uniform(&mut self.state, self.noise.stall));
+                        self.stall = Some(stall);
+                        stall
+                    }
+                };
+                if due < start {
+                    return jitter;
+                }
+                if due < end {
+                    return end - due + jitter;
+                }
+                self.stall = None;
+                after = end;
+            }
+        }
+    }
+
+    /// A draw from 0 to `most`.
+    fn uniform(state: &mut u64, most: Duration) -> Duration {
+        let ns = u64::try_from(most.as_nanos()).unwrap_or(u64::MAX);
+        Duration::from_nanos(draw(state) % ns.saturating_add(1))
+    }
+
+    /// The next draw of a seeded sequence (splitmix64).
+    fn draw(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// One direction's delivery: each packet reaches the far inbox when due,
+    /// or as late as `noise` draws.
     fn direction(
         bps: u64,
         one_way: Duration,
         queue: Duration,
         drop_every: u64,
+        noise: Option<Noise>,
     ) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let mut draws = noise.map(Draws::new);
             while let Some((due, p)) = due_rx.recv().await {
+                let due = draws.as_mut().map_or(due, |d| due + d.late(due));
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                 if inbox_tx.send(p).is_err() {
                     break;
@@ -1102,14 +1197,24 @@ pub(crate) mod shaped_link {
     /// A link whose agent-to-viewer direction drops every `drop_every`-th
     /// packet that carries a full DATA chunk; 0 drops none.
     fn lossy_link(bps: u64, drop_every: u64) -> (ShapedConn, ShapedConn) {
-        shaped_dropping(bps, DELAY, QUEUE, drop_every)
+        shaped_dropping(bps, DELAY, QUEUE, drop_every, None)
     }
 
     /// A link of `bps` each way, whose packets travel `one_way` after their
     /// serialisation and wait at most `queue` for the wire, losing nothing
     /// else: the agent's end first.
     pub(crate) fn shaped(bps: u64, one_way: Duration, queue: Duration) -> (ShapedConn, ShapedConn) {
-        shaped_dropping(bps, one_way, queue, 0)
+        shaped_dropping(bps, one_way, queue, 0, None)
+    }
+
+    /// As [`shaped`], with `noise` on both directions, each its own draws.
+    pub(crate) fn shaped_noisy(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        noise: Noise,
+    ) -> (ShapedConn, ShapedConn) {
+        shaped_dropping(bps, one_way, queue, 0, Some(noise))
     }
 
     fn shaped_dropping(
@@ -1117,9 +1222,16 @@ pub(crate) mod shaped_link {
         one_way: Duration,
         queue: Duration,
         drop_every: u64,
+        noise: Option<Noise>,
     ) -> (ShapedConn, ShapedConn) {
-        let (a_out, b_inbox) = direction(bps, one_way, queue, drop_every);
-        let (b_out, a_inbox) = direction(bps, one_way, queue, 0);
+        let (a_out, b_inbox) = direction(bps, one_way, queue, drop_every, noise);
+        let (b_out, a_inbox) = direction(
+            bps,
+            one_way,
+            queue,
+            0,
+            noise.map(|n| n.reseeded(0x5bd1_e995_7f4a_7c15)),
+        );
         let (a, b): (SocketAddr, SocketAddr) = (
             "10.0.0.1:5000".parse().unwrap(),
             "10.0.0.2:5000".parse().unwrap(),
