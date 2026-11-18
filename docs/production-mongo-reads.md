@@ -175,7 +175,7 @@ can prevent it:
 | `scripts/rc-shadow-report.sh` + `.cjs` | FR-63's shadow report and its verdict: the flip criterion's agreement, and FR-148's under-drive clause (per class, spent ≤ 1.25 × shadow in ≥ 90 % of the clean windows at the class's gate, 2 Mbit/s direct and 0.5 Mbit/s constrained, over ≥ 20 sessions), whose thresholds were published on 2026-11-02, before the seven-day read (`docs/rate-control.md`) | the same shape (`scripts/rc-shadow-report.sh:142`) |
 | `scripts/fr97-caps-census.sh` | FR-97's capability words by OS | on mars. The aggregation goes to the runner on stdin with `--db` (`scripts/fr97-caps-census.sh:78`). It no longer reads the app's database URL, which holds the password, from `roomler2` |
 | `scripts/fr138-roll-read.sh` | FR-138's roll read | the same (`scripts/fr138-roll-read.sh:539`). `--mars` ships itself and the runner in one `roomler ssh` |
-| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8). With `--timeline`, `scripts/rc-path-timeline.cjs`: one device's window, line by line (§8a) | the same shape (`scripts/rc-path-report.sh:188`). `--mars` ships both files and the runner in one `roomler ssh` |
+| `scripts/rc-path-report.sh` + `.cjs` | FR-148's path report: what a session opened at beside what its pair had carried (§8). With `--timeline`, `scripts/rc-path-timeline.cjs`: one device's window, line by line (§8a) | the same shape (`scripts/rc-path-report.sh:217`). `--mars` ships both files and the runner in one `roomler ssh` |
 | By hand | the growth-observability field check, the `rc.connect` mining in `docs/remote-control.md`, the pairing audit in `docs/device-pairing.md` | `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` … `JS`, with `db` already open |
 
 ```bash
@@ -299,7 +299,7 @@ AC23 and judges none of them. Message texts and field names come from the call s
 the self-test checks each message's text against the agent's source.
 
 ```bash
-node scripts/rc-path-timeline.cjs --self-test     # 92 cases: every line kind, the counters, both generations of the memory lines, masking, TRUNCATED, the query's shape
+node scripts/rc-path-timeline.cjs --self-test     # 109 cases: every line kind, the counters, both generations of the memory lines, masking (in --rows too, and one last 4 hex taken twice), TRUNCATED, the query's shape, the window's forms, the wrapper's refusals
 bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
      --from 2026-11-18T07:00:00Z --to 2026-11-18T18:15:00Z         # one device, one window
 bash scripts/rc-path-report.sh --timeline --mars --yes --tenant HEX --agent HEX \
@@ -331,15 +331,15 @@ printed `undefined` and NaN for it.
 
 | Bound | What it is | Where |
 |---|---|---|
-| Scope | one `--tenant` and exactly one `--agent`, and both ends of the window. The wrapper refuses anything else, and `--json` | `scripts/rc-path-report.sh:137`, `scripts/rc-path-timeline.cjs:856` |
-| Window | at most 24 h from `--from` to `--to`. A longer day is read in parts | `scripts/rc-path-timeline.cjs:866` |
-| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:871`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at` | `scripts/rc-path-timeline.cjs:808` |
-| Match | `tenant_id`, `agent_id`, and `created_at` from 10 min before the window to 10 min after it (a batch is stored after its lines). Each line's `ts` is then compared as a BSON Date | `scripts/rc-path-timeline.cjs:759`, `:773` |
-| Memory | `allowDiskUse: false`. After the match only streaming stages run (`$project` with `$filter`, `$unwind`, `$project`, `$limit`), with no `$group` | `scripts/rc-path-timeline.cjs:751` |
-| Time | `maxTimeMS` 240,000 | `scripts/rc-path-timeline.cjs:808` |
-| Rows | `$limit` of 60,000 + 1 by default (`--limit` up to 200,000). A read that reaches it prints `TRUNCATED` at the top and bottom of the report, and in `--rows` | `scripts/rc-path-timeline.cjs:804`, `:919` |
-| What leaves | named fields only, plus the two path-memory lines' fields minus every key that could name an address, a host or a person. Ids print as their last 4 hex, and every printed line is scrubbed of addresses and 24-hex ids | `scripts/rc-path-timeline.cjs:795`, `:294` |
-| Carrier record | one `$group` by `carrier` over this agent's `remote_sessions` created in the window, on `agent_id_1_created_at_-1` (`crates/modules/remote/src/lib.rs:291`), `maxTimeMS` 30,000. That is tens of rows a day | `scripts/rc-path-timeline.cjs:818`, `:825` |
+| Scope | one `--tenant` and exactly one `--agent`, and both ends of the window. The wrapper refuses anything else, and `--json`, before it looks at the target: an option given twice, and a window end that is not `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM[:SS[.sss]]` with `Z` or `+HH:MM` (JavaScript would read a time without a zone in the zone of the machine running the read). The read checks the same pattern, and every value bound for `--mars`'s remote command line is plain characters only | `scripts/rc-path-report.sh:160`, `:124`, `:168`, `scripts/rc-path-timeline.cjs:999` |
+| Window | at most 24 h from `--from` to `--to`. A longer day is read in parts | `scripts/rc-path-timeline.cjs:1012` |
+| Index | `tenant_id_1_agent_id_1_created_at_-1` (`crates/modules/fleet/src/lib.rs:871`), pinned with `hint`. Both leading keys are equalities, so the index serves the `$sort` on `created_at` | `scripts/rc-path-timeline.cjs:867` |
+| Match | `tenant_id`, `agent_id`, and `created_at` from 10 min before the window to 10 min after it (a batch is stored after its lines). Each line's `ts` is then compared as a BSON Date. A line whose batch was stored outside that range, uploaded over 10 min late or stamped by a clock over 10 min fast, is not read and leaves no mark, so the report's header prints the range read (`batches read: stored … -> …`) | `scripts/rc-path-timeline.cjs:818`, `:832`, `:734` |
+| Memory | `allowDiskUse: false`. After the match only streaming stages run (`$project` with `$filter`, `$unwind`, `$project`, `$limit`), with no `$group` | `scripts/rc-path-timeline.cjs:807` |
+| Time | `maxTimeMS` 240,000 | `scripts/rc-path-timeline.cjs:867` |
+| Rows | `$limit` of 60,000 + 1 by default (`--limit` up to 200,000, one bound in the wrapper and the read). A read that reaches it prints `TRUNCATED` at the top and bottom of the report, and in `--rows`. Rows come in the order their batches were stored, so the cut misses every batch stored after the last one read, and some of their lines can be older than the last time printed: narrow the window or raise `--limit` | `scripts/rc-path-timeline.cjs:863`, `:724`, `:923` |
+| What leaves | named fields only, plus the two path-memory lines' fields minus every key that could name an address, a host or a person. `viewers` leaves only as a number: the rank line's count, never the overlay-auto line's list of viewer addresses. Ids and the memory's `key_id` print as their last 4 hex, in the report and in `--rows` alike; an id whose last 4 hex another id took earlier in the same read prints with `~2` after them, so two sessions never merge. Every printed line, and every string `--rows` prints, is scrubbed of addresses and 24-hex ids. So `--rows` carries the named fields masked and scrubbed, plus the window, the agent's last 4 hex, the limit and the server's carrier record, and its offline re-read renders byte for byte as the direct read | `scripts/rc-path-timeline.cjs:811`, `:854`, `:323`, `:892`, `:340` |
+| Carrier record | one `$group` by `carrier` over this agent's `remote_sessions` created in the window, on `agent_id_1_created_at_-1` (`crates/modules/remote/src/lib.rs:291`), `maxTimeMS` 30,000. That is tens of rows a day | `scripts/rc-path-timeline.cjs:877`, `:884` |
 
 The estimate is for a ten-hour window with eight hours of FFmpeg sessions. That is about 14,400
 heartbeats (one every 2 s), 2,880 delivery and 2,880 model lines (one each every 10 s), 960
@@ -361,5 +361,14 @@ What the lines cannot tell:
 - **Whether a session ended.** A session whose last line falls within 30 s of the window's end
   prints as open at the window's end.
 
-**Not rehearsed, not run on production.** The self-test and a local fold of two hosts' own log
-text are the evidence so far. The `--docker` rehearsal on §8's seed has not run for the timeline.
+**Rehearsed, not run on production.** On 2026-11-18 a throwaway `mongo:7.0.45` held 624 invented
+batches (2,219 lines), with the indexes the fleet and remote modules declare on `agent_logs` and
+`remote_sessions`. The seed put two sessions of one device in the window, and lines of another
+device, of the same agent id under another org, of another day, and one stored 25 min after its
+time. `--explain`, and an `executionStats` explain of both pipelines, read an index scan on the
+hinted index, with no COLLSCAN, no SORT stage and no rejected plan. The read printed the 1,613
+lines the seed put in the window and none of the others, the late-stored line included.
+`--limit 100` printed `TRUNCATED` at the top and the bottom, a window with nothing in it printed
+0 rows, and `--rows`, with and without `--limit 100`, rendered offline byte for byte as the direct
+read, with no address and no 24-hex id in it. The seed was loaded with mongosh, not through
+`--seed`. The `--mars` branch has not run against production.

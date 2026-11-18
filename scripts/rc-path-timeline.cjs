@@ -58,18 +58,25 @@
 //     side, since a batch is stored after its lines), pinned with `hint` to
 //     `tenant_id_1_agent_id_1_created_at_-1` (docs/data-model.md, agent_logs).
 //     Equality on the first two keys, so the `$sort` on created_at is served
-//     by the index: no blocking SORT stage (`--explain` prints the plan).
+//     by the index: no blocking SORT stage (`--explain` prints the plan). A
+//     line whose batch was stored outside the padded range is not read; the
+//     report's header prints that range.
 //   - Streaming stages only after the match: a `$project` whose `$filter`
 //     keeps the lines of the messages above whose `ts` (a BSON Date, compared
 //     as a Date, never as text) lies in the window, `$unwind`, a `$project` of
 //     named fields, and `$limit` LIMIT+1. No `$group`. `allowDiskUse: false`,
 //     `maxTimeMS` 240 s.
-//   - A read that meets the limit prints `TRUNCATED` (the rows after the
-//     last one printed were not read: re-run from that time with --from).
-//   - What leaves the database: named fields only, plus the two path-memory
-//     lines' fields with every key that could name an address, a host or a
-//     person removed on the server (DENY_KEY). Ids print as their last 4 hex,
-//     and every printed line is scrubbed of addresses and 24-hex ids again.
+//   - A read that meets the limit prints `TRUNCATED`. Rows come in the order
+//     their batches were stored, so what is missing is every batch stored
+//     after the last one read, and some of its lines can be older than the
+//     last time printed: narrow the window, or raise --limit.
+//   - What leaves the database: named fields only (`viewers` only as a
+//     number: the rank line's count, never the overlay line's list of viewer
+//     addresses), plus the two path-memory lines' fields with every key that
+//     could name an address, a host or a person removed on the server
+//     (DENY_KEY). Ids print as their last 4 hex in the report and in --rows
+//     alike (`masks`), and every printed line, like every string --rows
+//     prints, is scrubbed of addresses and 24-hex ids again.
 //
 //   THE ESTIMATE, a ten-hour window with eight hours of sessions, FFmpeg pump:
 //   heartbeats one per ≈2 s (14,400), delivery and model lines one each per
@@ -114,6 +121,11 @@ const UPLOAD_PAD_MS = 10 * 60 * 1000;
 const DEFAULT_LIMIT = 60000;
 const MAX_LIMIT = 200000;
 const MAX_WINDOW_MS = 24 * 3600 * 1000;
+/** A window end, exactly as rc-path-report.sh's ISO pattern takes it (the
+ *  self-test compares the two): a date, or a date and a time with its zone.
+ *  A time without a zone is refused: JavaScript reads it in the zone of the
+ *  machine that runs the read. */
+const ISO_TIME = /^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])(T([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\.[0-9]{1,3})?)?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9]))?$/;
 
 /** The lines read: kind, the message's start, and the call site whose
  *  literal the self-test finds in the source. */
@@ -139,6 +151,16 @@ const MSG_PATTERN = KINDS.map((d) => d.re.source).join('|');
 const MEM_PATTERN = '^FR-148 P1 path memory: ';
 /** A key that could carry an address, a host, a person or a raw key. */
 const DENY_KEY = /addr|peer|user|name|host|^ip$|_ip$|mesh_blocks|candidate|email/i;
+/** The fields that carry an id, by kind. An id prints as its last 4 hex. */
+const ID_KEYS = new Map([
+  ['session_id', 'session'],
+  ['session', 'session'],
+  ['key_id', 'key'],
+]);
+/** Fields that leave only as a number. The rank line's `viewers` is a count
+ *  (rc_overlay.rs `log_rank`); the overlay-auto line's is its list of viewer
+ *  addresses, which stays in the database. */
+const NUMBER_ONLY = ['viewers'];
 
 /** Named fields that leave the database, by the line that carries them. */
 const FIELDS = [
@@ -178,7 +200,7 @@ const FIELDS = [
   'link_at_offer',
   'upgrading',
   'stalled',
-  'viewers',
+  'viewers', // a number only (NUMBER_ONLY)
   'viewers_from',
   'ranked_last',
   'read_ms',
@@ -284,10 +306,34 @@ function kindOf(msg) {
 
 // ---------------------------------------------------------------- privacy
 
-/** An id as its last 4 hex. */
+/** An id as its last 4 hex; an id already masked (`…`) as it is. */
 function mask(id) {
   const s = text(id);
-  return s ? '…' + s.slice(-4).toLowerCase() : '-';
+  if (!s) return '-';
+  return s[0] === '…' ? s : '…' + s.slice(-4).toLowerCase();
+}
+
+/**
+ * The masks of one read, by kind (ID_KEYS). An id prints as `mask` gives,
+ * and an id whose last 4 hex the read already gave to a different id of its
+ * kind gets `~2` after them (then `~3`, …), so two sessions never fold into
+ * one. The read's order decides, so one read's rows mask alike in the report
+ * and in --rows.
+ */
+function masks() {
+  const kinds = {};
+  return (kind, id) => {
+    const s = text(id);
+    if (s === null || s[0] === '…') return s;
+    const k = kinds[kind] || (kinds[kind] = { of: new Map(), n: new Map() });
+    if (!k.of.has(s)) {
+      const base = mask(s);
+      const n = (k.n.get(base) || 0) + 1;
+      k.n.set(base, n);
+      k.of.set(s, n === 1 ? base : `${base}~${n}`);
+    }
+    return k.of.get(s);
+  };
 }
 
 /** Every printed line: no 24-hex id, no IPv4 or IPv6 address. */
@@ -325,7 +371,7 @@ function kv(f, keys) {
   const out = [];
   for (const k of keys || Object.keys(f || {})) {
     if (!(k in (f || {})) || DENY_KEY.test(k)) continue;
-    const v = k === 'session_id' || k === 'session' || k === 'key_id' ? mask(f[k]) : dash(text(f[k]));
+    const v = ID_KEYS.has(k) ? mask(f[k]) : dash(text(f[k]));
     out.push(`${k}=${v}`);
   }
   return out.join(' ');
@@ -497,7 +543,7 @@ function finishSession(s, windowEnd) {
         break;
       }
       case 'overlay':
-        push(r.t, 'overlay', `${r.m.slice(0, 120)} ${kv(f, ['overlay_blocks'])}`);
+        push(r.t, 'overlay', [r.m.slice(0, 120), kv(f, ['overlay_blocks'])].filter(Boolean).join(' '));
         break;
       case 'qsv':
         enc.qsv++;
@@ -505,7 +551,8 @@ function finishSession(s, windowEnd) {
         break;
       case 'encOpen':
         enc.opens++;
-        push(r.t, 'encoder', `${enc.opens > 1 ? 'REOPEN' : 'open'}: ${kv(f, ['encoder', 'width', 'height', 'fps', 'cq', 'maxrate_bps', 'input'])} (${r.m.replace(/^ffmpeg encoder opened /, '')})`);
+        // The message's own rest, "(constant-quality + maxrate cap)", has its parentheses.
+        push(r.t, 'encoder', `${enc.opens > 1 ? 'REOPEN' : 'open'}: ${kv(f, ['encoder', 'width', 'height', 'fps', 'cq', 'maxrate_bps', 'input'])} ${r.m.replace(/^ffmpeg encoder opened /, '')}`);
         break;
       case 'rejected':
         enc.rejected++;
@@ -674,8 +721,17 @@ function minuteRows(ivs) {
 function render(r) {
   const o = r.opts || {};
   const L = [];
-  const trunc = `TRUNCATED: the read stopped at ${o.limit || '?'} rows; lines after the last time printed were not read. Re-run with --from that time.`;
+  const trunc = `TRUNCATED: the read stopped at ${o.limit || '?'} rows. Rows come in the order their batches were stored, so every batch stored after the last one read is missing, and some of its lines can be older than the last time printed. Narrow the window with --from/--to, or raise --limit (at most ${MAX_LIMIT}).`;
+  // The range of storage times the $match read: the window the database was
+  // read for (never a label given offline), padded by UPLOAD_PAD_MS.
+  const stored = (t, d) => {
+    const ms = epochMs(t);
+    return ms === null ? '-' : new Date(ms + d).toISOString();
+  };
+  const rd = o.read || {};
+  const pad = UPLOAD_PAD_MS / 60000;
   L.push(`# FR-148 path timeline: agent ${mask(o.agent)}, ${o.from ? new Date(epochMs(o.from)).toISOString() : '-'} -> ${o.to ? new Date(epochMs(o.to)).toISOString() : '-'}`);
+  L.push(`batches read: stored ${stored(rd.from, -UPLOAD_PAD_MS)} -> ${stored(rd.to, UPLOAD_PAD_MS)} (the window ± ${pad} min). A line whose batch was stored outside that range, uploaded over ${pad} min late or stamped by a clock over ${pad} min fast, is not in this report.`);
   L.push(`rows read: ${r.rows}${r.truncated ? ' (TRUNCATED)' : ''}`);
   if (r.truncated) L.push(trunc);
   r.sessions.forEach((s, n) => {
@@ -687,7 +743,7 @@ function render(r) {
     if (o.intervals) for (const iv of s.ivs) rows.push({ t: iv.t1, what: 'rate', line: `sent ${mbps((iv.bytes * 8000) / (iv.t1 - iv.t0))} ${((iv.frames * 1000) / (iv.t1 - iv.t0)).toFixed(1)} fps target ${dash(iv.target)} maxrate ${dash(iv.maxrate)} pipe ${dash(iv.pipe)}` });
     else for (const m of minuteRows(s.ivs)) rows.push({ t: m.t, what: 'minute', line: m.line });
     rows.sort((a, b) => a.t - b.t);
-    for (const e of rows) L.push(`  ${clock(e.t)}  ${e.what.padEnd(8)} ${e.line}`);
+    for (const e of rows) L.push(`  ${clock(e.t)}  ${e.what.padEnd(8)} ${e.line}`.trimEnd());
     L.push('');
     L.push('| Session summary | |');
     L.push('|---|---|');
@@ -750,7 +806,10 @@ function render(r) {
  */
 function timelinePipeline(o) {
   const project = {};
-  for (const k of FIELDS) project[k] = '$lines.fields.' + k;
+  for (const k of FIELDS) {
+    const v = '$lines.fields.' + k;
+    project[k] = NUMBER_ONLY.includes(k) ? { $cond: [{ $isNumber: v }, v, '$$REMOVE'] } : v;
+  }
   return [
     {
       $match: {
@@ -824,21 +883,105 @@ function carrierPipeline(o) {
 
 const CARRIER_OPTIONS = { maxTimeMS: 30000, allowDiskUse: false, hint: { agent_id: 1, created_at: -1 } };
 
-/** One row as `--rows` prints it and the offline mode reads it back. */
-function rowOut(row) {
+/**
+ * One row as `--rows` prints it and as the direct mode folds it, so that the
+ * offline re-read renders byte for byte as the direct read: ids masked
+ * through `ids` (one `masks()` per read), every key DENY_KEY names left out,
+ * every string scrubbed as a printed line is.
+ */
+function rowOut(row, ids) {
+  const idOf = ids || masks();
   const plain = (o) => {
     if (!o) return undefined;
     const f = {};
     for (const k of Object.keys(o)) {
       if (DENY_KEY.test(k)) continue;
-      const v = o[k];
-      f[k] = v !== null && typeof v === 'object' && typeof v.toNumber === 'function' ? v.toNumber() : v;
+      let v = o[k];
+      if (v !== null && typeof v === 'object' && typeof v.toNumber === 'function') v = v.toNumber();
+      if (ID_KEYS.has(k)) v = idOf(ID_KEYS.get(k), v);
+      else if (typeof v === 'string') v = scrub(v);
+      f[k] = v;
     }
     return f;
   };
-  const out = { t: row.t instanceof Date ? row.t.toISOString() : row.t, m: row.m, f: plain(row.f) };
+  const out = { t: row.t instanceof Date ? row.t.toISOString() : row.t, m: typeof row.m === 'string' ? scrub(row.m) : row.m, f: plain(row.f) };
   if (row.fm) out.fm = plain(row.fm);
   return out;
+}
+
+/** The `--rows` text's first lines: the read's window, which the offline
+ *  reader takes (the agent as its last 4 hex, and the limit), and the
+ *  server's record. */
+function rowsHead(s, carrierRecord) {
+  return [
+    `# window: ${JSON.stringify({ from: s.from.toISOString(), to: s.to.toISOString(), agent4: s.agent.slice(-4), limit: s.limit })}`,
+    `# carrier record: ${JSON.stringify(carrierRecord)}`,
+  ];
+}
+
+/** The `--rows` text's last line, after `n` rows came back for `limit`. */
+function rowsTail(n, limit) {
+  const cut = ` TRUNCATED at ${limit}: every batch stored after the last one read is missing, and some of its lines can be older than the last row's time; narrow --from/--to or raise --limit`;
+  return `# rows: ${Math.min(n, limit)}${n > limit ? cut : ''}`;
+}
+
+/** What the direct read renders with. */
+function readOpts(s, truncated, carrierRecord) {
+  return { truncated, limit: s.limit, agent: s.agent, from: s.from, to: s.to, carrierRecord, read: { from: s.from, to: s.to } };
+}
+
+/** A `--rows` text back as rows, with what its comment lines say. */
+function parseRows(textIn) {
+  const out = { rows: [], truncated: false, carrierRecord: null, window: null };
+  for (const line of String(textIn).split('\n')) {
+    if (/^# .*TRUNCATED/.test(line)) out.truncated = true;
+    const cr = /^# carrier record: (\{.*\})\s*$/.exec(line);
+    if (cr) {
+      try {
+        out.carrierRecord = JSON.parse(cr[1]);
+      } catch (_) {
+        /* not a record */
+      }
+    }
+    const win = /^# window: (\{.*\})\s*$/.exec(line);
+    if (win && !out.window) {
+      try {
+        out.window = JSON.parse(win[1]);
+      } catch (_) {
+        /* not a window */
+      }
+    }
+    if (line[0] !== '{') continue;
+    try {
+      out.rows.push(JSON.parse(line));
+    } catch (_) {
+      /* not a row */
+    }
+  }
+  return out;
+}
+
+/**
+ * `--rows` texts rendered as the direct read renders them. A window given
+ * here (`cli`) wins over the file's as the report's label; the range read is
+ * always the file's.
+ */
+function renderRows(texts, cli) {
+  const o = cli || {};
+  const rows = [];
+  let truncated = false;
+  let carrierRecord = null;
+  let w = null;
+  for (const t of texts) {
+    const p = parseRows(t);
+    for (const x of p.rows) rows.push(x);
+    truncated = truncated || p.truncated;
+    if (p.carrierRecord) carrierRecord = p.carrierRecord;
+    if (!w && p.window) w = p.window;
+  }
+  w = w || {};
+  const read = w.from && w.to ? { from: w.from, to: w.to } : null;
+  return render(fold(rows, { truncated, intervals: !!o.intervals, agent: o.agent || w.agent4, from: o.from || w.from, to: o.to || w.to, carrierRecord, limit: w.limit, read }));
 }
 
 function planStages(plan) {
@@ -860,8 +1003,11 @@ function readSettings(env) {
     .split(',')
     .filter(Boolean);
   if (agents.length !== 1 || !hex.test(agents[0])) throw new Error('the timeline reads ONE agent: --agent HEX, once');
-  const from = new Date(env.RC_PATH_SINCE || '');
-  const to = new Date(env.RC_PATH_UNTIL || '');
+  const since = env.RC_PATH_SINCE || '';
+  const until = env.RC_PATH_UNTIL || '';
+  if (!ISO_TIME.test(since) || !ISO_TIME.test(until)) throw new Error('--from and --to take YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS[.sss]] with Z or +HH:MM');
+  const from = new Date(since);
+  const to = new Date(until);
   if (isNaN(from.getTime()) || isNaN(to.getTime()) || from >= to) throw new Error('--from must be before --to (ISO 8601)');
   if (to.getTime() - from.getTime() > MAX_WINDOW_MS) throw new Error('the window is over 24 h: split it with --from/--to');
   const limit = env.RC_PATH_LIMIT ? Number(env.RC_PATH_LIMIT) : DEFAULT_LIMIT;
@@ -900,26 +1046,26 @@ function runMongosh() {
   sessions.aggregate(carrierPipeline(ids), CARRIER_OPTIONS).forEach((g) => {
     carrierRecord[String(g._id)] = g.n;
   });
-  if (emitRows) {
-    // The offline reader takes the window from here, so a session still open
-    // at its end is told apart there too. The agent leaves as its last 4 hex.
-    print(`# window: ${JSON.stringify({ from: s.from.toISOString(), to: s.to.toISOString(), agent4: s.agent.slice(-4) })}`);
-    print(`# carrier record: ${JSON.stringify(carrierRecord)}`);
-  }
+  // The offline reader takes the window from here, so a session still open
+  // at its end is told apart there too.
+  if (emitRows) for (const l of rowsHead(s, carrierRecord)) print(l);
   const rows = [];
+  const idMasks = masks();
   let n = 0;
   coll.aggregate(pipeline, QUERY_OPTIONS).forEach((row) => {
     n++;
     if (n > s.limit) return;
-    if (emitRows) print(JSON.stringify(rowOut(row)));
-    else rows.push(row);
+    // Both modes take each row as --rows prints it, masked in the read's order.
+    const out = rowOut(row, idMasks);
+    if (emitRows) print(JSON.stringify(out));
+    else rows.push(out);
   });
   const truncated = n > s.limit;
   if (emitRows) {
-    print(`# rows: ${Math.min(n, s.limit)}${truncated ? ` TRUNCATED at ${s.limit}: re-run with --from the last row's time` : ''}`);
+    print(rowsTail(n, s.limit));
     return;
   }
-  print(render(fold(rows, { truncated, limit: s.limit, agent: s.agent, from: s.from, to: s.to, carrierRecord })));
+  print(render(fold(rows, readOpts(s, truncated, carrierRecord))));
 }
 
 // ---------------------------------------------------------------- self-test
@@ -1127,6 +1273,110 @@ function selfTest() {
     }
   }
   check('settings refuse no org, two agents, a window over 24 h', threw === 3);
+  const fv = p[4].$project.f;
+  check(
+    'viewers leaves only as a number, every other named field as stored',
+    JSON.stringify(fv.viewers) === JSON.stringify({ $cond: [{ $isNumber: '$lines.fields.viewers' }, '$lines.fields.viewers', '$$REMOVE'] }) && FIELDS.every((k) => k === 'viewers' || fv[k] === '$lines.fields.' + k),
+    JSON.stringify(fv.viewers),
+  );
+  // 6. --rows: one read's rows, masked as the report masks them. A third
+  //    session whose id ends as session 1's does, its key as session 1's key,
+  //    and the overlay-auto line's addresses as an older read sent them.
+  const s3 = 'f14800000000000000015e51';
+  const more = [
+    { t: at(0.05), m: 'rc ICE: overlay auto (FR-128) — the session may ride the mesh', f: { session: FX.s1, viewers: '[192.0.2.10, 2001:db8::10]' } },
+    { t: at(300), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: s3, carrier: 'turn', local_typ: 'Relay', remote_typ: 'Relay' } },
+    {
+      t: at(301),
+      m: "FR-148 P1 path memory: the pair's entry at the open",
+      f: { session_id: s3 },
+      fm: { session_id: s3, key_id: 'f148f149a001', key_carrier: 'turn', entry: 'none', taken: 'today', taken_why: 'shadow_mode', note: 'via 198.51.100.7:3478 and 2001:db8::7' },
+    },
+    hbRow(302, s3, { bytes_written: 0, frames_sent: 0 }),
+    hbRow(304, s3, { bytes_written: 500000, frames_sent: 50 }),
+  ];
+  const readIn = rows.concat(more);
+  const set = { tenant: FX.tenant, agent: FX.agent, from: new Date(at(0)), to: new Date(at(400)), limit: readIn.length };
+  const ids = masks();
+  const printed = readIn.map((x) => rowOut(x, ids));
+  const rowsText = (lim) =>
+    rowsHead(Object.assign({}, set, { limit: lim }), { turn: 2 })
+      .concat(
+        printed.slice(0, lim).map((x) => JSON.stringify(x)),
+        [rowsTail(Math.min(printed.length, lim + 1), lim)],
+      )
+      .join('\n');
+  const full = rowsText(readIn.length);
+  const body = full
+    .split('\n')
+    .filter((l) => l[0] === '{')
+    .join('\n');
+  const v6 = (s) => (s.match(/(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}/g) || []).filter((x) => /[a-fA-F]|::/.test(x));
+  check('--rows: no 24-hex run, no raw key id', !/[0-9a-fA-F]{24}/.test(full) && !/f148f148a00[12]|f148f149a001/.test(full), (full.match(/.{0,30}[0-9a-fA-F]{24}.{0,10}/) || [''])[0]);
+  check('--rows: no dotted or colon address', !/\b\d{1,3}(\.\d{1,3}){3}\b/.test(body) && v6(body).length === 0 && !/192\.0\.2\.|198\.51\.100\.|2001:db8/i.test(full), JSON.stringify(v6(body)));
+  check('--rows: ids and key ids as the report masks them', /"session":"…5e51"/.test(body) && /"session_id":"…5e51~2"/.test(body) && /"key_id":"…a001"/.test(body) && /"key_id":"…a001~2"/.test(body));
+  const direct = render(fold(printed, readOpts(set, false, { turn: 2 })));
+  const offline = renderRows([full], {});
+  const firstDiff = (a, b) => {
+    const x = a.split('\n');
+    const y = b.split('\n');
+    const i = x.findIndex((l, j) => l !== y[j]);
+    return i < 0 ? `lengths ${x.length} / ${y.length}` : `line ${i + 1}: ${x[i]} | ${y[i]}`;
+  };
+  check('the masked --rows, read back offline, renders byte for byte as the direct read', offline === direct && !/[0-9a-fA-F]{24}/.test(full), firstDiff(direct, offline));
+  const sids = fold(printed, {}).sessions.map((x) => x.sid);
+  check('two ids with one last 4 hex stay two sessions (…5e51, …5e51~2)', sids.join(',') === '…5e51,…5e52,…5e51~2' && /^## session 3: …5e51~2, /m.test(direct) && /^## session 3: …5e51~2, /m.test(offline), sids.join(','));
+  const cut = 40;
+  const directCut = render(fold(printed.slice(0, cut), readOpts(Object.assign({}, set, { limit: cut }), true, { turn: 2 })));
+  check('a TRUNCATED --rows read back offline renders as the direct read, its limit too', renderRows([rowsText(cut)], {}) === directCut && /stopped at 40 rows/.test(directCut), firstDiff(directCut, renderRows([rowsText(cut)], {})));
+  check('mask: an id already masked prints as it is', mask('…5e51~2') === '…5e51~2' && mask(FX.s1) === '…5e51' && mask(null) === '-');
+  check('the header prints the range of storage times read', /^batches read: stored 2026-11-18T06:50:00\.000Z -> 2026-11-18T07:16:40\.000Z \(the window ± 10 min\)\. /m.test(direct), direct.split('\n')[1]);
+  check(
+    'TRUNCATED says the cut follows the order batches were stored',
+    /^TRUNCATED: the read stopped at 40 rows\. Rows come in the order their batches were stored, so every batch stored after the last one read is missing/m.test(directCut) &&
+      /^# rows: 40 TRUNCATED at 40: every batch stored after the last one read is missing/m.test(rowsText(cut)),
+  );
+  check('encoder rows: the message keeps its one pair of parentheses', /  encoder  open: encoder=hevc_qsv .* \(constant-quality \+ maxrate cap\)$/m.test(direct) && !/\(\(/.test(direct));
+  check('no printed line ends in a space', !/ $/m.test(direct), (direct.match(/^.* $/m) || [''])[0]);
+  const takes = (from, to, limit) => {
+    try {
+      readSettings({ RC_PATH_TENANT: FX.tenant, RC_PATH_AGENTS: FX.agent, RC_PATH_SINCE: from, RC_PATH_UNTIL: to, RC_PATH_LIMIT: limit });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  check(
+    'the window takes ISO_TIME only: a date, a time with Z or an offset; never a zone-less time',
+    takes('2026-11-18', '2026-11-18T08:00Z') &&
+      takes('2026-11-18T07:00:00.250+01:00', '2026-11-18T08:00:00Z') &&
+      !takes('2026-11-18T07:00:00', '2026-11-18T08:00:00Z') &&
+      !takes('2026-11-18T07:00:00Z', 'Nov 18 2026 09:00') &&
+      !takes('2026-11-18 07:00:00Z', '2026-11-18T08:00:00Z') &&
+      !takes('2026-11-18t07:00:00z', '2026-11-18T08:00:00Z'),
+  );
+  // 7. The wrapper checks its arguments before it looks at the target.
+  try {
+    const sh = require('fs').readFileSync(require('path').join(__dirname, 'rc-path-report.sh'), 'utf8');
+    const shl = sh.split('\n');
+    const lineOf = (re) => shl.findIndex((l) => re.test(l));
+    const target = lineOf(/^\[ -n "\$TARGET" \] \|\| die/);
+    const before = (i) => i >= 0 && target > i && lineOf(/^case "\$TARGET" in$/) > target;
+    const twice = (flag) => before(shl.findIndex((l) => /\|\| die "[^"]*given twice/.test(l) && l.includes(flag)));
+    check('the wrapper refuses --from/--since, --to/--until, --tenant, --agent or --limit given twice, before the target', ['--from', '--to', '--tenant', '--agent', '--limit'].every(twice));
+    const iso = /^ISO='([^']+)'$/m.exec(sh);
+    check('the wrapper checks both window values with ISO_TIME, before the target', iso && iso[1] === ISO_TIME.source && before(lineOf(/--since\|--from\)/)) && shl.filter((l) => /=~ \$ISO \]\]/.test(l)).length === 2, iso && iso[1]);
+    const lm = /^LIMIT_MAX=(\d+)$/m.exec(sh);
+    const said = MAX_LIMIT.toLocaleString('en-US');
+    check(
+      '--limit has one bound: the wrapper and the read agree on it, and the help states it once',
+      lm && Number(lm[1]) === MAX_LIMIT && shl.filter((l) => /^#/.test(l) && l.includes(said)).length === 1 && takes(at(0), at(10), String(MAX_LIMIT)) && !takes(at(0), at(10), String(MAX_LIMIT + 1)),
+      lm && lm[1],
+    );
+    check('every value bound for the remote command line is checked plain, before the target', before(lineOf(/\*\[!A-Za-z0-9\._:\+=-\]\*\)/)));
+  } catch (e) {
+    check('the wrapper is readable beside this script', false, e.message);
+  }
   console.log(`rc-path-timeline self-test: ${cases - fails}/${cases} passed`);
   return fails ? 1 : 0;
 }
@@ -1152,47 +1402,38 @@ function nodeMain(argv) {
     return process.exit(1);
   }
   const fs = require('fs');
-  const rows = [];
-  let truncated = false;
-  let carrierRecord = null;
-  for (const file of opts.files) {
-    for (const line of fs.readFileSync(file === '-' ? 0 : file, 'utf8').split('\n')) {
-      if (/^# .*TRUNCATED/.test(line)) truncated = true;
-      const cr = /^# carrier record: (\{.*\})\s*$/.exec(line);
-      if (cr) {
-        try {
-          carrierRecord = JSON.parse(cr[1]);
-        } catch (_) {
-          /* not a record */
-        }
-      }
-      const win = /^# window: (\{.*\})\s*$/.exec(line);
-      if (win) {
-        try {
-          const w = JSON.parse(win[1]);
-          // The command line wins over the file.
-          opts.from = opts.from || w.from;
-          opts.to = opts.to || w.to;
-          opts.agent = opts.agent || w.agent4;
-        } catch (_) {
-          /* not a window */
-        }
-      }
-      if (line[0] !== '{') continue;
-      try {
-        rows.push(JSON.parse(line));
-      } catch (_) {
-        /* not a row */
-      }
-    }
-  }
-  console.log(render(fold(rows, { truncated, intervals: opts.intervals, agent: opts.agent, from: opts.from, to: opts.to, carrierRecord })));
+  // The command line wins over the file as the report's label.
+  console.log(renderRows(opts.files.map((file) => fs.readFileSync(file === '-' ? 0 : file, 'utf8')), opts));
 }
 
 // ---------------------------------------------------------------- dispatch
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { fold, render, timelinePipeline, carrierPipeline, QUERY_OPTIONS, CARRIER_OPTIONS, KINDS, FIELDS, MSG_PATTERN, scrub, mask, value, readSettings, rowOut, selfTest };
+  module.exports = {
+    fold,
+    render,
+    timelinePipeline,
+    carrierPipeline,
+    QUERY_OPTIONS,
+    CARRIER_OPTIONS,
+    KINDS,
+    FIELDS,
+    MSG_PATTERN,
+    ISO_TIME,
+    MAX_LIMIT,
+    scrub,
+    mask,
+    masks,
+    value,
+    readSettings,
+    readOpts,
+    rowOut,
+    rowsHead,
+    rowsTail,
+    parseRows,
+    renderRows,
+    selfTest,
+  };
 }
 if (typeof Mongo === 'function' && typeof print === 'function') {
   runMongosh();
