@@ -331,10 +331,19 @@ impl DeviceView {
 /// absent, and this returns `available:false` + a `reason` so the SPA renders a
 /// clean "device service not running" state instead of a rejected promise. On
 /// success it issues `status` then `peers` on ONE connection.
+///
+/// #4020 — through [`connect_service`], so a stopped service on a Linux system
+/// install or a Mac reads `daemon_unreachable`, not `connect_error`.
 #[tauri::command]
 pub async fn cmd_device_view() -> DeviceView {
+    device_view(connect_service().await).await
+}
+
+/// [`cmd_device_view`] after its connect: `connected` is the connect's
+/// result.
+async fn device_view(connected: std::io::Result<localapi::Client>) -> DeviceView {
     const SURFACE: &str = "device_view";
-    let mut client = match localapi::connect().await {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) => {
             let reason = if e.kind() == std::io::ErrorKind::NotFound {
@@ -392,7 +401,7 @@ pub async fn cmd_ping(
     timeout_ms: Option<u64>,
     prefer_v6: Option<bool>,
 ) -> Result<PingResult, String> {
-    let mut client = localapi::connect().await.map_err(|e| {
+    let mut client = connect_service().await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "device service not running".to_string()
         } else {
@@ -459,8 +468,9 @@ pub async fn cmd_enroll(
 
 /// FR-43 P3a, #3996 — what a re-enroll says when this account's config holds
 /// no enrollment, or is not there: the device service holds it. A one-row
-/// Mac's person has no file at all; nor has a Windows background-service
-/// install's person, whose machine-wide file only administrators read.
+/// Mac's person has a file with no enrollment in it, which the screen worker
+/// writes at its first start; a Windows background-service install's person
+/// has no file, and the machine-wide one only administrators read.
 fn enrollment_elsewhere() -> String {
     if cfg!(target_os = "macos") {
         "The root daemon holds this Mac's enrollment. Refresh it with \
@@ -535,7 +545,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
 /// human detail ("archived … -> …"); Err carries why nothing was done.
 #[tauri::command]
 pub async fn cmd_config_cleanup() -> Result<String, String> {
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| format!("daemon unreachable: {e}"))?;
     match client.config_cleanup_stale().await {
@@ -1347,9 +1357,19 @@ const ENCODER_CAPS_SURFACE: &str = "encoder_caps";
 /// FR-84 D4 — what this device can encode, from the daemon's CACHED probe
 /// (the verb never starts one). The card polls this only while the answer
 /// is `not_probed`, and re-reads it when the daemon comes back or changes.
+///
+/// #4020 — through [`connect_service`]: a stopped service on a Linux system
+/// install or a Mac is `daemon_unreachable`, which the card words "Offline",
+/// not the system socket's `PermissionDenied` under its `Error` chip.
 #[tauri::command]
 pub async fn cmd_encoder_caps() -> EncoderCapsView {
-    let mut client = match localapi::connect().await {
+    encoder_caps_from(connect_service().await).await
+}
+
+/// [`cmd_encoder_caps`] after its connect: `connected` is the connect's
+/// result.
+async fn encoder_caps_from(connected: std::io::Result<localapi::Client>) -> EncoderCapsView {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return EncoderCapsView::unavailable("daemon_unreachable".into());
@@ -1474,10 +1494,19 @@ fn own_home() -> Option<String> {
 
 /// FR-84 D4 — the card's data: the daemon's effective folder (status) and
 /// the configured value (its config surface), on ONE connection.
+///
+/// #4020 — through [`connect_service`], as [`cmd_encoder_caps`]: a stopped
+/// service reads "Offline" on the card, on every OS.
 #[tauri::command]
 pub async fn cmd_files_dir_view() -> FilesDirView {
+    files_dir_view_from(connect_service().await).await
+}
+
+/// [`cmd_files_dir_view`] after its connect: `connected` is the connect's
+/// result.
+async fn files_dir_view_from(connected: std::io::Result<localapi::Client>) -> FilesDirView {
     const SURFACE: &str = "files_dir";
-    let mut client = match localapi::connect().await {
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return FilesDirView::unavailable("daemon_unreachable".into());
@@ -1553,7 +1582,7 @@ fn files_dir_value_for(picked: &Path, home: Option<&str>) -> String {
 /// write, as whom, into which profile; its refusal is the answer, shown in
 /// its own words — never a cue to write the file directly.
 async fn set_files_dir_via_daemon(value: Option<&str>) -> Result<localapi::ConfigEntry, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .config_set("files_dir", value)
         .await
@@ -1634,7 +1663,7 @@ pub async fn cmd_files_dir_default() -> Result<localapi::ConfigEntry, String> {
 /// <file>` / `open <file>` would launch a file rather than show it.
 #[tauri::command]
 pub async fn cmd_open_files_dir() -> Result<(), String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let status = client
         .status()
         .await
@@ -1869,10 +1898,13 @@ pub fn server_origin_blocking() -> Result<String, String> {
 }
 
 /// [`server_origin_blocking`] for the config at `path`, asking the daemon
-/// (`daemon`) when that file holds no enrollment. #3996 — or is not there: a
-/// one-row Mac's person never has one. Until #3996 a missing file ended here
-/// as "not enrolled", with `config::load`'s "must be re-enrolled" in the log,
-/// and the daemon was never asked.
+/// (`daemon`) when that file holds no enrollment. #3996 — or is not there. A
+/// one-row Mac's screen worker (`run --supervised --unenrolled`) writes the
+/// person's `config.toml` at its first start, with no enrollment in it, so
+/// the file is missing only in the install's first seconds or on a device not
+/// enrolled yet. Until #3996 a missing file ended here as "not enrolled", with
+/// `config::load`'s "must be re-enrolled" in the log, and the daemon was never
+/// asked.
 fn server_origin_from(
     path: &PathBuf,
     daemon: impl FnOnce() -> Option<NodeStatus>,
@@ -2275,7 +2307,7 @@ pub struct RestartReport {
 /// not be asked at all.
 #[tauri::command]
 pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let answer = client
         .restart_daemon(&reason)
         .await
@@ -2847,6 +2879,18 @@ fn sessions_answer(
 /// #3998 — [`localapi::connect`] for the consent prompt, the session banner
 /// and the tray's red: a connect that failed while this person's own
 /// endpoint is gone comes back as no service ([`proven`]).
+///
+/// #4020 — and for every other connect of this app whose error is read: a
+/// read that tells "not running" apart from another failure (the Overview's
+/// encoders and files cards, the device view, the Routes, Recordings and
+/// Devices pages), and an action whose error is shown as text, which keeps
+/// its words. Until #4020 those used the plain connect, so on a Linux system
+/// install or a Mac with the service stopped the Overview's cards said
+/// `Error` with the system socket's `PermissionDenied` (the 0.4.225 lab). A
+/// connect whose error nothing reads stays plain: a best-effort read with a
+/// fallback of its own, where the proof would probe the person's own
+/// endpoint for nothing. The test `only_a_connect_nobody_reads_stays_plain`
+/// holds that list.
 pub(crate) async fn connect_service() -> std::io::Result<localapi::Client> {
     match localapi::connect().await {
         Ok(client) => Ok(client),
@@ -2877,7 +2921,7 @@ pub(crate) fn proven(e: std::io::Error, own_endpoint_gone: bool) -> std::io::Err
 /// overlay's own button does.
 #[tauri::command]
 pub async fn cmd_rc_disconnect(session: String) -> Result<(), String> {
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| format!("Device service unreachable: {e}"))?;
     let ok = client
@@ -2927,7 +2971,7 @@ impl TunnelsView {
 #[tauri::command]
 pub async fn cmd_tunnels_view() -> TunnelsView {
     const SURFACE: &str = "tunnels";
-    let mut client = match localapi::connect().await {
+    let mut client = match connect_service().await {
         Ok(c) => c,
         Err(e) => {
             return TunnelsView::unavailable(refresh_failed(SURFACE, describe_io("connect", &e)));
@@ -2966,7 +3010,7 @@ pub async fn cmd_tunnels_view() -> TunnelsView {
 pub async fn cmd_route_update(
     route: roomler_localapi::RouteDescriptor,
 ) -> Result<roomler_localapi::RouteDescriptor, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .route_update(route)
         .await
@@ -2991,7 +3035,7 @@ fn explain_route_edit_error(message: &str) -> String {
 pub async fn cmd_route_add(
     route: roomler_localapi::RouteDescriptor,
 ) -> Result<roomler_localapi::RouteDescriptor, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client.route_add(route).await.map_err(|e| e.to_string())
 }
 
@@ -2999,14 +3043,14 @@ pub async fn cmd_route_add(
 /// daemon config). `Ok(false)` when the id was unknown.
 #[tauri::command]
 pub async fn cmd_route_remove(id: String) -> Result<bool, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client.route_remove(&id).await.map_err(|e| e.to_string())
 }
 
 /// Enable/disable a declared route (enabling clears a terminal `failed`).
 #[tauri::command]
 pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .route_set_enabled(&id, enabled)
         .await
@@ -3015,6 +3059,8 @@ pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, St
 
 /// The shared connect-error mapping for the mutating route commands
 /// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
+/// #4020 — its callers connect through [`connect_service`], so a stopped
+/// service is `NotFound` here on a Linux system install and a Mac too.
 pub(crate) fn daemon_unreachable(e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         "device service not running".to_string()
@@ -3118,7 +3164,7 @@ pub(crate) fn explain_recording_error(message: &str) -> String {
 #[tauri::command]
 pub async fn cmd_recordings_view() -> RecordingsView {
     const SURFACE: &str = "recordings";
-    let mut client = match localapi::connect().await {
+    let mut client = match connect_service().await {
         Ok(c) => c,
         Err(e) => {
             return RecordingsView::unavailable(refresh_failed(
@@ -3219,7 +3265,7 @@ pub async fn cmd_record_start(
     system_audio: Option<bool>,
     microphone: Option<bool>,
 ) -> Result<localapi::RecordingState, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .record_start(localapi::RecordStartOpts {
             fps,
@@ -3235,7 +3281,7 @@ pub async fn cmd_record_start(
 /// Stop the recording. Resolves once the file is final.
 #[tauri::command]
 pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .record_stop()
         .await
@@ -3245,7 +3291,7 @@ pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
 /// Delete a recording (and its sidecar) by file name.
 #[tauri::command]
 pub async fn cmd_recording_delete(name: String) -> Result<(), String> {
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     client
         .recording_delete(&name)
         .await
@@ -3275,7 +3321,7 @@ pub async fn cmd_recording_open(name: Option<String>, reveal: bool) -> Result<()
     if let Some(n) = &name {
         check_recording_name(n)?;
     }
-    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let mut client = connect_service().await.map_err(daemon_unreachable)?;
     let listing = client
         .recordings_list()
         .await
@@ -3419,7 +3465,7 @@ pub async fn cmd_devices(
     dir: Option<String>,
 ) -> Result<localapi::DevicesPage, String> {
     const SURFACE: &str = "devices";
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
     let query = localapi::DevicesQuery {
@@ -3443,7 +3489,7 @@ pub async fn cmd_devices(
 #[tauri::command]
 pub async fn cmd_mesh(org: Option<String>) -> Result<localapi::MeshView, String> {
     const SURFACE: &str = "mesh";
-    let mut client = localapi::connect()
+    let mut client = connect_service()
         .await
         .map_err(|e| directory_failure(SURFACE, "connect", e.into()))?;
     match client.mesh(org.as_deref().unwrap_or("")).await {
@@ -3606,10 +3652,11 @@ fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
 
 /// #3996 — the config at `path`, for a caller to whom no file there is a
 /// normal state. The companion never runs on a config (the device service
-/// does), so that is every read it makes. A one-row Mac's person never has a
-/// file: the root daemon holds the enrollment (FR-43). A host that is not
-/// enrolled yet has none, and the person at a Windows background-service
-/// install cannot see the machine-wide one.
+/// does), so that is every read it makes. A one-row Mac's person has none in
+/// the install's first seconds, until the screen worker writes one with no
+/// enrollment in it at its first start: the root daemon holds the enrollment
+/// (FR-43). A host that is not enrolled yet has none, and the person at a
+/// Windows background-service install cannot see the machine-wide one.
 ///
 /// No file is `Ok(None)`, with nothing logged. A file that is there goes
 /// through [`config::load`], so a broken one still logs its ERROR and is
@@ -5820,5 +5867,162 @@ mod tests {
             "a failed read changes the banner's words: {block}"
         );
         assert!(poll.contains("paint()"), "{poll}");
+    }
+
+    /// #4019 — a refresh that fails or recovers moves no row of the device
+    /// list. The stale-data line (`dv-grid-error`, "Showing data from 1 min
+    /// ago — …") and the status line (`dv-grid-status`) sat in the flow right
+    /// above the table, so showing one moved every row down by its height
+    /// while a person aimed at one: in the 0.4.225 lab two "View screen"
+    /// clicks landed on row padding. Both now sit in one slot above the
+    /// table whose height is fixed, shown or not, and the page shows and
+    /// hides the lines in it, never the slot.
+    #[test]
+    fn a_note_above_the_device_list_moves_no_row() {
+        let html = include_str!("front/index.html").replace("\r\n", "\n");
+        let css = include_str!("front/styles.css").replace("\r\n", "\n");
+        let js = include_str!("front/devices.js").replace("\r\n", "\n");
+        // The slot, never `hidden`, holds both lines, above the table.
+        let open = html
+            .find(r#"<div id="dv-notes" class="dv-notes">"#)
+            .expect("the list's notes have no slot");
+        let close = open + html[open..].find("</div>").expect("the slot's end");
+        let slot = &html[open..close];
+        for line in [r#"<p id="dv-grid-status""#, r#"<p id="dv-grid-error""#] {
+            assert_eq!(html.matches(line).count(), 1, "{line}");
+            assert!(slot.contains(line), "{line} is not in the slot: {slot}");
+        }
+        assert!(
+            close
+                < html
+                    .find(r#"<table id="dv-grid""#)
+                    .expect("the device list"),
+            "the slot is not above the list"
+        );
+        // Its height is fixed, and what does not fit in it is cut.
+        let start = css.find("\n.dv-notes {").expect("no rule for the slot");
+        let rule = &css[start..start + css[start..].find('}').expect("the rule's end")];
+        for decl in ["height: 32px;", "overflow: hidden;"] {
+            assert!(rule.contains(decl), "{decl}: {rule}");
+        }
+        assert!(
+            !rule.contains("min-height") && !rule.contains("max-height"),
+            "{rule}"
+        );
+        // The page shows and hides the lines, never the slot.
+        assert_eq!(js.matches("$('dv-notes')").count(), 1, "{js}");
+        assert!(js.contains("$('dv-notes').classList.toggle('both', !!note && !!warn);"));
+    }
+
+    /// #4020 — with the device service stopped on a Linux system install or
+    /// a Mac, a connect fails with the system socket's `PermissionDenied`
+    /// while the person's own endpoint is gone, and the Overview read that as
+    /// a failure: an `Error` chip and "Could not read …" on its encoders and
+    /// files cards (0.4.225 lab). Through `connect_service` ([`proven`]) it is
+    /// no service: the device view and both cards answer
+    /// `daemon_unreachable`, which the cards word "Offline". Where the own
+    /// endpoint is there, the same error stays a failure in its own words.
+    #[tokio::test]
+    async fn a_stopped_service_reads_not_running_on_the_overview() {
+        let denied = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            )
+        };
+        let stopped = || -> std::io::Result<localapi::Client> { Err(proven(denied(), true)) };
+        let view = device_view(stopped()).await;
+        assert!(!view.available);
+        assert_eq!(view.reason.as_deref(), Some("daemon_unreachable"));
+        let caps = encoder_caps_from(stopped()).await;
+        assert!(!caps.available);
+        assert_eq!(caps.reason.as_deref(), Some("daemon_unreachable"));
+        let files = files_dir_view_from(stopped()).await;
+        assert!(!files.available);
+        assert_eq!(files.reason.as_deref(), Some("daemon_unreachable"));
+        // The own endpoint is there. (Not the encoders card: its failures
+        // count in the refresh ledger, which
+        // `a_person_socket_refusal_is_root_only_and_no_answer_stays_a_failure`
+        // counts while the tests run in parallel.)
+        let there = || -> std::io::Result<localapi::Client> { Err(proven(denied(), false)) };
+        let view = device_view(there()).await;
+        assert_eq!(view.reason.as_deref(), Some("connect_error"));
+        let reason = files_dir_view_from(there()).await.reason.unwrap();
+        assert!(
+            reason.starts_with("connect: Permission denied")
+                && reason.ends_with("[PermissionDenied]"),
+            "{reason}"
+        );
+    }
+
+    /// #4020 — every connect of this app whose error is read goes through
+    /// `connect_service`, so a stopped service reads "not running" on every
+    /// OS and every page. A connect stays plain only where nothing reads its
+    /// error, each listed here with what a failed one leads to.
+    #[test]
+    fn only_a_connect_nobody_reads_stays_plain() {
+        // Each with what a failed connect leads to.
+        const PLAIN: &[(&str, &str)] = &[
+            ("commands.rs", "connect_service"),     // the proof itself
+            ("commands.rs", "daemon_node_status"),  // no answer: the file's word stands
+            ("commands.rs", "cmd_config_entries"),  // the root half on a Mac, else the file
+            ("commands.rs", "cmd_config_set"),      // the root half on a Mac, else the file
+            ("commands.rs", "cmd_pick_files_dir"),  // the picker opens with no start folder
+            ("commands.rs", "cmd_tail_log"),        // the log file, read directly
+            ("commands.rs", "cmd_set_device_name"), // the file, written directly
+            ("tray.rs", "spawn_keep_busy_watch"),   // the item reads off, disabled
+            ("first_run.rs", "daemon_has_something_to_show"), // the tour, as always
+            ("first_run.rs", "device_autostart_switch"), // the switch counts as on
+        ];
+        let call = concat!("localapi::", "connect()");
+        let mut plain: Vec<(&str, String)> = Vec::new();
+        for (file, src) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("desktop_log.rs", include_str!("desktop_log.rs")),
+            ("editor.rs", include_str!("editor.rs")),
+            ("first_run.rs", include_str!("first_run.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("panels.rs", include_str!("panels.rs")),
+            ("pin.rs", include_str!("pin.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+        ] {
+            let src = src.replace("\r\n", "\n");
+            let code = src
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap_or("");
+            // The function each line is in: the last `fn` line above it.
+            let mut within = String::new();
+            for line in code.lines().map(str::trim_start) {
+                if line.starts_with("//") {
+                    continue;
+                }
+                if let Some((head, rest)) = line.split_once("fn ")
+                    && head
+                        .split_whitespace()
+                        .all(|w| w.starts_with("pub") || matches!(w, "async" | "const" | "unsafe"))
+                {
+                    within = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if line.contains(call) {
+                    plain.push((file, within.clone()));
+                }
+            }
+        }
+        plain.sort();
+        plain.dedup();
+        let mut want: Vec<(&str, String)> = PLAIN
+            .iter()
+            .map(|(file, within)| (*file, within.to_string()))
+            .collect();
+        want.sort();
+        assert_eq!(
+            plain, want,
+            "a plain connect whose error is read: it goes through connect_service (#4020)"
+        );
     }
 }
