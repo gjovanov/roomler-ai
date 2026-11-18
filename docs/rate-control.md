@@ -1563,6 +1563,276 @@ window before the message is whole, and drops new data once the window is full. 
 what is in flight stays under the queue, and the cells measure the sampler, not SCTP's
 loss recovery.
 
+## The open-time train (FR-148 P0): reading the path before the first frame
+
+FR-148 P0, step 4a (#3953). **Built and tested, and run by no session yet**: step 4b
+wires it into a session's open, behind a switch. Nothing a session sends, reads or logs
+changes.
+
+At a session's open the encoder takes 0.65 to 2.8 s to start, and the path carries none
+of the session's media in that time. The train spends it reading the path: it writes
+bytes on a stream of its own, lets SCTP's slow start step them up, stops at the first
+push-back, and reads the rate from SCTP's acknowledgements. Its rules are a pure state
+machine, `media_train::Train` (`agents/roomlerd/src/media_train.rs:226`). It does no
+I/O, starts no task, reads no clock or environment variable, and logs nothing. Each
+call of `Train::step` (`:317`) takes the time, a reading of the association's
+acknowledgement clock (the delivery samples' clock, above) and of its gauges, and
+whether the first frame is ready, and answers `Write(n)` or `Stopped(reading)` (`:185`).
+Every byte it asks for is a byte SCTP sends, after the stop too, so what the train costs
+is what it wrote, and the reading says how much.
+
+**The gauges.** The acknowledgement clock says what the peer received. The train also
+needs to know why the sender sent what it did, so the vendored webrtc-sctp keeps the
+association's congestion state as gauges: one relaxed store, add or min each, where the
+association already holds its lock or where the pending queue counts its own bytes. A
+reader takes them without the lock (`Association::gauges`,
+`crates/vendored/webrtc-sctp/src/association/mod.rs:647`; the reading is `Gauges`,
+`crates/vendored/webrtc-sctp/src/association/gauges.rs:134`), and nothing in the
+association reads them back.
+
+| Gauge | Stored | Means |
+|---|---|---|
+| `max_payload` | once, when the association is made (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:199`) | the user data one DATA chunk carries, 1,200 bytes at SCTP's MTU of 1,228: the train's message length |
+| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:353`) when the association is made (`:200`), at the INIT ACK (`:815`), after every SACK (`:1596`) and every send (`:2073`), and at a T3-rtx expiry (`:2461`) | the windows and the bytes in flight |
+| `pending_bytes` | where the pending queue adds and pops bytes (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:139`, `:532`) | bytes written and not yet sent, over every stream |
+| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:512`, `:2460`) | loss events since the association began; the train counts only those after its first step |
+| `ack_delay`, `ack_delay_min` | in the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1318`) | how long the newest chunk a SACK newly acknowledged took from its send to that SACK, among the chunks sent once (Karn), and the least of those since the reader's last take |
+
+**The twin test** shows that a reader changes nothing the association sends.
+`test_gauges_a_reader_changes_nothing_the_association_sends`
+(`crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1072`)
+runs one scripted exchange twice, with a loss, a fast retransmission and a T3-rtx expiry
+in it, the second time with a thread reading both sides' gauges as fast as it can. It
+then compares every byte both sides sent, packet by packet. Before the comparison it
+rewrites only what each association draws at random (`normalised`, `:729`): a
+verification tag becomes the side it belongs to, a TSN its offset from its sender's
+initial TSN, and the state cookie and the checksum become zeros. Each run sent 101
+packets and 76,168 bytes, and the two runs were the same. The same script losing the
+fourth packet instead of the third sends differently, so the comparison does see a
+change of one packet. Two more fork tests pin the acknowledgement delay: the newest
+chunk sent once is the one that counts (`:1131`), and a clock that went backwards
+stores nothing (`:1167`).
+
+**A step**, in the order the machine takes it:
+
+```mermaid
+flowchart TD
+  A["Train::step"] --> B{"the first step?"}
+  B -- yes --> W1["write the congestion window<br/>and one message more"]
+  B -- no --> C["take the least acknowledgement delay<br/>of a SACK of two messages or more"]
+  C --> D{"a fast retransmission or<br/>T3-rtx expiry since the start?"}
+  D -- yes --> X1["stop: loss"]
+  D -- no --> E{"the round ended?"}
+  E -- yes --> F{"its least delay stood<br/>above the least seen?"}
+  F -- yes --> X2["stop: delay"]
+  F -- no --> G{"held at the cap, by no window,<br/>flat for a second round?"}
+  G -- yes --> X3["stop: plateau"]
+  G -- no --> H
+  E -- no --> E2{"held at the cap, four samples over<br/>half a round trip, every one queued?"}
+  E2 -- yes --> X2
+  E2 -- no --> H{"ready, deadline,<br/>budget or stall?"}
+  H -- yes --> X4["stop: a floor"]
+  H -- no --> W2["write what keeps slow start growing,<br/>within round 1's window and the cap"]
+```
+
+| Stop | When | The low edge is |
+|---|---|---|
+| `delay` | a round's least acknowledgement delay stood above the least seen by 10 ms and one message's serialisation at the estimated rate (`STANDING`, `agents/roomlerd/src/media_train.rs:31`; `standing`, `:499`): at the round's end, or at every one of four samples or more in a round the cap held (`early`, `:476`) | the link's rate: push-back |
+| `plateau` | two rounds held at the in-flight cap and by neither of SCTP's windows each delivered less than 10 % more than the round before (`PLATEAU_ROUNDS`, `:84`; `close_round`, `:540`) | the link's rate: push-back |
+| `loss` | a fast retransmission or a T3-rtx expiry after the first step (`:365`) | the link's rate: push-back |
+| `budget` | the next message would pass 512 KiB (`BUDGET`, `:21`) | a floor |
+| `deadline` | 2.5 s less 25 ms, or less two step intervals where steps come further apart (`DEADLINE`, `:24`; `DEADLINE_LEAD`, `:68`) | a floor |
+| `ready` | the first frame is ready, and the session needs the path | a floor |
+| `stall` | bytes in flight and nothing acknowledged for twice a delayed acknowledgement (200 ms) and the least round trip (`:396`) | a floor |
+
+**What it writes.** The first step writes the congestion window and one message more,
+within the budget (`:330`). SCTP sends the window at once, and the extra message is
+waiting when the first SACK comes, because the vendored SCTP grows its window only
+while bytes wait
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1358`). Every
+later step writes enough that bytes keep waiting until the next step: twice the most one
+step saw acknowledged, and a message (`agents/roomlerd/src/media_train.rs:414`). Two
+limits hold it back. Until the first round ends, what is in flight and waiting stays
+within the first window (`:404`), so what that window acknowledges releases as much
+again and not twice as much. Once a sample has sat 10 ms above the least (`QUEUED`,
+`:37`; `sample`, `:434`), the bottleneck has queued, and an in-flight cap applies (`cap`,
+`:527`): the estimated rate's pipe and a queue of a third of the least round trip (of
+50 ms at least), never less than the best round's pipe and a message, nor three
+messages. The estimate (`:487`) is the highest of three: the best whole round's
+delivery, the rate over the newest span of at least 10 ms and four SACKs (`disperse`,
+`:450`), and the first sample's lead over the least, read as one packet's
+serialisation.
+
+**The rules, and the cell that forced each.** The rulings set the train's shape; these
+are the numbers in it. The first four were found in a packet model of the vendored SCTP
+before the cells ran, the rest by a cell below that failed without them:
+
+| Rule | Anchor | Forced by |
+|---|---|---|
+| In flight and waiting stay within the first window until round 1 ends | `agents/roomlerd/src/media_train.rs:404` | 0.4 Mbit/s at 20 ms: SCTP's release of four packets for each SACK of two queued 77.7 ms, over P-e's 50 ms |
+| A round ends when the first byte sent after it began is acknowledged | `Round::mark`, `:214` | a round counted from bytes already in flight closed in 2 ms and read 1.23 times the link |
+| Twice the most one step acknowledged, and a message, wait | `:414` | 50 Mbit/s: with less waiting, slow start stopped growing between steps |
+| No sample from a SACK of one message | `:354` | a lone packet's SACK may have waited for the delayed acknowledgement |
+| The cap starts at a sample 10 ms above the least | `QUEUED`, `:37` | 2 Mbit/s at 80 ms, path I: two packets sent together put 4.9 ms between samples, and a cap from 5 ms held the climb at round 1's rate, a plateau at 0.11 of the link |
+| The cap's queue is a third of the least round trip, of 50 ms at least | `QUEUE_FLOOR`, `:42` | 2 Mbit/s at 250 ms, path I: with half, the peak queue reached 253 ms, over P-e's 250 |
+| The cap is never below three messages | `CAP_FLOOR_MESSAGES`, `:75` | 0.4 Mbit/s at 20 ms and 2 Mbit/s at 80 ms, path C: with one message in flight the train stalled (the vendored acknowledgement timer, below) |
+| A standing queue is 10 ms and one message's serialisation at the estimate | `STANDING`, `:31` | 0.4 Mbit/s at 250 ms, path I: a pair's serialisation read 22.7 ms in round 4 with no queue at all |
+| A plateau needs rounds held by the cap and by no window, and no queue | `PLATEAU_ROUNDS`, `:84` | 0.4 Mbit/s at 20 ms: three messages fill the path and no sample shows a queue, so the train ran to its deadline and wrote 118 KB, over P-f's 64; 2 Mbit/s at 80 ms, path C: rounds held by the congestion window grow one packet a round, and read as a plateau at 0.52 |
+| A round the cap held is judged early: four samples over half the least round trip and 50 ms, every one queued | `ROUND_SAMPLES`, `EARLY_SPAN`, `:63`, `:64` | 0.4 Mbit/s at 250 ms, path I: waiting for the round's end wrote 74.4 KB, over P-f; judged early in any round, 8 Mbit/s at 250 ms stopped on delay at 0.16; over a shorter span and with the round's own delivery left out, 2 Mbit/s at 250 ms stopped at 0.52 and 0.69 |
+| A rate from the spacing of SACKs spans 10 ms and four SACKs at least | `DISPERSION_SPAN`, `DISPERSION_ACKS`, `:53`, `:54` | 2 Mbit/s at 250 ms, path I: over one SACK it read 2.55 Mbit/s on a link that carries 1.95 |
+| The deadline comes 25 ms early, or two step intervals | `DEADLINE_LEAD`, `:68` | 50 Mbit/s at 250 ms, path C: the train ran past 2,500 ms |
+| The first write keeps within the budget | `:330` | a congestion window of 4 MiB (`the_first_write_keeps_within_the_budget`) |
+
+**The reading** (`Reading`, `agents/roomlerd/src/media_train.rs:147`):
+
+| Field | Means |
+|---|---|
+| `low_bps` | the best whole round's delivery rate; in a round judged early, its delivery so far counts too |
+| `high_bps` | the rate offered in the round that pushed back, when that round's queue stood and it delivered less than it was offered; `None` otherwise, on a floor, and where it would sit below the low edge |
+| `stop`, `floor_only` | why it stopped; `floor_only` is true for every stop but `delay`, `plateau` and `loss`, and then the low edge is only a floor |
+| `unit` | `SctpPayloadBps`: bits a second of SCTP payload, without SCTP's headers or anything beneath them |
+| `rounds` | the rounds closed |
+| `written_bytes`, `wire_bytes` | the payload written, and the SCTP packets that carry it once each: 28 bytes of common and DATA chunk header a message (`PACKET_OVERHEAD`, `:92`). What DTLS, UDP, IP and a relay add beneath is the carrier's |
+| `min_rtt` | the least acknowledgement delay seen |
+| `ssthresh_at_start` | the slow start threshold at the first write, which says the open path (below) |
+| `fast_retransmits`, `t3_expiries` | the loss events during the train |
+| `duration` | from the first step to the stop |
+
+**The two open paths.** The agent's association and the browser's both start as clients
+and send INIT, and which answer the agent's end takes first is a race. The two answers
+leave SCTP in different states:
+
+| Path | The agent's end is established by | Its slow start threshold at the first write | So the train climbs by |
+|---|---|---|---|
+| **I** | the peer's INIT ACK, which sets the threshold to the peer's window (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:814`) | the peer's window: 1 MiB by default, 64 KiB in the window cell | slow start: each SACK adds what it acknowledged to the window while bytes wait (`:1359`), so a SACK of two packets releases four |
+| **C** | the peer's COOKIE ECHO (`handle_cookie_echo`, `:896`), which sets neither | 0, the constructor's (`:169`); the peer's window is 0 until the first SACK | congestion avoidance from the first byte: one MTU more a round trip (`:1393`) |
+
+On path C the train comes within 20 % of the link only where congestion avoidance
+reaches it inside the train's time and budget: at 0.4 and 2 Mbit/s with 20 and 80 ms,
+and at 8 Mbit/s with 20 ms. At 2 Mbit/s and 80 ms and at 8 Mbit/s and 20 ms that is a
+floor at the link's rate, ended by the deadline and the budget. Everywhere else it reads
+a floor below the link, and the floor is the association's own ramp, not the path's: a
+session that opens on path C cannot send faster at first either. The ignored
+measurement `path_c_ramp_to_the_link_rate` (`agents/roomlerd/src/media_train.rs:1088`)
+keeps 16 messages waiting and records when the last round trip, of 200 ms at least,
+first carried 80 % of the link's payload rate:
+
+| Link | Path I | Path C | Path C's congestion window then |
+|---|---|---|---|
+| 2 Mbit/s, 80 ms | 529 ms | 1,866 ms | 20,344 bytes |
+| 8 Mbit/s, 80 ms | 633 ms | 5,120 ms | 67,008 bytes |
+| 2 Mbit/s, 250 ms | 1,562 ms | 12,062 ms | 52,272 bytes |
+| 8 Mbit/s, 250 ms | 2,190 ms | not within 15 s: 2.04 Mbit/s, 26 % of the link, at 15 s | 68,236 bytes at 15 s |
+
+At one MTU a round trip, 80 % of 8 Mbit/s at 250 ms is about 155 round trips away,
+about 40 s, and 80 % of 50 Mbit/s at 80 ms about 25 s. At 50 Mbit/s and 250 ms a window
+of 1 MiB holds either path under 34 Mbit/s.
+
+**The properties and their cells.** Each cell opens two in-process associations of the
+vendored SCTP over `media_delivery`'s shaped link (`shaped`,
+`agents/roomlerd/src/media_delivery.rs:1111`; `pair_opened`, `:1221`, by either path,
+`OpenPath`, `:1206`), steps the machine every millisecond, writes what it asks, and
+after the stop waits for every byte written to be acknowledged. A grid cell's link
+serialises each direction at its rate, adds half the round trip to every packet, and
+queues up to a second, deeper than anything the train can fill (`Cell::grid`,
+`agents/roomlerd/src/media_train.rs:666`). The shaper records the longest any packet of
+the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:1057`)
+and its tail drops (`:1062`). `broken` (`agents/roomlerd/src/media_train.rs:790`) checks
+every cell; it also checks that `floor_only` matches the stop, and that the slow start
+threshold at the first write is 0 on path C and not 0 on path I.
+
+| Property | Says | Checked | Read over five runs of each cell |
+|---|---|---|---|
+| **P-a** | a push-back stop's low edge is within 20 % of the link's payload rate | every cell | 0.84 to 1.07 of the link at every push-back stop of the grid. RED in the shallow buffer cell on path I (below) |
+| **P-b** | a budget, deadline or ready stop is a floor, at most 20 % above that rate | every cell | floors from 0.00 to 1.10 of the link |
+| **P-c** | no high edge below the low edge | every cell, and `a_high_edge_below_the_low_edge_or_on_a_floor_is_never_reported` | 12 high edges, all on path I (2 Mbit/s at 80 and 250 ms, 8 Mbit/s at 20 and 80 ms), at 1.04 to 1.96 times their low edges |
+| **P-d** | no delay stop while every round's least queueing delay is under 10 ms; a link with room ends on budget or deadline | every cell (a delay stop where no packet of the agent's waited 10 ms), the room cells at 50 Mbit/s and 250 ms (`room_is_not_push_back`, `:1014`), and `a_round_under_ten_ms_above_the_least_is_no_delay_stop` | a packet waited 20.9 ms or more in every cell that stopped on delay; the room cells ended on `budget` (path I) and `deadline` (path C) |
+| **P-e** | a peak queue of at most the round trip or 50 ms, whichever is longer, at most 512 KiB written, at most 2.5 s, and everything written acknowledged | every cell | peak queues up to 195.4 ms at 250 ms, 73.6 ms at 80 ms and 49.1 ms at 20 ms; 523,200 bytes; 2,478 ms |
+| **P-f** | at 0.4 Mbit/s, at most 64 KB written | the six 0.4 Mbit/s cells | 61,200 bytes at most (250 ms, path I) |
+| **P-g** | a first frame ready at 0.3 s ends the train with a floor | four cells, 8 Mbit/s at 80 and 250 ms on both paths (`ready_is_a_floor`, `:1048`) | `ready` at 300 to 301 ms, a floor every time |
+
+At 0.4 Mbit/s and 20 ms the 49.1 ms is SCTP's own initial window: three packets go at
+once, and the third waits two serialisations of 24.6 ms.
+
+**The grid.** The low edge as a share of the link's payload rate (the link's rate times
+1,200 / 1,228): the stop, the mean and the range over five runs, and the highest peak
+queue.
+
+| Link | Path I | Path C |
+|---|---|---|
+| 0.4 Mbit/s, 20 ms | plateau, 1.00 (0.99 to 1.02), 49.1 ms | plateau, 1.00 (0.98 to 1.02), 49.1 ms |
+| 0.4 Mbit/s, 80 ms | plateau, 0.91 (0.89 to 0.93), 73.6 ms | plateau and once delay, 0.92 (0.89 to 1.00), 51.2 ms |
+| 0.4 Mbit/s, 250 ms | delay, 1.00 (0.99 to 1.01), 165.7 ms | deadline, 0.42 (0.42 every run), 50.7 ms |
+| 2 Mbit/s, 20 ms | plateau and once delay, 0.98 (0.84 to 1.05), 35.5 ms | plateau, 1.04 (1.01 to 1.07), 16.8 ms |
+| 2 Mbit/s, 80 ms | delay, 0.98 (0.96 to 1.01), 59.4 ms | deadline, 1.00 (0.99 to 1.01), 21.6 ms |
+| 2 Mbit/s, 250 ms | delay, 0.98 (0.97 to 0.99), 195.4 ms | deadline, 0.12 (0.11 to 0.13), 11.5 ms |
+| 8 Mbit/s, 20 ms | delay, 1.02 (1.00 to 1.03), 33.3 ms | budget, 1.08 (1.03 to 1.10), 12.9 ms |
+| 8 Mbit/s, 80 ms | delay, 0.99 (0.98 to 1.00), 61.6 ms | deadline, 0.33 (0.30 to 0.35), 6.2 ms |
+| 8 Mbit/s, 250 ms | budget, 0.30 (0.28 to 0.32), 92.6 ms | deadline, 0.03 (0.03 to 0.04), 3.9 ms |
+| 50 Mbit/s, 20 ms | budget, 0.60 (0.42 to 0.78), 20.4 ms | budget, 0.25 (0.24 to 0.26), 3.1 ms |
+| 50 Mbit/s, 80 ms | budget, 0.19 (0.16 to 0.23), 19.0 ms | deadline, 0.08 (0.07 to 0.09), 2.9 ms |
+| 50 Mbit/s, 250 ms | budget, 0.07 (0.05 to 0.08), 20.5 ms | deadline, 0.01 (0.00 to 0.01), 1.2 ms |
+
+Path I reads the link wherever slow start fills it within the budget, up to 8 Mbit/s at
+80 ms. Beyond that the budget runs out before the window reaches the pipe, and the
+reading is a floor.
+
+| Named cell | Path I | Path C |
+|---|---|---|
+| A shallow buffer: 8 Mbit/s, 80 ms, a queue of 20 ms (`shallow`, `agents/roomlerd/src/media_train.rs:928`) | RED: `loss` in every run, the low edge 0.26 to 0.46 | `deadline`, 0.34 (0.33 to 0.35): congestion avoidance never fills the queue, so nothing is lost |
+| The viewer's window of 64 KiB, at 50 Mbit/s and 80 ms (`peer_window`, `:982`) | `budget`, 0.15 (0.14 to 0.16), a floor; the gauges showed the peer's window holding the sender at 148 to 190 steps | `deadline`, 0.06 (0.06 to 0.08), a floor; held by the window at 117 to 122 steps |
+| A link with room: 50 Mbit/s at 250 ms (P-d) | `budget` | `deadline` |
+| The first frame ready at 0.3 s: 8 Mbit/s at 80 and 250 ms (P-g) | `ready`, a floor | `ready`, a floor |
+
+**The shallow buffer is RED, and kept as written.** At 8 Mbit/s and 80 ms with a queue
+of 20 ms, P-a fails on path I in every run: the train stops on `loss`, and its low edge
+read 0.14 to 0.52 of the link over twelve runs. Each SACK of two packets releases
+four, so inside a round the bottleneck's queue grows by about what the round
+acknowledges, which is the window of the round before. The 20 ms queue holds a quarter
+of the 82 ms pipe, so it overflows in the round after the window first passes a quarter
+of the pipe, and each round that closes before that loss is seen acknowledges at most
+about half the pipe: no whole round before the first loss carries much more than half
+the link's rate. The in-flight cap does not bind that early, and the queue comes from
+the burst, not from what is in flight. Reading the link there would take a train that
+grows more gently than slow start's doubling, writing less than each SACK would
+release, and the rulings have the train let slow start set the pace. The cell keeps its
+assertions and is ignored with that reason (`agents/roomlerd/src/media_train.rs:949`).
+
+**Seen in the vendored SCTP, and left alone.** The delayed acknowledgement timer can be
+armed only while its `close_tx` is empty (`AckTimer::start`,
+`crates/vendored/webrtc-sctp/src/timer/ack_timer.rs:36`), and only `stop` empties it
+(`:65`). A timer that fires calls `on_ack_timeout`
+(`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2380`), which
+sends the SACK and leaves `close_tx` set. So after one delayed acknowledgement times
+out, the next lone packet is acknowledged only when another packet arrives and the
+immediate acknowledgement calls `stop` (`:2247`). With one message in flight the train
+stalled; with three it never waits for the timer. The same holds for the agent's own
+receiver, for what a browser sends it.
+
+**What a reading cannot tell.**
+
+- On path C a floor is the association's congestion avoidance, not the path.
+- A floor never lowers anything: a viewer's small window, a link with room, a ready
+  frame and the deadline all read as floors, and only `delay`, `plateau` and `loss` say
+  where the path is.
+- At 0.4 Mbit/s SCTP's initial window alone queues 49.1 ms, so a slower link at a short
+  round trip would pass P-e's 50 ms whatever the train does.
+- The shaped link proves the rules on a known pipe. It does not prove a real carrier's
+  jitter, reordering and loss, a browser's SCTP at the far end, or DTLS and ICE beneath
+  SCTP.
+
+**The tests** (`cargo test -p roomlerd --lib -- media_train`). The cells run in real
+time and one at a time (`TURN`, `agents/roomlerd/src/media_train.rs:647`), and ask
+Windows for 1 ms timers. In five runs on a Windows box the module took 63.5 to 64.4 s.
+
+| Test | Shows |
+|---|---|
+| `cells::path_{i,c}_{0_4,2,8,50}_mbps_{20,80,250}_ms` | the 24 grid cells |
+| `cells::path_c_a_shallow_buffer_reads_a_floor_or_stops_on_loss`, `cells::path_{i,c}_a_peer_window_limit_is_a_floor`, `cells::path_{i,c}_a_link_with_room_ends_on_budget_or_deadline`, `cells::path_{i,c}_a_window_of_0_3_s_at_{80,250}_ms_reads_a_floor` | the named cells |
+| `cells::path_i_a_shallow_buffer_stops_on_loss` | ignored: P-a's RED cell, run with `--ignored` |
+| `cells::path_c_ramp_to_the_link_rate` | ignored: the ramp, about 40 s, run with `--ignored --nocapture` |
+| `machine::*` | eleven tests of the machine alone, on readings made up by hand: the first write and its budget, round 1's window, a stopped train's answer, the floors, the train's own losses, the deadline, the budget, a delay stop, P-d's edge, and the high edge |
+
 ## Path numbers and their provenance (FR-148 P0) — how each was obtained, and how old it is
 
 FR-148 P0, step 3 (#3953). **A shadow: nothing reads a tag or the model.** Every path
