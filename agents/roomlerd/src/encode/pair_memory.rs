@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 use super::ceiling_learn::{CONTRADICTION_FACTOR, SEED_PCT};
 use super::pipe::{Basis, PathModel};
+use super::pipe_state::PipeState;
 use crate::session_carrier::{CandidateKind, SessionCarrier};
 
 /// The model's own file, in the directory of `rate_memory.json`. An earlier
@@ -562,6 +563,26 @@ pub fn model_opening(
 // The session: what it measured, and what its close writes (D24, D25)
 // ---------------------------------------------------------------------------
 
+/// FR-148 P1 (R1) — could the classifier READ this window? The path memory has
+/// one kind of evidence that the path pushed back, a counted sample, and a
+/// sample counts only from a window whose state the classifier read: the
+/// sender's own counters said `Overproduced`, or an age split said anything
+/// else on an age that is a reading ([`super::viewer_rate::age_is_plausible`]).
+/// `Unknown` is a window it could not read (no age, or no arrival stamp, to
+/// split), and the gate accepts it. A `TransitStalled` verdict never reaches a
+/// sample: the gate rejects that window and the one after it.
+///
+/// Inside the session such a window still acts exactly as before: a wrong cut
+/// is undone in seconds. The memory's record stands for a day and decides the
+/// next opening, so it does not take one.
+pub fn window_read(state: PipeState, age_plausible: bool) -> bool {
+    match state {
+        PipeState::Unknown => false,
+        PipeState::Overproduced => true,
+        PipeState::Clear | PipeState::TransitStalled | PipeState::ViewerLate => age_plausible,
+    }
+}
+
 /// The samples a session counted itself, since the last end of the record.
 #[derive(Debug, Clone, Copy)]
 struct Own {
@@ -585,6 +606,9 @@ pub struct SessionMemory {
     best: Option<(u32, Basis)>,
     /// Backlogged push-backs under half of `best`: dips, not counted.
     not_counted: u32,
+    /// R1 — backlogged push-backs from windows the classifier could not read
+    /// ([`window_read`]): never offered to the record.
+    unread: u32,
     /// A delivery ended the record in this session.
     ended: bool,
     /// A valid window gave any measured reading.
@@ -593,6 +617,10 @@ pub struct SessionMemory {
     /// record", to show the governor cell fails on it.
     #[cfg(test)]
     end_above_floor: bool,
+    /// Test only: master's law before R1, every push-back offered to the
+    /// record, to show the screen's cell fails on it.
+    #[cfg(test)]
+    read_any: bool,
 }
 
 /// What a close would write, taken at a viewer window.
@@ -605,6 +633,8 @@ pub struct Closing {
     pub record: Option<PushBack>,
     pub best: Option<(u32, FloorBasis)>,
     pub not_counted: u32,
+    /// R1 — samples from windows the classifier could not read.
+    pub unread: u32,
     pub ended: bool,
     pub measured: bool,
 }
@@ -621,6 +651,8 @@ impl SessionMemory {
         *self = Self {
             #[cfg(test)]
             end_above_floor: self.end_above_floor,
+            #[cfg(test)]
+            read_any: self.read_any,
             ..Self::default()
         };
         if let Some(e) = entry.filter(|e| e.fresh(now_unix)) {
@@ -711,6 +743,21 @@ impl SessionMemory {
         }
     }
 
+    /// R1 — a push-back from a window the classifier could not read
+    /// ([`window_read`]). Counted for the close line, and nothing more: it is
+    /// not a sample, it moves neither the record nor the floor, and its bytes
+    /// already reached [`Self::delivered`] as the same window's delivery.
+    pub fn unread_push_back(&mut self, bps: u32, basis: Basis, now: Instant) {
+        #[cfg(test)]
+        if self.read_any {
+            return self.pushed_back(bps, basis, now);
+        }
+        let _ = now;
+        if basis == Basis::Backlogged && bps > 0 {
+            self.unread = self.unread.saturating_add(1);
+        }
+    }
+
     /// What a close would write now.
     pub fn closing(&self, now: Instant, now_unix: u64) -> Closing {
         let floor = self.floor.offer(now).and_then(|n| {
@@ -750,6 +797,7 @@ impl SessionMemory {
                 .best
                 .and_then(|(bps, b)| FloorBasis::of(b).map(|b| (bps, b))),
             not_counted: self.not_counted,
+            unread: self.unread,
             ended: self.ended,
             measured: self.measured,
         }
@@ -766,6 +814,13 @@ impl SessionMemory {
     #[cfg(test)]
     pub(crate) fn set_end_above_floor(&mut self) {
         self.end_above_floor = true;
+    }
+
+    /// Test only: offer every push-back to the record, read window or not, as
+    /// master did before R1.
+    #[cfg(test)]
+    pub(crate) fn set_read_any(&mut self) {
+        self.read_any = true;
     }
 }
 

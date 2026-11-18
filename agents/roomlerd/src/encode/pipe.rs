@@ -241,13 +241,26 @@ impl Pipe {
     /// application-limited push-back moves this type exactly as a backlogged
     /// one does; only the model tells them apart.
     pub fn observe_capacity(&mut self, bps: u32, basis: Basis, now: Instant) {
+        self.observe_capacity_in(bps, basis, true, now);
+    }
+
+    /// FR-148 P1 (R1) — [`Self::observe_capacity`] from a window the classifier
+    /// did or did not READ (`pair_memory::window_read`). This type's own law and
+    /// the shadow model take it either way, exactly as before; the pair memory
+    /// takes it as a push-back only from a read window, and otherwise only
+    /// counts it.
+    pub fn observe_capacity_in(&mut self, bps: u32, basis: Basis, read: bool, now: Instant) {
         if bps == 0 {
             return;
         }
         // Every caller is a valid window: the goodput fold and the link loop
         // both act only on one (`governor`).
         self.model.pushed_back(bps, basis, now);
-        self.memory.pushed_back(bps, basis, now);
+        if read {
+            self.memory.pushed_back(bps, basis, now);
+        } else {
+            self.memory.unread_push_back(bps, basis, now);
+        }
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
         self.capacity_basis = Some(basis);

@@ -407,6 +407,7 @@ impl Drop for ModelGuard {
             push_back_windows = ?record.map(|r| r.windows),
             push_back_span_s = ?record.map(|r| r.span_s()),
             samples_not_counted = c.map_or(0, |c| c.not_counted),
+            samples_unread = c.map_or(0, |c| c.unread),
             record_ended = c.is_some_and(|c| c.ended),
             frozen = self.frozen,
             "{CLOSE_LINE}"
@@ -720,6 +721,7 @@ mod tests {
             record: None,
             best: Some((bps, pm::FloorBasis::AppLimited)),
             not_counted: 0,
+            unread: 0,
             ended: false,
             measured: true,
         }
@@ -858,7 +860,7 @@ mod tests {
         "taken",
     ];
 
-    const CLOSE_FIELDS: [&str; 17] = [
+    const CLOSE_FIELDS: [&str; 18] = [
         "session_id",
         "key_id",
         "key_carrier",
@@ -874,6 +876,7 @@ mod tests {
         "push_back_windows",
         "push_back_span_s",
         "samples_not_counted",
+        "samples_unread",
         "record_ended",
         "frozen",
     ];

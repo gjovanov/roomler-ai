@@ -1375,6 +1375,14 @@ impl RateGovernor {
             self.evidence.note(r);
         }
         let valid = rejection.is_none();
+        // FR-148 P1 (R1) — did the classifier READ this window? Its push-backs act
+        // in the session either way; the pair memory counts one only from a read
+        // window (`pair_memory::window_read`). The age is a reading by the age
+        // loop's own test, the half round trip it observes against below.
+        let read = super::pair_memory::window_read(
+            state,
+            report.is_some_and(|(_, min, rtt)| viewer_rate::age_is_plausible(min, rtt / 2)),
+        );
         // FR-148 P1 (D24) — the delivery is folded once the gate has ruled, which
         // reads only the window's facts: `Pipe` takes it whatever the verdict, the
         // shadow model and the pair memory only from a valid window.
@@ -1444,7 +1452,8 @@ impl RateGovernor {
             if self.goodput.observe_window(&samples, now)
                 && let Some(bps) = self.goodput.estimate_bps(now)
             {
-                self.belief.observe_capacity(bps, Basis::Backlogged, now);
+                self.belief
+                    .observe_capacity_in(bps, Basis::Backlogged, read, now);
             }
         }
         // FR-35 — a send blocked ≥ `HARD_STALL` is a hard stall: ×0.5, bypassing
@@ -1575,7 +1584,7 @@ impl RateGovernor {
                     // FR-148 P0 — with the switch off it gets here unoffered, and
                     // is then application-limited (the jupiter chain's trickle).
                     let basis = Basis::of_window(offer_held);
-                    self.belief.observe_capacity(rx_bps, basis, now);
+                    self.belief.observe_capacity_in(rx_bps, basis, read, now);
                     self.link_rx_bps = Some((rx_bps, now));
                     self.path.link_rx = basis;
                 }
@@ -5917,6 +5926,257 @@ mod tests {
             assert_eq!((r.windows, r.span_s()), (2, 1), "{side}");
             assert!(!trusted(&r, unix), "{side}: the first wording fails it");
         }
+    }
+
+    /// FR-148 P1 — the viewer's paint age in a screened session.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ScreenAge {
+        /// None at all: the viewer's clock probe has not locked, so it sends
+        /// the link report alone.
+        Absent,
+        /// It grows with the queue, by what each slowdown window did not
+        /// deliver.
+        Grows,
+        /// It stays at its floor while the link report reads the queue growing
+        /// (R3's V2, the unordered-video shape).
+        Flat,
+        /// It creeps up with the queue, at most 150 ms over its floor: still
+        /// under the transit-stall threshold (V2 too).
+        Creeps,
+    }
+
+    /// FR-148 P1 (R1, R2, R3) — one session of the screen: a screen that sends
+    /// `content` bit/s, on a relay of about 6 Mbit/s, slowed eight times for
+    /// `len` windows to `depth_pct` of what is offered, 12 s apart. Each
+    /// slowdown is followed by one window that delivers the backlog, so no
+    /// byte is lost, and the viewer's link report reads the queue growing by
+    /// what each slowdown window did not deliver.
+    #[derive(Clone, Copy, Debug)]
+    struct Screen {
+        content: u32,
+        /// R3's V3: the encoder's output is this share of the target the
+        /// window ran with, whatever the screen shows; `None` = `content`.
+        offer_pct: Option<u32>,
+        depth_pct: u32,
+        len: u32,
+        age: ScreenAge,
+        /// A busy first minute at 5.6 Mbit/s.
+        busy: bool,
+        /// The pair's entry: an application-limited floor, a day old.
+        prior: Option<u32>,
+    }
+
+    /// The nominal constrained opening the screen reads the next session at.
+    const SCREEN_N: u32 = 2_550_000;
+
+    /// What a screened session leaves for the next one.
+    #[derive(Debug)]
+    struct Screened {
+        closing: crate::encode::pair_memory::Closing,
+        trusted: bool,
+        /// The entry's floor after the close.
+        floor: Option<u32>,
+        /// The next session's opening under `on`.
+        next: crate::encode::pair_memory::ModelOpening,
+    }
+
+    impl Screened {
+        /// R1's half of the pass: no trusted record, and the next open under
+        /// `on` at N or above, with no slow-link profile.
+        fn opens_at_nominal(&self) -> bool {
+            !self.trusted && self.next.bps >= SCREEN_N && !self.next.profile
+        }
+    }
+
+    /// Replays `v` through the governor, closes it, and reads the next
+    /// opening (N 2.55 Mbit/s, hi 8 Mbit/s, T 1 Mbit/s). `master` is the law
+    /// before R1: every push-back offered to the record.
+    fn screen(v: Screen, master: bool) -> Screened {
+        use crate::encode::pair_memory::{
+            Floor, FloorBasis, PairEntry, close, model_opening, trusted,
+        };
+        // One window: the pump wrote `offer` bit/s, the viewer received `rx`,
+        // its queue grew `queue` ms, at paint age `age` (none without a report).
+        fn win(s: &mut V5bSession, offer: u32, rx: u32, queue: i16, age: Option<u16>) {
+            s.t += Duration::from_secs(1);
+            s.sent += u64::from(offer / 8);
+            s.g.note_window_sender(v5b_sender());
+            s.g.tick_viewer_window(
+                s.t,
+                30,
+                || {
+                    if rx > 0 {
+                        viewer_rate::pack_report(15, false)
+                    } else {
+                        0
+                    }
+                },
+                || match (rx > 0, age) {
+                    (true, Some(a)) => viewer_rate::pack_age_with_arrival(a, 17, 30, a - 2),
+                    _ => 0,
+                },
+                || {
+                    if rx > 0 {
+                        viewer_rate::pack_link(rx, queue)
+                    } else {
+                        0
+                    }
+                },
+                true,
+                |o| o,
+                s.sent,
+            )
+            .expect("window due");
+            s.g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, s.t);
+        }
+        let entry = v.prior.map(|bps| PairEntry {
+            floor: Floor {
+                bps,
+                basis: FloorBasis::AppLimited,
+                at_unix: P1_NOW_UNIX - 86_400,
+            },
+            push_back: None,
+        });
+        let mut s = V5bSession::open(true, None);
+        s.g.open_memory(entry.as_ref(), P1_NOW_UNIX, s.t);
+        if master {
+            s.g.belief.memory_mut().set_read_any();
+        }
+        let start = s.t;
+        let floor_age = |delay: u32| match v.age {
+            ScreenAge::Absent => None,
+            ScreenAge::Grows => Some((56 + delay).min(60_000) as u16),
+            ScreenAge::Flat => Some(56),
+            ScreenAge::Creeps => Some(56 + delay.min(150) as u16),
+        };
+        let offer = |s: &V5bSession| match v.offer_pct {
+            Some(pct) => (u64::from(s.g.applied_bps()) * u64::from(pct) / 100) as u32,
+            None => v.content,
+        };
+        if v.busy {
+            for _ in 0..30 {
+                win(&mut s, 5_600_000, 5_600_000, 0, floor_age(0));
+            }
+        }
+        for _ in 0..8 {
+            for _ in 0..12 {
+                let o = offer(&s);
+                win(&mut s, o, o, 0, floor_age(0));
+            }
+            let mut backlog: u64 = 0;
+            let mut delay: u32 = 0;
+            for _ in 0..v.len {
+                let o = offer(&s);
+                let rx = o / 100 * v.depth_pct;
+                backlog += u64::from(o - rx);
+                let growth = if rx == 0 {
+                    1_000
+                } else {
+                    ((u64::from(o - rx) * 1_000) / u64::from(rx)).min(1_000) as u32
+                };
+                delay += growth;
+                win(&mut s, o, rx, growth as i16, floor_age(delay));
+            }
+            let o = offer(&s);
+            let drain = o.saturating_add(backlog.min(u64::from(u32::MAX)) as u32);
+            let age = floor_age(delay / 2);
+            win(&mut s, o, drain, -(delay.min(1_000) as i16), age);
+        }
+        for _ in 0..10 {
+            let o = offer(&s);
+            win(&mut s, o, o, 0, floor_age(0));
+        }
+        let unix = P1_NOW_UNIX + s.t.duration_since(start).as_secs();
+        let closing = s.g.memory().closing(s.t, unix);
+        let (written, _) = close(entry.as_ref(), &closing);
+        let stands = written.or(entry);
+        Screened {
+            closing,
+            trusted: closing.record.is_some_and(|r| trusted(&r, unix)),
+            floor: stands.map(|e| e.floor.bps),
+            next: model_opening(SCREEN_N, 8_000_000, stands.as_ref(), 1_000_000, unix + 60),
+        }
+    }
+
+    /// FR-148 P1 (R1) — the screen of W-15's brief: a still screen on a relay
+    /// that slows for a few seconds at a time leaves no trusted push-back
+    /// record, keeps the remembered floor, and the next session under `on`
+    /// opens at the nominal. 336 sessions: a still screen of 40 or 300 kbit/s,
+    /// slowdowns of 3 to 5 s to 0 to 88 % of the offer, a busy first minute or
+    /// none, a remembered 2.2 Mbit/s floor or none, and a viewer that sends its
+    /// paint age or one whose clock probe has not locked.
+    ///
+    /// On master's law 24 of them fail, all the same class: no age, so the
+    /// classifier reads `Unknown` and the gate accepts the window, a still
+    /// screen throughout, and slowdowns that deliver 80 to 88 % of the offer.
+    /// The link loop reads two growing windows that were offered, a backlogged
+    /// sample at that rate counts (it is over half the session's best
+    /// delivery), and the drain does not end the record (not twice its rate):
+    /// two slowdowns make it trusted, and the next session would open at
+    /// 200 kbit/s with the profile on a 6 Mbit/s path. With R1 such a window's
+    /// sample still acts in the session, and is not offered to the record.
+    #[test]
+    fn a_still_screen_on_a_stalling_relay_leaves_no_trusted_record() {
+        let mut variants = Vec::new();
+        for content in [40_000u32, 300_000] {
+            for depth_pct in [0u32, 20, 50, 70, 80, 85, 88] {
+                for age in [ScreenAge::Grows, ScreenAge::Absent] {
+                    for busy in [false, true] {
+                        for len in [3u32, 4, 5] {
+                            for prior in [None, Some(2_200_000u32)] {
+                                variants.push(Screen {
+                                    content,
+                                    offer_pct: None,
+                                    depth_pct,
+                                    len,
+                                    age,
+                                    busy,
+                                    prior,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(variants.len(), 336);
+        let red = |master: bool| -> Vec<String> {
+            variants
+                .iter()
+                .filter_map(|v| {
+                    let r = screen(*v, master);
+                    (!r.opens_at_nominal()).then(|| format!("{v:?}: {r:?}"))
+                })
+                .collect()
+        };
+        let on_master = red(true);
+        assert_eq!(on_master.len(), 24, "{on_master:#?}");
+        let with_r1 = red(false);
+        assert!(with_r1.is_empty(), "{with_r1:#?}");
+        // The class, exactly: no age, no busy minute, slowdowns of 80 % or
+        // more, and a drain that does not deliver twice the sample:
+        // 1 + n·(1 − k) ≤ 2·k.
+        for v in &variants {
+            let survives = 100 + v.len * (100 - v.depth_pct) <= 2 * v.depth_pct;
+            let class = v.age == ScreenAge::Absent && !v.busy && v.depth_pct >= 80 && survives;
+            assert_eq!(!screen(*v, true).opens_at_nominal(), class, "{v:?}");
+        }
+        // With R1 those windows' samples are counted as unread on the close line.
+        let r = screen(
+            Screen {
+                content: 40_000,
+                offer_pct: None,
+                depth_pct: 85,
+                len: 4,
+                age: ScreenAge::Absent,
+                busy: false,
+                prior: None,
+            },
+            false,
+        );
+        assert_eq!(r.closing.record, None);
+        assert!(r.closing.unread > 0, "{r:?}");
+        assert_eq!(r.next.bps, SCREEN_N);
     }
 
     /// FR-148 P0 — what the line reads on a healthy session: the jupiter replay
