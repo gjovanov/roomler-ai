@@ -1,6 +1,6 @@
 # FR-148: The path is measured, and the plan follows it
 
-**Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16 and its lab cell ran a first slice on 2026-11-17; P1's memory stores the model in shadow, and P2's QSV step and P4's rank are merged behind switches that are off by default; none of the three is read in the field yet, and P1's opener is ruled and not built (§6). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
+**Issue:** [#3953](https://github.com/gjovanov/roomler-ai/issues/3953) · **Status:** P0 runs since 2026-11-16 and its lab cell ran a first slice on 2026-11-17; its open-time train is ruled and not built. P1's memory stores the model in shadow, and its opener is built behind the same switch, whose default is `shadow` and which is `on` on no device; P2's QSV step and P4's rank are merged behind switches that are off by default. None of these is read in the field yet (§6). The plan and decisions D1 to D5 are the operator's, taken on 2026-11-16 · **Owner:** the agent's rate path, its path memory and its ICE policy, and the viewer's video channels
 **Supersedes:** [FR-63](FR-63-one-delay-based-rate-controller.md) (#1243), [FR-79](FR-79-one-validity-gate.md) (#1524), [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), [FR-59](FR-59-slow-link-latency-priority.md) (#1163), [FR-71](FR-71-transport-stall-classification.md) (#1362), [FR-74](FR-74-text-clarity-on-direct-paths.md) (#1442), [FR-17](FR-17-partial-reliability-video.md) (#799), [FR-18](FR-18-carrier-queue-discipline.md) (#801), [FR-64](FR-64-remote-desktop-never-rides-the-overlay.md) (#1244). §12 says what moved where
 **Works beside:** [FR-135](FR-135-one-rc-media-pipeline.md) (#3293), which owns the pipeline's shape (§13)
 
@@ -179,6 +179,7 @@ Every value carries a provenance and an age:
 |---|---|---|
 | measured, backlogged | the sender had more to send than the path took | set the floor and both edges of the bracket |
 | measured, application-limited | the path took everything offered | raise the floor. It never lowers the bracket |
+| probe | a train sent on purpose: at the open (P0's step 4), and in a session from P3 | move the bracket's edges. It never sets or raises the floor (D39) |
 | assumed | a prior, a default, an entry from before this FR | open a session when nothing else exists. It is never stored, and it never holds the plan below a demonstrated value |
 
 A stalled window is evidence about the carrier's stall profile and not about its capacity. That is FR-71's
@@ -202,7 +203,8 @@ The opener, the ceiling, the slow-link profile and the queue budgets read the mo
 
 This reverses FR-35's decision (D2). FR-35's objection was that a startup probe measures a burst (18 Mbit/s
 instantaneous against about 8 sustained) and costs bytes on exactly the thin links. Two things answer it. The
-loop is closed and its steps are proportional, so a thin link stops the train at its first step. And the bracket
+loop is closed and its steps are proportional, so a thin link stops the train early: at 0.4 Mbit/s it writes at
+most 64 KB, at each round trip of the grid (D32's P-f). And the bracket
 keeps a burst reading apart from sustained evidence: a probe moves the bracket's edges, and only sustained
 delivery raises the floor.
 
@@ -390,7 +392,8 @@ index row.
       on the issue, and the numbers are in §15.
 - [ ] **AC2 (P0)** — On the shaped lab pair at 0.4, 2 and 8 Mbit/s, over TURN/UDP, TURN/TLS and the mesh relay,
       the shadow model's bracket contains the true capacity and its low edge is within 20 % of it, in every cell,
-      five runs each.
+      five runs each. The 20 % is judged in SCTP payload (D42). The open-time train does not run on the mesh
+      relay (D40); how that carrier is read is O8.
 - [ ] **AC3 (P0)** — Every path number in the heartbeat carries how it was obtained and its age. The jupiter chain
       of 2026-11-02 and the CORPLAP-2 chain of 2026-11-11 replay as unit cells: each fails on master's laws and
       passes on the model's. It is read on the path model's own line, which names every path number the heartbeat
@@ -527,7 +530,7 @@ D1 to D5 are the operator's, taken on 2026-11-16 with the plan. D6 to D42 are th
 | O5 | The stall budget of an adoption and the byte budget of a probe | 200 ms of the bracket's low edge for an adoption, set from P0's cell. The open-time train's byte budget is decided on 2026-11-18, D38: 512 KiB of SCTP payload and 2.5 s, whichever comes first, with the wire bytes reported beside it |
 | O6 | Loss recovery on the deadline-limited channel | A keyframe under the existing minimum gap, sized by the same cost rule. Intra-refresh where the backend has it, if P0 reads loss above one frame in ten seconds |
 | O7 | The open class of D29: a `Clear` window whose sender pushed against the plan while only the viewer's link report said the queue grew (a screen of about 300 kbit/s with the viewer's age flat) counts as a push-back, and no test against the target a window ran with separates it from a real slow link. May such a window teach the memory? | No rule until it is read. The close line splits the counted samples by the state of their window (`samples_counted_overproduced`, `samples_counted_clear`); read the split on the fleet's shadow lines and in AC9's and AC14's shaped cell. What one occurrence costs under `on`: the false record lowers the floor with it, and every session on that key then opens at about 0.85 × that floor, on the slow-link profile for the whole session, for up to 24 h, renewed by each later counted push-back. Until it is ruled, `on` is set on no device (D28) |
-| O8 | A reading on the mesh relay. Step 4 skips that carrier (D40): its outbound queue is one per node, with a 100 ms age drop (`crates/tunnel-core/src/transport/derp.rs:46-77`), so a train's queue there would drop other peers' frames on that node, SSH and tunnels among them. CORPLAP-2's sessions rode exactly that carrier before the rank was set. How does P3 read that carrier? | P3 needs either a train whose queue stays under the age limit, or another way to read that carrier. Decide with the lab's far-region cell (D37) and the carrier counts for CORPLAP-2 of the night of 2026-11-18 |
+| O8 | A reading on the mesh relay. Step 4 skips that carrier (D40): its outbound queue is one per node, with a 100 ms age drop (`crates/tunnel-core/src/transport/derp.rs:46-77`), so a train's queue there would drop other peers' frames on that node, SSH and tunnels among them. Until the rank was set on CORPLAP-2 on the morning of 2026-11-18, its sessions rode exactly that carrier. How does P3 read that carrier? | P3 needs either a train whose queue stays under the age limit, or another way to read that carrier. Decide with the lab's far-region cell (D37) and the carrier counts of CORPLAP-2's sessions on 2026-11-18, its first day with the rank on |
 
 ## 10. Not the fix
 
