@@ -1783,7 +1783,7 @@ pump's 4 s wait), `carrier_unknown`, `no_user`, or `learner_off` (`relay_max_hi_
 
 **Where the viewer's facts come from.** `PairFacts` (`media_pair_memory.rs:60`) is
 registered by session id in `AgentPeer::new`, before the pump starts. The user comes from
-the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4886`). The srflx addresses
+the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4876`). The srflx addresses
 are taken from the candidates the viewer trickles (`AgentPeer::add_remote_candidate`), at
 most 16. They are not read through `get_stats`: the vendored ICE agent's accessor is
 crate-private, and a stats read takes the ICE and SCTP locks. **Limit**: a candidate
