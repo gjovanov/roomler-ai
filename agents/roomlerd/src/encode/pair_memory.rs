@@ -504,13 +504,25 @@ impl PathMemory {
     /// holds for it. Two pumps that end at once would otherwise write the
     /// same temp sibling, and the later save would drop the key the earlier
     /// one wrote. Two sessions of ONE key still end as the later close says.
+    ///
+    /// It saves only when the read succeeded or found no file. Any other read
+    /// error is returned, the change is not made and the file stays as it
+    /// is: on Windows a scanner or a backup can hold the file without read
+    /// sharing for a moment, and a save from an empty memory then would drop
+    /// every other pair's entry (`a_file_held_without_read_sharing_keeps_every_other_key`).
+    /// A file that reads but does not parse is an empty memory, as at the
+    /// open, and the save replaces it.
     pub fn update(
         path: &Path,
         now_unix: u64,
         change: impl FnOnce(&mut PathMemory),
     ) -> std::io::Result<()> {
         let _held = FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut memory = Self::load(path, now_unix);
+        let mut memory = match std::fs::read(path) {
+            Ok(bytes) => Self::parse(&bytes, now_unix),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e),
+        };
         change(&mut memory);
         memory.save(path)
     }
@@ -1563,6 +1575,34 @@ mod tests {
         let memory = PathMemory::load(&path, NOW);
         assert_eq!(memory.pairs.len(), threads * rounds);
         assert!(memory.dropped.is_empty());
+    }
+
+    /// The review's probe (finding 3): on Windows a scanner or a backup holds
+    /// `path_memory.json` without read sharing for a moment, and lets go
+    /// before the save's rename. The close's read fails (OS error 32), and the
+    /// close must then leave the file as it is: before the fix it saved a
+    /// memory holding only its own key, and every other pair's entry was gone.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_without_read_sharing_keeps_every_other_key() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        PathMemory::update(&path, NOW, |m| m.write("a", entry(2_000_000, NOW), NOW)).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let written = PathMemory::update(&path, NOW, move |m| {
+            // The holder lets go before the save.
+            drop(held);
+            m.write("b", entry(1_000_000, NOW), NOW);
+        });
+        let keys: Vec<String> = PathMemory::load(&path, NOW).pairs.into_keys().collect();
+        assert_eq!(keys, ["a"], "the other pair's entry is kept");
+        let e = written.expect_err("the read failed, so nothing was saved");
+        assert_eq!(e.raw_os_error(), Some(32), "{e}");
     }
 
     /// A version other than 1, or a file that is not this shape, is an empty
