@@ -2660,7 +2660,7 @@ console user are skipped and every root row runs as on any install
   to print: its daemon thread exits 1 itself (`:1321-1323`). That thread
   writes the error on stderr as std prints it for the other `main`, `Error:`
   and then every cause, before it logs it through tracing
-  (`agents/roomlerd/src/daemon_error.rs:20`, `:28`). A failed write is
+  (`agents/roomlerd/src/daemon_error.rs:25`, `:33`). A failed write is
   ignored, so the exit always follows. Tracing's own file is in the folder the
   worker cannot write, and its console copy goes to stdout, which the root
   daemon's plist sends to `/dev/null`
