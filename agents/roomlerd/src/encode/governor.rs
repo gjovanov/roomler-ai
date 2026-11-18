@@ -309,6 +309,11 @@ pub struct RateGovernor {
     /// through the floor relief AND the queue budget while nothing measured
     /// (field 2026-09-04, `6a9abc30`; see `encode::prior`).
     open_seed_bps: Option<u32>,
+    /// FR-148 P1 step 3 — where the AIMD, the first encoder and slow start
+    /// open when it sits under the ceiling: today's rule gives the P8 seed
+    /// above; the path model's gives its opening after a trusted push-back,
+    /// which may sit above the nominal floor. `None` = at the ceiling.
+    open_at_bps: Option<u32>,
     /// FR-70 P1 — the belief about the pipe while nothing measures it: the
     /// seed, then the last live measurement, decaying toward the band on
     /// clean windows. Read wherever `open_seed_bps` used to stand in.
@@ -462,6 +467,28 @@ impl RateGovernor {
         ceiling_seed_bps: Option<u32>,
         now: Instant,
     ) -> Self {
+        let plan = super::pair_memory::OpenPlan::Today(ceiling_seed_bps);
+        Self::new_with(target_fps, send_depth, flags, ceiling_hi_bps, &plan, now)
+    }
+
+    /// FR-148 P1 step 3 — [`Self::new`] from what the session opens from:
+    /// today's seed, or the path model's floor and opening. `new(…, s, …)` is
+    /// `new_with(…, &OpenPlan::Today(s), …)`.
+    pub fn new_with(
+        target_fps: u32,
+        send_depth: usize,
+        flags: GovernorFlags,
+        ceiling_hi_bps: u32,
+        plan: &super::pair_memory::OpenPlan,
+        now: Instant,
+    ) -> Self {
+        let (ceiling_seed_bps, open_at_bps) = plan.resolve(flags.floor_relief);
+        // FR-59 P8 — the relief and the prior take the opening only under the
+        // nominal floor with the relief on: at or above the band a seed never
+        // stood in for anything (the relief is inert there and the P6 check
+        // would read it as a contradiction).
+        let open_seed_bps =
+            open_at_bps.filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief);
         let mut governor = Self {
             aimd: None,
             send_depth,
@@ -496,14 +523,11 @@ impl RateGovernor {
             link_unoffered: 0,
             link_rx_bps: None,
             drain_until: None,
-            open_seed_bps: ceiling_seed_bps
-                .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
-            // Seeded with the SAME filtered value: a seed at or above the
-            // band never stood in for anything (the relief is inert there
-            // and the P6 check would read it as a contradiction).
+            open_seed_bps,
+            open_at_bps,
+            // Seeded with the SAME filtered value.
             prior: super::prior::RatePrior::new(
-                ceiling_seed_bps
-                    .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
+                open_seed_bps,
                 super::MIN_BITRATE_BPS,
                 // FR-79 V3 — the prior always decays; the switch is gone (FR-70 P1
                 // was field-verified with its own same-build control on 0.4.64).
@@ -551,6 +575,27 @@ impl RateGovernor {
     #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
     pub fn open_seed_bps(&self) -> Option<u32> {
         self.open_seed_bps
+    }
+
+    /// FR-148 P1 step 3 — where the session opens when that sits under the
+    /// ceiling (see `open_at_bps`). The pump opens its first encoder, and a
+    /// replacement before the first tick, at it. Today's rule gives
+    /// [`Self::open_seed_bps`].
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn open_at_bps(&self) -> Option<u32> {
+        self.open_at_bps
+    }
+
+    /// FR-148 P1 step 3 — the rate a session built from `plan` opens at under
+    /// a plan ceiling of `plan_ceiling_bps`, with this governor's relay cap
+    /// and floor relief: the AIMD's first target before the floor in force
+    /// clamps it. The open line logs today's rule's beside the model's.
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn opening_of(&self, plan: &super::pair_memory::OpenPlan, plan_ceiling_bps: u32) -> u32 {
+        let (seed, open_at) = plan.resolve(self.slow_link.floor_relief);
+        let ceiling = super::ceiling_learn::CeilingLearner::new(self.learner.hi_bps(), seed)
+            .ceiling_for(plan_ceiling_bps);
+        open_at.map_or(ceiling, |o| o.min(ceiling))
     }
 
     /// FR-59 P4 — is production paused for a queue drain right now?
@@ -1008,7 +1053,9 @@ impl RateGovernor {
         // at all. The floor parameter means "a rate already PROVEN", and only
         // the remembered seed is that.
         if self.slow_link.slow_start && constrained {
-            let seeded = self.open_seed_bps;
+            // FR-148 P1 step 3 — the opening, which is the P8 seed under
+            // today's rule and the model's opening after a push-back.
+            let seeded = self.open_at_bps;
             let ss = self.slow_start.get_or_insert_with(|| {
                 super::slow_start::SlowStart::new(seeded.unwrap_or(0), ceiling_bps)
             });
@@ -1086,7 +1133,7 @@ impl RateGovernor {
             _ => floor_bps,
         };
         let depth = self.send_depth;
-        let open_seed_bps = self.open_seed_bps;
+        let open_at_bps = self.open_at_bps;
         // FR-63 B1 — feed the SHADOW the same resolved domain and occupancy the
         // live AIMD below gets, and let it open on its first frame. Placed where
         // no `&mut self.aimd` borrow is live and before the `?` the AIMD takes,
@@ -1106,7 +1153,9 @@ impl RateGovernor {
             // remembered slower than the nominal floor: the ceiling is the
             // relay cap, and an opener sized by it is the burst this program
             // exists to prevent. The additive increase climbs from here.
-            let initial = open_seed_bps.map_or(ceiling_bps, |s| s.min(ceiling_bps));
+            // FR-148 P1 step 3 — or at the path model's opening after a
+            // trusted push-back (`open_at_bps`).
+            let initial = open_at_bps.map_or(ceiling_bps, |s| s.min(ceiling_bps));
             AimdController::new(initial, floor_bps, ceiling_bps, depth as u32, now)
         });
         ctrl.set_floor(floor_bps);

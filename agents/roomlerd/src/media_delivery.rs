@@ -58,8 +58,10 @@ pub const LINE: &str = "path delivery (FR-148 P0, shadow, ≈10s)";
 
 /// FR-148's switch, `ROOMLERD_PATH_MODEL` (D28): `off` is the release before
 /// P0 exactly (no delivery sample, no path memory, no line); `shadow` and `on`
-/// sample and keep the path memory. Until P1 step 3, `on` behaves as `shadow`:
-/// the opener reads today's rate memory in every mode.
+/// sample and keep the path memory. `shadow`, the default, opens by today's
+/// rate memory; `on` lets the path model's entry decide the opening of a
+/// constrained FFmpeg-pump session (`media_pair_memory`, P1 step 3). The
+/// config key `path_model` sets it on a device (a set variable wins).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Off,

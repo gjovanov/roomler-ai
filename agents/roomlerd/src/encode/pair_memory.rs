@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-148 P1 step 2 — the pair memory stores the path model, under a key that
-//! names the path (spec §8, D22 to D26). Pure: no clock read, no I/O but the
-//! file's own load and save.
+//! FR-148 P1 steps 2 to 4 — the pair memory stores the path model, under a
+//! key that names the path, and under `on` the opener reads it (spec §8, D22
+//! to D28). Pure: no clock read, no I/O but the file's own load and save.
 //!
 //! | Part | What it is |
 //! |---|---|
 //! | the key ([`pair_key`]) | `v2|<carrier>|u:<controlling user>|<viewer network>`. The relay worker's address is not in it (AC8) |
-//! | the file ([`PathMemory`]) | `path_memory.json`, beside today's `rate_memory.json`, which is written exactly as before |
+//! | the file ([`PathMemory`]) | `path_memory.json`, beside today's `rate_memory.json`, which is written exactly as before; one lock in the process around its read-modify-write ([`PathMemory::update`]) |
 //! | an entry ([`PairEntry`]) | the model's floor, and a push-back record of its own (D25) |
-//! | the session ([`SessionMemory`]) | the floor law from the entry's floor, and the record, fed only by valid windows (D24) |
+//! | the session ([`SessionMemory`]) | the floor law from the entry's floor, and the record, fed only by counted samples of valid windows (D24, R1 to R3) |
 //! | the close ([`close`]) | what a session writes, case by case, and why |
-//! | the opening ([`model_opening`]) | what the model WOULD open at. In this step only the open line reads it |
+//! | the opening ([`model_opening`]) | what the model opens at (D25) and whether the slow-link profile engages (D26) |
+//! | the decision ([`Taken`], [`OpenPlan`]) | which rule opens the session: the model's under `on` with a key and a fresh entry, else today's, and why |
 //!
-//! ⚠️ Nothing here drives a rate in this step: the opener reads today's
-//! `rate_memory.json` in every mode (D28).
+//! ⚠️ Under `off` and `shadow` (the default, D28) nothing here drives a rate:
+//! the opener reads today's `rate_memory.json`, byte for byte.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -497,7 +499,25 @@ impl PathMemory {
         std::fs::write(&tmp, self.to_bytes())?;
         std::fs::rename(&tmp, path)
     }
+
+    /// Read the file, change it and save it, under the one lock this process
+    /// holds for it. Two pumps that end at once would otherwise write the
+    /// same temp sibling, and the later save would drop the key the earlier
+    /// one wrote. Two sessions of ONE key still end as the later close says.
+    pub fn update(
+        path: &Path,
+        now_unix: u64,
+        change: impl FnOnce(&mut PathMemory),
+    ) -> std::io::Result<()> {
+        let _held = FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut memory = Self::load(path, now_unix);
+        change(&mut memory);
+        memory.save(path)
+    }
 }
+
+/// The lock around [`PathMemory::update`]: one per process (ruling 2).
+static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The file's location: the directory of `rate_memory.json`.
 pub fn default_path() -> Option<PathBuf> {
@@ -526,8 +546,8 @@ pub struct ModelOpening {
 /// ```
 ///
 /// No entry, an expired floor, or an entry that failed its check (it is not
-/// in the memory then): O = N and no profile. In this step only the open line
-/// calls it.
+/// in the memory then): O = N and no profile. The open line logs it in every
+/// mode; under `on` it decides the opening ([`Taken`]).
 pub fn model_opening(
     nominal: u32,
     hi: u32,
@@ -556,6 +576,125 @@ pub fn model_opening(
         bps,
         profile,
         trusted: record.is_some(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which rule opens the session (step 3)
+// ---------------------------------------------------------------------------
+
+/// FR-148 P1 step 3 — what a constrained FFmpeg-pump session opens from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenPlan {
+    /// Today's rule: the measured seed of `rate_memory.json`, if any (FR-35,
+    /// FR-59 P8). `off` and `shadow` always open from it.
+    Today(Option<u32>),
+    /// The model's (D25): the entry's floor D seeds the ceiling learner, the
+    /// shadow controller and the P0 model, so the ceiling at the first tick
+    /// is `max(N, min(⌊0.85·D⌋, hi))`; after a trusted push-back the session
+    /// opens at `open_at_bps`, which may sit under the nominal.
+    Model {
+        floor_bps: u32,
+        open_at_bps: Option<u32>,
+    },
+}
+
+impl OpenPlan {
+    /// The model's plan for `opening`, computed on `entry`.
+    pub fn model(entry: &PairEntry, opening: ModelOpening) -> Self {
+        OpenPlan::Model {
+            floor_bps: entry.floor.bps,
+            open_at_bps: opening.trusted.then_some(opening.bps),
+        }
+    }
+
+    /// `(seed, open_at)` as the governor takes them: the seed of the ceiling
+    /// learner, the shadow controller and the P0 model; and where the AIMD,
+    /// the first encoder and slow start open when that sits under the
+    /// ceiling.
+    ///
+    /// Today's is FR-59 P8 exactly: the seed when it is under the nominal
+    /// floor and the floor relief is on. The model's opening is taken as it
+    /// is, except that with the relief off one under the nominal floor is
+    /// lifted to it: the AIMD's floor would lift it at the first tick, and an
+    /// encoder opened under it would be rebuilt right there.
+    pub fn resolve(&self, floor_relief: bool) -> (Option<u32>, Option<u32>) {
+        let floor = super::MIN_BITRATE_BPS;
+        match *self {
+            OpenPlan::Today(seed) => (seed, seed.filter(|s| *s > 0 && *s < floor && floor_relief)),
+            OpenPlan::Model {
+                floor_bps,
+                open_at_bps,
+            } => (
+                Some(floor_bps),
+                open_at_bps.map(|o| if floor_relief { o } else { o.max(floor) }),
+            ),
+        }
+    }
+}
+
+/// Why today's rule opened the session: under `on`, why the model did not
+/// (ruling 3); under `shadow`, the switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodayWhy {
+    Shadow,
+    NoKey,
+    NoEntry,
+    EntryInvalid,
+    FloorExpired,
+}
+
+impl TodayWhy {
+    pub fn word(self) -> &'static str {
+        match self {
+            TodayWhy::Shadow => "shadow",
+            TodayWhy::NoKey => "no_key",
+            TodayWhy::NoEntry => "no_entry",
+            TodayWhy::EntryInvalid => "entry_invalid",
+            TodayWhy::FloorExpired => "floor_expired",
+        }
+    }
+}
+
+/// Which rule opened the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// The model's opening (D25) and profile (D26).
+    Model,
+    /// Today's rule, and why.
+    Today(TodayWhy),
+}
+
+impl Taken {
+    /// The model decides under `on` when the session has a key and its entry
+    /// is fresh and passed its check. Anything else opens by today's rule:
+    /// no entry, an entry dropped at the read (a bad value or a time ahead),
+    /// a floor older than its TTL, or no key.
+    pub fn decide(on: bool, keyed: bool, state: EntryState) -> Self {
+        let why = match state {
+            _ if !on => TodayWhy::Shadow,
+            _ if !keyed => TodayWhy::NoKey,
+            EntryState::Fresh => return Taken::Model,
+            EntryState::None => TodayWhy::NoEntry,
+            EntryState::Invalid | EntryState::Future => TodayWhy::EntryInvalid,
+            EntryState::Expired => TodayWhy::FloorExpired,
+        };
+        Taken::Today(why)
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Taken::Model => "model",
+            Taken::Today(_) => "today",
+        }
+    }
+
+    /// `-` for the model's; today's reason otherwise.
+    pub fn why(self) -> &'static str {
+        match self {
+            Taken::Model => "-",
+            Taken::Today(why) => why.word(),
+        }
     }
 }
 
@@ -1325,6 +1464,42 @@ mod tests {
         let mut master = super::super::rate_memory::RateMemory::default();
         master.record("later", 2_000_000, NOW + 86_400);
         assert_eq!(master.seed_for("later", NOW), Some(2_000_000), "master");
+    }
+
+    /// Ruling 2: pumps that end at once each keep their key. Eight threads,
+    /// started together, each write twenty keys of their own through
+    /// [`PathMemory::update`]; the file ends with all 160. Without the lock
+    /// two saves share the temp sibling and a load-then-save drops the other
+    /// thread's key (the red run lost keys or failed a save).
+    #[test]
+    fn pumps_that_end_at_once_each_keep_their_key() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let (threads, rounds) = (8, 20);
+        let start = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (path, start) = (path.clone(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..rounds)
+                        .map(|r| {
+                            PathMemory::update(&path, NOW, |m| {
+                                m.write(&format!("k{t}-{r}"), entry(2_000_000, NOW), NOW);
+                            })
+                            .is_ok()
+                        })
+                        .filter(|ok| !ok)
+                        .count()
+                })
+            })
+            .collect();
+        let failed: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(failed, 0, "every save went through");
+        let memory = PathMemory::load(&path, NOW);
+        assert_eq!(memory.pairs.len(), threads * rounds);
+        assert!(memory.dropped.is_empty());
     }
 
     /// A version other than 1, or a file that is not this shape, is an empty

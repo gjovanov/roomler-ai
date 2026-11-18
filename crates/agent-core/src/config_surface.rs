@@ -1440,6 +1440,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-148 P4 - the carrier rank, for a remote-desktop session the mesh may carry: `0` (empty; off, as before), `prio` or `1`. On, the session reads its mesh link to the viewer's device at the offer; unless that link is direct, every candidate only the mesh carries (a host, a server-reflexive or a relay candidate on the mesh's own addresses) is signalled at priority 255, below every relay, so the session lands on TURN whenever TURN connects and on the mesh when nothing else does. `1` also ends each such candidate's line with ` network-cost 999`. On, a relay over TCP or TLS also ranks below one over UDP, and the agent keeps checking the pairs above its selection. Env: ROOMLERD_RC_CARRIER_RANK. This device only: never pushable. Restart required.",
     },
     KeyMeta {
+        key: "path_model",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:off|shadow|on",
+        description: "FR-148 P1 - the path model's switch for a remote-desktop session on a relay: `shadow` (empty; the default: the path memory is kept and logged beside the opening, and the session opens as before), `on` (a relayed session whose pair has a fresh entry in the path memory opens from it: 0.85 x its floor, at most the relay cap, under the nominal opening only after a trusted push-back, and on the slow-link profile only after a trusted push-back at or under 1 Mbit/s) or `off` (no delivery samples, no path memory, no lines: the release before). A device set to `shadow` stays at shadow when the default changes; empty takes the default. Env: ROOMLERD_PATH_MODEL (a set variable wins). This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
         key: "relay_max_kbps",
         group: Group::VideoRate,
         tier: Tier::Advanced,
@@ -2137,6 +2145,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
         "rc_carrier_rank" => cfg.rc_carrier_rank.clone(),
+        "path_model" => cfg.path_model.clone(),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
@@ -2720,6 +2729,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 Some(v) if v == "prio" || v == "1" => Some(v),
                 Some(v) => {
                     return Err(format!("rc_carrier_rank must be 0, prio or 1 (got {v:?})"));
+                }
+            }
+        }
+        // `shadow` is stored, not cleared: a device taken back to it stays
+        // there when the default changes (D28).
+        "path_model" => {
+            cfg.path_model = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() => None,
+                Some(v) if v == "off" || v == "shadow" || v == "on" => Some(v),
+                Some(v) => {
+                    return Err(format!("path_model must be off, shadow or on (got {v:?})"));
                 }
             }
         }
@@ -5019,6 +5040,46 @@ mod tests {
         for bad in ["on", "1", "vbr", "icq", "qvbr2"] {
             assert!(
                 apply(&mut cfg, "qsv_rate_mode", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 P1 — `path_model`: `off`, `shadow` and `on` are stored, blank
+    /// clears the key (the default, `shadow` today), and anything else is
+    /// refused rather than read as `shadow` without a word. `shadow` is
+    /// stored, so a device taken back stays there when the default moves. It
+    /// reaches the daemon's env fallbacks under the switch's own name.
+    #[test]
+    fn path_model_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "path_model"), None);
+        apply(&mut cfg, "path_model", Some(" ON ")).unwrap();
+        assert_eq!(cfg.path_model.as_deref(), Some("on"));
+        assert_eq!(
+            entry_for(&cfg, "path_model").unwrap().value.as_deref(),
+            Some("on")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("PATH_MODEL")
+                .map(String::as_str),
+            Some("on")
+        );
+        apply(&mut cfg, "path_model", Some("shadow")).unwrap();
+        assert_eq!(
+            cfg.path_model.as_deref(),
+            Some("shadow"),
+            "kept, not cleared"
+        );
+        apply(&mut cfg, "path_model", Some("off")).unwrap();
+        assert_eq!(cfg.path_model.as_deref(), Some("off"));
+        apply(&mut cfg, "path_model", Some("")).unwrap();
+        assert_eq!(cfg.path_model, None, "blank clears to the default");
+        assert_eq!(crate::config::env_fallbacks(&cfg).get("PATH_MODEL"), None);
+        for bad in ["1", "true", "model", "on1", "shadow,on"] {
+            assert!(
+                apply(&mut cfg, "path_model", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }
