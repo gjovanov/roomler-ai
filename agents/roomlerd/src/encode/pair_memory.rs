@@ -732,7 +732,7 @@ pub fn window_read(state: PipeState, age_plausible: bool) -> bool {
 /// A still screen writes tens of kbit/s under a target of megabits. What
 /// arrives then measures the screen, not the path, and with a viewer whose
 /// paint age stays flat while its link report says the queue grows (R3's V2,
-/// `governor::tests::the_screens_families_leave_the_path_as_it_was`) the
+/// `governor::tests::the_screens_families_on_r1_r2_and_the_plan_limited_test`) the
 /// classifier reads such a window `Clear`: before this test a still screen's
 /// slowdowns left a trusted record at a few hundred kbit/s.
 pub fn pushing_against_plan(state: PipeState, sent_bps: u32, target_bps: u32) -> bool {

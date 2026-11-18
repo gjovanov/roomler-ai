@@ -480,7 +480,7 @@ after it read `cap_fps=60 skip_divisor=2`. Divisor 1 came only 3–5 s later.
   now capture faster. A move down is unchanged.
 - **The base rate moving up with the transport** (30 on a relay, 60 direct) follows the same rule, and now gets the
   higher rate from the next window instead of climbing back to it.
-- **Tests** (`viewer_rate.rs:954`, `:968`). An unclamped cap follows a move from 60 to 120, on both the plain and the
+- **Tests** (`viewer_rate.rs:964`, `:978`). An unclamped cap follows a move from 60 to 120, on both the plain and the
   slow-start controller. A clamped cap stays clamped: 25 at 60 is still 25 at 120, which is divisor 5. The first is
   red on the code before the fix. The second passes on both, and guards the half that must not change.
 
@@ -563,7 +563,7 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
 
 - **The gate ran on constrained windows only.** A direct window was evidence by definition, so FR-119's grant (which
   only runs on a direct path) read capacity claims nothing had gated. The gate now runs on every window
-  (`encode/governor.rs:1110`). On a direct window the classifier does not run, so its state is `Unknown` with no
+  (`encode/governor.rs:1159`). On a direct window the classifier does not run, so its state is `Unknown` with no
   predecessor, and only the agent's own stall and the opening apply.
 - **The opening is not evidence** (`encode/evidence.rs:73`). The session's first keyframe, meeting a transport still
   ramping, blocked sends for 43–82 ms, and the drain rate folded as a capacity of 14–22 Mbps against the 104 Mbps
@@ -574,14 +574,14 @@ as evidence, each fixed where it lives rather than around FR-119's grant.
 - **The window was one pass long.** The pump hands its sender facts to the governor on every pass, as deltas since
   the previous pass, and each call overwrote the last. A stalled pass anywhere but in a window's last iteration
   never reached `AgentStalled`, and `frames_sent` and `gate_skips` read 0–2 where the window held 30–120.
-  `WindowSenderStats::absorb` (`governor.rs:375`, called from `note_window_sender`, `:1495`) folds the passes: counts
+  `WindowSenderStats::absorb` (`governor.rs:380`, called from `note_window_sender`, `:1556`) folds the passes: counts
   add, the longest wait wins, the average is weighted by frames sent (the send task records a wait for every frame
   it writes), `opening` ORs, and the levels are the latest.
   ⚠️ This also corrects the inputs FR-71's classifier reads on constrained sessions: a gate skip anywhere in a window
   now classifies it `overproduced`, and the silent-viewer gap rule sees real frame counts. That is what the
   classifier's tests always encoded; it was never what the field ran. Watch the relay fleet's `pipe_states` and
   `evidence_rejected` after the release that carries it.
-- **Tests** (`governor.rs:4024`, `:4065`, `:4096`, `evidence.rs` tests). A window is the sum of its passes. A stalled
+- **Tests** (`governor.rs:4085`, `:4126`, `:4157`, `evidence.rs` tests). A window is the sum of its passes. A stalled
   pass early in a window still rejects it, which is red on the overwrite. A direct window in the opening folds no
   capacity, and the same window after the opening folds as before, which is red with the gate constrained-only. The
   negative controls, each alone, fail exactly their test. CI's `ffmpeg-encoder` clippy lane compiles the pump change,

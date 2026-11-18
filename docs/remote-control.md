@@ -4086,7 +4086,7 @@ worker started after its page, the age and the age at arrival move by the skew, 
 counts the hops it used to drop: through the skew since #3566, and inside the skew's error, as 0, since #3596.
 FR-15's loop fires on the age less a floor it learns from the session's own window
 minimums, where a constant cancels, but also on an age far above half the RTT, and it refuses a floor sample below
-half the RTT (`AgeLoop::observe`, `agents/roomlerd/src/encode/viewer_rate.rs:759`). Those two read the age itself,
+half the RTT (`AgeLoop::observe`, `agents/roomlerd/src/encode/viewer_rate.rs:769`). Those two read the age itself,
 a negative age never reaches the loop at all, and the split and the verdicts read absolute numbers too.
 
 **The proof here, and what it is not.** `ui/src/__tests__/workers/rcClockCal.spec.ts` pins the arithmetic with the
@@ -7062,7 +7062,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2658`](../crates/agent-core/src/config.rs#L2658))
+([`crates/agent-core/src/config.rs:2664`](../crates/agent-core/src/config.rs#L2664))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |

@@ -152,7 +152,7 @@ found it is §6.
 ### 3.2 The governor reads a total that never resets (fixed 2026-10-30)
 
 FR-79's gate asks whether the agent's own loop was free in a window
-(`governor.rs:1362`, `agent_stalled: stalled_passes > 0`). The pump fed it
+(`governor.rs:1411`, `agent_stalled: stalled_passes > 0`). The pump fed it
 `pump_stalls − win_stalls_last`, and the heartbeat zeroed `pump_stalls` but not
 the mark: after a window that held a stall, the next verdict read `1 − N`,
 which saturates to 0. The first verdict after a reset is the heartbeat pass's
