@@ -1554,8 +1554,9 @@ mod machine_reply_tests {
     /// Long enough that only something stuck runs out of it.
     const LONG: Duration = Duration::from_secs(10);
 
-    /// Whether this test runs as root. Under `ROOMLERD_TEST_REQUIRE_ROOT`
-    /// (CI's sudo step) a run that is not root fails instead.
+    /// Whether this test runs as root. Under `ROOMLERD_TEST_REQUIRE_ROOT` a
+    /// run that is not root fails instead, so a sudo run cannot pass by
+    /// skipping the root half's answer.
     fn as_root() -> bool {
         // SAFETY: geteuid never fails.
         let root = unsafe { libc::geteuid() } == 0;
