@@ -903,9 +903,11 @@ mod tests {
     /// 0.2 to 9.4 Mbit/s) and each model entry (none, a floor, a trusted
     /// push-back that would open under the profile), the pump's plan is
     /// today's seed, its profile seed and age are today's, and the governor
-    /// built from it acts on master's recorded values; the open line's
-    /// `today_open_bps` is master's expression. Change one filter (the
-    /// 1.5 Mbit/s bound of P8) and a row goes red.
+    /// built from it acts on master's recorded values, `open_at_bps` (what
+    /// the pump's two encoder opens read; on master they read the seed)
+    /// included; the open line's `today_open_bps` is master's expression.
+    /// Change one filter (the 1.5 Mbit/s bound of P8) and a row goes red.
+    /// One `N` and one `hi`: master's values for others were not recorded.
     #[test]
     fn shadow_is_todays_opener_exactly() {
         let now_unix = rate_memory::now_unix();
@@ -950,6 +952,9 @@ mod tests {
                     for ((relief, slow_start, ratectl), want) in SETUPS.into_iter().zip(master) {
                         let (got, g) = opened(&p.plan(), relief, slow_start, ratectl);
                         assert_eq!(got, want, "{at} relief {relief} slow start {slow_start}");
+                        // What the pump's two encoder opens read: `open_at_bps`
+                        // here, `open_seed_bps` on master.
+                        assert_eq!(g.open_at_bps(), want.0, "{at} relief {relief}: open_at");
                         // The open line's `today_open_bps`, as master wrote it.
                         assert_eq!(
                             g.opening_of(&pm::OpenPlan::Today(seed), 2_550_000),

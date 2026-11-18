@@ -2024,7 +2024,7 @@ place: `new_with` with `pair_memory.plan()`, and the two encoder opens read
 
 | Test | Shows |
 |---|---|
-| `media_pair_memory::tests::shadow_is_todays_opener_exactly` | D28's twin: under `shadow` and `off`, for 8 of today's seeds × 3 model entries × 3 governor set-ups, the plan, the profile seed and its age are today's, and the governor acts on master's values, recorded on the base before step 3 (`MASTER`). Moving P8's 1.5 Mbit/s bound by 0.5 Mbit/s turns it red |
+| `media_pair_memory::tests::shadow_is_todays_opener_exactly` | D28's twin: under `shadow` and `off`, for 8 of today's seeds × 3 model entries × 3 governor set-ups, the plan, the profile seed and its age are today's, and the governor acts on master's values, recorded on the base before step 3 (`MASTER`); `open_at_bps`, which the pump's two encoder opens read, is master's `open_seed_bps`, which they read on master. Moving P8's 1.5 Mbit/s bound by 0.5 Mbit/s turns it red |
 | `on_opens_where_the_model_says` | the design's §3.3 rows through the governor under `on`, with master's opening beside the two AC3 chains and §2.1's 281,732 bit/s: master opens each lower, on the profile |
 | `the_open_line_says_which_rule_opened_and_why` | the table above, line by line |
 | `twenty_still_screens_keep_the_floor_and_its_age` | AC6 under `on`, through the file: after a session of 6.5 Mbit/s, twenty still screens each open at 5.525 Mbit/s or more, and the entry does not move |
@@ -2169,10 +2169,9 @@ no device until it is ruled ([§ The switch](#the-switch-d28)).
   bounded, since nothing awaits under the lock and nothing nests, and today's memory does
   the same.
 - The twin test (`shadow_is_todays_opener_exactly`) holds at one `N` (2.55 Mbit/s) and
-  one `hi` (8 Mbit/s), with the flags the cell sets rather than `from_env`'s, and compares
-  the opening seed and the first tick. Under today's rule `open_at_bps` equals the seed by
-  construction; the pump's two encoder opens that read it are under no test (ledger
-  `p1:OPENER-4`).
+  one `hi` (8 Mbit/s), with the flags the cell sets rather than `from_env`'s: master's
+  values for another `N` or `hi` were not recorded. It compares `open_at_bps`, the value
+  the pump's two encoder opens read, but not the opens themselves (ledger `p1:OPENER-4`).
 
 ## Config / env reference
 
