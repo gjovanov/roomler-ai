@@ -1415,11 +1415,11 @@ of the vendored webrtc-sctp keeps where the events happen:
 
 | Counter | Counted in | Means |
 |---|---|---|
-| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1468`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
-| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:118`, `:512`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
+| acknowledged bytes | the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1518`) | user data the peer acknowledged it received, each chunk once, over every stream of the association: by a gap block, or by the cumulative point. A partially reliable chunk is left out when a SACK reported it missing, or when it was outstanding as the retransmission timer expired, and the cumulative point then passed it: a FORWARD TSN skipped it (`DeliveryCounters::loss_mark`, `crates/vendored/webrtc-sctp/src/association/delivery.rs:41`) |
+| fills and empties | the pending queue (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:135`, `:530`) | how many times the queue of written, not yet sent chunks went from empty to holding bytes, and back |
 
 The agent reads both without the association's lock (`Association::delivery_clock`,
-`crates/vendored/webrtc-sctp/src/association/mod.rs:632`), through the peer
+`crates/vendored/webrtc-sctp/src/association/mod.rs:638`), through the peer
 connection's SCTP transport (`RTCSctpTransport::delivery_clock`,
 `crates/vendored/webrtc/src/sctp_transport/mod.rs:437`, a patch of the vendored
 webrtc). That accessor never waits: `stop()` holds the transport's slot across the
