@@ -38,6 +38,12 @@
 //! (`encode::pipe::PathView`). Also in shadow, also off with the switch; see
 //! `docs/rate-control.md` (§ Path numbers and their provenance).
 //!
+//! O10 writes a third, [`OPEN_LINE`], once a pump at its first media write:
+//! which way SCTP opened the session's association (the peer's INIT ACK first,
+//! or its COOKIE ECHO), read from the association's gauges without taking from
+//! them, and the windows then. Also off with the switch; see
+//! `docs/rate-control.md` (§ The open-time train).
+//!
 //! The delivery line also says whether a queue stood on the path: the
 //! classifier above cannot see one that a TCP carrier holds, since the queue
 //! of unsent chunks keeps running empty while seconds of bytes wait in the
@@ -385,6 +391,8 @@ pub struct DeliverySampler {
     /// [`MODEL_LINE`] was (its own [`LINE_EVERY`]).
     view: Option<PathView>,
     model_since: Option<Instant>,
+    /// O10 — whether this pump wrote its [`OPEN_LINE`].
+    opened: bool,
 }
 
 impl DeliverySampler {
@@ -414,6 +422,7 @@ impl DeliverySampler {
             session: None,
             view: None,
             model_since: None,
+            opened: false,
         }
     }
 
@@ -595,6 +604,33 @@ impl DeliverySampler {
             }
         }
     }
+
+    /// O10 — the pump's call at each media message it hands to its send task.
+    /// The first reads the association's gauges without taking from them
+    /// (`GaugeReader::peek`: the least acknowledgement delay stays for a reader
+    /// that takes it) and writes [`OPEN_LINE`]; every later call returns at
+    /// once. Never waits: a transport whose slot is held reads as no gauges.
+    /// Off, it reads and writes nothing.
+    pub fn on_media_write(&mut self, pc: &RTCPeerConnection, session_id: ObjectId, pump: Pump) {
+        self.on_first_write(session_id, pump, || pc.sctp().gauges());
+    }
+
+    /// [`Self::on_media_write`], with the gauges from `gauges`. Returns what the
+    /// line said, the one time it writes it; `None` after that, and off.
+    pub fn on_first_write(
+        &mut self,
+        session_id: ObjectId,
+        pump: Pump,
+        gauges: impl FnOnce() -> Option<GaugeReader>,
+    ) -> Option<OpenedBy> {
+        if !self.on || self.opened {
+            return None;
+        }
+        self.opened = true;
+        let read = gauges().map(|g| g.peek());
+        emit_open(session_id, pump, read.as_ref());
+        Some(OpenedBy::of(read.as_ref()))
+    }
 }
 
 impl Drop for DeliverySampler {
@@ -703,11 +739,104 @@ pub fn seed_at_open(path: &Path, peer: &str) -> (Option<u32>, Option<Duration>) 
     )
 }
 
+/// FR-148 O10 — the open path's line, once a pump at its first media write,
+/// which a field read greps for.
+pub const OPEN_LINE: &str = "path open (FR-148 P0, O10)";
+
+/// The data-channel pump that writes [`OPEN_LINE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pump {
+    Vp9444Dc,
+    FfmpegDc,
+}
+
+impl Pump {
+    pub fn word(self) -> &'static str {
+        match self {
+            Pump::Vp9444Dc => "vp9-444-dc",
+            Pump::FfmpegDc => "ffmpeg-dc",
+        }
+    }
+}
+
+/// Which way a session's association opened, as its gauges read at the pump's
+/// first media write. The vendored SCTP sets the slow start threshold in three
+/// places only: where the peer's INIT ACK arrives, to the peer's window (path
+/// I), and where a fast retransmission or a T3-rtx expiry cuts it. An
+/// association its peer's COOKIE ECHO established (path C) has a threshold of
+/// 0 until its first loss. So before any loss, 0 is path C and above 0 is path
+/// I; after one, the gauges cannot tell. The peer's window is no help: any SACK
+/// sets it, on both paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenedBy {
+    /// Path C: the threshold 0, and no loss yet.
+    CookieEcho,
+    /// Path I: the threshold above 0, and no loss yet.
+    InitAck,
+    /// A fast retransmission or a T3-rtx expiry came first. Either sets the
+    /// threshold, on both paths.
+    Unknown,
+    /// No gauges: no association, or its transport's slot was held.
+    Unread,
+}
+
+impl OpenedBy {
+    /// The classification: a pure function of the gauges read at the first
+    /// write.
+    pub fn of(gauges: Option<&Gauges>) -> Self {
+        match gauges {
+            None => Self::Unread,
+            Some(g) if g.fast_retransmits > 0 || g.t3_expiries > 0 => Self::Unknown,
+            Some(g) if g.ssthresh == 0 => Self::CookieEcho,
+            Some(_) => Self::InitAck,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::CookieEcho => "cookie_echo",
+            Self::InitAck => "init_ack",
+            Self::Unknown => "unknown",
+            Self::Unread => "unread",
+        }
+    }
+}
+
+/// O10's line: the session, the pump, the open path, and the gauges it was
+/// read from; without gauges, the first three alone. No field can carry an
+/// address. The names and their order are pinned by a test.
+pub fn emit_open(session_id: ObjectId, pump: Pump, gauges: Option<&Gauges>) {
+    let open_path = OpenedBy::of(gauges).word();
+    match gauges {
+        Some(g) => tracing::info!(
+            %session_id,
+            pump = %pump.word(),
+            open_path = %open_path,
+            ssthresh = g.ssthresh,
+            rwnd = g.rwnd,
+            cwnd = g.cwnd,
+            inflight_bytes = g.inflight_bytes,
+            pending_bytes = g.pending_bytes,
+            max_payload = g.max_payload,
+            fast_retransmits = g.fast_retransmits,
+            t3_expiries = g.t3_expiries,
+            "{OPEN_LINE}"
+        ),
+        None => tracing::info!(
+            %session_id,
+            pump = %pump.word(),
+            open_path = %open_path,
+            "{OPEN_LINE}"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::sync::{Arc, Mutex};
 
+    use super::shaped_link::{self, OpenPath};
     use super::*;
     use crate::encode::pipe::Basis;
 
@@ -1515,6 +1644,244 @@ mod tests {
             seed_at_open(&missing, "198.51.100.7|relay:turn/udp"),
             (None, None)
         );
+    }
+
+    /// O10 — gauges as an association holds them before any loss: the
+    /// threshold given, the rest a session's first write.
+    fn opening(ssthresh: u32) -> Gauges {
+        Gauges {
+            max_payload: 1_188,
+            cwnd: 4_380,
+            ssthresh,
+            rwnd: 1_043_200,
+            inflight_bytes: 0,
+            pending_bytes: 2_404,
+            ..Gauges::default()
+        }
+    }
+
+    #[test]
+    fn a_threshold_of_0_with_no_loss_opened_on_the_cookie_echo() {
+        assert_eq!(OpenedBy::of(Some(&opening(0))), OpenedBy::CookieEcho);
+        // Whatever the peer's window says: a SACK sets it on both paths.
+        for rwnd in [0, 1_500, 1_048_576] {
+            let g = Gauges { rwnd, ..opening(0) };
+            assert_eq!(OpenedBy::of(Some(&g)), OpenedBy::CookieEcho, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn a_threshold_above_0_with_no_loss_opened_on_the_init_ack() {
+        for ssthresh in [1, 1_500, 131_072, 1_048_576, u32::MAX] {
+            let g = opening(ssthresh);
+            assert_eq!(OpenedBy::of(Some(&g)), OpenedBy::InitAck, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn a_loss_before_the_first_write_leaves_the_open_path_unknown() {
+        for (ssthresh, fast_retransmits, t3_expiries) in [
+            (0, 1, 0),
+            (0, 0, 1),
+            (17_520, 1, 0),
+            (4_800, 0, 2),
+            (4_800, 3, 1),
+        ] {
+            let g = Gauges {
+                fast_retransmits,
+                t3_expiries,
+                ..opening(ssthresh)
+            };
+            assert_eq!(OpenedBy::of(Some(&g)), OpenedBy::Unknown, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn no_gauges_is_unread() {
+        assert_eq!(OpenedBy::of(None), OpenedBy::Unread);
+        let words = [
+            OpenedBy::CookieEcho,
+            OpenedBy::InitAck,
+            OpenedBy::Unknown,
+            OpenedBy::Unread,
+        ]
+        .map(OpenedBy::word);
+        assert_eq!(words, ["cookie_echo", "init_ack", "unknown", "unread"]);
+    }
+
+    #[test]
+    fn the_open_line_names_its_fields() {
+        let out = logged(|| emit_open(sid(), Pump::FfmpegDc, Some(&opening(0))));
+        let mut rest = out.as_str();
+        for want in [
+            " INFO ",
+            OPEN_LINE,
+            "session_id=65a1b2c3d4e5f60718293a4b",
+            "pump=ffmpeg-dc",
+            "open_path=cookie_echo",
+            "ssthresh=0",
+            "rwnd=1043200",
+            "cwnd=4380",
+            "inflight_bytes=0",
+            "pending_bytes=2404",
+            "max_payload=1188",
+            "fast_retransmits=0",
+            "t3_expiries=0",
+        ] {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        let init_ack = logged(|| emit_open(sid(), Pump::Vp9444Dc, Some(&opening(1_048_576))));
+        for want in ["pump=vp9-444-dc", "open_path=init_ack", "ssthresh=1048576"] {
+            assert!(init_ack.contains(want), "{want:?} is not in {init_ack:?}");
+        }
+        // Without gauges: the session, the pump and the open path alone.
+        let unread = logged(|| emit_open(sid(), Pump::Vp9444Dc, None));
+        assert!(unread.contains("open_path=unread"), "{unread:?}");
+        assert!(!unread.contains("ssthresh"), "{unread:?}");
+        // Its cost: one line a session.
+        for l in [&out, &init_ack, &unread] {
+            println!("open line: {} bytes\n{l}", l.len());
+            assert!(l.len() < 400, "{} bytes: {l:?}", l.len());
+        }
+    }
+
+    #[test]
+    fn the_open_line_comes_once_a_pump_and_off_writes_none() {
+        let asked = Cell::new(0u32);
+        let gauges = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(true);
+            let first = s.on_first_write(sid(), Pump::FfmpegDc, gauges);
+            assert_eq!(first, Some(OpenedBy::Unread));
+            for _ in 0..5 {
+                assert_eq!(s.on_first_write(sid(), Pump::FfmpegDc, gauges), None);
+            }
+        });
+        assert_eq!(
+            asked.get(),
+            1,
+            "the gauges are read at the first write only"
+        );
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(out.contains(OPEN_LINE), "{out:?}");
+        let out = logged(|| {
+            let mut s = DeliverySampler::new(false);
+            for _ in 0..5 {
+                assert_eq!(s.on_first_write(sid(), Pump::FfmpegDc, gauges), None);
+            }
+        });
+        assert_eq!(asked.get(), 1, "off read the gauges");
+        assert!(out.is_empty(), "off wrote {out:?}");
+    }
+
+    /// The number a logged line gives `name`.
+    fn field(out: &str, name: &str) -> u64 {
+        let key = format!(" {name}=");
+        let at = out
+            .find(&key)
+            .unwrap_or_else(|| panic!("no {name} in {out:?}"))
+            + key.len();
+        let digits: String = out[at..].chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} in {out:?}"))
+    }
+
+    /// O10's cells, over 4a's shaped link: an association opened by `path` on
+    /// 8 Mbit/s at 80 ms with the viewer's default window (1 MiB), a control
+    /// message written and acknowledged first, as a session's other channels
+    /// open before its video, and then the pump's first media write. Returns
+    /// what the line said, the line, and the gauges taken after it.
+    async fn the_first_write_on(path: OpenPath) -> (Option<OpenedBy>, String, Gauges) {
+        use bytes::Bytes;
+        use webrtc::sctp::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+
+        let (a, b) =
+            shaped_link::shaped(8_000_000, Duration::from_millis(40), Duration::from_secs(1));
+        let (agent, viewer) =
+            shaped_link::pair_opened(Arc::new(a), Arc::new(b), 0, path, Arc::default()).await;
+        let control = agent
+            .open_stream(0, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        control
+            .write(&Bytes::from_static(b"control"))
+            .await
+            .unwrap();
+        let clock = agent.delivery_clock();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while clock.read().acked_bytes == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the control message was never acknowledged"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let video = agent
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .await
+            .unwrap();
+        let mut sampler = DeliverySampler::new(true);
+        let mut said = None;
+        let out = logged(|| {
+            said = sampler.on_first_write(sid(), Pump::FfmpegDc, || Some(agent.gauges()));
+        });
+        video
+            .write(&Bytes::from(vec![0x5a; 16 * 1024]))
+            .await
+            .unwrap();
+        let again = logged(|| {
+            let second = sampler.on_first_write(sid(), Pump::FfmpegDc, || Some(agent.gauges()));
+            assert_eq!(second, None);
+        });
+        assert!(again.is_empty(), "a second write wrote {again:?}");
+        let after = agent.gauges().take();
+        let _ = agent.close().await;
+        let _ = viewer.close().await;
+        (said, out, after)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_association_its_init_ack_opened_reads_init_ack_at_the_first_write() {
+        let (said, out, after) = the_first_write_on(OpenPath::InitAck).await;
+        println!("path I: {out}");
+        assert_eq!(said, Some(OpenedBy::InitAck), "{out:?}");
+        assert!(out.contains("open_path=init_ack"), "{out:?}");
+        assert_eq!(
+            field(&out, "ssthresh"),
+            1_048_576,
+            "the viewer's window: {out:?}"
+        );
+        assert_eq!(
+            field(&out, "fast_retransmits") + field(&out, "t3_expiries"),
+            0
+        );
+        // The line peeked: the control message's least delay is still there.
+        assert!(after.ack_delay_min.is_some(), "the line took it: {after:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_association_its_peers_cookie_echo_opened_reads_cookie_echo_at_the_first_write() {
+        let (said, out, after) = the_first_write_on(OpenPath::CookieEcho).await;
+        println!("path C: {out}");
+        assert_eq!(said, Some(OpenedBy::CookieEcho), "{out:?}");
+        assert!(out.contains("open_path=cookie_echo"), "{out:?}");
+        assert_eq!(field(&out, "ssthresh"), 0, "{out:?}");
+        // The control message's SACK set the peer's window: by the first media
+        // write, path C's 0 and 0 is the threshold's 0 alone.
+        assert!(field(&out, "rwnd") > 0, "{out:?}");
+        assert_eq!(
+            field(&out, "fast_retransmits") + field(&out, "t3_expiries"),
+            0
+        );
+        assert!(after.ack_delay_min.is_some(), "the line took it: {after:?}");
     }
 }
 
