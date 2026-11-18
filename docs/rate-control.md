@@ -1731,7 +1731,7 @@ and at 8 Mbit/s with 20 ms. At 2 Mbit/s and 80 ms and at 8 Mbit/s and 20 ms that
 floor at the link's rate, ended by the deadline and the budget. Everywhere else it reads
 a floor below the link, and the floor is the association's own ramp, not the path's: a
 session that opens on path C cannot send faster at first either. The ignored
-measurement `path_c_ramp_to_the_link_rate` (`agents/roomlerd/src/media_train.rs:1459`)
+measurement `path_c_ramp_to_the_link_rate` (`agents/roomlerd/src/media_train.rs:1461`)
 keeps 16 messages waiting and records when the last round trip, of 200 ms at least,
 first carried 80 % of the link's payload rate:
 
@@ -1803,8 +1803,8 @@ reading is a floor.
 
 | Named cell | Path I | Path C |
 |---|---|---|
-| A shallow buffer: 8 Mbit/s, 80 ms, a queue of 20 ms (`shallow`, `agents/roomlerd/src/media_train.rs:1299`) | RED: `loss` in every run, the low edge 0.26 to 0.46 | `deadline`, 0.35 (0.33 to 0.36): congestion avoidance never fills the queue, so nothing is lost |
-| The viewer's window of 64 KiB, at 50 Mbit/s and 80 ms (`peer_window`, `:1353`) | `budget`, 0.15 (0.14 to 0.16), a floor; the gauges showed the peer's window holding the sender at 149 to 220 steps | `deadline`, 0.07 (0.07 to 0.08), a floor; held by the window at 118 to 120 steps |
+| A shallow buffer: 8 Mbit/s, 80 ms, a queue of 20 ms (`shallow`, `agents/roomlerd/src/media_train.rs:1301`) | RED: `loss` in every run, the low edge 0.26 to 0.46 | `deadline`, 0.35 (0.33 to 0.36): congestion avoidance never fills the queue, so nothing is lost |
+| The viewer's window of 64 KiB, at 50 Mbit/s and 80 ms (`peer_window`, `:1355`) | `budget`, 0.15 (0.14 to 0.16), a floor; the gauges showed the peer's window holding the sender at 149 to 220 steps | `deadline`, 0.07 (0.07 to 0.08), a floor; held by the window at 118 to 120 steps |
 | A link with room: 50 Mbit/s at 250 ms (P-d) | `budget` | `deadline` |
 | The first frame ready at 0.3 s: 8 Mbit/s at 80 and 250 ms (P-g) | `ready`, a floor | `ready`, a floor |
 
@@ -1820,7 +1820,7 @@ the link's rate. The in-flight cap does not bind that early, and the queue comes
 the burst, not from what is in flight. Reading the link there would take a train that
 grows more gently than slow start's doubling, writing less than each SACK would
 release, and the rulings have the train let slow start set the pace. The cell keeps its
-assertions and is ignored with that reason (`agents/roomlerd/src/media_train.rs:1327`).
+assertions and is ignored with that reason (`agents/roomlerd/src/media_train.rs:1329`).
 
 **Under a busy runner's noise.** CI run 44383834538, on PR #4034, broke P-f in the
 quiet cell `path_i_0_4_mbps_250_ms` on both its runners, where every quiet local run had
@@ -1855,12 +1855,12 @@ A few milliseconds of noise moved the judgment one SACK later and spent them. Th
 budget (above) is the rule that holds however late the judgment comes, and the run of
 samples in a row lets a dip start the count again instead of sinking a round.
 
-The cells' noise (`runner_noise`, `agents/roomlerd/src/media_train.rs:1238`) is 2 ms of
+The cells' noise (`runner_noise`, `agents/roomlerd/src/media_train.rs:1239`) is 2 ms of
 jitter on every packet each way and on every step of the writer, and a stall of up to
-20 ms about every half second on each of the three. Four standing cells run under it on
-every build (`noisy!`, `:1247`, seeds 1 to 4): 0.4 and 2 Mbit/s at 250 ms on both paths,
+20 ms about every half second on each of the three. Four standing cells run under it
+(`noisy!`, `:1248`, seeds 1 to 4): 0.4 and 2 Mbit/s at 250 ms on both paths,
 where a judgment that comes late writes the most. The ignored measurement
-`grid_under_noise` (`:1274`) runs the 24 grid cells under five seeds each. In its two
+`grid_under_noise` (`:1276`) runs the 24 grid cells under five seeds each. In its two
 runs on these rules, P-f held in all 240 runs, at 44,400 bytes at most, and the four
 standing cells' links broke nothing under any seed. Three runs broke another property,
 each in a cell the write budget does not touch:
@@ -1918,11 +1918,28 @@ its timers. In five runs on a Windows box the cells took 75.7 to 76.4 s, 12.5 s 
 the four noise cells. On the rule before this one, the noise cell at 0.4 Mbit/s on path I
 broke P-f in one run of two, with 73,200 bytes written, and wrote 62,400 in the other.
 
+**What CI runs, and what is a measurement (FR-148 D44).** A cell runs the train in real
+time over the vendored SCTP, so a busy runner's scheduling moves what it reads. After the
+write budget, one of six runs of the whole lib suite on the dev box still broke P-e in
+the quiet grid cell at 8 Mbit/s and 80 ms, and three of 240 noisy runs broke P-a or P-e.
+Each break went through the rate estimate, whose limits stand as found (above). So
+`cargo test` runs only what timing cannot flip:
+- the seventeen machine tests, which drive the rules on readings made up by hand;
+- the nine named cells, which ended on a floor (`budget`, `deadline` or `ready`) and broke
+  nothing in eleven runs, six of them inside the loaded lib suite.
+
+The 24 grid cells and the four noise cells are ignored. They are run alone before a
+change to the train merges, and their numbers are recorded here:
+
+```
+cargo test -p roomlerd --lib media_train::cells -- --ignored --skip shallow_buffer_stops_on_loss --skip grid_under_noise --skip ramp
+```
+
 | Test | Shows |
 |---|---|
-| `cells::path_{i,c}_{0_4,2,8,50}_mbps_{20,80,250}_ms` | the 24 grid cells |
-| `cells::path_{i,c}_{0_4,2}_mbps_250_ms_under_noise` | the four noise cells: a busy runner's seeded noise on the slow links at 250 ms |
-| `cells::path_c_a_shallow_buffer_reads_a_floor_or_stops_on_loss`, `cells::path_{i,c}_a_peer_window_limit_is_a_floor`, `cells::path_{i,c}_a_link_with_room_ends_on_budget_or_deadline`, `cells::path_{i,c}_a_window_of_0_3_s_at_{80,250}_ms_reads_a_floor` | the named cells |
+| `cells::path_{i,c}_{0_4,2,8,50}_mbps_{20,80,250}_ms` | ignored, a measurement (D44): the 24 grid cells |
+| `cells::path_{i,c}_{0_4,2}_mbps_250_ms_under_noise` | ignored, a measurement (D44): the four noise cells, a busy runner's seeded noise on the slow links at 250 ms |
+| `cells::path_c_a_shallow_buffer_reads_a_floor_or_stops_on_loss`, `cells::path_{i,c}_a_peer_window_limit_is_a_floor`, `cells::path_{i,c}_a_link_with_room_ends_on_budget_or_deadline`, `cells::path_{i,c}_a_window_of_0_3_s_at_{80,250}_ms_reads_a_floor` | the named cells, run by `cargo test` |
 | `cells::path_i_a_shallow_buffer_stops_on_loss` | ignored: P-a's RED cell, run with `--ignored` |
 | `cells::grid_under_noise` | ignored: the 24 grid cells under five seeds of the noise, about four minutes, run with `--ignored --nocapture`; it fails when any run breaks a property, as three of 240 did (above) |
 | `cells::path_c_ramp_to_the_link_rate` | ignored: the ramp, about 40 s, run with `--ignored --nocapture` |

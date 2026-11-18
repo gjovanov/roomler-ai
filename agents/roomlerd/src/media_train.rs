@@ -1193,6 +1193,7 @@ mod cells {
     macro_rules! grid {
         ($($name:ident: $bps:expr, $rtt:expr, $path:expr;)*) => {$(
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): see docs/rate-control.md"]
             async fn $name() {
                 assert_cell(Cell::grid($bps, $rtt, $path), none).await;
             }
@@ -1247,6 +1248,7 @@ mod cells {
     macro_rules! noisy {
         ($($name:ident: $bps:expr, $path:expr, $seed:expr;)*) => {$(
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): see docs/rate-control.md"]
             async fn $name() {
                 let cell = Cell {
                     noise: Some(runner_noise($seed)),
@@ -1258,7 +1260,7 @@ mod cells {
     }
 
     // The slow links at 250 ms, where a judgment that comes late writes the
-    // most, under a busy runner's noise on every build.
+    // most, under a busy runner's noise. A measurement, like the grid (D44).
     noisy! {
         path_i_0_4_mbps_250_ms_under_noise: 400_000, OpenPath::InitAck, 1;
         path_c_0_4_mbps_250_ms_under_noise: 400_000, OpenPath::CookieEcho, 2;
