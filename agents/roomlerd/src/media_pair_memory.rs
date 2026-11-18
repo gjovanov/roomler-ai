@@ -768,6 +768,78 @@ mod tests {
         assert_eq!(idle.verdict(), (None, pm::Why::NothingMeasured));
     }
 
+    /// FR-148 P1 — a field fact of 0.4.225: a close wrote no push-back
+    /// (`push_back_bps=None`, `record_ended=false`) while the delivery sampler's
+    /// last line, written after it, read a backlogged sample of about
+    /// 255 kbit/s on a nearly still screen. A delivery sample taken at or after
+    /// the close can neither start nor extend a record:
+    ///
+    /// - a delivery sample feeds no memory: the sampler writes its own line and
+    ///   nothing else, and the FFmpeg pump drops the model's guard before the
+    ///   sampler (`peer.rs` declares `pair_memory` after `delivery`), so that
+    ///   line comes after the write;
+    /// - the close writes the closing of the last viewer window the pump took
+    ///   ([`PumpMemory::window`]), so a push-back after it reaches no write.
+    #[test]
+    fn a_delivery_sample_at_the_close_neither_starts_nor_extends_a_record() {
+        use crate::encode::pipe::Basis;
+        use crate::media_delivery::{Class, DeliverySampler};
+        use webrtc::sctp::association::delivery::Delivery;
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let now_unix = rate_memory::now_unix();
+        let carried = PairEntry {
+            floor: pm::Floor {
+                bps: 2_200_000,
+                basis: pm::FloorBasis::AppLimited,
+                at_unix: now_unix - 86_400,
+            },
+            push_back: Some(pm::PushBack {
+                bps: 255_000,
+                at_unix: now_unix - 600,
+                first_at_unix: now_unix - 610,
+                windows: 2,
+            }),
+        };
+        for entry in [None, Some(carried)] {
+            let mut g = ModelGuard::new(ObjectId::new(), turn_key());
+            g.entry = entry;
+            let mut mem = pm::SessionMemory::default();
+            mem.open(entry.as_ref(), now_unix, t0);
+            mem.delivered(300_000, Basis::AppLimited, at(5));
+            // The last viewer window, as the pump takes it.
+            g.take(mem.closing(at(30), now_unix), true);
+            let written = g.verdict();
+            // At the close: the sampler's last sample, backlogged at 255 kbit/s.
+            let mut sampler = DeliverySampler::new(true);
+            let reading = |acked: u64| Delivery {
+                acked_bytes: acked,
+                queue_fills: 1,
+                queue_empties: 0,
+            };
+            assert_eq!(sampler.on_reading(at(28), reading(0)), None);
+            let s = sampler
+                .on_reading(at(30), reading(63_750))
+                .expect("a sample");
+            assert_eq!((s.class, s.bps()), (Class::Backlogged, Some(255_000)));
+            drop(sampler);
+            assert_eq!(g.verdict(), written, "the sample reached no memory");
+            // After the last window, the session's memory takes a push-back
+            // that would start or extend the record ...
+            mem.pushed_back(255_000, Basis::Backlogged, at(31));
+            let late = mem.closing(at(31), now_unix).record.map(|r| r.windows);
+            assert_eq!(late, Some(if entry.is_some() { 3 } else { 1 }));
+            // ... and the close still writes the last window's.
+            assert_eq!(g.verdict(), written);
+            let record = |v: &(Option<PairEntry>, pm::Why)| v.0.or(entry).and_then(|e| e.push_back);
+            assert_eq!(
+                record(&g.verdict()).map(|r| r.windows),
+                entry.and_then(|e| e.push_back).map(|r| r.windows),
+                "{entry:?}"
+            );
+        }
+    }
+
     /// What `f` logs, as the daemon's log file writes it (time, level,
     /// message, fields; no target), as `media_delivery`'s cells read theirs.
     fn logged(f: impl FnOnce()) -> String {
