@@ -374,7 +374,7 @@ flowchart BT
   mapping are untouched by every phase. The lane's four build lines never change. What moves is
   *below* the package: sibling crates it depends on.
 - **Every `crate::X` path inside `roomlerd` keeps resolving.** An extracted module is re-exported at
-  its old place (`pub use roomler_node_tunnel as tunnel;` where `lib.rs:236` has `pub mod tunnel;`),
+  its old place (`pub use roomler_node_tunnel as tunnel;` where `lib.rs:298` has `pub mod tunnel;`),
   exactly as FR-21's P3e did for `roomler-node-core` (`agents/roomlerd/src/lib.rs:16-19`). The
   integration tests (`crates/tests`, 160 `roomlerd::` paths) and the wizard (`agents/roomler-setup`,
   which links the lib for `updater`, `enrollment`, `install_detect`) compile unchanged.
@@ -437,7 +437,7 @@ where a mistake costs little: 11 files, 8,195 lines, 31 doc anchors, 6 commits i
 | Today | After P1 |
 |---|---|
 | `agents/roomlerd/src/tunnel/{mod,acceptor,client_mgr,dialer,netwatch,peer,port_holder,quic_peer,quic_setup,reap,route_reconciler}.rs` (`tunnel/mod.rs:28-46`) | `crates/node-tunnel/src/{lib,…}.rs`, bodies byte-identical; `mod.rs` becomes `lib.rs` |
-| `lib.rs:236` `pub mod tunnel;` | `pub use roomler_node_tunnel as tunnel;` |
+| `lib.rs:298` `pub mod tunnel;` | `pub use roomler_node_tunnel as tunnel;` |
 | `tunnel/mod.rs:32` `pub use roomler_node_core::acl;` | the same line in the new `lib.rs`, so `crate::tunnel::acl::…` still resolves |
 | `tunnel/netwatch.rs:43`, `:57` call `crate::overlay::{primary_,}derp_tunnel_handle` | the registry moves into the crate: `DERP_TUNNEL_MUXES`, `register_derp_tunnel_mux`, `derp_tunnel_handle`, `primary_derp_tunnel_handle` (`overlay.rs:117-160`) become `roomler_node_tunnel::netwatch::*`; `overlay.rs` registers into it. `PRIMARY_TENANT_ID` stays in `overlay.rs` and is passed in |
 | `pub(crate) mod netwatch` and its `pub(crate)` functions, used by `signaling.rs` and `hive/supervisor/stream.rs` | `pub` |

@@ -54,7 +54,7 @@ be turned off only one host at a time, over exec, and only on hosts that answer 
 A decode error in the viewer's WebCodecs worker is posted to the page (`ui/src/workers/rc-webcodecs-worker.ts:170-182`),
 which tears the WebCodecs path down and falls back to `<video>` (`ui/src/composables/useRemoteControl.ts:7752-7765`).
 Nothing reaches the agent or the server. What does reach the server per session is `rc:session.stats`, whose
-`keyframe_requests` counts the viewer's keyframe asks (`agents/roomlerd/src/peer.rs:334-350`). FR-118's legs read
+`keyframe_requests` counts the viewer's keyframe asks (`agents/roomlerd/src/peer.rs:338-354`). FR-118's legs read
 decode errors in a viewer someone was watching, and a fleet week has no such viewer. So the first measure decision
 2 names cannot be read today.
 
@@ -154,7 +154,7 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 |---|---|---|
 | decode errors per session-hour | `rc:session.stats` (3b) | no rise (open decision 3) |
 | keyframe requests per session-hour | `rc:session.stats` | no rise |
-| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:10238-10252`) | `gpu` on every session of the cell; no `open_failed` that persists |
+| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:10124-10138`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 The capture + encode row reads moving and idle windows apart, with under 5 fps captured as idle. FR-118 measured its
