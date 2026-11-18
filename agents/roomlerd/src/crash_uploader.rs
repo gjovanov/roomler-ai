@@ -22,6 +22,13 @@
 //!   the machine's `crashes` once that ledger names it (#3799), so that one is
 //!   logged at INFO; one kept anywhere else stays, with a WARN.
 //!
+//! #4022 — each answered sidecar gets two lines, in this order. The drain's
+//! says what the server did: `uploaded`, or `server rejected payload` with the
+//! status and the body. Then `settle`'s, after it tried the delete, says what
+//! became of the file: `sidecar deleted`, or one of the lines above for a
+//! sidecar this process may not delete. Until #4022 the drain said `uploaded +
+//! deleted` (and `deleting` for a 4xx) before the delete was tried.
+//!
 //! ## Concurrency
 //!
 //! Single sequential POST per sidecar. A fleet of 100 hosts rebooting
@@ -107,9 +114,7 @@ pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::Toke
     let url = format!("{}/api/agent/crash", cfg.server_url.trim_end_matches('/'));
     let agent_token = token.get();
 
-    let mut ok_count = 0u32;
-    let mut keep_count = 0u32;
-    let mut drop_count = 0u32;
+    let mut tally = Tally::default();
     let mut first = true;
     for (sidecar, payload) in pending {
         // Inter-request delay to stay under the backend's 60-req/min
@@ -119,51 +124,73 @@ pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::Toke
             tokio::time::sleep(INTER_REQUEST_DELAY).await;
         }
         first = false;
-        match upload_one(&client, &url, &agent_token, &payload).await {
-            UploadOutcome::Accepted => {
-                tracing::info!(file = %sidecar.path().display(), "crash_uploader: uploaded + deleted");
-                settle(
-                    &sidecar,
-                    ledger.as_deref(),
-                    swept.as_deref(),
-                    "uploaded",
-                    crash_recorder::Sidecar::remove,
-                );
-                ok_count += 1;
-            }
-            UploadOutcome::Rejected { status, body } => {
-                tracing::warn!(
-                    file = %sidecar.path().display(),
-                    status = %status,
-                    body = %body,
-                    "crash_uploader: server rejected payload; deleting (4xx is permanent)"
-                );
-                settle(
-                    &sidecar,
-                    ledger.as_deref(),
-                    swept.as_deref(),
-                    "rejected (4xx)",
-                    crash_recorder::Sidecar::remove,
-                );
-                drop_count += 1;
-            }
-            UploadOutcome::Transient { reason } => {
-                tracing::warn!(
-                    file = %sidecar.path().display(),
-                    reason = %reason,
-                    "crash_uploader: transient failure; keeping sidecar for next startup"
-                );
-                keep_count += 1;
-            }
-        }
+        let outcome = upload_one(&client, &url, &agent_token, &payload).await;
+        answered(
+            &sidecar,
+            outcome,
+            ledger.as_deref(),
+            swept.as_deref(),
+            crash_recorder::Sidecar::remove,
+            &mut tally,
+        );
     }
 
     tracing::info!(
-        uploaded = ok_count,
-        kept = keep_count,
-        dropped = drop_count,
+        uploaded = tally.uploaded,
+        kept = tally.kept,
+        dropped = tally.dropped,
         "crash_uploader: drain complete"
     );
+}
+
+/// What one drain did with the sidecars it sent, for its last line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    uploaded: u32,
+    kept: u32,
+    dropped: u32,
+}
+
+/// #4022 — one sidecar the server answered. The drain's own line says what the
+/// server did. A final verdict (2xx or 4xx) then settles the file ([`settle`]),
+/// which says what became of it, once, after it tried: where this process may
+/// not delete it (a person's drain in the machine's `crashes`, #3799), nothing
+/// says it was deleted. `remove` is [`crash_recorder::Sidecar::remove`]
+/// outside the tests.
+fn answered(
+    sidecar: &crash_recorder::Sidecar,
+    outcome: UploadOutcome,
+    ledger: Option<&Path>,
+    swept: Option<&Path>,
+    remove: impl FnOnce(&crash_recorder::Sidecar) -> std::io::Result<()>,
+    tally: &mut Tally,
+) {
+    let file = sidecar.path().display();
+    match outcome {
+        UploadOutcome::Accepted => {
+            tracing::info!(file = %file, "crash_uploader: uploaded");
+            settle(sidecar, ledger, swept, "uploaded", remove);
+            tally.uploaded += 1;
+        }
+        UploadOutcome::Rejected { status, body } => {
+            tracing::warn!(
+                file = %file,
+                status = %status,
+                body = %body,
+                "crash_uploader: server rejected payload (4xx is permanent)"
+            );
+            settle(sidecar, ledger, swept, "rejected (4xx)", remove);
+            tally.dropped += 1;
+        }
+        UploadOutcome::Transient { reason } => {
+            tracing::warn!(
+                file = %file,
+                reason = %reason,
+                "crash_uploader: transient failure; keeping sidecar for next startup"
+            );
+            tally.kept += 1;
+        }
+    }
 }
 
 /// Build the reqwest client with the same posture as
@@ -340,6 +367,8 @@ fn without_settled<T>(
 /// folder, by handle through the folder it was read from (FR-145). `swept` is
 /// [`swept_dir`]: a recorded sidecar there is the service's to remove, so
 /// nothing is wrong and the line is INFO; one anywhere else stays, a WARN.
+/// #4022 — the one line that says what became of the file, said after the
+/// delete was tried: deleted, gone already, or kept with its verdict recorded.
 fn settle(
     sidecar: &crash_recorder::Sidecar,
     ledger: Option<&Path>,
@@ -349,8 +378,18 @@ fn settle(
 ) {
     let path = sidecar.path();
     let err = match remove(sidecar) {
-        Ok(()) => return,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Ok(()) => {
+            tracing::info!(file = %path.display(), "crash_uploader: {verdict}; sidecar deleted");
+            return;
+        }
+        // Another drainer, or the service's sweep, took it since the scan.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                file = %path.display(),
+                "crash_uploader: {verdict}; the sidecar was gone already"
+            );
+            return;
+        }
         Err(e) => e,
     };
     match ledger {
@@ -560,6 +599,133 @@ mod tests {
             &load_settled(ledger),
         );
         assert!(left.is_empty(), "both are recorded: {left:?}");
+    }
+
+    /// The two answers that settle a sidecar: accepted, and rejected for good.
+    fn final_answers() -> [(UploadOutcome, &'static str); 2] {
+        [
+            (UploadOutcome::Accepted, "crash_uploader: uploaded "),
+            (
+                UploadOutcome::Rejected {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    body: "log_tail too big".into(),
+                },
+                "crash_uploader: server rejected payload (4xx is permanent) ",
+            ),
+        ]
+    }
+
+    /// #4022 — the field bug: a person's drain logged `uploaded + deleted` for
+    /// a record in the machine's `crashes`, then, 0.6 ms later, that it may not
+    /// delete it. An accepted or rejected sidecar this process may not delete
+    /// is never said deleted: the server's line comes first, then `settle`'s
+    /// words for a sidecar it may not delete, in the service's folder or
+    /// anywhere else, and nothing more.
+    #[test]
+    fn a_sidecar_this_process_may_not_delete_is_never_said_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let swept = dir.path().join("crashes");
+        std::fs::create_dir(&swept).unwrap();
+        let ledger = dir.path();
+        let folders = [
+            (
+                swept.clone(),
+                "The service removes it once this ledger names it",
+            ),
+            (
+                dir.path().to_path_buf(),
+                "Remove it as the account that owns it",
+            ),
+        ];
+        let mut tally = Tally::default();
+        for (f, (folder, settled)) in folders.into_iter().enumerate() {
+            for (o, (outcome, server)) in final_answers().into_iter().enumerate() {
+                let path = folder.join(format!("{f}{o}-1.json"));
+                std::fs::write(&path, b"{}").unwrap();
+                let log = logged(|| {
+                    answered(
+                        &plain(&path),
+                        outcome,
+                        Some(ledger),
+                        Some(swept.as_path()),
+                        denied,
+                        &mut tally,
+                    )
+                });
+                assert!(
+                    !log.contains("deleted") && !log.contains("deleting"),
+                    "{log}"
+                );
+                let lines: Vec<&str> = log.lines().collect();
+                assert_eq!(lines.len(), 2, "the server's line, then settle's: {log}");
+                assert!(lines[0].contains(server), "{log}");
+                assert!(lines[1].contains(settled), "{log}");
+                assert!(path.exists(), "the test's remove refused, so it stays");
+            }
+        }
+        let expected = Tally {
+            uploaded: 2,
+            kept: 0,
+            dropped: 2,
+        };
+        assert_eq!(tally, expected);
+    }
+
+    /// #4022 — the control: a sidecar this process deletes is said deleted
+    /// once, by `settle`, after the server's line, and the file is gone. A
+    /// transient answer deletes nothing and keeps the sidecar for the next
+    /// drain.
+    #[test]
+    fn a_sidecar_is_said_deleted_once_after_the_servers_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tally = Tally::default();
+        for (n, (outcome, server)) in final_answers().into_iter().enumerate() {
+            let path = dir.path().join(format!("{n}-1.json"));
+            std::fs::write(&path, b"{}").unwrap();
+            let log = logged(|| {
+                answered(
+                    &plain(&path),
+                    outcome,
+                    Some(dir.path()),
+                    None,
+                    crash_recorder::Sidecar::remove,
+                    &mut tally,
+                )
+            });
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 2, "{log}");
+            assert!(lines[0].contains(server), "{log}");
+            assert!(lines[1].contains("; sidecar deleted"), "{log}");
+            assert_eq!(log.matches("deleted").count(), 1, "said once: {log}");
+            assert!(!path.exists());
+        }
+
+        let path = dir.path().join("9-1.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let log = logged(|| {
+            answered(
+                &plain(&path),
+                UploadOutcome::Transient {
+                    reason: "HTTP 503".into(),
+                },
+                Some(dir.path()),
+                None,
+                |_| panic!("a transient answer deletes nothing"),
+                &mut tally,
+            )
+        });
+        assert!(log.contains("keeping sidecar"), "{log}");
+        assert!(path.exists());
+        let expected = Tally {
+            uploaded: 1,
+            kept: 1,
+            dropped: 1,
+        };
+        assert_eq!(tally, expected);
+        assert!(
+            !dir.path().join(crash_recorder::VERDICTS_FILE).exists(),
+            "nothing to record for a deleted sidecar"
+        );
     }
 
     /// #3799 — the folder the uploader calls the service's is the one the
