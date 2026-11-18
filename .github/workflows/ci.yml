@@ -1651,11 +1651,11 @@ jobs:
       # #3858: and `companion::tray_start_tests::`: with the process list, the
       # console's owner, the account database or launchd held up, the tray's
       # start for a prompt fails within 2.5 s naming the step, off the async
-      # worker, one start in flight; in time, it runs launchctl as today.
+      # worker, one start in flight; in time, it runs launchctl as today. #4011: and `consent_relay::` (the kept root list) with `person_socket::machine_reply_tests::` (on a real socket path, gone against no answer).
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests::
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only

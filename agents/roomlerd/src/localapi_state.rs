@@ -175,8 +175,8 @@ pub struct DaemonState {
     no_enrollment: bool,
     /// #3864 — where such a worker asks the root half for the consent
     /// questions the root half asks, and sends their answers: the root
-    /// daemon's person socket ([`crate::consent_relay::PersonSocket`]).
-    root_half: Arc<dyn crate::consent_relay::RootHalf>,
+    /// daemon's person socket, with #4011's kept list ([`crate::consent_relay::Relay`]).
+    root_half: crate::consent_relay::Relay,
     /// #3967 — this process runs as a person on a Mac: a per-user half,
     /// beside a root half when the Mac has two rows (or a one-row Mac's
     /// worker, with [`Self::no_enrollment`]). It lists the root half's
@@ -597,7 +597,7 @@ impl DaemonState {
             self_view: None,
             ephemeral: false,
             no_enrollment: false,
-            root_half: Arc::new(crate::consent_relay::PersonSocket),
+            root_half: crate::consent_relay::Relay::to_the_root_half(),
             macs_per_user_half: on_a_mac && !privileged,
             announcements: (on_a_mac && privileged).then(crate::consent_relay::announcements),
             #[cfg(feature = "recording")]
@@ -680,7 +680,7 @@ impl DaemonState {
     /// socket ([`Self::root_half`], the field).
     #[cfg(test)]
     pub(crate) fn with_root_half(mut self, root: Arc<dyn crate::consent_relay::RootHalf>) -> Self {
-        self.root_half = root;
+        self.root_half = crate::consent_relay::Relay::new(root);
         self
     }
 
@@ -2222,7 +2222,7 @@ impl LocalApiState for DaemonState {
     /// #3864 — on a one-row Mac's worker, the questions its person's app
     /// lists are this process's own and the root half's: the root daemon asks
     /// that Mac's questions on its own broker, and the app reaches this
-    /// worker's socket ([`crate::consent_relay::listed`], over the root
+    /// worker's socket ([`crate::consent_relay::Relay::listed`], over the root
     /// half's person socket). #3967 — on a two-row Mac's per-user half too,
     /// whose root half asks its own row's questions
     /// ([`Self::relays_the_root_half`]). Everywhere else, this daemon's own.
@@ -2231,7 +2231,7 @@ impl LocalApiState for DaemonState {
         if !self.relays_the_root_half() {
             return own;
         }
-        crate::consent_relay::listed(own, self.root_half.as_ref()).await
+        self.root_half.listed(own).await
     }
 
     /// #3864 — and an answer to a question its own broker is not asking goes
@@ -2247,7 +2247,7 @@ impl LocalApiState for DaemonState {
                 ok: self.consent_decide(session_id, allow),
             };
         }
-        crate::consent_relay::decided(self.root_half.as_ref(), session_id, allow).await
+        self.root_half.decided(session_id, allow).await
     }
 
     /// #3967 — a two-row Mac's root half takes its console person's
@@ -2908,7 +2908,10 @@ mod tests {
 
     #[async_trait]
     impl crate::consent_relay::RootHalf for ServedRootHalf {
-        async fn ask(&self, req: &tunnel_core::localapi::Request) -> Option<Response> {
+        async fn ask(
+            &self,
+            req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
             let person = self.root.person;
             let peer = tunnel_core::localapi::ClientPeer {
                 uid: Some(person),
@@ -2916,7 +2919,12 @@ mod tests {
                 ..tunnel_core::localapi::ClientPeer::UNKNOWN
             };
             let scope = tunnel_core::localapi::Scope::Person { owner_uid: person };
-            round_trip(self.root.clone(), peer, scope, req).await
+            match round_trip(self.root.clone(), peer, scope, req).await {
+                Some(answer) => crate::consent_relay::RootReply::Answer(Box::new(answer)),
+                None => crate::consent_relay::RootReply::NoAnswer(
+                    "the connection ended with no answer".into(),
+                ),
+            }
         }
     }
 
@@ -3120,9 +3128,12 @@ mod tests {
 
     #[async_trait]
     impl crate::consent_relay::RootHalf for PersonSocketFor {
-        async fn ask(&self, req: &tunnel_core::localapi::Request) -> Option<Response> {
+        async fn ask(
+            &self,
+            req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
             if self.uid != self.root.person {
-                return None;
+                return crate::consent_relay::RootReply::Gone;
             }
             let served = ServedRootHalf {
                 root: self.root.clone(),
@@ -3476,9 +3487,12 @@ mod tests {
 
     #[async_trait]
     impl crate::consent_relay::RootHalf for StalledRootHalf {
-        async fn ask(&self, _req: &tunnel_core::localapi::Request) -> Option<Response> {
+        async fn ask(
+            &self,
+            _req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
             if self.gone {
-                return None;
+                return crate::consent_relay::RootReply::Gone;
             }
             std::future::pending().await
         }
@@ -3565,6 +3579,121 @@ mod tests {
                 waited <= DECIDE_WITHIN + Duration::from_millis(50),
                 "gone: {gone}: the answer waited {waited:?}"
             );
+        }
+    }
+
+    /// #4011 — the root half's road, stood in so that it can miss a list or
+    /// be gone: while `misses`, a list asked of it never answers (a root half
+    /// slow for that poll); while `gone`, no socket is at its path. Otherwise
+    /// it is the root half's person socket, as [`ServedRootHalf`] asks it.
+    struct Unsteady {
+        root: Arc<SeatedRoot>,
+        misses: AtomicBool,
+        gone: AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::consent_relay::RootHalf for Unsteady {
+        async fn ask(
+            &self,
+            req: &tunnel_core::localapi::Request,
+        ) -> crate::consent_relay::RootReply {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.gone.load(SeqCst) {
+                return crate::consent_relay::RootReply::Gone;
+            }
+            if self.misses.load(SeqCst)
+                && matches!(req, tunnel_core::localapi::Request::ConsentPending)
+            {
+                return std::future::pending().await;
+            }
+            let served = ServedRootHalf {
+                root: self.root.clone(),
+            };
+            crate::consent_relay::RootHalf::ask(&served, req).await
+        }
+    }
+
+    /// #4011 — on a one-row Mac's worker and on a two-row Mac's per-user
+    /// half, a root half that misses one list between two answers leaves its
+    /// question on the list the app reads, after the process's own, at every
+    /// step. So the companion's prompt for it neither comes down for that
+    /// poll nor comes back placed anew, with its click hold armed again. The
+    /// miss costs the relay's own bound, no more. A root half that is gone
+    /// takes its question off at once.
+    ///
+    /// Red before #4011: the missed list held the process's own question
+    /// alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_misses_one_list_leaves_its_question_on_the_apps_list() {
+        use crate::consent_relay::RELAY_WITHIN;
+        use std::sync::atomic::Ordering::SeqCst;
+        let window = Duration::from_secs(30);
+        let dirs = tempfile::tempdir().unwrap();
+        let mode = crate::consent::Mode::Prompt { timeout: window };
+        let root_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("root")).unwrap();
+        let own_broker =
+            crate::consent::ConsentBroker::new(mode, dirs.path().join("person")).unwrap();
+        let root = Arc::new(SeatedRoot {
+            root: half(root_broker.clone()),
+            person: 501,
+        });
+        let own = "401100000000000000000a01";
+        let theirs = "401100000000000000000a02";
+        let _own_asking = ask_on(&own_broker, own, window);
+        let _root_asking = ask_kind_on(
+            &root_broker,
+            theirs,
+            window,
+            crate::consent::PromptKind::Exec,
+        );
+        for one_row in [true, false] {
+            let road = Arc::new(Unsteady {
+                root: root.clone(),
+                misses: AtomicBool::new(false),
+                gone: AtomicBool::new(false),
+            });
+            let process = if one_row {
+                half(own_broker.clone()).with_no_enrollment(true)
+            } else {
+                half(own_broker.clone()).with_macs_per_user_half(true)
+            };
+            let process = Arc::new(process.with_root_half(road.clone()));
+            let shape = if one_row { "one row" } else { "two rows" };
+
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own, theirs],
+                "{shape}: an answer"
+            );
+            road.misses.store(true, SeqCst);
+            let asked = tokio::time::Instant::now();
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own, theirs],
+                "{shape}: a missed list"
+            );
+            let waited = asked.elapsed();
+            assert!(
+                waited <= RELAY_WITHIN + Duration::from_millis(50),
+                "{shape}: the missed list waited {waited:?}"
+            );
+            road.misses.store(false, SeqCst);
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own, theirs],
+                "{shape}: an answer again"
+            );
+
+            road.gone.store(true, SeqCst);
+            let asked = tokio::time::Instant::now();
+            assert_eq!(
+                listed_to_the_app(&process).await,
+                [own],
+                "{shape}: the root half is gone"
+            );
+            assert_eq!(asked.elapsed(), Duration::ZERO, "{shape}: at once");
         }
     }
 
