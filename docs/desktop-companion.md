@@ -3210,7 +3210,7 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not. A root daemon starts it on three roads, and all three build the same unit
 (`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:4416`): the tray's start for a
-prompt (`start_tray`, `:2299`, §10.2), FR-117's restart after an update
+prompt (`start_tray`, `companion.rs:2299`, §10.2), FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
 first run (`agents/roomlerd/src/companion/launch_once.rs:585`), the last two through
 `systemd_run_command` (`agents/roomlerd/src/companion.rs:4239`). For a root daemon that is a
@@ -3258,7 +3258,7 @@ install, at 1280 × 800:
 Since #3973, when logind gives the session no `Display`, a root daemon takes the session's own from
 the person's user manager. That is the environment it already reads for the allowlist. It passes
 the value on as `--setenv=DISPLAY=…` (`systemd_run_command_with`, `companion.rs:4442`;
-`session_display`, `:4326`):
+`session_display`, `companion.rs:4326`):
 
 ```mermaid
 flowchart TD
@@ -3272,10 +3272,10 @@ flowchart TD
 ```
 
 - **logind's value wins** when it has one, and `DISPLAY` is set once.
-- **Only the `DISPLAY` key**, by the allowlist's own value checks (`plain_value`, `:4312`): never
-  `GNOME_SETUP_DISPLAY`, the second display GNOME sets (`:1` beside `DISPLAY=:0` in the real GNOME
-  session's environment the tests below read), and never an empty, shell-escaped or
-  control-character value. `SESSION_ENV_KEYS` is unchanged.
+- **Only the `DISPLAY` key**, by the allowlist's own value checks (`plain_value`,
+  `companion.rs:4312`). Never `GNOME_SETUP_DISPLAY`, the second display GNOME sets
+  (`:1` beside `DISPLAY=:0` in the real GNOME session's environment the tests below read), and
+  never an empty, shell-escaped or control-character value. `SESSION_ENV_KEYS` is unchanged.
 - **Only a root daemon's roads change**, all three of them: the start for a prompt, the restart
   after an update and the first run. A per-user daemon's `systemd-run --user` unit inherits its
   manager's environment, `DISPLAY` included. It reads nothing and its argv is as before.
