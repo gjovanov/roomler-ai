@@ -21,7 +21,7 @@
 //!
 //! | Half | What it does |
 //! |---|---|
-//! | the worker (`run --supervised --unenrolled`) | lists its own questions, then the root half's, asked over the root's person socket ([`listed`]); sends an answer to a question its own broker is not asking there ([`decided`]); says [`RELAY_CONSENT`] in its caps frame |
+//! | the worker (`run --supervised --unenrolled`) | lists its own questions, then the root half's, asked over the root's person socket ([`Relay::listed`]); #4011 — keeps the root half's last list through a list the root half misses, [`ROOT_LIST_KEPT_FOR`] from its answer at most, and takes those questions off at once when the root half refuses or proves gone; sends an answer to a question its own broker is not asking there ([`decided`]); says [`RELAY_CONSENT`] in its caps frame |
 //! | the root daemon | counts the app as a question's surface only while that road is open ([`reach`]): an attached worker that said [`RELAY_CONSENT`], and the person socket of that worker's account answering within [`RELAY_WITHIN`] |
 //! | #3967 — a two-row Mac's per-user half (a Mac daemon that runs as a person and holds an enrollment) | lists and decides as the worker does; says `consent_relaying` over the root half's person socket for its person and holds that connection (`keep_telling`) |
 //! | #3967 — a two-row Mac's root half | takes that announcement from the socket's own person, for as long as its connection stays open ([`Announcements`]), and counts the app only while one is live and that person's socket answers within [`RELAY_WITHIN`] ([`reach_two_rows`]) |
@@ -64,60 +64,258 @@ pub const NO_ANSWER_FROM_THE_ROOT: &str = "The answer was not taken: this Mac's 
                                            which asked the question, did not answer in time. \
                                            Try again.";
 
-/// Where a one-row Mac's worker asks the root half: a request, and its
-/// answer, or none.
+/// Where a one-row Mac's worker asks the root half: a request, and what came
+/// of it ([`RootReply`]).
 #[async_trait::async_trait]
 pub trait RootHalf: Send + Sync {
-    async fn ask(&self, req: &Request) -> Option<Response>;
+    async fn ask(&self, req: &Request) -> RootReply;
 }
 
-/// The root half as the daemon asks it: the root daemon's person socket for
-/// this process's account, kept only when root serves it
-/// (`person_socket::machine_answer`). There is none off macOS.
-pub struct PersonSocket;
+/// #4011 — what an ask of the root half came to. A relaying process keeps
+/// the root half's last list through no answer, and through nothing else
+/// ([`Relay`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RootReply {
+    /// The root half answered, in its own words: a list, a verdict, or a
+    /// refusal (an `Error`, as after a seat change).
+    Answer(Box<Response>),
+    /// Proof that the root half is gone: no socket at its person socket's
+    /// path for this account, or nothing listening on one that is there
+    /// (`NotFound`, `ConnectionRefused`), as #3998's
+    /// `localapi::own_endpoint_gone` reads an endpoint.
+    Gone,
+    /// No answer, and why: none within the ask's bound, or a connect or a
+    /// request that failed any other way.
+    NoAnswer(String),
+}
 
-#[async_trait::async_trait]
-impl RootHalf for PersonSocket {
-    async fn ask(&self, req: &Request) -> Option<Response> {
-        #[cfg(target_os = "macos")]
-        {
-            // SAFETY: geteuid never fails.
-            let euid = unsafe { libc::geteuid() };
-            // Each caller bounds its own ask ([`listed`], [`decided`]).
-            crate::person_socket::machine_answer(euid, req, DECIDE_WITHIN).await
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = req;
-            None
+impl RootReply {
+    /// What a connect to the root half's person socket that failed proves:
+    /// gone when nothing is there to connect to, no answer for any other
+    /// failure (a socket that someone other than root serves, among them).
+    pub fn not_connected(e: &std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => Self::Gone,
+            _ => Self::NoAnswer(format!("the connect failed: {e}")),
         }
     }
 }
 
+/// The root half as the daemon asks it: the root daemon's person socket for
+/// this process's account, kept only when root serves it
+/// (`person_socket::machine_reply`). There is none off macOS.
+pub struct PersonSocket;
+
+#[async_trait::async_trait]
+impl RootHalf for PersonSocket {
+    async fn ask(&self, req: &Request) -> RootReply {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: geteuid never fails.
+            let euid = unsafe { libc::geteuid() };
+            // Each caller bounds its own ask ([`Relay::listed`], [`decided`]).
+            crate::person_socket::machine_reply(euid, req, DECIDE_WITHIN).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = req;
+            RootReply::Gone
+        }
+    }
+}
+
+/// #4011 — how long a relaying process keeps the root half's last list
+/// through lists the root half misses, from that list's answer: the bound
+/// the companion's prompt keeps its questions for through its own reads that
+/// fail (`QUESTIONS_KEPT_FOR`, `agents/roomler-desktop/src/main.rs`), so a
+/// question nobody can decide lingers no longer here than there.
+pub const ROOT_LIST_KEPT_FOR: Duration = Duration::from_secs(10);
+
 /// The questions the person's app lists on a one-row Mac: the worker's own
 /// first, then each of the root half's whose id is not there already. Ids are
 /// ObjectIds, a server's session or request id or one the asking daemon
-/// minted, so two brokers never hold the same one. Anything but a list from
-/// the root half (no answer, a refusal) leaves the worker's own.
-pub fn merged(mut own: Vec<ConsentRequest>, root: Option<Response>) -> Vec<ConsentRequest> {
-    if let Some(Response::ConsentPending(theirs)) = root {
-        for question in theirs {
-            if !own.iter().any(|q| q.session_id == question.session_id) {
-                own.push(question);
-            }
+/// minted, so two brokers never hold the same one.
+pub fn merged(mut own: Vec<ConsentRequest>, theirs: Vec<ConsentRequest>) -> Vec<ConsentRequest> {
+    for question in theirs {
+        if !own.iter().any(|q| q.session_id == question.session_id) {
+            own.push(question);
         }
     }
     own
 }
 
-/// [`merged`], with the root half asked for [`RELAY_WITHIN`] at most: a root
-/// half that is slow or gone leaves the worker's own list, in time.
-pub async fn listed(own: Vec<ConsentRequest>, root: &dyn RootHalf) -> Vec<ConsentRequest> {
-    let theirs = tokio::time::timeout(RELAY_WITHIN, root.ask(&Request::ConsentPending))
-        .await
-        .ok()
-        .flatten();
-    merged(own, theirs)
+/// #3864 — where a relaying process (a one-row Mac's worker, a two-row Mac's
+/// per-user half) asks the root half; #4011 — and the root half's last good
+/// list, which a list the root half misses leaves where it was. Until #4011 a
+/// missed list was the process's own list alone, which the app took as a good
+/// answer: its prompt went down for a poll and came back placed anew, with
+/// its click hold armed again, and the app's own hold on a failed read
+/// (#3998) could not see it.
+///
+/// | What came of the ask ([`RootReply`]) | The root half's questions on the list |
+/// |---|---|
+/// | an answer: a list, empty or not | that list, which is kept in place of the last |
+/// | a refusal: any other answer | none, at once |
+/// | gone: no socket, or nothing listening on it | none, at once |
+/// | no answer: none within [`RELAY_WITHIN`], or any other failure | the kept list, for [`ROOT_LIST_KEPT_FOR`] from its answer at most, less each question whose deadline (`expires_at_ms`) has passed |
+///
+/// The process's own questions are its broker's of the moment, never kept. A
+/// run of missed lists that the kept list covers is logged once, at WARN, and
+/// the end of its hold once, at INFO; so is a refusal or a proof of gone that
+/// takes kept questions off. The app's polls are never logged.
+pub struct Relay {
+    root: std::sync::Arc<dyn RootHalf>,
+    kept: std::sync::Mutex<Kept>,
+}
+
+/// The root half's last good list, as a [`Relay`] keeps it.
+#[derive(Debug, Default)]
+struct Kept {
+    /// The root half's questions in its last answer, and when that came.
+    /// `None` before the first answer, and once a refusal, a proof that it is
+    /// gone, or the end of the hold took them off.
+    last: Option<(Vec<ConsentRequest>, tokio::time::Instant)>,
+    /// Whether the run of missed lists since that answer has said so.
+    said: bool,
+}
+
+impl Relay {
+    /// A relay that asks `root`.
+    pub fn new(root: std::sync::Arc<dyn RootHalf>) -> Self {
+        Self {
+            root,
+            kept: Default::default(),
+        }
+    }
+
+    /// The daemon's own: over the root daemon's person socket
+    /// ([`PersonSocket`]).
+    pub fn to_the_root_half() -> Self {
+        Self::new(std::sync::Arc::new(PersonSocket))
+    }
+
+    /// [`merged`]: `own`, then the root half's questions, asked for
+    /// [`RELAY_WITHIN`] at most, as what came of the ask leaves them
+    /// ([`Relay`]'s table).
+    pub async fn listed(&self, own: Vec<ConsentRequest>) -> Vec<ConsentRequest> {
+        let reply = tokio::time::timeout(RELAY_WITHIN, self.root.ask(&Request::ConsentPending))
+            .await
+            .unwrap_or_else(|_| RootReply::NoAnswer(format!("none within {RELAY_WITHIN:?}")));
+        let theirs = self.theirs_after(reply, tokio::time::Instant::now(), wall_clock_ms());
+        merged(own, theirs)
+    }
+
+    /// [`decided`], on this relay's road.
+    pub async fn decided(&self, session_id: &str, allow: bool) -> Response {
+        decided(self.root.as_ref(), session_id, allow).await
+    }
+
+    /// The root half's questions on the list after `reply`, at `now`;
+    /// `now_ms` is the wall clock a question's deadline is read on.
+    fn theirs_after(
+        &self,
+        reply: RootReply,
+        now: tokio::time::Instant,
+        now_ms: u64,
+    ) -> Vec<ConsentRequest> {
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reply {
+            RootReply::Answer(answer) => match *answer {
+                Response::ConsentPending(theirs) => {
+                    kept.last = Some((theirs.clone(), now));
+                    kept.said = false;
+                    theirs
+                }
+                other => {
+                    let answer = match other {
+                        Response::Error { message } => message,
+                        _ => "an answer that is not a list".into(),
+                    };
+                    kept.off(&format!("the root half refused the list ({answer})"));
+                    Vec::new()
+                }
+            },
+            RootReply::Gone => {
+                kept.off(
+                    "the root half is gone (no person socket for this account, or nothing \
+                     listening on it)",
+                );
+                Vec::new()
+            }
+            RootReply::NoAnswer(why) => kept.through_a_miss(&why, now, now_ms),
+        }
+    }
+}
+
+impl Kept {
+    /// A refusal or a proof of gone, `why`: the root half's questions come
+    /// off at once, said once when there were any.
+    fn off(&mut self, why: &str) {
+        if let Some((questions, _)) = self.last.take()
+            && !questions.is_empty()
+        {
+            tracing::info!(
+                questions = questions.len(),
+                "consent relay: {why}; its questions come off the person's list at once (#4011)"
+            );
+        }
+        self.said = false;
+    }
+
+    /// No answer, `why`: the kept list while its answer is less than
+    /// [`ROOT_LIST_KEPT_FOR`] old, less each question whose deadline has
+    /// passed; none after that.
+    fn through_a_miss(
+        &mut self,
+        why: &str,
+        now: tokio::time::Instant,
+        now_ms: u64,
+    ) -> Vec<ConsentRequest> {
+        let Some((questions, answered)) = self.last.as_mut() else {
+            return Vec::new();
+        };
+        // A deadline that has passed is a question over. `0` is one not known
+        // (a daemon older than FR-27), which only the hold bounds.
+        questions.retain(|q| q.expires_at_ms == 0 || q.expires_at_ms > now_ms);
+        if questions.is_empty() {
+            return Vec::new();
+        }
+        let since = now.saturating_duration_since(*answered);
+        if since >= ROOT_LIST_KEPT_FOR {
+            tracing::info!(
+                questions = questions.len(),
+                since_its_answer = ?since,
+                "consent relay: the root half has not answered a list for {ROOT_LIST_KEPT_FOR:?}; \
+                 its questions come off the person's list (#4011)"
+            );
+            self.last = None;
+            self.said = false;
+            return Vec::new();
+        }
+        if !self.said {
+            tracing::warn!(
+                questions = questions.len(),
+                %why,
+                "consent relay: the root half did not answer the list; its last one stays on the \
+                 person's list, for {ROOT_LIST_KEPT_FOR:?} from its answer at most (#4011)"
+            );
+            self.said = true;
+        }
+        questions.clone()
+    }
+}
+
+/// The wall clock in Unix milliseconds, which a question's deadline
+/// (`expires_at_ms`) is written on: the root half writes it on the same
+/// host's clock.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The answer to a question the worker's own broker is not asking: the root
@@ -129,16 +327,19 @@ pub async fn decided(root: &dyn RootHalf, session_id: &str, allow: bool) -> Resp
         session_id: session_id.to_string(),
         allow,
     };
-    match tokio::time::timeout(DECIDE_WITHIN, root.ask(&req))
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(answer @ (Response::ConsentDecided { .. } | Response::Error { .. })) => answer,
+    match tokio::time::timeout(DECIDE_WITHIN, root.ask(&req)).await {
+        Ok(RootReply::Answer(answer))
+            if matches!(
+                *answer,
+                Response::ConsentDecided { .. } | Response::Error { .. }
+            ) =>
+        {
+            *answer
+        }
         other => {
             tracing::warn!(
                 session = %session_id,
-                answered = other.is_some(),
+                answered = matches!(other, Ok(RootReply::Answer(_))),
                 "consent: the root half did not take the answer to its question (#3864)"
             );
             Response::Error {
@@ -624,7 +825,7 @@ pub async fn tell_the_root_half(shutdown: tokio::sync::watch::Receiver<bool>) {
 }
 
 /// #3967 — the root half's person socket for this account, kept only when
-/// root serves it, as the relay asks it (`person_socket::machine_answer`).
+/// root serves it, as the relay asks it (`person_socket::machine_reply`).
 /// `None` while there is none: someone else is at the screen, the root
 /// daemon is down, or its person socket is switched off.
 #[cfg(target_os = "macos")]
@@ -708,6 +909,7 @@ pub(crate) mod stand_in {
 mod tests {
     use super::stand_in::{Answers, Road};
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     fn question(id: &str) -> ConsentRequest {
@@ -738,7 +940,7 @@ mod tests {
     struct Silent;
     #[async_trait::async_trait]
     impl RootHalf for Silent {
-        async fn ask(&self, _req: &Request) -> Option<Response> {
+        async fn ask(&self, _req: &Request) -> RootReply {
             std::future::pending().await
         }
     }
@@ -747,24 +949,20 @@ mod tests {
     struct Answering(Response, AtomicUsize);
     #[async_trait::async_trait]
     impl RootHalf for Answering {
-        async fn ask(&self, _req: &Request) -> Option<Response> {
+        async fn ask(&self, _req: &Request) -> RootReply {
             self.1.fetch_add(1, SeqCst);
-            Some(self.0.clone())
+            RootReply::Answer(Box::new(self.0.clone()))
         }
     }
 
     /// The worker's own questions come first, then the root half's, each id
-    /// once. No list from the root half (none, a refusal) leaves the own.
+    /// once.
     #[test]
     fn the_list_is_the_workers_own_then_the_root_halfs_each_once() {
         let own = vec![question("a1"), question("b2")];
-        let theirs = Response::ConsentPending(vec![question("c3"), question("a1")]);
-        assert_eq!(ids(&merged(own.clone(), Some(theirs))), ["a1", "b2", "c3"]);
-        assert_eq!(ids(&merged(own.clone(), None)), ["a1", "b2"]);
-        let refused = Response::Error {
-            message: "not on the person socket".into(),
-        };
-        assert_eq!(ids(&merged(own, Some(refused))), ["a1", "b2"]);
+        let theirs = vec![question("c3"), question("a1")];
+        assert_eq!(ids(&merged(own.clone(), theirs)), ["a1", "b2", "c3"]);
+        assert_eq!(ids(&merged(own, Vec::new())), ["a1", "b2"]);
     }
 
     /// #3864, the owner's question 5 — the relay is bounded: a root half that
@@ -774,7 +972,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_silent_root_half_leaves_the_own_list_and_refuses_an_answer_in_time() {
         let asked = tokio::time::Instant::now();
-        let list = listed(vec![question("a1")], &Silent).await;
+        let list = Relay::new(Arc::new(Silent))
+            .listed(vec![question("a1")])
+            .await;
         assert_eq!(ids(&list), ["a1"]);
         let waited = asked.elapsed();
         assert!(
@@ -821,6 +1021,256 @@ mod tests {
             Response::Error {
                 message: NO_ANSWER_FROM_THE_ROOT.into()
             }
+        );
+    }
+
+    /// #4011 — the root half, scripted: each ask takes the next reply in
+    /// turn, and [`MISSES`] never answers (a root half slow for that list).
+    struct Scripted(std::sync::Mutex<std::collections::VecDeque<Option<RootReply>>>);
+
+    impl Scripted {
+        fn new(replies: impl IntoIterator<Item = Option<RootReply>>) -> Arc<Self> {
+            Arc::new(Self(std::sync::Mutex::new(replies.into_iter().collect())))
+        }
+
+        /// The replies to the asks after the ones scripted so far.
+        fn then(&self, replies: impl IntoIterator<Item = Option<RootReply>>) {
+            self.0.lock().unwrap().extend(replies);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RootHalf for Scripted {
+        async fn ask(&self, _req: &Request) -> RootReply {
+            let next = self.0.lock().unwrap().pop_front();
+            match next.expect("the root half was asked more often than scripted") {
+                Some(reply) => reply,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// #4011 — a connect to the root half's person socket that failed is
+    /// proof that it is gone only when nothing is there to connect to (no
+    /// socket, or nothing listening on it); any other failure is no answer.
+    /// `person_socket::machine_reply_tests` reads the same on a real path.
+    #[test]
+    fn a_failed_connect_is_gone_only_when_nothing_is_there() {
+        use std::io::{Error, ErrorKind};
+        for gone in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert_eq!(
+                RootReply::not_connected(&Error::from(gone)),
+                RootReply::Gone,
+                "{gone:?}"
+            );
+        }
+        for other in [
+            Error::new(ErrorKind::PermissionDenied, "served by uid 501, not root"),
+            Error::from(ErrorKind::WouldBlock),
+            Error::from(ErrorKind::TimedOut),
+        ] {
+            let reply = RootReply::not_connected(&other);
+            assert!(
+                matches!(&reply, RootReply::NoAnswer(why) if why.contains("the connect failed")),
+                "{other:?}: {reply:?}"
+            );
+        }
+    }
+
+    /// The root half lists `questions`.
+    fn lists(questions: &[ConsentRequest]) -> Option<RootReply> {
+        Some(RootReply::Answer(Box::new(Response::ConsentPending(
+            questions.to_vec(),
+        ))))
+    }
+
+    /// A list the root half misses: it never answers, so the relay's own
+    /// bound, [`RELAY_WITHIN`], ends the ask.
+    const MISSES: Option<RootReply> = None;
+
+    /// The lines logged at a run of missed lists the kept list covers, and at
+    /// the end of its hold, and when a refusal or a proof of gone takes the
+    /// root half's questions off.
+    const MISS_COVERED: &str = "the root half did not answer the list; its last one stays";
+    const HOLD_ENDED: &str = "the root half has not answered a list for";
+    const TAKEN_OFF: &str = "its questions come off the person's list at once";
+
+    /// How many times `line` is in `logged`.
+    fn times(logged: &crate::peer::files_log_tests::Logged, line: &str) -> usize {
+        logged.text().matches(line).count()
+    }
+
+    /// #4011 — a root half that misses one list between two answers leaves
+    /// its question where it was: on the list the app reads at every step,
+    /// after the process's own, so the companion's prompt neither comes down
+    /// nor comes back placed anew with its click hold armed again. The miss
+    /// takes the relay's own bound, no more, and is said once, at WARN.
+    ///
+    /// Red before #4011: the missed list held the process's own question
+    /// alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_misses_one_list_leaves_its_question_where_it_was() {
+        let logged = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+        let root = Scripted::new([lists(&[question("c3")]), MISSES, lists(&[question("c3")])]);
+        let relay = Relay::new(root);
+        for step in ["an answer", "a missed list", "an answer again"] {
+            let asked = tokio::time::Instant::now();
+            let list = relay.listed(vec![question("a1")]).await;
+            assert_eq!(ids(&list), ["a1", "c3"], "{step}");
+            let waited = asked.elapsed();
+            assert!(
+                waited < RELAY_WITHIN + Duration::from_millis(50),
+                "{step}: the list waited {waited:?}"
+            );
+        }
+        assert_eq!(times(&logged, MISS_COVERED), 1, "{}", logged.text());
+        assert_eq!(times(&logged, HOLD_ENDED), 0, "{}", logged.text());
+    }
+
+    /// #4011 — a root half that proves gone (no person socket, or nothing
+    /// listening on it) or refuses the list takes its questions off at once:
+    /// no wait for a bound, and nothing kept for a miss after it. Each is
+    /// said once, at INFO.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_is_gone_or_refuses_takes_its_questions_off_at_once() {
+        let refusal = RootReply::Answer(Box::new(Response::Error {
+            message: "only the person signed in at this device's own screen answers".into(),
+        }));
+        for (what, ends) in [("gone", RootReply::Gone), ("a refusal", refusal)] {
+            let logged = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+            let root = Scripted::new([lists(&[question("c3")]), Some(ends), MISSES]);
+            let relay = Relay::new(root);
+            let own = || vec![question("a1")];
+            assert_eq!(ids(&relay.listed(own()).await), ["a1", "c3"], "{what}");
+            let asked = tokio::time::Instant::now();
+            assert_eq!(ids(&relay.listed(own()).await), ["a1"], "{what}");
+            assert_eq!(asked.elapsed(), Duration::ZERO, "{what}: at once");
+            assert_eq!(
+                ids(&relay.listed(own()).await),
+                ["a1"],
+                "{what}: a miss after it brings nothing back"
+            );
+            assert_eq!(times(&logged, TAKEN_OFF), 1, "{what}: {}", logged.text());
+            assert_eq!(times(&logged, MISS_COVERED), 0, "{what}: {}", logged.text());
+        }
+    }
+
+    /// #4011 — the kept list lasts [`ROOT_LIST_KEPT_FOR`] from the root
+    /// half's LAST answer, and no longer. With the app asking every 750 ms
+    /// and the root half missing every list, its question is on each list
+    /// that ends within the bound and off every one after it. An answer
+    /// within the bound starts it again. Each run of misses is said once, at
+    /// WARN, and the end of the hold once, at INFO: never a line a poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_half_that_misses_past_the_bound_loses_its_questions_there() {
+        const POLL: Duration = Duration::from_millis(750);
+        let logged = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+        let root = Scripted::new([lists(&[question("c3")])]);
+        let relay = Relay::new(root.clone());
+        assert_eq!(ids(&relay.listed(Vec::new()).await), ["c3"]);
+        let answered = tokio::time::Instant::now();
+        let mut misses = 0;
+        while answered.elapsed() < ROOT_LIST_KEPT_FOR - Duration::from_secs(2) {
+            tokio::time::sleep(POLL).await;
+            root.then([MISSES]);
+            let list = relay.listed(Vec::new()).await;
+            assert_eq!(ids(&list), ["c3"], "at {:?}", answered.elapsed());
+            misses += 1;
+        }
+        assert!(misses >= 4, "{misses} missed lists");
+
+        tokio::time::sleep(POLL).await;
+        root.then([lists(&[question("c3")])]);
+        assert_eq!(ids(&relay.listed(Vec::new()).await), ["c3"]);
+        let again = tokio::time::Instant::now();
+        let (mut kept, mut off, mut kept_past_the_first) = (0, 0, false);
+        while again.elapsed() < ROOT_LIST_KEPT_FOR + Duration::from_secs(3) {
+            tokio::time::sleep(POLL).await;
+            root.then([MISSES]);
+            let list = relay.listed(Vec::new()).await;
+            let at = again.elapsed();
+            if at < ROOT_LIST_KEPT_FOR {
+                assert_eq!(ids(&list), ["c3"], "{at:?} after the answer");
+                kept += 1;
+                kept_past_the_first |= answered.elapsed() >= ROOT_LIST_KEPT_FOR;
+            } else {
+                assert!(list.is_empty(), "{at:?} after the answer: {:?}", ids(&list));
+                off += 1;
+            }
+        }
+        assert!(kept >= 4 && off >= 1, "kept {kept}, off {off}");
+        assert!(
+            kept_past_the_first,
+            "the bound counts from the last answer, not the first"
+        );
+        assert_eq!(times(&logged, MISS_COVERED), 2, "{}", logged.text());
+        assert_eq!(times(&logged, HOLD_ENDED), 1, "{}", logged.text());
+    }
+
+    /// #4011 — a kept question whose deadline has passed is over: a miss
+    /// after its deadline does not keep it, while one whose deadline is still
+    /// ahead is kept, and so is one whose deadline is not known (`0`), for
+    /// the hold alone. An answer lists what the root half says, as it says
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_question_past_its_deadline_is_not_kept() {
+        let at = |id: &str, expires_at_ms: u64| ConsentRequest {
+            expires_at_ms,
+            ..question(id)
+        };
+        // The deadline passes between the answer and the miss.
+        let relay = Relay::new(Scripted::new([]));
+        let t0 = 1_800_000_000_000;
+        let now = tokio::time::Instant::now();
+        let answer = RootReply::Answer(Box::new(Response::ConsentPending(vec![
+            at("c3", t0 + 5_000),
+            at("d4", t0 + 60_000),
+            at("e5", 0),
+        ])));
+        assert_eq!(
+            ids(&relay.theirs_after(answer, now, t0)),
+            ["c3", "d4", "e5"]
+        );
+        let missed = RootReply::NoAnswer("none within 1s".into());
+        let later = now + Duration::from_secs(6);
+        assert_eq!(
+            ids(&relay.theirs_after(missed, later, t0 + 6_000)),
+            ["d4", "e5"]
+        );
+
+        // And on the wall clock, through the relay's own list.
+        let root = Scripted::new([
+            lists(&[at("c3", 1), at("d4", wall_clock_ms() + 3_600_000)]),
+            MISSES,
+        ]);
+        let relay = Relay::new(root);
+        assert_eq!(ids(&relay.listed(Vec::new()).await), ["c3", "d4"]);
+        assert_eq!(ids(&relay.listed(Vec::new()).await), ["d4"]);
+    }
+
+    /// #4011 — an answer replaces the kept list, an empty one too: a question
+    /// the root half no longer lists is not brought back by a miss after it.
+    /// And the process's own questions are its broker's of the moment, never
+    /// kept: one that has ended is off the next list, miss or not.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_answer_empties_the_kept_list_and_the_own_questions_are_never_kept() {
+        let root = Scripted::new([lists(&[question("c3")]), lists(&[]), MISSES]);
+        let relay = Relay::new(root.clone());
+        let own = || vec![question("a1")];
+        assert_eq!(ids(&relay.listed(own()).await), ["a1", "c3"]);
+        assert_eq!(ids(&relay.listed(own()).await), ["a1"], "an empty answer");
+        assert_eq!(
+            ids(&relay.listed(own()).await),
+            ["a1"],
+            "a miss after it brings nothing back"
+        );
+
+        root.then([lists(&[question("c3")]), MISSES]);
+        assert_eq!(ids(&relay.listed(own()).await), ["a1", "c3"]);
+        assert_eq!(
+            ids(&relay.listed(Vec::new()).await),
+            ["c3"],
+            "the own question has ended, and a miss does not keep it"
         );
     }
 

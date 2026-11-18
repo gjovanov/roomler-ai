@@ -247,22 +247,22 @@ const LIVE_ANSWER: Duration = Duration::from_millis(1500);
 /// FR-97 P2g — ask the root half's person socket for `uid`. `None` when it is
 /// not there, is served by anyone but root, or does not answer within `within`:
 /// the caller keeps its own answer then.
+///
+/// #4011 — the same ask as [`machine_reply`], which tells those apart for the
+/// consent relay: a root half that is gone takes its questions off the
+/// person's list at once, and one that did not answer leaves its last list
+/// there for a while. Every other caller keeps its own answer for all three.
 #[cfg(target_os = "macos")]
 pub async fn machine_answer(
     uid: u32,
     req: &tunnel_core::localapi::Request,
     within: Duration,
 ) -> Option<Response> {
-    let path = localapi::person_socket_path(uid);
-    if !path.exists() {
-        return None;
+    use crate::consent_relay::RootReply;
+    match machine_reply(uid, req, within).await {
+        RootReply::Answer(answer) => Some(*answer),
+        RootReply::Gone | RootReply::NoAnswer(_) => None,
     }
-    let ask = async {
-        // Only a socket ROOT serves is the machine's half.
-        let mut client = localapi::connect_unix_served_by_root(path).await.ok()?;
-        client.request(req).await.ok()
-    };
-    tokio::time::timeout(within, ask).await.ok().flatten()
 }
 
 /// FR-97 P2h — should a Mac's per-user half take the machine's live network
@@ -376,6 +376,45 @@ pub async fn or_machine_peers(
         return machine;
     }
     own
+}
+
+/// #4011 — [`machine_answer`]'s ask, with what came of it told apart
+/// ([`crate::consent_relay::RootReply`]): the root half's answer, whatever it
+/// says; proof that it is gone, when no socket is at its path for `uid` or
+/// nothing listens on one there; and no answer for anything else, a socket
+/// that someone other than root serves and an ask past `within` among them.
+/// The consent relay keeps the root half's last list through no answer alone.
+#[cfg(target_os = "macos")]
+pub async fn machine_reply(
+    uid: u32,
+    req: &tunnel_core::localapi::Request,
+    within: Duration,
+) -> crate::consent_relay::RootReply {
+    machine_reply_at(localapi::person_socket_path(uid), req, within).await
+}
+
+/// [`machine_reply`] at `path`, which a test makes in a folder of its own.
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+async fn machine_reply_at(
+    path: std::path::PathBuf,
+    req: &tunnel_core::localapi::Request,
+    within: Duration,
+) -> crate::consent_relay::RootReply {
+    use crate::consent_relay::RootReply;
+    let ask = async {
+        // Only a socket ROOT serves is the machine's half.
+        let mut client = match localapi::connect_unix_served_by_root(path).await {
+            Ok(client) => client,
+            Err(e) => return RootReply::not_connected(&e),
+        };
+        match client.request(req).await {
+            Ok(answer) => RootReply::Answer(Box::new(answer)),
+            Err(e) => RootReply::NoAnswer(format!("the request failed: {e}")),
+        }
+    };
+    tokio::time::timeout(within, ask)
+        .await
+        .unwrap_or_else(|_| RootReply::NoAnswer(format!("none within {within:?}")))
 }
 
 /// Who is at the seat now: on Linux the person signed in at seat0 (logind's
@@ -1493,5 +1532,103 @@ mod following_the_seat_tests {
         );
         assert_eq!(state.answers.load(SeqCst), 1);
         stop_following(stop, poll).await;
+    }
+}
+
+/// #4011 — what an ask of a real socket path comes to, as the consent relay
+/// reads it ([`machine_reply_at`]). No socket at the path, or one that nothing
+/// listens on (a root daemon that stopped and left it behind), is proof that
+/// the root half is gone. A live socket that root does not serve is no
+/// answer, never gone. CI runs it as the runner: rust-agent's "Test agent
+/// under vp9-444" and the macOS job's "cargo check + test the agent's Mac-only
+/// units". Run as root (`ROOMLERD_TEST_REQUIRE_ROOT` turns the skip into a
+/// failure), a socket root serves that never answers is no answer within the
+/// bound, and one that answers is its answer.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod machine_reply_tests {
+    use super::*;
+    use crate::consent_relay::RootReply;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tunnel_core::localapi::Request;
+
+    /// Long enough that only something stuck runs out of it.
+    const LONG: Duration = Duration::from_secs(10);
+
+    /// Whether this test runs as root. Under `ROOMLERD_TEST_REQUIRE_ROOT` a
+    /// run that is not root fails instead, so a sudo run cannot pass by
+    /// skipping the root half's answer.
+    fn as_root() -> bool {
+        // SAFETY: geteuid never fails.
+        let root = unsafe { libc::geteuid() } == 0;
+        if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+            panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+        }
+        root
+    }
+
+    #[tokio::test]
+    async fn a_gone_root_half_is_told_from_one_that_does_not_answer() {
+        let list = Request::ConsentPending;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("501.sock");
+
+        // No socket at the path: the seat moved, or the root daemon stopped.
+        assert_eq!(
+            machine_reply_at(path.clone(), &list, LONG).await,
+            RootReply::Gone
+        );
+
+        // A socket nothing listens on: a root daemon that stopped and left it.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "the socket is left behind");
+        assert_eq!(
+            machine_reply_at(path.clone(), &list, LONG).await,
+            RootReply::Gone
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        // A live socket, which this test's own account serves.
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        if !as_root() {
+            let reply = machine_reply_at(path.clone(), &list, LONG).await;
+            assert!(
+                matches!(&reply, RootReply::NoAnswer(why) if why.contains("not root")),
+                "a socket that someone other than root serves is no answer: {reply:?}"
+            );
+            eprintln!("machine-reply: not root, so a socket root serves is not asked here");
+            return;
+        }
+
+        // As root, it is served by root, and it never answers.
+        let within = Duration::from_millis(300);
+        let asked = std::time::Instant::now();
+        let reply = machine_reply_at(path.clone(), &list, within).await;
+        assert!(
+            matches!(&reply, RootReply::NoAnswer(why) if why.contains("none within")),
+            "{reply:?}"
+        );
+        assert!(asked.elapsed() < LONG, "it waited {:?}", asked.elapsed());
+
+        // And it answers each connection's request: the first it takes is the
+        // silent ask's, whose asker gave up on it.
+        let answering = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                let read = tokio::io::BufReader::new(read).read_line(&mut line).await;
+                if !matches!(read, Ok(n) if n > 0) {
+                    continue;
+                }
+                let mut answer = serde_json::to_vec(&Response::ConsentPending(Vec::new())).unwrap();
+                answer.push(b'\n');
+                let _ = write.write_all(&answer).await;
+            }
+        });
+        assert_eq!(
+            machine_reply_at(path.clone(), &list, LONG).await,
+            RootReply::Answer(Box::new(Response::ConsentPending(Vec::new())))
+        );
+        answering.abort();
+        eprintln!("machine-reply: as root, a silent root half is no answer and an answer is read");
     }
 }
