@@ -1320,7 +1320,7 @@ pub fn main() -> Result<()> {
             purge_after_daemon();
             if let Err(e) = res {
                 roomlerd::daemon_error::say(&e);
-                std::process::exit(1);
+                std::process::exit(roomlerd::daemon_error::exit_code(&e).unwrap_or(1));
             }
             // FR-84 D3 — a requested restart leaves with its own code (launchd
             // relaunches only a non-zero exit). Diverges when it applies.
@@ -3912,10 +3912,10 @@ async fn run_cmd(
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
     if !config_path.exists() && !unenrolled {
-        // #4023 — the device's state, not a fault, told apart by type and never by
-        // its words: a Windows worker records no crash for it, and (#4028) the
-        // service host's worker exits with its own code, so the host records none.
-        return Err(roomlerd::daemon_error::NoConfig::of_run(config_path, supervisor_flag).into());
+        // #4023 — the device's state, not a fault, told apart by type and never by its words:
+        // no crash is recorded for it, and a supervisor that reads 78 gets 78 (#4028, #4071).
+        let supervision = roomlerd::supervision::detect_here(supervisor_flag, supervised);
+        return Err(roomlerd::daemon_error::NoConfig::under(config_path, supervision).into());
     }
     // Take the single-instance lock before doing anything else. If
     // another agent is already attached to this config (typically the
@@ -9046,9 +9046,13 @@ mod smoke_ffmpeg_tests {
 mod no_enrollment_exit_tests {
     use super::*;
 
-    /// `run_cmd` on a missing config, started as `run --supervisor <supervisor>`.
-    /// Its future is the whole daemon's, so it runs on a thread with room for it.
-    fn run_with_no_config(supervisor: Option<&'static str>) -> (PathBuf, Result<()>) {
+    /// `run_cmd` on a missing config, started as `run --supervisor <supervisor>`,
+    /// and with FR-43's `--supervised` when `supervised` (#4071). Its future is the
+    /// whole daemon's, so it runs on a thread with room for it.
+    fn run_with_no_config(
+        supervisor: Option<&'static str>,
+        supervised: bool,
+    ) -> (PathBuf, Result<()>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("config.toml");
         let path = missing.clone();
@@ -9060,7 +9064,7 @@ mod no_enrollment_exit_tests {
                     .build()
                     .expect("runtime")
                     .block_on(Box::pin(run_cmd(
-                        &path, None, false, false, supervisor, None, None,
+                        &path, None, supervised, false, supervisor, None, None,
                     )))
                     .map(|_| ())
             })
@@ -9086,7 +9090,7 @@ mod no_enrollment_exit_tests {
             (Some("task"), EXIT_CODE_OF_AN_ERR),
             (None, EXIT_CODE_OF_AN_ERR),
         ] {
-            let (missing, res) = run_with_no_config(supervisor);
+            let (missing, res) = run_with_no_config(supervisor, false);
             let (words, code) = step_outcome(&res);
             assert_eq!(code, want, "{supervisor:?}");
             assert_eq!(
@@ -9107,5 +9111,29 @@ mod no_enrollment_exit_tests {
         let fault: Result<()> =
             Err(anyhow::anyhow!("access denied").context("acquiring single-instance lock"));
         assert_eq!(step_outcome(&fault).1, EXIT_CODE_OF_AN_ERR);
+    }
+
+    /// #4071 — the GUI worker FR-43's macOS supervisor starts on a two-row Mac
+    /// (`run --supervised`, no `--unenrolled`) ends with the same code there, the
+    /// one platform where that flag proves the supervisor; anywhere else it
+    /// proves nothing, and the worker ends with 1, as it always has. The same
+    /// words either way.
+    #[test]
+    fn the_macos_supervisors_worker_with_no_config_ends_with_its_own_code_on_a_mac() {
+        let want = if cfg!(target_os = "macos") {
+            roomlerd::daemon_error::NO_ENROLLMENT_EXIT_CODE
+        } else {
+            EXIT_CODE_OF_AN_ERR
+        };
+        let (missing, res) = run_with_no_config(None, true);
+        let (words, code) = step_outcome(&res);
+        assert_eq!(code, want);
+        assert_eq!(
+            words,
+            Some(format!(
+                "no config found at {}. Run `roomlerd enroll` first.",
+                missing.display()
+            ))
+        );
     }
 }

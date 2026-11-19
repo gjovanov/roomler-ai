@@ -4354,7 +4354,7 @@ sequenceDiagram
 | A9, D6 — the host bumps an attach generation each time a channel ends, however it ends, an I/O error included (a worker gone mid-write is EPIPE), before the next worker can attach: a record of an older one is never claimed, counted or resumed. Each bound record hears its session end as `error`, which the server hears on this connection, or after the next hello, and the worker's `keep-delegated` goes with the channel. The queue, the caps and keep busy's questions are cleared by `run` however the channel ends, outside the switch, a line over the read limit included | `records_channel_ended`, `agents/roomlerd/src/delegate.rs:1896`; `channel_ended`, `:1872`; `prune_records`, `agents/roomlerd/src/session_table.rs:1189` |
 | A10 — kept records count against `rc_max_sessions` | `len`, `agents/roomlerd/src/session_table.rs:1506` |
 | A11 — a loop that holds the host says `rc-resume` with the switch on, as every loop does. The verb asks for a window, and nothing else changes before one (P4-0) | `connection_keeps`, `agents/roomlerd/src/session_table.rs:115` |
-| P4-0 — one device, one switch: the root's `rc_sessions_survive_reattach`, set in its environment or its config, binds the GUI worker, whose own table and hello would otherwise follow the person's config | `WORKER_ENV_FORWARD`, `agents/roomlerd/src/macos_supervisor.rs:347`; `the_roots_resume_switch_binds_the_worker`, `:1946` |
+| P4-0 — one device, one switch: the root's `rc_sessions_survive_reattach`, set in its environment or its config, binds the GUI worker, whose own table and hello would otherwise follow the person's config | `WORKER_ENV_FORWARD`, `agents/roomlerd/src/macos_supervisor.rs:353`; `the_roots_resume_switch_binds_the_worker`, `:2301` |
 | B2 — the worker serves a message about a session whose params said `keepable`, or that its delegated table holds, on that table; anything else as before | `agents/roomlerd/src/signaling.rs:3173` |
 | B3, B6 — such a session's peer is built on a link to the delegation channel, and its own end closes it at once, attached or kept, with its real end: after a roll no server echoes it | `agents/roomlerd/src/signaling.rs:4668`; `forward`, `agents/roomlerd/src/session_table.rs:478`; `serve`, `:1910` |
 | B4 — the orders (`Detached`, `Resumed`, `Close`, `Ended`, and the channel's own `Paused` and `Attached`) travel a lane of their own, served by the delegated table wherever the worker's loop waits, its own connection down included | `worker_lane`, `agents/roomlerd/src/delegate.rs:339`; `obey`, `agents/roomlerd/src/session_table.rs:1058`; `next_side`, `agents/roomlerd/src/signaling.rs:7372`; `serving_delegated`, `:7407` |
@@ -7143,11 +7143,14 @@ the crash *reports* because the watchdog wrote its own.
 
 **A worker with no enrollment counts nowhere** (#4028). The SCM host's
 worker for an account with no config exits `NO_ENROLLMENT_EXIT_CODE`
-(78, [`daemon_error.rs:126`](../agents/roomlerd/src/daemon_error.rs#L126)).
+(78, [`daemon_error.rs:147`](../agents/roomlerd/src/daemon_error.rs#L147)).
 `should_record_supervisor_crash` leaves it out of the reports, and the host
 backs it off exactly as an exit 1. It ends before this bookkeeping, with no
-config to keep a count in, so it needs no `--prior-end` word. Only that
-worker exits 78: every other `run` with no config still exits 1.
+config to keep a count in, so it needs no `--prior-end` word. Since #4071 the
+GUI worker FR-43's macOS supervisor starts (`run --supervised` on a two-row
+Mac) exits 78 as well, and that supervisor's `crash_summary` leaves it out of
+its reports. Only those two workers exit 78: every other `run` with no config
+still exits 1.
 
 ⚠️ **The boot is an id, never a time.** A boot time worked out from the
 wall clock moves when the clock is stepped, and two starts of one boot
