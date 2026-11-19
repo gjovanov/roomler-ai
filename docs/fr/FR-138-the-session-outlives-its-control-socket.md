@@ -50,13 +50,13 @@ control the device, a kick still lands, and every WebRTC peer that really ends i
 ### 2.2 The mechanism, in the code [R]
 
 The agent closes every peer on every way its control socket can end. `close_all_peers`
-(`agents/roomlerd/src/signaling.rs:6206`) drains the connection's session map, ends each session's recording
+(`agents/roomlerd/src/signaling.rs:6224`) drains the connection's session map, ends each session's recording
 (`:6362`), takes its banner down (`:6363`) and closes the peer within the 5 s budget (`:6368`, `PEER_CLOSE_BUDGET`
 at `:204`). Seventeen arms call it, and the loop that owns the map returns after each:
 
 | Arm | Call | What ended | Kind |
 |---|---|---|---|
-| shutdown: a stop, an update, a restart | `signaling.rs:2187` | the process | terminal |
+| shutdown: a stop, an update, a restart | `signaling.rs:2194` | the process | terminal |
 | the computer is going to sleep (FR-55 P4) | `:2257` | the machine | terminal |
 | a resume from suspend, ≥ 120 s napped | `:2312` | the machine, a while ago | terminal |
 | no inbound frame within the RX deadline | `:2344` | the path | transient |
@@ -138,11 +138,11 @@ Every piece this FR needs has a precedent in the repository. None of them covers
 
 | Precedent | What it does | Where |
 |---|---|---|
-| R3, tunnel peers survive a reattach | On a transient exit the agent parks its QUIC tunnel peers in a per-tenant stash capped at 32, and the next connection reclaims them; a peer whose client left while parked is closed, not re-adopted (#1754). The server waits `ROOMLER__RC__TUNNEL_GRACE_SECS` before terminating a tunnel session whose agent dropped, and keeps it if the agent is back on this pod or on another (a fresh foreign Redis presence). Both default off | `signaling.rs:6349`, `:6354`, `:6390`, `:6409`; `crates/modules/network/src/tunnel.rs:1929`, `:1937`; `crates/config/src/settings.rs:978` |
+| R3, tunnel peers survive a reattach | On a transient exit the agent parks its QUIC tunnel peers in a per-tenant stash capped at 32, and the next connection reclaims them; a peer whose client left while parked is closed, not re-adopted (#1754). The server waits `ROOMLER__RC__TUNNEL_GRACE_SECS` before terminating a tunnel session whose agent dropped, and keeps it if the agent is back on this pod or on another (a fresh foreign Redis presence). Both default off | `signaling.rs:6367`, `:6372`, `:6408`, `:6427`; `crates/modules/network/src/tunnel.rs:1929`, `:1937`; `crates/config/src/settings.rs:978` |
 | FR-85 P3b-3, a recording's re-attach grace | A recording whose session goes is detached, not stopped: its banner stays, marked reconnecting; only the same controller picks it up; after 60 s with nobody back it stops; the owner's off still stops it meanwhile | `agents/roomlerd/src/recording/remote.rs:52-66`; `manager.rs:166` |
 | The session watchdog (rc.190) | Ends a session whose peer never connects within 45 s or sits `Disconnected` for 20 s, and closes it itself | `peer.rs:1066`, `:1083`, `:1084`, `:1147` |
-| FR-43's re-pointed sender | The delegation host's channel to the control socket is set again on each connect | `agents/roomlerd/src/delegate.rs:884` |
-| A report kept for the next connection (FR-40 P1c) | A key-rotation report is queued so the next healthy connection says it again | `signaling.rs:3352`, `:3358` |
+| FR-43's re-pointed sender | The delegation host's channel to the control socket is set again on each connect | `agents/roomlerd/src/delegate.rs:911` |
+| A report kept for the next connection (FR-40 P1c) | A key-rotation report is queued so the next healthy connection says it again | `signaling.rs:3370`, `:3376` |
 | The two-pod test harness | `TestApp::spawn_pair` runs two in-process pods on one Redis; a controller on one pod drives an agent on the other, and a kick on one pod reaches the other's hub | `crates/tests/src/cluster_tests.rs:183`, `:442` |
 
 ⚠️ **R3's server grace does not survive a roll.** It is a timer on the pod that saw the drop
@@ -249,7 +249,7 @@ rules:
 - **The person at the device is served during the gap.** The backoff wait also drains the Disconnect and idle
   channels, which `run` already lends each connection so that they span reconnects (`signaling.rs:1722`, `:1739`).
   It stops serving at once, says `rc:ended` on the session's control channel, closes after the grace, and queues
-  `rc:terminate` with the reason for the next connection, the way FR-40 keeps its report (`signaling.rs:3352`). A
+  `rc:terminate` with the reason for the next connection, the way FR-40 keeps its report (`signaling.rs:3370`). A
   pump with no encoder asks through the Disconnect channel too, and a kept one's end is `no_video`, not the
   person's `host_disconnect` (P2a-2).
 - **What the server must hear is never lost to a full queue** (P2a-2): an end at the device, a kept session's own
@@ -269,16 +269,16 @@ rules:
   `AgentPeer::outbound` alone would leave every clone on the dead connection, so a resumed peer that later failed, or
   that the watchdog ended, would tell the server nothing. P2a gives each session one handle that every sender it
   holds goes through, and the table points it at each new connection, the way FR-43 points the delegation host
-  (`delegate.rs:884`). ⚠️ `await_prompt_or_socket_end` (`signaling.rs:410`) reads the connection's own sender
+  (`delegate.rs:911`). ⚠️ `await_prompt_or_socket_end` (`signaling.rs:410`) reads the connection's own sender
   closing to withdraw a pending prompt, so the connection keeps its own sender for that.
 - **No send by a kept peer blocks during the gap.** The connection's channel is bounded (`PEER_OUTBOUND_CAP`, 64:
-  `signaling.rs:38`, `:1950`), and nobody polls a dead connection's receiver. While detached, the handle drops what
+  `signaling.rs:41`, `:2010`), and nobody polls a dead connection's receiver. While detached, the handle drops what
   it is given (ICE candidates, stats) and never waits. Two kinds are the exception: the session's own end, for which
   the table closes the peer itself and queues the end for the next connection, and the activity its recording and
   its curtain report, which the table queues for the audit as it queues an end (P2a-2).
 - **A peer that cannot recover is closed at once.** The RC path has no ICE restart: no hit for one in `peer.rs`,
   `signaling.rs` or `useRemoteControl.ts` at the pin. A peer detached by one of the three net-change arms
-  (`signaling.rs:2333`, `:2353`, `:2446`), where the host's addresses just changed, cannot get its path back once
+  (`signaling.rs:2340`, `:2360`, `:2453`), where the host's addresses just changed, cannot get its path back once
   its connection leaves `Connected`, so the table closes it then instead of holding it to the watchdog's 20 s
   (`peer.rs:1084`). After any other arm it keeps today's watchdog, since a path the roll did not touch can come back
   from a brief loss. A dead peer is never kept (P2a-2): one whose connection is `Failed` or `Closed` at a transient
@@ -289,9 +289,9 @@ rules:
   (`hub.rs:1711-1712`). A request that would exceed it is refused as busy, never served beside a kept peer.
 - **The banner, the lock and the recording follow the session, not the socket.** A detach leaves the banner up,
   since the session is live and its pixels still flow, and it neither calls `lock_on_end` nor detaches a recording.
-  Only the real end takes the banner down (`signaling.rs:6229` today), so only the real end can lock the screen.
+  Only the real end takes the banner down (`signaling.rs:6247` today), so only the real end can lock the screen.
 - **A delegated session** (a supervised Mac, FR-43) keeps its peer in the GUI worker, while the daemon's socket
-  carries its signalling (`signaling.rs:1977` drops a worker's reply while no socket is up). The daemon claims it,
+  carries its signalling (`signaling.rs:2039` drops a worker's reply while no socket is up). The daemon claims it,
   in a record that holds no peer; the worker keeps and closes it, on a second session table that the daemon's
   orders drive (P2b, `docs/remote-control.md` §11.16.1). The server's end of such a session is one of those orders
   too, so it reaches the peer while the worker's own socket redials, and the end of the channel between them ends

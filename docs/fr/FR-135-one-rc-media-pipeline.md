@@ -175,9 +175,9 @@ The send task holds the `video_bytes_dc` mutex for a frame's whole chunked send 
 
 ### 2.6 Eight readers of "which encoder" [R]
 
-Probe (`encode/caps.rs`), pick (`signaling.rs:3366`), RTP track bind (`peer.rs:13344`), RTP open (`encode/mod.rs:1617`), DC dispatcher (`peer.rs:2420-2638`), DC open (`peer.rs:5247`), GPU plan (`encode/ffmpeg/gpu_input.rs:130`), viewer (`ui/src/composables/videoCells.ts`, `ui/src/composables/useRemoteControl.ts:3471`), and the bench's mirror (`encode/bench.rs:906`). Twenty named divergences between them are listed in §5.7. The three that cost the most:
+Probe (`encode/caps.rs`), pick (`signaling.rs:3384`), RTP track bind (`peer.rs:14066`), RTP open (`encode/mod.rs:1617`), DC dispatcher (`peer.rs:2420-2638`), DC open (`peer.rs:5436`), GPU plan (`encode/ffmpeg/gpu_input.rs:130`), viewer (`ui/src/composables/videoCells.ts`, `ui/src/composables/useRemoteControl.ts:3471`), and the bench's mirror (`encode/bench.rs:906`). Twenty named divergences between them are listed in §5.7. The three that cost the most:
 
-- `chosen_codec` is bound before the transport and without it (`signaling.rs:3365-3381`), so a session can bind a codec no opener on that transport has: #3245, 7 sessions on one laptop in 7 days, connected and black, the watchdog looping [M].
+- `chosen_codec` is bound before the transport and without it (`signaling.rs:3383-3399`), so a session can bind a codec no opener on that transport has: #3245, 7 sessions on one laptop in 7 days, connected and black, the watchdog looping [M].
 - `codecs` is a union of what MF and FFmpeg opened on RTP or DC, read by one consumer that means RTP (`encode/caps.rs:1860`, `:1917`, `:1939`, `:2186`, `:2209`).
 - A probe proves different things by phase: FFmpeg's base and `444` phases open at 480×270 and drop it, no frame encoded, while `docs/encoders.md` calls it a real-bytes trial. `av1_vulkan` opened, encoded and did not decode [M FR-78].
 
@@ -431,7 +431,7 @@ Bare paths are relative to `agents/roomlerd/src/`; `:N` continues the file just 
 | — | `system_context/capture_pump.rs:285`, `system_context/dxgi_direct.rs:1174` | `set_target_fps` empty on DXGI; `AcquireNextFrame(0)` | cadence on the stage; a real wait with two devices | R4b, R5 |
 | — | `encode/ffmpeg/encoder.rs:2843`, `:2860` | Encoder reopens when the capture device changes, 0.6-0.9 s on Iris Xe | encoder device by LUID; the capture device is free to churn | R5 |
 | — | `encode/ffmpeg/gpu_input.rs:111`, `:130` | GPU form by name; proof on the wrong adapter | `CellSpec.input_forms` + `CellProof` keyed by arm | R10 |
-| — | `signaling.rs:3365-3381` | `chosen_codec` before transport | `pick(path, …)` | W-1 PR 2 starts it, R10 finishes |
+| — | `signaling.rs:3383-3399` | `chosen_codec` before transport | `pick(path, …)` | W-1 PR 2 starts it, R10 finishes |
 | — | `encode/caps.rs:1860`, `:1917`, `:1939`, `:2186`, `:2209` | `codecs` is a union | derived RTP column | R9 |
 | enc:I005 | `encode/ffmpeg/encoder.rs:3148-3149` | `is_hardware` always true | `CellSpec.hw`, per backend | R10 |
 | enc:I185 | `encode/caps.rs:2044` | A `vp9_vaapi` cell takes `hw` from a QSV check | same | R9 |
@@ -612,7 +612,7 @@ Locked: DRM sees it. Portal and mutter refuse while locked; mutter resumes 2.8 s
 
 ### 5.4 Fallback and selection facts this design binds to
 
-Cascade in `open_with` (`capture/mod.rs:2893`): synthetic, SystemContext, WGC, auto mutter then portal, DRM, `portal_capture` key, Xwayland refusal, scrap, Noop. Windows worker choice: `decide_spawn` (`win_service/supervisor.rs:790`). `planned_arm` and `arm_facts` only predict and are kept in step by hand (`capture/mod.rs:1345-1346`). The prediction cannot go: `pick` runs at session create (`signaling.rs:3365-3381`), before any capture opens (`peer.rs:6482`). So R10 puts both behind one function that returns a predicted `CaptureFacts`, and an open source's `facts()` reports any mismatch.
+Cascade in `open_with` (`capture/mod.rs:2893`): synthetic, SystemContext, WGC, auto mutter then portal, DRM, `portal_capture` key, Xwayland refusal, scrap, Noop. Windows worker choice: `decide_spawn` (`win_service/supervisor.rs:790`). `planned_arm` and `arm_facts` only predict and are kept in step by hand (`capture/mod.rs:1345-1346`). The prediction cannot go: `pick` runs at session create (`signaling.rs:3383-3399`), before any capture opens (`peer.rs:6749`). So R10 puts both behind one function that returns a predicted `CaptureFacts`, and an open source's `facts()` reports any mismatch.
 
 ### 5.5 Transport × codec × browser decode
 
@@ -976,7 +976,7 @@ pub fn pick(path: MediaPath, browser: &BrowserCaps, pref: EncoderPreference,
 |---|---|
 | Probe (`encode/caps.rs`) | Walks rows; writes `CellProof`; a dead child costs one cell (#3271) |
 | Hello: `hw_encoders`, `codecs`, `transports`, `video_cells`, chroma | **Generated** from rows, wire unchanged. R9's gate is byte-identical against recorded hellos, the composition-baseline pattern. `data-channel-vp9-444` stays on the wire forever, and legacy labels render as a generated column |
-| Pick (`signaling.rs:3366`) | `pick(path, …)`, after transport. W-1 PR 2 starts this |
+| Pick (`signaling.rs:3384`) | `pick(path, …)`, after transport. W-1 PR 2 starts this |
 | RTP bind (`peer.rs:13344`) | Derives from the row; a DC row gets its placeholder by rule, no row in common is the refusal |
 | RTP open, DC dispatcher, DC open | One `open(binding, dims, fps, bps, input)` walking the rows `pick` chose, reporting each attempt |
 | GPU plan (`gpu_input.rs:130`) | `input_forms` + `CellProof.gpu`, keyed by arm |
@@ -1205,7 +1205,7 @@ Phase ids are stable names, because the ledger's `phase` column uses them. Their
 - **Precedence.** `rc_media_legacy` beats `rc_media_canary`, which beats the built-in default.
 - **Live, no restart.** One read site, at session open, which is the reason `exec_enabled` is live (`agents/roomlerd/src/remote_config.rs:11-19`, `:246`). A session never changes path mid-flight. So a push reaches a connected device through FR-132 P1b's nudge (#3242) and applies from its next session. Without that nudge a deny sat undelivered on an online laptop for 71 minutes [M FR-132 §8], so #3242 is a precondition of Wave B. Every precedent media key is `needs_restart` (`agents/roomlerd/src/remote_config.rs:308-369`), so this is new plumbing: a holder like `exec_enabled`'s, carried through `adopt_local` (`.claude/rules/networking.md:168`), about 1 day in R0. These keys never go through config fallbacks, because `encode/caps_cache.rs:196-210` hashes those and a push would re-probe at the next start.
 - **Which row on a Mac.** The pump runs in the worker, with a file of its own (`docs/remote-config.md:498-501`, `agents/roomlerd/src/delegate.rs:5-8`), so a push goes to the worker's row. Most Mac hours are there.
-- **Reach limit, measured.** A device that has not opted in with `remote_config_enabled` refuses every push (`docs/remote-config.md:41-51`), the default is off (`crates/agent-core/src/config.rs:2867`) and the server can never set it. Of the 37 agents seen in the 7 days to 2026-11-02, **4 have ever been sent a push, all `noop`.** `noop` is sent only past both gates (`signaling.rs:4935-4942`, `:4954-4964`, `:4977`), so those 4 are primary and opted in [M, R]. **The other 33 were never asked:** an empty row gets no frame (`crates/modules/fleet/src/socket.rs:392-393`, `:415-421`), and 16 of them carry the default `revision: 0`, so a `rev` existing is not a push. Silence says nothing, and the prior is "refuses". **Of the 7 online QSV hosts 1 is proven, the corporate laptop of FR-132's AC2, which has no `hevc_qsv`. Of the 5 `hevc_qsv` hosts, none.** The MacBook is opted out on purpose by its owner. On a device that refuses, the switch is a person at the device or a forward release. How corporate and office hosts opt in is D17. **The push drill, 2026-11-08 (§13):** of 10 devices asked, 3 took the push end to end: the dev box, the opted-in corporate laptop and one office desktop on `hevc_qsv`. The other 7 refused, the MacBook among them.
+- **Reach limit, measured.** A device that has not opted in with `remote_config_enabled` refuses every push (`docs/remote-config.md:41-51`), the default is off (`crates/agent-core/src/config.rs:2867`) and the server can never set it. Of the 37 agents seen in the 7 days to 2026-11-02, **4 have ever been sent a push, all `noop`.** `noop` is sent only past both gates (`signaling.rs:4953-4960`, `:4972-4982`, `:4995`), so those 4 are primary and opted in [M, R]. **The other 33 were never asked:** an empty row gets no frame (`crates/modules/fleet/src/socket.rs:392-393`, `:415-421`), and 16 of them carry the default `revision: 0`, so a `rev` existing is not a push. Silence says nothing, and the prior is "refuses". **Of the 7 online QSV hosts 1 is proven, the corporate laptop of FR-132's AC2, which has no `hevc_qsv`. Of the 5 `hevc_qsv` hosts, none.** The MacBook is opted out on purpose by its owner. On a device that refuses, the switch is a person at the device or a forward release. How corporate and office hosts opt in is D17. **The push drill, 2026-11-08 (§13):** of 10 devices asked, 3 took the push end to end: the dev box, the opted-in corporate laptop and one office desktop on `hevc_qsv`. The other 7 refused, the MacBook among them.
 - **The push drill, in R0.** R0's field step proves the push end to end on one host per class and records who answered. The operator pushes, since it edits production config. Its traps are measured. Never drill with a blank `zero_copy_deny`: blank clears a device's own local deny at its next restart. Use R0's new key, on R0's build only, since an agent without the key would ignore it and still report `noop`. Compare `rrev` with `rev`, because a report is last-write-wins, and read `applied` only after P1c. A cleared form is never delivered (rows at rev 3 / rrev 2 and rev 6 / rrev 5), so "blank" must be sent as `Some("")`.
 
 | `rc_media_legacy` entry | Sends a session back to | Phase | Retires when |
@@ -1464,7 +1464,7 @@ Each answers one question with a yes or a no.
 | Host went away | 5 | 0.74 | No reconnect for minutes to days |
 | Never started | 5 | 0 | `started_at` is null |
 
-The agent tears a session down on purpose: `close_all_peers` (`signaling.rs:6721`, a comment from rc.24 names a stuck frame and "agent capacity exceeded" after a web deploy). The server does its half in `end_agent_sessions` and the zombie reap (`crates/modules/fleet/src/hub.rs:1199`, `:1112`). FR-28 already found this: its registry row reads "a roll ends every RC session on the control WS, on any carrier (9 of 9)". The next session after a flap took about 5 s to first encode in one read, plus first frame, so it costs a person 6-24 s each time.
+The agent tears a session down on purpose: `close_all_peers` (`signaling.rs:6751`, a comment from rc.24 names a stuck frame and "agent capacity exceeded" after a web deploy). The server does its half in `end_agent_sessions` and the zombie reap (`crates/modules/fleet/src/hub.rs:1199`, `:1112`). FR-28 already found this: its registry row reads "a roll ends every RC session on the control WS, on any carrier (9 of 9)". The next session after a flap took about 5 s to first encode in one read, plus first frame, so it costs a person 6-24 s each time.
 
 ### 8.2 Remaining
 
