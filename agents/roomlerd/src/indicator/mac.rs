@@ -485,6 +485,11 @@ impl Panel {
                 NSBackingStoreType::Buffered,
                 false,
             );
+            // A plain NSWindow is released when it closes, and its `Retained`
+            // releases it again when `Panel` drops it after `close` (`Drop`
+            // below): objc2-app-kit requires this call for a window made
+            // outside a window controller. An NSPanel defaults to it.
+            window.setReleasedWhenClosed(false);
             window.setLevel(NSScreenSaverWindowLevel);
             // Visible on every Space and over a fullscreen app: a prompt that
             // only exists on the desktop someone happens to be looking at is
