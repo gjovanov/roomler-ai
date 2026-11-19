@@ -1184,11 +1184,42 @@ backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
 real hardware, and the AC4 oracle's first target went missing. The device used
 to be created at the session's first event. The input arbiter now opens it as
 soon as a session that may input has its control channel
-(`warm`, `agents/roomlerd/src/input/arbiter.rs:1302`), which gives it the second
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:1352`), which gives it the second
 or more a viewer takes to send anything. This applies on Linux only, and an
 injector without the OS's permission is never cached. The kill switch is
 `ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides
 the settle for measuring it on a host.
+
+⚠️ **On a system install the warm-up waits for the automatic capture, and runs
+again when it goes live** (#4069). `open_default` picks the automatic uinput of
+§1.2.1 only while an automatic capture is alive. Before that it picks enigo,
+which a root daemon has no display for: the open fails, logs #3787's ERROR when
+a person is at the screen, and caches nothing, so the uinput opened at the first
+event, without its warm-up. 0.4.226's capture went live before the control
+channel was ready. 0.4.227 connected faster, so the control channel came first
+and the warm-up lost that race. Now, where the automatic uinput is planned (the
+brief plans the DRM arm, `uinput` is unset and `/dev/uinput` opens) and no
+automatic capture is alive yet, the warm-up opens nothing
+(`awaits_automatic_capture`, `agents/roomlerd/src/input/mod.rs:354`). The
+capture's live edge runs it again for every session that may input
+(`Cmd::CaptureLive`):
+
+| Order | Before #4069 | Now |
+|---|---|---|
+| the capture goes live, then the control channel (0.4.226) | the control channel's warm-up opens the uinput | the live edge opens it, if a session that may input is registered by then; otherwise the control channel's warm-up does. One open either way |
+| the control channel, then the capture (0.4.227) | the warm-up opens enigo, which fails on a root daemon; the uinput opens at the first event | the warm-up waits (`the warm-up waits for the planned automatic system capture to go live (#4069)`, `on="control_ready"`); the live edge opens the uinput (`injector opened ahead of the first event (FR-93 P4c)`, `on="capture_live"`) |
+
+The edge is the first automatic capture alive: `ViewingMark`'s count going from
+0 to 1. After the count, it runs the hook the input arbiter set as it started
+(`seat_guard::on_live`, `agents/roomlerd/src/capture/seat_guard.rs:216`): one
+command, handed over with a `try_send`, which drops it on a full queue rather
+than wait. So the capture's code calls no input code, the edge never starts the
+arbiter, and a process without one tells nobody. The caps' `mouse-rel` word reads the same
+prediction (`automatic_uinput_planned`, [relative-mouse.md](relative-mouse.md)).
+A wrong prediction costs the warm-up, never input. A planned capture that never
+goes live leaves the first event to open, as before. A capture that comes
+unpredicted replaces what the control channel opened (`stale`).
+`ROOMLERD_INPUT_WARM=0` turns off both warm-ups.
 
 ⚠️ **Root, or a refusal at open (FR-93 P3h).** `drmModeGetFB2` does not fail
 for a caller without `CAP_SYS_ADMIN`. It answers with the geometry and **no
@@ -2719,7 +2750,8 @@ is still in its file (`scripts/code-map-audit.sh`).
 | `agents/roomlerd/src/virtual_desktop/keeper.rs` | #3665: the desktop's keeper, `roomlerd vd-keeper` (§2.3): the subreaper that starts the window manager and the apps, collects what exits and takes the desktop down when its input ends (`run`, `serve`, `teardown_with`, `may_signal`) |
 | `agents/roomlerd/src/media_share.rs` | #3671: the shared pipelines retired with the desktop's X server (`retire_all`); #3918: a joiner under a marked owner (`try_join`), from what the owner published (`names_a_capture_off_x`) |
 | `agents/roomlerd/src/input/x_follow.rs` | #3918: the X11 injector's follow (`gate`, `let_go`, `opened_under`) and its kill switch (`enabled`); the marks (`no_picture`) and who is left behind (`Sessions`) |
-| `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`) |
+| `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`); FR-93 P4c's warm-up (`warm`) and its kill switch (`warm_on`); #4069: the wait for a planned automatic capture (`awaits_automatic_capture`), the one prediction it and the caps' word share (`automatic_uinput_planned`), and the capture's live edge (`live_edge`, `CaptureLive`) |
+| `agents/roomlerd/src/capture/seat_guard.rs` | FR-95 P2: the automatic captures alive and viewing (`live`, `viewing`, `ViewingMark`); #4069: the live edge and the hook the input arbiter sets for it (`on_live`, `LiveHook`, `goes_live`, `tell_live`) |
 | `agents/roomlerd/src/clipboard.rs` | #3671: the worker's follow of the desktop's X server (`x11_follow`, `Follow`, `connect_anew`, `REBUILD_BOUND`), the retry that `shared` and `available` read (`Retry`), and the teardown that holds back arboard's dead-connection lines (`quietly_drop`) |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled`, `primary`) and the scanout's channel order, both depths (`Layout::of`, `repack_to_bgra`, `repack_bgra_half`); FR-93 P3c: the plane table with each plane's type (`read_planes`), the primary by type (`primary_plane`), the cursor caps (`enable_cursor_caps`) and the per-frame cursor read (`CursorReader`, `read_cursor_pixels`); FR-93 P3d/P3f: the buffer's identity (`BufferId`) and the mapping's key (`maps`), the kill switch (`idle_skip_enabled`), the gate in `grab`, and the still screen waited out in `next_frame`; FR-93 P3e: a display switched off (`display_off`, for an open `display_is_off`), told apart in the worker loop (`worker`), waited out in `next_frame` (`DARK_POLL`) and reported by `waits_for`, and its kill switch (`wake_wait_enabled`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable`); #4035: a framebuffer freed between the plane read and GETFB2 costs its grab a tick, bounded (`FreedRun`, `FREED_RUN_MAX`, `freed`), answered as `Grabbed::Raced` and waited out in `next_frame` |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish`, `latest`) and the pure conversions (`straighten_and_crop`, `place`, `shape_id`, `pick_primary`) |

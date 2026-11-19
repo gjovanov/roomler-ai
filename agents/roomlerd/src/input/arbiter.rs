@@ -326,6 +326,12 @@ impl ArbiterState {
         self.sessions.get(&session).is_some_and(SessCore::may_input)
     }
 
+    /// #4069 — whether any registered session may input, as [`Self::can_input`]
+    /// asks of one: an automatic capture's live edge warms for those only.
+    pub fn any_can_input(&self) -> bool {
+        self.sessions.values().any(SessCore::may_input)
+    }
+
     /// Deregister a session. Returns the key/button releases to inject
     /// (its whole held set). Reassigns the exclusive holder if it left.
     pub fn close(&mut self, session: ObjectId) -> Vec<InputMsg> {
@@ -791,6 +797,12 @@ enum Cmd {
         session: ObjectId,
         token: String,
     },
+    /// #4069 — an automatic system capture went live (`seat_guard`'s live
+    /// edge, [`live_edge`]): the warm-up runs again for the sessions that may
+    /// input, so the automatic uinput opens ahead of the first event whichever
+    /// came first, the capture or a session's control DC.
+    #[cfg(all(target_os = "linux", feature = "drm-capture"))]
+    CaptureLive,
 }
 
 /// FR-92 — a keep-busy request, answered on `reply` from the arbiter thread
@@ -862,7 +874,27 @@ pub fn global() -> &'static Arbiter {
             .name("input-arbiter".into())
             .spawn(move || worker(rx, handle))
             .expect("spawn input-arbiter worker");
+        // #4069 — an automatic system capture's live edge warms again. Set
+        // as the arbiter starts, so a capture in a process without one tells
+        // nobody, and the edge never starts it.
+        #[cfg(all(target_os = "linux", feature = "drm-capture"))]
+        crate::capture::seat_guard::on_live(live_edge(tx.clone()));
         Arbiter { tx }
+    })
+}
+
+/// #4069 — what `seat_guard`'s live edge runs, on the capture's thread: one
+/// [`Cmd::CaptureLive`], sent after the capture was counted alive, so the
+/// arbiter's read of `seat_guard::live` behind it sees the capture. It holds
+/// only the arbiter's sender, so it starts nothing and needs no runtime, and a
+/// full queue drops it rather than block the capture: the first event then
+/// opens, as before #4069.
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+fn live_edge(tx: std::sync::mpsc::SyncSender<Cmd>) -> crate::capture::seat_guard::LiveHook {
+    Box::new(move || {
+        if tx.try_send(Cmd::CaptureLive).is_err() {
+            tracing::debug!("input arbiter queue full — the capture's live edge dropped (#4069)");
+        }
     })
 }
 
@@ -1121,7 +1153,14 @@ fn run_command(
             tracing::debug!(%session, "input arbiter: control DC ready — re-broadcasting state");
             viewers.tell_if(true, state, sinks);
             if state.can_input(session) {
-                warm(injector);
+                warm(injector, "control_ready");
+            }
+        }
+        #[cfg(all(target_os = "linux", feature = "drm-capture"))]
+        Cmd::CaptureLive => {
+            tracing::debug!("input arbiter: an automatic system capture went live (#4069)");
+            if state.any_can_input() {
+                warm(injector, "capture_live");
             }
         }
         Cmd::ReleaseHeld { session } => {
@@ -1269,9 +1308,9 @@ fn run_command(
 /// its own, after its last change: an event that moves no floor after its
 /// plan and before its injection, a ClearFloorRequest that clears nothing and
 /// the last Close at theirs. Only an arm without a tell point (ReleaseHeld,
-/// KeepBusy, KeepBusySet, LayoutSet) and a dropped event pay it at the
-/// command's end. With nothing owed every arm tells as before. Two commands
-/// still tell twice, in tasks of their own.
+/// KeepBusy, KeepBusySet, LayoutSet, CaptureLive) and a dropped event pay it
+/// at the command's end. With nothing owed every arm tells as before. Two
+/// commands still tell twice, in tasks of their own.
 struct Viewers<F> {
     owed: bool,
     tell: F,
@@ -1298,28 +1337,63 @@ impl<F: FnMut(&ArbiterState, &HashMap<ObjectId, Sinks>)> Viewers<F> {
 /// send anything. Linux only — the race is libinput's — and an injector
 /// without the OS's permission is not cached, by `keep_busy_op`'s rule: one
 /// cached before a display exists would break every later controller's input.
-/// `ROOMLERD_INPUT_WARM=0` keeps the first event as the opener.
-fn warm(injector: &mut Option<Box<dyn super::InputInjector + Send>>) {
-    if !cfg!(target_os = "linux") || !tunnel_core::env::flag("INPUT_WARM", true) {
+/// `ROOMLERD_INPUT_WARM=0` keeps the first event as the opener ([`warm_on`]).
+///
+/// #4069 — it runs when a session's control DC is ready
+/// ([`Cmd::ControlReady`]) and again when an automatic system capture goes
+/// live (`Cmd::CaptureLive`), for the sessions that may input; `on` names
+/// which. While that capture is planned and not live yet
+/// (`input::awaits_automatic_capture`), it opens nothing: `open_default`
+/// picks the automatic uinput only while the capture is live, and before that
+/// it would open enigo, which a root daemon has no display for (#3787's ERROR,
+/// with a person at the screen). On 0.4.227 a faster connect let the control
+/// DC come before the capture, and the uinput opened at the first event,
+/// without its warm-up.
+fn warm(injector: &mut Option<Box<dyn super::InputInjector + Send>>, on: &'static str) {
+    if !cfg!(target_os = "linux") || !warm_on() {
         return;
     }
     if injector.as_deref().is_some_and(|i| super::stale(i)) {
         *injector = None;
     }
     // #3918 — nothing opens while this device's virtual desktop is down, and
-    // an injector left on an older X server of it is let go first. Last
-    // before the open, so whatever was dropped above opens nothing then.
+    // an injector left on an older X server of it is let go first. After the
+    // drop above, so whatever was dropped there opens nothing then.
     if !follow_the_desktop(injector) {
         return;
     }
     if injector.is_some() {
         return;
     }
+    // #4069 — the automatic system capture's live edge opens it. An event
+    // before then opens what `open_default` picks then, as before.
+    if super::awaits_automatic_capture() {
+        tracing::info!(
+            on,
+            "input arbiter: the warm-up waits for the planned automatic system capture to go live \
+             (#4069)"
+        );
+        return;
+    }
     let fresh = open_injector();
     if fresh.has_permission() {
-        tracing::info!("input arbiter: injector opened ahead of the first event (FR-93 P4c)");
+        tracing::info!(
+            on,
+            "input arbiter: injector opened ahead of the first event (FR-93 P4c)"
+        );
         *injector = Some(fresh);
     }
+}
+
+/// FR-93 P4c — `ROOMLERD_INPUT_WARM` (default on), read at each warm-up: `0`
+/// keeps the first event as the opener, the live edge's warm-up (#4069)
+/// included.
+fn warm_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::WARM_HERE.with(std::cell::Cell::get) {
+        return on;
+    }
+    tunnel_core::env::flag("INPUT_WARM", true)
 }
 
 /// #3164 — an injector opened before the OS granted input is not final.
@@ -2862,6 +2936,11 @@ mod tests {
         /// when a test set one: it opens the test's stand-in.
         pub(super) static STAND_IN_OPEN: std::cell::RefCell<Option<StandInOpen>> =
             const { std::cell::RefCell::new(None) };
+        /// #4069 — `Some(on)` answers [`warm_on`] on this thread, as
+        /// `ROOMLERD_INPUT_WARM` would: a test process cannot set the switch
+        /// off for itself alone.
+        pub(super) static WARM_HERE: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// #3918 — what reached one stand-in X11 injector, and whether it was told
@@ -2920,9 +2999,11 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "enigo-input"))]
     fn stand_ins(x11: bool) -> std::sync::Arc<std::sync::Mutex<Vec<Seen>>> {
         // No automatic capture of another test is alive here
-        // (`x11_would_open`, `stale`).
+        // (`x11_would_open`, `stale`), and none is planned (#4069's wait).
         #[cfg(feature = "drm-capture")]
         crate::capture::seat_guard::LIVE_HERE.with(|l| l.set(Some(false)));
+        #[cfg(all(feature = "uinput-input", feature = "drm-capture"))]
+        crate::input::PLANNED_HERE.with(|p| p.set(Some(false)));
         let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
         let list = opened.clone();
         STAND_IN_OPEN.with(|o| {
@@ -2949,6 +3030,9 @@ mod tests {
         crate::input::x_follow::test_seam::clear();
         #[cfg(feature = "drm-capture")]
         crate::capture::seat_guard::LIVE_HERE.with(|l| l.set(None));
+        #[cfg(all(feature = "uinput-input", feature = "drm-capture"))]
+        crate::input::PLANNED_HERE.with(|p| p.set(None));
+        WARM_HERE.with(|w| w.set(None));
     }
 
     /// A runtime handle for [`run_command`]. Nothing a test runs spawns on
@@ -3569,7 +3653,8 @@ mod tests {
     /// when it has one (an event that moves no floor, a view-only session's,
     /// after its plan and before its injection; a withdrawal of no request,
     /// where a withdrawal tells), else at the command's end (a release of
-    /// held input, keep busy's read, a refused keep-busy or layout switch).
+    /// held input, keep busy's read, a refused keep-busy or layout switch, an
+    /// automatic capture's live edge).
     /// Each in the set-up of
     /// `a_dropped_event_still_tells_what_its_command_changed`, with a
     /// view-only V for B; the refusals are A's, which is left behind. A holds
@@ -3609,6 +3694,14 @@ mod tests {
                 session: v,
             }),
         ];
+        // #4069 — the live edge warms for a session that may input, and
+        // neither A, left behind, nor V may.
+        #[cfg(feature = "drm-capture")]
+        let commands = {
+            let mut all = commands.to_vec();
+            all.push(("CaptureLive", |_, _| Cmd::CaptureLive));
+            all
+        };
         for (name, cmd) in commands {
             let opened = stand_ins(true);
             let mut st = ArbiterState::default();
@@ -3659,7 +3752,8 @@ mod tests {
     /// SetMode; and a Close that leaves a session, after what it releases (B
     /// holds a key when it closes). An event that moves no floor, a refused
     /// one, ReleaseHeld, KeepBusy, a refused KeepBusySet or LayoutSet, a
-    /// ClearFloorRequest that clears nothing and the last Close tell nothing.
+    /// ClearFloorRequest that clears nothing, a live edge (#4069) and the last
+    /// Close tell nothing.
     #[cfg(all(target_os = "linux", feature = "enigo-input"))]
     #[test]
     fn with_no_mark_every_command_tells_as_before() {
@@ -3727,6 +3821,11 @@ mod tests {
             "ControlReady"
         );
         assert_eq!(at(), (1, 0), "ControlReady's warm open");
+        #[cfg(feature = "drm-capture")]
+        {
+            assert_eq!(run!(Cmd::CaptureLive), none, "a live edge");
+            assert_eq!(at(), (1, 0), "a live edge with an injector that fits");
+        }
         let a_key = Cmd::Event {
             session: a,
             msg: key(0x04, true),
@@ -4270,14 +4369,14 @@ mod tests {
                 keep_busy_op(&st, &mut injector, &mut regrant, half),
                 KbReply::Failed(_)
             ));
-            warm(&mut injector);
+            warm(&mut injector, "control_ready");
             // With nothing open, nothing opens either.
             let mut none: Option<Box<dyn crate::input::InputInjector + Send>> = None;
             inject_all(&mut none, &mut regrant, &[key(0x04, true)]);
-            warm(&mut none);
+            warm(&mut none, "control_ready");
             assert!(none.is_none(), "nothing opens while the desktop is down");
             desk::up(1);
-            warm(&mut injector);
+            warm(&mut injector, "control_ready");
             assert_eq!(
                 keep_busy_op(&st, &mut injector, &mut regrant, half),
                 KbReply::Moved
@@ -4325,7 +4424,7 @@ mod tests {
         inject_all(&mut injector, &mut regrant, &[key(0x04, false)]);
         desk::up(1);
         inject_all(&mut injector, &mut regrant, &[key(0x05, true)]);
-        warm(&mut injector);
+        warm(&mut injector, "control_ready");
         let opened = opened.lock().unwrap().clone();
         no_stand_ins();
         assert_eq!(opened.len(), 1, "never let go, never opened again");
@@ -4335,6 +4434,349 @@ mod tests {
             opened[0].events(),
             vec![key(0x04, true), key(0x04, false), key(0x05, true)]
         );
+    }
+
+    /// #4069 — the warm-up waits for a planned automatic system capture, and
+    /// runs again on its live edge. Each case runs the worker's own code
+    /// ([`command`]) on a system install's seat on this thread
+    /// ([`on_a_seat`]): `seat_guard::LIVE_HERE` says whether an automatic
+    /// capture is live, `input::PLANNED_HERE` whether one is planned. The
+    /// process's real count is never read: other tests make marks.
+    #[cfg(all(
+        target_os = "linux",
+        feature = "enigo-input",
+        feature = "uinput-input",
+        feature = "drm-capture"
+    ))]
+    mod warm_up {
+        use super::*;
+        use crate::input::x_follow::test_seam as desk;
+        use std::sync::{Arc, Mutex};
+
+        /// What one stand-in open made, as `open_default` picks with `uinput`
+        /// unset: the automatic uinput while an automatic capture is live,
+        /// another injector (enigo) otherwise; and what reached it.
+        #[derive(Clone, Default)]
+        struct Opened {
+            automatic: bool,
+            events: Arc<Mutex<Vec<InputMsg>>>,
+        }
+
+        impl Opened {
+            fn events(&self) -> Vec<InputMsg> {
+                self.events.lock().unwrap().clone()
+            }
+        }
+
+        struct OnSeat(Opened);
+
+        impl crate::input::InputInjector for OnSeat {
+            fn inject(&mut self, event: InputMsg) -> anyhow::Result<()> {
+                self.0.events.lock().unwrap().push(event);
+                Ok(())
+            }
+            fn has_permission(&self) -> bool {
+                true
+            }
+            fn automatic(&self) -> bool {
+                self.0.automatic
+            }
+        }
+
+        /// A system install's seat on this thread: the arbiter's lazy open
+        /// makes an [`OnSeat`], automatic while `seat_guard::live` says so;
+        /// the automatic capture is `planned` or not, and none is live yet;
+        /// the warm-up is on; no virtual desktop runs. Every open, in order.
+        /// `no_stand_ins` undoes it.
+        fn on_a_seat(planned: bool) -> Arc<Mutex<Vec<Opened>>> {
+            crate::capture::seat_guard::LIVE_HERE.with(|l| l.set(Some(false)));
+            crate::input::PLANNED_HERE.with(|p| p.set(Some(planned)));
+            WARM_HERE.with(|w| w.set(Some(true)));
+            desk::none();
+            let opened = Arc::new(Mutex::new(Vec::<Opened>::new()));
+            let list = opened.clone();
+            STAND_IN_OPEN.with(|o| {
+                *o.borrow_mut() = Some(Box::new(move || {
+                    let made = Opened {
+                        automatic: crate::capture::seat_guard::live(),
+                        ..Opened::default()
+                    };
+                    list.lock().unwrap().push(made.clone());
+                    Box::new(OnSeat(made))
+                }))
+            });
+            opened
+        }
+
+        /// The automatic capture goes live on this thread, as its mark's
+        /// count does before the edge is sent.
+        fn capture_goes_live() {
+            crate::capture::seat_guard::LIVE_HERE.with(|l| l.set(Some(true)));
+        }
+
+        /// The worker's state on this thread, and each command through the
+        /// worker's own code.
+        #[derive(Default)]
+        struct Worker {
+            st: ArbiterState,
+            follow: Follow,
+            injector: Option<Box<dyn crate::input::InputInjector + Send>>,
+            regrant: Regrant,
+        }
+
+        impl Worker {
+            fn run(&mut self, cmd: Cmd) {
+                command(
+                    &mut self.st,
+                    &mut self.follow,
+                    &mut self.injector,
+                    &mut self.regrant,
+                    cmd,
+                );
+            }
+            fn open(&mut self, session: ObjectId, can_input: bool) {
+                self.run(Cmd::Open {
+                    session,
+                    name: "viewer".into(),
+                    can_input,
+                    mode_hint: None,
+                    control: Arc::new(tokio::sync::Mutex::new(None)),
+                    cursor: Arc::new(tokio::sync::Mutex::new(None)),
+                });
+            }
+            /// Whether the cached injector is the automatic uinput.
+            fn cached(&self) -> Option<bool> {
+                self.injector.as_deref().map(|i| i.automatic())
+            }
+        }
+
+        /// 0.4.227's order: the control DC is ready before the automatic
+        /// capture exists. The warm-up opens nothing (no enigo, which a root
+        /// daemon has no display for: #3787's ERROR) and says it waits. The
+        /// live edge then opens the automatic uinput, once, and keeps it,
+        /// ahead of the first event, which reaches it. Before #4069 the control
+        /// DC's warm-up fell through to enigo here, and the uinput opened at
+        /// the first event.
+        #[test]
+        fn the_control_dc_waits_and_the_live_edge_opens_the_uinput() {
+            let opened = on_a_seat(true);
+            let mut w = Worker::default();
+            let a = sid();
+            let mut at_control_dc = usize::MAX;
+            let lines = desk::logged(|| {
+                w.open(a, true);
+                w.run(Cmd::ControlReady { session: a });
+                at_control_dc = opened.lock().unwrap().len();
+                capture_goes_live();
+                w.run(Cmd::CaptureLive);
+            });
+            w.run(Cmd::Event {
+                session: a,
+                msg: key(0x04, true),
+            });
+            let cached = w.cached();
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(at_control_dc, 0, "the control DC opened: {lines:#?}");
+            assert_eq!(opened.len(), 1, "{lines:#?}");
+            assert!(opened[0].automatic, "the live edge opened enigo");
+            assert_eq!(cached, Some(true), "the uinput was not kept");
+            assert_eq!(opened[0].events(), vec![key(0x04, true)]);
+            let said = |what: &str, on: &str| {
+                lines
+                    .iter()
+                    .any(|l| l.contains("INFO") && l.contains(what) && l.contains(on))
+            };
+            assert!(
+                said("waits for the planned automatic", "control_ready"),
+                "{lines:#?}"
+            );
+            assert!(
+                said("opened ahead of the first event", "capture_live"),
+                "{lines:#?}"
+            );
+        }
+
+        /// 0.4.226's order: the automatic capture is live before the control
+        /// DC. Its live edge opens the uinput as soon as a session that may
+        /// input is registered, and the control DC's warm-up opens nothing
+        /// more: one open in all.
+        #[test]
+        fn a_capture_live_before_the_control_dc_opens_the_uinput_once() {
+            let opened = on_a_seat(true);
+            let mut w = Worker::default();
+            let a = sid();
+            w.open(a, true);
+            capture_goes_live();
+            w.run(Cmd::CaptureLive);
+            let at_the_edge = opened.lock().unwrap().len();
+            w.run(Cmd::ControlReady { session: a });
+            let cached = w.cached();
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(at_the_edge, 1, "the live edge opened nothing");
+            assert_eq!(opened.len(), 1, "the control DC opened again");
+            assert!(opened[0].automatic);
+            assert_eq!(cached, Some(true));
+        }
+
+        /// No session may input: the live edge with no session, with a
+        /// view-only one, and after the only one that could has closed, opens
+        /// nothing. A session that may input, registered after the edge,
+        /// opens at its control DC, the capture live by then.
+        #[test]
+        fn the_live_edge_opens_nothing_with_no_session_that_may_input() {
+            let opened = on_a_seat(true);
+            let mut w = Worker::default();
+            let (v, gone, a) = (sid(), sid(), sid());
+            capture_goes_live();
+            w.run(Cmd::CaptureLive);
+            w.open(v, false);
+            w.run(Cmd::CaptureLive);
+            w.open(gone, true);
+            w.run(Cmd::Close { session: gone });
+            w.run(Cmd::CaptureLive);
+            let at_the_edges = opened.lock().unwrap().len();
+            w.open(a, true);
+            w.run(Cmd::ControlReady { session: a });
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(at_the_edges, 0, "an edge opened for nobody");
+            assert_eq!(opened.len(), 1, "the control DC did not open");
+            assert!(opened[0].automatic);
+        }
+
+        /// `ROOMLERD_INPUT_WARM=0` turns every warm-up off, the live edge's
+        /// too: neither the control DC (nothing planned, so it would open
+        /// otherwise) nor the edge opens anything, and the first event is the
+        /// opener.
+        #[test]
+        fn input_warm_off_opens_nothing_at_the_control_dc_or_the_live_edge() {
+            let opened = on_a_seat(false);
+            WARM_HERE.with(|w| w.set(Some(false)));
+            let mut w = Worker::default();
+            let a = sid();
+            w.open(a, true);
+            w.run(Cmd::ControlReady { session: a });
+            capture_goes_live();
+            w.run(Cmd::CaptureLive);
+            let warmed = opened.lock().unwrap().len();
+            w.run(Cmd::Event {
+                session: a,
+                msg: key(0x04, true),
+            });
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(warmed, 0, "a warm-up opened with the switch off");
+            assert_eq!(opened.len(), 1, "the first event did not open");
+            assert!(opened[0].automatic);
+            assert_eq!(opened[0].events(), vec![key(0x04, true)]);
+        }
+
+        /// Nothing planned and nothing live (an X11 desktop, `uinput` set, the
+        /// automatic capture switched off: `input`'s
+        /// `the_automatic_uinput_is_planned_only_for_the_drm_arm_with_uinput_unset`):
+        /// the control DC's warm-up opens at once, as before #4069, what
+        /// `open_default` picks then, and keeps it.
+        #[test]
+        fn with_nothing_planned_the_control_dc_opens_as_before() {
+            let opened = on_a_seat(false);
+            let mut w = Worker::default();
+            let a = sid();
+            w.open(a, true);
+            w.run(Cmd::ControlReady { session: a });
+            let cached = w.cached();
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(opened.len(), 1, "the control DC did not open");
+            assert!(!opened[0].automatic);
+            assert_eq!(cached, Some(false));
+        }
+
+        /// The prediction missed (no brief yet, or one a minute old), and the
+        /// capture comes: the control DC's warm-up opened enigo, and the live
+        /// edge replaces it through `stale`, so the uinput is open ahead of the
+        /// first event, and no event during a lock can reach enigo, whose
+        /// XTest reaches Xwayland windows behind the lock screen.
+        #[test]
+        fn the_live_edge_replaces_what_the_control_dc_opened_before_it() {
+            let opened = on_a_seat(false);
+            let mut w = Worker::default();
+            let a = sid();
+            w.open(a, true);
+            w.run(Cmd::ControlReady { session: a });
+            capture_goes_live();
+            w.run(Cmd::CaptureLive);
+            let at_the_edge = opened.lock().unwrap().len();
+            w.run(Cmd::Event {
+                session: a,
+                msg: key(0x04, true),
+            });
+            let cached = w.cached();
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(at_the_edge, 2, "the live edge did not replace enigo");
+            assert_eq!(opened.len(), 2);
+            assert!(!opened[0].automatic);
+            assert!(opened[1].automatic);
+            assert_eq!(cached, Some(true));
+            assert_eq!(
+                opened[0].events(),
+                Vec::<InputMsg>::new(),
+                "enigo got the event"
+            );
+            assert_eq!(opened[1].events(), vec![key(0x04, true)]);
+        }
+
+        /// The prediction missed the other way: the capture is planned and
+        /// never goes live (its DRM open failed, and the cascade fell
+        /// through). The waiting warm-up costs the warm-up and no event: the
+        /// first event opens what `open_default` picks then, as before, and
+        /// every event reaches it.
+        #[test]
+        fn a_planned_capture_that_never_goes_live_leaves_the_first_event_the_opener() {
+            let opened = on_a_seat(true);
+            let mut w = Worker::default();
+            let a = sid();
+            w.open(a, true);
+            w.run(Cmd::ControlReady { session: a });
+            let warmed = opened.lock().unwrap().len();
+            for msg in [key(0x04, true), key(0x04, false)] {
+                w.run(Cmd::Event { session: a, msg });
+            }
+            let opened = opened.lock().unwrap().clone();
+            no_stand_ins();
+            assert_eq!(warmed, 0);
+            assert_eq!(opened.len(), 1, "the first event did not open");
+            assert!(!opened[0].automatic);
+            assert_eq!(opened[0].events(), vec![key(0x04, true), key(0x04, false)]);
+        }
+
+        /// The edge's signal as the arbiter sets it ([`live_edge`]), on a
+        /// thread with no tokio runtime, as a capture's may be: one
+        /// `CaptureLive`, then, on a full queue, nothing, at once. It holds
+        /// only the arbiter's sender, so it can start nothing. With no
+        /// arbiter nothing set it, and the edge tells nobody: `seat_guard`'s
+        /// `with_no_arbiter_the_live_edge_tells_nobody_and_needs_no_runtime`.
+        #[test]
+        fn the_live_edges_signal_never_blocks_and_needs_no_runtime() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Cmd>(1);
+            let edge = live_edge(tx);
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let no_runtime = tokio::runtime::Handle::try_current().is_err();
+                edge();
+                edge();
+                let _ = done.send(no_runtime);
+            });
+            assert_eq!(
+                finished.recv_timeout(Duration::from_secs(10)),
+                Ok(true),
+                "the edge waited on a full queue, or ran inside a runtime"
+            );
+            assert!(matches!(rx.try_recv(), Ok(Cmd::CaptureLive)));
+            assert!(rx.try_recv().is_err(), "the second edge was not dropped");
+        }
     }
 }
 
