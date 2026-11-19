@@ -1671,7 +1671,8 @@ mod keeper_tests {
     /// timer is silent until the request gives up while the control keeps
     /// time, and the test fails on its first check, the runtime standing
     /// still. One worker, so that the thread that waits is the one driving the
-    /// runtime's timers.
+    /// runtime's timers. With two, the other worker may be driving them when
+    /// the wait starts: then only the keeper stops, and the passes' checks fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[should_panic(expected = "the runtime stood still")]
     async fn a_pass_that_waits_for_the_request_on_the_runtime_fails_as_a_stall() {

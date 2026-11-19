@@ -119,7 +119,7 @@ runtime kept time is read from two 10 ms timers over the same stretch: the canar
 on the runtime, and a control on a thread of its own that no request can hold
 ([`power.rs:1501`](../agents/roomlerd/src/power.rs#L1501) `ControlTimer`). The
 test fails when the runtime's timer was silent more than 200 ms longer than the
-control's ([`power.rs:1601`](../agents/roomlerd/src/power.rs#L1601)). A slow
+control's ([`power.rs:1600`](../agents/roomlerd/src/power.rs#L1600)). A slow
 runner holds both timers. On the macOS lane, for one, `thread_dump`'s test points
 `/usr/bin/sample` at the test process beside these, and `sample` suspends the
 process at every sample. In the run #4075 records, the runtime's timer woke 265 ms
@@ -129,13 +129,17 @@ the runtime's timer.
 | Case | the runtime's timer | the control's | the test |
 |---|---|---|---|
 | A slow runner | silent while the process is held | silent as long | passes |
-| #3871's wait put back inside a pass | silent until the request gives up, 4 s | about 10 ms | fails: `the runtime stood still` |
+| #3871's wait put back inside a pass, on the worker that drives the timers | silent until the request gives up, 4 s | about 10 ms | fails: `the runtime stood still` |
+| The same wait while another worker drives the timers | on time | on time | fails: the keeper's passes stop |
 
-The second row runs in every lane
-([`power.rs:1677`](../agents/roomlerd/src/power.rs#L1677)
+The second row runs on Linux, Windows and macOS
+([`power.rs:1678`](../agents/roomlerd/src/power.rs#L1678)
 `a_pass_that_waits_for_the_request_on_the_runtime_fails_as_a_stall`): the stood-in
 OS puts #3871's wait back inside a pass, on a runtime of one worker, and the test
-must fail saying the runtime stood still.
+must fail saying the runtime stood still. With the two workers of the other tests,
+the worker that drives the timers when the wait starts decides between the second
+row and the third. On Windows, 20 of 20 local runs landed in the third, with 1 pass
+in the 1.5 s.
 
 ## 2. `power_policy`
 
