@@ -303,6 +303,17 @@ pub fn derpnet_key(net_hex: &str) -> String {
     format!("roomler:own:derpnet:{net_hex}")
 }
 
+/// #3840 — `claim_if_newer`: SET unless the key holds another token minted in
+/// the same millisecond as ARGV[1] or later (every token ends `/<since_ms>`).
+/// A value that ends in no `since_ms` names no registration and is replaced.
+const CLAIM_IF_NEWER: &str = "local v = redis.call('GET', KEYS[1]) \
+     if v and v ~= ARGV[1] then \
+       local held = tonumber(string.match(v, '/(%d+)$')) \
+       local ours = tonumber(string.match(ARGV[1], '/(%d+)$')) \
+       if ours == nil or (held ~= nil and held >= ours) then return 0 end \
+     end \
+     redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) return 1";
+
 impl OwnershipDirectory {
     /// #3840 — the LWW claim of a registration whose first claim had no
     /// answer, made later. `claim_lww` writes the newest registration's token
@@ -318,7 +329,14 @@ impl OwnershipDirectory {
         token: &str,
         ttl_secs: u64,
     ) -> Result<bool, redis::RedisError> {
-        self.refresh_if_mine(key, token, ttl_secs).await
+        let mut conn = self.conn.clone();
+        let n: i64 = redis::Script::new(CLAIM_IF_NEWER)
+            .key(key)
+            .arg(token)
+            .arg(ttl_secs)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(n > 0)
     }
 }
 

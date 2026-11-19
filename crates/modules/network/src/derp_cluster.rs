@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::NetworkState;
 use crate::derp_types::{DerpKey, DerpPubKey};
-use roomler_core::cluster::directory::{OwnerRecord, derp_key, derpnet_key};
+use roomler_core::cluster::directory::{DIRECTORY_TTL_SECS, OwnerRecord, derp_key, derpnet_key};
 use roomler_core::cluster::metrics::DERP_REHOME_STUCK_TOTAL;
 
 const REHOME_COOLDOWN: Duration = Duration::from_secs(60);
@@ -82,19 +82,33 @@ pub async fn on_derp_register(
     let member = pk_hex(pk);
     let token = dir.owner_token(&agent_id.to_hex());
     let key = derp_key(&net_hex, &member);
-    if let Err(e) = dir.claim_lww(&key, &token).await {
-        debug!(%network_id, %e, "derp directory claim failed");
-        return;
-    }
-    state.derp_presence_tokens.insert((network_id, *pk), token);
-    if let Err(e) = dir.set_add(&derpnet_key(&net_hex), &member).await {
-        debug!(%network_id, %e, "derp net-index add failed");
-    }
+    // #3840: the token is kept whatever the claim answered (a reply lost to a
+    // timeout may hide a write that landed), and `finish_registration` writes
+    // what a Redis error left owed. This path waits on Redis no longer than
+    // before: the claim, and the index add only after a claim that answered.
+    let claimed = dir.claim_lww(&key, &token).await;
+    state
+        .derp_presence_tokens
+        .insert((network_id, *pk), token.clone());
+    let owed = match claimed {
+        Ok(()) => match dir.set_add(&derpnet_key(&net_hex), &member).await {
+            Ok(()) => false,
+            Err(e) => {
+                debug!(%network_id, %e, "derp net-index add failed");
+                true
+            }
+        },
+        Err(e) => {
+            debug!(%network_id, %e, "derp directory claim failed");
+            true
+        }
+    };
     // Sweep off the registration path: a dead peer pod costs an RPC
     // deadline and must not delay this socket's frame pumping.
     let st = state.clone();
+    let pk = *pk;
     tokio::spawn(async move {
-        converge_network(&st, network_id).await;
+        finish_registration(st, network_id, pk, token, owed).await;
     });
 }
 
@@ -130,11 +144,12 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) -> Swe
     let net_hex = network_id.to_hex();
     let members = match dir.set_members(&derpnet_key(&net_hex)).await {
         Ok(m) if m.len() > 1 => m,
-        _ => return Sweep::Done,
+        Ok(_) => return Sweep::Done,
+        Err(_) => return Sweep::Again,
     };
     let keys: Vec<String> = members.iter().map(|m| derp_key(&net_hex, m)).collect();
     let Ok(records) = dir.get_many(&keys).await else {
-        return Sweep::Done;
+        return Sweep::Again;
     };
 
     let mut by_pod: std::collections::HashMap<String, Vec<String>> =
@@ -308,8 +323,82 @@ pub enum Sweep {
 /// Whether a `derp.rehome` request that failed leaves the sweep to be run
 /// again. A deadline (the pod is presumed dead) or a NACK (it answered) does
 /// not.
-fn sweep_again_after(_e: &roomler_core::cluster::bus::BusError) -> bool {
-    false
+fn sweep_again_after(e: &roomler_core::cluster::bus::BusError) -> bool {
+    matches!(e, roomler_core::cluster::bus::BusError::Redis(_))
+}
+
+/// #3840 — the wait before a registration's second round; it doubles up to
+/// [`FINISH_WAIT_MAX`].
+const FINISH_WAIT_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between two rounds: the heartbeat's period.
+const FINISH_WAIT_MAX: Duration = Duration::from_secs(30);
+
+/// The wait after a round that waited `wait`.
+fn finish_wait_after(wait: Duration) -> Duration {
+    (wait * 2).min(FINISH_WAIT_MAX)
+}
+
+/// #3840 — what a registration owes after its claim, done off the
+/// registration path: when a Redis error stopped the claim or the index add
+/// (`owed`), the record and the member; then one convergence sweep. A round
+/// that a Redis error stops runs again after a wait of 1 s doubling to 30 s,
+/// while this registration's token is still the one this pod holds for the
+/// node (teardown, a newer registration here, or the heartbeat's prune of a
+/// closed socket ends it).
+///
+/// The record is written again with `claim_if_newer`, never a plain claim: a
+/// registration made after this one, on any pod, keeps the record, and that
+/// registration's own sweep converges the network.
+async fn finish_registration(
+    state: NetworkState,
+    network_id: ObjectId,
+    pk: DerpPubKey,
+    token: String,
+    mut owed: bool,
+) {
+    let Some(dir) = state.cluster_directory.clone() else {
+        return;
+    };
+    let net_hex = network_id.to_hex();
+    let member = pk_hex(&pk);
+    let key = derp_key(&net_hex, &member);
+    let mut wait = FINISH_WAIT_FIRST;
+    // Nothing owed: the sweep runs at once, as it always did.
+    let mut at_once = !owed;
+    loop {
+        if !at_once {
+            tokio::time::sleep(wait).await;
+            wait = finish_wait_after(wait);
+            let ours = state
+                .derp_presence_tokens
+                .get(&(network_id, pk))
+                .is_some_and(|held| *held == token);
+            if !ours {
+                return;
+            }
+        }
+        at_once = false;
+        if owed {
+            match dir.claim_if_newer(&key, &token, DIRECTORY_TTL_SECS).await {
+                Ok(true) => {}
+                // A registration made after this one holds the record.
+                Ok(false) => return,
+                Err(e) => {
+                    debug!(%network_id, %e, "derp directory claim failed again");
+                    continue;
+                }
+            }
+            if let Err(e) = dir.set_add(&derpnet_key(&net_hex), &member).await {
+                debug!(%network_id, %e, "derp net-index add failed again");
+                continue;
+            }
+            owed = false;
+            debug!(%network_id, "derp registration written after a Redis error");
+        }
+        if converge_network(&state, network_id).await == Sweep::Done {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +428,19 @@ mod tests {
             "W14-RED a rehome Redis did not publish must leave the sweep to run again, \
              and only that one"
         );
+    }
+
+    /// #3840 — a registration's rounds wait 1 s, then twice as long each
+    /// time, up to the heartbeat's 30 s.
+    #[test]
+    fn a_registrations_rounds_wait_1_s_doubling_to_30_s() {
+        let mut wait = FINISH_WAIT_FIRST;
+        let mut waits = vec![wait];
+        for _ in 0..6 {
+            wait = finish_wait_after(wait);
+            waits.push(wait);
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
     }
 
     #[test]

@@ -806,12 +806,12 @@ async fn handle_tunnel_open(
             )
             .await
         {
+            // Kept anyway (#3840): the heartbeat re-sets an absent record.
             debug!(%tunnel_session_id, %e, "tunnel ownership claim failed");
-        } else {
-            state
-                .tunnel_presence_tokens
-                .insert(tunnel_session_id, token);
         }
+        state
+            .tunnel_presence_tokens
+            .insert(tunnel_session_id, token);
     }
     // P7 flap resilience: index the session by its TARGET agent so
     // `terminate_sessions_targeting_agent` can kill it the moment that
