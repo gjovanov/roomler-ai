@@ -71,7 +71,7 @@ async fn a_session_cookie_authenticates_a_browser_socket() {
     let seeded = app.seed_tenant("wsauth-cookie").await;
 
     let req = handshake(
-        &app.addr,
+        app.addr,
         None,
         Some(&seeded.member.access_token),
         Some(OURS),
@@ -101,7 +101,7 @@ async fn a_foreign_origin_cannot_spend_the_cookie() {
     let seeded = app.seed_tenant("wsauth-foreign").await;
 
     let req = handshake(
-        &app.addr,
+        app.addr,
         None,
         Some(&seeded.member.access_token),
         Some("https://evil.example"),
@@ -124,7 +124,7 @@ async fn a_cookie_with_no_origin_at_all_is_refused() {
     let app = spawn().await;
     let seeded = app.seed_tenant("wsauth-noorigin").await;
 
-    let req = handshake(&app.addr, None, Some(&seeded.member.access_token), None);
+    let req = handshake(app.addr, None, Some(&seeded.member.access_token), None);
     let err = connect_async(req)
         .await
         .expect_err("no Origin must not open a cookie-authed socket");
@@ -140,7 +140,7 @@ async fn the_query_token_still_works_and_needs_no_origin() {
     let app = spawn().await;
     let seeded = app.seed_tenant("wsauth-legacy").await;
 
-    let req = handshake(&app.addr, Some(&seeded.member.access_token), None, None);
+    let req = handshake(app.addr, Some(&seeded.member.access_token), None, None);
     let (mut ws, resp) = connect_async(req).await.expect("legacy ws connect");
     assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
@@ -155,7 +155,7 @@ async fn a_foreign_origin_does_not_block_the_query_token() {
     let seeded = app.seed_tenant("wsauth-legacy-origin").await;
 
     let req = handshake(
-        &app.addr,
+        app.addr,
         Some(&seeded.member.access_token),
         None,
         Some("https://evil.example"),
@@ -169,7 +169,7 @@ async fn a_foreign_origin_does_not_block_the_query_token() {
 #[tokio::test]
 async fn no_credential_at_all_is_refused() {
     let app = spawn().await;
-    let req = handshake(&app.addr, None, None, Some(OURS));
+    let req = handshake(app.addr, None, None, Some(OURS));
     let err = connect_async(req)
         .await
         .expect_err("an anonymous socket must be refused");
@@ -183,7 +183,7 @@ async fn a_garbage_cookie_is_refused_even_from_our_own_origin() {
     let app = spawn().await;
     let _ = app.seed_tenant("wsauth-garbage").await;
 
-    let req = handshake(&app.addr, None, Some("not-a-jwt"), Some(OURS));
+    let req = handshake(app.addr, None, Some("not-a-jwt"), Some(OURS));
     let err = connect_async(req)
         .await
         .expect_err("an invalid session cookie must be refused");

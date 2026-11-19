@@ -1700,7 +1700,7 @@ jobs:
       - name: cargo test the files channel on a Mac's root daemon (#3757)
         run: |
           set -eu
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- peer::files_channel_tests:: encode::caps::tests::a_macs_root_half_still_offers_file_transfer --nocapture
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- peer::files_channel_tests:: encode::caps::tests::a_macs_root_half_still_offers_file_transfer files::drawer_edges:: --nocapture
           cargo test -p roomlerd --lib --features clipboard,enigo-input --no-run --message-format=json > /tmp/files3757.json
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/files3757.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi

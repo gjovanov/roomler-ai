@@ -13077,7 +13077,8 @@ pub fn attach_files_handler(
     dc.on_close(Box::new(move || {
         let h = handler_for_close.clone();
         Box::pin(async move {
-            h.abort().await;
+            // #3682 — and a listing still running drops its answer.
+            h.channel_closed().await;
         })
     }));
     let handler_for_end = handler.clone();
@@ -13317,39 +13318,9 @@ async fn handle_files_control(
                 .await;
                 return;
             }
-            match crate::files::list_dir(&path).await {
-                Ok(listing) => {
-                    info!(
-                        %session_id, ?req_id,
-                        path = ?listing.path,
-                        entries = listing.entries.len(),
-                        "files: dir listed"
-                    );
-                    let parent_owned = listing.parent.clone();
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::DirList {
-                            req_id: &req_id,
-                            path: &listing.path,
-                            parent: parent_owned.as_deref(),
-                            entries: &listing.entries,
-                        },
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
-                    let msg = format!("{e}");
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::DirError {
-                            req_id: &req_id,
-                            message: &msg,
-                        },
-                    )
-                    .await;
-                }
-            }
+            // #3682 (D1-B) — never awaited here: this loop reads the
+            // channel's next message only once this one is handled.
+            spawn_dir_listing(dc.clone(), handler, session_id, req_id, path);
         }
         crate::files::FilesIncoming::Resume {
             id,
@@ -13390,6 +13361,73 @@ async fn handle_files_control(
                     .await;
                 }
             }
+        }
+    }
+}
+
+/// #3682 (D1-B) — a folder listing, in a task of its own. The files channel's
+/// read loop hands `files:dir` here and goes on reading, so a cancel or a
+/// chunk sent behind a listing that waits on a share is read at once. The
+/// listing is bounded as a whole and takes the channel's lane, one step at a
+/// time ([`crate::files::FilesHandler::list_dir`]). Its answer carries the
+/// request's `req_id`, which the viewer matches, so a later listing's answer
+/// may come first.
+fn spawn_dir_listing(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    req_id: String,
+    path: String,
+) {
+    tokio::spawn(answer_dir_listing(dc, handler, session_id, req_id, path));
+}
+
+/// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
+/// or the session ends it stops and drops its answer, and it never sends on a
+/// channel that has closed. The answer's send races that end too
+/// ([`or_stopped`], #1730): after a network drop a send can park for good on
+/// a channel that still reads open, and the task kept the channel and the
+/// handler for as long as the agent ran.
+async fn answer_dir_listing<S: DownloadSink>(
+    dc: S,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    req_id: String,
+    path: String,
+) {
+    let closed = handler.listings_closed();
+    let listed = tokio::select! {
+        () = closed.cancelled() => return,
+        listed = handler.list_dir(&path) => listed,
+    };
+    if closed.is_cancelled() || dc.gone() {
+        return;
+    }
+    match listed {
+        Ok(listing) => {
+            info!(
+                %session_id, ?req_id,
+                path = ?listing.path,
+                entries = listing.entries.len(),
+                "files: dir listed"
+            );
+            let parent_owned = listing.parent.clone();
+            let msg = crate::files::FilesOutgoing::DirList {
+                req_id: &req_id,
+                path: &listing.path,
+                parent: parent_owned.as_deref(),
+                entries: &listing.entries,
+            };
+            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
+        }
+        Err(e) => {
+            warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
+            let message = format!("{e}");
+            let msg = crate::files::FilesOutgoing::DirError {
+                req_id: &req_id,
+                message: &message,
+            };
+            let _ = or_stopped(&closed, dc.send_json(&msg)).await;
         }
     }
 }
@@ -17786,5 +17824,128 @@ mod wire_text_log_tests {
             broken.is_empty(),
             "lines a line break from the viewer broke: {broken:#?}\n{text}"
         );
+    }
+}
+
+/// #3682 (D1-B) — a folder listing never holds the files channel's read
+/// loop. It waited there for its folder, so while a share did not answer, no
+/// later message on the channel was read: not a download's cancel, not the
+/// next request. The listing's seam is the lib's (`files::drawer_edges`), so
+/// the loopback channel is too ([`files_channel_tests::Pair`]), not the one
+/// in `tests/file_dc.rs`.
+#[cfg(test)]
+mod dir_listing_tests {
+    use super::files_channel_tests::Pair;
+    use super::*;
+    use crate::files::drawer_edges::seams;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::json;
+
+    /// Messages of other kinds, sent behind a listing whose folder's entries
+    /// do not come, are acted on at once: a cancel naming an id that is not
+    /// one plain name is refused, and a download of a file that is not there
+    /// fails, each answered while the listing still waits.
+    #[tokio::test]
+    async fn messages_behind_a_held_listing_are_acted_on_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let slow = temp.path().join("slow");
+        std::fs::create_dir(&slow).expect("a folder");
+        std::fs::write(slow.join("a.txt"), b"a").expect("a file in it");
+        let held = seams::hold_entries(&slow);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let gone = temp.path().join("not-there.txt");
+        pair.ask(&json!({"t": "files:dir", "req_id": "held", "path": slow}))
+            .await;
+        let reached = held.reached_within(Duration::from_secs(5)).await;
+        let started = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:cancel", "id": "not/one-name"}))
+            .await;
+        pair.ask(&json!({"t": "files:get", "id": "get-1", "path": gone}))
+            .await;
+        let behind = tokio::time::timeout(Duration::from_secs(1), pair.heard(2)).await;
+        let waited = started.elapsed();
+        // The share answers: the listing's thread goes free before anything
+        // is asserted.
+        held.release();
+        let listed = pair.heard(1).await;
+        pair.close().await;
+        assert!(reached, "the listing's entries were asked for");
+        let Ok(behind) = behind else {
+            panic!("nothing behind the listing was answered within 1 s");
+        };
+        let answered: Vec<(&str, &str)> = behind
+            .iter()
+            .map(|f| {
+                (
+                    f["t"].as_str().unwrap_or(""),
+                    f["id"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        for expected in [("files:error", "not/one-name"), ("files:error", "get-1")] {
+            assert!(
+                answered.contains(&expected),
+                "{expected:?} is not in {behind:?} ({waited:?})"
+            );
+        }
+        assert_eq!(
+            listed.first().and_then(|f| f["req_id"].as_str()),
+            Some("held"),
+            "the listing answered once its folder did: {listed:?}"
+        );
+    }
+
+    /// A channel whose peer vanished after the listing found it open: the
+    /// answer's send parks for good while the channel still reads open, the
+    /// shape #1730 met in the field.
+    struct AnswerParks {
+        parked: Arc<tokio::sync::Notify>,
+    }
+
+    impl DownloadSink for AnswerParks {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A listing whose answer cannot be sent ends once its session ends. Its
+    /// send parked with nothing racing it, so the task kept the channel and
+    /// the handler for as long as the daemon lived.
+    #[tokio::test]
+    async fn a_listing_whose_answer_cannot_be_sent_ends_with_its_session() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let handler = crate::files::FilesHandler::new();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(answer_dir_listing(
+            AnswerParks {
+                parked: parked.clone(),
+            },
+            handler.clone(),
+            bson::oid::ObjectId::new(),
+            "parks".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ));
+        let sent = tokio::time::timeout(Duration::from_secs(5), parked.notified()).await;
+        handler.end_session().await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(sent.is_ok(), "the listing's answer was never sent");
+        let Ok(ended) = ended else {
+            panic!("the listing outlived its session, parked in its answer's send");
+        };
+        ended.expect("the listing's task");
     }
 }
