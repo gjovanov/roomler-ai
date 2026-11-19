@@ -1907,8 +1907,6 @@ async fn connect_once(
     // #3439 — subscribed before the generation is read, so an answer that lands
     // after this wakes the loop, which announces it at once.
     let mut caps_news = crate::encode::caps::news();
-    // #3280 — read before the answer: one adopted in between is news next beat.
-    let mut last_announced_caps_generation = crate::encode::caps::generation();
     // FR-138 — the switch, read once for this connection: with it on, the
     // hello says `rc-resume` (P4-0: it asks for a window, and nothing else
     // changes before one) and claims what the last connection kept. P2b
@@ -1919,64 +1917,23 @@ async fn connect_once(
         delegation.host().is_some(),
     );
     let kept_sessions = peers.begin_connection(survive).await;
-    let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
-    crate::session_table::apply_resume_word(&mut hello_caps.rpc, survive);
-    // FR-94 — `exec-system` on exactly the connection of the device this
-    // machine's SYSTEM service is anchored for, and the heartbeat re-announces
-    // when that changes (an anchor written or removed while connected).
-    let mut last_announced_exec_system = crate::exec_service::advertised_for(&cfg.agent_id);
-    crate::exec_service::apply_word(&mut hello_caps.rpc, last_announced_exec_system);
-    // FR-105 — `ssh-system` the same way: the service serves SSH for exactly
-    // this device, and the person's `ssh_enabled` has this worker carry its
-    // port.
-    let mut last_announced_ssh_system =
-        crate::ssh_service::advertised_for(&cfg.agent_id, cfg.ssh_enabled);
-    crate::ssh_service::apply_word(&mut hello_caps.rpc, last_announced_ssh_system);
-    // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
-    // worker can record. Saying the root daemon's own list (nothing) would
-    // strip RECORD for the 30 s until the first heartbeat corrects it, after
-    // every reconnect. Only a loop that holds the host, like the heartbeat:
-    // the primary, and on a one-row Mac every org (FR-43 P3b).
-    if let Some(record) = delegation.host().and_then(|d| d.effective_record()) {
-        hello_caps.record = record;
-    }
-    // FR-97 P2c — and its Remote Apps words, the same way: a delegated
-    // session's control channel ends on the worker's peer, so the worker
-    // serves `rc:apps.*` in the person's window-server session, while this
-    // root daemon is in none and says `status` alone. Our own words are kept
-    // for when no worker is attached (`detect()` memoizes them).
-    let own_apps: Vec<String> = hello_caps.apps.clone();
-    if let Some(apps) = delegation.host().and_then(|d| d.effective_apps()) {
-        hello_caps.apps = apps;
-    }
-    let mut last_announced_apps: Vec<String> = hello_caps.apps.clone();
-    // FR-97 P2a — and its audio offer: the worker captures a delegated
-    // session's sound through ScreenCaptureKit in the person's session, while
-    // this root daemon says `no-session`. Ours is kept for when no worker is
-    // attached.
-    let own_audio = crate::encode::caps::AudioWords::of(&hello_caps);
-    if let Some(audio) = delegation.host().and_then(|d| d.effective_audio()) {
-        audio.apply(&mut hello_caps);
-    }
-    let mut last_announced_audio = crate::encode::caps::AudioWords::of(&hello_caps);
-    // FR-85 P3b — what the hello told the server about remote recording, so
-    // the heartbeat re-announces the moment the owner's gate changes it.
-    let mut last_announced_record: Vec<String> = hello_caps.record.clone();
-    // FR-92 — and whether the hello advertised keep-busy, so a flipped
-    // `keep_busy_enabled` reaches the server within a beat.
-    let mut last_announced_keep_busy = hello_caps.input.iter().any(|w| w == "keep-busy");
-    // FR-97 P4a — and whether it advertised the real Ctrl+Alt+Del, so a
-    // policy a GPO refresh changes reaches the server within a beat, instead
-    // of a viewer sending a sequence the host may no longer send.
-    let mut last_announced_sas = hello_caps.input.iter().any(|w| w == "sas");
-    // FR-93 P2b — and the desktop brief it carried, so a login, a logout or
-    // the greeter reaches the server within a beat.
-    let mut last_announced_desktop = hello_caps.desktop.clone();
-    // FR-99 P1b — and the privacy words it carried, read off the hello itself
-    // so a switch flipped since `stub_caps` ran is still news on the next beat.
-    let mut last_announced_privacy = privacy_words_in(&hello_caps.rpc);
-    // FR-101 P2b — and the owner's session-policy floor it carried, likewise.
-    let mut last_announced_session_policy = hello_caps.session_policy;
+    // #3992 — the hello says every word the heartbeat would: one read
+    // (`Announcer::now`) and one builder (`Announcer::caps`) for both. So a
+    // supervised Mac's hello carries what its attached worker has already
+    // said, its permissions and, on one row, the person's floor included,
+    // rather than the root daemon's own `no-gui-session` for the 30 s until
+    // the first beat, after every reconnect. Only a loop that holds the host
+    // passes it: the primary, and on a one-row Mac every org (FR-43 P3b).
+    let announcer = Announcer {
+        agent_id: &cfg.agent_id,
+        ssh_enabled: cfg.ssh_enabled,
+        multi_org_tun: cfg.overlay_multi_org,
+        is_primary: ctx.is_primary,
+        survive,
+    };
+    let (hello_words, hello_caps) = announcer.hello(delegation.host());
+    let hello_permissions = hello_caps.permissions.clone();
+    let hello_session_policy = hello_caps.session_policy;
     let (arch, arch_emulated) = crate::arch::native();
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
@@ -2027,7 +1984,11 @@ async fn connect_once(
     // reset the timer, so this only matters when the server stalls
     // immediately after upgrade.
     watchdog::tick(ctx.pump);
-    info!("rc:agent.hello sent");
+    info!(
+        permissions = ?hello_permissions,
+        session_policy = ?hello_session_policy,
+        "rc:agent.hello sent"
+    );
     // FR-55 P4 — this connection says goodbye when the computer is going to
     // sleep. After the hello, because the server keys the notice by the
     // hello's connection; one that comes up inside an announced sleep is told
@@ -2087,16 +2048,14 @@ async fn connect_once(
             outbound_tx.clone(),
         );
     }
+    // FR-43 P2c, #3992 — what we last told the server: the words the hello
+    // carried, never a value read again afterwards, until a beat carries newer
+    // ones. So the first beat sends no caps unless something changed since the
+    // hello. Per CONNECTION, not per process: a reconnect's hello is built from
+    // a fresh read, and the server replaces what it held with it.
+    let mut last_announced = hello_words;
     // FR-43 P2b-2 — the WORKER's ends. The receiver is borrowed for this
     // connection; the sender is cloned so a delegated session can hold it.
-    // FR-43 P2c — what we last told the server about our permissions.
-    //
-    // Per CONNECTION, not per process: a reconnect sends a fresh `rc:agent.hello`
-    // carrying our own caps, so the server's view resets and our memory of it
-    // must reset too — otherwise a worker that attached before a reconnect would
-    // never be re-announced, and the row would sit wrong until the worker
-    // happened to change.
-    let mut last_announced_permissions: Option<(Vec<String>, bool)> = None;
     let (mut delegated_in, delegated_out) = match delegation.worker_mut() {
         Some((rx, tx)) => (Some(rx), Some(tx.clone())),
         None => (None, None),
@@ -2696,123 +2655,30 @@ async fn connect_once(
                     .filter(|w| w.state == "live")
                     .and_then(|w| w.relayed.clone());
                 // FR-43 P2c — announce capabilities only when they have
-                // CHANGED. Caps travel once in `rc:agent.hello`, which is too
-                // early for a macOS daemon: it must say hello immediately, and
-                // the GUI worker whose permissions it reports attaches later
-                // (or never, when nobody is logged in).
+                // CHANGED since the hello or the last beat that carried them:
+                // a worker that attaches after the hello (or leaves, or never
+                // comes, when nobody is logged in), an owner's live switch, a
+                // new answer. #3992 — what `Announcer::now` reads is compared
+                // whole, and only a changed beat builds caps, with the
+                // builder the hello used.
                 //
                 // ⚠️ Sending them every beat would be ~200 bytes of nothing on
                 // a frequent message. `None` means "no news", not "no caps".
                 watchdog::stage(ctx.pump, "heartbeat.caps");
-                let caps_now = delegate.as_ref().and_then(|d| d.effective_permissions());
-                // FR-85 P3b — the owner's remote-recording gate is live, so its
-                // word is news too: an OFF must stop the hub granting RECORD
-                // within a beat, not at the next reconnect.
-                //
-                // FR-85 P1e-mac — on a supervised Mac, the WORKER's word: a
-                // delegated session records there, with the person's recorder
-                // and gates, while this root daemon can record nothing. Only a
-                // loop that holds the host, like delegation itself: the
-                // primary, and on a one-row Mac every org (FR-43 P3b). Off one
-                // row a secondary org's session is never handed to the worker,
-                // so its row keeps our own caps.
-                let record_now = delegate
-                    .as_ref()
-                    .and_then(|d| d.effective_record())
-                    .unwrap_or_else(record_caps);
-                // FR-97 P2c — and its Remote Apps words, the same way: a
-                // worker that attaches after the hello (or leaves) is news.
-                let apps_now = delegate
-                    .as_ref()
-                    .and_then(|d| d.effective_apps())
-                    .unwrap_or_else(|| own_apps.clone());
-                // FR-97 P2a — and its audio offer, the same way.
-                let audio_now = delegate
-                    .as_ref()
-                    .and_then(|d| d.effective_audio())
-                    .unwrap_or_else(|| own_audio.clone());
-                let keep_busy_now = crate::keep_busy::advertised();
-                let sas_now = sas_advertised();
-                let desktop_now = crate::desktop_brief::current();
-                let exec_system_now = crate::exec_service::advertised_for(&cfg.agent_id);
-                let ssh_system_now =
-                    crate::ssh_service::advertised_for(&cfg.agent_id, cfg.ssh_enabled);
-                // FR-99 P1b — the owner's privacy switch is live: an OFF must
-                // stop the hub granting PRIVACY within a beat.
-                let privacy_now: Vec<String> = crate::privacy::current_words()
-                    .into_iter()
-                    .map(|w| w.wire().to_string())
-                    .collect();
-                // FR-101 P2b — the owner's floor is live too: a new `off` must
-                // reach the hub's strip (and its reason) within a beat.
-                //
-                // FR-43 P3b — on a one-row Mac, with the person's floor folded
-                // in, as the `Request` arm enforces it. Elsewhere this is
-                // `caps_policy()`.
-                let session_policy_now =
-                    crate::session_policy::caps_policy_of(crate::delegate::PersonFloor::session_policy(
-                        delegate.as_ref().and_then(|d| d.person_floor()),
-                        crate::session_policy::device_policy(),
-                    ));
-                // #3280 — a later try's answer replaced the probe's: its cells
-                // reach this row within a beat. Read before `stub_caps` below.
-                let caps_generation_now = crate::encode::caps::generation();
-                let caps = if caps_now == last_announced_permissions
-                    && record_now == last_announced_record
-                    && apps_now == last_announced_apps
-                    && audio_now == last_announced_audio
-                    && keep_busy_now == last_announced_keep_busy
-                    && sas_now == last_announced_sas
-                    && desktop_now == last_announced_desktop
-                    && exec_system_now == last_announced_exec_system
-                    && ssh_system_now == last_announced_ssh_system
-                    && privacy_now == last_announced_privacy
-                    && session_policy_now == last_announced_session_policy
-                    && caps_generation_now == last_announced_caps_generation
-                {
-                    None
-                } else {
-                    last_announced_permissions = caps_now.clone();
-                    last_announced_record = record_now.clone();
-                    last_announced_apps = apps_now.clone();
-                    last_announced_audio = audio_now.clone();
-                    last_announced_keep_busy = keep_busy_now;
-                    last_announced_sas = sas_now;
-                    last_announced_desktop = desktop_now;
-                    last_announced_exec_system = exec_system_now;
-                    last_announced_ssh_system = ssh_system_now;
-                    last_announced_privacy = privacy_now;
-                    last_announced_session_policy = session_policy_now;
-                    last_announced_caps_generation = caps_generation_now;
-                    // Our own caps AS THE HELLO BUILT THEM — the server replaces
-                    // its stored blob with this, so anything the hello carried
-                    // (`multi_org` `tun`, `record`) must be here too — with the
-                    // worker's permissions substituted: codecs and encoders
-                    // stay OURS, because we are the half that answers
-                    // `rc:session.request` (the P2b-3 lesson).
-                    let mut c = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
-                    crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
-                    crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
-                    crate::session_table::apply_resume_word(&mut c.rpc, survive);
-                    c.record = record_now;
-                    c.apps = apps_now;
-                    audio_now.apply(&mut c);
-                    c.session_policy = session_policy_now;
-                    if let Some((perms, has_input)) = caps_now {
-                        c.permissions = Some(perms);
-                        c.has_input_permission = has_input;
-                    }
-                    info!(
-                        permissions = ?c.permissions,
-                        record = ?c.record,
-                        apps = ?c.apps,
-                        audio = ?c.audio,
-                        desktop = ?c.desktop,
-                        video_cells = c.video_cells.len(),
-                        "announcing changed capabilities on the heartbeat (FR-43 P2c)"
-                    );
-                    Some(Box::new(c))
-                };
+                let caps = announcer
+                    .beat(&mut last_announced, delegate.as_ref())
+                    .map(|c| {
+                        info!(
+                            permissions = ?c.permissions,
+                            record = ?c.record,
+                            apps = ?c.apps,
+                            audio = ?c.audio,
+                            desktop = ?c.desktop,
+                            video_cells = c.video_cells.len(),
+                            "announcing changed capabilities on the heartbeat (FR-43 P2c)"
+                        );
+                        Box::new(c)
+                    });
                 let hb = ClientMsg::AgentHeartbeat {
                     // #2551 — no block until the sampler's first read lands.
                     rss_mb: sys.as_ref().map_or(0, |s| s.rss_mb),
@@ -7052,7 +6918,180 @@ fn stub_displays() -> Vec<DisplayInfo> {
     crate::displays::enumerate()
 }
 
-fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
+/// #3992 — every word a connection announces that can change while it is up,
+/// read in one place ([`Announcer::now`]). The hello carries the first read,
+/// and that is what the connection has announced until a beat reads one that
+/// differs and carries it. [`Announcer::caps`] builds the caps of both from it,
+/// so a word cannot be right in the hello and wrong on the heartbeat: record,
+/// apps and audio were each fixed in the hello alone, one at a time, and a
+/// one-row Mac's hello still said the root daemon's `no-gui-session` until its
+/// first beat.
+///
+/// The caps carry these values, never a second read of the same word, so what
+/// a connection records as announced is what it sent: a switch flipped after
+/// the read is news on the next beat.
+#[derive(Debug, Clone, PartialEq)]
+struct Announced {
+    /// #3280 — the answer's generation, read before anything else: an answer
+    /// adopted after this read is news on the next beat.
+    caps_generation: u64,
+    /// FR-43 P2c — the attached worker's permission pair
+    /// ([`DelegateHost::effective_permissions`](crate::delegate::DelegateHost::effective_permissions)).
+    /// `None` keeps our own: no worker, or one that has not sent its caps.
+    /// `Some([])` says the worker holds neither permission, and the row must
+    /// read `[]`, never our `no-gui-session`.
+    permissions: Option<(Vec<String>, bool)>,
+    /// FR-85 P3b — what this device can record, live: the owner's gate, so an
+    /// OFF stops the hub granting RECORD within a beat. FR-85 P1e-mac — on a
+    /// supervised Mac, the worker's: a delegated session records there, with
+    /// the person's recorder and gates, while the root daemon can record
+    /// nothing.
+    record: Vec<String>,
+    /// FR-97 P2c — the worker's Remote Apps words: a delegated session's
+    /// control channel ends on its peer, which serves `rc:apps.*` in the
+    /// person's window-server session, while the root daemon is in none and
+    /// says `status` alone. `None` keeps our own.
+    apps: Option<Vec<String>>,
+    /// FR-97 P2a — the worker's audio offer: it captures a delegated session's
+    /// sound in the person's session, while the root daemon says `no-session`.
+    /// `None` keeps our own.
+    audio: Option<crate::encode::caps::AudioWords>,
+    /// FR-92 — `keep-busy`: a flipped `keep_busy_enabled` reaches the server
+    /// within a beat.
+    keep_busy: bool,
+    /// FR-97 P4a — `sas`, the real Ctrl+Alt+Del ([`sas_advertised`]): a policy
+    /// a GPO refresh changes reaches the server within a beat, instead of a
+    /// viewer sending a sequence the host may no longer send.
+    sas: bool,
+    /// FR-93 P2b — the desktop a controller would see now: a login, a logout or
+    /// the greeter reaches the server within a beat.
+    desktop: Option<roomler_ai_remote_control::models::DesktopBrief>,
+    /// FR-94 — `exec-system`, on exactly the connection of the device this
+    /// machine's SYSTEM service is anchored for: an anchor written or removed
+    /// while connected is news.
+    exec_system: bool,
+    /// FR-105 — `ssh-system`, the same way: the service serves SSH for exactly
+    /// this device, and the person's `ssh_enabled` has this worker carry its
+    /// port.
+    ssh_system: bool,
+    /// FR-99 P1b — the `privacy-*` words, in order: an OFF of the owner's
+    /// switch stops the hub granting PRIVACY within a beat.
+    privacy: Vec<String>,
+    /// FR-101 P2b — the session-policy floor: a new `off` reaches the hub's
+    /// strip, and its reason, within a beat. FR-43 P3b — on a one-row Mac with
+    /// the person's floor folded in, as the `Request` arm enforces it.
+    session_policy: Option<roomler_ai_remote_control::models::SessionPolicy>,
+    /// FR-138 — `rc-resume`: the switch as this connection read it, the same
+    /// for its whole life.
+    resume: bool,
+}
+
+/// #3992 — what a connection's announcements are built from and that stays the
+/// same while it is up.
+struct Announcer<'a> {
+    /// The device this connection is, for `exec-system` and `ssh-system`.
+    agent_id: &'a str,
+    /// The person's `ssh_enabled`, for `ssh-system`.
+    ssh_enabled: bool,
+    /// `overlay_multi_org`, for [`stub_caps`]' `tun`.
+    multi_org_tun: bool,
+    is_primary: bool,
+    /// FR-138 — the switch, read once for this connection.
+    survive: bool,
+}
+
+impl Announcer<'_> {
+    /// Every word this connection announces, as it stands now. `delegate` is
+    /// the host on a loop that holds it, like delegation itself: the primary,
+    /// and on a one-row Mac every org (FR-43 P3b). Any other loop passes
+    /// `None` and says our own words: off one row a secondary org's session is
+    /// never handed to the worker.
+    fn now(&self, delegate: Option<&crate::delegate::DelegateHost>) -> Announced {
+        // #3280 — before the answer [`Self::caps`] reads: one adopted in
+        // between is news on the next beat.
+        let caps_generation = crate::encode::caps::generation();
+        Announced {
+            caps_generation,
+            permissions: delegate.and_then(|d| d.effective_permissions()),
+            record: delegate
+                .and_then(|d| d.effective_record())
+                .unwrap_or_else(record_caps),
+            apps: delegate.and_then(|d| d.effective_apps()),
+            audio: delegate.and_then(|d| d.effective_audio()),
+            keep_busy: crate::keep_busy::advertised(),
+            sas: sas_advertised(),
+            desktop: crate::desktop_brief::current(),
+            exec_system: crate::exec_service::advertised_for(self.agent_id),
+            ssh_system: crate::ssh_service::advertised_for(self.agent_id, self.ssh_enabled),
+            privacy: crate::privacy::current_words()
+                .into_iter()
+                .map(|w| w.wire().to_string())
+                .collect(),
+            // `person_floor` is `None` off one row, so there this is
+            // `caps_policy()`.
+            session_policy: crate::session_policy::caps_policy_of(
+                crate::delegate::PersonFloor::session_policy(
+                    delegate.and_then(|d| d.person_floor()),
+                    crate::session_policy::device_policy(),
+                ),
+            ),
+            resume: self.survive,
+        }
+    }
+
+    /// The caps that announce `words`: our own ([`stub_caps`]) with each of
+    /// them written in. The server replaces the row's stored caps with what a
+    /// beat sends, so everything the hello carried (`multi_org` `tun`,
+    /// `record`) is in every announcement. The worker's words replace ours
+    /// where it has said them; codecs and encoders stay OURS, because we are
+    /// the half that answers `rc:session.request` (the P2b-3 lesson).
+    fn caps(&self, words: &Announced) -> AgentCaps {
+        let mut caps = stub_caps(self.multi_org_tun, self.is_primary, words);
+        crate::session_table::apply_resume_word(&mut caps.rpc, words.resume);
+        crate::exec_service::apply_word(&mut caps.rpc, words.exec_system);
+        crate::ssh_service::apply_word(&mut caps.rpc, words.ssh_system);
+        if let Some(apps) = &words.apps {
+            caps.apps = apps.clone();
+        }
+        if let Some(audio) = &words.audio {
+            audio.clone().apply(&mut caps);
+        }
+        if let Some((permissions, has_input)) = &words.permissions {
+            caps.permissions = Some(permissions.clone());
+            caps.has_input_permission = *has_input;
+        }
+        caps
+    }
+
+    /// The hello's words and the caps that carry them. The words are what this
+    /// connection has announced until a beat carries newer ones.
+    fn hello(&self, delegate: Option<&crate::delegate::DelegateHost>) -> (Announced, AgentCaps) {
+        let words = self.now(delegate);
+        let caps = self.caps(&words);
+        (words, caps)
+    }
+
+    /// A beat's caps: `None` while the words read now are `last`, the ones last
+    /// announced, and otherwise the caps that carry the new words, which become
+    /// `last`. Only a changed beat builds caps.
+    fn beat(
+        &self,
+        last: &mut Announced,
+        delegate: Option<&crate::delegate::DelegateHost>,
+    ) -> Option<AgentCaps> {
+        let now = self.now(delegate);
+        if now == *last {
+            return None;
+        }
+        let caps = self.caps(&now);
+        *last = now;
+        Some(caps)
+    }
+}
+
+/// Our own caps, with the live words of `words` written in where the probe's
+/// answer has none: [`Announcer::caps`] is its one caller.
+fn stub_caps(multi_org_tun: bool, is_primary: bool, words: &Announced) -> AgentCaps {
     // Real probe via encode::caps; replaces the empty-vec stub. The
     // resulting AgentCaps populates the rc:agent.hello payload, which
     // the server persists into the agents collection and surfaces in
@@ -7082,11 +7121,11 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
     if multi_org_tun {
         caps.multi_org.push("tun".into());
     }
-    caps.record = record_caps();
+    caps.record = words.record.clone();
     // FR-92 — `keep-busy` follows the owner's LIVE `keep_busy_enabled`, so,
     // like the record words, it is appended at every announcement and never
     // inside the memoized, config-blind `detect()`.
-    if crate::keep_busy::advertised() {
+    if words.keep_busy {
         caps.input.push("keep-busy".into());
     }
     // FR-109 — `mouse-rel` where this build's injector carries relative
@@ -7101,44 +7140,41 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
     // Live like the words above, and the heartbeat compares it
     // (`sas_advertised`), so a GPO refresh that changes the policy is news
     // within a beat. Elsewhere the button keeps typing keys, and the reason
-    // says which half is missing.
+    // says which half is missing. The word is the snapshot's; its reason, which
+    // no beat compares, is read here, and a policy that let services in
+    // between keeps the answer's own.
     #[cfg(target_os = "windows")]
-    match crate::input::sas::availability() {
-        Ok(()) => {
+    {
+        if words.sas {
             caps.input.push("sas".into());
             caps.unavailable.remove("sas");
-        }
-        Err(refusal) => {
-            if let Some(entry) = caps.unavailable.get_mut("sas") {
-                entry.reason = refusal.reason().into();
-                // #3387 — `no-machine-enrollment` on a service that waits for
-                // a machine enrollment: what a server read finds it by.
-                if let Some(code) = refusal.code() {
-                    entry.code = code.into();
-                }
+        } else if let Err(refusal) = crate::input::sas::availability()
+            && let Some(entry) = caps.unavailable.get_mut("sas")
+        {
+            entry.reason = refusal.reason().into();
+            // #3387 — `no-machine-enrollment` on a service that waits for
+            // a machine enrollment: what a server read finds it by.
+            if let Some(code) = refusal.code() {
+                entry.code = code.into();
             }
         }
     }
     // FR-93 P2b — the desktop a controller would see now, read from the
     // refresher's cache (never logind on this path). Live, like the words
     // above: the heartbeat re-announces when it changes.
-    caps.desktop = crate::desktop_brief::current();
+    caps.desktop = words.desktop.clone();
     // FR-99 P1b — `privacy-available` where a curtain is possible here, and
     // `privacy-mode` only while the owner allows it too. Live like the record
     // words: the owner's switch moves the second, and the overlay coming up
     // after `detect()` ran moves both. The heartbeat re-announces a change.
-    caps.rpc.extend(
-        crate::privacy::current_words()
-            .into_iter()
-            .map(|w| w.wire().to_string()),
-    );
+    caps.rpc.extend(words.privacy.iter().cloned());
     // FR-101 P2b — this build enforces the session policy (it masks every
     // grant by the org's policy and its owner's floor, and its prompt names
     // what it asks about), so the hub may keep an `ask` feature for it. And
     // the floor itself, when it restricts anything, so the hub can say why it
     // strips what this device will refuse. Live: the heartbeat re-announces it.
     caps.rpc.push(RpcCap::SessionPolicy.wire().to_string());
-    caps.session_policy = crate::session_policy::caps_policy();
+    caps.session_policy = words.session_policy;
     // FR-101 P4b-2 — and it keeps an idle limit (`session_idle`), so the hub
     // may tell the viewer the limit this session runs under.
     caps.rpc.push(RpcCap::IdleTimeout.wire().to_string());
@@ -7163,15 +7199,6 @@ fn sas_advertised() -> bool {
     {
         false
     }
-}
-
-/// FR-99 P1b — the `privacy-*` words in an `rpc` list, in order: what the
-/// heartbeat compares to decide whether the owner's switch is news.
-fn privacy_words_in(rpc: &[String]) -> Vec<String> {
-    rpc.iter()
-        .filter(|w| *w == RpcCap::PrivacyMode.wire() || *w == RpcCap::PrivacyAvailable.wire())
-        .cloned()
-        .collect()
 }
 
 /// FR-85 P3b — `AgentCaps.record` as it stands NOW: the owner's live gate
@@ -10115,5 +10142,212 @@ mod exec_answer_tests {
                 "withdrawn (surface={have_surface})"
             );
         }
+    }
+}
+
+/// #3992 — the hello and the heartbeat announce one snapshot: the words
+/// [`Announcer::now`] reads, in the caps [`Announcer::caps`] builds. Each test
+/// holds the probe's lock ([`crate::encode::caps::loop_fixture`]), so the
+/// answer's generation cannot move between two reads.
+#[cfg(test)]
+mod announce_tests {
+    use super::Announcer;
+    use crate::delegate::{DelegateHost, PersonFloor};
+    use roomler_ai_remote_control::models::{AgentCaps, FeaturePolicy, SessionPolicy, VideoCell};
+
+    /// A primary org's loop. No SYSTEM service is anchored for this id.
+    fn primary() -> Announcer<'static> {
+        Announcer {
+            agent_id: "000000000000000000003992",
+            ssh_enabled: false,
+            multi_org_tun: false,
+            is_primary: true,
+            survive: false,
+        }
+    }
+
+    /// A daemon whose worker has announced this permission pair.
+    fn worker_said(permissions: &[&str], has_input: bool) -> DelegateHost {
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        host.hold_worker_caps_for_test(AgentCaps {
+            permissions: Some(permissions.iter().map(|w| w.to_string()).collect()),
+            has_input_permission: has_input,
+            ..Default::default()
+        });
+        host
+    }
+
+    /// Every feature off: stricter than any device's floor.
+    fn all_off() -> SessionPolicy {
+        SessionPolicy {
+            clipboard: FeaturePolicy::Off,
+            files: FeaturePolicy::Off,
+            audio: FeaturePolicy::Off,
+        }
+    }
+
+    /// T1 — a worker that holds neither permission: the hello says `[]`, as
+    /// the issue's Mac measured, never the root daemon's `no-gui-session`.
+    #[test]
+    fn the_hello_carries_a_worker_that_holds_neither_permission() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = worker_said(&[], false);
+        let (_, hello) = primary().hello(Some(&host));
+        assert_eq!(hello.permissions, Some(Vec::new()));
+        assert!(!hello.has_input_permission);
+    }
+
+    /// T2 — a worker that holds both: exactly its words, and input.
+    #[test]
+    fn the_hello_carries_a_worker_that_holds_both_permissions() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = worker_said(&["screen-capture", "input"], true);
+        let (_, hello) = primary().hello(Some(&host));
+        assert_eq!(
+            hello.permissions,
+            Some(vec!["screen-capture".to_string(), "input".to_string()])
+        );
+        assert!(hello.has_input_permission);
+    }
+
+    /// T3 — a loop that holds no host says our own pair.
+    #[test]
+    fn with_no_worker_the_hello_carries_our_own_permissions() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let own = crate::encode::caps::answer_now();
+        let (words, hello) = primary().hello(None);
+        assert_eq!(words.permissions, None, "nothing to override");
+        assert_eq!(hello.permissions, own.permissions);
+        assert_eq!(hello.has_input_permission, own.has_input_permission);
+    }
+
+    /// T4 — and so does one whose worker is attached but has sent no caps.
+    #[test]
+    fn with_a_worker_that_has_said_nothing_the_hello_carries_our_own_permissions() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let own = crate::encode::caps::answer_now();
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        let (words, hello) = primary().hello(Some(&host));
+        assert_eq!(words.permissions, None, "nothing to override");
+        assert_eq!(hello.permissions, own.permissions);
+        assert_eq!(hello.has_input_permission, own.has_input_permission);
+    }
+
+    /// T5 — one row, the person's floor stricter than the device's: the hello
+    /// carries the session policy a beat would send for the same inputs, with
+    /// the floor folded in as the `Request` arm enforces it.
+    #[test]
+    fn on_one_row_the_hello_carries_the_persons_floor_as_a_beat_does() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = worker_said(&[], false);
+        host.set_one_row();
+        host.note_person_floor_for_test(PersonFloor {
+            auto_grant_session: false,
+            session_policy: all_off(),
+        });
+        let announcer = primary();
+        let (words, hello) = announcer.hello(Some(&host));
+        // A beat with news to tell builds its caps from the same inputs.
+        let mut older = words.clone();
+        older.caps_generation = older.caps_generation.wrapping_sub(1);
+        let beat = announcer
+            .beat(&mut older, Some(&host))
+            .expect("a beat with news carries caps");
+        assert_eq!(hello.session_policy, Some(all_off()));
+        assert_eq!(hello.session_policy, beat.session_policy);
+    }
+
+    /// T6 — with no person's floor, the device's own, as before: no host, a
+    /// one-row host whose worker sent none, and a host off one row, which
+    /// ignores one.
+    #[test]
+    fn with_no_persons_floor_the_hello_carries_the_devices_policy() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let device = crate::session_policy::caps_policy();
+        let (_, no_host) = primary().hello(None);
+        assert_eq!(no_host.session_policy, device);
+
+        let one_row = worker_said(&[], false);
+        one_row.set_one_row();
+        let (_, quiet) = primary().hello(Some(&one_row));
+        assert_eq!(quiet.session_policy, device);
+
+        let two_rows = worker_said(&[], false);
+        two_rows.note_person_floor_for_test(PersonFloor {
+            auto_grant_session: false,
+            session_policy: all_off(),
+        });
+        let (_, ignored) = primary().hello(Some(&two_rows));
+        assert_eq!(ignored.session_policy, device);
+    }
+
+    /// T7 — after a hello that carried the worker's words, a beat with nothing
+    /// new carries no caps.
+    #[test]
+    fn a_beat_after_a_hello_with_the_workers_words_carries_none() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = worker_said(&[], false);
+        let announcer = primary();
+        let (mut last, _) = announcer.hello(Some(&host));
+        assert!(announcer.beat(&mut last, Some(&host)).is_none());
+    }
+
+    /// T8 — a worker that announces after the hello: the next beat carries its
+    /// words, and the one after it nothing.
+    #[test]
+    fn a_worker_that_announces_after_the_hello_is_news_once() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        let announcer = primary();
+        let (mut last, _) = announcer.hello(Some(&host));
+        assert!(
+            announcer.beat(&mut last, Some(&host)).is_none(),
+            "nothing yet"
+        );
+        host.hold_worker_caps_for_test(AgentCaps {
+            permissions: Some(vec!["screen-capture".into()]),
+            ..Default::default()
+        });
+        let beat = announcer
+            .beat(&mut last, Some(&host))
+            .expect("the worker's words are news");
+        assert_eq!(beat.permissions, Some(vec!["screen-capture".to_string()]));
+        assert!(!beat.has_input_permission);
+        assert!(announcer.beat(&mut last, Some(&host)).is_none(), "once");
+    }
+
+    /// T9 — a worker's codecs, encoders and cells never reach the row: ours
+    /// do, the half that answers `rc:session.request` (the P2b-3 lesson).
+    #[test]
+    fn the_hello_keeps_our_codecs_encoders_and_cells() {
+        let _probe = crate::encode::caps::loop_fixture();
+        let own = crate::encode::caps::answer_now();
+        let host = DelegateHost::new();
+        let _frames = host.attach_for_test();
+        host.hold_worker_caps_for_test(AgentCaps {
+            codecs: vec!["av1".into(), "vp9".into()],
+            hw_encoders: vec!["a worker's encoder".into()],
+            video_cells: vec![VideoCell {
+                codec: "av1".into(),
+                backend: "videotoolbox".into(),
+                chroma: vec!["yuv444".into()],
+                hw: true,
+            }],
+            permissions: Some(vec!["screen-capture".into(), "input".into()]),
+            has_input_permission: true,
+            ..Default::default()
+        });
+        let (_, hello) = primary().hello(Some(&host));
+        assert_eq!(hello.codecs, own.codecs);
+        assert_eq!(hello.hw_encoders, own.hw_encoders);
+        assert_eq!(hello.video_cells, own.video_cells);
+        assert_eq!(
+            hello.permissions,
+            Some(vec!["screen-capture".to_string(), "input".to_string()]),
+            "while its permissions do"
+        );
     }
 }

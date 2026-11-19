@@ -297,7 +297,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:4075`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3941`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10381`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -951,11 +951,16 @@ wins. The config-derived words stay as they are. The GPU-input lists are an `RwL
 `OnceLock` for this: a first answer installs even an empty list, so a later one could never have got
 in.
 
-**How it reaches the server and the viewer.** The heartbeat re-announces when something changed
-(FR-43 P2c), and the server replaces the row's blob. A generation counter joins that comparison, per
-connection, with no wire change, and since #3439 a watch on it wakes every connection, so every
-organization's row gets it at once rather than within a beat. A reconnect's hello reads the answer
-in force. A viewer sees the new matrix at its next page load or 5-minute status read. A session
+**How it reaches the server and the viewer.** The hello and the heartbeat announce one snapshot
+(#3992). One function reads every word a connection announces, the answer's generation first
+([`Announcer::now`](../agents/roomlerd/src/signaling.rs#L7009)), and one builds the caps from it
+([`Announcer::caps`](../agents/roomlerd/src/signaling.rs#L7048)). The hello carries the first
+snapshot, and that is what the connection has announced until a beat reads one that differs
+([`Announcer::beat`](../agents/roomlerd/src/signaling.rs#L7077)) and re-announces (FR-43 P2c);
+the server replaces the row's blob. The generation is part of that comparison, per connection,
+with no wire change, and since #3439 a watch on it wakes every connection, so every organization's
+row gets it at once rather than within a beat. A reconnect's hello reads the answer in force. A
+viewer sees the new matrix at its next page load or 5-minute status read. A session
 starting from an older page still gets the new answer for its codec pick, because the agent picks
 from the answer in force, and a live session is not renegotiated.
 
