@@ -335,6 +335,11 @@ mod rc_resume_tests;
 mod rc_session_limits_tests;
 #[cfg(test)]
 mod rc_session_policy_tests;
+/// #3840 — a Redis that stops answering, with no reset and no close, fails a
+/// command on the shared connection and a request that awaits one within the
+/// response timeout, instead of hanging.
+#[cfg(test)]
+mod redis_bound_tests;
 #[cfg(test)]
 mod relay_allowance_tests;
 #[cfg(test)]

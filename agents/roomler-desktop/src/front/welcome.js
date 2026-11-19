@@ -163,8 +163,12 @@
     const s = get('status');
     const dv = get('deviceView');
     const enrolled = !!(s && s.enrolled);
+    // #4020 — an enrollment the device service holds and this app cannot
+    // read: neither line, and no offer to enroll.
+    const unknown = !enrolled && !!(s && s.enrollment_unknown);
     el('wl-dev-enrolled').hidden = !enrolled;
-    el('wl-dev-unenrolled').hidden = enrolled || !s;
+    el('wl-dev-unenrolled').hidden = enrolled || unknown || !s;
+    el('wl-dev-unknown').hidden = !unknown;
     if (enrolled) {
       const liveName = dv && dv.available && dv.status && dv.status.name;
       setText('wl-dev-name', liveName || s.device_name || '—');

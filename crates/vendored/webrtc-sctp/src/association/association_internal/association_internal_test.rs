@@ -1228,3 +1228,111 @@ async fn test_gauges_a_clock_gone_backwards_stores_nothing() -> Result<()> {
 
     Ok(())
 }
+
+/// roomler (#4033): one DATA chunk, `tsn`, in a packet of its own, taken as
+/// `handle_inbound` takes a packet.
+async fn receive_lone_data(a: &mut AssociationInternal, tsn: u32) -> Result<()> {
+    a.handle_chunk_start();
+    a.handle_data(&ChunkPayloadData {
+        unordered: true,
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        stream_identifier: 1,
+        user_data: Bytes::from_static(b"lone"),
+        ..Default::default()
+    })
+    .await?;
+    a.handle_chunk_end();
+    Ok(())
+}
+
+/// roomler (#4033): the cumulative TSN of the SACK the write loop would send
+/// now, if one is owed.
+async fn sack_owed(a: &mut AssociationInternal) -> Option<u32> {
+    a.gather_outbound_sack_packets(vec![])
+        .await
+        .iter()
+        .flat_map(|p| p.chunks.iter())
+        .find_map(|c| {
+            c.as_any()
+                .downcast_ref::<ChunkSelectiveAck>()
+                .map(|s| s.cumulative_tsn_ack)
+        })
+}
+
+/// roomler (#4033): whether the ack timer's handle is set, so that its
+/// `start` arms nothing.
+fn ack_timer_set(a: &AssociationInternal) -> bool {
+    a.ack_timer.as_ref().is_some_and(|t| t.is_running())
+}
+
+/// roomler (#4033): a timeout delivered late loses no SACK, and no timeout
+/// leaves the ack timer's handle set. The race: a timer fires, and its task
+/// waits for the association's lock; meanwhile a second packet is
+/// acknowledged at once, which stops that timer, and a lone packet after it
+/// arms a new one; then the old task's timeout runs. It stops the new timer,
+/// whose SACK it sends at once. The timers here never fire on their own (an
+/// hour, and no observer), so the test delivers each timeout in that order.
+#[tokio::test]
+async fn test_a_late_ack_timeout_loses_no_sack_and_leaves_the_timer_free() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "receiver".to_owned(),
+    });
+    a.ack_timer = Some(AckTimer::new(
+        std::sync::Weak::new(),
+        Duration::from_secs(3600),
+    ));
+    a.open_stream(1, PayloadProtocolIdentifier::Binary)?;
+
+    // A lone packet: its SACK is delayed, and the timer armed.
+    receive_lone_data(&mut a, 1).await?;
+    assert_eq!(a.ack_state, AckState::Delay);
+    assert!(ack_timer_set(&a), "the first lone packet armed no timer");
+    assert_eq!(sack_owed(&mut a).await, None);
+
+    // Its timer fires, and its task waits. A second packet is acknowledged
+    // at once, which stops the timer.
+    receive_lone_data(&mut a, 2).await?;
+    assert_eq!(sack_owed(&mut a).await, Some(2));
+    assert!(!ack_timer_set(&a));
+
+    // A lone packet after it arms a new timer.
+    receive_lone_data(&mut a, 3).await?;
+    assert_eq!(a.ack_state, AckState::Delay);
+    assert!(
+        ack_timer_set(&a),
+        "the lone packet after a stop armed no timer"
+    );
+
+    // The old task's timeout runs now.
+    a.on_ack_timeout().await;
+    assert_eq!(
+        sack_owed(&mut a).await,
+        Some(3),
+        "the late timeout lost the SACK of the lone packet after it"
+    );
+    assert!(
+        !ack_timer_set(&a),
+        "a late timeout left the ack timer's handle set: the next lone packet arms no timer"
+    );
+
+    // The next lone packet arms a timer, and its own timeout sends its SACK
+    // and leaves the timer free for the one after.
+    receive_lone_data(&mut a, 4).await?;
+    assert!(
+        ack_timer_set(&a),
+        "the lone packet after a late timeout armed no timer"
+    );
+    a.on_ack_timeout().await;
+    assert_eq!(sack_owed(&mut a).await, Some(4));
+    assert!(
+        !ack_timer_set(&a),
+        "a timeout left the ack timer's handle set: the next lone packet arms no timer"
+    );
+
+    Ok(())
+}

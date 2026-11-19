@@ -85,9 +85,9 @@ const DEADLINE_LEAD: Duration = Duration::from_millis(25);
 
 /// The fewest messages the in-flight cap allows: a receiver acknowledges
 /// every second packet at once and a lone one only when its delayed
-/// acknowledgement fires (the vendored receiver, after one such timeout, not
-/// until the next packet comes), so two keep the acknowledgements coming and
-/// a third keeps the link busy while they return.
+/// acknowledgement fires, up to [`DELAYED_ACK`] after it arrived, so two
+/// keep the acknowledgements coming and a third keeps the link busy while
+/// they return.
 const CAP_FLOOR_MESSAGES: u64 = 3;
 
 /// Rounds held at the cap, and never by SCTP's windows, each delivering less

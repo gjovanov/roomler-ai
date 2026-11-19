@@ -8422,6 +8422,7 @@ dependencies = [
  "axum",
  "bson",
  "dashmap",
+ "redis",
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-fleet",

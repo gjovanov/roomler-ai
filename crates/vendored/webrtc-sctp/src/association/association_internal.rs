@@ -2384,6 +2384,14 @@ impl AckTimerObserver for AssociationInternal {
             self.ack_state
         );
         self.stats.inc_ack_timeouts();
+        // roomler (#4033): the timer that fired is spent, but its task leaves
+        // `close_tx` set, and `AckTimer::start` arms nothing while it is, so
+        // the next lone packet would arm none. A late timeout, whose timer was
+        // stopped while it waited for this lock, stops any armed since; the
+        // SACK that one was for goes now, as `Immediate` sends it.
+        if let Some(ack_timer) = &mut self.ack_timer {
+            ack_timer.stop();
+        }
         self.ack_state = AckState::Immediate;
         self.awake_write_loop();
     }

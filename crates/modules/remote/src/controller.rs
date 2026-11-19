@@ -350,7 +350,7 @@ pub async fn dispatch_controller_rc(
                         });
                         return true;
                     }
-                    Err(()) => { /* relay unavailable - PR-1 path below */ }
+                    Err(_) => { /* relay unavailable - PR-1 path below */ }
                 }
             }
             // PR-1 direction rule: only a correctly-keyed conn that is
@@ -429,7 +429,7 @@ pub async fn dispatch_controller_rc(
             if !owners.is_empty()
                 && let Ok(frame_val) = serde_json::from_str::<serde_json::Value>(text)
             {
-                let mut refusal: Option<(String, String)> = None;
+                let mut said = crate::relay::Scoped::default();
                 for owner in owners {
                     match crate::relay::relay_rc_frame(
                         state,
@@ -453,17 +453,17 @@ pub async fn dispatch_controller_rc(
                     .await
                     {
                         Ok(None) => return true,
-                        Ok(Some(cm)) => refusal = Some(cm),
-                        Err(()) => {}
+                        Ok(Some(cm)) => said.refused(cm),
+                        Err(failed) => said.failed(failed),
                     }
                 }
-                if let Some((code, message)) = refusal {
-                    let _ = controller_tx.try_send(ServerMsg::Error {
-                        session_id: error_session_id(&e),
-                        code,
-                        message,
-                        open_nonce: None,
-                    });
+                if let Some(refusal) = said.refusal(error_session_id(&e)) {
+                    let _ = controller_tx.try_send(refusal);
+                    return true;
+                }
+                // #3840: Redis lost it on the way and no owner refused it: no
+                // word to the controller, whose timers recover a setup.
+                if said.dropped(&frame_val) {
                     return true;
                 }
             }

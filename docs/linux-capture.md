@@ -529,8 +529,8 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:130`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7125`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2620`).
+heartbeat only read that cache (`signaling.rs:7023`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:2669`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
@@ -1196,7 +1196,7 @@ buffer handle**, so a daemon that is not root opened DRM capture without
 complaint and then failed every frame. That is a per-user install with
 `drm_capture` set. The session died and re-created itself, and the viewer only
 ever said *"No video from this device after 3 attempts"*. The open now checks
-the handle (`unreadable`, `drm_backend.rs:1128`) and refuses with the fix in
+the handle (`unreadable`, `drm_backend.rs:1157`) and refuses with the fix in
 words, which reach the viewer as the arm's own error (§1.1): *"drm_capture is
 on, but DRM capture could not open: reading the scanout needs CAP_SYS_ADMIN
 (root), which this daemon lacks: on a per-user install run roomler config
@@ -1207,7 +1207,7 @@ arm (§1.2), the desktop's own screencast.
 On one Apple-silicon (Asahi) display, mutter scans out 10-bit `XR30` and KWin
 8-bit `AB24`: the same driver and panel, with red and blue in opposite places.
 The repack resolves a `Layout` from each framebuffer's fourcc (`Layout::of`,
-`drm_backend.rs:673`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
+`drm_backend.rs:674`) and handles the eight 32-bit RGB formats, `XR24`/`AR24`,
 `XB24`/`AB24`, `XR30`/`AR30` and `XB30`/`AB30`. Any other fourcc is a refusal
 (*"unhandled scanout pixel format …"*), never a guess. Before it, a KDE host on
 Asahi refused every frame. ⚠️ A wrong channel order does not *look* broken:
@@ -1475,10 +1475,10 @@ flowchart LR
 
 | Phase | What changed | Where | Kill switch |
 |---|---|---|---|
-| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3817`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1329`; `set_output_cap`, `drm_backend.rs:1542` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
-| **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:712`; `band_threads`, `drm_backend.rs:740` | `ROOMLERD_DRM_THREADS=1` |
-| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1476` | — (a timing fix) |
-| **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:151` | `ROOMLERD_DRM_GPU=0` |
+| **P1** | The DRM arm honours the pump's encode box (`set_output_cap`, the seam macOS already honours). Whenever half the source still covers the box, the CPU path takes the fused half read, whatever the policy says: a 4K scanout for a 1920×1012 encode, but never a 1440p one, whose half would be smaller than what the encode keeps. The VP9 and FFmpeg DataChannel pumps open their capture with `Never` (`agents/roomlerd/src/peer.rs:3817`), so before P1 they read the full 4K and resampled all 8.8 M pixels of it | `wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1439`; `set_output_cap`, `drm_backend.rs:1668` | `ROOMLERD_DRM_FOLLOW_CAP=0` |
+| **P2** | The CPU repack runs in row bands, one thread each (4 by default). Each thread still reads its own rows in order, the one access pattern FR-36 measured this mapping to tolerate. The output is byte-identical to the single pass, which `banded_repacks_match_the_single_pass` locks for every layout | `in_bands`, `drm_backend.rs:713`; `band_threads`, `drm_backend.rs:741` | `ROOMLERD_DRM_THREADS=1` |
+| **P2b** | The frame period runs from when a frame was *asked for*, not from when it arrived. Timed from the arrival, every period also paid for the grab, so a 30 fps target ran at 1000 / (33.3 + grab): 15–16 fps with the CPU's ~34 ms read, 26–27 with the GPU's ~3 ms. Both predictions matched the measurements to within 1 fps | `next_frame`, `drm_backend.rs:1544` | — (a timing fix) |
+| **P3** | The GPU reads the scanout. EGL imports its dma-buf through Mesa's surfaceless platform, on the render node, with no display server. One GLES pass renders it at **exactly** the pump's encode box (a box filter of up to 4×4 bilinear taps a pixel), and converts any of the eight RGB scanout formats to BGRA. The CPU reads back that small frame, and the pump's resample has nothing left to do. Imports are cached per buffer, keyed as the mapping is (FR-93 P3f). `libEGL.so.1` and `libGLESv2.so.2` are loaded at runtime, so no package gains a dependency. A host without them, with a software renderer (`llvmpipe`), or whose GPU pass fails keeps the CPU path, said once in the log. The idle skip (§3.2) and the cursor plane (§3.1) are unchanged | `Egl`, `agents/roomlerd/src/capture/drm_gpu.rs:316`; `Egl::retire`, `drm_gpu.rs:445`; `Converter::open`, `drm_gpu.rs:464`; `convert`, `drm_gpu.rs:754`; `via_gpu`, `drm_backend.rs:152` | `ROOMLERD_DRM_GPU=0` |
 
 Shipped in **0.4.140**. Measured on that box (GNOME, 4096×2160 `XR30`), one
 viewer, a continuously moving window (`vkcube`), 0.4.139 and the released
@@ -1539,6 +1539,93 @@ encode stays in software.
 pipeline.** The animation moves for part of each toggle, and the idle skip
 (§3.2) rightly sends nothing in between, so "frames per second" there reads 4–5
 for every build. Measure with motion that never stops.
+
+### 3.5 A framebuffer freed under a grab (#4035)
+
+Each grab reads which framebuffer the primary plane shows, reads the cursor
+plane, and then asks the kernel for that framebuffer (`drmModeGetFB2`). A
+compositor that flips to a new buffer and frees the old one between those calls
+makes the kernel answer `ENOENT` for an id that was on screen a moment before.
+Until #4035 that failed the grab. A pump has one answer to a failed grab: it
+rebuilds the capture, and the VP9 4:4:4 and RTP pumps drop their encoder with
+it. So the viewer got a keyframe and a gap for a race the next tick would have
+won. A bounded read of the fleet's logs over the 7 days to 2026-11-18 found 18
+such rebuilds, in 8 sessions on 4 lab guests, all on the VP9 4:4:4 pump. On an
+FR-148 lab cell they landed inside two measurement holds, and a result was
+withdrawn (#3953).
+
+An `ENOENT` now costs its grab one tick, and a run of them is bounded
+(`FreedRun`, `agents/roomlerd/src/capture/drm_backend.rs:1189`):
+
+```mermaid
+flowchart TD
+    T["a tick: the primary plane names a framebuffer"] --> C["the cursor plane is read and published"]
+    C --> G{"GETFB2 for that framebuffer"}
+    G -- found --> R["the frame is read as before;<br/>the run of ENOENTs ends"]
+    G -- "ENOENT, under 10 in a row" --> K["Grabbed::Raced:<br/>no frame this tick, and no error"]
+    K --> N["next_frame asks again a frame period later,<br/>as it does after an unchanged frame"]
+    N --> T
+    G -- "ENOENT, the 10th in a row" --> X["the grab fails and names the count;<br/>the pump rebuilds the capture"]
+    G -- "any other failure" --> F["the grab fails at once, as before;<br/>the pump rebuilds the capture"]
+```
+
+| What the grab meets | Transient? | What the pump sees |
+|---|---|---|
+| GETFB2 answers `ENOENT`: the compositor freed the framebuffer after the plane read | **yes**, a lost race: the next grab reads the plane again and finds the buffer that replaced it | nothing. `next_frame` waits the tick out as it does an unchanged frame: it asks again a frame period later, and says "no frame" only after 250 ms without one (§3.2) |
+| `ENOENT` on `FREED_RUN_MAX` (10) grabs in a row | **no**: the plane goes on naming a framebuffer the kernel cannot find | the error, *"drmModeGetFB2: No such file or directory (os error 2), 10 grabs in a row: the primary plane names a framebuffer the kernel cannot find (#4035)"*. The pump rebuilds the capture, which reads the planes again |
+| any other GETFB2 failure, `EPERM` and `EACCES` among them, or a fourcc the drm crate does not know | no | the error at once and a rebuild, as before |
+| any later failure of the grab: a non-linear modifier, an unhandled pixel format, no GEM handle, the PRIME export, the `mmap` | no | the error at once and a rebuild, as before |
+| no plane bound: nothing scanned out | not a failure | "no frame", as before: the pointer is hidden, the idle gate forgets, and a display switched off is told (§3.3). It asks no GETFB2, so it neither ends nor extends a run |
+| the cursor plane's own GETFB2 or read fails | not a failure | nothing: the pointer is hidden until the cursor's next read (a new buffer, or 250 ms), as before (§3.1) |
+
+⚠️ **The errno decides, never the message.** The drm crate hands the ioctl's
+errno over as `io::Error::from_raw_os_error`, and `freed`
+(`drm_backend.rs:1226`) compares that code with `ENOENT`. An error that only
+reads like one, with *"No such file or directory"* in its text, fails the grab
+like any other, and `any_other_getfb2_failure_fails_at_once` holds it to that.
+
+⚠️ **A skipped tick is neither "nothing scanned out" nor "unchanged".** It is
+its own answer, `Grabbed::Raced` (`drm_backend.rs:823`). "Nothing scanned out"
+hides the pointer, makes the idle gate forget its last frame, and leads the
+worker to check for a dark display (§3.3); a race does none of that. The cursor
+plane was read and published before GETFB2, so the pointer keeps following the
+viewer's mouse through a skip, and the gate still holds the frame it last
+delivered. `next_frame` waits a race out on the same arm as an unchanged frame
+(`drm_backend.rs:1605`), but does not count it in `frames_unchanged`, which
+stays the idle skip's own measure.
+
+⚠️ **Bounded on purpose.** A plane that keeps naming a framebuffer the kernel
+cannot find has not lost a race, and skipping it for good would freeze the
+picture with nothing to recover it. Ten in a row (`FREED_RUN_MAX`,
+`drm_backend.rs:1167`) is a third of a second at 30 fps and a sixth at 60. The
+run ends in the rebuild every `ENOENT` caused before, and its error carries the
+count, so a field read can tell a bounded run's end from the race #4035
+removed.
+
+**The next tick, not a second read in this one.** The race is a window between
+two ioctls. The next grab, a frame period later, reads a plane the compositor
+has finished flipping; a second read inside this grab would repeat the plane
+and cursor reads within the same tick. One mechanism also keeps the bound a
+plain count.
+
+**The log.** A capture's first skip says so once: `drm capture: the compositor
+freed the primary plane's framebuffer mid-grab (ENOENT): the tick is skipped,
+and 10 in a row rebuild the capture (#4035)`. When the capture ends, `drm
+capture: ticks skipped because the compositor freed their framebuffer mid-grab
+(#4035)` gives the total as `skipped`.
+
+The open's own GETFB2 (`drm_backend.rs:1026`) is unchanged: an error there,
+`ENOENT` included, fails the open as before. There is no kill switch: the bound
+already falls back to the old rebuild for a plane that stays broken, and a knob
+would raise FR-135's ratchet (`scripts/rc-media-ratchet.sh` counts env reads in
+`capture/`). The class this belongs to, a transient capture error that forces a
+full rebuild, is FR-135's `CaptureStage` (phase R4b). Its ledger row,
+`cap:SPC-58` in `docs/plans/rc-media-debt.tsv`, retires when the capture stage
+classifies its errors, so that a transient one costs a tick, bounded, and only a
+persistent one reopens. Unit-tested without a DRM device (`FreedRun::judge`,
+and `next_frame` against a stand-in worker); not yet field-verified: #4035's
+acceptance is the same bounded log read, over a week, after the release that
+carries it.
 
 ## 4. The portal arm (FR-45 P1–P4)
 
@@ -2027,10 +2114,10 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:4521`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:4536`) — the same `loginctl` walk the FR-27
 consent companion uses, asked since #3857 through one walk in flight, 1.5 s at
-most (`graphical_session_within`, `companion.rs:8604`). It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4574-4577`),
+most (`graphical_session_within`, `companion.rs:8655`). It accepts a session only when
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:4589-4592`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
@@ -2634,7 +2721,7 @@ is still in its file (`scripts/code-map-audit.sh`).
 | `agents/roomlerd/src/input/x_follow.rs` | #3918: the X11 injector's follow (`gate`, `let_go`, `opened_under`) and its kill switch (`enabled`); the marks (`no_picture`) and who is left behind (`Sessions`) |
 | `agents/roomlerd/src/input/mod.rs` · `arbiter.rs` | #3918: where a session is marked and a mark is read (`told_no_picture`, `mark_no_picture`, `has_no_picture`); the gate before each lazy open (`follow_the_desktop`) and a marked session left behind (`leave_behind`) |
 | `agents/roomlerd/src/clipboard.rs` | #3671: the worker's follow of the desktop's X server (`x11_follow`, `Follow`, `connect_anew`, `REBUILD_BOUND`), the retry that `shared` and `available` read (`Retry`), and the teardown that holds back arboard's dead-connection lines (`quietly_drop`) |
-| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled`, `primary`) and the scanout's channel order, both depths (`Layout::of`, `repack_to_bgra`, `repack_bgra_half`); FR-93 P3c: the plane table with each plane's type (`read_planes`), the primary by type (`primary_plane`), the cursor caps (`enable_cursor_caps`) and the per-frame cursor read (`CursorReader`, `read_cursor_pixels`); FR-93 P3d/P3f: the buffer's identity (`BufferId`) and the mapping's key (`maps`), the kill switch (`idle_skip_enabled`), the gate in `grab`, and the still screen waited out in `next_frame`; FR-93 P3e: a display switched off (`display_off`, for an open `display_is_off`), told apart in the worker loop (`worker`), waited out in `next_frame` (`DARK_POLL`) and reported by `waits_for`, and its kill switch (`wake_wait_enabled`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable`) |
+| `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled`, `primary`) and the scanout's channel order, both depths (`Layout::of`, `repack_to_bgra`, `repack_bgra_half`); FR-93 P3c: the plane table with each plane's type (`read_planes`), the primary by type (`primary_plane`), the cursor caps (`enable_cursor_caps`) and the per-frame cursor read (`CursorReader`, `read_cursor_pixels`); FR-93 P3d/P3f: the buffer's identity (`BufferId`) and the mapping's key (`maps`), the kill switch (`idle_skip_enabled`), the gate in `grab`, and the still screen waited out in `next_frame`; FR-93 P3e: a display switched off (`display_off`, for an open `display_is_off`), told apart in the worker loop (`worker`), waited out in `next_frame` (`DARK_POLL`) and reported by `waits_for`, and its kill switch (`wake_wait_enabled`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable`); #4035: a framebuffer freed between the plane read and GETFB2 costs its grab a tick, bounded (`FreedRun`, `FREED_RUN_MAX`, `freed`), answered as `Grabbed::Raced` and waited out in `next_frame` |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish`, `latest`) and the pure conversions (`straighten_and_crop`, `place`, `shape_id`, `pick_primary`) |
 | `agents/roomlerd/src/capture/drm_idle.rs` | FR-93 P3d: the bounds (`MAX_SKIP`, `IDLE_WAIT`, `SAMPLE_ROWS`), what a tick showed (`Shown`), the gate (`IdleGate`, `unchanged`) and the row hash (`sample_rows`, `sampled_row`) |
 | `agents/roomlerd/src/capture/portal/mod.rs` | `PortalStatus` and the detector (`detect`, P2d-3's bounded `detect_within`, `detect_in_session`); the brief's non-activating `reachable`; `pub mod helper`: the `portal-helper` subcommand, `spawn_streaming`, `spawn_child`; FR-93 P5b: the helper ends with its mutter session, exit 3 on `Closed` (`EXIT_SESSION_CLOSED`, armed in `run_stream_mutter`); FR-93 P5c: and with its stream, exit 4 once that has left *streaming* for good (`EXIT_STREAM_ENDED`, `SOURCE_GONE_AFTER`, `source_gone`, read in the frame loop both arms share, P5d: `write_frames`, which since P5e writes the first frame first); FR-93 P2d-4: a helper that fails before its stream says why (`STREAM_FAILED_MARKER`, `fail_stream`, read in `read_stream_handshake`); FR-93 P6c: who closed the session (`ClosedBy`, mutter's `closed_mutter`, the portal's `closed_portal`, `end_closed`), the person's stop as exit 5 (`EXIT_STOPPED_AT_SCREEN`), the portal arm's watcher armed in `run_stream`, with KWin's bus owner telling a crash apart (`KWIN_BUS`) |

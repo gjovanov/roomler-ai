@@ -1906,10 +1906,10 @@ pub async fn check_once() -> CheckOutcome {
 /// - **Windows**: `msiexec /i <path> /qn /norestart`. Requires
 ///   per-user MSI (no UAC) — which is what cargo-wix emits by
 ///   default for our install mode.
-/// - **Linux**: `pkexec apt-get install -y <path>`. Requires policykit
-///   plus sudo-equivalent; a non-interactive fallback uses
-///   `dpkg --install` directly (works when run as the user who
-///   owns /usr/bin, e.g. in a cargo-installed dev env).
+/// - **Linux**: a `.deb` through `linux_install_candidates` (root: `apt-get`,
+///   then `dpkg`; otherwise `pkexec`, then `sudo -n`, each in front of
+///   `apt-get`), with dpkg's [`tunnel_core::dpkg::OPTIONS`] and a null stdin;
+///   a `.tar.gz` in-process (`install_tarball_linux`).
 /// - **macOS**: `installer -pkg <path> -target /` — the same target
 ///   `scripts/install.sh` uses. It must be the volume root: the payload
 ///   paths are absolute and the launchd plists name them literally.
@@ -2358,38 +2358,29 @@ pub fn spawn_installer_for_flavour_with_properties(
 /// spawn succeeded, pkexec died immediately, nothing was installed, and
 /// the agent exited anyway — a silent no-op that left field hosts pinned
 /// to an old build across many update attempts.
+///
+/// Every candidate hands dpkg [`tunnel_core::dpkg::OPTIONS`] (#3932): a
+/// configuration file the host edited stays as it is, and dpkg asks nothing.
+/// `dpkg` takes them before its action, `apt-get` as
+/// `-o Dpkg::Options::=<option>`.
 #[cfg(any(target_os = "linux", test))]
 fn linux_install_candidates(euid: u32, path: &str) -> Vec<(&'static str, Vec<String>)> {
-    let apt = |prefix: Vec<&str>| {
-        let mut a: Vec<String> = prefix.into_iter().map(String::from).collect();
-        a.extend(["apt-get", "install", "-y", path].map(String::from));
-        a
-    };
+    use tunnel_core::dpkg;
+    // apt-get's own arguments, whoever runs it.
+    let mut apt: Vec<String> = vec!["install".into(), "-y".into()];
+    apt.extend(dpkg::apt_get_args());
+    apt.push(path.into());
     if euid == 0 {
-        vec![
-            ("apt-get", vec!["install".into(), "-y".into(), path.into()]),
-            ("dpkg", vec!["--install".into(), path.into()]),
-        ]
+        let mut by_dpkg: Vec<String> = dpkg::dpkg_args().collect();
+        by_dpkg.extend(["--install", path].map(String::from));
+        vec![("apt-get", apt), ("dpkg", by_dpkg)]
     } else {
-        vec![("pkexec", apt(vec![])), ("sudo", apt(vec!["-n"]))]
+        let pkexec = [vec!["apt-get".to_string()], apt].concat();
+        let sudo = [vec!["-n".to_string()], pkexec.clone()].concat();
+        vec![("pkexec", pkexec), ("sudo", sudo)]
     }
 }
 
-/// Run [`linux_install_candidates`] in order and return the pid of the
-/// first one that exits 0.
-///
-/// Deliberately WAITS on each child instead of firing and forgetting:
-/// dpkg replacing a running `/usr/bin/roomlerd` is safe on Linux (it
-/// unlinks and recreates) and takes seconds, and waiting is the only way
-/// to know the install actually happened. The returned pid belongs to an
-/// already-exited process, which is what the post-install watcher expects
-/// on Unix anyway: `wait_pid_unix` reads `ESRCH`, reports `Exited(0)`, and
-/// `verify_new_binary` re-runs `--version` — now a truthful check, because
-/// the install really did finish before we got here.
-///
-/// Every candidate failing is a hard `Err`, so `run_periodic`'s existing
-/// "installer spawn failed; will retry next cycle" branch keeps the
-/// daemon ALIVE rather than exiting into a pointless restart.
 /// The payload members a tarball MUST carry, relative to its prefix dir.
 /// Asserted before anything installed is touched — a truncated download that
 /// cleared the size floor must not half-install a host.
@@ -2550,14 +2541,34 @@ fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
     Ok(std::process::id())
 }
 
+/// Run [`linux_install_candidates`] in order and return the pid of the
+/// first one that exits 0.
+///
+/// Deliberately WAITS on each child instead of firing and forgetting:
+/// dpkg replacing a running `/usr/bin/roomlerd` is safe on Linux (it
+/// unlinks and recreates) and takes seconds, and waiting is the only way
+/// to know the install actually happened. The returned pid belongs to an
+/// already-exited process, which is what the post-install watcher expects
+/// on Unix anyway: `wait_pid_unix` reads `ESRCH`, reports `Exited(0)`, and
+/// `verify_new_binary` re-runs `--version` — now a truthful check, because
+/// the install really did finish before we got here.
+///
+/// Every candidate failing is a hard `Err`, so `run_periodic`'s existing
+/// "installer spawn failed; will retry next cycle" branch keeps the
+/// daemon ALIVE rather than exiting into a pointless restart.
+///
+/// Each candidate reads its own `/dev/null` (#3932), never the daemon's
+/// stdin, which is a person's terminal for a daemon or a `roomlerd
+/// self-update` started by hand: no install takes an answer from there.
 #[cfg(target_os = "linux")]
 fn run_linux_install_candidates(euid: u32, path: &str) -> Result<u32> {
     let mut attempts: Vec<String> = Vec::new();
     for (bin, args) in linux_install_candidates(euid, path) {
         let mut cmd = std::process::Command::new(bin);
         cmd.args(&args);
-        // The installer may outlive this daemon: it keeps its stdio and
-        // nothing else of ours.
+        // The installer may outlive this daemon: it keeps our stdout and
+        // stderr and nothing else of ours, and reads its own /dev/null.
+        cmd.stdin(std::process::Stdio::null());
         tunnel_core::child::inherit_only_stdio(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -5933,6 +5944,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #3932 — every candidate hands dpkg `tunnel_core::dpkg::OPTIONS` where
+    /// dpkg reads them: `dpkg` before its action (it stops reading options at
+    /// the first argument that is not one), `apt-get` as
+    /// `-o Dpkg::Options::=<option>`. These are the argv the real-dpkg cell
+    /// ran: an edited configuration file stays, exit 0, the package
+    /// configured, nothing read from stdin.
+    #[test]
+    fn linux_install_candidates_keep_an_edited_configuration_file() {
+        let s = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let to_dpkg = "Dpkg::Options::=--force-confold";
+        assert_eq!(
+            linux_install_candidates(0, DEB),
+            vec![
+                ("apt-get", s(&["install", "-y", "-o", to_dpkg, DEB])),
+                ("dpkg", s(&["--force-confold", "--install", DEB])),
+            ]
+        );
+        let apt = s(&["apt-get", "install", "-y", "-o", to_dpkg, DEB]);
+        let sudo = [s(&["-n"]), apt.clone()].concat();
+        assert_eq!(
+            linux_install_candidates(1000, DEB),
+            vec![("pkexec", apt), ("sudo", sudo)]
+        );
+        // The vectors above are the whole set: a new option is a new cell run.
+        assert_eq!(tunnel_core::dpkg::OPTIONS, ["--force-confold"]);
     }
 
     fn mk_release(tag: &str, draft: bool, prerelease: bool) -> GithubRelease {

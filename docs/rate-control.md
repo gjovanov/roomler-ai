@@ -1669,11 +1669,14 @@ the rule allows.
 | 2 s (the FFmpeg pump's heartbeat) | 14,400 bytes | 57.6 kbit/s |
 | 6 s (a late heartbeat) | 38,400 bytes | 51.2 kbit/s |
 
-The vendored SCTP's own timer makes a lone packet's delay worse still: once its delayed
-SACK has fired, the timer is not started again until a SACK goes out at once (#4033), so
-a lone packet after it can wait for the sender's retransmission timer instead. The
-still-screen cells' lines count those expiries (`loss=(0, 4)`), and a chunk sent more
-than once gives no delay.
+Until #4033 the vendored SCTP's own timer made a lone packet's delay worse still: once
+its delayed SACK had fired, the timer was not started again until a SACK went out at
+once, so a lone packet after it waited for the sender's retransmission timer instead.
+The still-screen cells' lines counted those expiries, `loss=(0, 4)` in each of four runs,
+and as a chunk sent more than once gives no delay, only one to three of a line's five
+samples carried one. With the timer armed again, every line reads `loss=(0, 0)` and
+every sample carries a least, 263 to 266 ms: the 200 ms hold over the cells' 60 ms round
+trip.
 
 **What the cells read** (`cargo test -p roomlerd --lib -- media_delivery::shaped_link::tcp_shape
 --skip clipboard:: --nocapture --test-threads=1`, on a Windows box):
@@ -1683,7 +1686,7 @@ than once gives no delay.
 | deep, 0.4 Mbit/s, path I | 9 of 9 loaded samples queued, standing 744 to 6,438 ms | `ack_ms=Some((107, 3652, 6545)) standing_ms=Some((3545, 6438)) queued=5` |
 | deep, 2 Mbit/s, path I, the pump's skip over 256 KiB | 9 of 9 loaded samples queued, standing 792 to 953 ms | `ack_ms=Some((75, 1002, 1028)) standing_ms=Some((927, 953)) queued=5` |
 | the four controls (0.4 and 2 Mbit/s, paths I and C) | none queued, standing at most 25 ms | `ack_ms=Some((63, 63, 82)) standing_ms=Some((0, 19)) queued=0` |
-| a still screen, one 200-byte message a second, deep and shallow | none counts: 200 to 600 bytes a sample | `ack_ms=None standing_ms=None queued=0` |
+| a still screen, one 200-byte message a second, deep and shallow | none counts: 400 bytes a sample (200 to 600 before #4033, as late SACKs moved bytes between samples) | `ack_ms=None standing_ms=None queued=0` |
 
 The first sample of a deep cell stands at 0: it is where the session's least comes from.
 The two deep cells that run in CI assert that at least half of their loaded samples are
@@ -1800,9 +1803,9 @@ association reads them back.
 | Gauge | Stored | Means |
 |---|---|---|
 | `max_payload` | once, when the association is made (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:199`) | the user data one DATA chunk carries, 1,200 bytes at SCTP's MTU of 1,228: the train's message length |
-| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:353`) when the association is made (`:200`), at the INIT ACK (`:815`), after every SACK (`:1596`) and every send (`:2073`), and at a T3-rtx expiry (`:2461`) | the windows and the bytes in flight |
+| `cwnd`, `ssthresh`, `rwnd`, `inflight_bytes` | by `store_gauges` (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:353`) when the association is made (`:200`), at the INIT ACK (`:815`), after every SACK (`:1596`) and every send (`:2073`), and at a T3-rtx expiry (`:2469`) | the windows and the bytes in flight |
 | `pending_bytes` | where the pending queue adds and pops bytes (`crates/vendored/webrtc-sctp/src/queue/pending_queue.rs:139`, `:532`) | bytes written and not yet sent, over every stream |
-| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:512`, `:2460`) | loss events since the association began; the train counts only those after its first step |
+| `fast_retransmits`, `t3_expiries` | where the association's stats count them (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:512`, `:2468`) | loss events since the association began; the train counts only those after its first step |
 | `ack_delay`, `ack_delay_min` | in the SACK handler (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1318`) | how long the newest chunk a SACK newly acknowledged took from its send to that SACK, among the chunks sent once (Karn), and the least of those since the reader's last take |
 
 **The twin test** shows that a reader changes nothing the association sends.
@@ -1895,7 +1898,7 @@ before the cells ran, the rest by a cell below that failed without them:
 | No sample from a SACK of one message | `:393` | a lone packet's SACK may have waited for the delayed acknowledgement |
 | The cap starts at a sample 10 ms above the least | `QUEUED`, `:40` | 2 Mbit/s at 80 ms, path I: two packets sent together put 4.9 ms between samples, and a cap from 5 ms held the climb at round 1's rate, a plateau at 0.11 of the link |
 | The cap's queue is a third of the least round trip, of 50 ms at least | `QUEUE_FLOOR`, `:45` | 2 Mbit/s at 250 ms, path I: with half, the peak queue reached 253 ms, over P-e's 250 |
-| The cap is never below three messages | `CAP_FLOOR_MESSAGES`, `:91` | 0.4 Mbit/s at 20 ms and 2 Mbit/s at 80 ms, path C: with one message in flight the train stalled (the vendored acknowledgement timer, below) |
+| The cap is never below three messages | `CAP_FLOOR_MESSAGES`, `:91` | 0.4 Mbit/s at 20 ms and 2 Mbit/s at 80 ms, path C: with one message in flight the train stalled, every SACK a lone packet's, on the vendored acknowledgement timer that #4033 fixed (below). Any receiver still holds a lone packet's SACK up to 200 ms, so the floor stays |
 | The cap is the nearest whole number of messages | `cap`, `:658` | 0.4 Mbit/s at 80 ms, path C: a pair's round trip is the least and one serialisation, so a train that writes in pairs fills a pipe of 4.4 messages only with about 5.4 in flight; cut down to whole messages, the cap kept 4, and the rounds read a plateau at 0.74 |
 | A standing queue is 10 ms and one message's serialisation at the estimate | `STANDING`, `:34` | 0.4 Mbit/s at 250 ms, path I: a pair's serialisation read 22.7 ms in round 4 with no queue at all |
 | A plateau needs rounds held by the cap and by no window, and no queue | `PLATEAU_ROUNDS`, `:100` | 0.4 Mbit/s at 20 ms: three messages fill the path and no sample shows a queue, so the train ran to its deadline and wrote 118 KB, over P-f's 64; 2 Mbit/s at 80 ms, path C: rounds held by the congestion window grow one packet a round, and read as a plateau at 0.52 |
@@ -1972,7 +1975,7 @@ The answer is a pure function of the gauges (`OpenedBy::of`,
 |---|---|
 | `init_ack` | the slow start threshold is above 0, and no loss came first |
 | `cookie_echo` | the threshold is 0, and no loss came first. An INIT ACK that arrives after the COOKIE ECHO is discarded (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:782`), so it cannot set the threshold later |
-| `unknown` | a fast retransmission or a T3-rtx expiry came first: either sets the threshold, on both paths (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1442`, `:2457`) |
+| `unknown` | a fast retransmission or a T3-rtx expiry came first: either sets the threshold, on both paths (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:1442`, `:2465`) |
 | `unread` | no gauges: no association, or the transport's slot was held at that moment |
 
 The threshold tells the paths apart and the peer's window does not, since any SACK sets
@@ -2124,16 +2127,20 @@ delays the least by about 7 ms, under a third of a serialisation, breaks P-e, an
 about 9 ms breaks P-f. All three are the estimate's limits and not the write budget's,
 and they stand as found.
 
-**Seen in the vendored SCTP, and left alone.** The delayed acknowledgement timer can be
-armed only while its `close_tx` is empty (`AckTimer::start`,
+**Seen in the vendored SCTP, and fixed (#4033).** The delayed acknowledgement timer can
+be armed only while its `close_tx` is empty (`AckTimer::start`,
 `crates/vendored/webrtc-sctp/src/timer/ack_timer.rs:36`), and only `stop` empties it
 (`:65`). A timer that fires calls `on_ack_timeout`
 (`crates/vendored/webrtc-sctp/src/association/association_internal.rs:2380`), which
-sends the SACK and leaves `close_tx` set. So after one delayed acknowledgement times
-out, the next lone packet is acknowledged only when another packet arrives and the
-immediate acknowledgement calls `stop` (`:2247`). With one message in flight the train
-stalled; with three it never waits for the timer. The same holds for the agent's own
-receiver, for what a browser sends it.
+sends the SACK. Upstream it left `close_tx` set, so after one delayed acknowledgement
+timed out, the next lone packet was acknowledged only when another packet arrived and
+the immediate acknowledgement called `stop` (`:2247`), or when the sender's T3-rtx sent
+it again. With one message in flight the train stalled. `on_ack_timeout` now calls
+`stop` itself (`:2393`), so every lone packet arms a timer of its own. A receiver still
+holds a lone packet's SACK up to 200 ms, so the cap keeps its floor of three messages,
+with which the train never waits for the timer. The fix reaches the agent's own
+receiver, for what a browser sends it, and both ends of a tunnel on `webrtc-dc-v1`. In a
+session the train's receiver is the browser's SCTP, which shares none of this code.
 
 **What a reading cannot tell.**
 
@@ -2419,7 +2426,7 @@ pump's 4 s wait), `carrier_unknown`, `no_user`, or `learner_off` (`relay_max_hi_
 
 **Where the viewer's facts come from.** `PairFacts` (`media_pair_memory.rs:61`) is
 registered by session id in `AgentPeer::new`, before the pump starts. The user comes from
-the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4876`). The srflx addresses
+the `rc:request`'s record (`agents/roomlerd/src/signaling.rs:4742`). The srflx addresses
 are taken from the candidates the viewer trickles (`AgentPeer::add_remote_candidate`), at
 most 16. They are not read through `get_stats`: the vendored ICE agent's accessor is
 crate-private, and a stats read takes the ICE and SCTP locks. **Limit**: a candidate

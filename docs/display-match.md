@@ -75,8 +75,8 @@ Every request gets exactly one `rc:display-match.state`
 | `recording` | a recording, local or remote, holds the display: it is made at the display's own mode, so nothing switches under it. Decided again once it has stopped (P1c, [below](#a-recording-holds-the-display-3467)) | "a recording is running on this computer" |
 | `disabled_on_device` | the owner set `display_match = never` | "this device's owner turned display match off" |
 | `no_fitting_mode` | no mode the display offers fits inside the stage | "no display mode fits this window" |
-| `switch_failed` | `ChangeDisplaySettingsExW` refused, or on Linux `xrandr` did | "the display could not be switched" |
-| `unsupported` | neither a Windows host, a Linux virtual desktop on Xorg with the dummy driver (P2), nor a person's X11 display with one active output (FR-97 P3e-2) | "this device can't switch its display" |
+| `switch_failed` | `ChangeDisplaySettingsExW` refused, or on Linux `xrandr` did, or on a Mac `CGDisplaySetDisplayMode` did | "the display could not be switched" |
+| `unsupported` | neither a Windows host, a Linux virtual desktop on Xorg with the dummy driver (P2), a person's X11 display with one active output (FR-97 P3e-2), nor a Mac with one active display (FR-97 P2d-2b) | "this device can't switch its display" |
 
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
