@@ -103,7 +103,7 @@ flowchart LR
     B --> C["tab: Start-HandoffSession.ps1 OLD"]
     C --> D["claude -n NAME<br/>--append-system-prompt (names the pack)"]
     D --> E["first message:<br/>the model reads the pack"]
-    C -. "CRESTORE_WAKE=OLD" .-> F["hook.ps1: continues, continued_at"]
+    C -.->|CRESTORE_WAKE=OLD| F["hook.ps1: continues, continued_at"]
     F --> G["crestore no longer offers OLD"]
 ```
 
