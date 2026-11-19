@@ -82,7 +82,13 @@ pub enum Outcome {
 
 /// `ROOMLERD_ENCODER_CLOCK`, [`DEFAULT_ON`] when unset.
 pub fn enabled() -> bool {
-    tunnel_core::env::flag("ENCODER_CLOCK", DEFAULT_ON)
+    switch_or(DEFAULT_ON)
+}
+
+/// `ROOMLERD_ENCODER_CLOCK`, `default` when unset: the switch's one read, so
+/// every thread hears the same switch and only its default differs.
+fn switch_or(default: bool) -> bool {
+    tunnel_core::env::flag("ENCODER_CLOCK", default)
 }
 
 /// Ask for this thread's clock. Call it first thing on a thread that encodes
@@ -102,10 +108,7 @@ pub fn ask_for_encoder_thread(hardware: bool) -> Outcome {
     } else {
         "encoder"
     };
-    let outcome = ask(tunnel_core::env::flag(
-        "ENCODER_CLOCK",
-        default_for_encoder(hardware),
-    ));
+    let outcome = ask(switch_or(default_for_encoder(hardware)));
     say_once(role, outcome);
     outcome
 }
