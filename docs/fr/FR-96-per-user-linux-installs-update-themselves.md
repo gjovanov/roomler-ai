@@ -83,7 +83,7 @@ sequenceDiagram
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3527-3534` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3028`, `LINUX_UPDATE_TRIGGER` `:3033`, `queue_update_check` / `queue_update_check_at` `:3248-3267` (was `macos_queue_update_check`) |
 | `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1993-2008`) |
-| `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:779-818`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2115-2125`) |
+| `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:1058-1060`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2115-2125`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
 | consuming the wake: a symlink unlinked NOT followed, a planted directory moved aside into a fresh root-owned dir | new | `consume_wake` (`updater.rs`) |

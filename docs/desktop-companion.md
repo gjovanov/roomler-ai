@@ -441,7 +441,7 @@ sequenceDiagram
     participant S as /api/agent/self/*
     G->>L: Devices {org, page, per_page, q, sort, dir}
     L->>V: cache hit (≤ 10 s)? answer it
-    V->>S: GET with THAT org's agent token (10 s timeout)
+    V->>S: GET with THAT org's agent token (10 s timeout, asked once more if its connection closed before any answer)
     S-->>V: VisibleDevicesPage
     V-->>G: DevicesPage — or Upstream {code, message}
     Note over G: live connection / RTT cells come from the local<br/>Peers poll (2 s), joined on the overlay node id
@@ -451,8 +451,29 @@ sequenceDiagram
   URL and agent token (the token is redacted from `Debug` and never logged) and asks with
   the right one. Answers are cached — 10 s for a page, 20 s for the mesh, 32 entries, one
   request in flight per key — so the companion, the CLI and re-renders share a fetch.
+- **A poll never rides a connection the server is closing (#4018).** The server side closes an
+  idle HTTP/1.1 connection after 30 s (measured on 2026-11-19: its FIN came 29.99 s after the
+  answer, in both of two trials), and the page asks again 30 s after its last answer.
+  reqwest's default pool kept an idle connection for 90 s, so a poll went out on a pooled
+  connection just as the server closed it. A GET written in the last few tens of milliseconds
+  before the FIN got no answer, and about every other poll logged `refresh failed
+  surface="devices"` with `connection closed before message completed`. Two changes, each
+  pinned by a test:
+
+  | What | Where (`agents/roomlerd/src/self_view.rs`) | Why |
+  |---|---|---|
+  | The pool drops a connection idle for 10 s | `POOL_IDLE_TIMEOUT` (`:69`), set by `client_builder` (`:247`); a const assertion (`:70`) holds it at 20 s or less | a third of the server's close: the 30 s poll and the 60 s mesh ask always dial a new connection and never meet that close, while a burst (a search being typed, a page turn, the CLI beside the companion) still shares one |
+  | A GET whose connection closed before any answer came is asked once more, at once | `closed_before_any_answer` (`:671`), from `SelfView::get` (`:459`) | hyper's incomplete message, found by downcasting reqwest's error chain, never by its text. It covers a self-hosted server behind a front or middlebox whose idle close nobody here knows (5 s, 15 s, 60 s). Both routes are GETs, so asking again is safe. A timeout, a connect failure and any HTTP status are never asked again, and nothing is asked a third time. A second ask that answers is a DEBUG line only; one that fails returns its error as before |
+
+  Tested by `a_get_whose_connection_closes_before_any_answer_is_asked_once_more` (a raw server
+  closes the pooled connection on the second GET; the caller gets the answer after two
+  connections and three requests), `a_get_closed_again_on_its_second_ask_fails_as_before`,
+  `a_get_that_times_out_is_not_asked_again`, `a_get_that_is_answered_is_not_asked_again`,
+  `a_connect_failure_is_not_a_close_before_any_answer` and
+  `a_connection_idle_past_the_pool_timeout_is_never_reused`.
 - **A failure has a name, never an empty list.** `Response::Upstream { code }`:
-  `server_unreachable` (connect, TLS, timeout), `unauthorized` (401), `unsupported_server`
+  `server_unreachable` (connect, TLS, timeout, a connection closed before any answer on both
+  asks), `unauthorized` (401), `unsupported_server`
   (404 — a server older than the route), `module_unmounted` (the server's own 503),
   `rate_limited` (429), `server_error`, `unknown_org`, `org_disabled`.
 - **The page.** `front/grid.js` is the web grid's model ported to plain JS: server sort keys,
@@ -1248,10 +1269,10 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/peer.rs`) | Why |
 |---|---|---|
-| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12893`), asked as the channel opens (`files_channel_here`, `:12902`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3814`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4692`) |
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12895`), asked as the channel opens (`files_channel_here`, `:12904`, from the `"files"` arm, `:1328`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3814`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:1153`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4692`) |
 | Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
-| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12928`), `attach_files_declined` (`:12951`), `declined_reply` (`:12982`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
-| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12861`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
+| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:12930`), `attach_files_declined` (`:12953`), `declined_reply` (`:12984`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12863`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
 | What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4482`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
 
 What a viewer notices:
@@ -1266,7 +1287,7 @@ What a viewer notices:
   ends "Remote shell works here.", where it said file transfer worked there too.
 - Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
 
-**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:16984`), on every lane's lib
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:16986`), on every lane's lib
 tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
 the router over an in-process peer pair, both peers closed after each test, a declined channel that
 answers each request with the reason, leaves the folder asked about as it was and stays up
@@ -1435,10 +1456,10 @@ start goes on without it.
 
 Where neither the native panel nor the tray can show a remote-control question (no tray
 installed, its start failed, or no marker for it to read), FR-93 P6f puts it up as a desktop
-notification (`docs/remote-control.md`, "Prompt surfaces"). The session helper that posts it
-runs as the person at the screen, so its start asks logind for the graphical session
-(`loginctl list-sessions`, then `show-session` for each), the account database for the
-person's account, and the person's session bus. Until #3857 the org's WS loop waited for all
+notification ([remote-control.md §11.2](remote-control.md#112-consent), "Prompt surfaces"). The
+session helper that posts it runs as the person at the screen, so its start asks logind for the
+graphical session (`loginctl list-sessions`, then `show-session` for each), the account database
+for the person's account, and the person's session bus. Until #3857 the org's WS loop waited for all
 of that inline, and the session walk had no bound: with logind stopped, every `loginctl` waits
 out its D-Bus timeout, about 25 s. No async worker was held (the show ran on the blocking
 pool), but that org's control channel read no frame meanwhile: another viewer's request, a live
@@ -2340,7 +2361,7 @@ at most 480 × 240 logical.
 
 | Daemon panel | Size | Where |
 |---|---|---|
-| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:72`, `:477` |
+| macOS | 480 × 240 pt | `agents/roomlerd/src/indicator/mac.rs:86`, `:511` |
 | X11 | 480 × 236 at the desktop's scale | `agents/roomlerd/src/indicator/x11.rs:67`, `:299` |
 | Windows | 460 × 232 physical px, no larger in logical units | `agents/roomlerd/src/indicator/win.rs:135`, `:611` |
 
@@ -2622,7 +2643,7 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5805`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5814`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1370`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:535`). The mark goes

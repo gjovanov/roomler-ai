@@ -3,8 +3,8 @@
 # the ledger row it adds and when that row retires:
 #   pump_lines_ffmpeg_dc=3950 # r0:FOO-1: retires with R8's delete
 # Set at FR-135 R0b, on the instruments it added to both data-channel pumps.
-agent_env_reads=180 # p2:QSV-1: retires with FR-148 P5, when the constant-bitrate path is deleted
+agent_env_reads=181 # p2:BUDGET-1: retires with FR-148 P5, when the in-flight budget's switch is deleted
 viewer_knobs=33 # r0:CLOCK-1: retires after a week of field reads with the calibration on
 pump_lines_rtp=1312
-pump_lines_vp9_dc=1473 # p0:OPEN-1: retires with O10's ruling
-pump_lines_ffmpeg_dc=3903 # p0:OPEN-2: retires with O10's ruling
+pump_lines_vp9_dc=1482 # p2:BUDGET-2: retires with FR-148 P5, when the one controller owns the budget or it is deleted
+pump_lines_ffmpeg_dc=3896 # p2:BUDGET-3: retires with FR-148 P5, when the one controller owns the budget or it is deleted

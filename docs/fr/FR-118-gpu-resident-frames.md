@@ -1171,7 +1171,7 @@ the frames encoded in between.
 | ON2 21:38:18–21:58:14 | on | `gpu` | 597 | 88.0; 87.0 | 11.21 | 0.12 | 0.03 | 0.05 | 11.32 | 23 % (2.60 ms) |
 
 - **On this arm capture + encode is the frame period.** The pump times the whole `next_frame()`
-  (`agents/roomlerd/src/peer.rs:7926`): the pacing gate's sleep, the capture thread polling the display stream every
+  (`agents/roomlerd/src/peer.rs:7936`): the pacing gate's sleep, the capture thread polling the display stream every
   2 ms until a new frame arrives (`agents/roomlerd/src/capture/scrap_backend.rs:554`), and on the CPU path the copy
   of the 23.7 MB frame into memory (`:551`). At 88 fps the pump waits for the stream on both paths, so capture +
   encode is 11.3 ms on both, and the time the GPU path saves goes into the wait. The work per frame is the encode

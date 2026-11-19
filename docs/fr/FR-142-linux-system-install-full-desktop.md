@@ -185,8 +185,8 @@ flowchart TB
     socket, on descriptor 0, with the worker end's inode; after the worker's move, a child it starts has no socket;
     killing the worker gives root's end an EOF.
 
-  Nothing is listening for anyone else, so the 0711 directory and per-uid socket (`delegate.rs:835-850`) are not
-  needed. FR-43's other gates carry over: one worker per session, refused while one is attached (`delegate.rs:1332`),
+  Nothing is listening for anyone else, so the 0711 directory and per-uid socket (`delegate.rs:808-823`) are not
+  needed. FR-43's other gates carry over: one worker per session, refused while one is attached (`delegate.rs:1300`),
   and the channel's end stops the worker, the lifeline (`macos_supervisor.rs:376`).
 - **What root accepts from the worker**: a handshake with its version and the features it can serve now; frames
   (P2); clipboard content and change events; the layout snapshot; the display-match state; its log lines
@@ -203,7 +203,7 @@ flowchart TB
 | every frame | a length prefix, read and checked against its type's cap BEFORE anything is allocated; over the cap closes the channel; an unknown type is skipped and counted |
 | handshake, features, layout, display state, a clipboard change event | one control frame, at most 64 KiB; the layout at most `MAX_GROUPS` (4) entries (`input/layout_x11.rs:51`), each token and tag at most 64 bytes; the display state one mode from the list root sent |
 | clipboard content | root applies the caps the data channel already has: text 1 MiB, PNG 8 MiB and 4096 x 4096 pixels, HTML 4 MiB, the native set 16 MiB (`clipboard.rs:2147`, `:2249-2268`); UTF-8 checked. The worker applies the same caps where it reads the clipboard (`clipboard.rs:1561-1567`, `:1935`), and root checks again |
-| log lines | as `WorkerLogs`: 100 a frame, each message cut to 8 KiB and marked by root (`delegate.rs:259-290`, `:769-785`), inside the frame cap above |
+| log lines | as `WorkerLogs`: 100 a frame, each message cut to 8 KiB and marked by root (`delegate.rs:259-290`, `:742-758`), inside the frame cap above |
 | pixels (P2) | root checks every frame's payload length against its stride and height before any consumer reads it: the payload is exactly `stride x height`, at most 256 MiB; the header carries the magic, the size the worker announced at open (non-zero, at most 8192 on a side) and a stride of at least four bytes a pixel; the frame lands in a buffer root reuses |
 - **What the worker accepts from root**: open or close a source; input events; clipboard read and write; a layout
   token; a display mode. Only while root's guard is `Open` for the worker's session (inferred).
@@ -237,7 +237,7 @@ picks.
 ### Capability changes while connected
 
 Caps travel once in `rc:agent.hello`; after it the heartbeat carries a change, and only a change, for the
-permission words, `record`, Remote Apps, audio and keep busy (`signaling.rs:7039-7079`), the path FR-43's
+permission words, `record`, Remote Apps, audio and keep busy (`signaling.rs:7009-7040`), the path FR-43's
 `WorkerCaps` takes on a Mac (code). Nothing carries a clipboard, layout or display-match change after the hello.
 P1 adds those three to the heartbeat's change set, computed as root's own gate AND the worker's features, so a
 worker that attaches, dies or comes back reaches the row within a beat (inferred design). An open viewer: not

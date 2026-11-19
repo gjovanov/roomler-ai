@@ -104,7 +104,7 @@ a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
 masked at 1.0 (`governor.rs:1946`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
 reads `governor.paced_fps()` each loop (`governor.rs:1958`; consumed at
-`peer.rs:8203`, logged at `:10073`). FR-112 gave a software encoder a pace of its
+`peer.rs:8215`, logged at `:10075`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
@@ -149,7 +149,7 @@ built **without a wire-format change**: the 13-byte video header already carried
   send-queue wait is *inside* the measured age.
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3633` `clock_echo_json`, handled at
-  `:10957`). The browser probes it every stats tick and keeps the **lowest-RTT**
+  `:10959`). The browser probes it every stats tick and keeps the **lowest-RTT**
   sample of the last 8 (`useRemoteControl.ts:7243` `CLOCK_RING`, `:7247`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.

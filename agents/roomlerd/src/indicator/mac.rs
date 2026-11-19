@@ -22,7 +22,19 @@
 //! AppKit at all: it parks the request in shared state, and the main thread
 //! picks it up on its next pass. Everything that touches a window lives in
 //! [`pump`], which takes a `MainThreadMarker` — so the rule is enforced by the
-//! type system rather than by remembering it.
+//! type system rather than by remembering it. The one window a question makes
+//! before that is #4053's probe ([`window_device`]), a job the main thread
+//! runs too ([`on_main`]).
+//!
+//! ## When the panel takes no question (#4053)
+//!
+//! A root daemon that launchd started before anyone signed in was refused by
+//! the window server, and a log-out detaches one that was served: either way
+//! its windows reach no screen for the rest of its life. So `prompt` asks
+//! [`super::panel_gate`] first: whether a probe window gets a window device,
+//! and in a root process whether another console session has started since
+//! the pump's start ([`super::console_watch`]). Its `false` is a taken
+//! panel's, and the question goes to the person's app.
 //!
 //! ## The application delegate (#3164)
 //!
@@ -66,6 +78,8 @@ use objc2_foundation::{
     NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
+use super::console_watch::ConsoleWatch;
+use super::panel_gate::{Connection, PanelGate, Screen, reads_console_session};
 use super::{ConsentSender, PromptView};
 use crate::macos_quit::{self, QuitReply};
 
@@ -153,12 +167,26 @@ impl Inner {
             ));
         }
         shared().lock().unwrap().tx = Some(consent_tx);
-        tracing::info!("macOS consent panel available");
+        // #4053 — "available", or in its place one WARN: a panel the window
+        // server refused when the pump started shows no question at all.
+        if let Some(screen) = PANEL_SCREEN.get() {
+            screen.gate.announce();
+        }
         Ok(Self)
     }
 
     pub(super) fn prompt(&self, view: PromptView) -> bool {
         if !PUMPING.load(Ordering::SeqCst) {
+            return false;
+        }
+        // #4053 — not where this process cannot reach the screen now: the
+        // window server refused it at the start, its connection is gone (a
+        // log-out), or another console session has started since. Asked
+        // before the shared lock is taken, never under it: the connection's
+        // read waits for the main thread, `PROBE_WAIT` at most, and the pump
+        // and `dismiss` take that lock. This `false` is a taken panel's: the
+        // caller sends the question to the person's app.
+        if !PANEL_SCREEN.get().is_some_and(PanelScreen::shows_now) {
             return false;
         }
         let mut s = shared().lock().unwrap();
@@ -364,7 +392,6 @@ pub fn run_main_loop() -> ! {
     // loop below, which is the process.
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    PUMPING.store(true, Ordering::SeqCst);
 
     // `NSApp.run()` would never give control back, so this is the manual pump
     // it wraps: block for one event or 120 ms, dispatch it, then step our own
@@ -379,6 +406,13 @@ pub fn run_main_loop() -> ! {
     // ⚠️ `finishLaunching` is what `run()` would have called. Skipping it
     // leaves NSApplication half-initialised and windows behave erratically.
     app.finishLaunching();
+
+    // #4053 — the panel's first reads, after `finishLaunching` and never
+    // before it: whether the window server serves this process, and the
+    // console session it serves. Made before PUMPING is set, so a panel that
+    // finds the loop pumping finds them.
+    let _ = PANEL_SCREEN.set(PanelScreen::at_start(mtm));
+    PUMPING.store(true, Ordering::SeqCst);
 
     let mut panel: Option<Panel> = None;
     loop {
@@ -485,6 +519,11 @@ impl Panel {
                 NSBackingStoreType::Buffered,
                 false,
             );
+            // A plain NSWindow is released when it closes, and its `Retained`
+            // releases it again when `Panel` drops it after `close` (`Drop`
+            // below): objc2-app-kit requires this call for a window made
+            // outside a window controller. An NSPanel defaults to it.
+            window.setReleasedWhenClosed(false);
             window.setLevel(NSScreenSaverWindowLevel);
             // Visible on every Space and over a fullscreen app: a prompt that
             // only exists on the desktop someone happens to be looking at is
@@ -743,5 +782,89 @@ unsafe fn add_button(
         b.setButtonType(NSButtonType::PushOnPushOff);
         parent.addSubview(&b);
         b
+    }
+}
+
+/// #4053 — how long a question waits for the main thread to read the
+/// connection. The pump comes round every 120 ms at most; past this the
+/// question goes to the person's app, said once (`panel_gate`'s `NotKnown`).
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// #4053 — the panel's gate ([`PanelGate`], the same on every lane), and the
+/// two readers it asks at each question.
+struct PanelScreen {
+    gate: PanelGate,
+    /// notify(3) on the window server's console-session names, from the
+    /// pump's start, in a root process only ([`reads_console_session`]).
+    console: Option<ConsoleWatch>,
+}
+
+/// Made on the main thread after `finishLaunching`, before [`PUMPING`] is
+/// set ([`run_main_loop`]).
+static PANEL_SCREEN: OnceLock<PanelScreen> = OnceLock::new();
+
+impl PanelScreen {
+    /// The reads at the pump's start, on the main thread. A per-user process
+    /// (a two-row Mac's per-user half) makes no console reader: its gate
+    /// starts with no console session, and the connection alone decides.
+    fn at_start(mtm: MainThreadMarker) -> Self {
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let console = reads_console_session(euid).then(ConsoleWatch::console);
+        let gate = PanelGate::new(
+            window_device(mtm),
+            console.as_ref().and_then(ConsoleWatch::session),
+        );
+        Self { gate, console }
+    }
+
+    /// Whether the panel can show a question now ([`PanelGate::verdict`]).
+    fn shows_now(&self) -> bool {
+        self.gate.verdict(self).shows()
+    }
+}
+
+impl Screen for PanelScreen {
+    fn connection(&self) -> Connection {
+        match MainThreadMarker::new() {
+            // No caller asks from the main thread today, and one that did
+            // would wait for itself through `on_main`.
+            Some(mtm) => window_device(mtm),
+            None => on_main(PROBE_WAIT, window_device).unwrap_or(Connection::NotKnown),
+        }
+    }
+
+    fn console_session(&self) -> Option<u64> {
+        self.console.as_ref().and_then(ConsoleWatch::session)
+    }
+}
+
+/// #4053 — whether this process can put a window on the window server now:
+/// a 1×1 borderless window made with its window device at once (`defer:
+/// false`), never shown, then closed. AppKit gives a window a number above 0
+/// only with a window device, so a process the window server refused, before
+/// login or after a log-out, reads 0 or less. The panel's own window is made
+/// the same way, at each question it shows (`Panel::new`).
+fn window_device(mtm: MainThreadMarker) -> Connection {
+    // SAFETY: a window made outside a window controller must not be released
+    // when it closes (objc2-app-kit), and `setReleasedWhenClosed(false)` right
+    // after it is made keeps that: its `Retained` releases it once, here.
+    let number = unsafe {
+        let window = NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
+            NSWindowStyleMask::Borderless,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        window.setReleasedWhenClosed(false);
+        let number = window.windowNumber();
+        window.close();
+        number
+    };
+    if number > 0 {
+        Connection::Works(number)
+    } else {
+        Connection::Refused(number)
     }
 }

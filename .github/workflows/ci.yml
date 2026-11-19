@@ -1655,11 +1655,11 @@ jobs:
       # FR-147 P1: and `one_row::` with `one_row_home::`: root's side of
       # `sudo roomlerd one-row` and the person's own child, whose plans, lines
       # and records every lane tests, on the platform they serve; the `mac`
-      # effects compile in the check above.
+      # effects compile in the check above. #4053: and `indicator::panel_gate::` (the panel's gate, on the Mac it serves) with `indicator::console_watch::` (the console-session reader on a real notify(3), a name of its own).
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home:: indicator::panel_gate:: indicator::console_watch::
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only
