@@ -32,12 +32,16 @@
 //! necessarily the write. What each caller does with the error, and what
 //! heals a write applied behind it, is in `docs/multi-pod-scale-out.md`.
 //!
-//! Every timeout, of a command or of a replacement's connection attempt, is
-//! logged at warn in one fixed wording, `redis: no answer within the timeout`;
-//! a Redis that answers never produces it. Both bounds are settings
-//! (`ROOMLER__REDIS__RESPONSE_TIMEOUT_MS`,
-//! `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS`), and 0 turns a bound off: with
-//! both at 0 the connection is the crate's default manager, as before #3840.
+//! A Redis that took the bytes and said nothing (a command, or a connection
+//! attempt, timed out) is logged at warn in one fixed wording, `redis: no
+//! answer within the timeout`; a Redis that refused or closed the connection
+//! in another, `redis: no connection could be made`. A Redis that answers
+//! produces neither. Each wording writes at most one line a second per pod,
+//! and a line says how many were held back since the one before it. Both
+//! bounds are settings (`ROOMLER__REDIS__RESPONSE_TIMEOUT_MS`,
+//! `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS`): 0 turns a bound off (with both at
+//! 0 the connection is the crate's default manager, as before #3840), and a
+//! value from 1 to 999 is used as 1000, with a warn line at boot.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,13 +49,17 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
-use redis::{Cmd, Pipeline, RedisError, RedisFuture, RedisResult, Value};
+use redis::{AsyncConnectionConfig, Cmd, Pipeline, RedisError, RedisFuture, RedisResult, Value};
 use tracing::{info, warn};
 
 /// The default of `ROOMLER__REDIS__RESPONSE_TIMEOUT_MS`.
 pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(3000);
 /// The default of `ROOMLER__REDIS__CONNECTION_TIMEOUT_MS`.
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_millis(3000);
+/// The least a bound setting is used as, in ms. A value from 1 to 999 (3,
+/// meant as seconds) would fail commands on a Redis that answers, so it is
+/// used as this, with a warn line at boot.
+pub const BOUND_FLOOR_MS: u64 = 1000;
 /// A replacement's wait after its first failed attempt; it doubles up to
 /// [`REPLACE_WAIT_MAX`].
 pub const REPLACE_WAIT_FIRST: Duration = Duration::from_secs(1);
@@ -95,7 +103,8 @@ impl RedisBounds {
         connection_timeout: None,
     };
 
-    /// From the settings, in milliseconds; 0 is no bound.
+    /// From the settings, in milliseconds: 0 is no bound, and a value under
+    /// [`BOUND_FLOOR_MS`] is used as it, with a warn line.
     pub fn from_settings(settings: &roomler_ai_config::RedisSettings) -> Self {
         Self {
             response_timeout: bound_setting(RESPONSE_SETTING, settings.response_timeout_ms),
@@ -107,6 +116,18 @@ impl RedisBounds {
     /// reset or a refused connection) stays the crate's default, as before.
     fn manager_config(&self) -> ConnectionManagerConfig {
         let mut config = ConnectionManagerConfig::new();
+        if let Some(t) = self.response_timeout {
+            config = config.set_response_timeout(t);
+        }
+        if let Some(t) = self.connection_timeout {
+            config = config.set_connection_timeout(t);
+        }
+        config
+    }
+
+    /// One plain connection with these bounds: a replacement's first step.
+    fn probe_config(&self) -> AsyncConnectionConfig {
+        let mut config = AsyncConnectionConfig::new();
         if let Some(t) = self.response_timeout {
             config = config.set_response_timeout(t);
         }
@@ -132,21 +153,76 @@ struct Shared {
     /// never held across an await.
     current: RwLock<ConnectionManager>,
     replacing: AtomicBool,
+    /// The last word on the connection was a refusal or a close (an io error
+    /// that was no timeout): a call that times out now waited for the crate's
+    /// reconnect, and is logged as no connection. An answer, a swap, or a
+    /// connection attempt that timed out clears it.
+    down: AtomicBool,
     timeouts: AtomicU64,
     connect_failures: AtomicU64,
+    /// One line a second for each wording.
+    timeout_lines: LineBound,
+    connect_lines: LineBound,
     replacements: AtomicU64,
 }
 
 impl Shared {
-    /// Count and log one timeout, in the one wording.
-    fn timed_out(&self, command: &str, bound: Duration) {
+    fn set_down(&self, down: bool) {
+        // A load first: almost every call finds it already so, and a store
+        // from every call would have every core write the same cache line.
+        if self.down.load(Ordering::Relaxed) != down {
+            self.down.store(down, Ordering::Relaxed);
+        }
+    }
+
+    /// One call with no answer within `bound`: no connection while the
+    /// connection is down, otherwise no answer.
+    fn timed_out(&self, what: impl FnOnce() -> String, bound: Duration) {
+        if !self.down.load(Ordering::Relaxed) {
+            self.no_answer(what, bound);
+            return;
+        }
+        let n = self.connect_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(suppressed) = self.connect_lines.admit() {
+            warn!(
+                command = what(),
+                waited_ms = bound.as_millis() as u64,
+                connect_failures = n,
+                suppressed,
+                "{CONNECT_LINE}"
+            );
+        }
+    }
+
+    /// Count one call or connection attempt with no answer within `bound`,
+    /// and log it in the one wording, one line a second at most.
+    fn no_answer(&self, what: impl FnOnce() -> String, bound: Duration) {
         let n = self.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
-        warn!(
-            command,
-            timeout_ms = bound.as_millis() as u64,
-            timeouts = n,
-            "{TIMEOUT_LINE}"
-        );
+        if let Some(suppressed) = self.timeout_lines.admit() {
+            warn!(
+                command = what(),
+                timeout_ms = bound.as_millis() as u64,
+                timeouts = n,
+                suppressed,
+                "{TIMEOUT_LINE}"
+            );
+        }
+    }
+
+    /// A connection attempt that failed for another reason than a timeout:
+    /// refused, closed, or answered with an error in the handshake.
+    fn not_connected(&self, error: &RedisError, retry_in: Duration) {
+        self.set_down(true);
+        let n = self.connect_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(suppressed) = self.connect_lines.admit() {
+            warn!(
+                error = %error,
+                retry_in_ms = retry_in.as_millis() as u64,
+                connect_failures = n,
+                suppressed,
+                "{CONNECT_LINE}"
+            );
+        }
     }
 }
 
@@ -164,8 +240,11 @@ impl RedisConnection {
                 db,
                 current: RwLock::new(manager),
                 replacing: AtomicBool::new(false),
+                down: AtomicBool::new(false),
                 timeouts: AtomicU64::new(0),
                 connect_failures: AtomicU64::new(0),
+                timeout_lines: LineBound::per_second(),
+                connect_lines: LineBound::per_second(),
                 replacements: AtomicU64::new(0),
             }),
         })
@@ -175,12 +254,16 @@ impl RedisConnection {
         self.shared.bounds
     }
 
-    /// Timeouts logged so far, one per line in the one wording.
+    /// Calls and connection attempts with no answer within their bound
+    /// ([`TIMEOUT_LINE`]), each counted whether its line was written or held
+    /// back.
     pub fn timeouts(&self) -> u64 {
         self.shared.timeouts.load(Ordering::Relaxed)
     }
 
-    /// Connections refused, closed or failed, as [`CONNECT_LINE`] counts them.
+    /// Connection attempts that failed for another reason than a timeout, and
+    /// calls that timed out while the connection was down ([`CONNECT_LINE`]),
+    /// each counted whether its line was written or held back.
     pub fn connect_failures(&self) -> u64 {
         self.shared.connect_failures.load(Ordering::Relaxed)
     }
@@ -214,17 +297,25 @@ impl RedisConnection {
                 std::io::ErrorKind::TimedOut,
             ))),
         };
-        if let Err(e) = &result
-            && e.is_timeout()
-        {
-            self.shared.timed_out(&what(), bound);
-            self.replace();
+        match &result {
+            Err(e) if e.is_timeout() => {
+                self.shared.timed_out(what, bound);
+                self.replace();
+            }
+            // Refused or closed: the crate reconnects, and a call that waits
+            // for that reconnect has no connection, not no answer.
+            Err(e) if e.is_io_error() => self.shared.set_down(true),
+            // A reply, an error reply included: Redis answered.
+            _ => self.shared.set_down(false),
         }
         result
     }
 
     /// Start the replacement unless one is already running. It stops once
-    /// nothing holds the connection any more.
+    /// nothing holds the connection any more. Each attempt first makes one
+    /// plain connection, so a Redis that refuses fails the attempt at once:
+    /// the crate's own retries inside an attempt would wait 1 to 2 s, then 60
+    /// to 120 s, and the attempt would end at its bound as a timeout.
     fn replace(&self) {
         if self.shared.replacing.swap(true, Ordering::AcqRel) {
             return;
@@ -238,10 +329,16 @@ impl RedisConnection {
                 .connection_timeout
                 .or(bounds.response_timeout)
                 .unwrap_or(DEFAULT_CONNECTION_TIMEOUT);
+            let probe = bounds.probe_config();
             let mut wait = REPLACE_WAIT_FIRST;
             loop {
-                let attempt =
-                    ConnectionManager::new_with_config(client.clone(), bounds.manager_config());
+                let attempt = async {
+                    client
+                        .get_multiplexed_async_connection_with_config(&probe)
+                        .await?;
+                    ConnectionManager::new_with_config(client.clone(), bounds.manager_config())
+                        .await
+                };
                 let outcome = tokio::time::timeout(attempt_bound, attempt).await;
                 let Some(shared) = weak.upgrade() else {
                     return;
@@ -252,6 +349,7 @@ impl RedisConnection {
                             .current
                             .write()
                             .unwrap_or_else(PoisonError::into_inner) = manager;
+                        shared.set_down(false);
                         let n = shared.replacements.fetch_add(1, Ordering::Relaxed) + 1;
                         shared.replacing.store(false, Ordering::Release);
                         info!(
@@ -260,12 +358,12 @@ impl RedisConnection {
                         );
                         return;
                     }
-                    Ok(Err(e)) if !e.is_timeout() => warn!(
-                        error = %e,
-                        retry_in_ms = wait.as_millis() as u64,
-                        "redis: a replacement connection could not be made"
-                    ),
-                    _ => shared.timed_out("connect", attempt_bound),
+                    Ok(Err(e)) if !e.is_timeout() => shared.not_connected(&e, wait),
+                    _ => {
+                        // Taken and not answered: a silent Redis, not a down one.
+                        shared.set_down(false);
+                        shared.no_answer(|| "connect".to_string(), attempt_bound);
+                    }
                 }
                 drop(shared);
                 tokio::time::sleep(wait).await;
@@ -367,14 +465,29 @@ fn now_ms() -> u64 {
 const RESPONSE_SETTING: &str = "ROOMLER__REDIS__RESPONSE_TIMEOUT_MS";
 const CONNECTION_SETTING: &str = "ROOMLER__REDIS__CONNECTION_TIMEOUT_MS";
 
-/// A bound setting in milliseconds as it is used: 0 is no bound.
+/// A bound setting in milliseconds as it is used: 0 is no bound, a value
+/// under [`BOUND_FLOOR_MS`] is used as it, any other as given.
 pub fn bound_ms_used(given: u64) -> Option<u64> {
-    (given > 0).then_some(given)
+    (given > 0).then_some(given.max(BOUND_FLOOR_MS))
 }
 
-/// One bound setting as it is used.
-fn bound_setting(_setting: &str, given: u64) -> Option<Duration> {
-    bound_ms_used(given).map(Duration::from_millis)
+/// A bound in milliseconds as the settings write it: 0 is no bound.
+pub fn bound_ms(bound: Option<Duration>) -> u64 {
+    bound.map_or(0, |b| b.as_millis() as u64)
+}
+
+/// One bound setting as it is used, with one warn line when it was raised.
+fn bound_setting(setting: &str, given: u64) -> Option<Duration> {
+    let used = bound_ms_used(given);
+    if let Some(used) = used.filter(|&used| used != given) {
+        warn!(
+            setting,
+            given_ms = given,
+            used_ms = used,
+            "redis: a timeout setting under {BOUND_FLOOR_MS} ms is used as {BOUND_FLOOR_MS} ms"
+        );
+    }
+    used.map(Duration::from_millis)
 }
 
 #[cfg(test)]

@@ -1295,10 +1295,10 @@ pub struct JwtSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RedisSettings {
     pub url: String,
-    /// #3840 — a command with no answer fails after this; 0 = no bound.
+    /// #3840 — a command with no answer fails after this; 0 = no bound, 1-999 = 1000.
     #[serde(default = "redis_bound_ms")]
     pub response_timeout_ms: u64,
-    /// #3840 — one connection attempt gives up after this; 0 = no bound.
+    /// #3840 — one connection attempt gives up after this; 0 = no bound, 1-999 = 1000.
     #[serde(default = "redis_bound_ms")]
     pub connection_timeout_ms: u64,
 }

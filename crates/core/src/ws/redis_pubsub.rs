@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::redis_conn::{RedisBounds, RedisConnection};
+use super::redis_conn::{RedisBounds, RedisConnection, bound_ms};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -455,10 +455,14 @@ return 0
     ) -> Result<Self, redis::RedisError> {
         let bounds = RedisBounds::from_settings(settings);
         let client = redis::Client::open(settings.url.as_str())?;
+        // Host and port: the line names where Redis is, nothing else of the URL.
+        let addr = client.get_connection_info().addr.to_string();
         let publisher = RedisConnection::connect(client, bounds).await?;
         info!(
-            ?bounds,
-            "Redis Pub/Sub publisher connected to {}", settings.url
+            addr = %addr,
+            response_timeout_ms = bound_ms(bounds.response_timeout),
+            connection_timeout_ms = bound_ms(bounds.connection_timeout),
+            "Redis Pub/Sub publisher connected"
         );
         Ok(Self {
             publisher,
