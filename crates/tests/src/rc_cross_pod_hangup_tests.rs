@@ -38,6 +38,21 @@ use crate::rc_resume_claim_tests::{
 };
 use crate::rc_resume_rejoin_tests::{controller, live_session, request, send, wait_bus};
 
+/// One measured line, written straight to stderr. The harness captures
+/// `println!` and `eprintln!` from a test that passes, and the integration
+/// lane runs without `--nocapture`, so this is how a passing cell's times
+/// (and a skip) reach the lane's log as well as a local one.
+fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// What the measure leaves running, kept by its cell to the cell's end. A
+/// dropped `TestApp` drops its database at once (#4085), while its server
+/// and jobs run on until the cell's runtime ends, so a write from them
+/// while the cell goes on would bring that database back, left over.
+type Measure = (TestApp, Ws);
+
 /// The viewer's hang-up, as the UI's Disconnect sends it.
 fn hangup(sid: ObjectId) -> Value {
     json!({ "t": "rc:terminate", "session_id": sid.to_hex(), "reason": "controller_hangup" })
@@ -97,8 +112,9 @@ async fn seen_from(app: &TestApp, agent_id: ObjectId) {
 /// The measure. One pod at the window's default of 0, the device and the
 /// viewer on it, the session live: the viewer hangs up and keeps its socket
 /// open. Asserts that the device is told, naming the session and
-/// `controller_hangup`, and returns how long that took from the send.
-async fn same_pod_hangup() -> Duration {
+/// `controller_hangup`, and returns how long that took from the send, with
+/// what the cell keeps running to its end.
+async fn same_pod_hangup() -> (Duration, Measure) {
     let app = one(0).await;
     let seeded = app.seed_tenant("w17same").await;
     let (agent_id, token) = enroll(&app, &seeded, "w17-same").await;
@@ -113,7 +129,7 @@ async fn same_pod_hangup() -> Duration {
         .await
         .expect("on one pod the device is told of the viewer's hang-up");
     let took = sent.elapsed();
-    println!("hangup same-pod ms={}", took.as_millis());
+    say(&format!("hangup same-pod ms={}", took.as_millis()));
     assert_eq!(told["reason"], "controller_hangup", "{told}");
     assert!(
         app.state.fleet().rc_hub.session_snapshot(sid).is_none(),
@@ -121,19 +137,19 @@ async fn same_pod_hangup() -> Duration {
     );
     // The viewer's socket stayed open throughout: the end is the hang-up's.
     drop(ctl);
-    took
+    (took, (app, agent))
 }
 
 /// The bound a hang-up across pods is held to: the measured same-pod time
 /// plus the longest one relayed frame may take on a live bus.
 fn bound_from(same: Duration) -> Duration {
     let bound = same + RPC_DEADLINE;
-    println!(
+    say(&format!(
         "hangup bound ms={} (same-pod {} + RPC_DEADLINE {})",
         bound.as_millis(),
         same.as_millis(),
         RPC_DEADLINE.as_millis()
-    );
+    ));
     bound
 }
 
@@ -156,7 +172,7 @@ struct Relayed {
 /// window. `None` (after the skip line) when the harness has no Redis.
 async fn relayed(app1: TestApp, app2: TestApp, window: u64, rpc: &[&str]) -> Option<Relayed> {
     if !wait_bus(&app1, &app2).await {
-        eprintln!("skipping: no Redis available");
+        say("skipping: no Redis available");
         return None;
     }
     let seeded = app1.seed_tenant("w17relay").await;
@@ -209,7 +225,7 @@ async fn a_viewers_hangup_on_one_pod_reaches_the_device() {
 /// the socket's close nor the relay's janitor can be what ends it.
 #[tokio::test]
 async fn a_viewers_hangup_across_pods_reaches_the_device_at_window_zero() {
-    let same = same_pod_hangup().await;
+    let (same, _measure) = same_pod_hangup().await;
     let bound = bound_from(same);
     let (app1, app2) = pair(0).await;
     let Some(mut r) = relayed(app1, app2, 0, &[]).await else {
@@ -229,14 +245,14 @@ async fn a_viewers_hangup_across_pods_reaches_the_device_at_window_zero() {
         .is_some();
     let Some(told) = told else {
         panic!(
-            "W17-RED the device was not told within {} ms (same-pod {} ms + RPC_DEADLINE {} ms); \
+            "the device was not told within {} ms (same-pod {} ms + RPC_DEADLINE {} ms); \
              pod 1 still holds the session: {still_held}",
             bound.as_millis(),
             same.as_millis(),
             RPC_DEADLINE.as_millis()
         );
     };
-    println!("hangup cross-pod ms={}", took.as_millis());
+    say(&format!("hangup cross-pod ms={}", took.as_millis()));
     assert_eq!(told["reason"], "controller_hangup", "{told}");
     assert!(
         r.app1
@@ -269,16 +285,16 @@ async fn the_next_connect_after_a_hangup_across_pods_is_a_new_session() {
     let told = terminate_for(&mut r.agent, r.sid, WITHIN).await.is_some();
     let again = request(&mut r.ctl, r.agent_id, None).await;
     let next = again["session_id"].as_str().map(|s| s.to_string());
-    println!(
-        "W17-RESULT next connect: answer={} same_id={} device_told_of_the_hangup={told}",
+    say(&format!(
+        "hangup next-connect answer={} same_id={} device_told_of_the_hangup={told}",
         again["t"],
         next.as_deref() == Some(r.sid.to_hex().as_str())
-    );
+    ));
     assert_eq!(again["t"], "rc:session.created", "{again}");
     assert_ne!(
         next.as_deref(),
         Some(r.sid.to_hex().as_str()),
-        "W17-RED the next Connect got the hung-up session's id back: {again}"
+        "the next Connect got the hung-up session's id back: {again}"
     );
     next_of(&mut r.agent, "rc:request", WITHIN)
         .await
@@ -304,7 +320,7 @@ async fn ends_in_audit(app: &TestApp, sid: ObjectId) -> usize {
 /// trail of the end the viewer's pod wrote to the row, and pod 1's own end.
 #[tokio::test]
 async fn with_the_window_on_a_hangup_across_pods_keeps_todays_outcome() {
-    let same = same_pod_hangup().await;
+    let (same, _measure) = same_pod_hangup().await;
     let bound = bound_from(same);
     let (app1, app2) = pair(WINDOW).await;
     let Some(mut r) = relayed(app1, app2, WINDOW, &[RESUME]).await else {
@@ -327,7 +343,10 @@ async fn with_the_window_on_a_hangup_across_pods_keeps_todays_outcome() {
             )
         });
     let took = sent.elapsed();
-    println!("hangup cross-pod window-on ms={}", took.as_millis());
+    say(&format!(
+        "hangup cross-pod window-on ms={}",
+        took.as_millis()
+    ));
     assert_eq!(told["reason"], "controller_hangup", "{told}");
     assert!(
         terminate_for(&mut r.agent, r.sid, QUIET).await.is_none(),
@@ -345,7 +364,9 @@ async fn with_the_window_on_a_hangup_across_pods_keeps_todays_outcome() {
     let row = wait_row(&r.app1, r.sid, "the hang-up ends the row", ended).await;
     assert_eq!(end_reason(&row), Some("controller_hangup"), "{row}");
     let ends = ends_in_audit(&r.app1, r.sid).await;
-    println!("W17-RESULT window-on ends in the audit: {ends}");
+    say(&format!(
+        "hangup window-on session_ended in the audit={ends}"
+    ));
     assert_eq!(ends, 2, "the row's trail and pod 1's end, as before");
     assert!(
         r.app2
@@ -418,18 +439,18 @@ async fn another_members_hangup_across_pods_is_refused_as_on_one_pod() {
     let told = terminate_for(&mut r.agent, r.sid, QUIET).await;
     device_ice(&mut r.agent, r.sid).await;
     let ice = next_of(&mut r.ctl, "rc:ice", WITHIN).await;
-    println!(
-        "W17-RESULT another member's hang-up: same-pod={same} cross-pod={refused:?} held={held} \
+    say(&format!(
+        "hangup other-member same-pod={same} cross-pod={refused:?} held={held} \
          device_told={} viewer_got_ice={}",
         told.is_some(),
         ice.is_some()
-    );
+    ));
     assert!(held, "pod 1 still holds the admin's session");
     assert!(told.is_none(), "the device is not told: {told:?}");
     let ice = ice.expect("a frame from the device still reaches the admin's viewer");
     assert_eq!(ice["session_id"], r.sid.to_hex().as_str(), "{ice}");
     assert!(open(&row(&r.app1, r.sid).await), "the row is still live");
 
-    let refused = refused.expect("W17-RED another member's hang-up across pods is not answered");
+    let refused = refused.expect("another member's hang-up across pods is not answered");
     assert_eq!(refused, same, "refused in the same words as on one pod");
 }
