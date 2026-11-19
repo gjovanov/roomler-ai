@@ -860,7 +860,7 @@ flowchart TD
 | Who reads | `FsAs::for_read` (`:480`) and `FsAs::for_write` (`:502`) through `reads::session_or_daemon_within` (`agents/roomlerd/src/files/reads.rs:389`), one rule with `FsAs::now` (`session_or_daemon`, `agents/roomlerd/src/files.rs:541`): `fs_as_for` (`:420`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`). #3682 — an async caller looks the person up on a thread of its own, through one lookup in flight (`PERSON`, `agents/roomlerd/src/files/reads.rs:378`), and waits for it 1.5 s (`PERSON_LOOKUP_WAIT`, `:373`), as a Linux read asks seat0 (§9.4). `WTSQueryUserToken` calls the session manager and the Downloads known folder reads the person's registry, and the async worker the lookup ran on served the whole files channel. No answer in that time is `FsAs::CannotTell`, never the service. `FsAs::now`, asked only on blocking threads (the status refresh, a `ConfigSet`), still asks on its own |
 | A download | `begin_outgoing_as` (`:3577`), `open_to_send` (`:3695`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
 | A folder | `begin_outgoing_zip_as` (`:4304`), `walk_and_zip` (`:4386`), `zip_folder_entries` (`:4576`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
-| A listing | `list_dir_as` (`:4063`), `list_dir_in` (`:4070`), `list_canonical` (`:4095`); the channel's listings `reads::Listings` (`agents/roomlerd/src/files/reads.rs:88`), its folder lane `reads::Lane` (`:122`, its step `:180`, `take` `:206`) | resolved, opened and its entries read as them in ONE step, under one bound: 3 s from when the step takes the channel's folder lane (`LISTING_BOUND`, `:69`). The whole listing, its person lookup and its wait for the lane included, is answered within 4.5 s of its arrival (`LISTING_ANSWERED_WITHIN`, `:77`), inside the viewer's 5 s. #3682 — the entries were read in a second step with no bound, so a share that answered the open and then stopped held the listing for as long as it liked |
+| A listing | `list_dir_as` (`:4063`), `list_dir_in` (`:4070`), `list_canonical` (`:4095`); the channel's listings `reads::Listings` (`agents/roomlerd/src/files/reads.rs:88`), its folder lane `reads::Lane` (`:122`, its step `:180`, `take` `:206`) | resolved, opened and its entries read as them in ONE step, under one bound: 3 s from when the step takes the channel's folder lane (`LISTING_BOUND`, `:69`). The whole listing, its person lookup and its wait for the lane included, is answered within 4.5 s of reaching its task (`LISTING_ANSWERED_WITHIN`, `:77`), inside the viewer's 5 s unless an upload's end, which the channel's read loop runs inline, delays its start (#4082). #3682 — the entries were read in a second step with no bound, so a share that answered the open and then stopped held the listing for as long as it liked |
 | The Drives view | `reads::roots` (`agents/roomlerd/src/files/reads.rs:271`), `enumerate_roots` (`agents/roomlerd/src/files.rs:4220`) | #3682 — built inside a step as them, within the listing's bound, on a lane of its own (`Listings::drives`). Windows keeps drive letters per sign-in, so a letter the person mapped lives in their sign-in's device map, not the service's, and the service's own list left it out. `GetLogicalDrives` asks no drive anything, so the step touches no share, and a folder stuck on a share that stopped answering never holds it up |
 
 - **Nobody signed in**: a download or a folder download is refused with "Nobody is signed in to
@@ -929,7 +929,7 @@ sequenceDiagram
     V->>L: files:cancel / files:dir {req_id: b} / chunks
     L-->>V: answered at once, not behind a
     T->>T: who reads: the person lookup, 1.5 s at most
-    T->>K: take the lane, within 4.5 s of the request
+    T->>K: take the lane, within 4.5 s of the task's start
     K->>B: one step, 3 s from now: resolve, open, read the entries
     B-->>T: the listing
     T-->>V: files:dir-list {req_id: a}, or files:dir-error with the reason,<br/>unless the channel closes or the session ends first
@@ -969,10 +969,15 @@ sequenceDiagram
   asks. The Drives view has a lane of its own (`reads::Listings`): `GetLogicalDrives` asks no share,
   so a folder stuck on a share that stopped answering never refuses the viewer's way back to the
   drives.
-- **Every listing is answered inside the viewer's 5 s** (`useRemoteControl.ts:14153`, a timer set
-  just before the send at `:14156`): within 4.5 s of its arrival (`LISTING_ANSWERED_WITHIN`), its
-  person lookup (1.5 s at most), its wait for the lane and its step all in. That leaves 0.5 s for
-  the way there and back, however long it waited. A lookup that runs out
+- **A listing is answered within 4.5 s of reaching its task** (`LISTING_ANSWERED_WITHIN`): its
+  person lookup (1.5 s at most), its wait for the lane and its step all in. The viewer gives up
+  5 s after its send (`useRemoteControl.ts:14153`, a timer set just before the send at `:14156`),
+  which leaves 0.5 s for the way there and back, however long the listing waited, when the read
+  loop hands it on at once. ⚠️ The read loop still runs an upload's end itself
+  (`agents/roomlerd/src/peer.rs:13217`), and that end moves the file into place with no bound: on
+  a service install it copies the whole file across to the person's folder
+  (`agents/roomlerd/src/files.rs:2868`). A listing asked while a large upload ends reaches its task
+  only after the copy, and the viewer may show its own timeout first (#4082). A lookup that runs out
   answers "Could not tell who is signed in to this computer. Try again." (`CANNOT_TELL`,
   `agents/roomlerd/src/files/reads.rs:35`), a read and a received file alike, never the service's own
   identity. A retry asks again, and joins a lookup still running rather than starting another.

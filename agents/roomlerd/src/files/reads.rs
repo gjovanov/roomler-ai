@@ -68,12 +68,12 @@ pub(super) fn resolve_path(asked: &Path) -> std::io::Result<PathBuf> {
 /// deadline, [`LISTING_ANSWERED_WITHIN`], covers that wait.
 pub(super) const LISTING_BOUND: Duration = Duration::from_secs(super::DIR_LIST_TIMEOUT_SECS);
 
-/// How long a listing has from its arrival to its answer, all in: the person
-/// lookup before it (1.5 s at most: [`PERSON_LOOKUP_WAIT`] on Windows, the
-/// seat0 lookup's on Linux), its wait for the channel's lane, and its step.
-/// The viewer waits 5 s from its send (`listDir`,
-/// `ui/src/composables/useRemoteControl.ts`), so an answer leaves it 0.5 s
-/// for the way there and back.
+/// How long a listing has from reaching its task to its answer, all in: the
+/// person lookup (1.5 s at most: [`PERSON_LOOKUP_WAIT`] on Windows, the seat0
+/// lookup's on Linux), its wait for the channel's lane, and its step. The
+/// viewer waits 5 s from its send (`listDir`,
+/// `ui/src/composables/useRemoteControl.ts`): 0.5 s for the way there and back
+/// if the read loop hands it on at once; an upload's end, run inline, can delay it.
 pub(super) const LISTING_ANSWERED_WITHIN: Duration = Duration::from_millis(4500);
 
 /// How many listings may wait on a channel's lane behind the step it runs.

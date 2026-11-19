@@ -4089,9 +4089,9 @@ async fn list_dir_in(
 ///
 /// #3669 — resolving and opening the folder is one step as `who`, so a share
 /// that hangs cannot stall an async worker. #3682 — reading its entries is
-/// in the same step, and one bound covers it all ([`reads::LISTING_BOUND`]),
-/// the wait for the channel's lane included: a share that answered the open
-/// and then stopped held the listing for as long as it liked.
+/// in the same step, bounded whole from when it takes the lane
+/// ([`reads::LISTING_BOUND`]), and `by` bounds its wait for the lane: a share
+/// that answered the open and then stopped held the listing as long as it liked.
 async fn list_canonical(
     lane: &reads::Lane,
     who: &FsAs,

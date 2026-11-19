@@ -5967,10 +5967,11 @@ to-activate, so the browser never sees a bait-and-switch.
   read loop: nothing else on the channel waits behind a share, and a later
   listing's answer can come before an earlier one's, which the viewer
   matches by `req_id`. One 3 s bound covers a listing's step, from when it
-  takes the channel's lane, and every listing is answered within 4.5 s of
-  its arrival, inside the viewer's 5 s. A channel runs one folder listing
-  step at a time, and the Drives view has a lane of its own
-  ([desktop-companion.md](desktop-companion.md) §9.3).
+  takes the channel's lane, and a listing is answered within 4.5 s of
+  reaching its task, inside the viewer's 5 s unless the read loop is
+  still running an upload's end, which it awaits inline (#4082). A
+  channel runs one folder listing step at a time, and the Drives view has
+  a lane of its own ([desktop-companion.md](desktop-companion.md) §9.3).
   **One upload on the wire at a time** (#2929). The agent keeps ONE active
   transfer per files channel: a `files:begin` while another is open
   replaces it, and every chunk lands in the open one. Two uploads started
