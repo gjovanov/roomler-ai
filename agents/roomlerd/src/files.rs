@@ -539,9 +539,9 @@ impl FsAs {
         #[cfg(target_os = "windows")]
         {
             fs_as_for(
-                crate::win_identity::own_token_is_local_system(),
-                tunnel_core::env::flag("FILES_AS_SEAT_USER", true),
-                crate::win_identity::session_person,
+                reads::own_token_is_local_system(),
+                reads::files_as_seat_user(),
+                reads::session_person,
             )
         }
         #[cfg(not(target_os = "windows"))]
@@ -4074,7 +4074,10 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
         )
         .await
         .map_err(|_| anyhow!("listing timed out"))??;
-        let entries = who.run(move || Ok(collect_dir_entries(read))).await?;
+        let held_at = canon.clone();
+        let entries = who
+            .run(move || Ok(reads::read_entries(&held_at, read)))
+            .await?;
         Ok::<_, anyhow::Error>(DirListing {
             parent: canon.parent().map(|p| p.to_string_lossy().to_string()),
             path: canon.to_string_lossy().to_string(),
@@ -4107,7 +4110,7 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
 /// is refused, and told so.
 #[cfg(target_os = "windows")]
 async fn list_staging(who: &FsAs) -> Result<DirListing> {
-    let staging = staging_root_windows();
+    let staging = reads::staging_root();
     let target = if staging.is_dir() {
         staging
     } else {
@@ -13792,7 +13795,7 @@ mod refused_begin_tests {
 
 /// #3682 — the drawer's reads to their edges: tests, and the seams they stand in.
 #[cfg(test)]
-mod drawer_edges;
+pub(crate) mod drawer_edges;
 
 /// #3682 — the drawer's reads to their edges: what resolving a path answers.
 mod reads;

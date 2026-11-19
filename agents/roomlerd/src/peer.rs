@@ -17803,3 +17803,76 @@ mod wire_text_log_tests {
         );
     }
 }
+
+/// #3682 (D1-B) — a folder listing never holds the files channel's read
+/// loop. It waited there for its folder, so while a share did not answer, no
+/// later message on the channel was read: not a download's cancel, not the
+/// next request. The listing's seam is the lib's (`files::drawer_edges`), so
+/// the loopback channel is too ([`files_channel_tests::Pair`]), not the one
+/// in `tests/file_dc.rs`.
+#[cfg(test)]
+mod dir_listing_tests {
+    use super::files_channel_tests::Pair;
+    use super::*;
+    use crate::files::drawer_edges::seams;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::json;
+
+    /// Messages of other kinds, sent behind a listing whose folder's entries
+    /// do not come, are acted on at once: a cancel naming an id that is not
+    /// one plain name is refused, and a download of a file that is not there
+    /// fails, each answered while the listing still waits.
+    #[tokio::test]
+    async fn messages_behind_a_held_listing_are_acted_on_at_once() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let slow = temp.path().join("slow");
+        std::fs::create_dir(&slow).expect("a folder");
+        std::fs::write(slow.join("a.txt"), b"a").expect("a file in it");
+        let held = seams::hold_entries(&slow);
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        let gone = temp.path().join("not-there.txt");
+        pair.ask(&json!({"t": "files:dir", "req_id": "held", "path": slow}))
+            .await;
+        let reached = held.reached_within(Duration::from_secs(5)).await;
+        let started = std::time::Instant::now();
+        pair.ask(&json!({"t": "files:cancel", "id": "not/one-name"}))
+            .await;
+        pair.ask(&json!({"t": "files:get", "id": "get-1", "path": gone}))
+            .await;
+        let behind = tokio::time::timeout(Duration::from_secs(1), pair.heard(2)).await;
+        let waited = started.elapsed();
+        // The share answers: the listing's thread goes free before anything
+        // is asserted.
+        held.release();
+        let listed = pair.heard(1).await;
+        pair.close().await;
+        assert!(reached, "the listing's entries were asked for");
+        let Ok(behind) = behind else {
+            panic!("nothing behind the listing was answered within 1 s");
+        };
+        let answered: Vec<(&str, &str)> = behind
+            .iter()
+            .map(|f| {
+                (
+                    f["t"].as_str().unwrap_or(""),
+                    f["id"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        for expected in [("files:error", "not/one-name"), ("files:error", "get-1")] {
+            assert!(
+                answered.contains(&expected),
+                "{expected:?} is not in {behind:?} ({waited:?})"
+            );
+        }
+        assert_eq!(
+            listed.first().and_then(|f| f["req_id"].as_str()),
+            Some("held"),
+            "the listing answered once its folder did: {listed:?}"
+        );
+    }
+}
