@@ -26,6 +26,9 @@ impl EncoderOps for FfmpegEncoder {
     // P5; the inline path keeps that verbatim.
     const INLINE_BLOCK_IN_PLACE: bool = true;
 
+    // Every name in the dispatch tables is a hardware backend (`is_hardware`).
+    const HARDWARE: bool = true;
+
     fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
         FfmpegEncoder::encode_sync(self, frame)
     }
