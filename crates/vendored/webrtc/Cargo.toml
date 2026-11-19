@@ -38,6 +38,12 @@
 #     And src/ice_transport/mod.rs: `RTCIceTransport::local_candidates()`,
 #     the gathered candidates for a caller outside this crate (the gatherer
 #     is crate-private), read without ever creating an agent.
+#   - src/ice_transport/ice_candidate_pair.rs + src/ice_transport/mod.rs
+#     (FR-148 P0): `RTCIceCandidatePair::local_relay_transport()`, what
+#     carries the local candidate's TURN allocation (`Candidate::
+#     relay_transport`, a patch of the vendored webrtc-ice), on the pairs the
+#     selection reads and its change handler hands over. Read only by the
+#     agent's carrier line.
 #
 # Default behaviour is unchanged — sctp_max_receive_buffer_size
 # defaults to 0, which preserves the upstream 1 MB fallback. Only

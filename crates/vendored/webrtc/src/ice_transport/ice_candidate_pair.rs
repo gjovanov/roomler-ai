@@ -1,5 +1,7 @@
 use std::fmt;
 
+use ice::url::{ProtoType, SchemeType};
+
 use crate::ice_transport::ice_candidate::*;
 
 /// ICECandidatePair represents an ICE Candidate pair
@@ -14,6 +16,8 @@ pub struct RTCIceCandidatePair {
     stats_id: String,
     local: RTCIceCandidate,
     remote: RTCIceCandidate,
+    /// Roomler patch (FR-148 P0): see [`Self::local_relay_transport`].
+    local_relay: Option<(ProtoType, SchemeType)>,
 }
 
 impl fmt::Display for RTCIceCandidatePair {
@@ -35,7 +39,24 @@ impl RTCIceCandidatePair {
             stats_id,
             local,
             remote,
+            local_relay: None,
         }
+    }
+
+    /// Roomler patch (FR-148 P0): the pair, with what carries its local
+    /// candidate's TURN allocation, as the ICE agent's candidate says it
+    /// (`Candidate::relay_transport`, a patch of the vendored webrtc-ice).
+    pub(crate) fn with_local_relay(mut self, relay: Option<(ProtoType, SchemeType)>) -> Self {
+        self.local_relay = relay;
+        self
+    }
+
+    /// Roomler patch (FR-148 P0): the transport and the scheme of the TURN URL
+    /// the local candidate's allocation was made over. `None` when the local
+    /// candidate is not a relay, when its gather did not say, and on a pair
+    /// made with [`Self::new`] rather than read from the ICE agent.
+    pub fn local_relay_transport(&self) -> Option<(ProtoType, SchemeType)> {
+        self.local_relay
     }
 
     /// The local candidate of the selected pair. Exposed (roomler patch) so

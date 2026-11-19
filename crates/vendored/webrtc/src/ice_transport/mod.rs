@@ -89,7 +89,9 @@ impl RTCIceTransport {
             if let Some(ice_pair) = agent.get_selected_candidate_pair() {
                 let local = RTCIceCandidate::from(&ice_pair.local);
                 let remote = RTCIceCandidate::from(&ice_pair.remote);
-                return Some(RTCIceCandidatePair::new(local, remote));
+                // Roomler patch (FR-148 P0): and what carries the local relay.
+                let relay = ice_pair.local.relay_transport();
+                return Some(RTCIceCandidatePair::new(local, remote).with_local_relay(relay));
             }
         }
         None
@@ -142,6 +144,8 @@ impl RTCIceTransport {
                       remote: &Arc<dyn Candidate + Send + Sync>| {
                     let on_selected_candidate_pair_change_handler_clone =
                         Arc::clone(&on_selected_candidate_pair_change_handler);
+                    // Roomler patch (FR-148 P0): as get_selected_candidate_pair.
+                    let relay = local.relay_transport();
                     let local = RTCIceCandidate::from(local);
                     let remote = RTCIceCandidate::from(remote);
                     Box::pin(async move {
@@ -149,7 +153,8 @@ impl RTCIceTransport {
                             &*on_selected_candidate_pair_change_handler_clone.load()
                         {
                             let mut f = handler.lock().await;
-                            f(RTCIceCandidatePair::new(local, remote)).await;
+                            f(RTCIceCandidatePair::new(local, remote).with_local_relay(relay))
+                                .await;
                         }
                     })
                 },
