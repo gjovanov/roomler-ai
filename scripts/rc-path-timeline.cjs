@@ -13,7 +13,8 @@
 //
 //   | Section    | Lines read (message text, by call site)                                  |
 //   |------------|--------------------------------------------------------------------------|
-//   | carrier    | `session carrier recorded (FR-102 P9c)` (session_carrier.rs),            |
+//   | carrier    | `session carrier recorded (FR-102 P9c)` (session_carrier.rs), with its   |
+//   |            | `relay_transport` (FR-148 P0: what carries the agent's TURN allocation), |
 //   |            | `per-session ICE path detected (adaptive bitrate)` (carrier_rank.rs),    |
 //   |            | `rc ICE: overlay …` (peer.rs, rc_overlay.rs),                            |
 //   |            | `rc ICE: carrier rank (FR-148 P4)` and `…, the mesh link 10 s on …`      |
@@ -22,7 +23,8 @@
 //   | rate       | `FFmpeg DC pump heartbeat (≈2s window)`, `VP9-444 DC pump heartbeat…`    |
 //   |            | (peer.rs): bytes_written and frames_sent are CUMULATIVE per pump         |
 //   | delivery   | `path delivery (FR-148 P0, shadow, ≈10s)`, `path model (…)`              |
-//   |            | (media_delivery.rs)                                                      |
+//   |            | (media_delivery.rs); a delivery line with a queued sample prints as a    |
+//   |            | `queue` event: `queued`, `standing_ms`, `inflight`, `cwnd`, `rwnd_low`   |
 //   | open       | `path open (FR-148 P0, O10)` (media_delivery.rs): once a pump, at its    |
 //   |            | first media write, which way SCTP opened the association (FR-148 O10)    |
 //   | memory     | `FR-148 P1 path memory: the pair's entry at the open` / `…: what the     |
@@ -190,6 +192,7 @@ const FIELDS = [
   'window_ms',
   // carrier + ICE (session_carrier.rs, carrier_rank.rs)
   'carrier',
+  'relay_transport',
   'local_typ',
   'remote_typ',
   'relay',
@@ -222,6 +225,12 @@ const FIELDS = [
   'backlogged_bps',
   'app_limited_bps',
   'stalled_ms',
+  // the standing queue (FR-148 P0), on a delivery line that carries it; its
+  // `cwnd`, a pair there, leaves under the open line's name below
+  'standing_ms',
+  'queued',
+  'inflight',
+  'rwnd_low',
   'viewer_rx_bps',
   'model_capacity_bps',
   'model_floor_bps',
@@ -255,6 +264,9 @@ const OPEN_PATHS = ['cookie_echo', 'init_ack', 'unknown', 'unread'];
 /** The open line's fields, in the order media_delivery.rs `emit_open` writes
  *  them. Each is in FIELDS too. */
 const OPEN_FIELDS = ['pump', 'open_path', 'ssthresh', 'rwnd', 'cwnd', 'inflight_bytes', 'pending_bytes', 'max_payload', 'fast_retransmits', 't3_expiries'];
+/** What a `queue` event prints of a delivery line with a queued sample, as
+ *  media_delivery.rs `emit` names them (FR-148 P0). Each is in FIELDS too. */
+const QUEUE_FIELDS = ['queued', 'standing_ms', 'inflight', 'cwnd', 'rwnd_low'];
 
 // ---------------------------------------------------------------- values
 
@@ -301,6 +313,15 @@ function text(v) {
   if (some) s = some[1].trim();
   if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') s = s.slice(1, -1);
   return s === '' ? null : s;
+}
+
+/** A Debug tuple of two integers, `(a, b)`, bare or inside `Some(…)`; null for
+ *  `None`. The delivery line's `standing_ms` has this shape. A copy of
+ *  rc-path-report.cjs `couple`, so both read the field alike. */
+function couple(v) {
+  const s = text(v);
+  const m = s && /^\(\s*(\d+)\s*,\s*(\d+)\s*\)$/.exec(s);
+  return m ? [Number(m[1]), Number(m[2])] : null;
 }
 
 /** `<bps>/<basis>/<age>ms` (media_delivery.rs `Shown`), or null. */
@@ -471,7 +492,9 @@ function finishSession(s, windowEnd) {
   const ka = { frames: 0, bytes: 0, carried: 0, missing: 0 };
   const cap = { judged: 0, at: 0, nominal: 0 };
   const enc = { opens: 0, qsv: 0, rejected: 0 };
-  const del = { windows: 0, stalled: 0, longestMs: 0, stalledMs: 0 };
+  // FR-148 P0: `carried` counts the lines with the standing queue's fields,
+  // `queued` those with a queued sample, `standingHigh` the highest standing.
+  const del = { windows: 0, stalled: 0, longestMs: 0, stalledMs: 0, carried: 0, queued: 0, standingHigh: null };
   const model = { n: 0, lastRx: null, maxRx: null, lastCap: null };
   let lastModelKey = null;
   // FR-148 O10: the open lines, and the first one's answer.
@@ -553,7 +576,7 @@ function finishSession(s, windowEnd) {
       case 'carrier':
         carrier = text(f.carrier);
         if (carrierAt === null) carrierAt = r.t - s.first;
-        push(r.t, 'carrier', kv(f, ['carrier', 'local_typ', 'remote_typ']));
+        push(r.t, 'carrier', kv(f, ['carrier', 'relay_transport', 'local_typ', 'remote_typ']));
         break;
       case 'ice':
         push(r.t, 'ice', kv(f, ['relay', 'local_typ', 'local_proto', 'remote_typ', 'remote_proto', 'waited_ms', 'opening']));
@@ -589,6 +612,18 @@ function finishSession(s, windowEnd) {
           del.stalledMs += st;
           del.longestMs = Math.max(del.longestMs, st);
           push(r.t, 'stall', kv(f, ['span_ms', 'delivery_samples', 'backlogged_bps', 'app_limited_bps', 'stalled_ms']));
+        }
+        // FR-148 P0: the standing queue, on a line that carries it (an older
+        // agent's does not). The highest standing is over every such line.
+        const queued = num(f.queued);
+        if (queued !== null) {
+          del.carried++;
+          const standing = couple(f.standing_ms);
+          if (standing) del.standingHigh = del.standingHigh === null ? standing[1] : Math.max(del.standingHigh, standing[1]);
+          if (queued >= 1) {
+            del.queued++;
+            push(r.t, 'queue', kv(f, QUEUE_FIELDS));
+          }
         }
         break;
       }
@@ -797,6 +832,7 @@ function render(r) {
     L.push(`| heartbeats / without counters / counter resets / holes | ${x.heartbeats} / ${x.heartbeatsWithoutCounters} / ${x.resets} / ${x.holes} |`);
     L.push(`| encoder: opens / QVBR opens / rejected quality options | ${x.enc.opens} / ${x.enc.qsv} / ${x.enc.rejected} |`);
     L.push(`| delivery: windows / stalled / share / longest stall | ${x.del.windows} / ${x.del.stalled} / ${pct(x.del.stalled, x.del.windows)} / ${x.del.windows ? x.del.longestMs + ' ms' : '-'} |`);
+    L.push(`| delivery: windows with a queued sample / carrying the standing queue / highest standing | ${x.del.carried ? x.del.queued : '-'} / ${x.del.carried} / ${x.del.standingHigh === null ? '-' : x.del.standingHigh + ' ms'} |`);
     const rx = x.model.lastRx;
     const mc = x.model.lastCap;
     L.push(`| path model: lines / last viewer_rx (basis, age) / highest viewer_rx / last model_capacity (basis) | ${x.model.n} / ${rx ? `${dash(rx.bps)} (${dash(rx.basis || rx.raw)}, ${dash(rx.ageMs)} ms)` : '-'} / ${dash(x.model.maxRx)} / ${mc ? `${dash(mc.bps)} (${dash(mc.basis || mc.raw)})` : '-'} |`);
@@ -1172,6 +1208,10 @@ function selfTest() {
     const md = fs.readFileSync(path.join(src, 'media_delivery.rs'), 'utf8');
     for (const k of OPEN_FIELDS) check(`source: open line field ${k}`, md.includes(`${k} = `));
     for (const k of OPEN_PATHS) check(`source: open line answer ${k}`, md.includes(`"${k}"`));
+    // FR-148 P0: the delivery line's standing-queue fields, as `emit` writes them.
+    for (const k of QUEUE_FIELDS) check(`source: delivery line field ${k}`, new RegExp(`\\b${k} = \\??q\\.${k},`).test(md));
+    const sc = fs.readFileSync(path.join(src, 'session_carrier.rs'), 'utf8');
+    check('source: carrier line field relay_transport', /\brelay_transport = relay\.as_str\(\),/.test(sc));
   } catch (e) {
     check('source files readable', false, e.message);
   }
@@ -1319,6 +1359,41 @@ function selfTest() {
       /^\| open path \/ ssthresh \/ rwnd at the first write \| unread \/ - \/ - \|$/m.test(four) &&
       /^\| open path \/ ssthresh \/ rwnd at the first write \| - \/ - \/ - \|$/m.test(four),
   );
+  // FR-148 P0: the relay transport and the standing queue. A session on TURN
+  // over TCP: a delivery line with two queued samples, one with none. And an
+  // older agent's session, whose delivery line carries no queue fields.
+  const sq = fold(
+    [
+      { t: at(10), m: 'session carrier recorded (FR-102 P9c)', f: { session_id: oid('5a01'), carrier: 'turn', relay_transport: 'tcp', local_typ: 'Relay', remote_typ: 'Relay' } },
+      {
+        t: at(20),
+        m: 'path delivery (FR-148 P0, shadow, ≈10s)',
+        f: { session_id: oid('5a01'), span_ms: 9994, delivery_samples: '(0, 5, 0)', backlogged_bps: 'None', app_limited_bps: 'Some(391566)', stalled_ms: 0, standing_ms: 'Some((40, 610))', queued: 2, inflight: '(327500, 540000)', cwnd: '(332780, 544380)', rwnd_low: 508576 },
+      },
+      {
+        t: at(30),
+        m: 'path delivery (FR-148 P0, shadow, ≈10s)',
+        f: { session_id: oid('5a01'), span_ms: 10002, delivery_samples: '(0, 5, 0)', backlogged_bps: 'None', app_limited_bps: 'Some(52000)', stalled_ms: 0, standing_ms: 'Some((0, 19))', queued: 0, inflight: '(0, 2400)', cwnd: '(544380, 544380)', rwnd_low: 1046020 },
+      },
+      { t: at(40), m: 'path delivery (FR-148 P0, shadow, ≈10s)', f: { session_id: oid('5a02'), span_ms: 10000, delivery_samples: '(5, 0, 0)', backlogged_bps: 'Some((1, 2, 3))', app_limited_bps: 'None', stalled_ms: 0 } },
+    ],
+    { to: at(600) },
+  );
+  const sqOut = render(sq);
+  check('relay_transport: the carrier line prints it after the carrier', /^  07:00:10\.000  carrier  carrier=turn relay_transport=tcp local_typ=Relay remote_typ=Relay$/m.test(sqOut), (sqOut.match(/^.*  carrier  .*$/m) || [''])[0]);
+  check(
+    'queue: a delivery line with a queued sample is a queue row, with the fields it carries',
+    /^  07:00:20\.000  queue    queued=2 standing_ms=\(40, 610\) inflight=\(327500, 540000\) cwnd=\(332780, 544380\) rwnd_low=508576$/m.test(sqOut),
+    (sqOut.match(/^.*  queue  .*$/m) || [''])[0],
+  );
+  check('queue: a line with none queued, or none of the fields, is no row', (sqOut.match(/^ {2}\S+ {2}queue /gm) || []).length === 1);
+  const sd = sq.sessions.map((x) => x.summary.del);
+  check('queue: the session counts its queued windows, the lines carrying the fields, and the highest standing', sd[0].queued === 1 && sd[0].carried === 2 && sd[0].standingHigh === 610 && sd[1].queued === 0 && sd[1].carried === 0 && sd[1].standingHigh === null, JSON.stringify(sd));
+  check(
+    "queue: the session row, and an older agent's session reads - where it carries nothing",
+    /^\| delivery: windows with a queued sample \/ carrying the standing queue \/ highest standing \| 1 \/ 2 \/ 610 ms \|$/m.test(sqOut) &&
+      /^\| delivery: windows with a queued sample \/ carrying the standing queue \/ highest standing \| - \/ 0 \/ - \|$/m.test(sqOut),
+  );
   // 3. Masking: a full id and an address in a field print neither.
   const leak = fold(
     [
@@ -1369,6 +1444,10 @@ function selfTest() {
   check(
     "open: the query's filter keeps the line, and its fields leave as stored",
     new RegExp(cond[0].$regexMatch.regex).test('path open (FR-148 P0, O10)') && OPEN_FIELDS.every((k) => FIELDS.includes(k) && fv[k] === '$lines.fields.' + k),
+  );
+  check(
+    "queue and relay transport: the delivery line's queue fields and the carrier line's relay_transport leave as stored",
+    QUEUE_FIELDS.concat(['relay_transport']).every((k) => FIELDS.includes(k) && fv[k] === '$lines.fields.' + k),
   );
   // 6. --rows: one read's rows, masked as the report masks them. A third
   //    session whose id ends as session 1's does, its key as session 1's key,

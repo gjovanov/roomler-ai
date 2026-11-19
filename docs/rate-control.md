@@ -1644,14 +1644,14 @@ their own. A new association brings new gauges, and the session's least starts o
 it.
 
 **When a sample is queued.** A sample is queued when it **counts** and its least stands
-250 ms or more over the session's least (`QUEUED_OVER_MS`, `:76`). A sample counts
-(`counts`, `:98`) when it acknowledged more than `max_payload × (ms / 200 + 2)` bytes.
+250 ms or more over the session's least (`QUEUED_OVER_MS`, `:82`). A sample counts
+(`counts`, `:104`) when it acknowledged more than `max_payload × (ms / 200 + 2)` bytes.
 The session's least is the lowest least of the samples that counted since the
 association started, and `standing_ms` is how far a sample that counts stood over it.
 
 The byte rule keeps a receiver's delayed SACK out of the reading. A receiver acknowledges
 the second of two packets at once, and holds the SACK of a lone packet for up to 200 ms
-(`DELAYED_ACK_MS`, `:81`: the vendored SCTP's `ACK_INTERVAL`, and the hold of Chrome's
+(`DELAYED_ACK_MS`, `:87`: the vendored SCTP's `ACK_INTERVAL`, and the hold of Chrome's
 dcSCTP and of usrsctp), a wait its delay then carries. A still screen sends lone packets,
 so its least can stand 200 ms or more over a busy screen's with no queue anywhere. For
 every SACK of a sample to have been held, each packet came after the hold of the one
@@ -1715,12 +1715,18 @@ hold that case.
 | `the_gauges_are_taken_where_a_sample_starts_and_closes_only`, `a_sample_without_a_take_at_its_start_reads_no_gauges` | one take at a sample's start and one at its close, none at a reading sooner than `SAMPLE_MIN`; a sample whose start took none reads none |
 | `the_line_folds_its_samples_gauges`, `the_line_names_its_fields` | the fold over a line's samples, and the line's field names and their order, with and without the gauges |
 | `shaped_link::a_peek_leaves_the_least_to_the_samplers_take` | over a real association: a peek leaves the least to the sampler's take, and a second reader that took leaves the next sample none |
-| `shaped_link::tcp_shape::deep_*`, `shallow_*_control`, `a_still_screen_on_the_{deep,shallow}_queue_reads_no_queue` | the cells above. The four deep cells that stay red on the TCP cells' own hypothesis (fewer than half the loaded seconds backlogged) are ignored, as before |
+| `shaped_link::tcp_shape::deep_0_4_mbps_path_i_reads_under_half_backlogged`, `deep_2_mbps_path_i_with_the_pump_skip_reads_under_half_backlogged` | the two deep cells above: the queue drops nothing, fewer than half the loaded seconds read backlogged (the TCP cells' own hypothesis), at least half the loaded samples read queued, and SCTP's acknowledgement delay stands 250 ms or more over its least on at least half the loaded seconds. That pin was on every loaded second, where the lowest reading stood 1.36 to 1.40 times the 250 ms. Under FR-148 D44 it moved to half, so that a busy runner cannot flip it. Three runs of each, alone on a Windows box, after the change: 19 of 19 loaded seconds, the lowest 344, 350 and 346 ms over the least at 0.4 Mbit/s and 343, 339 and 343 ms at 2 Mbit/s under the skip; 9 of 9 loaded samples queued; 0 of 19 seconds backlogged |
+| the other four `shaped_link::tcp_shape::deep_*` | ignored: red on the TCP cells' own hypothesis, as before |
+| `shaped_link::tcp_shape::shallow_*_control` | the four controls above |
+| `shaped_link::tcp_shape::a_still_screen_on_the_{deep,shallow}_queue_reads_no_queue` | the still screens above: at least two samples in their 10 s, none that counts, a delay from some SACK, and no sample queued. The precondition was four samples, and the first runs took five. Under D44 it moved to two: a still screen's 200 bytes a second never pass `counts`' byte bound, so two samples show the guard holds. Three runs of each, alone on a Windows box, after the change: five samples in every run, 200 to 600 bytes each |
+| `shaped_link::tcp_shape::stalls_2_mbps_path_i_lift_the_floor_over_the_link`, `stalls_under_the_pump_skip_2_mbps_path_i_lift_the_floor_over_the_link` | ignored, a measurement (D44): head-of-line stalls of 0.8 s every 3.3 s on the deep lossless link at 2 Mbit/s, path I. The viewer window after a stall carries the stall's bytes too, and `Pipe`'s floor takes every window, so the floor ends over 1.3 times the link's 1,954 kbit/s of payload. The cells pin that defect, so as gates they would protect nothing in the product. Three runs of each with `--ignored`, alone on a Windows box: 1.50 to 1.55 times the link under a writer that offers 80 % of it, and 1.77 to 1.78 times under the pump's skip at 150 %, which is 1.15 to 1.20 and 1.36 to 1.37 times the 1.3 they assert |
+| `shaped_link::tcp_shape::stalls_2_mbps_path_c_lift_the_floor_over_the_link` | ignored, red: path C's window caps what the link carries in a stall, at 1.27 to 1.28 times the link in 20 s |
 
 They add about 23 s of test time, each cell timed alone: 10.1 s for each still-screen
 cell, 2.2 s for the relay pair below, 0.3 s for the peek, and the unit cells nothing that
 shows. The two still-screen cells wait their turn with the TCP cells, which run one at a
-time, so that line of cells grows by about 20 s.
+time, so that line of cells grows by about 20 s. Since D44 the line runs eight cells, in
+141 s on a Windows box: the two stall cells and their 20 s each left it.
 
 **The carrier's relay transport.** The carrier line (`session carrier recorded (FR-102
 P9c)`, [remote-control.md §11.9](remote-control.md#119-the-carrier-a-session-rides-fr-102-p9c))
