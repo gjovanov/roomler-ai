@@ -285,7 +285,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3988`, `crates/agent-core/src/config.rs:4434`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3988`, `crates/agent-core/src/config.rs:4463`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -576,20 +576,36 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3579`) |
-| `config::read_if_present` (`:3570`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3547`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…from the previous good copy"*, worded for what happened to the live file (below), and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3608`) |
+| `config::read_if_present` (`:3638`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
     Q["a caller needs config.toml"] --> A{"is 'no file' a normal answer<br/>for THIS caller?"}
     A -->|"yes — an optional-flag probe,<br/>a first enrollment"| P["read_if_present<br/>→ None · debug at most"]
     A -->|"no — the config the<br/>process runs on"| L["load"]
-    L --> T{"live file parses?"}
+    L --> T{"live file loads?"}
     T -->|"yes"| OK["the config"]
     T -->|"no"| V{"config.toml.prev parses?"}
-    V -->|"yes"| R["promoted to live<br/>ERROR 'RECOVERED' — no action needed"]
+    V -->|"yes"| W{"was the live file there?<br/>(the read's own error)"}
+    W -->|"no — NotFound"| RM["promoted to live<br/>ERROR 'config missing — RESTORED'<br/>— no action needed"]
+    W -->|"yes"| R["promoted to live<br/>ERROR 'config unreadable — RECOVERED'<br/>— no action needed"]
     V -->|"no"| E["ERROR 'the host must be re-enrolled'<br/>— believe it"]
 ```
+
+The recovery's line says what happened to the live file (#4058). Both are ERROR: either way the
+host now runs on an older config, and that must never look like a normal boot.
+
+| The live file | ERROR line | Where |
+|---|---|---|
+| **is not there**: the read's own `NotFound` | *"config missing — RESTORED from the previous good copy; the live file was not there"* | `crates/agent-core/src/config.rs:3581` |
+| **is there and does not load**: it may not be read (`PermissionDenied`), does not parse, or is all NUL | *"config unreadable — RECOVERED from the previous good copy; the live file was likely truncated by an unclean shutdown"* | `:3589` |
+
+"Not there" is read off the read's own error (`not_found`, `:3807`), never off an `exists()`
+that could race the read, and a parse error is never read as missing. Before #4058 a live file
+that a person or a test had removed took the second line, which named a truncation that never
+happened. With no usable previous copy, a missing file takes the re-enrollment line above,
+unchanged.
 
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
@@ -614,7 +630,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2620`, `:2642`), at the clean-run promotion
 (`record_clean_run_at`, `:2570`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4352`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4415`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -626,7 +642,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:4097`):
+ignores (`serialise_for`, `:4235`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -652,14 +668,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3929`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:4041`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
 `audit` (`:2805`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3997`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:3981`), never one read off the entry on disk. A newer build's
+`:4109`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:4093`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -680,11 +696,11 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:4075`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4187`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4163`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4381`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
@@ -862,7 +878,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4721`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4750`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -1908,7 +1924,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3133-3140`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3134-3141`).
 
 ### What a bare host needs (#3204)
 
@@ -3296,7 +3312,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3131-3132`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3132-3133`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 
