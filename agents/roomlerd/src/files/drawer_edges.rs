@@ -455,6 +455,34 @@ mod one_bound_over_a_listing {
         assert!(!ran.load(Ordering::SeqCst), "the listing started a step");
         assert_eq!(outermost(answered), "listing timed out");
     }
+
+    /// While a folder's step is stuck on a share that stopped answering, the
+    /// Drives view still answers on that channel. `GetLogicalDrives` asks no
+    /// share, so the Drives view needs no turn behind a folder, and it is the
+    /// viewer's way back from a dead share. Elsewhere the roots take no lane.
+    #[tokio::test]
+    async fn behind_a_stuck_listing_the_drives_view_still_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let dead = folder(temp.path(), "dead");
+        let held = seams::hold_entries(&dead);
+        let h = FilesHandler::new();
+        let first = tokio::time::timeout(BOUND + ROOM, listing(&h, &dead)).await;
+        let started = Instant::now();
+        let drives = tokio::time::timeout(2 * ROOM, h.list_as(&FsAs::Daemon, "")).await;
+        let waited = started.elapsed();
+        held.release();
+        let Ok(Ok(first)) = first else {
+            panic!("the first listing gave no answer within its bound");
+        };
+        assert_eq!(outermost(first), "listing timed out");
+        let drives = match drives {
+            Ok(Ok(drives)) => drives,
+            Ok(Err(e)) => panic!("the Drives view was refused: {e:#}"),
+            Err(_) => panic!("the Drives view gave no answer within {:?}", 2 * ROOM),
+        };
+        assert!(!drives.entries.is_empty(), "the Drives view lists nothing");
+        assert!(waited < ROOM, "answered after {waited:?}");
+    }
 }
 
 /// #3682 item 6 — a refusal names what was refused and why, for every
