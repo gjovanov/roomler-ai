@@ -368,6 +368,15 @@ mod one_bound_over_a_listing {
         let first = tokio::time::timeout(BOUND + ROOM, first).await;
         let second = tokio::time::timeout(BOUND + ROOM, second).await;
         assert!(reached, "the first listing's entries were asked for");
+        both_listed(first, second);
+    }
+
+    /// A listing's task, awaited within some time.
+    type Awaited =
+        Result<Result<Result<DirListing>, tokio::task::JoinError>, tokio::time::error::Elapsed>;
+
+    /// Both listings, each its folder's one file, or which one failed how.
+    fn both_listed(first: Awaited, second: Awaited) {
         for (which, answered) in [("first", first), ("second", second)] {
             let listing = match answered {
                 Ok(Ok(Ok(listing))) => listing,
@@ -377,6 +386,74 @@ mod one_bound_over_a_listing {
             };
             assert_eq!(names(&listing), vec!["a.txt"], "the {which} listing");
         }
+    }
+
+    /// A share that answers each listing in 2 s, SMB over a corporate VPN:
+    /// a listing asked 0.5 s after another waits for it, and its own step
+    /// then has the whole bound. Its bound ran from when it was asked, so it
+    /// timed out at 3.5 s, half a second before its step would have ended.
+    #[tokio::test]
+    async fn behind_a_slow_listing_the_next_has_its_own_steps_whole_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, b) = (folder(temp.path(), "a"), folder(temp.path(), "b"));
+        let (held_a, held_b) = (seams::hold_entries(&a), seams::hold_entries(&b));
+        let h = FilesHandler::new();
+        let started = tokio::time::Instant::now();
+        let first = listing(&h, &a);
+        tokio::time::sleep_until(started + Duration::from_millis(500)).await;
+        let second = listing(&h, &b);
+        tokio::time::sleep_until(started + Duration::from_secs(2)).await;
+        held_a.release();
+        let second_began = held_b.reached_within(BOUND).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        held_b.release();
+        let first = tokio::time::timeout(ROOM, first).await;
+        let second = tokio::time::timeout(2 * ROOM, second).await;
+        assert!(second_began, "the second listing's step never began");
+        both_listed(first, second);
+    }
+
+    /// The edge of it: the first listing ends just inside its bound, at
+    /// 2.9 s, and a quick one asked 0.1 s after it needs 0.3 s. Its bound
+    /// ran from when it was asked, so it timed out at 3.1 s.
+    #[tokio::test]
+    async fn behind_a_listing_ending_just_inside_its_bound_a_quick_one_gets_its_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, b) = (folder(temp.path(), "a"), folder(temp.path(), "b"));
+        let (held_a, held_b) = (seams::hold_entries(&a), seams::hold_entries(&b));
+        let h = FilesHandler::new();
+        let started = tokio::time::Instant::now();
+        let first = listing(&h, &a);
+        tokio::time::sleep_until(started + Duration::from_millis(100)).await;
+        let second = listing(&h, &b);
+        tokio::time::sleep_until(started + Duration::from_millis(2900)).await;
+        held_a.release();
+        let second_began = held_b.reached_within(BOUND).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        held_b.release();
+        let first = tokio::time::timeout(ROOM, first).await;
+        let second = tokio::time::timeout(2 * ROOM, second).await;
+        assert!(second_began, "the second listing's step never began");
+        both_listed(first, second);
+    }
+
+    /// A listing already past its own bound when it reaches the lane answers
+    /// `listing timed out` and starts no step. A step it started would hold
+    /// the lane, for an answer nobody waits for.
+    #[tokio::test]
+    async fn a_listing_past_its_own_bound_starts_no_step() {
+        let lane = reads::Lane::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        let marks = ran.clone();
+        let by = Instant::now();
+        let answered = lane
+            .step(&FsAs::Daemon, "past", by, move || {
+                marks.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert!(!ran.load(Ordering::SeqCst), "the listing started a step");
+        assert_eq!(outermost(answered), "listing timed out");
     }
 }
 

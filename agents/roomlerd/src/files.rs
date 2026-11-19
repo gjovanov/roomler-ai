@@ -4060,19 +4060,26 @@ pub async fn list_dir(path: &str) -> Result<DirListing> {
 /// #3682 — on a lane of its own; a channel's listings share the channel's
 /// ([`FilesHandler::list_dir`]).
 pub(crate) async fn list_dir_as(who: &FsAs, path: &str) -> Result<DirListing> {
-    list_dir_in(&reads::Lane::default(), who, path).await
+    let by = std::time::Instant::now() + reads::LISTING_ANSWERED_WITHIN;
+    list_dir_in(&reads::Lane::default(), who, path, by).await
 }
 
-/// [`list_dir_as`] on `lane`: one step at a time, each bounded whole.
-async fn list_dir_in(lane: &reads::Lane, who: &FsAs, path: &str) -> Result<DirListing> {
+/// [`list_dir_as`] on `lane`, answered `by`: one step at a time, each
+/// bounded whole.
+async fn list_dir_in(
+    lane: &reads::Lane,
+    who: &FsAs,
+    path: &str,
+    by: std::time::Instant,
+) -> Result<DirListing> {
     who.refuse_read(NOBODY_SIGNED_IN_TO_BROWSE)?;
     if path.is_empty() || path == "~" {
-        return reads::roots(lane, who).await;
+        return reads::roots(lane, who, by).await;
     }
     if path == STAGING_SENTINEL {
-        return list_staging(lane, who).await;
+        return list_staging(lane, who, by).await;
     }
-    list_canonical(lane, who, &PathBuf::from(path)).await
+    list_canonical(lane, who, &PathBuf::from(path), by).await
 }
 
 /// Canonicalise, enumerate and shape one directory, as `who`. Shared by the
@@ -4088,10 +4095,11 @@ async fn list_canonical(
     lane: &reads::Lane,
     who: &FsAs,
     pb: &std::path::Path,
+    by: std::time::Instant,
 ) -> Result<DirListing> {
     let (asked, checks) = (pb.to_path_buf(), who.checks_handles());
     let listed = lane
-        .step(who, &pb.to_string_lossy(), move || {
+        .step(who, &pb.to_string_lossy(), by, move || {
             let canon = reads::resolve(&asked)?;
             let read = folder_listing(&canon, checks)?;
             let entries = reads::read_entries(&canon, read);
@@ -4127,7 +4135,11 @@ async fn list_canonical(
 /// is refused, and told so. #3682 — told why, and how an administrator reads
 /// it ([`reads::explain_staging`]).
 #[cfg(target_os = "windows")]
-async fn list_staging(lane: &reads::Lane, who: &FsAs) -> Result<DirListing> {
+async fn list_staging(
+    lane: &reads::Lane,
+    who: &FsAs,
+    by: std::time::Instant,
+) -> Result<DirListing> {
     let staging = reads::staging_root();
     let target = if staging.is_dir() {
         staging
@@ -4135,7 +4147,7 @@ async fn list_staging(lane: &reads::Lane, who: &FsAs) -> Result<DirListing> {
         let root = crate::appdirs::machine_global_dir();
         nearest_existing_dir(&root).unwrap_or(root)
     };
-    reads::explain_staging(who, &target, list_canonical(lane, who, &target).await)
+    reads::explain_staging(who, &target, list_canonical(lane, who, &target, by).await)
 }
 
 /// The deepest directory that exists on `path`'s way up: `path` itself when
@@ -4153,7 +4165,11 @@ fn nearest_existing_dir(path: &std::path::Path) -> Option<PathBuf> {
 /// so there is no single staging root to open. Say so rather than inventing a
 /// path that would then be wrong in a new way.
 #[cfg(not(target_os = "windows"))]
-async fn list_staging(_lane: &reads::Lane, _who: &FsAs) -> Result<DirListing> {
+async fn list_staging(
+    _lane: &reads::Lane,
+    _who: &FsAs,
+    _by: std::time::Instant,
+) -> Result<DirListing> {
     Err(anyhow!(
         "this host has no single staging root — non-Windows agents stage \
          alongside each destination"

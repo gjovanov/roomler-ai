@@ -69,6 +69,14 @@ pub(super) fn resolve_path(asked: &Path) -> std::io::Result<PathBuf> {
 /// viewer's 5 s.
 pub(super) const LISTING_BOUND: Duration = Duration::from_secs(super::DIR_LIST_TIMEOUT_SECS);
 
+/// How long a listing has from its arrival to its answer, all in: the person
+/// lookup before it (1.5 s at most: [`PERSON_LOOKUP_WAIT`] on Windows, the
+/// seat0 lookup's on Linux), its wait for the channel's lane, and its step.
+/// The viewer waits 5 s from its send (`listDir`,
+/// `ui/src/composables/useRemoteControl.ts`), so an answer leaves it 0.5 s
+/// for the way there and back.
+pub(super) const LISTING_ANSWERED_WITHIN: Duration = Duration::from_millis(4500);
+
 /// How many listings may wait on a channel's lane behind the step it runs.
 /// One more is answered at once.
 pub(super) const LISTINGS_WAITING_AT_MOST: usize = 4;
@@ -152,12 +160,20 @@ impl Lane {
 
     /// Run `step` as `who`, as this lane's one step, within one
     /// [`LISTING_BOUND`] from now that covers the wait for the lane too.
-    /// `asked` is the folder as the viewer named it.
-    pub(super) async fn step<T, F>(&self, who: &FsAs, asked: &str, step: F) -> Result<T>
+    /// `asked` is the folder as the viewer named it, a listing to be answered
+    /// `by`.
+    pub(super) async fn step<T, F>(
+        &self,
+        who: &FsAs,
+        asked: &str,
+        by: Instant,
+        step: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        let _ = by;
         let until = Instant::now() + LISTING_BOUND;
         let held = self.take(asked, until).await?;
         let ran = who.run(move || {
@@ -230,14 +246,16 @@ impl Lane {
 /// in their sign-in's device map, not the service's. `GetLogicalDrives` asks
 /// no drive anything, so the step touches no share. Elsewhere the roots are
 /// `/` alone.
-pub(super) async fn roots(lane: &Lane, who: &FsAs) -> Result<DirListing> {
+pub(super) async fn roots(lane: &Lane, who: &FsAs, by: Instant) -> Result<DirListing> {
     #[cfg(target_os = "windows")]
     let entries = lane
-        .step(who, &super::roots_label(), || Ok(super::enumerate_roots()))
+        .step(who, &super::roots_label(), by, || {
+            Ok(super::enumerate_roots())
+        })
         .await?;
     #[cfg(not(target_os = "windows"))]
     let entries = {
-        let _ = (lane, who);
+        let _ = (lane, who, by);
         super::enumerate_roots()
     };
     Ok(DirListing {
@@ -260,15 +278,18 @@ pub(super) fn read_entries(at: &Path, read: std::fs::ReadDir) -> Vec<super::DirE
 
 impl super::FilesHandler {
     /// A folder listing on this channel (#3682, D1-B): who reads it is looked
-    /// up first, then the listing takes the channel's lane.
+    /// up first, then the listing takes the channel's lane, all of it within
+    /// [`LISTING_ANSWERED_WITHIN`] of its arrival.
     pub(crate) async fn list_dir(&self, path: &str) -> Result<DirListing> {
+        let by = Instant::now() + LISTING_ANSWERED_WITHIN;
         let who = FsAs::for_read().await;
-        self.list_as(&who, path).await
+        super::list_dir_in(&self.lane, &who, path, by).await
     }
 
     /// [`Self::list_dir`], read as `who`.
     pub(crate) async fn list_as(&self, who: &FsAs, path: &str) -> Result<DirListing> {
-        super::list_dir_in(&self.lane, who, path).await
+        let by = Instant::now() + LISTING_ANSWERED_WITHIN;
+        super::list_dir_in(&self.lane, who, path, by).await
     }
 
     /// The channel closed: an upload's state goes, as with [`Self::abort`],
