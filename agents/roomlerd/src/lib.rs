@@ -145,6 +145,9 @@ pub mod media_paths;
 /// FR-135 R2 — `rc:media-plan`: what a session promised its viewer, and every
 /// step it took down from there.
 pub mod media_plan;
+/// FR-148 P0 step 4a — the open-time train's reading, as a pure state
+/// machine over SCTP's acknowledgement clock and gauges. No session runs it.
+pub mod media_train;
 /// FR-135 R0 — one data-channel pump's window of media numbers: the
 /// heartbeat's new fields and the session's summary.
 pub mod media_window;

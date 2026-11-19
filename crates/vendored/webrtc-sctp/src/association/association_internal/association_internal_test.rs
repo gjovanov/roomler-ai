@@ -692,3 +692,539 @@ async fn test_delivery_clock_counts_no_chunk_out_at_a_t3_expiry_that_a_forward_t
 
     Ok(())
 }
+
+// roomler (FR-148 P0): the gauges. The association stores them and never reads
+// them back, so a reader changes nothing it sends. The twin test runs one
+// scripted exchange twice, the second time with a reader polling both sides'
+// gauges as fast as it can, and compares every byte both sides sent, packet by
+// packet, after rewriting what each association draws at random and nothing
+// else: a verification tag becomes whose it is, a TSN its offset from its
+// sender's initial TSN, the state cookie zeros. The checksum is zeroed too: it
+// is a function of the other bytes, the drawn ones among them.
+
+use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+
+use crate::association::gauges::{GaugeReader, Gauges};
+
+/// What each association draws at random, which two runs cannot share.
+#[derive(Clone, Copy)]
+struct Drawn {
+    agent_tag: u32,
+    viewer_tag: u32,
+    agent_tsn: u32,
+    viewer_tsn: u32,
+}
+
+/// The 32-bit field at `at`, rewritten by `f`.
+fn rewrite32(b: &mut [u8], at: usize, f: impl Fn(u32) -> u32) {
+    let v = u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    b[at..at + 4].copy_from_slice(&f(v).to_be_bytes());
+}
+
+/// One packet's bytes as they went on the wire, with the drawn values
+/// rewritten (RFC 4960 §3 for every offset). Each chunk type the exchange can
+/// send is walked; any other fails the test, so no byte goes unread.
+fn normalised(from_agent: bool, raw: &Bytes, d: &Drawn) -> Vec<u8> {
+    let mut b = raw.to_vec();
+    let role = |t: u32| match t {
+        0 => 0,
+        t if t == d.agent_tag => 1,
+        t if t == d.viewer_tag => 2,
+        t => panic!("a verification tag of neither side: {t}"),
+    };
+    let (own_tsn, peer_tsn) = if from_agent {
+        (d.agent_tsn, d.viewer_tsn)
+    } else {
+        (d.viewer_tsn, d.agent_tsn)
+    };
+    rewrite32(&mut b, 4, role);
+    rewrite32(&mut b, 8, |_| 0); // the checksum
+    let mut at = 12;
+    while at < b.len() {
+        let (typ, len) = (
+            b[at],
+            usize::from(u16::from_be_bytes([b[at + 2], b[at + 3]])),
+        );
+        match typ {
+            // DATA: the TSN.
+            0 => rewrite32(&mut b, at + 4, |t| t.wrapping_sub(own_tsn)),
+            // INIT and INIT ACK: the initiate tag, the initial TSN, and a
+            // state cookie among the parameters.
+            1 | 2 => {
+                rewrite32(&mut b, at + 4, role);
+                rewrite32(&mut b, at + 16, |t| t.wrapping_sub(own_tsn));
+                let mut p = at + 20;
+                while p < at + len {
+                    let (pt, pl) = (
+                        u16::from_be_bytes([b[p], b[p + 1]]),
+                        usize::from(u16::from_be_bytes([b[p + 2], b[p + 3]])),
+                    );
+                    if pt == 7 {
+                        b[p + 4..p + pl].fill(0);
+                    }
+                    p += pl.div_ceil(4) * 4;
+                }
+            }
+            // SACK: the cumulative TSN acknowledged, and each duplicate TSN.
+            3 => {
+                rewrite32(&mut b, at + 4, |t| t.wrapping_sub(peer_tsn));
+                let gaps = usize::from(u16::from_be_bytes([b[at + 12], b[at + 13]]));
+                let dups = usize::from(u16::from_be_bytes([b[at + 14], b[at + 15]]));
+                for i in 0..dups {
+                    rewrite32(&mut b, at + 16 + gaps * 4 + i * 4, |t| {
+                        t.wrapping_sub(peer_tsn)
+                    });
+                }
+            }
+            // COOKIE ECHO: the cookie.
+            10 => b[at + 4..at + len].fill(0),
+            // COOKIE ACK carries nothing.
+            11 => {}
+            t => panic!("the twin exchange sends no chunk of type {t}"),
+        }
+        at += len.div_ceil(4) * 4;
+    }
+    b
+}
+
+/// Whether a packet's first chunk is DATA.
+fn carries_data(raw: &Bytes) -> bool {
+    raw.get(12) == Some(&0)
+}
+
+/// Which of the agent's DATA packets the path loses, by their order.
+enum Loss {
+    None,
+    Packet(usize),
+    From(usize),
+}
+
+/// The two ends of the twin exchange, joined by a wire this test drives: no
+/// timer and no task, so the same script sends the same packets.
+struct Twin {
+    agent: AssociationInternal,
+    viewer: AssociationInternal,
+    drawn: Drawn,
+    /// Every packet in the order it went on the wire: from the agent, lost on
+    /// the way, its normalised bytes.
+    sent: Vec<(bool, bool, Vec<u8>)>,
+    data_packets: usize,
+    loss: Loss,
+    reads: Option<Arc<AtomicU64>>,
+    /// The agent's congestion window after each step.
+    windows: BTreeSet<u32>,
+}
+
+impl Twin {
+    /// Both sides' packets onto the wire, then one off it to its peer, until
+    /// the wire is empty and neither side has more to send. A quiet wire with
+    /// the viewer holding a delayed acknowledgement fires its ack timer.
+    async fn pump(&mut self) {
+        let mut wire: VecDeque<(bool, Bytes)> = VecDeque::new();
+        loop {
+            for from_agent in [true, false] {
+                let side = if from_agent {
+                    &mut self.agent
+                } else {
+                    &mut self.viewer
+                };
+                let (packets, _) = side.gather_outbound().await;
+                for p in packets {
+                    wire.push_back((from_agent, p.marshal().expect("a packet marshals")));
+                }
+            }
+            let Some((from_agent, raw)) = wire.pop_front() else {
+                if self.viewer.ack_state == AckState::Delay {
+                    self.viewer.on_ack_timeout().await;
+                    continue;
+                }
+                return;
+            };
+            let lost = from_agent && carries_data(&raw) && {
+                let n = self.data_packets;
+                self.data_packets += 1;
+                match self.loss {
+                    Loss::None => false,
+                    Loss::Packet(k) => n == k,
+                    Loss::From(k) => n >= k,
+                }
+            };
+            self.sent
+                .push((from_agent, lost, normalised(from_agent, &raw, &self.drawn)));
+            if !lost {
+                let to = if from_agent {
+                    &mut self.viewer
+                } else {
+                    &mut self.agent
+                };
+                to.handle_inbound(&raw).await.expect("the peer takes it");
+            }
+            self.windows.insert(self.agent_gauges().cwnd);
+            self.wait_for_reader();
+        }
+    }
+
+    /// With a reader, wait until it has read both sides' gauges since this
+    /// step, so it saw every state the exchange went through.
+    fn wait_for_reader(&self) {
+        if let Some(reads) = &self.reads {
+            let seen = reads.load(std::sync::atomic::Ordering::Acquire);
+            while reads.load(std::sync::atomic::Ordering::Acquire) < seen + 2 {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    fn agent_gauges(&self) -> Gauges {
+        self.agent.pending_queue.gauges().read(false)
+    }
+
+    /// The agent's gauges are what it holds.
+    fn assert_gauges_hold_the_agent(&self) {
+        let g = self.agent_gauges();
+        let a = &self.agent;
+        assert_eq!(g.max_payload, a.max_payload_size);
+        assert_eq!(g.max_payload, 1200, "1228 less 12 and 16");
+        assert_eq!(g.cwnd, a.cwnd);
+        assert_eq!(g.ssthresh, a.ssthresh);
+        assert_eq!(g.rwnd, a.rwnd);
+        assert_eq!(g.inflight_bytes, a.inflight_queue.get_num_bytes() as u64);
+        assert_eq!(g.pending_bytes, a.pending_queue.get_num_bytes() as u64);
+        assert_eq!(g.fast_retransmits, a.stats.get_num_fast_retrans());
+        assert_eq!(g.t3_expiries, a.stats.get_num_t3timeouts());
+    }
+}
+
+async fn write_messages(stream: &Stream, messages: std::ops::Range<u8>) {
+    for m in messages {
+        stream
+            .write_sctp(
+                &Bytes::from(vec![m; 1200]),
+                PayloadProtocolIdentifier::Binary,
+            )
+            .await
+            .expect("the queue has room");
+    }
+}
+
+/// What the reader saw: how many times it read both sides, and every
+/// distinct reading of each side.
+struct ReaderLog {
+    reads: u64,
+    seen: HashSet<(usize, Gauges)>,
+}
+
+fn spawn_reader(
+    gauges: [GaugeReader; 2],
+    stop: Arc<AtomicBool>,
+    reads: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<ReaderLog> {
+    std::thread::spawn(move || {
+        let mut seen = HashSet::new();
+        while !stop.load(Ordering::Relaxed) {
+            for (side, g) in gauges.iter().enumerate() {
+                seen.insert((side, g.take()));
+            }
+            reads.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        ReaderLog {
+            reads: reads.load(std::sync::atomic::Ordering::Acquire),
+            seen,
+        }
+    })
+}
+
+/// The script: the handshake on the agent's INIT, 24 messages in slow start
+/// with nothing lost, 24 more with one packet lost that the SACKs report (fast
+/// retransmit), and 6 more whose whole flight is lost until T3-rtx expires.
+async fn twin_exchange(
+    with_reader: bool,
+    lost: usize,
+) -> (Vec<(bool, bool, Vec<u8>)>, BTreeSet<u32>, Option<ReaderLog>) {
+    let agent = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "agent".to_owned(),
+    });
+    let viewer = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "viewer".to_owned(),
+    });
+    let drawn = Drawn {
+        agent_tag: agent.my_verification_tag,
+        viewer_tag: viewer.my_verification_tag,
+        agent_tsn: agent.my_next_tsn,
+        viewer_tsn: viewer.my_next_tsn,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
+    let reader = with_reader.then(|| {
+        spawn_reader(
+            [agent.gauge_reader(), viewer.gauge_reader()],
+            Arc::clone(&stop),
+            Arc::clone(&reads),
+        )
+    });
+    let mut twin = Twin {
+        agent,
+        viewer,
+        drawn,
+        sent: vec![],
+        data_packets: 0,
+        loss: Loss::None,
+        reads: with_reader.then(|| Arc::clone(&reads)),
+        windows: BTreeSet::new(),
+    };
+    twin.wait_for_reader();
+
+    // The handshake, as `Association::client` starts it.
+    let mut init = ChunkInit {
+        initial_tsn: twin.agent.my_next_tsn,
+        num_outbound_streams: twin.agent.my_max_num_outbound_streams,
+        num_inbound_streams: twin.agent.my_max_num_inbound_streams,
+        initiate_tag: twin.agent.my_verification_tag,
+        advertised_receiver_window_credit: twin.agent.max_receive_buffer_size,
+        ..Default::default()
+    };
+    init.set_supported_extensions();
+    twin.agent.set_state(AssociationState::CookieWait);
+    twin.agent.stored_init = Some(init);
+    twin.agent.send_init().expect("an INIT to send");
+    twin.pump().await;
+    assert_eq!(twin.agent.get_state(), AssociationState::Established);
+    let window = twin.viewer.max_receive_buffer_size;
+    let g = twin.agent_gauges();
+    assert_eq!(
+        (
+            g.cwnd,
+            g.ssthresh,
+            g.rwnd,
+            g.inflight_bytes,
+            g.pending_bytes
+        ),
+        (4380, window, window, 0, 0),
+        "the viewer's INIT ACK set the slow start threshold to its window"
+    );
+    twin.viewer
+        .open_stream(1, PayloadProtocolIdentifier::Binary)
+        .expect("the viewer's stream");
+    let stream = twin
+        .agent
+        .open_stream(1, PayloadProtocolIdentifier::Binary)
+        .expect("the agent's stream");
+
+    // Slow start, nothing lost.
+    write_messages(&stream, 0..24).await;
+    assert_eq!(twin.agent_gauges().pending_bytes, 24 * 1200);
+    twin.pump().await;
+    twin.assert_gauges_hold_the_agent();
+    let g = twin.agent_gauges();
+    assert_eq!((g.inflight_bytes, g.pending_bytes), (0, 0));
+    assert!(g.cwnd > 4380, "slow start grew the window: {}", g.cwnd);
+    assert!(g.ack_delay.is_some());
+
+    // One packet lost, which the SACKs report: fast retransmit.
+    twin.loss = Loss::Packet(twin.data_packets + lost);
+    write_messages(&stream, 24..48).await;
+    twin.pump().await;
+    twin.assert_gauges_hold_the_agent();
+    let g = twin.agent_gauges();
+    assert!(g.fast_retransmits >= 1, "{g:?}");
+    assert!(g.ssthresh < window, "the loss cut the threshold: {g:?}");
+    assert_eq!(
+        (g.inflight_bytes, g.pending_bytes, g.t3_expiries),
+        (0, 0, 0)
+    );
+
+    // A whole flight lost, which nothing reports: T3-rtx expires.
+    twin.loss = Loss::From(twin.data_packets);
+    write_messages(&stream, 48..54).await;
+    twin.pump().await;
+    let g = twin.agent_gauges();
+    assert!(g.inflight_bytes > 0, "{g:?}");
+    assert_eq!(g.inflight_bytes + g.pending_bytes, 6 * 1200);
+    twin.agent
+        .on_retransmission_timeout(RtxTimerId::T3RTX, 1)
+        .await;
+    let g = twin.agent_gauges();
+    assert_eq!((g.t3_expiries, g.cwnd), (1, twin.agent.mtu));
+    twin.loss = Loss::None;
+    twin.pump().await;
+    twin.assert_gauges_hold_the_agent();
+    let g = twin.agent_gauges();
+    assert_eq!(
+        (g.inflight_bytes, g.pending_bytes, g.t3_expiries),
+        (0, 0, 1)
+    );
+    assert!(twin.sent.iter().any(|(_, lost, _)| *lost));
+
+    stop.store(true, Ordering::Relaxed);
+    let log = reader.map(|r| r.join().expect("the reader ends"));
+    (twin.sent, twin.windows, log)
+}
+
+#[tokio::test]
+async fn test_gauges_a_reader_changes_nothing_the_association_sends() {
+    let (plain, _, _) = twin_exchange(false, 2).await;
+    let (read, windows, log) = twin_exchange(true, 2).await;
+    let log = log.expect("the second run had a reader");
+
+    for (i, (p, r)) in plain.iter().zip(&read).enumerate() {
+        assert_eq!(p, r, "packet {i} differs");
+    }
+    assert_eq!(plain.len(), read.len(), "both runs sent as many packets");
+    assert!(
+        plain.len() > 100,
+        "the exchange sent {} packets",
+        plain.len()
+    );
+    let bytes: usize = plain.iter().map(|(_, _, b)| b.len()).sum();
+
+    // The comparison sees a change of one packet: the same script losing the
+    // fourth packet of the flight instead of the third sends differently.
+    let (other, _, _) = twin_exchange(false, 3).await;
+    assert_ne!(other, plain);
+
+    // The reader read both sides after every packet, so it saw every window
+    // the agent went through.
+    assert!(log.reads >= read.len() as u64 * 2, "{} reads", log.reads);
+    let agent: Vec<&Gauges> = log
+        .seen
+        .iter()
+        .filter(|(side, _)| *side == 0)
+        .map(|(_, g)| g)
+        .collect();
+    let seen: BTreeSet<u32> = agent.iter().map(|g| g.cwnd).collect();
+    assert!(seen.is_superset(&windows), "{seen:?} {windows:?}");
+    eprintln!(
+        "twin: {} packets ({bytes} bytes) each run, the same; the reader read {} times and saw {} agent readings, windows {windows:?}",
+        read.len(),
+        log.reads,
+        agent.len(),
+    );
+    assert!(agent.iter().any(|g| g.fast_retransmits >= 1));
+    assert!(agent.iter().any(|g| g.t3_expiries == 1));
+    assert!(agent.iter().any(|g| g.ack_delay_min.is_some()));
+    assert!(agent.iter().any(|g| g.pending_bytes > 0));
+}
+
+/// An association with chunks in flight sent `ago` before now, the newest
+/// last, each `(tsn, sent how many times, how long ago)`.
+fn ack_delay_association(chunks: &[(u32, u32, Duration)]) -> AssociationInternal {
+    let mut a = delivery_association(chunks.last().map_or(10, |c| c.0 + 1));
+    a.use_forward_tsn = false;
+    for &(tsn, nsent, ago) in chunks {
+        let mut c = sent(tsn, 100, false);
+        c.nsent = nsent;
+        c.since = SystemTime::now() - ago;
+        a.inflight_queue.push_no_check(c);
+    }
+    a
+}
+
+#[tokio::test]
+async fn test_gauges_ack_delay_is_the_newest_chunk_sent_once() -> Result<()> {
+    let ms = Duration::from_millis;
+    // 12, the newest, was sent twice (Karn): 11 is the one that counts.
+    let mut a = ack_delay_association(&[(10, 1, ms(900)), (11, 1, ms(500)), (12, 2, ms(100))]);
+    let gauges = a.gauge_reader();
+    assert_eq!(gauges.take().ack_delay, None);
+
+    a.handle_sack(&sack(12, &[])).await?;
+    let g = gauges.take();
+    let delay = g.ack_delay.expect("a delay");
+    assert!(delay >= ms(500) && delay < ms(900), "{delay:?}");
+    assert_eq!(g.ack_delay_min, g.ack_delay);
+    assert_eq!(
+        gauges.take().ack_delay_min,
+        None,
+        "the take reset the least"
+    );
+    assert_eq!(gauges.take().ack_delay, g.ack_delay, "the latest stays");
+
+    // A gap block above the cumulative point holds the newest.
+    let mut a = ack_delay_association(&[(10, 1, ms(900)), (11, 1, ms(700)), (12, 1, ms(300))]);
+    let gauges = a.gauge_reader();
+    a.handle_sack(&sack(10, &[(2, 2)])).await?;
+    let delay = gauges.take().ack_delay.expect("a delay");
+    assert!(delay >= ms(300) && delay < ms(700), "{delay:?}");
+
+    // The least since the last take is the least of the SACKs since.
+    a.handle_sack(&sack(11, &[(1, 1)])).await?;
+    let g = gauges.take();
+    assert!(g.ack_delay.expect("a delay") >= ms(700));
+    assert_eq!(g.ack_delay_min, g.ack_delay);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gauges_a_peek_leaves_the_least_delay_to_the_next_take() -> Result<()> {
+    let ms = Duration::from_millis;
+    // 10's SACK came 300 ms after its send, 11's 900 ms after (a delayed
+    // acknowledgement): the least of the two is 10's.
+    let chunks = [(10, 1, ms(300)), (11, 1, ms(900))];
+    let mut a = ack_delay_association(&chunks);
+    let gauges = a.gauge_reader();
+    a.handle_sack(&sack(10, &[])).await?;
+    let peeked = gauges.peek();
+    let least = peeked.ack_delay_min.expect("a least delay");
+    assert!(least >= ms(300) && least < ms(900), "{least:?}");
+    assert_eq!(gauges.peek(), peeked, "a second peek reads the same");
+
+    a.handle_sack(&sack(11, &[])).await?;
+    let taken = gauges.take();
+    assert!(taken.ack_delay.expect("a delay") >= ms(900), "{taken:?}");
+    assert_eq!(
+        taken.ack_delay_min,
+        Some(least),
+        "the take's least still covers the SACK before the peek"
+    );
+    assert_eq!(gauges.peek().ack_delay_min, None, "the take reset it");
+
+    // A take where the peek was leaves the next take the later SACK alone.
+    let mut a = ack_delay_association(&chunks);
+    let gauges = a.gauge_reader();
+    a.handle_sack(&sack(10, &[])).await?;
+    assert_eq!(gauges.take().ack_delay_min.map(|d| d < ms(900)), Some(true));
+    a.handle_sack(&sack(11, &[])).await?;
+    let least = gauges.take().ack_delay_min.expect("a least delay");
+    assert!(least >= ms(900), "{least:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gauges_a_clock_gone_backwards_stores_nothing() -> Result<()> {
+    let ms = Duration::from_millis;
+    let mut a = ack_delay_association(&[(10, 1, ms(50))]);
+    let gauges = a.gauge_reader();
+    a.handle_sack(&sack(10, &[])).await?;
+    let before = gauges.take();
+    assert!(before.ack_delay.is_some());
+
+    // 11 was sent "after" this SACK: the clock went back between the two. The
+    // association measured its round trip on 10, so the RTT path, which
+    // errors on such a chunk, does not read it; the gauge must not either.
+    a.my_next_tsn = 12;
+    let mut c = sent(11, 100, false);
+    c.since = SystemTime::now() + Duration::from_secs(3600);
+    a.inflight_queue.push_no_check(c);
+    a.min_tsn2measure_rtt = 12;
+    let cwnd = a.cwnd;
+    a.handle_sack(&sack(11, &[])).await?;
+
+    let after = gauges.take();
+    assert_eq!(after.ack_delay, before.ack_delay, "the latest is unchanged");
+    assert_eq!(after.ack_delay_min, None, "nothing new since the take");
+    assert_eq!(acked_bytes(&a), 200, "the SACK went on as it would");
+    assert_eq!(after.cwnd, a.cwnd);
+    assert!(a.cwnd >= cwnd);
+
+    Ok(())
+}

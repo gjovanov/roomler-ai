@@ -83,6 +83,27 @@
 #     src/association/association_internal/association_internal_test.rs
 #     holds its tests (a skipped chunk, a gap-acked one counted once, a
 #     T3-rtx expiry, and an abandoned chunk with no evidence of loss).
+#   - src/association/gauges.rs (new), src/association/mod.rs,
+#     src/association/association_internal.rs and src/queue/pending_queue.rs
+#     (FR-148 P0 step 4a): the association's congestion gauges, read without
+#     its lock (`Association::gauges`): the congestion window, the slow start
+#     threshold, the peer's receive window, the bytes in flight and waiting,
+#     the fast retransmissions and T3-rtx expiries, and the acknowledgement
+#     delay of the newest chunk a SACK newly acknowledged that was sent once.
+#     The agent's open-time train reads them to tell the path's push-back
+#     from a window of SCTP's own. Each is a relaxed store, add or min where
+#     its value changes; nothing in the association reads one, so a reader
+#     changes nothing it sends.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its tests (one scripted exchange run with and without a reader,
+#     compared packet by packet; the acknowledgement delay; a clock gone
+#     backwards).
+#   - src/association/gauges.rs and src/association/mod.rs (FR-148 O10):
+#     `GaugeReader::peek`, the gauges read as `take` reads them but resetting
+#     nothing, so the agent's open-path line, which only looks, leaves the
+#     least acknowledgement delay to the reader that takes it.
+#     src/association/association_internal/association_internal_test.rs
+#     holds its test (a peek between two SACKs, then a take).
 
 [package]
 edition = "2021"

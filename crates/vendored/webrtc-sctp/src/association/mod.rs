@@ -5,6 +5,8 @@ mod association_internal;
 mod association_stats;
 // roomler (FR-148): the acknowledgement clock (`Association::delivery_clock`).
 pub mod delivery;
+// roomler (FR-148 P0): the congestion gauges (`Association::gauges`).
+pub mod gauges;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -250,6 +252,8 @@ pub struct Association {
     bytes_sent: Arc<AtomicUsize>,
     // roomler (FR-148): read without `association_internal`'s lock.
     delivery: delivery::DeliveryClock,
+    // roomler (FR-148 P0): read without `association_internal`'s lock.
+    gauges: gauges::GaugeReader,
 
     pub(crate) association_internal: Arc<Mutex<AssociationInternal>>,
 }
@@ -351,6 +355,7 @@ impl Association {
         let inflight_queue_length = Arc::clone(&ai.inflight_queue_length);
         let will_send_shutdown = Arc::clone(&ai.will_send_shutdown);
         let delivery = ai.delivery_clock(); // roomler (FR-148)
+        let gauges = ai.gauge_reader(); // roomler (FR-148 P0)
 
         let mut init = ChunkInit {
             initial_tsn: ai.my_next_tsn,
@@ -435,6 +440,7 @@ impl Association {
                 bytes_received,
                 bytes_sent,
                 delivery,
+                gauges,
                 association_internal,
             },
             handshake_completed_ch_rx,
@@ -631,6 +637,15 @@ impl Association {
     /// below counts packets written to the wire, retransmissions included.
     pub fn delivery_clock(&self) -> delivery::DeliveryClock {
         self.delivery.clone()
+    }
+
+    /// roomler (FR-148 P0): the congestion window, the slow start threshold,
+    /// the peer's receive window, what is in flight and what waits, the loss
+    /// events and the acknowledgement delay, read without this association's
+    /// lock (`gauges::GaugeReader::take`, or `peek` to reset nothing). The
+    /// association stores them and never reads them back.
+    pub fn gauges(&self) -> gauges::GaugeReader {
+        self.gauges.clone()
     }
 
     /// bytes_sent returns the number of bytes sent

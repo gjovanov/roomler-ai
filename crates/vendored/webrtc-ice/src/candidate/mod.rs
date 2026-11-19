@@ -28,6 +28,7 @@ use tokio::sync::{broadcast, Mutex};
 use crate::error::Result;
 use crate::network_type::*;
 use crate::tcp_type::*;
+use crate::url::{ProtoType, SchemeType};
 
 pub(crate) const RECEIVE_MTU: usize = 8192;
 pub(crate) const DEFAULT_LOCAL_PREFERENCE: u16 = 65535;
@@ -86,6 +87,14 @@ pub trait Candidate: fmt::Display {
     fn set_ip(&self, ip: &IpAddr) -> Result<()>;
     fn get_conn(&self) -> Option<&Arc<dyn util::Conn + Send + Sync>>;
     fn get_closed_ch(&self) -> Arc<Mutex<Option<broadcast::Sender<()>>>>;
+
+    /// roomler (FR-148 P0): the transport and the scheme of the TURN URL a
+    /// relay candidate's allocation was made over, as the gather that made it
+    /// stamped them. `None` on a candidate of any other type, on a remote
+    /// candidate, and on a relay whose gather did not say.
+    fn relay_transport(&self) -> Option<(ProtoType, SchemeType)> {
+        None
+    }
 }
 
 /// Represents the type of candidate `CandidateType` enum.
