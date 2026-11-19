@@ -6925,6 +6925,35 @@ wobble. The uploader's own 401 now waits out its 60 s backoff, as
 its doc always said. Before, it set that backoff and went straight
 back to its 5 s tick.
 
+**A batch never rides a connection the server is closing** (#4067).
+The uploader keeps one HTTP client for the life of the process, and
+its pool kept an idle connection for reqwest's default 90 s. The
+server closes an idle HTTP/1.1 connection after 30 s (#4018 measured
+it for the self-view client,
+[desktop-companion.md](desktop-companion.md#the-companions-side)),
+and a batch goes out on the first 5 s tick that finds lines queued.
+So a batch six ticks after the last one rode a connection idle for
+about 30 s, just as the server closed it, and one written in the last
+few tens of milliseconds before the server's FIN got no answer.
+Nothing was lost: the batch was kept and sent again after the
+backoff, one backoff late.
+
+| What | Where (`crates/agent-core/src/logs_upload.rs`) | Why |
+|---|---|---|
+| The pool drops a connection idle for 10 s | `POOL_IDLE_TIMEOUT` (`:123`), set by `client_builder` (`:421`); a const assertion (`:124`) holds it at 20 s or less | a third of the server's close, and the self-view client's value: a batch after a quiet spell dials a new connection, while a busy log's batches, one per tick, still share one |
+| A failed POST is not asked again at once | `post_batch` (`:429`), called once per flush (`:373`) | the batch is already kept and sent again after the backoff. A front that closes idle connections sooner than 10 s still costs a batch one backoff, as before |
+
+A failed send writes `logs upload error` at DEBUG (target
+`roomlerd::logs_upload`, the cause in `e`). The line reaches the
+on-disk log only, and only when `RUST_LOG` enables DEBUG for that
+target: the upload layer skips its own target. Tested by
+`a_connection_idle_past_the_pool_timeout_never_carries_a_batch`: the
+uploader's own client and `post_batch` against a raw keep-alive
+server that answers as ours does (201, and a body the uploader never
+reads). Two batches 50 ms apart share one connection, and one sent
+after a 2 s idle timeout dials a new one. CI runs it on Linux
+(`rust-unit`) and on Windows (`windows-overlay-clippy`).
+
 ### 19.2 Update-path hardening (0.1.51)
 
 **Configurable update cadence**: `update_check_interval_h: Option<u32>`
