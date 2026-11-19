@@ -1445,7 +1445,7 @@ the FFmpeg pump beats every 2 s, and the VP9-444 pump every 30 encoded frames (a
 from the association's first reading on, with no gap and no overlap. A new association
 is a new clock, and no sample spans the two. Because the queue counts its own fills and
 empties, a sample is classed right whatever its length and however late a heartbeat
-runs (`agents/roomlerd/src/media_delivery.rs:208`):
+runs (`agents/roomlerd/src/media_delivery.rs:214`):
 
 | Class | When | What it says about the path |
 |---|---|---|
@@ -1457,7 +1457,7 @@ Calling a sample application-limited when in doubt is the safe direction: such a
 sample can only raise a floor.
 
 **The line** is `path delivery (FR-148 P0, shadow, ≈10s)`, at INFO, written by
-`media_delivery::emit` (`agents/roomlerd/src/media_delivery.rs:620`) at the first
+`media_delivery::emit` (`agents/roomlerd/src/media_delivery.rs:656`) at the first
 heartbeat 10 s after the last line (`LINE_EVERY`), and once more when the pump ends with
 samples not yet written. A test pins its field names (`the_line_names_its_fields`):
 
@@ -1533,7 +1533,7 @@ application-limited.
 
 **The switch** is `ROOMLERD_PATH_MODEL` (since P1 also the config key `path_model`), read
 once per pump at its start through `tunnel_core::env::node_env`
-(`agents/roomlerd/src/media_delivery.rs:138`). `off`
+(`agents/roomlerd/src/media_delivery.rs:144`). `off`
 reads no clock, takes no sample and writes no line, which a test shows
 (`off_takes_no_sample_and_writes_no_line`). Any other value, or none, samples. Since
 FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
@@ -1542,8 +1542,8 @@ FR-148 P1 it reads three values, `off`, `shadow` (the default) and `on`
 
 | Where | Anchor |
 |---|---|
-| the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:368` (`DeliverySampler`), `:426` (`heartbeat`), `:500` (`on_reading_with`), `:559` (`take_line`) |
-| the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:76` (`QUEUED_OVER_MS`), `:98` (`counts`), `:473-482` (`DeliverySampler::observe`, the one take), `:530` (`judge`), `:293` (`Fold::add_queue`) |
+| the sampler: readings, samples, the line | `agents/roomlerd/src/media_delivery.rs:374` (`DeliverySampler`), `:435` (`heartbeat`), `:509` (`on_reading_with`), `:568` (`take_line`) |
+| the standing queue: the rule, the one take, the reading, the fold | `agents/roomlerd/src/media_delivery.rs:82` (`QUEUED_OVER_MS`), `:104` (`counts`), `:482-491` (`DeliverySampler::observe`, the one take), `:539` (`judge`), `:299` (`Fold::add_queue`) |
 | the gauges | `crates/vendored/webrtc-sctp/src/association/gauges.rs:134` (`Gauges`), `:179` (`take`), `:187` (`peek`); through the transport, `crates/vendored/webrtc/src/sctp_transport/mod.rs:445` (`RTCSctpTransport::gauges`) |
 | the VP9-444 pump | `agents/roomlerd/src/peer.rs:3978` (made), `:5385` (drained, after the heartbeat line) |
 | the FFmpeg pump | `agents/roomlerd/src/peer.rs:6535` (made), `:10358` (drained, after the heartbeat line) |
@@ -1591,7 +1591,7 @@ carry yet and loses nothing. So SCTP's congestion window grows past what the lin
 carries, the bytes wait in the carrier, and the queue of unsent chunks keeps running
 empty: every sample reads application-limited while seconds of bytes stand on the link.
 The shaped link's TCP cells showed it (`shaped_link::tcp_shape`,
-`agents/roomlerd/src/media_delivery.rs:2235`), and so did the lab: on TURN over TCP 443
+`agents/roomlerd/src/media_delivery.rs:2714`), and so did the lab: on TURN over TCP 443
 at 2 Mbit/s the viewer's round trip ended at 1,262 ms, against 154 ms on TURN over UDP at
 the same rate.
 
@@ -1635,7 +1635,7 @@ backlog too.
 reads covers the SACKs since the take before it. The delivery sampler is the one reader
 that takes. It fetches the gauges with the clock, from the same slot, and takes them
 only where a sample starts and where it closes, beside the clock's reading
-(`DeliverySampler::observe`, `agents/roomlerd/src/media_delivery.rs:473-482`). So a
+(`DeliverySampler::observe`, `agents/roomlerd/src/media_delivery.rs:482-491`). So a
 sample's least is the least of its own SACKs. A second reader that took would split a
 sample's SACKs with the sampler, and each would read a least too high. A reader that
 only looks peeks (`GaugeReader::peek`), which resets nothing, as FR-148 O10's open line
@@ -1949,18 +1949,18 @@ of 1 MiB holds either path under 34 Mbit/s.
 
 **Which path a session took (O10).** How often each path wins on the fleet is not known,
 so each data-channel pump writes one line at its first media write:
-`path open (FR-148 P0, O10)` (`OPEN_LINE`, `agents/roomlerd/src/media_delivery.rs:489`).
+`path open (FR-148 P0, O10)` (`OPEN_LINE`, `agents/roomlerd/src/media_delivery.rs:744`).
 The call sits where the pump hands each media message to its send task
 (`agents/roomlerd/src/peer.rs:5234` in the VP9 4:4:4 pump, `:9914` in the FFmpeg one),
 and only its first call reads anything (`DeliverySampler::on_first_write`,
-`agents/roomlerd/src/media_delivery.rs:388`). It reads the gauges through
+`agents/roomlerd/src/media_delivery.rs:620`). It reads the gauges through
 `RTCSctpTransport::gauges` (`crates/vendored/webrtc/src/sctp_transport/mod.rs:445`),
 which never waits for the transport's slot, with `GaugeReader::peek`
 (`crates/vendored/webrtc-sctp/src/association/gauges.rs:187`), which resets nothing, so
 the least acknowledgement delay stays for the reader that takes it (the fork's test,
 `crates/vendored/webrtc-sctp/src/association/association_internal/association_internal_test.rs:1167`).
 The answer is a pure function of the gauges (`OpenedBy::of`,
-`agents/roomlerd/src/media_delivery.rs:531`):
+`agents/roomlerd/src/media_delivery.rs:786`):
 
 | `open_path` | When |
 |---|---|
@@ -1978,19 +1978,19 @@ written at INFO, like the other P0 lines, so the default filter ships it
 follower of a shared pipeline runs no pump and writes no line, and a pump that starts
 again for the same session writes its own. The cells open a pair by each path over the
 shaped link and read `init_ack` and `cookie_echo` at the first write
-(`agents/roomlerd/src/media_delivery.rs:1265`, `:1284`). The path report counts one
+(`agents/roomlerd/src/media_delivery.rs:1852`, `:1871`). The path report counts one
 device's sessions by answer (`docs/production-mongo-reads.md` §8a).
 
 **The properties and their cells.** Each cell opens two in-process associations of the
 vendored SCTP over `media_delivery`'s shaped link (`shaped`,
-`agents/roomlerd/src/media_delivery.rs:1206`; `pair_opened`, `:1333`, by either path,
-`OpenPath`, `:1318`), steps the machine every millisecond, writes what it asks, and
+`agents/roomlerd/src/media_delivery.rs:2161`; `pair_opened`, `:2288`, by either path,
+`OpenPath`, `:2273`), steps the machine every millisecond, writes what it asks, and
 after the stop waits for every byte written to be acknowledged. A grid cell's link
 serialises each direction at its rate, adds half the round trip to every packet, and
 queues up to a second, deeper than anything the train can fill (`Cell::grid`,
 `agents/roomlerd/src/media_train.rs:800`). The shaper records the longest any packet of
-the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:1057`)
-and its tail drops (`:1062`). `broken` (`agents/roomlerd/src/media_train.rs:1084`) checks
+the agent's waited for the wire (`peak_wait`, `agents/roomlerd/src/media_delivery.rs:2012`)
+and its tail drops (`:2017`). `broken` (`agents/roomlerd/src/media_train.rs:1084`) checks
 every cell; it also checks that `floor_only` matches the stop, and that the slow start
 threshold at the first write is 0 on path C and not 0 on path I.
 
@@ -2070,8 +2070,8 @@ held it:
 
 The shaped link now adds a busy runner's scheduling noise on request, seeded so that a
 cell meets the same draws on every run (`Noise`,
-`agents/roomlerd/src/media_delivery.rs:1075`; `Draws`, `:1095`; `shaped_noisy`,
-`:1211`). Every wake-up of a task comes up to the jitter late, and about once a period
+`agents/roomlerd/src/media_delivery.rs:2030`; `Draws`, `:2050`; `shaped_noisy`,
+`:2166`). Every wake-up of a task comes up to the jitter late, and about once a period
 the scheduler takes the task's core away for up to the stall, so that a wake-up due then
 comes when it returns. On the link a wake-up is a packet's delivery, and the packets
 behind a late one wait for it, in order. Under the rule before this one, 2 ms of jitter
@@ -2259,8 +2259,8 @@ When every input is backlogged the model is `Pipe`'s law exactly
 (`the_model_is_pipes_law_when_everything_is_backlogged`).
 
 **The line** is `path model (FR-148 P0, shadow, ≈10s)`, at INFO, written by
-`media_delivery::emit_model` (`agents/roomlerd/src/media_delivery.rs:672`). The delivery
-sampler takes the numbers at every pump heartbeat (`on_view`, `:579`) and writes them
+`media_delivery::emit_model` (`agents/roomlerd/src/media_delivery.rs:708`). The delivery
+sampler takes the numbers at every pump heartbeat (`on_view`, `:588`) and writes them
 at the first heartbeat 10 s after the last line; the first heartbeat starts the count,
 and a pump that ends between two lines writes its last numbers as it drops. Each value
 is `<bps>/<provenance>/<age>ms`, or `None`. A test pins the names and their order
@@ -2338,7 +2338,7 @@ the base (`peer.rs:3405`).
 |---|---|
 | the tags and the model | `agents/roomlerd/src/encode/pipe.rs:420` (`Basis`), `:455` (`PathNumber`), `:521` (`PathModel`), `:639` (`PathView`); `Pipe` takes the class at `:189` (`observe_delivered`) and `:243` (`observe_capacity`) |
 | the governor's tags and the view | `agents/roomlerd/src/encode/governor.rs:1441` (a delivery, classed), `:1639` (an arrival-rate push-back, classed), `:2069` (`path_view`), `:2200` (`PathTags`) |
-| the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:579` (`on_view`), `:672` (`emit_model`), `:695` (`seed_at_open`) |
+| the line and the seed's age | `agents/roomlerd/src/media_delivery.rs:588` (`on_view`), `:708` (`emit_model`), `:731` (`seed_at_open`) |
 | the pumps | `agents/roomlerd/src/peer.rs:5385` (VP9-444), `:10358` (FFmpeg), `:6621` (the FFmpeg pump's seed and its age) |
 
 **The tests** (`cargo test -p roomlerd --lib -- pipe:: governor:: media_delivery`):
@@ -2706,7 +2706,7 @@ line reads `mode=on`, `taken=model taken_why=-`, and the session opens at 614,12
 ### The switch (D28)
 
 `ROOMLERD_PATH_MODEL`, or the config key `path_model`, read once per pump
-(`media_delivery::mode`, `agents/roomlerd/src/media_delivery.rs:138`):
+(`media_delivery::mode`, `agents/roomlerd/src/media_delivery.rs:144`):
 
 | Value | Delivery samples, path numbers, their lines | The path memory, its file and its lines | The opener |
 |---|---|---|---|
@@ -2879,7 +2879,7 @@ still waiting for its evidence.
 | `RATE_SLOW_START` | `:573` | FR-63 | off | a session opens with slow start instead of a constant | B2's evidence flips it, or it is deleted | FR-63 | — |
 | `RATECTL` (env only) | `:613` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
 | `SHARED_RATE_SPLIT` (env only) | `:926` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
-| `PATH_MODEL` | `agents/roomlerd/src/media_delivery.rs:138`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)). Three values since P1 (D28): `off`, `shadow` (the default) and `on`, under which the path memory opens a constrained session of the FFmpeg data-channel pump ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ `on` is set on no device until FR-148's O7 is ruled | P5 deletes it with the composition it measures | FR-148 P5 | — |
+| `PATH_MODEL` | `agents/roomlerd/src/media_delivery.rs:144`, not `encode/mod.rs` | FR-148 P0 | shadow | the delivery samples and their line ([§ Delivery samples](#delivery-samples-fr-148-p0--what-the-path-carried-and-whether-the-sender-was-waiting)), the path numbers' tags and their line ([§ Path numbers](#path-numbers-and-their-provenance-fr-148-p0--how-each-was-obtained-and-how-old-it-is)), and since P1 the path memory and its two lines ([§ The path memory](#the-path-memory-fr-148-p1--the-models-floor-under-a-key-that-names-the-path)). Three values since P1 (D28): `off`, `shadow` (the default) and `on`, under which the path memory opens a constrained session of the FFmpeg data-channel pump ([§ Which rule opens the session](#which-rule-opens-the-session-step-3)); ⚠️ `on` is set on no device until FR-148's O7 is ruled | P5 deletes it with the composition it measures | FR-148 P5 | — |
 | `QSV_RATE_MODE` | `agents/roomlerd/src/encode/ffmpeg/encoder.rs:3471`, not `encode/mod.rs` | FR-148 P2 (FR-62 A5) | `cbr` | constant bitrate on QSV: `qvbr` opens HEVC and H.264 QSV at QVBR, the target at 0.9 × the cap, and falls back to `cbr` on a refusal (`QsvRateOpen`, [`encoders.md`](encoders.md#qsv-off-constant-bitrate-fr-148-p2)) | FR-148 AC13 read with it on: a QSV keepalive no longer `maxrate ÷ fps ÷ 8` bytes, a still screen under 0.3 Mbit/s. FR-148 P5 then deletes the constant-bitrate path, and the switch with it | FR-148 P5 | — |
 
 **Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
