@@ -1234,26 +1234,26 @@ impl RateGovernor {
         }
     }
 
-    /// A fresh encoder starts at its constructor's full-ceiling
-    /// maxrate; force the AIMD to re-apply its current (possibly
-    /// lower) target so the stream doesn't snap back up after a dim
-    /// change / resolution switch.
+    /// A fresh encoder starts at its constructor's rate, not the session's:
+    /// FFmpeg's at its full-ceiling maxrate, libvpx's at its 8 Mbps boot
+    /// target (`DEFAULT_BITRATE_BPS`). Force the AIMD to re-apply its
+    /// current (possibly lower) target on the next tick, so the stream
+    /// doesn't snap back up after a dim change, a capture reopen or a
+    /// keyframe-fallback rebuild. Before the first tick there is no AIMD
+    /// yet and the call does nothing: that tick builds it and applies the
+    /// opening target anyway. The mirror keeps the last value applied, so
+    /// the heartbeat's `target_bps` does not read 0 across a rebuild.
+    ///
+    /// ⚠ Both data-channel pumps call this after every build (#3472). The
+    /// VP9-444 pump called a hook that zeroed the mirror only, so nothing
+    /// told a fresh libvpx encoder its target until the AIMD next moved:
+    /// a relay session at its 3 Mbps ceiling ran 6 min 18 s at 8.8 Mbps
+    /// with `target_bps=0` in every heartbeat (2026-11-04). Pinned by
+    /// `a_vp9_rebuild_hands_the_fresh_encoder_its_target`.
     pub fn on_encoder_rebuilt(&mut self) {
         if let Some(ctrl) = self.aimd.as_mut() {
             ctrl.force_reapply();
         }
-    }
-
-    /// The VP9 pump's HISTORICAL rebuild behavior, preserved verbatim
-    /// (P8c is structural-only): zero the applied-bitrate MIRROR so the
-    /// next apply logs, WITHOUT `force_reapply` — the AIMD's internal
-    /// last-applied is untouched, so the fresh encoder runs at its
-    /// boot-time bitrate until the controller's next MD/AI/ceiling
-    /// move actually shifts `desired`. ⚠ Named divergence from
-    /// [`Self::on_encoder_rebuilt`] (the ffmpeg pump's semantics);
-    /// unifying them is a behavioral decision for the post-soak pass.
-    pub fn on_encoder_rebuilt_mirror_only(&mut self) {
-        self.applied_bps = 0;
     }
 
     /// Once a second, fold the browser's decode report into the
@@ -6793,18 +6793,18 @@ mod tests {
         assert_eq!(g.evidence_rejected()[5], 1, "rejected as a keyframe burst");
     }
 
-    /// #3472 — RED on master. The VP9-444 pump calls this hook when it builds
-    /// a fresh libvpx encoder (`peer.rs`, the rebuild for dims), and a fresh
-    /// encoder starts at libvpx's boot target (`DEFAULT_BITRATE_BPS`, 8 Mbps),
-    /// not the session's. The hook zeroes the mirror only, so on a pump whose
-    /// AIMD sits still (a relay held at its ceiling) nothing tells the new
-    /// encoder its target. Field, 2026-11-04: display match rebuilt a 3 Mbps
-    /// relay session's encoder 0.1 s in, and it ran 6 min 18 s at 8.8 Mbps
-    /// with `target_bps=0` in every heartbeat, until the first decrease.
-    /// `rebuild_forces_a_reapply_of_the_current_target` is the FFmpeg pump's
-    /// hook doing it right. Un-ignore this with the fix (FR-62's A4 row 3).
+    /// #3472 — the VP9-444 pump calls `on_encoder_rebuilt` when it builds a
+    /// fresh libvpx encoder (`peer.rs`, the rebuild for dims, which a capture
+    /// reopen and the keyframe fallback reach too), and a fresh encoder starts
+    /// at libvpx's boot target (`DEFAULT_BITRATE_BPS`, 8 Mbps), not the
+    /// session's. On a pump whose AIMD sits still (a relay held at its
+    /// ceiling) the next tick must still hand the new encoder its target, and
+    /// the heartbeat's mirror must not read 0 in between. Field, 2026-11-04,
+    /// under the mirror-only hook this replaced: display match rebuilt a
+    /// 3 Mbps relay session's encoder 0.1 s in, and it ran 6 min 18 s at
+    /// 8.8 Mbps with `target_bps=0` in every heartbeat, until the first
+    /// decrease. FR-62's A4 row 3.
     #[test]
-    #[ignore = "#3472: red on master until a VP9 rebuild re-applies the target"]
     fn a_vp9_rebuild_hands_the_fresh_encoder_its_target() {
         let now = Instant::now();
         let mut g = gov(now);
@@ -6814,7 +6814,17 @@ mod tests {
             .pre_encode_tick(relay_cap, floor, true, DEPTH, now)
             .expect("the first tick applies the ceiling");
         assert_eq!(first.bps, relay_cap);
-        g.on_encoder_rebuilt_mirror_only();
+        assert!(
+            g.pre_encode_tick(relay_cap, floor, true, DEPTH, now)
+                .is_none(),
+            "the premise: a relay held at its ceiling has no move of its own"
+        );
+        g.on_encoder_rebuilt();
+        assert_eq!(
+            g.applied_bps(),
+            relay_cap,
+            "the heartbeat's target does not read 0 across the rebuild"
+        );
         let applied = g
             .pre_encode_tick(relay_cap, floor, true, DEPTH, now)
             .expect("the fresh encoder is told its target on the next tick");

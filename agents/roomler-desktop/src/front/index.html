@@ -145,6 +145,8 @@
             <h3>This device</h3>
             <span id="ov-enrolled-chip" class="chip chip-muted">…</span>
           </div>
+          <!-- #4020: why the chip reads Offline, when the enrollment cannot be read. -->
+          <p id="ov-enrolled-note" class="muted small" hidden></p>
           <dl class="kv">
             <dt>Device name</dt>
             <dd id="ov-name">—</dd>
@@ -877,6 +879,13 @@
             This device is already enrolled — submitting refreshes its token.
             Server URL and device name are locked to the current enrollment.
           </div>
+          <!-- #4020: shown while the device service holds an enrollment this app
+               cannot read and no service answers. -->
+          <div id="onboard-unknown-note" class="banner banner-warn" hidden>
+            The device service holds this device's enrollment, and it did not answer, so
+            this app cannot tell whether the device is enrolled. Enrolling from here waits
+            until the service answers.
+          </div>
           <form id="enroll-form" autocomplete="off">
             <label for="server">Server URL</label>
             <input
@@ -958,6 +967,17 @@
                   token). You can also do this later.
                 </p>
                 <button type="button" class="primary" id="wl-btn-enroll">Enroll this device…</button>
+              </div>
+            </div>
+            <!-- #4020: the Roomler service holds the enrollment, and it did not answer. -->
+            <div id="wl-dev-unknown" class="banner banner-warn" hidden>
+              <div>
+                <strong>Enrollment not known yet</strong>
+                <p class="muted small" style="margin: 4px 0 0">
+                  The Roomler service holds this computer's enrollment, and it did not
+                  answer, so this app cannot say yet whether this computer is enrolled. It
+                  shows here once the service answers.
+                </p>
               </div>
             </div>
             <p>

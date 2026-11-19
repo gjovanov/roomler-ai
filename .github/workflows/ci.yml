@@ -1652,10 +1652,14 @@ jobs:
       # console's owner, the account database or launchd held up, the tray's
       # start for a prompt fails within 2.5 s naming the step, off the async
       # worker, one start in flight; in time, it runs launchctl as today. #4011: and `consent_relay::` (the kept root list) with `person_socket::machine_reply_tests::` (on a real socket path, gone against no answer).
+      # FR-147 P1: and `one_row::` with `one_row_home::`: root's side of
+      # `sudo roomlerd one-row` and the person's own child, whose plans, lines
+      # and records every lane tests, on the platform they serve; the `mac`
+      # effects compile in the check above.
       - name: cargo check + test the agent's Mac-only units
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams exec::mac_console_lookup_tests companion::tray_start_tests:: power:: consent_relay:: person_socket::machine_reply_tests:: one_row:: one_row_home::
 
       # #3813 — the real clipboard on a Mac. A test that writes it replaces
       # what the person at the Mac had copied, so each such test runs only
@@ -1735,6 +1739,17 @@ jobs:
       # Settings pane) exist on exactly this target.
       - name: cargo check the desktop companion
         run: cargo check -p roomler-desktop
+
+      # #4020 — the companion's enrollment status on a real Mac. A one-row Mac
+      # whose daemon misses an answer, or is stopped, reads its enrollment as
+      # not known, never "Not enrolled" with an offer to enroll, and this
+      # build's rule is the Mac's (`Platform::HERE`, the stat of a real file
+      # and of a folder closed to the runner). The companion's other tests run
+      # on Linux and Windows (rust-unit, and the Windows job's #3940 step);
+      # only these run here.
+      - name: cargo test the companion's enrollment status on a real Mac (#4020)
+        run: |
+          cargo test -p roomler-desktop --bins -- commands::tests::enrollment::
 
       # FR-129 B1 — the setup wizard installs the daemon on macOS now (the
       # `osascript` half, `agents/roomler-setup/src/unix_daemon.rs`), and its
@@ -2400,8 +2415,8 @@ jobs:
         #
         # ⚠️ `vp9-444` is in the set ON PURPOSE, and dropping it makes this lane
         # LIE. Four of the "pre-existing warnings" were `dead_code` on
-        # `on_encoder_rebuilt_mirror_only`, `PipelineKey::Vp9Dc`,
-        # `quality_state` and `min_quality` — all of which ARE used, from call
+        # `on_encoder_rebuilt_mirror_only` (retired since, #3472), `PipelineKey::Vp9Dc`,
+        # `quality_state` and `min_quality`, every one of them used then, from call
         # sites inside `#[cfg(feature = "vp9-444")]` functions in peer.rs. Lint
         # a feature set no one ships and you get findings that are artifacts of
         # the configuration; "fixing" them by deleting would have broken every

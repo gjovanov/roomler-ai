@@ -160,6 +160,9 @@ pub struct Vp9Encoder {
     force_keyframe: bool,
     /// Most-recent bitrate target (as set by REMB/back-channel).
     target_bitrate: u32,
+    /// #3472 — the pts the last encode handed libvpx, and when it was handed:
+    /// a frame fed again is stamped from them ([`refed_pts`]).
+    last_pts: Option<(vpx::vpx_codec_pts_t, std::time::Instant)>,
 }
 
 // `vpx_codec_ctx_t` contains raw `*const`/`*mut` pointers into
@@ -362,6 +365,7 @@ impl Vp9Encoder {
             frame_idx: 0,
             force_keyframe: true, // first frame is always keyframe
             target_bitrate: DEFAULT_BITRATE_BPS,
+            last_pts: None,
         };
         enc.apply_screen_content_controls();
         Ok(enc)
@@ -630,6 +634,14 @@ impl Vp9Encoder {
     /// the packet drain. The `VideoEncoder::encode` below is this behind an
     /// `Arc`; the encoder thread calls it directly.
     pub(crate) fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
+        self.encode_at(frame, std::time::Instant::now())
+    }
+
+    /// [`Self::encode_sync`] at `now`, the moment the frame reaches the
+    /// encoder: the clock a frame fed again takes its pts from (#3472). The
+    /// tests pass a simulated one, so the pump's 60 ms keepalive is 60 ms
+    /// however fast the encode runs.
+    fn encode_at(&mut self, frame: &Frame, now: std::time::Instant) -> Result<Vec<EncodedPacket>> {
         if frame.pixel_format != PixelFormat::Bgra {
             bail!("vp9-444: expected BGRA input, got {:?}", frame.pixel_format);
         }
@@ -697,6 +709,9 @@ impl Vp9Encoder {
         } else {
             pts
         };
+        // #3472 — a frame fed again (the pump's idle keepalive) carries its
+        // own time, not its first encode's.
+        let pts = refed_pts(self.last_pts, pts, now);
         let duration: u64 = frame_duration_us as u64;
 
         let force_kf = self.force_keyframe || self.frame_idx == 0;
@@ -723,6 +738,7 @@ impl Vp9Encoder {
         if err != vpx::VPX_CODEC_OK {
             bail!("vp9-444: vpx_codec_encode failed: {err:?}");
         }
+        self.last_pts = Some((pts, now));
 
         // P8 Phase 5 (QP telemetry, record-only) — the quantizer libvpx
         // actually used for THIS frame (its native qindex scale, not the
@@ -787,6 +803,32 @@ impl Vp9Encoder {
         }
         self.frame_idx += 1;
         Ok(out)
+    }
+}
+
+/// #3472 — the pts libvpx is handed for a frame whose own `pts` is not after
+/// the last one (`last`: that pts, and when it was handed). The pump's idle
+/// keepalive re-encodes its last frame: the same `Arc<Frame>`, so the same
+/// `monotonic_us`. libvpx's one-pass rate control reads its frame rate off
+/// the gaps between timestamps, so a repeated pts adds no time, yet each
+/// encode is still granted `target ÷ that rate`. The keepalive banked a
+/// capture's worth of budget and the next capture spent it: 2.0–2.4× the
+/// target in the field (2026-11-03, 11-04). Stamped with the last pts plus
+/// the time since the last encode, every encode carries its own time and
+/// the grants add up to the target. At least 1 µs later, so the pts stays
+/// strictly increasing whatever the clock reads.
+fn refed_pts(
+    last: Option<(vpx::vpx_codec_pts_t, std::time::Instant)>,
+    pts: vpx::vpx_codec_pts_t,
+    now: std::time::Instant,
+) -> vpx::vpx_codec_pts_t {
+    match last {
+        Some((last_pts, at)) if pts <= last_pts => {
+            let since =
+                i64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(i64::MAX);
+            last_pts.saturating_add(since.max(1))
+        }
+        _ => pts,
     }
 }
 
@@ -1507,13 +1549,14 @@ mod tests {
     /// is damage-gated (FR-29), so a screen that changes every `period_ms`
     /// hands the pump one real frame per period and `None` in between, and
     /// 60 ms after each real frame the pump re-encodes it (`IDLE_KEEPALIVE`
-    /// in `peer.rs`): the SAME `Arc<Frame>`, so the same `monotonic_us`, which
-    /// `encode_sync` hands libvpx as the pts.
+    /// in `peer.rs`): the SAME `Arc<Frame>`, so the same `monotonic_us`.
+    /// `encode_sync` handed libvpx that pts again until #3472's fix, and now
+    /// stamps the frame with the time it is fed (`refed_pts`).
     #[derive(Clone, Copy, PartialEq)]
     enum Ka {
-        /// The keepalive repeats its real frame's pts: the pump today.
+        /// The keepalive is its real frame fed again, as the pump feeds it.
         Repeat,
-        /// The keepalive carries the time it is encoded.
+        /// The keepalive carries the time it is encoded in its own pts.
         Fresh,
         /// No keepalive at all.
         None,
@@ -1530,7 +1573,9 @@ mod tests {
 
     /// One run of that pattern, measured after a 2 s warm-up. `target_bps`
     /// `None` skips `set_bitrate`, leaving libvpx at the boot target a
-    /// rebuilt encoder keeps (`DEFAULT_BITRATE_BPS`).
+    /// rebuilt encoder keeps (`DEFAULT_BITRATE_BPS`). Each encode is fed at
+    /// its simulated time (`encode_at`), so the keepalive lands 60 ms after
+    /// its capture, as in the pump, however fast this machine encodes.
     fn issue3472_run(
         w: u32,
         h: u32,
@@ -1612,10 +1657,12 @@ mod tests {
         let (mut bytes, mut periods, mut real_n, mut ka_n) = (0usize, 0u64, 0u64, 0u64);
         let (mut real_q, mut ka_q, mut real_b, mut ka_b) = (0f64, 0f64, 0usize, 0usize);
         let mut t_us = 1_000u64;
+        let t0 = std::time::Instant::now();
+        let at = |us: u64| t0 + std::time::Duration::from_micros(us);
         while t_us < end_us {
             let measured = t_us >= warm_us;
             let frame = window_frame(t_us);
-            let pkts = enc.encode_sync(&frame).expect("encode");
+            let pkts = enc.encode_at(&frame, at(t_us)).expect("encode");
             if measured {
                 periods += 1;
                 real_n += 1;
@@ -1630,11 +1677,11 @@ mod tests {
                     break;
                 }
                 let pkts = if ka == Ka::Repeat {
-                    enc.encode_sync(&frame)
+                    enc.encode_at(&frame, at(t_ka))
                 } else {
                     let mut f = frame.clone();
                     f.monotonic_us = t_ka;
-                    enc.encode_sync(&f)
+                    enc.encode_at(&f, at(t_ka))
                 }
                 .expect("encode");
                 if measured {
@@ -1659,8 +1706,10 @@ mod tests {
     }
 
     /// #3472 — the OFFLINE measurement: the same frames through the pump's
-    /// encoder with the keepalive's pts repeated (today), fresh, or with no
-    /// keepalive, plus `repeat-boot` (no `set_bitrate`: a rebuilt encoder).
+    /// encoder with the keepalive fed again as the pump feeds it (`repeat`:
+    /// 1.76× the target at 800x600 and 2.05× at 1920x1080 before the fix),
+    /// with a pts of its own, or with no keepalive, plus `repeat-boot` (no
+    /// `set_bitrate`: a rebuilt encoder).
     /// Knobs: `ISSUE3472_DIMS` (`800x600`), `ISSUE3472_PERIOD_MS` (100),
     /// `ISSUE3472_KEEPALIVES` (1), `ISSUE3472_TARGET` (3000000),
     /// `ISSUE3472_SECS` (30).
@@ -1705,15 +1754,14 @@ mod tests {
         }
     }
 
-    /// #3472 — RED on master. Fed as the pump feeds it on a screen that
-    /// changes every 100 ms (a keepalive 60 ms after each real capture,
-    /// carrying that capture's own pts), libvpx spends about twice its
-    /// target: it reads its frame rate off the pts gaps, a repeated pts adds
-    /// no time, and every encode is still granted target ÷ that rate. Field,
-    /// 2026-11-03 and 11-04: 6.1–7.2 Mbps against a 3 Mbps relay ceiling, with
-    /// twice as many encodes as captures. Un-ignore it with the fix.
+    /// #3472 — fed as the pump feeds it on a screen that changes every
+    /// 100 ms (a keepalive 60 ms after each real capture: the same frame,
+    /// with that capture's pts), libvpx holds its target. It spent about
+    /// twice it before the fix: it reads its frame rate off the pts gaps, the
+    /// repeated pts added no time, and every encode was still granted
+    /// target ÷ that rate. Field, 2026-11-03 and 11-04: 6.1–7.2 Mbps against a
+    /// 3 Mbps relay ceiling, with twice as many encodes as captures.
     #[test]
-    #[ignore = "#3472: red on master until a re-fed frame stops repeating its pts"]
     fn issue3472_repeated_pts_keepalives_hold_the_target() {
         let target = 3_000_000u32;
         let r = issue3472_run(800, 600, Some(target), Ka::Repeat, 100, 1, 12);
@@ -1724,6 +1772,41 @@ mod tests {
             target as f64 / 1e6,
             r.bps / target as f64,
             r.encodes_per_real
+        );
+    }
+
+    /// #3472 — the stamp rule alone: a pts after the last one passes through;
+    /// one that is not (repeated or earlier) takes the last pts plus the time
+    /// since the last encode, and is never the last pts again.
+    #[test]
+    fn a_frame_fed_again_takes_the_time_since_the_last_encode() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        assert_eq!(
+            refed_pts(None, 5_000, at(0)),
+            5_000,
+            "a first frame keeps its pts"
+        );
+        let last = Some((5_000, at(0)));
+        assert_eq!(
+            refed_pts(last, 105_000, at(100)),
+            105_000,
+            "a later pts passes"
+        );
+        assert_eq!(
+            refed_pts(last, 5_000, at(60)),
+            65_000,
+            "a repeat takes the 60 ms since"
+        );
+        assert_eq!(
+            refed_pts(last, 1_000, at(60)),
+            65_000,
+            "and so does an earlier pts"
+        );
+        assert_eq!(
+            refed_pts(last, 5_000, at(0)),
+            5_001,
+            "never the last pts again"
         );
     }
 }

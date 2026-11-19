@@ -100,6 +100,12 @@
   // FULL fresh enroll into the per-user file, which on SCM installs
   // manufactured the split-config the Settings banner warns about.
   let enrolledMode = false;
+  // #4020: the device service holds an enrollment this app cannot read, and
+  // no service answered. An enroll from here would write this person's own
+  // file beside the service's, so the form waits for the service.
+  let enrollmentUnknown = false;
+  // A click in flight keeps its button disabled whatever a status says.
+  let submitting = false;
 
   function showReEnrolled() {
     const el = resultSlot();
@@ -122,10 +128,16 @@
 
     on('status', (s) => {
       enrolledMode = !!s.enrolled;
+      enrollmentUnknown = !enrolledMode && !!s.enrollment_unknown;
       const btn = $('btn-enroll');
-      if (btn) btn.textContent = enrolledMode ? 'Re-enroll this device' : 'Enroll this device';
+      if (btn) {
+        btn.textContent = enrolledMode ? 'Re-enroll this device' : 'Enroll this device';
+        btn.disabled = submitting || enrollmentUnknown;
+      }
       const note = $('onboard-reenroll-note');
       if (note) note.hidden = !enrolledMode;
+      const unknownNote = $('onboard-unknown-note');
+      if (unknownNote) unknownNote.hidden = !enrollmentUnknown;
       const server = $('server');
       const name = $('device-name');
       if (server) {
@@ -142,6 +154,8 @@
 
     $('enroll-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
+      // #4020: Enter in a field submits too; the note above says why not.
+      if (enrollmentUnknown || submitting) return;
       const token = $('token').value.trim();
       const btn = $('btn-enroll');
       const label = btn.textContent;
@@ -151,6 +165,7 @@
           showError('Paste a fresh enrollment token.');
           return;
         }
+        submitting = true;
         btn.disabled = true;
         btn.textContent = 'Re-enrolling…';
         try {
@@ -161,7 +176,8 @@
         } catch (e) {
           showError('Re-enrollment failed: ' + e);
         } finally {
-          btn.disabled = false;
+          submitting = false;
+          btn.disabled = enrollmentUnknown;
           btn.textContent = label;
         }
         return;
@@ -173,6 +189,7 @@
         showError('Fill all three fields.');
         return;
       }
+      submitting = true;
       btn.disabled = true;
       btn.textContent = 'Enrolling…';
       try {
@@ -183,7 +200,8 @@
       } catch (e) {
         showError('Enrollment failed: ' + e);
       } finally {
-        btn.disabled = false;
+        submitting = false;
+        btn.disabled = enrollmentUnknown;
         btn.textContent = label;
       }
     });

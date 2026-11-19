@@ -25,6 +25,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
     pub enrolled: bool,
+    /// #4020 — whether this device is enrolled cannot be known: no config
+    /// this person reads holds an enrollment, the device service's own config
+    /// is there where they may not read it ([`ServiceConfig`]), and no
+    /// service named one. `enrolled` is `false` then, and the pages read it
+    /// as the service being offline, never as "Not enrolled": no set-up
+    /// offer. Until #4020 an enrolled Linux system install with its service
+    /// stopped, and a one-row Mac for a missed answer, offered set-up.
+    pub enrollment_unknown: bool,
     pub agent_id: Option<String>,
     pub tenant_id: Option<String>,
     pub server_url: Option<String>,
@@ -53,7 +61,8 @@ pub struct StatusReport {
 }
 
 /// Read current agent config + probe service state for the status view. Never
-/// errors — missing config = `enrolled: false`.
+/// errors — missing config = `enrolled: false`, and an enrollment that cannot
+/// be read is `enrollment_unknown` (#4020).
 ///
 /// ASYNC so the blocking service-state probe runs OFF the main (UI) thread:
 /// Tauri runs synchronous commands on the main thread, and `status.js` polls
@@ -67,25 +76,57 @@ pub async fn cmd_status() -> StatusReport {
         .await
         .unwrap_or_else(|_| status_report());
     // #1701 — the file said "not enrolled"; ask the daemon before believing it.
-    if !report.enrolled
-        && let Some(id) = daemon_node_status()
-            .await
-            .as_ref()
-            .and_then(daemon_identity)
-    {
-        apply_daemon_identity(&mut report, id);
+    if !report.enrolled {
+        let answer = daemon_node_status().await;
+        take_daemon_word(&mut report, answer.as_ref());
     }
     report
+}
+
+/// #1701 — `answer`, the daemon's `status`, settles a report whose files hold
+/// no enrollment when it names one ([`daemon_identity`]). No answer, or one
+/// that names none, leaves the report as the files left it: not enrolled, or,
+/// #4020, `enrollment_unknown`. A one-row Mac's screen worker answers with no
+/// name when the root half did not answer it (FR-43 P3a): a missed answer,
+/// never an un-enrollment, because the worker lives only while its root
+/// daemon does (#2987).
+fn take_daemon_word(report: &mut StatusReport, answer: Option<&NodeStatus>) {
+    if let Some(id) = answer.and_then(daemon_identity) {
+        apply_daemon_identity(report, id);
+    }
 }
 
 /// The blocking status-probe body — run on the blocking pool by [`cmd_status`],
 /// and directly by the (already-async, user-triggered) enroll commands.
 fn status_report() -> StatusReport {
-    let (service_kind, service_running) = probe_service_state();
+    let service = probe_service_state();
+    let own = load_optional_config(service.0 == "scmService");
+    status_report_from(Platform::HERE, service, own, ServiceConfig::of_held)
+}
+
+/// [`status_report`] from what it read: the device service's kind and state
+/// ([`probe_service_state`]), this person's own config (`own`, as
+/// [`load_optional_config`] loaded it), and `stat`, which says whether the
+/// device service's own config is there where this person may not read it
+/// ([`ServiceConfig`]). It is asked only when `own` holds no enrollment and
+/// [`enrollment_held_at`] names that config for `platform`.
+fn status_report_from(
+    platform: Platform,
+    (service_kind, service_running): (String, bool),
+    own: Option<AgentConfig>,
+    stat: impl FnOnce(HeldAt) -> ServiceConfig,
+) -> StatusReport {
     let is_scm = service_kind == "scmService";
     // FR-43 P3a — a person's file on a one-row Mac holds their settings and no
     // enrollment. That reads as no file, so `cmd_status` asks the daemon.
-    let cfg = load_optional_config(is_scm).filter(AgentConfig::has_primary_enrollment);
+    let own_without_enrollment = own.as_ref().is_some_and(|c| !c.has_primary_enrollment());
+    let cfg = own.filter(AgentConfig::has_primary_enrollment);
+    // #4020 — and the device service's own config, which this person may not
+    // read: is it there? Only whether it is; it is never read.
+    let held = match enrollment_held_at(platform, &service_kind, own_without_enrollment) {
+        Some(at) if cfg.is_none() => stat(at),
+        _ => ServiceConfig::Absent,
+    };
     // S1b — read BOTH sentinel locations (per-user + machine-global) and
     // parse message/reason; the old path-only read missed a SystemContext
     // host's machine-global sentinel entirely.
@@ -95,6 +136,7 @@ fn status_report() -> StatusReport {
         .map(|i| i.path.to_string_lossy().into_owned());
     StatusReport {
         enrolled: cfg.is_some(),
+        enrollment_unknown: cfg.is_none() && held.may_hold_an_enrollment(),
         agent_id: cfg.as_ref().map(|c| c.agent_id.clone()),
         tenant_id: cfg.as_ref().map(|c| c.tenant_id.clone()),
         server_url: cfg.as_ref().map(|c| c.server_url.clone()),
@@ -158,10 +200,135 @@ fn apply_daemon_identity(report: &mut StatusReport, id: DaemonIdentity) {
         return;
     }
     report.enrolled = true;
+    // #4020 — the daemon named it, so it is known.
+    report.enrollment_unknown = false;
     report.agent_id = Some(id.agent_id);
     report.tenant_id = Some(id.tenant_id);
     report.server_url = id.server_url;
     report.device_name = Some(id.device_name);
+}
+
+/// #4020 — the OS this build runs on, as the rule of where the device service
+/// holds an enrollment reads it ([`enrollment_held_at`]). A value rather than
+/// `cfg!` alone, so that every platform's rule is tested on every lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    Linux,
+    Mac,
+}
+
+impl Platform {
+    const HERE: Self = if cfg!(windows) {
+        Self::Windows
+    } else if cfg!(target_os = "macos") {
+        Self::Mac
+    } else {
+        Self::Linux
+    };
+}
+
+/// #4020 — the device service's own config, where its person may not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldAt {
+    /// Windows: the machine-wide service's machine-global config
+    /// (`config::machine_global_config_path`). Its folder is SYSTEM's and the
+    /// Administrators' alone (#3609).
+    MachineGlobal,
+    /// [`ROOT_CONFIG`]: a Linux system install's, or a Mac's root half's.
+    RootConfig,
+}
+
+/// #4020 — the root daemon's config: the `--config` of the packaged
+/// `roomlerd.service` on Linux (`appdirs::system_config_path`) and of
+/// `com.roomler.daemon.plist` on a Mac (roomlerd's `one_row::ROOT_CONFIG`).
+/// `roomlerd enroll` and `install.sh` make its folder `0755`, and the file
+/// `0600`: its person can see that it is there, and cannot read it.
+const ROOT_CONFIG: &str = "/etc/roomler/config.toml";
+
+impl HeldAt {
+    /// Where it is on this OS; `None` for the machine-global config off
+    /// Windows, which names none.
+    fn path(self) -> Option<PathBuf> {
+        match self {
+            #[cfg(windows)]
+            HeldAt::MachineGlobal => Some(config::machine_global_config_path()),
+            #[cfg(not(windows))]
+            HeldAt::MachineGlobal => None,
+            HeldAt::RootConfig => Some(PathBuf::from(ROOT_CONFIG)),
+        }
+    }
+}
+
+/// #4020 — where the device service holds this host's enrollment, when the
+/// config this person reads holds none: the config to look for.
+///
+/// - **Windows**: the machine-global one, when the machine-wide service is
+///   registered (`scmService`), as [`active_config_path`] reads it. A
+///   per-user install with a machine copy left behind is not asked.
+/// - **Linux**: [`ROOT_CONFIG`], when the root unit is registered
+///   (`systemDaemon`). A per-user install is not asked.
+/// - **A Mac**: [`ROOT_CONFIG`], when the person's own file is there and holds
+///   no enrollment: the one-row layout, where the root half holds the device's
+///   (FR-43 P3a). A two-row Mac whose per-user half is not enrolled has no
+///   such file, and is still offered set-up.
+///
+/// ⚠️ A registered service that is not running is no sign of an enrollment:
+/// a daemon with no config exits ("no config found … Run 'roomlerd enroll'
+/// first"), so a fresh system install's service is registered and stopped.
+/// Only the config being there is, so the service's state never decides it.
+fn enrollment_held_at(
+    platform: Platform,
+    service_kind: &str,
+    own_without_enrollment: bool,
+) -> Option<HeldAt> {
+    match platform {
+        Platform::Windows => (service_kind == "scmService").then_some(HeldAt::MachineGlobal),
+        Platform::Linux => (service_kind == "systemDaemon").then_some(HeldAt::RootConfig),
+        Platform::Mac => own_without_enrollment.then_some(HeldAt::RootConfig),
+    }
+}
+
+/// #4020 — what a `stat` of the device service's own config ([`HeldAt`])
+/// answers its person. Never a read: the file is the service's, and it holds
+/// the agent token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceConfig {
+    /// Not there (`NotFound`, or any answer that is not a yes): the service
+    /// holds no enrollment, and a host not enrolled yet reads "Not enrolled".
+    Absent,
+    /// There. On Linux and a Mac its folder (`0755`) lets the person see it,
+    /// and its mode (`0600`, root's) does not let them read it.
+    There,
+    /// The folder does not say (`PermissionDenied`). On Windows that is the
+    /// answer for a file that is there: the machine-global folder answers
+    /// `NotFound` for one that is not (measured with a basic-user token). On
+    /// Linux or a Mac it is a folder closed to the person (`0700`, as the
+    /// legacy-config migration makes it, or under a restrictive umask), which
+    /// answers it whatever is inside. Counted as there: every path that
+    /// closes the folder comes with a config.
+    Closed,
+}
+
+impl ServiceConfig {
+    /// A `stat` of `path`, logging nothing: it runs on every status poll.
+    fn of(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(_) => Self::There,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Self::Closed,
+            Err(_) => Self::Absent,
+        }
+    }
+
+    /// [`Self::of`] the config `at` names on this OS.
+    fn of_held(at: HeldAt) -> Self {
+        at.path().map_or(Self::Absent, |path| Self::of(&path))
+    }
+
+    /// Whether the service may hold an enrollment that its person cannot read.
+    fn may_hold_an_enrollment(self) -> bool {
+        self != Self::Absent
+    }
 }
 
 /// The daemon's `status`, best-effort: a daemon that is down simply leaves
@@ -4025,6 +4192,7 @@ mod tests {
     fn report(enrolled: bool) -> StatusReport {
         StatusReport {
             enrolled,
+            enrollment_unknown: false,
             agent_id: enrolled.then(|| "from-file".to_string()),
             tenant_id: enrolled.then(|| "tenant-from-file".to_string()),
             server_url: enrolled.then(|| "https://file.example".to_string()),
@@ -6024,5 +6192,394 @@ mod tests {
             plain, want,
             "a plain connect whose error is read: it goes through connect_service (#4020)"
         );
+    }
+
+    /// #4020 — the device service holds an enrollment its person cannot read:
+    /// with no service that names it, the status says so, and the pages read
+    /// it as the service being offline, never as "Not enrolled" with a set-up
+    /// offer. In the 0.4.226 lab a Linux system install with its service
+    /// stopped read "Not enrolled … Set up this device", and a one-row Mac
+    /// whose person socket to the root daemon was cut for 5 s read "Not
+    /// enrolled yet … Enroll this device…". A host with no such config is
+    /// still offered set-up.
+    mod enrollment {
+        use super::*;
+
+        /// The device service, as `probe_service_state` reads it.
+        fn service(kind: &str, running: bool) -> (String, bool) {
+            (kind.to_string(), running)
+        }
+
+        /// A per-user install's own config: it holds the enrollment.
+        fn enrolled_file() -> AgentConfig {
+            let mut cfg = AgentConfig::for_person_with_no_enrollment("host").expect("a config");
+            cfg.server_url = "https://file.example".to_string();
+            cfg.agent_token = "token".to_string();
+            cfg.agent_id = "from-file".to_string();
+            cfg.tenant_id = "tenant-from-file".to_string();
+            cfg
+        }
+
+        /// A one-row Mac's person file (FR-43 P3a): settings, no enrollment.
+        fn person_file_without_enrollment() -> AgentConfig {
+            AgentConfig::for_person_with_no_enrollment("mac").expect("a config")
+        }
+
+        /// A look the rule must not take: this person's own config is the
+        /// service's, so nothing else holds an enrollment for it.
+        fn not_asked(at: HeldAt) -> ServiceConfig {
+            panic!("{at:?} was looked for, where the person's own config is the service's")
+        }
+
+        /// What a one-row Mac's screen worker answers when the root half did
+        /// not answer it (`person_socket::with_machine_identity(own, None)`):
+        /// its own blank node and tenant, not connected, no orgs.
+        fn a_missed_answer() -> NodeStatus {
+            serde_json::from_str(
+                r#"{"node_id":"","name":"mac","version":"0.4.226","mode":"service",
+                    "privileged":false,"connected":false}"#,
+            )
+            .expect("a NodeStatus the worker could send")
+        }
+
+        /// Cell 1 — an enrolled system install with its service stopped: its
+        /// config is there and this person may not read it, and no service
+        /// answers. Not known, and the service is not running.
+        #[test]
+        fn an_enrolled_system_install_with_its_service_stopped_is_not_known() {
+            // Linux: `/etc/roomler/config.toml`, `0600` in a `0755` folder
+            // (There), or in a folder closed to the person (Closed).
+            for found in [ServiceConfig::There, ServiceConfig::Closed] {
+                let mut r = status_report_from(
+                    Platform::Linux,
+                    service("systemDaemon", false),
+                    None,
+                    |at| {
+                        assert_eq!(at, HeldAt::RootConfig);
+                        found
+                    },
+                );
+                take_daemon_word(&mut r, None);
+                assert!(!r.enrolled, "{found:?}");
+                assert!(r.enrollment_unknown, "{found:?}: there, unread, no service");
+                assert!(!r.service_running, "the card's words are 'not running'");
+            }
+            // Windows: the machine-wide service stopped, its config in the
+            // folder only SYSTEM and Administrators open.
+            let mut r = status_report_from(
+                Platform::Windows,
+                service("scmService", false),
+                None,
+                |at| {
+                    assert_eq!(at, HeldAt::MachineGlobal);
+                    ServiceConfig::Closed
+                },
+            );
+            take_daemon_word(&mut r, None);
+            assert!(!r.enrolled && r.enrollment_unknown);
+        }
+
+        /// Cell 2, THE TRAP — a system install never enrolled: its service is
+        /// registered and not running (a daemon with no config exits), and no
+        /// config is there. "Not enrolled", and set-up is offered, whatever the
+        /// service's state.
+        #[test]
+        fn a_system_install_never_enrolled_still_reads_not_enrolled() {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let none = dir.path().join("config.toml");
+            for (platform, kind) in [
+                (Platform::Linux, "systemDaemon"),
+                (Platform::Windows, "scmService"),
+            ] {
+                for running in [false, true] {
+                    let mut r = status_report_from(platform, service(kind, running), None, |_| {
+                        ServiceConfig::of(&none)
+                    });
+                    take_daemon_word(&mut r, None);
+                    assert!(!r.enrolled, "{platform:?} running={running}");
+                    assert!(
+                        !r.enrollment_unknown,
+                        "{platform:?} running={running}: no config is not enrolled"
+                    );
+                }
+            }
+            // A Mac whose root half holds nothing: the person's file alone.
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", false),
+                Some(person_file_without_enrollment()),
+                |_| ServiceConfig::of(&none),
+            );
+            take_daemon_word(&mut r, None);
+            assert!(!r.enrolled && !r.enrollment_unknown);
+        }
+
+        /// Cell 3 — a per-user install, not enrolled: "Not enrolled", as
+        /// before. Its enrollment is its person's own file, so no service
+        /// config is looked for, not even a machine-wide copy left behind.
+        #[test]
+        fn a_per_user_install_not_enrolled_reads_not_enrolled_as_before() {
+            for (platform, kind) in [
+                (Platform::Windows, "scheduledTask"),
+                (Platform::Linux, "scheduledTask"),
+                (Platform::Mac, "scheduledTask"),
+                (Platform::Windows, "none"),
+                (Platform::Linux, "none"),
+                (Platform::Mac, "none"),
+                // A Mac with a root half alone: no person file, so its
+                // per-user half is still offered set-up.
+                (Platform::Mac, "systemDaemon"),
+            ] {
+                let mut r = status_report_from(platform, service(kind, false), None, not_asked);
+                take_daemon_word(&mut r, None);
+                assert!(!r.enrolled, "{platform:?} {kind}");
+                assert!(!r.enrollment_unknown, "{platform:?} {kind}");
+            }
+        }
+
+        /// Cell 4 — the service runs and names the device: "Enrolled", as
+        /// before, over every file. A config this person reads that holds the
+        /// enrollment is "Enrolled" too, and nothing else is looked for.
+        #[test]
+        fn a_service_that_answers_reads_enrolled_as_before() {
+            let named = daemon_status("6ab7a24f352abff7547c5062", Some("6a975e17971e2d55ddcdedb2"));
+            for (platform, kind, own) in [
+                (Platform::Linux, "systemDaemon", None),
+                (Platform::Windows, "scmService", None),
+                (
+                    Platform::Mac,
+                    "systemDaemon",
+                    Some(person_file_without_enrollment()),
+                ),
+            ] {
+                let mut r = status_report_from(platform, service(kind, true), own, |_| {
+                    ServiceConfig::There
+                });
+                assert!(
+                    r.enrollment_unknown,
+                    "{platform:?}: the files alone cannot say"
+                );
+                take_daemon_word(&mut r, Some(&named));
+                assert!(r.enrolled, "{platform:?}");
+                assert!(!r.enrollment_unknown, "{platform:?}");
+                assert_eq!(r.agent_id.as_deref(), Some("6ab7a24f352abff7547c5062"));
+            }
+            let r = status_report_from(
+                Platform::Linux,
+                service("systemDaemon", false),
+                Some(enrolled_file()),
+                not_asked,
+            );
+            assert!(r.enrolled && !r.enrollment_unknown);
+            assert_eq!(r.agent_id.as_deref(), Some("from-file"));
+        }
+
+        /// Cell 5 — a one-row Mac: the person's file holds no enrollment, the
+        /// root half's config is there, and the daemon misses one answer (the
+        /// 0.4.226 lab's 5 s cut) or is stopped. Not known: never "Not
+        /// enrolled", and no enroll offer. What tells the companion it is on a
+        /// one-row Mac is the person's file with no enrollment beside the root
+        /// half's config, read afresh on every poll, so nothing is remembered:
+        /// the next answer that names the device ends it, and so does an
+        /// un-enrollment, which takes the root half's config away.
+        #[test]
+        fn a_one_row_mac_that_misses_an_answer_is_not_offered_to_enroll() {
+            let held = |at: HeldAt| {
+                assert_eq!(at, HeldAt::RootConfig);
+                ServiceConfig::There
+            };
+            // The root half runs, and its worker missed an answer.
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", true),
+                Some(person_file_without_enrollment()),
+                held,
+            );
+            take_daemon_word(&mut r, Some(&a_missed_answer()));
+            assert!(!r.enrolled);
+            assert!(
+                r.enrollment_unknown,
+                "a missed answer is not 'Not enrolled'"
+            );
+            // The root half stopped: no answer at all.
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", false),
+                Some(person_file_without_enrollment()),
+                held,
+            );
+            take_daemon_word(&mut r, None);
+            assert!(!r.enrolled && r.enrollment_unknown);
+            // The next answer names the device.
+            take_daemon_word(
+                &mut r,
+                Some(&daemon_status(
+                    "6ab7a24f352abff7547c5062",
+                    Some("6a975e17971e2d55ddcdedb2"),
+                )),
+            );
+            assert!(r.enrolled && !r.enrollment_unknown);
+            // Un-enrolled: the root half's config is gone (an uninstall).
+            let mut r = status_report_from(
+                Platform::Mac,
+                service("systemDaemon", false),
+                Some(person_file_without_enrollment()),
+                |_| ServiceConfig::Absent,
+            );
+            take_daemon_word(&mut r, None);
+            assert!(
+                !r.enrolled && !r.enrollment_unknown,
+                "an un-enrollment shows"
+            );
+        }
+
+        /// The look itself: a `stat`, never a read, and nothing in the log on
+        /// a poll. On Linux and a Mac a file this process may not read is
+        /// there, and a folder closed to it does not say.
+        #[test]
+        fn a_stat_tells_a_config_there_from_none_and_logs_nothing() {
+            // A second live dispatcher, so that no other test thread's visit
+            // caches a callsite as never logged (as in
+            // `a_start_with_no_config_and_no_service_logs_no_error`).
+            let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let path = dir.path().join("config.toml");
+            let (log, guard) = capture();
+            assert_eq!(ServiceConfig::of(&path), ServiceConfig::Absent);
+            std::fs::write(&path, "agent_token = \"secret\"\n").expect("the file");
+            assert_eq!(ServiceConfig::of(&path), ServiceConfig::There);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = |p: &Path, m: u32| {
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("a mode")
+                };
+                if process_is_root() {
+                    eprintln!("as root every mode reads: the unreadable cases are skipped");
+                } else {
+                    // Cell 1's file: `0600` and root's, here `0000` and this process's.
+                    mode(&path, 0o000);
+                    assert_eq!(
+                        std::fs::read(&path).map_err(|e| e.kind()).err(),
+                        Some(std::io::ErrorKind::PermissionDenied)
+                    );
+                    assert_eq!(ServiceConfig::of(&path), ServiceConfig::There);
+                    mode(&path, 0o600);
+                    // A folder closed to its person: there or not, it does not say.
+                    let closed = dir.path().join("closed");
+                    std::fs::create_dir(&closed).expect("the folder");
+                    std::fs::write(closed.join("config.toml"), "").expect("the file");
+                    mode(&closed, 0o000);
+                    assert_eq!(
+                        ServiceConfig::of(&closed.join("config.toml")),
+                        ServiceConfig::Closed
+                    );
+                    assert_eq!(
+                        ServiceConfig::of(&closed.join("none.toml")),
+                        ServiceConfig::Closed
+                    );
+                    mode(&closed, 0o700);
+                }
+            }
+            // This build's own rule, over the real file: there, unread, and no
+            // service answering.
+            let (kind, own) = match Platform::HERE {
+                Platform::Windows => ("scmService", None),
+                Platform::Linux => ("systemDaemon", None),
+                Platform::Mac => ("systemDaemon", Some(person_file_without_enrollment())),
+            };
+            let mut r = status_report_from(Platform::HERE, service(kind, false), own, |_| {
+                ServiceConfig::of(&path)
+            });
+            take_daemon_word(&mut r, None);
+            drop(guard);
+            assert!(!r.enrolled && r.enrollment_unknown);
+            let text = log.text();
+            assert!(!text.contains("WARN") && !text.contains("ERROR"), "{text}");
+        }
+
+        /// The rule names this build's own platform, and on Linux the root
+        /// config is the packaged unit's.
+        #[test]
+        fn the_root_config_is_the_root_daemons() {
+            #[cfg(windows)]
+            assert_eq!(Platform::HERE, Platform::Windows);
+            #[cfg(target_os = "macos")]
+            assert_eq!(Platform::HERE, Platform::Mac);
+            #[cfg(target_os = "linux")]
+            assert_eq!(Platform::HERE, Platform::Linux);
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                Path::new(ROOT_CONFIG),
+                roomler_node_core::appdirs::system_config_path()
+            );
+            assert_eq!(HeldAt::RootConfig.path(), Some(PathBuf::from(ROOT_CONFIG)));
+            #[cfg(windows)]
+            assert_eq!(
+                HeldAt::MachineGlobal.path(),
+                Some(config::machine_global_config_path())
+            );
+            #[cfg(not(windows))]
+            assert_eq!(HeldAt::MachineGlobal.path(), None);
+        }
+
+        /// The pages: an unknown enrollment reads "Offline" with the encoders
+        /// and files cards' "The device service is not running.", and offers
+        /// no set-up anywhere: no "Not enrolled" banner on the Overview, no
+        /// Onboarding spotlight, no "Enroll this device…" on the Welcome, and
+        /// an Onboarding form that waits. A host that is not enrolled keeps
+        /// all of them.
+        #[test]
+        fn the_pages_read_an_unknown_enrollment_as_offline_with_no_setup_offer() {
+            let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let html = flat(include_str!("front/index.html"));
+            let overview = flat(include_str!("front/overview.js"));
+            let app = flat(include_str!("front/app.js"));
+            let welcome = flat(include_str!("front/welcome.js"));
+            let onboarding = flat(include_str!("front/onboarding.js"));
+            for id in [
+                r#"id="ov-enrolled-note""#,
+                r#"id="wl-dev-unknown""#,
+                r#"id="onboard-unknown-note""#,
+            ] {
+                assert_eq!(html.matches(id).count(), 1, "{id}");
+            }
+            for line in [
+                "const unknown = !s.enrolled && !!s.enrollment_unknown;",
+                "if (s.enrolled || unknown) hide($('ov-not-enrolled')); else show($('ov-not-enrolled'));",
+                "chip.textContent = unknown ? 'Offline' : s.enrolled ? 'Enrolled' : 'Not enrolled';",
+                "const note = $('ov-enrolled-note');",
+                "note.textContent = !unknown ? '' : s.service_running ? 'The device service did not answer.' : 'The device service is not running.';",
+                "note.hidden = !unknown;",
+            ] {
+                assert!(overview.contains(line), "overview.js: {line}");
+            }
+            assert!(
+                app.contains(
+                    "onboardNav.classList.toggle('nav-onboard', !s.enrolled && !s.enrollment_unknown);"
+                ),
+                "app.js"
+            );
+            for line in [
+                "const unknown = !enrolled && !!(s && s.enrollment_unknown);",
+                "el('wl-dev-unenrolled').hidden = enrolled || unknown || !s;",
+                "el('wl-dev-unknown').hidden = !unknown;",
+            ] {
+                assert!(welcome.contains(line), "welcome.js: {line}");
+            }
+            for line in [
+                "enrollmentUnknown = !enrolledMode && !!s.enrollment_unknown;",
+                "btn.disabled = submitting || enrollmentUnknown;",
+                "if (unknownNote) unknownNote.hidden = !enrollmentUnknown;",
+                "if (enrollmentUnknown || submitting) return;",
+                "submitting = false; btn.disabled = enrollmentUnknown;",
+            ] {
+                assert!(onboarding.contains(line), "onboarding.js: {line}");
+            }
+            assert!(
+                !onboarding.contains("btn.disabled = false;"),
+                "a finished click leaves the form as the status says"
+            );
+        }
     }
 }

@@ -1548,7 +1548,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1929`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
 | Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:619`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
-| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:454`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
+| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:458`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
@@ -2202,6 +2202,20 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
   The cap holds the notch frames at q 64; the steady scroll still refines to
   q 0 inside the budget and idle stays lossless. Env
   `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3).
+- **#3472 — a frame fed again carries its own time.** libvpx's one-pass CBR
+  reads its frame rate off the gaps between timestamps and grants each encode
+  `target ÷ that rate`. The VP9 4:4:4 data-channel pump's idle keepalive
+  re-encodes its last frame 60 ms after it (`IDLE_KEEPALIVE`, `peer.rs:4048`): the same
+  `Arc<Frame>`, so the same `monotonic_us`. That repeated pts added no time
+  and still took a grant, so a damage-gated screen spent about twice its
+  target: 2.0–2.4× in the field, 1.76× at 800×600 and 2.05× at 1920×1080
+  offline. `encode_sync` now stamps a frame whose pts is not after the last
+  one with the last pts plus the time since the last encode (`refed_pts`,
+  `agents/roomlerd/src/encode/libvpx.rs:820`). Offline the keepalive then
+  costs what a frame with a pts of its own costs: 1.00× of the target at
+  800×600 and 0.99× at 1920×1080, where a capture is coded at q 253 rather
+  than borrowing its way to q 221. No pixels are copied. Pinned by
+  `issue3472_repeated_pts_keepalives_hold_the_target`.
 
 Bindgen (`vp9-444-bindgen` feature) generates bindings against system headers on
 Linux/macOS; Windows links the vendored prebuilt libvpx.

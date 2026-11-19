@@ -199,6 +199,89 @@ pub fn output_bounded_fed(
     }
 }
 
+/// [`output_bounded_fed`] that also says which process it ran: the child's
+/// pid, `None` when no child was started, beside the same result under the
+/// same bounds, a call past its deadline included. For a caller that names
+/// each child in its log (FR-147's `one-row`). It repeats
+/// [`output_bounded_fed`]'s steps rather than change that function, which
+/// stays as #3838 shipped it: a fix to one of the two is a fix to both.
+pub fn output_bounded_fed_pid(
+    cmd: &mut Command,
+    stdin: &[u8],
+    deadline: Duration,
+    cap: usize,
+) -> (Option<u32>, io::Result<Output>) {
+    let spawned = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => return (None, Err(e)),
+    };
+    let pid = child.id();
+    let pipe = child.stdin.take();
+    let input = stdin.to_vec();
+    let (said, how) = std::sync::mpsc::channel();
+    let feeder = std::thread::Builder::new()
+        .name("child-stdin".into())
+        .spawn(move || {
+            let written = match pipe {
+                Some(mut pipe) => pipe.write_all(&input),
+                None => Ok(()),
+            };
+            let _ = said.send(written);
+        });
+    if let Err(e) = feeder {
+        let _ = child.kill();
+        let _ = child.wait();
+        return (Some(pid), Err(e));
+    }
+    let collected = collect(
+        &mut child,
+        deadline,
+        Limit::Fail(cap),
+        Limit::Keep(FED_STDERR_KEPT),
+    );
+    if collected.is_err() {
+        let _ = child.kill();
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => return (Some(pid), Err(e)),
+    };
+    let (stdout, stderr) = match collected {
+        Ok(both) => both,
+        Err(e) => return (Some(pid), Err(e)),
+    };
+    let error = match how.recv_timeout(FEED_GRACE) {
+        Ok(Ok(())) => {
+            return (
+                Some(pid),
+                Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                }),
+            );
+        }
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => format!("the write was still blocked {FEED_GRACE:?} after the child exited"),
+    };
+    (
+        Some(pid),
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            InputNotTaken {
+                status,
+                stderr,
+                error,
+            },
+        )),
+    )
+}
+
 /// Why [`output_bounded_fed`] failed when the child did not take all of its
 /// stdin: how the child ended, and what it said on stderr (at most
 /// [`FED_STDERR_KEPT`] bytes, as it wrote them). Reached through
@@ -815,5 +898,44 @@ mod tests {
         // still answer; a reaped child is gone.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "pid {pid} is still there after the call returned");
+    }
+
+    /// The pid variant names the process it ran (the shell's own `$$`) and
+    /// returns what `output_bounded_fed` does; a child past its deadline is
+    /// still named, and no pid is named when nothing was started.
+    #[test]
+    fn the_pid_variant_names_the_child_it_ran() {
+        let (pid, out) = output_bounded_fed_pid(
+            &mut sh("cat >/dev/null; echo $$; echo said >&2; exit 3"),
+            b"bytes",
+            Duration::from_secs(10),
+            1 << 20,
+        );
+        let out = out.expect("ran");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stderr, b"said\n");
+        let printed: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("the child printed its pid");
+        assert_eq!(pid, Some(printed));
+
+        let (pid, e) = output_bounded_fed_pid(
+            &mut sh("exec sleep 30"),
+            b"",
+            Duration::from_millis(300),
+            1 << 20,
+        );
+        assert!(pid.is_some());
+        assert_eq!(e.expect_err("timed out").kind(), io::ErrorKind::TimedOut);
+
+        let (pid, e) = output_bounded_fed_pid(
+            &mut Command::new("/nonexistent/one-row-home"),
+            b"",
+            Duration::from_secs(1),
+            1 << 20,
+        );
+        assert_eq!(pid, None);
+        assert!(e.is_err());
     }
 }

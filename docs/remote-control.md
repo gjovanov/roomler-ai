@@ -7072,7 +7072,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
-| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1116)) | `EndedByItsHost` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1078)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
 | Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
@@ -7097,6 +7097,14 @@ ladder, so an unknown boot reads as the same boot, and a code nobody
 named counts. A stall counts too (`STALL_EXIT_CODE`): it is the build's
 own failure, although `should_record_supervisor_crash` leaves it out of
 the crash *reports* because the watchdog wrote its own.
+
+**A worker with no enrollment counts nowhere** (#4028). The SCM host's
+worker for an account with no config exits `NO_ENROLLMENT_EXIT_CODE`
+(78, [`daemon_error.rs:126`](../agents/roomlerd/src/daemon_error.rs#L126)).
+`should_record_supervisor_crash` leaves it out of the reports, and the host
+backs it off exactly as an exit 1. It ends before this bookkeeping, with no
+config to keep a count in, so it needs no `--prior-end` word. Only that
+worker exits 78: every other `run` with no config still exits 1.
 
 ⚠️ **The boot is an id, never a time.** A boot time worked out from the
 wall clock moves when the clock is stepped, and two starts of one boot
@@ -7164,7 +7172,7 @@ The sentinel goes where its reader looks:
 `attention_path_for_worker`, so a worker in SystemContext reaches the
 machine-global path, where the companion (running as the person) reads
 it. Its one reader is the companion's Overview
-([`agents/roomler-desktop/src/commands.rs:92`](../agents/roomler-desktop/src/commands.rs#L92)).
+([`agents/roomler-desktop/src/commands.rs:133`](../agents/roomler-desktop/src/commands.rs#L133)).
 
 ⚠️ **The way back by hand undoes itself unless updates are off first.**
 Uninstalling keeps the config and the enrollment, and installing the
@@ -7610,8 +7618,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1475`). Again in
-  the `Stop` arm (`supervisor.rs:1617`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1478`). Again in
+  the `Stop` arm (`supervisor.rs:1627`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

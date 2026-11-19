@@ -1609,7 +1609,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1989`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:2019`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2062`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1930`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1941`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7816`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7849`)
 pin the role per command and the end line of a failure.
@@ -1908,7 +1908,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3120-3127`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3131-3138`).
 
 ### What a bare host needs (#3204)
 
@@ -2434,16 +2434,43 @@ WireGuard key, so its row stays, with its overlay off until `roomlerd org overla
 it on. Then the LaunchAgent goes, the root's file gets both switches, and the daemon
 restarts, which ends live sessions.
 
+**Root changes nothing in a home (FR-147).** From the release that carries FR-147's
+root side, the command running as root lists `/Users`, `stat`s each entry and reads
+the account database, and every other read or write inside a person's home is done by
+that person's own process: `roomlerd one-row-home <verb>`, the package's binary
+(`/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd`), which root starts with the
+person's uid, primary gid and no other group, an empty environment and `/` as its folder,
+one per account in uid order, 30 s each, and which checks its own identity before it
+touches anything (`agents/roomlerd/src/one_row.rs:2885`,
+`agents/roomlerd/src/one_row_home.rs:3-60`). Root keeps its own copies and records in
+its own tree: `/etc/roomler/config.toml.pre-one-row` and `/etc/roomler/one-row/`
+(root:wheel 700, files 600: `root.json` and one folder per uid, its `record.json`
+written last), each a temporary file, `fsync`, `rename`; they go only after a restart
+answers. A home a root step changed before (#3763, #3802), or a config its person
+cannot read, is refused before anything changes, with an administrator's line where
+the package's rule fits and otherwise words that name the section below; such a Mac
+keeps working two-row ([FR-147](fr/FR-147-root-out-of-homes-macos.md), "Refusals at
+Read").
+
 ```mermaid
-flowchart LR
-    PLAN["plan, said"] --> KEEP["copies: *.pre-one-row"] --> LA["LaunchAgent out, plist aside"]
-    LA --> FILES["root's file: both switches, moved orgs; people's files: no enrollment"]
-    FILES --> RESTART["kickstart -k: a new daemon in 30 s"] --> VERIFY{"within 60 s: connected, worker attached, screen-capture"}
-    VERIFY -- yes --> REPORT["one row: the retired rows to delete"]
-    VERIFY -- no --> UNDO["copies and plists back, LaunchAgent bootstrapped, restart"]
-    KEEP -.->|"a step fails"| UNDO
-    LA -.->|"a step fails"| UNDO
-    FILES -.->|"a step fails"| UNDO
+sequenceDiagram
+    participant R as root, sudo roomlerd one-row
+    participant C as the person's own process, one-row-home
+    participant D as launchd
+    R->>C: read, one per account, in uid order
+    C-->>R: owners, modes and kinds, the config's and the plist's bytes
+    Note over R: the plan and the refusals, nothing changed yet
+    R->>R: keep - root's copy, root.json, one folder per uid
+    R->>D: bootout gui/uid/com.roomler.agent
+    R->>R: root's file - both switches, the moved enrollments
+    R->>C: convert, over the bytes root kept
+    C-->>R: the new config's sha256, the plist removed
+    R->>R: kickstart -k, then within 60 s connected, worker attached, screen-capture
+    alt a step or the verify fails
+        R->>C: put-back, for every person started
+        R->>D: bootstrap gui/uid
+        R->>R: root's file back, restart, then the records go
+    end
 ```
 
 Once it goes ahead it can't be stopped halfway: a detached copy of it applies the plan,
@@ -2451,8 +2478,13 @@ so it outlives the restart of the daemon that carried a `roomler exec`, and a Ct
 ends only the command that waits for it. Its account also goes to
 `/var/log/roomler/one-row.log`. `sudo roomlerd one-row --revert` puts back
 every copy, the plist and the LaunchAgent, and restarts: two rows again, until a person
-deletes a retired row, whose token then cannot come back. The one-token install is
-P3d.
+deletes a retired row, whose token then cannot come back. Root's file goes back first;
+then each person in uid order, by that person's own process: `put-back` from root's
+records, or `put-back-legacy`, which renames back the copies an older release kept in
+the person's folder. A person who fails is named and keeps their record, the others go
+on, and the command exits 1; the next `--revert` finishes them. When nobody's `read`
+answers and nothing else is left, it exits 1 before it asks and restarts nothing. The
+one-token install is P3d.
 
 ⚠️ On 0.4.200 the command stops before it changes anything on a Mac where an entry
 under `/Users` links to another account's folder, as a tart image's `/Users/runner`
@@ -2664,7 +2696,14 @@ console user are skipped and every root row runs as on any install
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:157` |
 | Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:583-586`, `:591`, `:691-694`, `:712`, `:720`, `:733`, `:612`, `:747` |
 | The enrollment `install.sh --one-row` runs under `sudo`, and any other root `roomlerd` command: its log | root | root's own tree, `/var/root/Library/Application Support/live.roomler.roomler/logs`, never the person's home | `crates/agent-core/src/appdirs.rs:152` |
+| `sudo roomlerd one-row`, its undo and `--revert`: the person's config and `com.roomler.agent.plist` | **that person** (`roomlerd one-row-home <verb>`, started by root with the person's uid and gid alone, FR-147) | the person's home | `agents/roomlerd/src/one_row.rs:2885`, `agents/roomlerd/src/one_row_home.rs:3-60` |
+| `sudo roomlerd one-row`: root's copy of its config, its records and its log | root | `/etc/roomler/config.toml.pre-one-row`, `/etc/roomler/one-row/`, `/var/log/roomler/one-row.log` | `agents/roomlerd/src/one_row.rs:143` |
 
+- **`sudo roomlerd one-row` writes nothing in a home as root (FR-147).** A home whose
+  `~/Library/LaunchAgents` or roomler folder a root step made, or whose config its person
+  cannot read, is refused before anything changes, with an administrator's command only
+  where the rule below fits, else words that name this section. Whether such a folder
+  ever comes back without an administrator's command is FR-147's D8, still open.
 - **No root command writes in the person's folder (#3802).** macOS `sudo` keeps
   the caller's `HOME`, so on macOS the agent's folders hang off the home that the
   account database names for the account a process runs as, never `HOME`
@@ -2733,7 +2772,9 @@ console user are skipped and every root row runs as on any install
     worker makes the folder again, as the person, at its next start.
   - When it holds `com.roomler.agent.plist.pre-one-row` or
     `config.toml.pre-one-row`, which the revert reads there and nowhere else
-    (`agents/roomlerd/src/one_row.rs:913-921`), the command stages first and
+    (the person's own `put-back-legacy`, `agents/roomlerd/src/one_row_home.rs:1152-1194`,
+    started by `--revert` where that person's `read` reports them,
+    `agents/roomlerd/src/one_row.rs:2185`), the command stages first and
     moves last: `<test> && sudo -u '#<uid>' mkdir '<folder>.new-<stamp>' &&
     sudo -u '#<uid>' cp '<folder>/<copy>' … '<folder>.new-<stamp>/' && sudo mv
     '<folder>' '<aside>' && { sudo mv '<folder>.new-<stamp>' '<folder>' || {
@@ -2773,9 +2814,9 @@ console user are skipped and every root row runs as on any install
     command: a move would set that entry aside with the folder, and with
     `macos_one_row` off a file of that name is this person's enrollment. The
     product's own states never put one in a folder of root's.
-  - When `lstat` says the person cannot read a copy (the conversion keeps a
-    config's copy mode 600 and owned as the original, `one_row.rs:1347-1357`, so
-    the copy of a file of root's), the line names it and says that a later
+  - When `lstat` says the person cannot read a copy (a conversion by a release
+    before FR-147's root side kept a config's copy mode 600 and owned as the
+    original, so the copy of a file of root's), the line names it and says that a later
     revert would not restore it if the folder were moved, and gives no command.
     Nor does it give one for a folder that is not a directory, or for a folder
     of another account than root: the line says it is that account's folder.
@@ -3060,7 +3101,7 @@ sequenceDiagram
 | Side of the race | Since #3080 | Where |
 |---|---|---|
 | **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:1619`, `:1568`; `crates/tunnel-core/src/child.rs:86` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:367`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:1359` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:450`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:1359` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
@@ -3257,7 +3298,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3118-3119`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3129-3130`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 
