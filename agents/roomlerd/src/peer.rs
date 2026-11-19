@@ -13386,9 +13386,7 @@ async fn handle_files_control(
 /// listing is bounded as a whole and takes the channel's lane, one step at a
 /// time ([`crate::files::FilesHandler::list_dir`]). Its answer carries the
 /// request's `req_id`, which the viewer matches, so a later listing's answer
-/// may come first. Once the channel closes or the session ends the task
-/// stops and drops its answer, and it never sends on a channel that has
-/// closed.
+/// may come first.
 fn spawn_dir_listing(
     dc: Arc<RTCDataChannel>,
     handler: crate::files::FilesHandler,
@@ -13396,49 +13394,54 @@ fn spawn_dir_listing(
     req_id: String,
     path: String,
 ) {
+    tokio::spawn(answer_dir_listing(dc, handler, session_id, req_id, path));
+}
+
+/// [`spawn_dir_listing`]'s task, answering on `dc`. Once the channel closes
+/// or the session ends it stops and drops its answer, and it never sends on a
+/// channel that has closed.
+async fn answer_dir_listing<S: DownloadSink>(
+    dc: S,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    req_id: String,
+    path: String,
+) {
     let closed = handler.listings_closed();
-    tokio::spawn(async move {
-        let listed = tokio::select! {
-            () = closed.cancelled() => return,
-            listed = handler.list_dir(&path) => listed,
-        };
-        if closed.is_cancelled() || channel_gone(dc.ready_state()) {
-            return;
+    let listed = tokio::select! {
+        () = closed.cancelled() => return,
+        listed = handler.list_dir(&path) => listed,
+    };
+    if closed.is_cancelled() || dc.gone() {
+        return;
+    }
+    match listed {
+        Ok(listing) => {
+            info!(
+                %session_id, ?req_id,
+                path = ?listing.path,
+                entries = listing.entries.len(),
+                "files: dir listed"
+            );
+            let parent_owned = listing.parent.clone();
+            dc.send_json(&crate::files::FilesOutgoing::DirList {
+                req_id: &req_id,
+                path: &listing.path,
+                parent: parent_owned.as_deref(),
+                entries: &listing.entries,
+            })
+            .await;
         }
-        match listed {
-            Ok(listing) => {
-                info!(
-                    %session_id, ?req_id,
-                    path = ?listing.path,
-                    entries = listing.entries.len(),
-                    "files: dir listed"
-                );
-                let parent_owned = listing.parent.clone();
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::DirList {
-                        req_id: &req_id,
-                        path: &listing.path,
-                        parent: parent_owned.as_deref(),
-                        entries: &listing.entries,
-                    },
-                )
-                .await;
-            }
-            Err(e) => {
-                warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
-                let msg = format!("{e}");
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::DirError {
-                        req_id: &req_id,
-                        message: &msg,
-                    },
-                )
-                .await;
-            }
+        Err(e) => {
+            warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
+            let msg = format!("{e}");
+            dc.send_json(&crate::files::FilesOutgoing::DirError {
+                req_id: &req_id,
+                message: &msg,
+            })
+            .await;
         }
-    });
+    }
 }
 
 /// Spawn a tokio task that pumps an outgoing single-file download.
@@ -17906,5 +17909,55 @@ mod dir_listing_tests {
             Some("held"),
             "the listing answered once its folder did: {listed:?}"
         );
+    }
+
+    /// A channel whose peer vanished after the listing found it open: the
+    /// answer's send parks for good while the channel still reads open, the
+    /// shape #1730 met in the field.
+    struct AnswerParks {
+        parked: Arc<tokio::sync::Notify>,
+    }
+
+    impl DownloadSink for AnswerParks {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {
+            self.parked.notify_one();
+            std::future::pending().await
+        }
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A listing whose answer cannot be sent ends once its session ends. Its
+    /// send parked with nothing racing it, so the task kept the channel and
+    /// the handler for as long as the daemon lived.
+    #[tokio::test]
+    async fn a_listing_whose_answer_cannot_be_sent_ends_with_its_session() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let handler = crate::files::FilesHandler::new();
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(answer_dir_listing(
+            AnswerParks {
+                parked: parked.clone(),
+            },
+            handler.clone(),
+            bson::oid::ObjectId::new(),
+            "parks".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        ));
+        let sent = tokio::time::timeout(Duration::from_secs(5), parked.notified()).await;
+        handler.end_session().await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(sent.is_ok(), "the listing's answer was never sent");
+        let Ok(ended) = ended else {
+            panic!("the listing outlived its session, parked in its answer's send");
+        };
+        ended.expect("the listing's task");
     }
 }
