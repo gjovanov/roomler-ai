@@ -248,8 +248,9 @@ once at boot, at warn: `redis: a timeout setting under 1000 ms is used as 1000 m
 `given_ms` and `used_ms` (`redis_conn.rs:480-491`). A bound under a second would fail commands on a
 Redis that answers: a value of 3, meant as seconds, would put both pods into "Redis down" at once.
 Linux also sends its first SYN retransmission after 1 s, so a connection timeout under 1 s fails a
-connection that one lost packet only delays. No value refuses boot: a pod that will not start
-holds a roll. Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no
+connection that one lost packet only delays. No number refuses boot (a value that is not a number
+fails the settings load, as it does for every number setting): a pod that will not start holds a
+roll. Both at 0 is the crate's default `ConnectionManager` with no outer timeout and no
 replacement, restored by a setting on the deployment and a restart, with no new image
 (`crates/config/src/settings.rs:1296-1304`). The boot line `Redis Pub/Sub publisher connected`
 names the bounds in use, `response_timeout_ms` and `connection_timeout_ms` (0 is no bound), and
@@ -309,8 +310,9 @@ Why 3 s, for both:
   several commands in a row. One that gets no answer now fails inside it, at 3 s.
 
 **A timeout means the reply was lost, not that the write was.** A write may be applied behind a
-timed-out command. What each Redis user does with an error, whatever its cause, and what heals a
-write applied behind a lost reply:
+timed-out command, and a write still queued in the socket of a connection that was replaced can
+reach Redis after newer writes sent on the replacement. What each Redis user does with an error,
+whatever its cause, and what heals a write applied behind a lost reply, or one that lands late:
 
 | Redis user | Commands | On an error | A write applied behind the lost reply |
 |---|---|---|---|
@@ -325,10 +327,10 @@ write applied behind a lost reply:
 | Relay allowance (`crates/modules/network/src/relay_allowance.rs:260`, `:265`, `:282`) | DEL, SET EX 900, GET | a failed read is an empty set: throttles lift (fails open, as the code intends) | the previous set until the next job (300 s) |
 | Ownership directory (`crates/core/src/cluster/directory.rs`) | GET, SET (NX) EX, Lua refresh and release, SCAN | "no record": rc and tunnels answer pod-local, media serves the join here (the belt) | records are re-asserted within one beat or end by TTL |
 | Media claim-or-route (`crates/modules/conference/src/media_cluster.rs:62`, `:226`, `:624`) | GET, Lua claim and refresh, bus requests | a join whose claim cannot be read is served here (the belt), and the orphan pass folds it ≤ 10 s after Redis answers; a media command whose bus request fails prunes the owner's record as a deadline does, and a join that claims the room meanwhile makes the owner fold its room at its next refresh (≤ 10 s): every participant rejoins once; a member's removal whose claim read fails counts the room as this pod's, closes nothing here and reports 0 seats, and the serving pod's seat check ends the seat within 30 s (`crates/modules/conference/src/revoke.rs:322`) | the claim's 30 s TTL |
-| DERP registration (`crates/modules/network/src/derp_cluster.rs:72`, `:352`) | Lua LWW claim, SADD, convergence reads | the registration keeps its token whatever the claim answered, and its socket goes on; `finish_registration` writes what the error left owed once Redis answers, 1 s apart doubling to 30 s: the record by `claim_if_newer`, which never takes it from a later registration; the index member; a convergence sweep (measured: settled 9.2 s after Redis answered) | the record holds this registration's own token: the heartbeat refreshes it |
+| DERP registration (`crates/modules/network/src/derp_cluster.rs:72`, `:352`) | Lua LWW claim, SADD, convergence reads | the registration keeps its token whatever the claim answered, and its socket goes on; `finish_registration` writes what the error left owed once Redis answers, 1 s apart doubling to 30 s: the record by `claim_if_newer`, which never takes it from a later registration, and which is released again by its token when the registration ended while the claim was in flight (`keep_late_claim`); the index member; a convergence sweep (measured: settled 9.2 s after Redis answered) | the record holds this registration's own token: the heartbeat refreshes it |
 | Tunnel ownership record (`crates/modules/network/src/tunnel.rs:800-815`) | Lua LWW claim | the session keeps its token whatever the claim answered; the 30 s heartbeat re-sets an absent record (`refresh_if_mine`, `crates/modules/network/src/lib.rs:382-393`); only the split-evidence probe reads it | the record holds the session's own token: the heartbeat refreshes it |
 | Pod bus (`bus.rs:225`, `:317`) | PUBLISH | a request fails before its deadline starts; a lost reply is a deadline at the requester | handlers are idempotent |
-| Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A deadline, or the owner's answer (`alive: false`, a NACK), still reaps a proxy or forgets a route | nothing is written |
+| Cross-pod RC relay (`crates/modules/remote/src/relay.rs:714`, `:524`) | bus requests `rc.conn_alive`, `rc.cmd` | "unknown": the janitor keeps the proxy and asks again at the next sweep; a frame that cannot be relayed is dropped with a warn, the route is kept, and the viewer's own timers recover the setup. A deadline, or the owner's answer (`alive: false`; a NACK, which to a relayed frame is also the owner's refusal of that one frame), still reaps a proxy or forgets a route. A deadline says only that the owner did not answer: until #3952, after a Redis lost without a reset, it can be this pod's own deaf bus subscriber | nothing is written |
 | Session slots (`crates/core/src/cluster/session_slots.rs:209`, `:263`, `:346`, `:366`) | Lua claim, renew pipeline, keep, release | a claim error, or a set full only by stale leases Redis did not let go (`crates/modules/remote/src/slots.rs:206-210`), lets the session proceed uncounted (fails open, as the code intends); a keep is tried again 1, 2, 4, 8, 16 s apart while its lease can still exist (`keep_retrying`, `session_slots.rs:417`); renew and release log | a lease lapses in 90 s; a keep only lengthens a live lease, so trying it again is harmless |
 | Reads with a shorter bound of their own (`crates/modules/fleet/src/agent.rs:1984`, `crates/modules/remote/src/resume.rs:610`, `extauth.rs:305`, `rejoin.rs:360`, `controller.rs:293`, `dead_rows.rs:365`, `crates/modules/network/src/tunnel.rs:607`) | GET, MGET | their own bound fires first, as before | — |
 
@@ -340,7 +342,11 @@ is bounded; the sum is k × 3 s.
 
 **Not covered: the subscriptions** (#3952). The `roomler:ws` and bus subscribers hold their own
 connections (`redis_pubsub.rs:427`, `bus.rs:258`), which nothing bounds yet: a subscriber whose
-Redis went silent stays subscribed to nothing until the kernel gives the socket up.
+Redis went silent stays subscribed to nothing until the kernel gives the socket up. Until then, a
+bus deadline after such an outage says only that no reply came: it can be this pod's own deaf
+subscriber rather than a pod that is gone, and the RC relay reaps a proxy or forgets a route on it
+as it does on a gone pod. With both bounds at 0 it comes too, later: once the kernel gives the
+command socket up.
 
 **Field read.** Each wording below is one fixed line at warn, written at most once a second per
 pod, with `suppressed`, the lines held back since the one before it (`LineBound`,
