@@ -21,10 +21,12 @@
 //!   server now, read once at the pump's start and again at each question.
 //!   Refused at the start: `false` from the first question on. Gone later:
 //!   `false` from then on. No answer in time: `false` for that question.
-//! - **the console session**: another console session started since the
+//! - **the console session**, in a root process only
+//!   ([`reads_console_session`]): another console session started since the
 //!   pump's start (a log-out and a login, a user switch, a restart of
 //!   loginwindow) means the person the panel could reach is gone: `false` from
-//!   then on.
+//!   then on. A per-user process reads none, and the connection alone decides
+//!   for it.
 //!
 //! ⚠️ This `false` is not a refusal. It is the answer a panel already showing
 //! another question gives, and it takes the same road: the caller marks the
@@ -76,8 +78,25 @@ pub(crate) trait Screen {
     fn connection(&self) -> Connection;
     /// The console session now, as a value that stays the one read at the
     /// pump's start for as long as no other console session has started
-    /// since. `None` when it cannot be read.
+    /// since. `None` when it cannot be read, and in a process that reads
+    /// none ([`reads_console_session`]).
     fn console_session(&self) -> Option<u64>;
+}
+
+/// Whether a process with this effective uid reads the console session: a
+/// root process only (a one-row Mac's daemon, a two-row Mac's root half).
+///
+/// A root daemon's window-server connection belongs to the console session
+/// it started in, so another one since leaves its panel reaching nobody. A
+/// per-user process (a two-row Mac's per-user half) belongs to a GUI session
+/// of its own, which a fast user switch away and back leaves alive, and the
+/// window server posts the console-session names for that switch: a read
+/// there would end its panel at the first switch, and its row's questions
+/// would go to the app until it restarted. So it builds its gate with no
+/// console session, which the gate takes as the same one at every question,
+/// and the connection alone decides for it.
+pub(crate) fn reads_console_session(euid: u32) -> bool {
+    euid == 0
 }
 
 /// What the gate answers a question.
@@ -215,7 +234,8 @@ impl PanelGate {
     }
 
     /// The console session read now, against the one at the start. One the
-    /// reader could not read at the start leaves the connection to decide.
+    /// reader could not read at the start, or a process that reads none
+    /// ([`reads_console_session`]), leaves the connection to decide.
     fn session_now(&self, now: Option<u64>) -> Session {
         match (self.start_session, now) {
             (None, _) => Session::Same,
@@ -503,6 +523,89 @@ mod tests {
         assert!(text.contains("window_number=none"), "{text}");
         assert_eq!(lines_at(&logged, "INFO"), 1, "{text}");
         assert!(text.contains("both reads answer again"), "{text}");
+    }
+
+    /// Cell 4c — only a root process reads the console session: a one-row
+    /// Mac's daemon and a two-row Mac's root half run as root (0), a two-row
+    /// Mac's per-user half as its person (501, the first account a Mac
+    /// makes).
+    #[test]
+    fn only_a_root_process_reads_the_console_session() {
+        assert!(reads_console_session(0), "a root process");
+        assert!(!reads_console_session(501), "a per-user process");
+    }
+
+    /// The console session `PanelScreen::at_start` gives the gate in a
+    /// process with this effective uid: its reader's first read in a root
+    /// process, and none in any other, which has no reader.
+    fn session_at_start(euid: u32) -> Option<u64> {
+        if reads_console_session(euid) {
+            SESSION
+        } else {
+            None
+        }
+    }
+
+    /// Cell 4c — a fast user switch to a second account and back, as each
+    /// process's gate sees it. The window server posts the console-session
+    /// names for it. A root process's reader counts them: another console
+    /// session, from then on, with ONE WARN (lab cell L10). A per-user
+    /// process has no reader: its "available" line says
+    /// `console_session=none`, and its panel takes the questions after the
+    /// switch back with no line past that one (lab cell L9). The connection
+    /// still decides for it: a lost one takes no question, with ONE WARN.
+    ///
+    /// Red with a reader in every process: the per-user half took no question
+    /// after the first switch, for the rest of its life.
+    #[test]
+    fn a_user_switch_and_back_ends_the_panel_of_a_root_process_only() {
+        let logged = Logged::start(tracing::Level::INFO);
+        let start = session_at_start(0);
+        let root = PanelGate::new(WORKS, start);
+        let screen = StoodIn::new(WORKS, start);
+        root.announce();
+        assert!(root.verdict(&screen).shows());
+        // The switch away and back: the reader counted the posts.
+        screen.session.set(Some(1));
+        for _ in 0..3 {
+            assert_eq!(root.verdict(&screen), Verdict::AnotherSession);
+        }
+        let text = logged.text();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert_eq!(lines_at(&logged, "WARN"), 1, "{text}");
+        assert!(
+            text.contains("another console session has started since the panel came up"),
+            "{text}"
+        );
+        assert!(text.contains("console_session_at_start=0"), "{text}");
+        drop(logged);
+
+        let logged = Logged::start(tracing::Level::INFO);
+        let start = session_at_start(501);
+        assert_eq!(start, None, "a per-user process read the console session");
+        let per_user = PanelGate::new(WORKS, start);
+        // No reader, so no session at a question either.
+        let screen = StoodIn::new(WORKS, None);
+        per_user.announce();
+        // Before the switch, after the switch away, and after the switch back.
+        for _ in 0..3 {
+            assert!(per_user.verdict(&screen).shows());
+        }
+        let text = logged.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains(AVAILABLE), "{text}");
+        assert!(text.contains("console_session=none"), "{text}");
+
+        screen.connection.set(REFUSED);
+        assert_eq!(per_user.verdict(&screen), Verdict::Lost);
+        assert_eq!(per_user.verdict(&screen), Verdict::Lost);
+        let text = logged.text();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert_eq!(lines_at(&logged, "WARN"), 1, "{text}");
+        assert!(
+            text.contains("can no longer put a window on the screen"),
+            "{text}"
+        );
     }
 
     /// Cell 5 — THE TRAP: a question the panel does not take because it

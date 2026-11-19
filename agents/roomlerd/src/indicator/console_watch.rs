@@ -6,7 +6,9 @@
 //! The root daemon's consent panel ([`super::mac`]) reads it at each question,
 //! through [`super::panel_gate`]: after a log-out and a login, a fast user
 //! switch or a restart of loginwindow, the person the panel could reach when
-//! it came up is no longer the one at the screen.
+//! it came up is no longer the one at the screen. Only a root process watches
+//! ([`super::panel_gate::reads_console_session`]): a per-user process's own
+//! GUI session lives through a fast user switch.
 //!
 //! CoreGraphics names the two notifications in its public `CGSession.h`
 //! (`kCGNotifyGUIConsoleSessionChanged`, `kCGNotifyGUISessionUserChanged`) and

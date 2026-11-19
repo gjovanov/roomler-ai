@@ -2661,28 +2661,43 @@ panel connects to its display once, when the daemon starts, and keeps that conne
    (`viewer-indicator-macos`, AppKit). The macOS panel is a question's surface
    only while the window server serves its process (#4053). At each question
    `prompt` (`agents/roomlerd/src/indicator/mac.rs:178`) asks a gate
-   (`indicator/panel_gate.rs:186`) two things, with no lock held:
+   (`indicator/panel_gate.rs:205`) two things, with no lock held:
    - whether a 1×1 probe window, never shown, gets a window device
-     (`window_number` above 0, `indicator/mac.rs:841`). The main thread makes
+     (`window_number` above 0, `indicator/mac.rs:848`). The main thread makes
      it, and the question waits 500 ms at most.
-   - whether another console session has started since the pump's start:
-     notify(3) on CoreGraphics' `GUIConsoleSessionChanged` and
-     `GUISessionUserChanged` (`indicator/console_watch.rs:38`).
+   - in a root process only, whether another console session has started
+     since the pump's start: notify(3) on CoreGraphics'
+     `GUIConsoleSessionChanged` and `GUISessionUserChanged`
+     (`indicator/console_watch.rs:40`). A root `notifyutil` in the lab (macOS
+     15, 2026-11-19) saw neither name at a lock, a display sleep or the screen
+     saver, and one or both at a log-out, a login, a fast user switch and the
+     switch back.
+
+   Only a root process reads the console session (`reads_console_session`,
+   `indicator/panel_gate.rs:98`): a one-row Mac's daemon and a two-row Mac's
+   root half. Its window-server connection belongs to the console session it
+   started in, so another one since leaves its panel reaching nobody. A
+   per-user process, a two-row Mac's per-user half, belongs to a GUI session
+   of its own, which a fast user switch away and back leaves alive: a read
+   there would end its panel at the first switch, and its row's questions
+   would go to the app until it restarted. It reads none, so the window
+   device alone decides for it, and its lines say `console_session=none`.
 
    A root daemon that launchd started before anyone signed in is refused when
    it starts, and a log-out detaches one that was served. Either way, and when
-   the console session has changed, the panel answers `false` for the rest of
-   the process's life. A read with no answer in time gives `false` for that
-   question alone. `false` is the answer of a panel already showing another
-   question: the question is marked `companion` and goes on down this chain to
-   the person's app, over the relay on a one-row Mac and through the
-   announcement on a two-row Mac. It is never a refusal. The panel comes back at the root daemon's next
-   start with someone signed in. Nothing restarts it, and drawing it from the
-   person's own session is FR-149 (#4054). Each change is logged once, with
-   `window_number` and `console_session`: `macOS consent panel available` at
-   the start, or in its place a WARN that the process could not put a window
-   on the screen, then a WARN when the connection is lost or the console
-   session changes.
+   a root process's console session has changed, the panel answers `false`
+   for the rest of the process's life. A read with no answer in time gives
+   `false` for that question alone. `false` is the answer of a panel already
+   showing another question: the question is marked `companion` and goes on
+   down this chain to the person's app, over the relay on a one-row Mac and
+   through the announcement on a two-row Mac. It is never a refusal. The panel
+   comes back at the root daemon's next start with someone signed in. Nothing
+   restarts it, and drawing it from the person's own session is FR-149
+   (#4054). Each change is logged once, with `window_number` and
+   `console_session`: `macOS consent panel available` at the start, or in its
+   place a WARN that the process could not put a window on the screen, then a
+   WARN when the connection is lost or a root process's console session
+   changes.
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
    starts it if it is not running (`companion::ensure_running`). On Linux,
    Windows and macOS that start runs off the async worker, one start in

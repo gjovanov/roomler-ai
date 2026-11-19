@@ -31,10 +31,10 @@
 //! A root daemon that launchd started before anyone signed in was refused by
 //! the window server, and a log-out detaches one that was served: either way
 //! its windows reach no screen for the rest of its life. So `prompt` asks
-//! [`super::panel_gate`] first, which reads whether a probe window gets a
-//! window device and whether another console session has started since the
-//! pump's start ([`super::console_watch`]). Its `false` is a taken panel's,
-//! and the question goes to the person's app.
+//! [`super::panel_gate`] first: whether a probe window gets a window device,
+//! and in a root process whether another console session has started since
+//! the pump's start ([`super::console_watch`]). Its `false` is a taken
+//! panel's, and the question goes to the person's app.
 //!
 //! ## The application delegate (#3164)
 //!
@@ -79,7 +79,7 @@ use objc2_foundation::{
 };
 
 use super::console_watch::ConsoleWatch;
-use super::panel_gate::{Connection, PanelGate, Screen};
+use super::panel_gate::{Connection, PanelGate, Screen, reads_console_session};
 use super::{ConsentSender, PromptView};
 use crate::macos_quit::{self, QuitReply};
 
@@ -795,8 +795,8 @@ const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 struct PanelScreen {
     gate: PanelGate,
     /// notify(3) on the window server's console-session names, from the
-    /// pump's start.
-    console: ConsoleWatch,
+    /// pump's start, in a root process only ([`reads_console_session`]).
+    console: Option<ConsoleWatch>,
 }
 
 /// Made on the main thread after `finishLaunching`, before [`PUMPING`] is
@@ -804,10 +804,17 @@ struct PanelScreen {
 static PANEL_SCREEN: OnceLock<PanelScreen> = OnceLock::new();
 
 impl PanelScreen {
-    /// The reads at the pump's start, on the main thread.
+    /// The reads at the pump's start, on the main thread. A per-user process
+    /// (a two-row Mac's per-user half) makes no console reader: its gate
+    /// starts with no console session, and the connection alone decides.
     fn at_start(mtm: MainThreadMarker) -> Self {
-        let console = ConsoleWatch::console();
-        let gate = PanelGate::new(window_device(mtm), console.session());
+        // SAFETY: `geteuid` reads the caller's own credentials; it cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let console = reads_console_session(euid).then(ConsoleWatch::console);
+        let gate = PanelGate::new(
+            window_device(mtm),
+            console.as_ref().and_then(ConsoleWatch::session),
+        );
         Self { gate, console }
     }
 
@@ -828,7 +835,7 @@ impl Screen for PanelScreen {
     }
 
     fn console_session(&self) -> Option<u64> {
-        self.console.session()
+        self.console.as_ref().and_then(ConsoleWatch::session)
     }
 }
 
