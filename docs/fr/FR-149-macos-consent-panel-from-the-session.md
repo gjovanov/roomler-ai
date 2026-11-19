@@ -171,7 +171,7 @@ sequenceDiagram
     participant W as screen worker (as the person)
     participant S as root's person socket for the person
     V->>R: rc:request
-    R->>R: the question on its own broker; the worker's person owns /dev/console
+    R->>R: the question on its own broker, and /dev/console owned by the worker's person
     R->>W: PanelAsk { id, question } over the delegation channel
     W->>W: the panel up, its window number read (main thread)
     W-->>R: PanelTold { id, state: shown }, within 500 ms
@@ -354,10 +354,10 @@ P1, unit tests with stood-in readers, so they run on every lane:
 
 The agent's tests run in "Agent tests (vp9-444, overlay, kernel TUN)", step "Test agent under vp9-444"; in "Windows
 agent unit tests", step "Agent unit tests on Windows (the whole --lib suite)"; and in "macOS overlay compile check",
-step "cargo check + test the agent's Mac-only units", whose list of modules (`.github/workflows/ci.yml:1655-1658`)
+step "cargo check + test the agent's Mac-only units", whose list of modules (`.github/workflows/ci.yml:1659-1662`)
 gains `indicator::session_panel::`. The worker's AppKit side compiles in "cargo check agent (viewer-indicator-macos —
 the AppKit panel + the main-thread swap)". The LocalAPI's run on a Mac in "cargo test the LocalAPI on a real Mac
-(#3736)" (`ci.yml:1714-1715`), where P2 adds the person-socket verbs' tests: `person_may` updated, an offer taken only
+(#3736)" (`ci.yml:1718-1719`), where P2 adds the person-socket verbs' tests: `person_may` updated, an offer taken only
 from the socket's own person on the connection that holds its `consent_relaying`, an offer that lives as long as its
 connection, `tests::a_panel_told_on_a_connection_that_did_not_wait_for_that_id_is_refused` (rule 3), and
 `consent_relay::tests::an_ask_with_no_parked_wait_is_no_answer_within_the_bound` (rule 4).
