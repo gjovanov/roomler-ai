@@ -413,11 +413,13 @@ mod one_bound_over_a_listing {
         both_listed(first, second);
     }
 
-    /// The edge of it: the first listing ends just inside its bound, at
-    /// 2.9 s, and a quick one asked 0.1 s after it needs 0.3 s. Its bound
-    /// ran from when it was asked, so it timed out at 3.1 s.
+    /// The edge of it: the first listing takes most of its bound, 2.5 s, and
+    /// one asked 0.1 s after it needs 1.0 s. Its bound ran from when it was
+    /// asked, so it timed out at 3.1 s, 0.4 s before its step would have
+    /// ended. Now the first ends 0.5 s inside its bound and the second 1.1 s
+    /// inside its 4.5 s: no margin here is under 0.4 s, on a loaded runner too.
     #[tokio::test]
-    async fn behind_a_listing_ending_just_inside_its_bound_a_quick_one_gets_its_listing() {
+    async fn behind_a_long_listing_one_asked_at_once_gets_its_listing() {
         let temp = tempfile::tempdir().unwrap();
         let (a, b) = (folder(temp.path(), "a"), folder(temp.path(), "b"));
         let (held_a, held_b) = (seams::hold_entries(&a), seams::hold_entries(&b));
@@ -426,10 +428,10 @@ mod one_bound_over_a_listing {
         let first = listing(&h, &a);
         tokio::time::sleep_until(started + Duration::from_millis(100)).await;
         let second = listing(&h, &b);
-        tokio::time::sleep_until(started + Duration::from_millis(2900)).await;
+        tokio::time::sleep_until(started + Duration::from_millis(2500)).await;
         held_a.release();
         let second_began = held_b.reached_within(BOUND).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         held_b.release();
         let first = tokio::time::timeout(ROOM, first).await;
         let second = tokio::time::timeout(2 * ROOM, second).await;
