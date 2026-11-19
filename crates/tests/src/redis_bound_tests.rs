@@ -523,3 +523,67 @@ async fn a_session_frame_redis_fails_to_relay_keeps_its_route_and_tells_the_cont
         RECOVERY + BOUND + SLACK
     );
 }
+
+/// #3840 — a detached session's slot keep that Redis did not answer is tried
+/// again while its lease can still exist, so a silence longer than the bound
+/// does not give away the slot of the session it kept (the lease would lapse
+/// at its own expiry, and a resume at the org's cap would then be refused).
+#[tokio::test]
+async fn a_slot_keep_redis_did_not_answer_lands_once_redis_answers_again() {
+    use roomler_core::cluster::session_slots::{SessionSlots, SlotClaim, SlotScope};
+
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let ps = through(&fwd).await;
+    let slots = SessionSlots::new(ps.connection(), &unique("w14db"));
+    let (org, session) = (
+        SlotScope::Org(bson::oid::ObjectId::new()),
+        bson::oid::ObjectId::new(),
+    );
+    let (user, device) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+    let claimed = slots
+        .claim(org, session, user, device, 1, "w14-pod")
+        .await
+        .expect("the claim is answered");
+    assert_eq!(claimed, SlotClaim::Claimed);
+    let until = bson::DateTime::now().timestamp_millis() + 600_000;
+
+    fwd.swallow();
+    let started = Instant::now();
+    let keep = tokio::spawn({
+        let slots = slots.clone();
+        async move { slots.keep_retrying(org, session, until).await }
+    });
+    // The first try has had no answer within the bound by now.
+    tokio::time::sleep(BOUND + Duration::from_millis(500)).await;
+    fwd.pass();
+    let answered = tokio::time::timeout(RECOVERY + RECOVERY, keep).await;
+    let elapsed = started.elapsed();
+    eprintln!(
+        "W14-RESULT slot keep through a {:?} silence: {answered:?} after {elapsed:?}",
+        BOUND + Duration::from_millis(500)
+    );
+    let kept = match answered {
+        Ok(Ok(Ok(kept))) => kept,
+        other => panic!(
+            "W14-RED the keep did not land once Redis answered again: {other:?} after {elapsed:?}"
+        ),
+    };
+    assert!(kept, "the lease still existed, so it was kept");
+
+    // Read the lease's expiry past the forwarder, straight from Redis.
+    let direct = RedisPubSub::new(&test_redis_url(), unique("w14-direct/"))
+        .await
+        .expect("a direct connection");
+    let mut conn = direct.connection();
+    let expiry: Option<f64> = redis::cmd("ZSCORE")
+        .arg(slots.slots_key(org))
+        .arg(session.to_hex())
+        .query_async(&mut conn)
+        .await
+        .expect("ZSCORE");
+    assert!(
+        expiry.is_some_and(|ms| ms as i64 >= until),
+        "the lease lives to the kept deadline: {expiry:?} < {until}"
+    );
+    let _ = slots.release(org, session).await;
+}

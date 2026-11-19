@@ -392,3 +392,87 @@ impl SessionSlots {
             .await
     }
 }
+
+/// #3840 — how long a keep that Redis did not answer is tried again: while
+/// the lease it lengthens can still exist. A lease lives [`SLOT_TTL_SECS`]
+/// from its last renewal, so past that there is nothing left to keep (a keep
+/// would answer `false`) and the slot is free anyway.
+pub const KEEP_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(SLOT_TTL_SECS);
+
+/// The wait before the next try of a keep that failed for the `failures`th
+/// time, or `None` when that try would start past [`KEEP_RETRY_WINDOW`],
+/// counted from the first try (`elapsed`).
+///
+/// Today's rule, kept until the fix: a keep is tried once.
+pub fn keep_retry_wait(
+    _failures: u32,
+    _elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    None
+}
+
+impl SessionSlots {
+    /// [`Self::keep`], tried again while Redis does not answer it and the
+    /// lease can still exist ([`keep_retry_wait`]). A keep only lengthens a
+    /// lease that exists, so a try after one that Redis applied but did not
+    /// answer changes nothing, and a lease that lapsed meanwhile answers
+    /// `false` and ends the tries. It can take [`KEEP_RETRY_WINDOW`]: spawn
+    /// it. The error is the last try's.
+    pub async fn keep_retrying(
+        &self,
+        scope: SlotScope,
+        session: ObjectId,
+        until_ms: i64,
+    ) -> Result<bool, redis::RedisError> {
+        let started = std::time::Instant::now();
+        let mut failures = 0;
+        loop {
+            match self.keep(scope, session, until_ms).await {
+                Ok(kept) => return Ok(kept),
+                Err(e) => {
+                    failures += 1;
+                    let Some(wait) = keep_retry_wait(failures, started.elapsed()) else {
+                        return Err(e);
+                    };
+                    tracing::debug!(%session, failures, ?wait, %e, "session slot: a keep was not answered; trying it again");
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod keep_retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const fn s(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    /// #3840 — a keep Redis did not answer is tried again, waiting 1, 2, 4,
+    /// 8 and then 16 s between tries.
+    #[test]
+    fn a_keep_redis_did_not_answer_is_tried_again_with_backoff() {
+        assert_eq!(keep_retry_wait(1, s(3)), Some(s(1)));
+        assert_eq!(keep_retry_wait(2, s(7)), Some(s(2)));
+        assert_eq!(keep_retry_wait(3, s(12)), Some(s(4)));
+        assert_eq!(keep_retry_wait(4, s(19)), Some(s(8)));
+        assert_eq!(keep_retry_wait(5, s(30)), Some(s(16)));
+        assert_eq!(
+            keep_retry_wait(9, s(60)),
+            Some(s(16)),
+            "the wait stays at 16 s"
+        );
+    }
+
+    /// No try starts once the lease could have lapsed: a lease lives 90 s
+    /// from its last renewal.
+    #[test]
+    fn no_try_starts_past_the_life_of_a_lease() {
+        assert_eq!(keep_retry_wait(1, s(88)), Some(s(1)));
+        assert_eq!(keep_retry_wait(1, s(89)), None);
+        assert_eq!(keep_retry_wait(6, s(80)), None, "80 s + 16 s is past 90 s");
+    }
+}

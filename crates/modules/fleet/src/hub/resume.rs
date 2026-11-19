@@ -449,8 +449,8 @@ impl Hub {
 
     /// Review 1, L5 — keep a detached session's lease, off the caller's
     /// thread, until `resume_by` plus 10 s: written once, in Redis, so no
-    /// pod renews it through the gap. A failed keep leaves the lease to
-    /// lapse at its own expiry, as before.
+    /// pod renews it through the gap. A keep Redis does not answer is tried
+    /// again while the lease can still exist (#3840, `keep_retrying`).
     fn keep_slot(&self, lease: Lease, resume_by: DateTime) {
         let Some(slots) = self.inner.session_slots.get().cloned() else {
             return;
@@ -460,7 +460,7 @@ impl Hub {
             .saturating_add(SLOT_KEEP_PAST_RESUME_MS);
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.spawn(async move {
-                if let Err(e) = slots.keep(lease.scope, lease.session, until).await {
+                if let Err(e) = slots.keep_retrying(lease.scope, lease.session, until).await {
                     warn!(
                         session = %lease.session,
                         %e,
