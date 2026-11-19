@@ -413,15 +413,26 @@ async fn finish_registration(
 /// outlive its socket. The index member is left to the next sweep, which
 /// prunes a member with no record: removing it here could race a newer
 /// registration's add on the other pod.
-/// TODAY: the record is kept, and the finisher adds the member.
 pub async fn keep_late_claim(
     state: &NetworkState,
     network_id: ObjectId,
     pk: &DerpPubKey,
     token: &str,
 ) -> bool {
-    let _ = (state, network_id, pk, token);
-    true
+    let held = state
+        .derp_presence_tokens
+        .get(&(network_id, *pk))
+        .is_some_and(|held| *held == token);
+    if held {
+        return true;
+    }
+    if let Some(dir) = &state.cluster_directory {
+        let key = derp_key(&network_id.to_hex(), &pk_hex(pk));
+        if let Err(e) = dir.release(&key, token).await {
+            debug!(%network_id, %e, "derp late claim release failed (TTL backstop)");
+        }
+    }
+    false
 }
 
 #[cfg(test)]
