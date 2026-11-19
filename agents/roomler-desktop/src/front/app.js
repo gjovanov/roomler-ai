@@ -150,8 +150,10 @@ window.Roomler = (function () {
     if (s) {
       setText('brand-version', 'v' + s.agent_version);
       // A fresh install: spotlight Onboarding, since nothing works before it.
+      // #4020 — never for an enrollment the device service holds and this app
+      // cannot read.
       const onboardNav = document.querySelector('#nav a[data-view="onboarding"]');
-      if (onboardNav) onboardNav.classList.toggle('nav-onboard', !s.enrolled);
+      if (onboardNav) onboardNav.classList.toggle('nav-onboard', !s.enrolled && !s.enrollment_unknown);
     }
     paintConnIndicator();
   }

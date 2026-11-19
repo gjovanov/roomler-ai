@@ -1736,6 +1736,16 @@ jobs:
       - name: cargo check the desktop companion
         run: cargo check -p roomler-desktop
 
+      # #4020 — the companion's enrollment status on a real Mac. A one-row Mac
+      # whose daemon misses an answer, or is stopped, reads its enrollment as
+      # not known, never "Not enrolled" with an offer to enroll, and this
+      # build's rule is the Mac's (`Platform::HERE`, the stat of a real file
+      # and of a folder closed to the runner). The companion's other tests run
+      # on Linux and Windows (rust-unit, and the Windows job's #3940 step);
+      # only these run here.
+      - name: cargo test the companion's enrollment status on a real Mac (#4020)
+        run: cargo test -p roomler-desktop --bins -- commands::tests::enrollment::
+
       # FR-129 B1 — the setup wizard installs the daemon on macOS now (the
       # `osascript` half, `agents/roomler-setup/src/unix_daemon.rs`), and its
       # macOS arms compiled NOWHERE before a `setup-v*` tag: release-setup.yml
