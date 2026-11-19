@@ -932,10 +932,12 @@ mod tests {
 
 /// Done-criterion 3 of FR-148 P0's step 2: the sampler reads a known pipe. Two
 /// in-process SCTP associations (the vendored webrtc-sctp, unmodified but for
-/// the clock) over a link this module shapes: each direction serialises every
-/// packet at the link's rate, holds it 10 ms more, and drops a packet that
-/// would wait more than 200 ms in its queue. Real time, so each cell takes a
-/// few seconds.
+/// the clock and the gauges) over a link this module shapes: each direction
+/// serialises every packet at the link's rate, holds it 10 ms more, and drops a
+/// packet that would wait more than 200 ms in its queue. Real time, so each
+/// cell takes a few seconds. Step 4a's train cells (`media_train`) use the same
+/// link with a one-way delay and a queue of their own ([`shaped`]), and the
+/// shaper's peak wait ([`ShapedConn::peak_wait`]).
 ///
 /// The viewer's receive window ([`rwnd`]) is 7/8 of what the link's queue
 /// holds, so what is in flight stays under the queue at every rate, and the
@@ -951,7 +953,7 @@ mod tests {
 /// What it does not prove: a real carrier's loss, jitter, reordering and
 /// stalls, a browser's SCTP at the far end, and DTLS and ICE beneath SCTP.
 #[cfg(test)]
-mod shaped_link {
+pub(crate) mod shaped_link {
     use std::any::Any;
     use std::io;
     use std::net::SocketAddr;
@@ -999,11 +1001,20 @@ mod shaped_link {
     /// One direction of the link.
     struct Shaper {
         bps: u64,
+        /// How long a packet travels once it is serialised.
+        one_way: Duration,
+        /// The longest a packet may wait for the wire; one that would wait
+        /// longer is dropped at the tail.
+        queue: Duration,
         next_free: StdMutex<Instant>,
         due: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
         /// Drops every n-th [`FULL_PACKET`] before its queue; 0 drops none.
         drop_every: u64,
         full_packets: AtomicU64,
+        /// The longest any packet waited for the wire, nanoseconds.
+        peak_wait_ns: AtomicU64,
+        /// Packets dropped at the tail.
+        tail_drops: AtomicU64,
     }
 
     impl Shaper {
@@ -1018,30 +1029,147 @@ mod shaped_link {
             let now = Instant::now();
             let mut next_free = self.next_free.lock().unwrap();
             let start = (*next_free).max(now);
-            if start.saturating_duration_since(now) > QUEUE {
+            let wait = start.saturating_duration_since(now);
+            if wait > self.queue {
+                self.tail_drops.fetch_add(1, Ordering::Relaxed);
                 return; // Dropped at the tail, as a full router queue does.
             }
+            let wait_ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+            self.peak_wait_ns.fetch_max(wait_ns, Ordering::Relaxed);
             let wire = Duration::from_nanos(b.len() as u64 * 8 * 1_000_000_000 / self.bps);
             *next_free = start + wire;
-            let _ = self.due.send((start + wire + DELAY, b.to_vec()));
+            let _ = self.due.send((start + wire + self.one_way, b.to_vec()));
         }
     }
 
     /// One end: it sends through its own shaper and receives what the other
     /// end's shaper delivers.
-    struct ShapedConn {
+    pub(crate) struct ShapedConn {
         out: Shaper,
         inbox: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
         local: SocketAddr,
         remote: SocketAddr,
     }
 
-    /// One direction's delivery: each packet reaches the far inbox when due.
-    fn direction(bps: u64, drop_every: u64) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
+    impl ShapedConn {
+        /// The longest any packet this end sent waited in its queue for the
+        /// wire: the peak queueing delay at this direction's bottleneck.
+        pub(crate) fn peak_wait(&self) -> Duration {
+            Duration::from_nanos(self.out.peak_wait_ns.load(Ordering::Relaxed))
+        }
+
+        /// The packets this end's queue dropped at its tail.
+        pub(crate) fn tail_drops(&self) -> u64 {
+            self.out.tail_drops.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Scheduling noise, as a busy test runner makes it, seeded so that a
+    /// cell meets the same draws on every run. Every wake-up of a task comes
+    /// up to `jitter` late, as a timer's does; and about once every
+    /// `stall_every` the scheduler gives the task's core away for up to
+    /// `stall`, and a wake-up due then comes when it returns. On the link a
+    /// wake-up is a packet's delivery, and the packets behind a late one wait
+    /// for it, in order. No wake-up comes more than `stall + jitter` late.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Noise {
+        pub(crate) seed: u64,
+        pub(crate) jitter: Duration,
+        pub(crate) stall: Duration,
+        /// The mean time between stalls; zero for none.
+        pub(crate) stall_every: Duration,
+    }
+
+    impl Noise {
+        /// The same noise, drawn from another sequence: one per task.
+        pub(crate) fn reseeded(self, salt: u64) -> Self {
+            Self {
+                seed: self.seed ^ salt,
+                ..self
+            }
+        }
+    }
+
+    /// One task's draws of a [`Noise`].
+    #[derive(Debug)]
+    pub(crate) struct Draws {
+        noise: Noise,
+        state: u64,
+        /// The stall due next or under way: when it starts and ends.
+        stall: Option<(Instant, Instant)>,
+    }
+
+    impl Draws {
+        pub(crate) fn new(noise: Noise) -> Self {
+            Self {
+                noise,
+                state: noise.seed,
+                stall: None,
+            }
+        }
+
+        /// How late a wake-up due at `due` comes. A stall starts from 0 to
+        /// twice `stall_every` after the one before it ended (after the first
+        /// wake-up, for the first), whether or not anything was due in it.
+        pub(crate) fn late(&mut self, due: Instant) -> Duration {
+            let jitter = uniform(&mut self.state, self.noise.jitter);
+            let every = self.noise.stall_every;
+            if every.is_zero() {
+                return jitter;
+            }
+            let mut after = due;
+            loop {
+                let (start, end) = match self.stall {
+                    Some(stall) => stall,
+                    None => {
+                        let start = after + uniform(&mut self.state, 2 * every);
+                        let stall = (start, start + uniform(&mut self.state, self.noise.stall));
+                        self.stall = Some(stall);
+                        stall
+                    }
+                };
+                if due < start {
+                    return jitter;
+                }
+                if due < end {
+                    return end - due + jitter;
+                }
+                self.stall = None;
+                after = end;
+            }
+        }
+    }
+
+    /// A draw from 0 to `most`.
+    fn uniform(state: &mut u64, most: Duration) -> Duration {
+        let ns = u64::try_from(most.as_nanos()).unwrap_or(u64::MAX);
+        Duration::from_nanos(draw(state) % ns.saturating_add(1))
+    }
+
+    /// The next draw of a seeded sequence (splitmix64).
+    fn draw(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// One direction's delivery: each packet reaches the far inbox when due,
+    /// or as late as `noise` draws.
+    fn direction(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        drop_every: u64,
+        noise: Option<Noise>,
+    ) -> (Shaper, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (due_tx, mut due_rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
+            let mut draws = noise.map(Draws::new);
             while let Some((due, p)) = due_rx.recv().await {
+                let due = draws.as_mut().map_or(due, |d| due + d.late(due));
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                 if inbox_tx.send(p).is_err() {
                     break;
@@ -1050,10 +1178,14 @@ mod shaped_link {
         });
         let shaper = Shaper {
             bps,
+            one_way,
+            queue,
             next_free: StdMutex::new(Instant::now()),
             due: due_tx,
             drop_every,
             full_packets: AtomicU64::new(0),
+            peak_wait_ns: AtomicU64::new(0),
+            tail_drops: AtomicU64::new(0),
         };
         (shaper, inbox_rx)
     }
@@ -1065,8 +1197,41 @@ mod shaped_link {
     /// A link whose agent-to-viewer direction drops every `drop_every`-th
     /// packet that carries a full DATA chunk; 0 drops none.
     fn lossy_link(bps: u64, drop_every: u64) -> (ShapedConn, ShapedConn) {
-        let (a_out, b_inbox) = direction(bps, drop_every);
-        let (b_out, a_inbox) = direction(bps, 0);
+        shaped_dropping(bps, DELAY, QUEUE, drop_every, None)
+    }
+
+    /// A link of `bps` each way, whose packets travel `one_way` after their
+    /// serialisation and wait at most `queue` for the wire, losing nothing
+    /// else: the agent's end first.
+    pub(crate) fn shaped(bps: u64, one_way: Duration, queue: Duration) -> (ShapedConn, ShapedConn) {
+        shaped_dropping(bps, one_way, queue, 0, None)
+    }
+
+    /// As [`shaped`], with `noise` on both directions, each its own draws.
+    pub(crate) fn shaped_noisy(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        noise: Noise,
+    ) -> (ShapedConn, ShapedConn) {
+        shaped_dropping(bps, one_way, queue, 0, Some(noise))
+    }
+
+    fn shaped_dropping(
+        bps: u64,
+        one_way: Duration,
+        queue: Duration,
+        drop_every: u64,
+        noise: Option<Noise>,
+    ) -> (ShapedConn, ShapedConn) {
+        let (a_out, b_inbox) = direction(bps, one_way, queue, drop_every, noise);
+        let (b_out, a_inbox) = direction(
+            bps,
+            one_way,
+            queue,
+            0,
+            noise.map(|n| n.reseeded(0x5bd1_e995_7f4a_7c15)),
+        );
         let (a, b): (SocketAddr, SocketAddr) = (
             "10.0.0.1:5000".parse().unwrap(),
             "10.0.0.2:5000".parse().unwrap(),
@@ -1143,16 +1308,54 @@ mod shaped_link {
         rwnd: u32,
         taken: Arc<AtomicU64>,
     ) -> (Association, Arc<Association>) {
+        pair_opened(a, b, rwnd, OpenPath::InitAck, taken).await
+    }
+
+    /// Which handshake establishes the agent's end. The agent's real
+    /// association is a client and so is the browser's: both send INIT, and
+    /// which answer the agent takes first is a race.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum OpenPath {
+        /// Path I: the agent's INIT is answered, and the peer's INIT ACK sets
+        /// its slow start threshold to the peer's window. The agent is the
+        /// client here.
+        InitAck,
+        /// Path C: the peer's COOKIE ECHO establishes the agent's end, whose
+        /// slow start threshold and peer window stay 0 until the first SACK.
+        /// The agent is the server here.
+        CookieEcho,
+    }
+
+    /// The agent's end and the viewer's, associated over `a` and `b` by
+    /// `path`; the viewer reads everything it is sent through a window of
+    /// `rwnd` bytes (0: the vendored default, 1 MiB), and `taken` counts what
+    /// it read.
+    pub(crate) async fn pair_opened(
+        a: Arc<dyn Conn + Send + Sync>,
+        b: Arc<dyn Conn + Send + Sync>,
+        rwnd: u32,
+        path: OpenPath,
+        taken: Arc<AtomicU64>,
+    ) -> (Association, Arc<Association>) {
         let config = |net_conn, rwnd, name: &str| Config {
             net_conn,
             max_receive_buffer_size: rwnd,
             max_message_size: 0,
             name: name.to_owned(),
         };
-        let agent = tokio::spawn(Association::client(config(a, 0, "agent")));
-        let viewer = Association::server(config(b, rwnd, "viewer")).await;
-        let viewer = Arc::new(viewer.unwrap());
-        let agent = agent.await.unwrap().unwrap();
+        let (agent, viewer) = match path {
+            OpenPath::InitAck => {
+                let agent = tokio::spawn(Association::client(config(a, 0, "agent")));
+                let viewer = Association::server(config(b, rwnd, "viewer")).await;
+                (agent.await.unwrap().unwrap(), viewer.unwrap())
+            }
+            OpenPath::CookieEcho => {
+                let viewer = tokio::spawn(Association::client(config(b, rwnd, "viewer")));
+                let agent = Association::server(config(a, 0, "agent")).await;
+                (agent.unwrap(), viewer.await.unwrap().unwrap())
+            }
+        };
+        let viewer = Arc::new(viewer);
         let reader = Arc::clone(&viewer);
         tokio::spawn(async move {
             while let Some(stream) = reader.accept_stream().await {

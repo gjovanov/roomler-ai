@@ -192,6 +192,12 @@ impl AssociationInternal {
             ack_state: AckState::default(),
             ack_mode: AckMode::default(),
         };
+        // roomler (FR-148 P0): what one DATA chunk carries, fixed for the
+        // association's life, so a writer can size its messages to one packet.
+        ret.pending_queue
+            .gauges()
+            .set_max_payload(ret.max_payload_size);
+        ret.store_gauges(); // roomler (FR-148 P0): the initial window
 
         log::trace!(
             "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
@@ -334,6 +340,23 @@ impl AssociationInternal {
     /// to read without this struct's lock.
     pub(crate) fn delivery_clock(&self) -> super::delivery::DeliveryClock {
         self.pending_queue.delivery_clock()
+    }
+
+    /// roomler (FR-148 P0): the gauges, which `Association` keeps to read
+    /// without this struct's lock.
+    pub(crate) fn gauge_reader(&self) -> super::gauges::GaugeReader {
+        self.pending_queue.gauge_reader()
+    }
+
+    /// roomler (FR-148 P0): the windows and the bytes in flight into the
+    /// gauges, where they changed: four relaxed stores, read by nothing here.
+    fn store_gauges(&self) {
+        self.pending_queue.gauges().store_windows(
+            self.cwnd,
+            self.ssthresh,
+            self.rwnd,
+            self.inflight_queue.get_num_bytes(),
+        );
     }
 
     /// unregister_stream un-registers a stream from the association
@@ -486,6 +509,7 @@ impl AssociationInternal {
 
                     fast_retrans_size += data_chunk_size;
                     self.stats.inc_fast_retrans();
+                    self.pending_queue.gauges().on_fast_retransmit(); // roomler (FR-148 P0)
                     c.nsent += 1;
                 } else {
                     break; // end of pending data
@@ -788,6 +812,7 @@ impl AssociationInternal {
         //     example, implementations MAY use the size of the receiver
         //     advertised window).
         self.ssthresh = self.rwnd;
+        self.store_gauges(); // roomler (FR-148 P0)
         log::trace!(
             "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
             self.name,
@@ -1121,6 +1146,9 @@ impl AssociationInternal {
         // streams' buffers and moves the congestion window, as it did.
         let mut delivered: u64 = 0;
         let loss_mark = self.pending_queue.delivery().loss_mark();
+        // roomler (FR-148 P0): the newest chunk this SACK newly acknowledges
+        // of those sent once (Karn), for the gauges' acknowledgement delay.
+        let mut newest_sent_once: Option<(u32, SystemTime)> = None;
 
         // New ack point, so pop all ACKed packets from inflight_queue
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -1159,6 +1187,12 @@ impl AssociationInternal {
                     // cumulative point cannot say which skipped chunks arrived.
                     if !(c.abandoned() && loss_mark.is_some_and(|m| sna32lt(c.tsn, m))) {
                         delivered += c.user_data.len() as u64;
+                    }
+
+                    // roomler (FR-148 P0): the cumulative point goes up in
+                    // TSN order, so the last one sent once is the newest.
+                    if c.nsent == 1 {
+                        newest_sent_once = Some((c.tsn, c.since));
                     }
 
                     // RFC 4960 sec 6.3.1.  RTO Calculation
@@ -1227,6 +1261,14 @@ impl AssociationInternal {
                         // roomler (FR-148): a gap block says the peer holds it.
                         delivered += u64::try_from(n_bytes_acked).unwrap_or(0);
 
+                        // roomler (FR-148 P0): gap blocks lie above the
+                        // cumulative point; the newest of them wins.
+                        if c.nsent == 1
+                            && newest_sent_once.is_none_or(|(newest, _)| sna32gt(tsn, newest))
+                        {
+                            newest_sent_once = Some((tsn, c.since));
+                        }
+
                         log::trace!("[{}] tsn={} has been sacked", self.name, c.tsn);
 
                         if c.nsent == 1 {
@@ -1268,6 +1310,14 @@ impl AssociationInternal {
             } else {
                 mark
             });
+
+        // roomler (FR-148 P0): the gauges' acknowledgement delay. A clock that
+        // went backwards stores nothing, and the SACK goes on as it would.
+        if let Some((_, since)) = newest_sent_once {
+            if let Ok(delay) = SystemTime::now().duration_since(since) {
+                self.pending_queue.gauges().on_ack_delay(delay);
+            }
+        }
 
         Ok((bytes_acked_per_stream, htna, delivered))
     }
@@ -1540,6 +1590,10 @@ impl AssociationInternal {
             }
             self.awake_write_loop();
         }
+
+        // roomler (FR-148 P0): the windows this SACK moved, and what it left
+        // in flight.
+        self.store_gauges();
 
         self.postprocess_sack(state, cum_tsn_ack_point_advanced)
             .await;
@@ -2014,6 +2068,10 @@ impl AssociationInternal {
             }
         }
 
+        // roomler (FR-148 P0): the window this send spent, and what it put in
+        // flight.
+        self.store_gauges();
+
         (chunks, sis_to_reset)
     }
 
@@ -2398,6 +2456,9 @@ impl RtxTimerObserver for AssociationInternal {
 
                 self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
+                // roomler (FR-148 P0): the expiry, and the windows it cut.
+                self.pending_queue.gauges().on_t3_expiry();
+                self.store_gauges();
                 log::trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.name,

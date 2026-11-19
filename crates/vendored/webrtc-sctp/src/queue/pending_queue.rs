@@ -12,6 +12,8 @@ use util::sync::RwLock;
 use std::sync::Arc;
 
 use crate::association::delivery::{DeliveryClock, DeliveryCounters};
+// roomler (FR-148 P0): the pending bytes, one of the association's gauges.
+use crate::association::gauges::{GaugeCounters, GaugeReader};
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 
 // TODO: benchmark performance between multiple Atomic+Mutex vs one Mutex<PendingQueueInternal>
@@ -72,6 +74,9 @@ pub(crate) struct PendingQueue {
     // roomler (FR-148): counts `n_bytes` leaving and reaching zero, and holds
     // the association's acknowledged bytes (`Association::delivery_clock`).
     delivery: Arc<DeliveryCounters>,
+    // roomler (FR-148 P0): `n_bytes` again, and the gauges the association
+    // stores under its lock (`Association::gauges`).
+    gauges: Arc<GaugeCounters>,
 }
 
 impl Default for PendingQueue {
@@ -100,6 +105,7 @@ impl PendingQueue {
             selected: Default::default(),
             unordered_is_selected: Default::default(),
             delivery: Default::default(), // roomler (FR-148)
+            gauges: Default::default(),   // roomler (FR-148 P0)
         }
     }
 
@@ -113,12 +119,24 @@ impl PendingQueue {
         DeliveryClock::new(Arc::clone(&self.delivery))
     }
 
+    /// roomler (FR-148 P0): the association's gauges, which this queue and
+    /// the association keep.
+    pub(crate) fn gauges(&self) -> &GaugeCounters {
+        &self.gauges
+    }
+
+    /// roomler (FR-148 P0): a reader's handle onto the gauges.
+    pub(crate) fn gauge_reader(&self) -> GaugeReader {
+        GaugeReader::new(Arc::clone(&self.gauges))
+    }
+
     /// roomler (FR-148): `n` bytes queued; the first bytes into an empty
     /// queue count as a fill.
     fn add_bytes(&self, n: usize) {
         if self.n_bytes.fetch_add(n, Ordering::SeqCst) == 0 && n > 0 {
             self.delivery.on_queue_filled();
         }
+        self.gauges.on_pending(n); // roomler (FR-148 P0)
     }
 
     /// roomler (#3755): a queue of `bytes`, for the tests that need one full
@@ -511,6 +529,7 @@ impl PendingQueue {
             {
                 self.delivery.on_queue_emptied();
             }
+            self.gauges.on_popped(user_data_len); // roomler (FR-148 P0)
             self.queue_len.fetch_sub(1, Ordering::SeqCst);
             // roomler (#3755): the overdraft is paid first, and only the rest
             // becomes room again. One load while nothing is owed.
