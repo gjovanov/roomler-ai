@@ -158,11 +158,23 @@ pub fn merged(mut own: Vec<ConsentRequest>, theirs: Vec<ConsentRequest>) -> Vec<
 /// | a refusal: any other answer | none, at once |
 /// | gone: no socket, or nothing listening on it | none, at once |
 /// | no answer: none within [`RELAY_WITHIN`], or any other failure | the kept list, for [`ROOT_LIST_KEPT_FOR`] from its answer at most, less each question whose deadline (`expires_at_ms`) has passed |
+/// | #4027 — the root half took an answer the person gave here ([`Relay::decided`]: `ConsentDecided { ok: true }`) | the kept list less that question, at once. An answer it did not take (`ok: false`, a refusal, none) leaves the list as it was. One given elsewhere (`roomlerd consent`) or a question withdrawn is not known here: the hold and the question's deadline bound it |
 ///
 /// The process's own questions are its broker's of the moment, never kept. A
 /// run of missed lists that the kept list covers is logged once, at WARN, and
 /// the end of its hold once, at INFO; so is a refusal or a proof of gone that
 /// takes kept questions off. The app's polls are never logged.
+///
+/// #4027 — one window is left. The root half lists a question until its
+/// prompt's next look takes the answer (`consent::POLL_INTERVAL`, 250 ms), so
+/// a list the root half answered before its prompt's look took the answer,
+/// read here after the verdict, brings the question back until the next
+/// answered list. The app polls every 750 ms on its own clock, so by the
+/// cadence about one answer in six meets that window, and the question
+/// lingers only when a miss follows: for the hold at most. A tombstone for it
+/// would have to be bounded in time: a remote-control session can be asked
+/// again under its own id (`PendingGuard::release` in `consent.rs`), and a
+/// tombstone kept by id alone would hide that new question.
 pub struct Relay {
     root: std::sync::Arc<dyn RootHalf>,
     kept: std::sync::Mutex<Kept>,
@@ -171,9 +183,10 @@ pub struct Relay {
 /// The root half's last good list, as a [`Relay`] keeps it.
 #[derive(Debug, Default)]
 struct Kept {
-    /// The root half's questions in its last answer, and when that came.
-    /// `None` before the first answer, and once a refusal, a proof that it is
-    /// gone, or the end of the hold took them off.
+    /// The root half's questions in its last answer, less each it took an
+    /// answer for since (#4027), and when that answer came. `None` before the
+    /// first answer, and once a refusal, a proof that it is gone, or the end
+    /// of the hold took them off.
     last: Option<(Vec<ConsentRequest>, tokio::time::Instant)>,
     /// Whether the run of missed lists since that answer has said so.
     said: bool,
@@ -205,9 +218,21 @@ impl Relay {
         merged(own, theirs)
     }
 
-    /// [`decided`], on this relay's road.
+    /// [`decided`], on this relay's road. #4027 — when the root half takes
+    /// the answer (`ConsentDecided { ok: true }`), its question comes off the
+    /// kept list at once (`Kept::answer_taken`), so a list the root half
+    /// misses after it no longer lists it. Any other outcome leaves the kept
+    /// list as it was. The app gets [`decided`]'s answer as it is.
     pub async fn decided(&self, session_id: &str, allow: bool) -> Response {
-        decided(self.root.as_ref(), session_id, allow).await
+        let answer = decided(self.root.as_ref(), session_id, allow).await;
+        if matches!(answer, Response::ConsentDecided { ok: true }) {
+            // After the ask, never across it: the app's lists take this lock.
+            self.kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .answer_taken(session_id);
+        }
+        answer
     }
 
     /// The root half's questions on the list after `reply`, at `now`;
@@ -305,6 +330,15 @@ impl Kept {
             self.said = true;
         }
         questions.clone()
+    }
+
+    /// #4027 — the root half took an answer to `session_id`: that question
+    /// comes off the kept list at once. The answer's time, the hold, and what
+    /// the run of misses has said stay as they were.
+    fn answer_taken(&mut self, session_id: &str) {
+        if let Some((questions, _)) = self.last.as_mut() {
+            questions.retain(|q| q.session_id != session_id);
+        }
     }
 }
 
@@ -1272,6 +1306,122 @@ mod tests {
             ["c3"],
             "the own question has ended, and a miss does not keep it"
         );
+    }
+
+    /// The root half's verdict on an answer this process sent it.
+    fn decides(verdict: Response) -> Option<RootReply> {
+        Some(RootReply::Answer(Box::new(verdict)))
+    }
+
+    /// #4027 — an answer the root half took (`ConsentDecided { ok: true }`)
+    /// takes its question off the kept list at once: the misses after it list
+    /// the root half's other question only, whether the answer came before
+    /// the run of misses or during it. The app gets the root half's verdict
+    /// as it is, and nothing else changes: the other question stays until the
+    /// hold's end, counted from the list's answer, and the run is said once
+    /// at WARN and its end once at INFO.
+    ///
+    /// Red before #4027: the answered question stayed on the kept list, and
+    /// on the app's, through every miss until the hold's end.
+    #[tokio::test(start_paused = true)]
+    async fn a_question_the_root_half_took_an_answer_for_leaves_the_kept_list_at_once() {
+        for misses_first in [0, 2] {
+            let when = format!("{misses_first} misses before the answer");
+            let logged = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+            let root = Scripted::new([lists(&[question("c3"), question("d4")])]);
+            let relay = Relay::new(root.clone());
+            let own = || vec![question("a1")];
+            assert_eq!(
+                ids(&relay.listed(own()).await),
+                ["a1", "c3", "d4"],
+                "{when}"
+            );
+            let answered = tokio::time::Instant::now();
+            for _ in 0..misses_first {
+                root.then([MISSES]);
+                assert_eq!(
+                    ids(&relay.listed(own()).await),
+                    ["a1", "c3", "d4"],
+                    "{when}"
+                );
+            }
+
+            root.then([decides(Response::ConsentDecided { ok: true })]);
+            assert_eq!(
+                relay.decided("c3", true).await,
+                Response::ConsentDecided { ok: true },
+                "{when}: the root half's verdict, as it is"
+            );
+            root.then([MISSES]);
+            assert_eq!(
+                ids(&relay.listed(own()).await),
+                ["a1", "d4"],
+                "{when}: the miss after the answer"
+            );
+
+            // The other question's hold is as it was: on every list that ends
+            // within the bound of the list's answer, and off after it.
+            let (mut kept, mut off) = (0, 0);
+            while answered.elapsed() < ROOT_LIST_KEPT_FOR + Duration::from_secs(2) {
+                root.then([MISSES]);
+                let list = relay.listed(own()).await;
+                let at = answered.elapsed();
+                if at < ROOT_LIST_KEPT_FOR {
+                    assert_eq!(ids(&list), ["a1", "d4"], "{when}: {at:?} after the list");
+                    kept += 1;
+                } else {
+                    assert_eq!(ids(&list), ["a1"], "{when}: {at:?} after the list");
+                    off += 1;
+                }
+            }
+            assert!(kept >= 5 && off >= 1, "{when}: kept {kept}, off {off}");
+            assert_eq!(times(&logged, MISS_COVERED), 1, "{when}: {}", logged.text());
+            assert_eq!(times(&logged, HOLD_ENDED), 1, "{when}: {}", logged.text());
+        }
+    }
+
+    /// #4027 — an answer the root half did not take leaves the kept list as it
+    /// was: its `ConsentDecided { ok: false }`, its refusal (an `Error`, as
+    /// after a seat change), and no answer within [`DECIDE_WITHIN`]. The
+    /// question may still stand, so both of the root half's questions stay
+    /// through the miss after it, and the app gets [`decided`]'s answer as
+    /// before.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_the_root_half_did_not_take_leaves_the_kept_list_as_it_was() {
+        let refusal = Response::Error {
+            message: "The answer was not taken: only the person signed in at this device's own \
+                      screen answers"
+                .into(),
+        };
+        let no_answer = Response::Error {
+            message: NO_ANSWER_FROM_THE_ROOT.into(),
+        };
+        for (what, verdict, gets) in [
+            (
+                "ok: false",
+                decides(Response::ConsentDecided { ok: false }),
+                Response::ConsentDecided { ok: false },
+            ),
+            ("a refusal", decides(refusal.clone()), refusal),
+            ("no answer", MISSES, no_answer),
+        ] {
+            let logged = crate::peer::files_log_tests::Logged::start(tracing::Level::INFO);
+            let root = Scripted::new([lists(&[question("c3"), question("d4")]), verdict, MISSES]);
+            let relay = Relay::new(root);
+            let own = || vec![question("a1")];
+            assert_eq!(
+                ids(&relay.listed(own()).await),
+                ["a1", "c3", "d4"],
+                "{what}"
+            );
+            assert_eq!(relay.decided("c3", true).await, gets, "{what}");
+            assert_eq!(
+                ids(&relay.listed(own()).await),
+                ["a1", "c3", "d4"],
+                "{what}: the miss after it"
+            );
+            assert_eq!(times(&logged, TAKEN_OFF), 0, "{what}: {}", logged.text());
+        }
     }
 
     /// The root daemon's verdict on the road. Off a one-row Mac's root there
