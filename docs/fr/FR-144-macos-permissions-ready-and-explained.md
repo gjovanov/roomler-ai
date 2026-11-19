@@ -143,7 +143,7 @@ what is missing.
   section heads the Overview: "Remote control of this Mac is not ready: <the row's name>." It is computed from the
   rows, so it goes away the moment the last one is Allowed.
 - **The restart is ours.** When See the screen turns on, Roomler restarts `roomlerd` itself through the LocalAPI
-  `RestartDaemon` verb the card already uses (`overview.js:695-714`), at once when no session is live, and
+  `RestartDaemon` verb the card already uses (`overview.js:708-727`), at once when no session is live, and
   otherwise after asking: "Restart roomlerd now? It ends the current remote session." What restarts is the
   process that holds the grant, the person's half: on a Mac with a root half, that half and its private network
   stay up (which process the verb restarts on a one-row Mac is to verify in P1). "Live" counts everything the

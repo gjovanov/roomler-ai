@@ -7164,7 +7164,7 @@ The sentinel goes where its reader looks:
 `attention_path_for_worker`, so a worker in SystemContext reaches the
 machine-global path, where the companion (running as the person) reads
 it. Its one reader is the companion's Overview
-([`agents/roomler-desktop/src/commands.rs:92`](../agents/roomler-desktop/src/commands.rs#L92)).
+([`agents/roomler-desktop/src/commands.rs:133`](../agents/roomler-desktop/src/commands.rs#L133)).
 
 ⚠️ **The way back by hand undoes itself unless updates are off first.**
 Uninstalling keeps the config and the enrollment, and installing the
