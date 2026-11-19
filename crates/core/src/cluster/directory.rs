@@ -303,6 +303,25 @@ pub fn derpnet_key(net_hex: &str) -> String {
     format!("roomler:own:derpnet:{net_hex}")
 }
 
+impl OwnershipDirectory {
+    /// #3840 — the LWW claim of a registration whose first claim had no
+    /// answer, made later. `claim_lww` writes the newest registration's token
+    /// because it arrives last; a retry arrives late, so it compares instead:
+    /// it writes `token` where the key is absent, already holds `token`, or
+    /// holds a token minted BEFORE it (the `since_ms` every token ends with,
+    /// the order convergence reads), and leaves a token minted at the same
+    /// millisecond or later alone (`Ok(false)`): a registration made after
+    /// this one, wherever it is, keeps the record.
+    pub async fn claim_if_newer(
+        &self,
+        key: &str,
+        token: &str,
+        ttl_secs: u64,
+    ) -> Result<bool, redis::RedisError> {
+        self.refresh_if_mine(key, token, ttl_secs).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

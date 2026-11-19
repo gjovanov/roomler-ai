@@ -587,3 +587,252 @@ async fn a_slot_keep_redis_did_not_answer_lands_once_redis_answers_again() {
     );
     let _ = slots.release(org, session).await;
 }
+
+/// #3840 — the claim a registration makes late, after its first claim had no
+/// answer (`claim_if_newer`), writes its record where no registration minted
+/// after it holds the key: absent, its own, older from this pod or another,
+/// or a value that names no registration. It leaves a token minted in the
+/// same millisecond or later alone, from either pod, and answers `false`.
+#[tokio::test]
+async fn a_late_claim_takes_a_record_only_from_an_older_registration() {
+    use roomler_core::cluster::directory::OwnershipDirectory;
+
+    let direct = RedisPubSub::new(&test_redis_url(), unique("w14-direct/"))
+        .await
+        .expect("a direct connection");
+    let here = OwnershipDirectory::new(direct.connection(), "w14-here/e1".to_string());
+    let mut conn = direct.connection();
+    let now = bson::DateTime::now().timestamp_millis();
+    let at = |origin: &str, ms: i64| format!("{origin}/agent/{ms}");
+    let ours = at("w14-here/e1", now);
+    let cases = [
+        ("absent", None, true),
+        ("its own", Some(ours.clone()), true),
+        ("older, this pod", Some(at("w14-here/e1", now - 1)), true),
+        (
+            "older, another pod",
+            Some(at("w14-there/e2", now - 60_000)),
+            true,
+        ),
+        ("no token", Some("garbage".to_string()), true),
+        (
+            "same millisecond, another pod",
+            Some(at("w14-there/e2", now)),
+            false,
+        ),
+        (
+            "newer, another pod",
+            Some(at("w14-there/e2", now + 1)),
+            false,
+        ),
+        (
+            "newer, this pod",
+            Some(at("w14-here/e1", now + 60_000)),
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, held, writes) in cases {
+        let key = unique("roomler:test:w14:late:");
+        if let Some(held) = &held {
+            let _: () = redis::cmd("SET")
+                .arg(&key)
+                .arg(held)
+                .arg("EX")
+                .arg(90)
+                .query_async(&mut conn)
+                .await
+                .expect("SET");
+        }
+        let answered = here
+            .claim_if_newer(&key, &ours, 90)
+            .await
+            .expect("a Redis that answers answers");
+        let holds = here.get(&key).await.expect("GET");
+        let want = if writes { Some(ours.clone()) } else { held };
+        eprintln!("W14-RESULT late claim, {case}: answered {answered}, holds {holds:?}");
+        if answered != writes || holds != want {
+            wrong.push(format!(
+                "{case}: answered {answered}, holds {holds:?}, wanted {want:?}"
+            ));
+        }
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .expect("DEL");
+    }
+    assert!(
+        wrong.is_empty(),
+        "W14-RED a late claim took or left the wrong records: {wrong:#?}"
+    );
+}
+
+/// A node's DERP record, and whether its network's index names it, read
+/// straight from Redis.
+async fn derp_entry(
+    conn: &mut roomler_core::ws::redis_conn::RedisConnection,
+    (network, pk): (bson::oid::ObjectId, [u8; 32]),
+) -> (Option<String>, bool) {
+    use roomler_ai_mod_network::derp_cluster::pk_hex;
+    use roomler_core::cluster::directory::{derp_key, derpnet_key};
+
+    let member = pk_hex(&pk);
+    let record: Option<String> = redis::cmd("GET")
+        .arg(derp_key(&network.to_hex(), &member))
+        .query_async(&mut *conn)
+        .await
+        .expect("GET");
+    let indexed: bool = redis::cmd("SISMEMBER")
+        .arg(derpnet_key(&network.to_hex()))
+        .arg(&member)
+        .query_async(&mut *conn)
+        .await
+        .expect("SISMEMBER");
+    (record, indexed)
+}
+
+/// #3840 — a DERP registration whose claim Redis did not answer keeps its
+/// token, and once Redis answers again its record and its member of the
+/// network's index are written, so convergence sees the node without waiting
+/// for it to reconnect.
+///
+/// Four registrations on the pod behind the forwarder while Redis is silent:
+/// a first one; one that displaced this pod's earlier registration of the
+/// same node; one made after the other pod's older registration of the same
+/// node; and one made BEFORE the other pod registers the same node. The first
+/// three end with the record and the member; the last leaves the record to
+/// the other pod's newer registration. Then the other pod's older
+/// registration ends, and its teardown leaves the record and the member of
+/// the registration that replaced it.
+#[tokio::test]
+async fn a_derp_registration_redis_did_not_answer_is_written_once_redis_answers_again() {
+    use bson::oid::ObjectId;
+    use roomler_ai_mod_network::NetworkState;
+    use roomler_ai_mod_network::derp_cluster::{on_derp_register, on_derp_teardown};
+
+    let fwd = RedisBlackout::start(&test_redis_url()).await;
+    let via = fwd.url_for(&test_redis_url());
+    // This pod reaches Redis through the forwarder, the other pod directly.
+    let (other_app, app) = TestApp::spawn_pair(move |s| {
+        if s.app
+            .pod_id
+            .as_deref()
+            .is_some_and(|p| p.starts_with("testpod2-"))
+        {
+            s.redis.url = via.clone();
+        }
+    })
+    .await;
+    let (here, there) = (app.state.network(), other_app.state.network());
+    let agent = ObjectId::new();
+    // One network per case, so no case's sweep reads another case's members.
+    let node = |n: u8| {
+        let mut pk = [n; 32];
+        pk[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        (ObjectId::new(), pk)
+    };
+    let (first, again, after_older, before_newer) = (node(1), node(2), node(3), node(4));
+    // A socket for each registration, as derp.rs inserts one before the hook
+    // (the heartbeat drops a token whose socket is gone).
+    let mut sockets = Vec::new();
+    for (pod, key) in [
+        (here, first),
+        (here, again),
+        (here, after_older),
+        (here, before_newer),
+        (there, after_older),
+        (there, before_newer),
+    ] {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        pod.derp_registry.insert(key, tx);
+        sockets.push(rx);
+    }
+    let token = |pod: &NetworkState, key: (ObjectId, [u8; 32])| {
+        pod.derp_presence_tokens
+            .get(&key)
+            .map(|t| t.value().clone())
+    };
+
+    // Before the silence: this pod's earlier registration of `again`, and the
+    // other pod's older registration of `after_older`.
+    on_derp_register(here, again.0, &again.1, agent).await;
+    on_derp_register(there, after_older.0, &after_older.1, agent).await;
+    let displaced = token(here, again).expect("a registration Redis answered keeps its token");
+    // A token carries the millisecond it was minted in.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    fwd.swallow();
+    let started = Instant::now();
+    let registering = futures::future::join_all(
+        [first, again, after_older, before_newer]
+            .map(move |(n, pk)| async move { on_derp_register(here, n, &pk, agent).await }),
+    );
+    let registered = tokio::time::timeout(OUTER, registering).await;
+    let took = started.elapsed();
+    eprintln!("W14-RESULT four DERP registrations while Redis was silent returned after {took:?}");
+    assert!(
+        registered.is_ok() && took < BOUND + SLACK,
+        "W14-RED a registration waited {took:?} on a silent Redis: its path waits one bound at most"
+    );
+    // The other pod registers `before_newer` after this pod did.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    on_derp_register(there, before_newer.0, &before_newer.1, agent).await;
+    let newer = token(there, before_newer).expect("the other pod's registration keeps its token");
+    fwd.pass();
+
+    let direct = RedisPubSub::new(&test_redis_url(), unique("w14-direct/"))
+        .await
+        .expect("a direct connection");
+    let mut conn = direct.connection();
+    let mine = [
+        ("first", first),
+        ("again", again),
+        ("after an older one", after_older),
+    ];
+    let deadline = Instant::now() + RECOVERY + RECOVERY;
+    loop {
+        let mut written = true;
+        for (_, key) in mine {
+            let held = token(here, key);
+            let (record, indexed) = derp_entry(&mut conn, key).await;
+            written &= held.is_some() && record == held && indexed;
+        }
+        if written || Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let settled = started.elapsed();
+    // The other pod's older registration of the node ends now.
+    on_derp_teardown(there, after_older.0, &after_older.1).await;
+
+    let mut report = Vec::new();
+    let mut wrong = Vec::new();
+    for (case, key) in mine {
+        let held = token(here, key);
+        let (record, indexed) = derp_entry(&mut conn, key).await;
+        report.push(format!(
+            "{case}: token {held:?}, record {record:?}, indexed {indexed}"
+        ));
+        if held.is_none() || record != held || !indexed {
+            wrong.push(case);
+        }
+    }
+    if token(here, again).as_ref() == Some(&displaced) {
+        wrong.push("again: this pod still holds the token it displaced");
+    }
+    let (record, _) = derp_entry(&mut conn, before_newer).await;
+    report.push(format!(
+        "before a newer one: record {record:?}, the other pod's token {newer:?}"
+    ));
+    if record.as_ref() != Some(&newer) {
+        wrong.push("before a newer one: the newer registration lost its record");
+    }
+    eprintln!("W14-RESULT DERP registrations, settled after {settled:?}: {report:#?}");
+    assert!(
+        wrong.is_empty(),
+        "W14-RED once Redis answered again: {wrong:?} in {report:#?}"
+    );
+    drop(sockets);
+}

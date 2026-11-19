@@ -123,18 +123,18 @@ pub async fn on_derp_teardown(state: &NetworkState, network_id: ObjectId, pk: &D
 /// One convergence sweep over a network's live registrations. Target =
 /// the pod of the newest record; every other pod gets a rehome for its
 /// members (locally short-circuited for ourselves).
-pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
+pub async fn converge_network(state: &NetworkState, network_id: ObjectId) -> Sweep {
     let Some(dir) = state.cluster_directory.clone() else {
-        return;
+        return Sweep::Done;
     };
     let net_hex = network_id.to_hex();
     let members = match dir.set_members(&derpnet_key(&net_hex)).await {
         Ok(m) if m.len() > 1 => m,
-        _ => return,
+        _ => return Sweep::Done,
     };
     let keys: Vec<String> = members.iter().map(|m| derp_key(&net_hex, m)).collect();
     let Ok(records) = dir.get_many(&keys).await else {
-        return;
+        return Sweep::Done;
     };
 
     let mut by_pod: std::collections::HashMap<String, Vec<String>> =
@@ -156,10 +156,10 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
         }
     }
     if by_pod.len() < 2 {
-        return;
+        return Sweep::Done;
     }
     let Some((_, target_pod)) = newest else {
-        return;
+        return Sweep::Done;
     };
     info!(
         %network_id,
@@ -167,6 +167,7 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
         pods = by_pod.len(),
         "derp network split across pods — rehoming toward newest registration"
     );
+    let mut sweep = Sweep::Done;
     for (pod, pks) in by_pod {
         if pod == target_pod {
             continue;
@@ -182,9 +183,13 @@ pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
                 // Presumed-dead pod: its records TTL out within 90 s and
                 // the next registration converges cleanly.
                 debug!(%network_id, %pod, %e, "derp.rehome RPC failed");
+                if sweep_again_after(&e) {
+                    sweep = Sweep::Again;
+                }
             }
         }
     }
+    sweep
 }
 
 /// Close local DERP sockets for the given pubkeys (cooldown-paced).
@@ -289,9 +294,52 @@ pub fn remove_cancel_if_ours(
         .remove_if(key, |_, c| std::sync::Arc::ptr_eq(c, ours));
 }
 
+/// #3840 — what one convergence sweep came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// Converged, nothing to converge, or every other pod was asked to close
+    /// its sockets (a pod that did not answer within the bus deadline is
+    /// presumed dead: its records end by TTL within 90 s).
+    Done,
+    /// A Redis error stopped it before every pod was asked: run it again.
+    Again,
+}
+
+/// Whether a `derp.rehome` request that failed leaves the sweep to be run
+/// again. A deadline (the pod is presumed dead) or a NACK (it answered) does
+/// not.
+fn sweep_again_after(_e: &roomler_core::cluster::bus::BusError) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3840 — a rehome request the bus could not publish (a Redis error)
+    /// says nothing of the pod it was for, so the sweep runs again. A
+    /// deadline or a NACK ends it, as before.
+    #[test]
+    fn only_a_redis_error_on_a_rehome_runs_the_sweep_again() {
+        use roomler_core::cluster::bus::BusError;
+        let redis = BusError::Redis(redis::RedisError::from(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )));
+        let deadline = BusError::Deadline(Duration::from_secs(2));
+        let nack = BusError::Nack("unknown class".into());
+        let got = [
+            sweep_again_after(&redis),
+            sweep_again_after(&deadline),
+            sweep_again_after(&nack),
+        ];
+        eprintln!("W14-RESULT sweep again after [redis, deadline, nack]: {got:?}");
+        assert_eq!(
+            got,
+            [true, false, false],
+            "W14-RED a rehome Redis did not publish must leave the sweep to run again, \
+             and only that one"
+        );
+    }
 
     #[test]
     fn pk_hex_roundtrip() {
