@@ -1198,6 +1198,21 @@ pub fn program_refusal(lstat: std::io::Result<(u32, u32)>) -> Option<String> {
     ))
 }
 
+/// FR-147 D7 — an account's UUID as text, from the 16 bytes
+/// `mbr_uid_to_uuid` writes: uppercase, 8-4-4-4-12, as `dsmemberutil
+/// getuuid` prints it.
+pub fn uuid_text(uu: &[u8; 16]) -> String {
+    let hex: String = uu.iter().map(|b| format!("{b:02X}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 /// The bytes and mode of a file a person's child read, when it read one.
 pub fn present(held: &crate::one_row_home::Held) -> Option<(&[u8], u32)> {
     match held {
@@ -1315,7 +1330,7 @@ async fn ask<H: Host>(
     let out = match host.person(account, verb, stdin).await {
         Ok(out) => out,
         Err(e) => {
-            let why = format!("it could not be started: {e:#}");
+            let why = format!("it could not be run: {e:#}");
             host.say(&format!(
                 "{}'s one-row-home {}: {why}",
                 account.name,
@@ -2653,13 +2668,11 @@ pub fn scan_users(root: &Path) -> Vec<UsersEntry> {
 mod mac {
     use super::*;
     use std::io::Write as _;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use tunnel_core::localapi::{Request, Response};
 
     const DAEMON: &str = "system/com.roomler.daemon";
     const AGENT_LABEL: &str = "com.roomler.agent";
-    const LOG_DIR: &str = "/var/log/roomler";
-    const LOG: &str = "/var/log/roomler/one-row.log";
 
     pub(super) async fn run(dry_run: bool, revert_asked: bool, yes: bool) -> Result<()> {
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -2667,83 +2680,17 @@ mod mac {
             bail!("one row changes the root half: run it as `sudo roomlerd one-row`");
         }
         let mut host = MacHost::new();
-        let root_path = PathBuf::from(ROOT_CONFIG);
-        let people = people()?;
         if revert_asked {
-            return run_revert(&mut host, &root_path, &people, dry_run, yes).await;
+            return revert_main(&mut host, dry_run, |r| {
+                go_ahead(yes, revert_digest(r), &["one-row", "--revert", "--yes"])
+            })
+            .await;
         }
-        if !root_path.exists() {
-            bail!("{ROOT_CONFIG} is not here: this Mac has no root half to make one row of");
-        }
-        let root =
-            crate::config::load(&root_path).with_context(|| format!("reading {ROOT_CONFIG}"))?;
-        let status = host
-            .status()
-            .await
-            .context("the root daemon does not answer on its LocalAPI socket")?;
-        if !status.connected {
-            bail!("the root half is not connected to its server: one row needs it connected");
-        }
-        let console_uid = console_uid().context(
-            "nobody is logged in at the console, and the verify needs a person's session: log in \
-             and run it again",
-        )?;
-        let read = Read {
-            root_path,
-            root,
-            people,
-            status,
-            console_uid,
-        };
+        let read = read_mac(&mut host).await?;
         migrate(&mut host, &read, dry_run, |plan| {
             go_ahead(yes, plan_digest(plan), &["one-row", "--yes"])
         })
         .await
-    }
-
-    async fn run_revert(
-        host: &mut MacHost,
-        root_path: &Path,
-        people: &[Person],
-        dry_run: bool,
-        yes: bool,
-    ) -> Result<()> {
-        let Some(r) = revert_plan(&*host, root_path, people) else {
-            bail!(
-                "nothing to revert: {} is not here",
-                kept_path(root_path).display()
-            );
-        };
-        let kept_root = crate::config::load(&r.configs[0].0)
-            .with_context(|| format!("reading {}", r.configs[0].0.display()))?;
-        let bootstrap_for = bootstrap_after_revert(&kept_root, console_uid());
-        host.say("one row --revert: the plan. Nothing has changed yet.");
-        for (kept, live) in &r.configs {
-            host.say(&format!(
-                "{} goes back over {}",
-                kept.display(),
-                live.display()
-            ));
-        }
-        for (uid, aside, plist) in &r.plists {
-            host.say(&format!(
-                "{} goes back to {}{}",
-                aside.display(),
-                plist.display(),
-                if bootstrap_for == Some(*uid) {
-                    ", and is bootstrapped"
-                } else {
-                    ""
-                }
-            ));
-        }
-        host.say("⚠️ the daemon restarts: every live remote-desktop, SSH and tunnel session ends");
-        if dry_run {
-            host.say("--dry-run: nothing has changed");
-            return Ok(());
-        }
-        go_ahead(yes, revert_digest(&r), &["one-row", "--revert", "--yes"])?;
-        revert(host, &r, bootstrap_for).await
     }
 
     /// Set in the detached copy that applies what a person said yes to: the
@@ -2831,57 +2778,6 @@ mod mac {
         }
     }
 
-    /// Every account under `/Users` with a roomler folder or a LaunchAgent
-    /// plist, one person per folder ([`distinct_homes`]). A file that does not
-    /// parse stops Read: the plan would be a guess.
-    fn people() -> Result<Vec<Person>> {
-        let mut out = Vec::new();
-        for found in distinct_homes(scan_homes(Path::new("/Users"))) {
-            let Home {
-                user,
-                path: home,
-                uid,
-                ..
-            } = found;
-            if uid == 0 {
-                continue;
-            }
-            let dir = crate::appdirs::macos_config_dir_in_home(&home, Path::exists);
-            let config_path = dir.join("config.toml");
-            let config = if config_path.exists() {
-                Some(
-                    crate::config::load(&config_path)
-                        .with_context(|| format!("reading {}", config_path.display()))?,
-                )
-            } else {
-                None
-            };
-            let person = Person {
-                user,
-                uid,
-                home,
-                dir,
-                config,
-                has_plist: false,
-            };
-            let has_plist = person.plist().exists();
-            if person.config.is_some() || has_plist {
-                out.push(Person {
-                    has_plist,
-                    ..person
-                });
-            }
-        }
-        out.sort_by(|a, b| a.user.cmp(&b.user));
-        Ok(out)
-    }
-
-    /// The console user's uid; `None` at the login window.
-    fn console_uid() -> Option<u32> {
-        let uid = std::fs::metadata("/dev/console").ok()?.uid();
-        (uid != 0).then_some(uid)
-    }
-
     fn launchctl(args: &[&str]) -> std::result::Result<(), String> {
         let out = std::process::Command::new("/bin/launchctl")
             .args(args)
@@ -2895,10 +2791,164 @@ mod mac {
         }
     }
 
-    fn owner(path: &Path) -> Result<(u32, u32)> {
+    unsafe extern "C" {
+        /// `<membership.h>`: the UUID of the account `uid`; 0 on success.
+        fn mbr_uid_to_uuid(uid: libc::uid_t, uu: *mut u8) -> libc::c_int;
+    }
+
+    /// The account's UUID ([`uuid_text`]); `None` when the system has none.
+    fn account_uuid(uid: u32) -> Option<String> {
+        let mut uu = [0u8; 16];
+        // SAFETY: `uu` holds the 16 bytes of a `uuid_t`, all the call writes.
+        if unsafe { mbr_uid_to_uuid(uid, uu.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        Some(uuid_text(&uu))
+    }
+
+    /// `dir`, one of root's records' folders, as a folder of root's, mode
+    /// 700: made so, or found so and set so. Never a link.
+    fn private_dir(dir: &Path) -> Result<()> {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("creating {}", dir.display())));
+            }
+        }
         let meta =
-            std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
-        Ok((meta.uid(), meta.gid()))
+            std::fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+        if !meta.is_dir() || meta.uid() != 0 {
+            bail!("{} is not a folder of root's", dir.display());
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting {} to 700", dir.display()))
+    }
+
+    fn sync_dir(dir: &Path) -> Result<()> {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))
+    }
+
+    /// What [`RECORDS`] holds: its uid folders, and every other name but
+    /// `root.json`. A folder that is not there holds nothing.
+    fn records_listing() -> Result<(Vec<u32>, Vec<String>)> {
+        let entries = match std::fs::read_dir(RECORDS) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {RECORDS}"))),
+        };
+        let (mut uids, mut strays) = (Vec::new(), Vec::new());
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {RECORDS}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Not followed: a link named like a uid is a stray.
+            let folder = entry.file_type().is_ok_and(|t| t.is_dir());
+            match name.parse::<u32>() {
+                Ok(uid) if folder && uid.to_string() == name => uids.push(uid),
+                _ if name == "root.json" => {}
+                _ => strays.push(name),
+            }
+        }
+        uids.sort_unstable();
+        strays.sort();
+        Ok((uids, strays))
+    }
+
+    /// FR-147 D1 — `roomlerd one-row-home <verb>` as `account`, by
+    /// [`spawn_plan`]: the package's binary, started only when
+    /// [`program_refusal`] finds nothing; the child's arguments, no
+    /// environment, `/` as its folder, its stdio and nothing else of root's.
+    /// Root's own hook, between the fork and the exec, makes it that account:
+    /// a session of its own, the primary group alone, the uid, umask 077,
+    /// each call checked. Never `Command::uid` or `gid`, whose group handling
+    /// is not this hook's. Fed and read within [`CHILD_DEADLINE`] and
+    /// [`CHILD_CAP`] on a blocking thread, never on a runtime worker.
+    async fn spawn_person(account: &Account, verb: Verb, stdin: &[u8]) -> Result<ChildOutput> {
+        use std::os::unix::process::CommandExt as _;
+        let plan = spawn_plan(account, verb);
+        let lstat = std::fs::symlink_metadata(plan.program).map(|m| (m.uid(), m.mode()));
+        if let Some(why) = program_refusal(lstat) {
+            bail!("{why}");
+        }
+        if stdin.len() > crate::one_row_home::STDIN_BOUND {
+            bail!(
+                "its input is {} bytes, over the {} it takes",
+                stdin.len(),
+                crate::one_row_home::STDIN_BOUND
+            );
+        }
+        let mut cmd = std::process::Command::new(plan.program);
+        cmd.args(&plan.args).env_clear().current_dir(plan.dir);
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
+        let (uid, gid): (libc::uid_t, libc::gid_t) = (plan.uid, plan.gid);
+        // SAFETY: the hook runs in the child between the fork and the exec.
+        // It allocates nothing (its values are copied integers and a stack
+        // array) and calls only async-signal-safe functions, each checked.
+        unsafe {
+            cmd.pre_exec(move || {
+                let fail = || Err(std::io::Error::last_os_error());
+                if libc::setsid() == -1 {
+                    return fail();
+                }
+                let groups = [gid];
+                if libc::setgroups(1, groups.as_ptr()) != 0 {
+                    return fail();
+                }
+                if libc::setgid(gid) != 0 {
+                    return fail();
+                }
+                if libc::setuid(uid) != 0 {
+                    return fail();
+                }
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        let input = stdin.to_vec();
+        let started = std::time::Instant::now();
+        let (pid, result) = tokio::task::spawn_blocking(move || {
+            tunnel_core::child::output_bounded_fed_pid(&mut cmd, &input, CHILD_DEADLINE, CHILD_CAP)
+        })
+        .await
+        .context("the thread that ran it")?;
+        let ran = started.elapsed();
+        let Some(pid) = pid else {
+            let e = result.err().map_or_else(
+                || anyhow::anyhow!("no process was started"),
+                anyhow::Error::from,
+            );
+            return Err(e.context(format!("starting {PERSON_PROGRAM}")));
+        };
+        let output = |code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>| ChildOutput {
+            pid,
+            code,
+            stdout,
+            stderr,
+            ran,
+        };
+        match result {
+            Ok(out) => Ok(output(out.status.code(), out.stdout, out.stderr)),
+            // Stopped at the deadline: no exit of its own.
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                Ok(output(None, Vec::new(), Vec::new()))
+            }
+            Err(e) => {
+                // It ended before it took its input: its exit and stderr say
+                // how, and no reply is read from it.
+                let not_taken = e
+                    .get_ref()
+                    .and_then(|r| r.downcast_ref::<tunnel_core::child::InputNotTaken>())
+                    .map(|n| (n.status.code(), n.stderr.clone()));
+                match not_taken {
+                    Some((code, stderr)) => Ok(output(code, Vec::new(), stderr)),
+                    None => Err(anyhow::Error::from(e).context(format!("pid {pid}"))),
+                }
+            }
+        }
     }
 
     struct MacHost {
@@ -2908,12 +2958,15 @@ mod mac {
 
     impl MacHost {
         fn new() -> Self {
-            let _ = std::fs::create_dir_all(LOG_DIR);
+            let log_path = root_path(RootFile::Log);
+            if let Some(dir) = log_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
             let log = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .mode(0o600)
-                .open(LOG)
+                .open(&log_path)
                 .ok();
             Self {
                 log,
@@ -2934,52 +2987,145 @@ mod mac {
             }
         }
 
-        fn exists(&self, path: &Path) -> bool {
-            path.exists()
+        fn read_root(&self, file: RootFile) -> Result<Option<Vec<u8>>> {
+            let path = root_path(file);
+            match std::fs::read(&path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => {
+                    Err(anyhow::Error::from(e).context(format!("reading {}", path.display())))
+                }
+            }
         }
 
-        fn keep(&mut self, live: &Path, kept: &Path) -> Result<()> {
-            let bytes = std::fs::read(live)?;
-            let (uid, gid) = owner(live)?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(kept)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::os::unix::fs::chown(kept, Some(uid), Some(gid))?;
-            Ok(())
+        fn write_root(&mut self, file: RootFile, bytes: &[u8]) -> Result<()> {
+            let path = root_path(file);
+            match file {
+                RootFile::RootRecord => private_dir(Path::new(RECORDS))?,
+                RootFile::Person { uid, .. } => {
+                    private_dir(Path::new(RECORDS))?;
+                    private_dir(&person_records(uid))?;
+                }
+                _ => {}
+            }
+            let dir = path.parent().context("a root file has a folder")?;
+            let name = path.file_name().context("a root file has a name")?;
+            let temp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+            let write = || -> std::io::Result<()> {
+                // One a power loss left before: root's own, never a record.
+                match std::fs::remove_file(&temp) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temp)?;
+                f.write_all(bytes)?;
+                f.sync_all()?;
+                if file == RootFile::Config {
+                    return std::fs::rename(&temp, &path);
+                }
+                // Never over a name that is there: a link to it fails.
+                let linked = std::fs::hard_link(&temp, &path);
+                std::fs::remove_file(&temp)?;
+                linked
+            };
+            write().with_context(|| format!("writing {}", path.display()))?;
+            sync_dir(dir)
         }
 
-        fn write_config(&mut self, path: &Path, cfg: &AgentConfig) -> Result<()> {
-            // `save` writes a new file and renames it into place, so as root it
-            // would leave a person's file owned by root, and their worker could
-            // no longer read it. The owner goes back, `.prev` included.
-            let (uid, gid) = owner(path)?;
-            crate::config::save(&path.to_path_buf(), cfg)?;
-            std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
-            let prev = path.with_extension("toml.prev");
-            if prev.exists() {
-                std::os::unix::fs::chown(&prev, Some(uid), Some(gid))?;
+        fn remove_root(&mut self, file: RootFile) -> Result<()> {
+            let path = root_path(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("removing {}", path.display()))
+                    );
+                }
+            }
+            if file == RootFile::RootRecord {
+                // The records' folder goes with its last record.
+                let _ = std::fs::remove_dir(RECORDS);
             }
             Ok(())
         }
 
-        fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
-            // A person with a LaunchAgent plist and no roomler folder yet: the
-            // plist goes into one made as theirs, which their first worker
-            // then uses as its own.
-            if let Some(dir) = to.parent()
-                && !dir.exists()
-            {
-                let (uid, gid) = owner(from)?;
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-                std::os::unix::fs::chown(dir, Some(uid), Some(gid))?;
+        fn record_uids(&self) -> Result<Vec<u32>> {
+            Ok(records_listing()?.0)
+        }
+
+        fn remove_records_of(&mut self, uid: u32) -> Result<()> {
+            let dir = person_records(uid);
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => {
+                    Err(anyhow::Error::from(e).context(format!("removing {}", dir.display())))
+                }
             }
-            std::fs::rename(from, to)?;
-            Ok(())
+        }
+
+        fn record_strays(&self) -> Result<Vec<String>> {
+            Ok(records_listing()?.1)
+        }
+
+        fn remove_record_stray(&mut self, name: &str) -> Result<()> {
+            if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+                bail!("{name:?} is not a name in {RECORDS}");
+            }
+            let path = Path::new(RECORDS).join(name);
+            let removed = match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            };
+            removed.with_context(|| format!("removing {}", path.display()))
+        }
+
+        fn load_root(&self) -> Result<AgentConfig> {
+            crate::config::load(&root_path(RootFile::Config))
+        }
+
+        fn save_root(&mut self, cfg: &AgentConfig) -> Result<()> {
+            crate::config::save(&root_path(RootFile::Config), cfg)
+        }
+
+        fn users(&self) -> Vec<UsersEntry> {
+            scan_users(Path::new("/Users"))
+        }
+
+        fn account(&self, uid: u32) -> Option<Account> {
+            let entry = crate::appdirs::account_entry(uid)?;
+            Some(Account {
+                uid: entry.uid,
+                gid: entry.gid,
+                name: entry.name.into_string().ok()?,
+                home: entry.home.into_os_string().into_string().ok()?,
+                uuid: account_uuid(entry.uid)?,
+            })
+        }
+
+        fn console_uid(&self) -> Option<u32> {
+            let uid = std::fs::metadata("/dev/console").ok()?.uid();
+            (uid != 0).then_some(uid)
+        }
+
+        async fn is_administrator(&mut self, name: &str) -> bool {
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || {
+                let mut cmd = std::process::Command::new("/usr/sbin/dseditgroup");
+                cmd.args(["-o", "checkmember", "-m", name.as_str(), "admin"]);
+                tunnel_core::child::output_bounded(&mut cmd, Duration::from_secs(10))
+                    .is_ok_and(|out| out.status.success())
+            })
+            .await
+            .unwrap_or(false)
         }
 
         fn agent_loaded(&mut self, uid: u32) -> bool {
@@ -3000,18 +3146,26 @@ mod mac {
             bail!("{target} is still loaded 15 s after `launchctl bootout`")
         }
 
-        fn bootstrap_agent(&mut self, uid: u32, plist: &Path) -> Result<()> {
-            let domain = format!("gui/{uid}");
-            let plist_arg = plist.to_string_lossy();
+        fn bootstrap(&mut self, argv: &[String]) -> Result<()> {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
             let mut last = String::new();
             for _ in 0..5 {
-                match launchctl(&["bootstrap", &domain, &plist_arg]) {
+                match launchctl(&args) {
                     Ok(()) => return Ok(()),
                     Err(e) => last = e,
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
-            bail!("launchctl bootstrap {domain} {plist_arg}: {last}")
+            bail!("launchctl {}: {last}", argv.join(" "))
+        }
+
+        async fn person(
+            &mut self,
+            account: &Account,
+            verb: Verb,
+            stdin: &[u8],
+        ) -> Result<ChildOutput> {
+            spawn_person(account, verb, stdin).await
         }
 
         async fn status(&mut self) -> Result<NodeStatus> {
@@ -4986,6 +5140,17 @@ mod tests {
                 "/Users/a/Library/LaunchAgents/com.roomler.agent.plist"
             ]
         );
+    }
+
+    /// D7's UUID reads as `dsmemberutil getuuid` prints it.
+    #[test]
+    fn an_account_uuid_reads_as_the_system_prints_it() {
+        let uu = [
+            0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7,
+            0xe8, 0xf9,
+        ];
+        assert_eq!(uuid_text(&uu), "0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9");
+        assert_eq!(uuid_text(&[0; 16]), "00000000-0000-0000-0000-000000000000");
     }
 
     #[test]
