@@ -1448,6 +1448,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-148 P1 - the path model's switch for a remote-desktop session on a relay: `shadow` (empty; the default: the path memory is kept and logged beside the opening, and the session opens as before), `on` (a relayed session whose pair has a fresh entry in the path memory opens from it: 0.85 x its floor, at most the relay cap, under the nominal opening only after a trusted push-back, and on the slow-link profile only after a trusted push-back at or under 1 Mbit/s) or `off` (no delivery samples, no path memory, no lines: the release before). ⚠️ Do not set `on` on a device yet: it is for tests until FR-148's open decision O7 is ruled. Under `on` a quiet screen whose viewer's two reports disagree can teach the memory a false slow path, and the pair's next sessions then open low, on the slow-link profile, for up to a day. `shadow` and a restart take a device back. A device set to `shadow` stays at shadow when the default changes; empty takes the default. Env: ROOMLERD_PATH_MODEL (a set variable wins). This device only: never pushable. Restart required.",
     },
     KeyMeta {
+        key: "inflight_budget",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:off|shadow|on",
+        description: "FR-148 D46 - the in-flight budget's switch, for a remote-desktop session on a data-channel pump (VP9 4:4:4 or FFmpeg): `off` (empty; the default: nothing is computed and the path delivery line is as before), `shadow` (once a frame the budget is computed from SCTP's acknowledgements, the frames it would have held are counted, and its fields close the path delivery line; it holds nothing) or `on` (runs as `shadow`, with a warning, until D46's step B3). Needs `path_model` other than `off`: that line carries its fields. Env: ROOMLERD_INFLIGHT_BUDGET (a set variable wins). This device only: never pushable. Restart required.",
+    },
+    KeyMeta {
         key: "relay_max_kbps",
         group: Group::VideoRate,
         tier: Tier::Advanced,
@@ -2146,6 +2154,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
         "rc_carrier_rank" => cfg.rc_carrier_rank.clone(),
         "path_model" => cfg.path_model.clone(),
+        "inflight_budget" => cfg.inflight_budget.clone(),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
@@ -2741,6 +2750,20 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 Some(v) if v == "off" || v == "shadow" || v == "on" => Some(v),
                 Some(v) => {
                     return Err(format!("path_model must be off, shadow or on (got {v:?})"));
+                }
+            }
+        }
+        // FR-148 D46 — as `path_model`: each word is stored, so a device set
+        // to `off` stays off when the default moves.
+        "inflight_budget" => {
+            cfg.inflight_budget = match value.map(|s| s.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(v) if v.is_empty() => None,
+                Some(v) if v == "off" || v == "shadow" || v == "on" => Some(v),
+                Some(v) => {
+                    return Err(format!(
+                        "inflight_budget must be off, shadow or on (got {v:?})"
+                    ));
                 }
             }
         }
@@ -5080,6 +5103,48 @@ mod tests {
         for bad in ["1", "true", "model", "on1", "shadow,on"] {
             assert!(
                 apply(&mut cfg, "path_model", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-148 D46 — `inflight_budget`: `off`, `shadow` and `on` are stored,
+    /// blank clears the key (the default, `off`), and anything else is refused
+    /// rather than read as `off` without a word. It reaches the daemon's env
+    /// fallbacks under the switch's own name.
+    #[test]
+    fn inflight_budget_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "inflight_budget"), None);
+        apply(&mut cfg, "inflight_budget", Some(" Shadow ")).unwrap();
+        assert_eq!(cfg.inflight_budget.as_deref(), Some("shadow"));
+        assert_eq!(
+            entry_for(&cfg, "inflight_budget").unwrap().value.as_deref(),
+            Some("shadow")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("INFLIGHT_BUDGET")
+                .map(String::as_str),
+            Some("shadow")
+        );
+        apply(&mut cfg, "inflight_budget", Some("on")).unwrap();
+        assert_eq!(cfg.inflight_budget.as_deref(), Some("on"));
+        apply(&mut cfg, "inflight_budget", Some("off")).unwrap();
+        assert_eq!(
+            cfg.inflight_budget.as_deref(),
+            Some("off"),
+            "kept, not cleared"
+        );
+        apply(&mut cfg, "inflight_budget", Some("")).unwrap();
+        assert_eq!(cfg.inflight_budget, None, "blank clears to the default");
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg).get("INFLIGHT_BUDGET"),
+            None
+        );
+        for bad in ["1", "true", "budget", "on1", "shadow,on"] {
+            assert!(
+                apply(&mut cfg, "inflight_budget", Some(bad)).is_err(),
                 "{bad:?} must be refused"
             );
         }

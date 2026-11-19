@@ -136,6 +136,9 @@ pub mod mdns_resolve;
 /// FR-148 P0 — delivery samples from SCTP's acknowledgement clock, each
 /// backlogged, application-limited or stalled, and their line. In shadow.
 pub mod media_delivery;
+/// FR-148 D46 B1 — the in-flight budget in time: its core, and the data-channel
+/// pumps' shadow of it, which acts on nothing. Off unless switched on.
+pub mod media_inflight;
 /// FR-148 P1 — the FFmpeg data-channel pump's pair memories: today's rate
 /// memory as before, and the path model's own file, its key and its two lines.
 pub mod media_pair_memory;

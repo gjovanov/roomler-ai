@@ -501,6 +501,7 @@ fn fresh_config(issued: Issued) -> AgentConfig {
         ice_relay_tcp: None,
         rc_carrier_rank: None,
         path_model: None,
+        inflight_budget: None,
         relay_max_kbps: None,
         rate_slow_start: None,
         media_thread: None,

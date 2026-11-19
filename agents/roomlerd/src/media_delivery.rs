@@ -64,6 +64,7 @@ use webrtc::sctp::association::delivery::{Delivery, DeliveryClock};
 use webrtc::sctp::association::gauges::{GaugeReader, Gauges};
 
 use crate::encode::pipe::{PathNumber, PathView};
+use crate::media_inflight::{Bound, PumpCount, Shadow, WindowReport};
 
 /// A sample closes at the first heartbeat at least this long after the last.
 pub const SAMPLE_MIN: Duration = Duration::from_millis(1500);
@@ -254,6 +255,9 @@ pub struct LineReport {
     /// The standing queue over the line's samples, from SCTP's gauges; `None`
     /// when no sample of the line was read with them.
     pub queue: Option<QueueLine>,
+    /// FR-148 D46 B1 — the in-flight budget's window, computed in shadow;
+    /// `None` when its switch is off.
+    pub budget: Option<WindowReport>,
 }
 
 /// The standing queue over one line's samples.
@@ -393,14 +397,20 @@ pub struct DeliverySampler {
     model_since: Option<Instant>,
     /// O10 — whether this pump wrote its [`OPEN_LINE`].
     opened: bool,
+    /// FR-148 D46 B1 — the in-flight budget, in shadow; `None` when its switch
+    /// is off, or this sampler is (the line carries its fields). Boxed: its
+    /// rings are 3.5 KB, kept out of the pump's state while it is off.
+    budget: Option<Box<Shadow>>,
 }
 
 impl DeliverySampler {
-    /// On unless `ROOMLERD_PATH_MODEL=off`: the pump's one read of the switch.
+    /// On unless `ROOMLERD_PATH_MODEL=off`: the pump's one read of the switch,
+    /// and of FR-148 D46's, `ROOMLERD_INFLIGHT_BUDGET`, beside it.
     pub fn from_env() -> Self {
         let mode = mode();
         let mut sampler = Self::new(mode.samples());
         sampler.mode = mode;
+        sampler.budget = Shadow::for_pump(crate::media_inflight::mode(), sampler.on).map(Box::new);
         sampler
     }
 
@@ -423,7 +433,16 @@ impl DeliverySampler {
             view: None,
             model_since: None,
             opened: false,
+            budget: None,
         }
+    }
+
+    /// A sampler with the in-flight budget in shadow, as
+    /// `ROOMLERD_INFLIGHT_BUDGET=shadow` gives one.
+    #[cfg(test)]
+    pub(crate) fn with_budget(mut self) -> Self {
+        self.budget = Shadow::for_pump(crate::media_inflight::Mode::Shadow, self.on).map(Box::new);
+        self
     }
 
     /// The pump's one call, at its heartbeat: read the association's clock and
@@ -571,13 +590,21 @@ impl DeliverySampler {
             return None;
         }
         self.line_since = Some(now);
-        Some(std::mem::take(&mut self.fold).report)
+        Some(self.report())
     }
 
     /// The samples not written yet, as the drop writes them; `None` when there
     /// are none.
     pub fn take_rest(&mut self) -> Option<LineReport> {
-        (!self.fold.is_empty()).then(|| std::mem::take(&mut self.fold).report)
+        (!self.fold.is_empty()).then(|| self.report())
+    }
+
+    /// The fold's report, and FR-148 D46's budget window beside it.
+    fn report(&mut self) -> LineReport {
+        LineReport {
+            budget: self.budget.as_deref_mut().map(Shadow::take_window),
+            ..std::mem::take(&mut self.fold).report
+        }
     }
 
     /// Step 3, [`Self::heartbeat`]'s path numbers at `now`: keep `view`'s as the
@@ -631,6 +658,84 @@ impl DeliverySampler {
         emit_open(session_id, pump, read.as_ref());
         Some(OpenedBy::of(read.as_ref()))
     }
+
+    /// FR-148 D46 B1 — the in-flight budget's step, once per frame before
+    /// capture, after today's gates let the frame through. The applied rate
+    /// stands for the opening rate, or before one is applied the rate the pump
+    /// opened at. Returns nothing: in shadow the verdict reaches the line's
+    /// counters and nothing else. Off, it reads nothing.
+    pub fn on_frame(&mut self, pc: &RTCPeerConnection, applied_bps: u32, open_at_bps: Option<u32>) {
+        if let Some(b) = self.budget.as_mut() {
+            b.on_frame(pc, applied_bps, open_at_bps);
+        }
+    }
+
+    /// FR-148 D46 B1 — at the pumps' 5 s re-check of the transport: a new
+    /// selected candidate pair starts the budget's least over. Off, it reads
+    /// nothing.
+    pub async fn on_pair_check(&mut self, pc: &RTCPeerConnection) {
+        if let Some(b) = self.budget.as_mut() {
+            b.on_pair_check(pc).await;
+        }
+    }
+
+    /// FR-148 D46 B1 — today's capacity gate held a pass: `full` when the send
+    /// channel was full, `ledger` when the FFmpeg ledger's byte gate was shut.
+    pub fn note_gate(&mut self, full: bool, ledger: bool) {
+        if let Some(b) = self.budget.as_mut() {
+            if full {
+                b.note_bound(Bound::ChannelFull);
+            }
+            if ledger {
+                b.note_bound(Bound::Ledger);
+            }
+        }
+    }
+
+    /// FR-148 D46 B1 — the VP9-444 pump shed a frame over the watermark.
+    pub fn note_watermark(&mut self) {
+        if let Some(b) = self.budget.as_mut() {
+            b.note_bound(Bound::Watermark);
+        }
+    }
+
+    /// FR-148 D46 B1 — a `try_send` found the send channel full.
+    pub fn note_full(&mut self) {
+        if let Some(b) = self.budget.as_mut() {
+            b.note_bound(Bound::ChannelFull);
+        }
+    }
+
+    /// FR-148 D46 B1 — a frame entered the send channel: its bytes are the
+    /// pump's own until SCTP takes them.
+    pub fn on_handed(&self, len: u64) {
+        if let Some(b) = self.budget.as_ref() {
+            b.on_handed(len);
+        }
+    }
+
+    /// FR-148 D46 B1 — the send task's handle on the pump's unsent bytes, one
+    /// that counts nothing with the budget off.
+    pub fn pump_count(&self) -> PumpCount {
+        self.budget
+            .as_deref()
+            .map(Shadow::pump_count)
+            .unwrap_or_default()
+    }
+
+    /// One frame's reading for the budget, as [`Self::on_frame`] reads it from
+    /// the association.
+    #[cfg(test)]
+    pub(crate) fn on_frame_reading(&mut self, now: Instant, acked: u64, g: Gauges, open_bps: u64) {
+        if let Some(b) = self.budget.as_mut() {
+            b.on_reading(now, acked, g, open_bps);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn budget_mut(&mut self) -> Option<&mut Shadow> {
+        self.budget.as_deref_mut()
+    }
 }
 
 impl Drop for DeliverySampler {
@@ -652,10 +757,11 @@ impl Drop for DeliverySampler {
 /// The line. Its field names and their order are pinned by a test, since a
 /// field read greps for them. The standing queue's fields follow when a
 /// sample of the line was read with SCTP's gauges, and are left out when none
-/// was.
+/// was. FR-148 D46's in-flight budget closes the line when its switch is not
+/// `off`; with it off the line is as before, to the byte.
 pub fn emit(session_id: ObjectId, line: &LineReport) {
-    match &line.queue {
-        Some(q) => tracing::info!(
+    match (&line.queue, &line.budget) {
+        (Some(q), None) => tracing::info!(
             %session_id,
             span_ms = line.span_ms,
             delivery_samples = ?line.samples,
@@ -674,7 +780,7 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
             loss = ?q.loss,
             "{LINE}"
         ),
-        None => tracing::info!(
+        (None, None) => tracing::info!(
             %session_id,
             span_ms = line.span_ms,
             delivery_samples = ?line.samples,
@@ -682,6 +788,57 @@ pub fn emit(session_id: ObjectId, line: &LineReport) {
             app_limited_bps = ?line.app_limited_bps,
             stalled_ms = line.stalled_ms,
             acked_bytes = line.acked_bytes,
+            "{LINE}"
+        ),
+        (Some(q), Some(b)) => tracing::info!(
+            %session_id,
+            span_ms = line.span_ms,
+            delivery_samples = ?line.samples,
+            backlogged_bps = ?line.backlogged_bps,
+            app_limited_bps = ?line.app_limited_bps,
+            stalled_ms = line.stalled_ms,
+            acked_bytes = line.acked_bytes,
+            ack_ms = ?q.ack_ms,
+            standing_ms = ?q.standing_ms,
+            queued = q.queued,
+            inflight = ?q.inflight,
+            cwnd = ?q.cwnd,
+            ssthresh = q.ssthresh,
+            rwnd_low = q.rwnd_low,
+            pending_high = q.pending_high,
+            loss = ?q.loss,
+            budget_held = ?b.held,
+            budget_max = b.budget_max,
+            budget_out_max = b.out_max,
+            budget_rate_bps = b.rate_bps,
+            budget_least_ms = ?b.least_ms,
+            budget_slack_ms = b.slack_ms,
+            budget_ack_over_ms = ?b.ack_over_ms,
+            budget_still = ?b.still,
+            bound_watermark = b.bounds.0,
+            bound_ledger = b.bounds.1,
+            bound_full = b.bounds.2,
+            "{LINE}"
+        ),
+        (None, Some(b)) => tracing::info!(
+            %session_id,
+            span_ms = line.span_ms,
+            delivery_samples = ?line.samples,
+            backlogged_bps = ?line.backlogged_bps,
+            app_limited_bps = ?line.app_limited_bps,
+            stalled_ms = line.stalled_ms,
+            acked_bytes = line.acked_bytes,
+            budget_held = ?b.held,
+            budget_max = b.budget_max,
+            budget_out_max = b.out_max,
+            budget_rate_bps = b.rate_bps,
+            budget_least_ms = ?b.least_ms,
+            budget_slack_ms = b.slack_ms,
+            budget_ack_over_ms = ?b.ack_over_ms,
+            budget_still = ?b.still,
+            bound_watermark = b.bounds.0,
+            bound_ledger = b.bounds.1,
+            bound_full = b.bounds.2,
             "{LINE}"
         ),
     }
@@ -970,6 +1127,7 @@ mod tests {
                 stalled_ms: 2_000,
                 acked_bytes: 850_000,
                 queue: None,
+                budget: None,
             }
         );
         // The next line starts empty and comes ten seconds after this one.
@@ -1099,6 +1257,7 @@ mod tests {
                 pending_high: 131_072,
                 loss: (0, 1),
             }),
+            budget: None,
         }
     }
 
@@ -1150,6 +1309,7 @@ mod tests {
                 pending_high: 0,
                 ..QueueLine::default()
             }),
+            budget: None,
         };
         let idle = logged(|| emit(sid(), &idle));
         for want in [
@@ -1192,6 +1352,182 @@ mod tests {
             );
             assert!(l.len() < 512, "{} bytes: {l:?}", l.len());
         }
+    }
+
+    /// FR-148 D46 B1 — a window of the in-flight budget, made-up values.
+    fn budget_window() -> WindowReport {
+        WindowReport {
+            held: (212, 300),
+            budget_max: 61_440,
+            out_max: 1_048_576,
+            rate_bps: 1_987_000,
+            least_ms: Some(62),
+            slack_ms: 150,
+            ack_over_ms: Some((3, 45, 1_257)),
+            still: (1, 812),
+            bounds: (0, 37, 4),
+        }
+    }
+
+    /// The budget's fields close the line, after every field before them, so
+    /// the field reads of `standing_ms=` and `queued=` hold; with its switch
+    /// off the line has none of them.
+    #[test]
+    fn the_inflight_budget_s_fields_close_the_line() {
+        let budget = [
+            "budget_held=(212, 300)",
+            "budget_max=61440",
+            "budget_out_max=1048576",
+            "budget_rate_bps=1987000",
+            "budget_least_ms=Some(62)",
+            "budget_slack_ms=150",
+            "budget_ack_over_ms=Some((3, 45, 1257))",
+            "budget_still=(1, 812)",
+            "bound_watermark=0",
+            "bound_ledger=37",
+            "bound_full=4",
+        ];
+        let line = LineReport {
+            budget: Some(budget_window()),
+            ..busy_line()
+        };
+        let out = logged(|| emit(sid(), &line));
+        let mut rest = out.as_str();
+        for want in ["standing_ms=Some((3, 1257))", "queued=2", "loss=(0, 1)"]
+            .into_iter()
+            .chain(budget)
+        {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {out:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        // Without the gauges' fields, the budget's follow the bytes.
+        let bare = LineReport {
+            queue: None,
+            ..line.clone()
+        };
+        let bare = logged(|| emit(sid(), &bare));
+        let mut rest = bare.as_str();
+        for want in ["acked_bytes=3012345"].into_iter().chain(budget) {
+            let at = rest
+                .find(want)
+                .unwrap_or_else(|| panic!("{want:?} is not in order in {bare:?}"));
+            rest = &rest[at + want.len()..];
+        }
+        assert!(!bare.contains("standing_ms"), "{bare:?}");
+        // No field of the budget's is one a field read greps for.
+        for field in budget {
+            assert!(!field.contains("standing_ms=") && !field.contains("queued="));
+        }
+        // Off: not one of them.
+        let off = logged(|| emit(sid(), &busy_line()));
+        assert!(
+            !off.contains("budget_") && !off.contains("bound_"),
+            "{off:?}"
+        );
+        println!("delivery line with the budget: {} bytes", out.len());
+        assert!(out.len() < 1_024, "{} bytes: {out:?}", out.len());
+    }
+
+    /// FR-148 D46 B1 — `on` runs as `shadow`, with one warning a pump; and a
+    /// sampler that is off carries no budget.
+    #[test]
+    fn the_inflight_budget_on_runs_as_shadow_with_one_warning() {
+        use crate::media_inflight::Mode as BudgetMode;
+        let mut pumps = Vec::new();
+        let out = logged(|| {
+            pumps.push(Shadow::for_pump(BudgetMode::On, true).is_some());
+            pumps.push(Shadow::for_pump(BudgetMode::Shadow, true).is_some());
+            pumps.push(Shadow::for_pump(BudgetMode::Off, true).is_some());
+        });
+        assert_eq!(pumps, [true, true, false]);
+        assert_eq!(out.matches(" WARN ").count(), 1, "{out:?}");
+        assert!(
+            out.contains("ROOMLERD_INFLIGHT_BUDGET=on runs as shadow"),
+            "{out:?}"
+        );
+        let off = logged(|| assert!(Shadow::for_pump(BudgetMode::Shadow, false).is_none()));
+        assert!(off.contains("the in-flight budget stays off"), "{off:?}");
+        assert!(
+            DeliverySampler::new(false)
+                .with_budget()
+                .budget_mut()
+                .is_none()
+        );
+    }
+
+    /// FR-148 D46 B1 — shadow acts on nothing. Over a recorded sequence of a
+    /// deep queue's readings, in which the budget would hold most frames, a
+    /// sampler with the budget in shadow answers every call a pump makes as
+    /// one with it off does: the same samples, the same lines but for the
+    /// budget's own field, the same switch. The calls that feed the budget
+    /// return nothing, so its verdict can reach no gate, no AIMD call and no
+    /// keyframe request: it reaches the line's counters, which show it held.
+    #[test]
+    fn the_inflight_budget_in_shadow_answers_every_pump_call_as_off_does() {
+        let t0 = Instant::now();
+        let mut off = DeliverySampler::new(true);
+        let mut shadow = DeliverySampler::new(true).with_budget();
+        let mut held = 0;
+        let mut lines = 0;
+        // 30 s at 30 fps of TURN over TCP: 2 Mbit/s acknowledged while a
+        // megabyte stands in flight, the delay growing with it.
+        for frame in 0..900u64 {
+            let now = at(t0, frame * 1_000 / 30);
+            let acked = frame * 250_000 / 30;
+            let g = Gauges {
+                max_payload: 1_200,
+                cwnd: 1_048_576,
+                ssthresh: 1_048_576,
+                rwnd: 131_072,
+                inflight_bytes: 1_000_000,
+                pending_bytes: 131_072,
+                ack_delay: Some(Duration::from_millis(60 + frame)),
+                ack_delay_min: Some(Duration::from_millis(60 + frame / 2)),
+                ..Gauges::default()
+            };
+            for s in [&mut off, &mut shadow] {
+                s.on_frame_reading(now, acked, g, 2_000_000);
+                s.note_gate(frame % 7 == 0, frame % 11 == 0);
+                if frame % 13 == 0 {
+                    s.note_watermark();
+                }
+                if frame % 17 == 0 {
+                    s.note_full();
+                }
+                s.on_handed(8_000);
+                let count = s.pump_count();
+                let mut chunk = count.unsent(8_000);
+                chunk.sent(8_000);
+            }
+            assert_eq!(off.mode(), shadow.mode());
+            // The heartbeat's reading, once a second.
+            if frame % 30 == 0 {
+                let reading = Delivery {
+                    acked_bytes: acked,
+                    queue_fills: frame / 30 + 1,
+                    queue_empties: 0,
+                };
+                let a = off.on_reading_with(now, reading, || Some(g));
+                let b = shadow.on_reading_with(now, reading, || Some(g));
+                assert_eq!(a, b, "frame {frame}");
+                let (a, b) = (off.take_line(now), shadow.take_line(now));
+                assert_eq!(a.is_some(), b.is_some(), "frame {frame}");
+                if let (Some(a), Some(b)) = (a, b) {
+                    lines += 1;
+                    assert_eq!(a.budget, None);
+                    let window = b.budget.expect("the budget's window");
+                    held += window.held.0;
+                    assert_eq!(LineReport { budget: None, ..b }, a, "frame {frame}");
+                }
+            }
+        }
+        let (a, b) = (off.take_rest(), shadow.take_rest());
+        assert_eq!(a.map(|a| a.span_ms), b.map(|b| b.span_ms));
+        assert!(lines >= 2, "{lines} lines");
+        assert!(held > 0, "the budget never held on a megabyte out");
     }
 
     /// Gauges as a take reads them: `least` is the least delay since the take
@@ -2565,6 +2901,50 @@ pub(crate) mod shaped_link {
         }
     }
 
+    /// FR-148 D46 B1 — the in-flight budget's least starts over on a new
+    /// association, as the sampler's does: a new clock is a new association.
+    /// A held slot reads the handles it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_inflight_budget_s_least_starts_over_on_a_new_clock() {
+        let w = rwnd(8_000_000);
+        let (a1, b1) = link(8_000_000);
+        let (first, first_viewer) = pair(Arc::new(a1), Arc::new(b1), w).await;
+        let (a2, b2) = link(8_000_000);
+        let (second, second_viewer) = pair(Arc::new(a2), Arc::new(b2), w).await;
+        let t0 = Instant::now();
+        let one_ms = Some(Duration::from_millis(1));
+        let mut s = crate::media_inflight::Shadow::new();
+        s.on_frame_with(
+            t0,
+            0,
+            || Some(first.delivery_clock()),
+            || Some(first.gauges()),
+        );
+        s.set_least(Duration::from_millis(1));
+        s.on_frame_with(at(t0, 10), 0, || Some(first.delivery_clock()), || None);
+        assert_eq!(s.budget().least(), one_ms, "the same association keeps it");
+        s.on_frame_with(at(t0, 20), 0, || None, || None);
+        assert_eq!(s.budget().least(), one_ms, "a held slot keeps it");
+        s.on_frame_with(
+            at(t0, 30),
+            0,
+            || Some(second.delivery_clock()),
+            || Some(second.gauges()),
+        );
+        let own = second.gauges().peek();
+        let own = [own.ack_delay, own.ack_delay_min]
+            .into_iter()
+            .flatten()
+            .min();
+        assert_eq!(s.budget().least(), own, "the new association's own least");
+        for a in [&first, &second] {
+            let _ = a.close().await;
+        }
+        for v in [&first_viewer, &second_viewer] {
+            let _ = v.close().await;
+        }
+    }
+
     /// Writes 16 KiB and waits until all of it is acknowledged and a SACK's
     /// delay is stored, so that no SACK with a delay comes after it returns.
     async fn delivered(
@@ -2709,6 +3089,19 @@ pub(crate) mod shaped_link {
     /// floor: it leaves out the `Overproduced` screen, by which a window with
     /// a blocked send is valid and its goodput damps the floor.
     ///
+    /// FR-148 D46 B1 — the `the_budget_*` cells run a shape under today's
+    /// writers and then under the product's in-flight budget
+    /// ([`crate::media_inflight::Budget`]), which holds a frame while what
+    /// SCTP has out stands at `rate × (least + S)`. Each run prints a `D46 |`
+    /// line: the link's queue, each second's least transit over the fastest a
+    /// frame can go, what the viewer read, and what it read fresh, within 300
+    /// ms of the fastest. `docs/rate-control.md` (§ The in-flight budget)
+    /// holds three runs' numbers. The deep cells assert the design's bar on
+    /// the budget's run, and the controls that its viewer reads 0.95 of
+    /// today's or more. `the_inflight_budget_in_shadow_holds_nothing_on_a_shaped_link`
+    /// runs the plain writer off and then with the budget in shadow, the
+    /// pumps' B1 path: a write at every tick in both.
+    ///
     /// `cargo test -p roomlerd --lib media_delivery::shaped_link::tcp_shape --
     /// --skip clipboard:: --nocapture --test-threads=1 --include-ignored`
     mod tcp_shape {
@@ -2718,6 +3111,7 @@ pub(crate) mod shaped_link {
         use crate::encode::goodput::{GoodputEstimator, GoodputSink};
         use crate::encode::pipe::{Basis, Pipe};
         use crate::encode::viewer_rate::{LinkLoop, OfferLoop, offered_over_arrival};
+        use crate::media_inflight::{Budget, Reading, Verdict, WindowReport};
 
         /// The lab slice's round trip.
         const RTT: Duration = Duration::from_millis(60);
@@ -2757,6 +3151,22 @@ pub(crate) mod shaped_link {
         /// cells' length: five of the sampler's samples.
         const SPARSE_LEN: usize = 200;
         const SPARSE_SECONDS: u32 = 10;
+        /// FR-148 D46 — fresh delivery: a message read within this of the
+        /// fastest its frame can go ([`fastest_ms`]).
+        const FRESH_MS: u64 = 300;
+        /// The slack the budget cells run at: D46's S.
+        const SLACK: Duration = Duration::from_millis(150);
+
+        /// FR-148 D46 — the in-flight budget on the writer.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Budgeted {
+            No,
+            /// The pumps' B1: computed once a frame through the product's
+            /// [`Shadow`], counted, and holding nothing.
+            Shadow,
+            /// The budget's verdict holds the frame, at this slack.
+            Holds(Duration),
+        }
 
         /// One cell at a time: the cells are timed.
         static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2771,6 +3181,8 @@ pub(crate) mod shaped_link {
             /// The writer skips a frame while the stream's buffered amount is
             /// over [`OVERFLOW`], as the VP9-444 pump does on a relay.
             skip_over: bool,
+            /// FR-148 D46 — the in-flight budget: none, in shadow, or holding.
+            budget: Budgeted,
             /// Head-of-line stalls on the agent's direction: how often, how long.
             stalls: Option<(Duration, Duration)>,
             /// FR-148 P0 — a still screen: one [`SPARSE_LEN`] message a second
@@ -2795,6 +3207,13 @@ pub(crate) mod shaped_link {
                     ", skip over 256 KiB"
                 } else {
                     ""
+                };
+                let skip = match self.budget {
+                    Budgeted::No => skip.to_owned(),
+                    Budgeted::Shadow => format!("{skip}, in-flight budget in shadow"),
+                    Budgeted::Holds(slack) => {
+                        format!("{skip}, in-flight budget, slack {} ms", ms(slack))
+                    }
                 };
                 let stalls = match self.stalls {
                     Some((every, stall)) => format!(", a {stall:?} stall every {every:?}"),
@@ -2821,6 +3240,84 @@ pub(crate) mod shaped_link {
             fn frame_len(&self) -> usize {
                 usize::try_from(self.bps * self.offer_pct / 100 / 8 / u64::from(FPS)).unwrap()
             }
+
+            /// What the writer offers, bit/s: the budget's opening rate, as
+            /// the pump's is the rate its encoder was opened at.
+            fn offer_bps(&self) -> u64 {
+                self.bps * self.offer_pct / 100
+            }
+        }
+
+        /// The least a message of `shape`'s can take, write to read, ms: the
+        /// one-way delay and its packets on the link. A run's own least is no
+        /// base: under the budget the queue stands from the first second.
+        fn fastest_ms(shape: &Shape) -> u64 {
+            let len = if shape.sparse {
+                SPARSE_LEN as u64
+            } else {
+                shape.frame_len() as u64
+            };
+            let wire = len + len.div_ceil(PAYLOAD) * (PACKET - PAYLOAD);
+            ms(RTT / 2) + wire * 8_000 / shape.bps
+        }
+
+        /// FR-148 D46 — the writer's core: the pumps' shadow, or the core
+        /// itself where its verdict holds the frame.
+        #[derive(Debug)]
+        enum Core {
+            Shadow(Box<Shadow>),
+            Holds(Box<Budget>),
+        }
+
+        impl Core {
+            fn of(budget: Budgeted) -> Option<Self> {
+                match budget {
+                    Budgeted::No => None,
+                    Budgeted::Shadow => Some(Self::Shadow(Box::default())),
+                    Budgeted::Holds(slack) => {
+                        Some(Self::Holds(Box::new(Budget::with_slack(slack))))
+                    }
+                }
+            }
+
+            fn budget(&self) -> &Budget {
+                match self {
+                    Self::Shadow(s) => s.budget(),
+                    Self::Holds(b) => b,
+                }
+            }
+
+            fn take_window(&mut self) -> WindowReport {
+                match self {
+                    Self::Shadow(s) => s.take_window(),
+                    Self::Holds(b) => b.take_window(),
+                }
+            }
+        }
+
+        /// The writer's counts.
+        #[derive(Debug, Default)]
+        struct WriterStats {
+            /// Ticks, and frames written.
+            ticks: AtomicU64,
+            written: AtomicU64,
+            /// Frames the budget held, and frames skipped over the watermark.
+            held: AtomicU64,
+            skipped: AtomicU64,
+            /// Frames the budget let go because SCTP's own window bound with
+            /// nothing in its queue.
+            window: AtomicU64,
+            /// The budget at the last frame, bytes.
+            budget: AtomicU64,
+            /// Spans, µs from the run's start, in which the acknowledgement
+            /// clock stood still for [`Budget::still_after`] or more while
+            /// bytes were out.
+            silent: StdMutex<Vec<(u64, u64)>>,
+            /// The budget's step with its reads: steps, their nanoseconds,
+            /// the longest.
+            steps: AtomicU64,
+            step_ns: AtomicU64,
+            step_max_ns: AtomicU64,
         }
 
         /// One message the viewer read: when it arrived and when it was
@@ -2871,6 +3368,14 @@ pub(crate) mod shaped_link {
             goodput_bps: Option<u32>,
             fast_rtx: u64,
             t3: u64,
+            /// FR-148 D46 — the frames the writer held or skipped in the
+            /// second, the budget at its end (0 without one), the least
+            /// transit of the second's arrivals, and what arrived fresh
+            /// ([`FRESH_MS`]), bit/s.
+            held: u64,
+            budget: u64,
+            transit_lo_ms: Option<u64>,
+            fresh_bps: u64,
         }
 
         /// The candidate signals of a standing queue for one second, each
@@ -2994,15 +3499,28 @@ pub(crate) mod shaped_link {
             goodput_capacities: u32,
         }
 
-        fn belief_of(windows: &[ViewerWindow], goodput: &[(u64, u32)], t0: Instant) -> Belief {
+        /// FR-148 D46 — `pushbacks` are capacities at their times (µs from
+        /// `t0`), folded as backlogged push-backs whatever the window: a
+        /// standing queue's push-back on the floor.
+        fn belief_of(
+            windows: &[ViewerWindow],
+            goodput: &[(u64, u32)],
+            t0: Instant,
+            pushbacks: &[(u64, u32)],
+        ) -> Belief {
             let mut pipe = Pipe::default();
             let mut link = LinkLoop::new();
             let mut offer = OfferLoop::default();
             let mut goodput = goodput.iter().peekable();
+            let mut pushbacks = pushbacks.iter().peekable();
             let mut prev_stalled = false;
             let mut b = Belief::default();
             for w in windows {
                 let at = t0 + Duration::from_micros(w.end_us);
+                while let Some(&(end_us, bps)) = pushbacks.next_if(|p| p.0 <= w.end_us) {
+                    let at = t0 + Duration::from_micros(end_us);
+                    pipe.observe_capacity(bps, Basis::Backlogged, at);
+                }
                 let stalled = w.excess_ms >= TRANSIT_OVER_MS;
                 let valid = !stalled && !prev_stalled;
                 prev_stalled = stalled;
@@ -3031,6 +3549,9 @@ pub(crate) mod shaped_link {
                     }
                 }
                 b.max_rx = b.max_rx.max(w.rx_bps);
+            }
+            for &(end_us, bps) in pushbacks {
+                pipe.observe_capacity(bps, Basis::Backlogged, t0 + Duration::from_micros(end_us));
             }
             let end = windows
                 .last()
@@ -3070,6 +3591,8 @@ pub(crate) mod shaped_link {
         struct Covered {
             rows: std::ops::Range<usize>,
             sample: Sample,
+            /// When the sample closed, µs from the run's `t0`.
+            end_us: u64,
         }
 
         impl Covered {
@@ -3097,6 +3620,24 @@ pub(crate) mod shaped_link {
             /// FR-148 P0 — the delivery sampler's samples and lines.
             samples: Vec<Covered>,
             lines: Vec<LineReport>,
+            /// FR-148 D46 — what `belief` was folded from, for a fold with
+            /// push-backs; the writer's ticks and counts over its life; and
+            /// the frames the budget's verdicts held, acted on or not.
+            t0: Instant,
+            goodput_at: Vec<(u64, u32)>,
+            ticks: u64,
+            written: u64,
+            held: u64,
+            skipped: u64,
+            would_hold: u64,
+            /// Frames the budget let go because SCTP's window bound with
+            /// nothing in its queue.
+            window_writes: u64,
+            /// The spans the clock stood still with bytes out
+            /// ([`WriterStats::silent`]).
+            silent: Vec<(u64, u64)>,
+            /// The budget's step with its reads: (steps, mean ns, longest ns).
+            step: (u64, u64, u64),
         }
 
         fn us(d: Duration) -> u64 {
@@ -3258,10 +3799,17 @@ pub(crate) mod shaped_link {
                 .unwrap();
             let sink = GoodputSink::new();
             let frames: Arc<StdMutex<Vec<(u64, u64)>>> = Arc::default();
+            let stats: Arc<WriterStats> = Arc::default();
+            // FR-148 D46 — the budget reads the association's clock and gauges
+            // through the handles a pump holds, and never takes the gauges.
+            let core = Core::of(shape.budget).map(|c| Arc::new(StdMutex::new(c)));
             let writer = {
                 let stream = Arc::clone(&stream);
                 let sink = sink.clone();
                 let frames = Arc::clone(&frames);
+                let stats = Arc::clone(&stats);
+                let core = core.clone();
+                let (clock, gauges) = (agent.delivery_clock(), agent.gauges());
                 let (every, len) = if shape.sparse {
                     (SAMPLE, SPARSE_LEN)
                 } else {
@@ -3271,9 +3819,69 @@ pub(crate) mod shaped_link {
                     let mut tick = tokio::time::interval(every);
                     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     let mut frame = vec![0x6b_u8; len];
+                    // The clock's last move: when, and the bytes it stood at.
+                    let mut moved = (Instant::now(), 0_u64);
                     loop {
                         tick.tick().await;
+                        stats.ticks.fetch_add(1, Ordering::Relaxed);
+                        let hold = core.as_ref().is_some_and(|core| {
+                            let mut core = core.lock().unwrap();
+                            let began = Instant::now();
+                            let hold = match &mut *core {
+                                // The pumps' B1 call: it returns nothing.
+                                Core::Shadow(s) => {
+                                    s.on_frame_with(
+                                        began,
+                                        shape.offer_bps(),
+                                        || Some(clock.clone()),
+                                        || Some(gauges.clone()),
+                                    );
+                                    false
+                                }
+                                Core::Holds(b) => {
+                                    let r = Reading {
+                                        acked_bytes: clock.read().acked_bytes,
+                                        gauges: gauges.peek(),
+                                        pump_bytes: 0,
+                                        open_bps: shape.offer_bps(),
+                                    };
+                                    let verdict = b.step(began, &r);
+                                    if matches!(verdict, Verdict::WindowBinds) {
+                                        stats.window.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    // A clock that stood still with bytes out
+                                    // for the least and the slack was a stall.
+                                    if r.acked_bytes != moved.1 || r.out() == 0 {
+                                        let still = began.saturating_duration_since(moved.0);
+                                        if still >= b.still_after() {
+                                            let at =
+                                                |i: Instant| us(i.saturating_duration_since(t0));
+                                            stats
+                                                .silent
+                                                .lock()
+                                                .unwrap()
+                                                .push((at(moved.0), at(began)));
+                                        }
+                                        moved = (began, r.acked_bytes);
+                                    }
+                                    verdict.holds()
+                                }
+                            };
+                            let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            stats.steps.fetch_add(1, Ordering::Relaxed);
+                            stats.step_ns.fetch_add(ns, Ordering::Relaxed);
+                            stats.step_max_ns.fetch_max(ns, Ordering::Relaxed);
+                            stats
+                                .budget
+                                .store(core.budget().last_budget(), Ordering::Relaxed);
+                            hold
+                        });
+                        if hold {
+                            stats.held.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         if shape.skip_over && stream.buffered_amount() as u64 > OVERFLOW {
+                            stats.skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         let stamp = us(t0.elapsed());
@@ -3284,6 +3892,7 @@ pub(crate) mod shaped_link {
                         }
                         sink.record(len as u64, began.elapsed());
                         frames.lock().unwrap().push((stamp, len as u64));
+                        stats.written.fetch_add(1, Ordering::Relaxed);
                     }
                 })
             };
@@ -3294,10 +3903,22 @@ pub(crate) mod shaped_link {
             let mut rows = Vec::new();
             let (mut seen_rx, mut seen_tx) = (0, 0);
             let mut last_transit: Option<u64> = None;
+            let fastest = fastest_ms(&shape);
+            let held_of = |s: &WriterStats| {
+                s.held.load(Ordering::Relaxed) + s.skipped.load(Ordering::Relaxed)
+            };
+            // FR-148 D46 — a line closes the budget's window, as in the pumps.
+            let with_budget = |mut l: LineReport| {
+                if let Some(core) = &core {
+                    l.budget = Some(core.lock().unwrap().take_window());
+                }
+                l
+            };
             let start = Instant::now();
             let first = gauges.take();
             let _ = sink.drain();
             let mut prev = (start, clock.read());
+            let mut held_before = held_of(&stats);
             // FR-148 P0 — the delivery sampler itself, on this run's clock and,
             // through `Split`, on its gauges.
             let mut sampler = DeliverySampler::new(true);
@@ -3334,15 +3955,23 @@ pub(crate) mod shaped_link {
                 if let Some(bps) = goodput_bps {
                     goodput_at.push((us(now - t0), bps));
                 }
-                let (rx, newest) = {
+                let (rx, newest, transit_lo_ms, in_time) = {
                     let log = arrivals.lock().unwrap();
-                    let fresh = &log[seen_rx..];
+                    let new = &log[seen_rx..];
                     seen_rx = log.len();
                     (
-                        fresh.iter().map(|x| x.len).sum::<u64>(),
-                        fresh.last().map(transit_ms),
+                        new.iter().map(|x| x.len).sum::<u64>(),
+                        new.last().map(transit_ms),
+                        new.iter().map(transit_ms).min(),
+                        new.iter()
+                            .filter(|x| transit_ms(x) <= fastest + FRESH_MS)
+                            .map(|x| x.len)
+                            .sum::<u64>(),
                     )
                 };
+                let held_now = held_of(&stats);
+                let held = held_now - held_before;
+                held_before = held_now;
                 let sent = {
                     let log = frames.lock().unwrap();
                     let fresh = &log[seen_tx..];
@@ -3376,19 +4005,55 @@ pub(crate) mod shaped_link {
                     goodput_bps,
                     fast_rtx: g.fast_retransmits,
                     t3: g.t3_expiries,
+                    held,
+                    budget: if core.is_some() {
+                        stats.budget.load(Ordering::Relaxed)
+                    } else {
+                        0
+                    },
+                    transit_lo_ms,
+                    fresh_bps: in_time * 8_000 / span,
                 });
                 if let Some(sample) = sampler.on_reading_with(now, d, || split.take()) {
                     samples.push(Covered {
                         rows: covered..rows.len(),
                         sample,
+                        end_us: us(now - t0),
                     });
                     covered = rows.len();
                 }
-                lines.extend(sampler.take_line(now));
+                lines.extend(sampler.take_line(now).map(&with_budget));
                 prev = (now, d);
             }
-            lines.extend(sampler.take_rest());
+            lines.extend(sampler.take_rest().map(&with_budget));
             writer.abort();
+            // Its counts are final once it has stopped.
+            let _ = writer.await;
+            let windows_held: u64 = lines
+                .iter()
+                .filter_map(|l| l.budget)
+                .map(|b| b.held.0)
+                .sum();
+            let would_hold = windows_held
+                + core
+                    .as_ref()
+                    .map_or(0, |c| c.lock().unwrap().take_window().held.0);
+            let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
+            let from_us = us(start - t0);
+            let silent: Vec<(u64, u64)> = stats
+                .silent
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|s| s.1 > from_us)
+                .collect();
+            let steps = load(&stats.steps);
+            let step = (
+                steps,
+                load(&stats.step_ns) / steps.max(1),
+                load(&stats.step_max_ns),
+            );
             let peak_queue = a.peak_wait();
             let tail_drops = a.tail_drops();
             let arrivals = arrivals.lock().unwrap().clone();
@@ -3396,7 +4061,7 @@ pub(crate) mod shaped_link {
             let _ = tokio::time::timeout(Duration::from_secs(5), agent.close()).await;
             let _ = tokio::time::timeout(Duration::from_secs(5), viewer.close()).await;
             let windows = viewer_windows(&arrivals, &frames, us(start - t0));
-            let belief = belief_of(&windows, &goodput_at, t0);
+            let belief = belief_of(&windows, &goodput_at, t0, &[]);
             TcpRun {
                 shape,
                 rows,
@@ -3406,6 +4071,16 @@ pub(crate) mod shaped_link {
                 tail_drops,
                 samples,
                 lines,
+                t0,
+                goodput_at,
+                ticks: load(&stats.ticks),
+                written: load(&stats.written),
+                held: load(&stats.held),
+                skipped: load(&stats.skipped),
+                would_hold,
+                window_writes: load(&stats.window),
+                silent,
+                step,
             }
         }
 
@@ -3482,12 +4157,13 @@ pub(crate) mod shaped_link {
             );
             println!(
                 " t class      acked  q_lo..q_hi ms  inflight    cwnd  ssthresh    rwnd  pending emp \
-                 buffered ackmin  sent    rx transit growth blk_ms goodput fr t3 | bdp% rtt+ tr+"
+                 buffered ackmin  sent    rx transit growth blk_ms goodput fr t3 | bdp% rtt+ tr+ \
+                 | held  budget tr_lo fresh"
             );
             for (s, g) in r.rows.iter().zip(signals_of(&r.rows)) {
                 let class = format!("{:?}", s.class);
                 println!(
-                    "{:>2} {class:<10} {:>5} {:>6}..{:<6} {:>9} {:>7} {:>9} {:>7} {:>8} {:>3} {:>8} {:>6} {:>5} {:>5} {:>7} {:>6} {:>6} {:>7} {:>2} {:>2} | {:>4} {:>4} {:>4}",
+                    "{:>2} {class:<10} {:>5} {:>6}..{:<6} {:>9} {:>7} {:>9} {:>7} {:>8} {:>3} {:>8} {:>6} {:>5} {:>5} {:>7} {:>6} {:>6} {:>7} {:>2} {:>2} | {:>4} {:>4} {:>4} | {:>4} {:>7} {:>5} {:>5}",
                     s.t,
                     kbps(s.acked_bps),
                     s.q_lo_ms,
@@ -3511,6 +4187,10 @@ pub(crate) mod shaped_link {
                     opt(g.bdp_pct),
                     opt(g.rtt_over_ms),
                     opt(g.transit_over_ms),
+                    s.held,
+                    s.budget,
+                    opt(s.transit_lo_ms),
+                    kbps(s.fresh_bps),
                 );
             }
             for (name, (a, b, c, d)) in readings(r) {
@@ -3577,6 +4257,7 @@ pub(crate) mod shaped_link {
                 path,
                 offer_pct: 150,
                 skip_over: false,
+                budget: Budgeted::No,
                 stalls: None,
                 sparse: false,
                 seconds: SAMPLES,
@@ -3859,6 +4540,374 @@ pub(crate) mod shaped_link {
                 ..stalled(OpenPath::InitAck)
             })
             .await;
+        }
+
+        /// FR-148 D46 — one run in the numbers the budget is judged by.
+        #[derive(Debug, Clone, Copy)]
+        struct Summary {
+            /// The link's queue at its least in each second, what stood all
+            /// second: the median and the most over the run's seconds.
+            link_ms: (u64, u64),
+            /// Each second's least transit, write to read, over the fastest a
+            /// frame can go ([`fastest_ms`]): the median and the most.
+            transit_ms: (u64, u64),
+            /// What the viewer read, and what it read within [`FRESH_MS`] of
+            /// the fastest, bit/s over the run's seconds.
+            rx_bps: u64,
+            fresh_bps: u64,
+            /// Frames written; held by the budget or skipped over the
+            /// watermark; and held by the budget's verdicts, acted on or not.
+            written: u64,
+            held: u64,
+            would_hold: u64,
+            /// The floor of the run's fold; with a push-back at each queued
+            /// sample (P1), and their count; and, under a holding budget, with
+            /// one at each sample that counted, was backlogged (SCTP's own
+            /// class, or the budget held a frame in each of its seconds) and
+            /// held no span of a still clock (P3).
+            floor: Option<u32>,
+            floor_p1: (Option<u32>, usize),
+            floor_p3: Option<(Option<u32>, usize)>,
+        }
+
+        /// `bps` as a percent of `r`'s link.
+        fn pct(bps: u64, r: &TcpRun) -> u64 {
+            bps * 100 / r.shape.payload_bps().max(1)
+        }
+
+        fn median_max(mut v: Vec<u64>) -> (u64, u64) {
+            v.sort_unstable();
+            match v.len() {
+                0 => (0, 0),
+                n => (v[n / 2], v[n - 1]),
+            }
+        }
+
+        fn summary(r: &TcpRun) -> Summary {
+            let link_ms = median_max(r.rows.iter().map(|s| s.q_lo_ms).collect());
+            let fastest = fastest_ms(&r.shape);
+            let transit_ms = median_max(
+                r.rows
+                    .iter()
+                    .filter_map(|s| s.transit_lo_ms.map(|t| t.saturating_sub(fastest)))
+                    .collect(),
+            );
+            let seconds = (r.rows.len() as u64).max(1);
+            let fold = |pushbacks: Vec<(u64, u32)>| {
+                let n = pushbacks.len();
+                let belief = belief_of(&r.windows, &r.goodput_at, r.t0, &pushbacks);
+                (belief.floor, n)
+            };
+            let at = |c: &Covered| {
+                let bps = c.sample.bps().unwrap_or(0);
+                (c.end_us, u32::try_from(bps).unwrap_or(u32::MAX))
+            };
+            let p3 = |c: &&Covered| {
+                let counted = c.sample.queue.is_some_and(|q| q.standing_ms.is_some());
+                let rows = &r.rows[c.rows.clone()];
+                let held = !rows.is_empty() && rows.iter().all(|s| s.held > 0);
+                let from = c.end_us.saturating_sub(c.sample.ms * 1000);
+                let still = r.silent.iter().any(|&(a, b)| a < c.end_us && b > from);
+                counted && (c.sample.class == Class::Backlogged || held) && !still
+            };
+            Summary {
+                link_ms,
+                transit_ms,
+                rx_bps: r.rows.iter().map(|s| s.rx_bps).sum::<u64>() / seconds,
+                fresh_bps: r.rows.iter().map(|s| s.fresh_bps).sum::<u64>() / seconds,
+                written: r.written,
+                held: r.held + r.skipped,
+                would_hold: r.would_hold,
+                floor: r.belief.floor,
+                floor_p1: fold(r.samples.iter().filter(|c| c.queued()).map(at).collect()),
+                floor_p3: matches!(r.shape.budget, Budgeted::Holds(_))
+                    .then(|| fold(r.samples.iter().filter(p3).map(at).collect())),
+            }
+        }
+
+        fn print_summary(r: &TcpRun, s: &Summary) {
+            let link = r.shape.payload_bps();
+            let floor = |f: Option<u32>| {
+                f.map_or_else(
+                    || "-".to_owned(),
+                    |f| format!("{} ({:.2} x)", f / 1000, f64::from(f) / link as f64),
+                )
+            };
+            let p3 = s
+                .floor_p3
+                .map_or_else(|| "-".to_owned(), |(f, n)| format!("{} from {n}", floor(f)));
+            println!(
+                "D46 | {} | standing link {} / {} ms, transit {} / {} ms (median / most) | \
+                 read {} %, fresh {} % of {} kbit/s | ticks {}, written {}, held or skipped \
+                 {}, the budget's verdicts held {}, written on SCTP's window {} | floor {}, \
+                 P1 {} from {}, P3 {p3} kbit/s; still clock {} spans | budget step {} ns \
+                 mean, {} ns most, {} steps",
+                r.shape.name(),
+                s.link_ms.0,
+                s.link_ms.1,
+                s.transit_ms.0,
+                s.transit_ms.1,
+                pct(s.rx_bps, r),
+                pct(s.fresh_bps, r),
+                kbps(link),
+                r.ticks,
+                s.written,
+                s.held,
+                s.would_hold,
+                r.window_writes,
+                floor(s.floor),
+                floor(s.floor_p1.0),
+                s.floor_p1.1,
+                r.silent.len(),
+                r.step.1,
+                r.step.2,
+                r.step.0,
+            );
+        }
+
+        /// FR-148 D46 — each shape in turn, its rows and its summary printed.
+        async fn measured(shapes: &[Shape]) -> Vec<(TcpRun, Summary)> {
+            let mut out = Vec::new();
+            for &shape in shapes {
+                let r = run(shape).await;
+                print_run(&r);
+                let s = summary(&r);
+                print_summary(&r, &s);
+                out.push((r, s));
+            }
+            out
+        }
+
+        /// The budget's fresh delivery over today's writer's, the bar 0.95
+        /// (D46 item 11), printed whichever way it falls.
+        fn print_fresh_ratio(today: &Summary, budget: &(TcpRun, Summary)) {
+            let ratio = budget.1.fresh_bps as f64 / today.fresh_bps.max(1) as f64;
+            println!(
+                "D46 | {} | fresh delivery {:.3} of today's writer's ({} against {} kbit/s); \
+                 the bar is 0.95: {}",
+                budget.0.shape.name(),
+                ratio,
+                kbps(budget.1.fresh_bps),
+                kbps(today.fresh_bps),
+                if ratio >= 0.95 { "over it" } else { "UNDER it" },
+            );
+        }
+
+        fn budgeted(shape: Shape) -> Shape {
+            Shape {
+                skip_over: false,
+                budget: Budgeted::Holds(SLACK),
+                ..shape
+            }
+        }
+
+        fn shadowed(shape: Shape) -> Shape {
+            Shape {
+                budget: Budgeted::Shadow,
+                ..shape
+            }
+        }
+
+        fn skipping(shape: Shape) -> Shape {
+            Shape {
+                skip_over: true,
+                ..shape
+            }
+        }
+
+        /// The bar on a TCP shape: the budget's standing queue under 300 ms in
+        /// every second, on the link and end to end, while the viewer reads
+        /// at least 0.9 of the link.
+        fn on_the_bar(r: &TcpRun, s: &Summary) {
+            let name = r.shape.name();
+            assert!(s.link_ms.1 < 300, "{name}: {s:?}");
+            assert!(s.transit_ms.1 < 300, "{name}: {s:?}");
+            assert!(pct(s.rx_bps, r) >= 90, "{name}: {s:?}");
+        }
+
+        /// A deep shape under today's two writers, then under the budget.
+        async fn deep_against_today(shape: Shape) {
+            let s = measured(&[shape, skipping(shape), budgeted(shape)]).await;
+            print_fresh_ratio(&s[0].1, &s[2]);
+            on_the_bar(&s[2].0, &s[2].1);
+        }
+
+        /// A control under today's writer, then under the budget, which
+        /// delivers at least 0.95 of what today's writer does.
+        async fn control_against_today(shape: Shape) {
+            let s = measured(&[shape, budgeted(shape)]).await;
+            print_fresh_ratio(&s[0].1, &s[1]);
+            assert!(
+                s[1].1.rx_bps * 100 >= s[0].1.rx_bps * 95,
+                "{}: {:?} against {:?}",
+                s[1].0.shape.name(),
+                s[1].1,
+                s[0].1
+            );
+        }
+
+        /// A stall shape under today's writer, then under the budget, whose
+        /// floor ends lower: a stall releases at most the budget.
+        async fn stalls_against_today(today: Shape) {
+            let s = measured(&[today, budgeted(today)]).await;
+            print_fresh_ratio(&s[0].1, &s[1]);
+            assert!(
+                s[1].1.floor < s[0].1.floor,
+                "{}: {:?} against {:?}",
+                s[1].0.shape.name(),
+                s[1].1,
+                s[0].1
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_deep_2_mbps_path_i() {
+            deep_against_today(shape(2_000_000, DEEP, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_deep_2_mbps_path_c() {
+            deep_against_today(shape(2_000_000, DEEP, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_deep_0_4_mbps_path_i() {
+            deep_against_today(shape(400_000, DEEP, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_deep_0_4_mbps_path_c() {
+            deep_against_today(shape(400_000, DEEP, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_shallow_2_mbps_path_i_control() {
+            control_against_today(shape(2_000_000, SHALLOW, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_shallow_2_mbps_path_c_control() {
+            control_against_today(shape(2_000_000, SHALLOW, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_shallow_0_4_mbps_path_i_control() {
+            control_against_today(shape(400_000, SHALLOW, OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_on_the_shallow_0_4_mbps_path_c_control() {
+            control_against_today(shape(400_000, SHALLOW, OpenPath::CookieEcho)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_under_stalls_2_mbps_path_i() {
+            stalls_against_today(stalled(OpenPath::InitAck)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_under_stalls_2_mbps_path_c() {
+            stalls_against_today(stalled(OpenPath::CookieEcho)).await;
+        }
+
+        /// Today's writer here is the VP9-444 pump's skip: at 1.5 times the
+        /// link a writer without one queues without end.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget against today's writers"]
+        async fn the_budget_under_stalls_at_1_5_x_2_mbps_path_i() {
+            stalls_against_today(skipping(Shape {
+                offer_pct: 150,
+                ..stalled(OpenPath::InitAck)
+            }))
+            .await;
+        }
+
+        /// FR-148 D46 — the slack's choice, each slack on the same three
+        /// shapes: the deep 2 Mbit/s path I shape (the queue the slack lets
+        /// stand), the stall shape at 1.5 times the link (what a head-of-line
+        /// stall costs while the budget is out), and the 2 Mbit/s path I
+        /// control (what it costs where SCTP's window governs). The standing
+        /// queue follows the slack.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget at three slacks"]
+        async fn the_budget_at_75_150_and_300_ms_of_slack() {
+            let deep_shape = shape(2_000_000, DEEP, OpenPath::InitAck);
+            let stall_shape = Shape {
+                offer_pct: 150,
+                ..stalled(OpenPath::InitAck)
+            };
+            let control_shape = shape(2_000_000, SHALLOW, OpenPath::InitAck);
+            let mut standing = Vec::new();
+            for slack in [75, 150, 300].map(Duration::from_millis) {
+                let at = |s: Shape| Shape {
+                    budget: Budgeted::Holds(slack),
+                    ..s
+                };
+                let s = measured(&[at(deep_shape), at(stall_shape), at(control_shape)]).await;
+                standing.push((ms(slack), s[0].1.link_ms.0));
+            }
+            assert!(
+                standing.windows(2).all(|w| w[0].1 < w[1].1),
+                "the deep shape's median standing queue by slack: {standing:?}"
+            );
+        }
+
+        /// FR-148 D46 B1 — the budget in shadow holds nothing. Today's plain
+        /// writer on the deep 2 Mbit/s path I shape, with the budget off and
+        /// then in shadow through the pumps' own [`Shadow`]: in both runs it
+        /// writes a frame at every tick and holds and skips none, while the
+        /// shadow's verdicts would have held frames. Then today's skip
+        /// writer, off and in shadow, whose skips follow the link's timing:
+        /// printed, not compared.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "a real-time measurement, not a CI gate (FR-148 D44): the in-flight budget in shadow against off"]
+        async fn the_inflight_budget_in_shadow_holds_nothing_on_a_shaped_link() {
+            let plain = shape(2_000_000, DEEP, OpenPath::InitAck);
+            let s = measured(&[
+                plain,
+                shadowed(plain),
+                skipping(plain),
+                shadowed(skipping(plain)),
+            ])
+            .await;
+            for (r, _) in &s[..2] {
+                let name = r.shape.name();
+                assert_eq!((r.held, r.skipped), (0, 0), "{name}: held or skipped");
+                // An abort can land between a tick and its write.
+                assert!(
+                    r.written > 0 && r.ticks.saturating_sub(r.written) <= 1,
+                    "{name}: {} ticks, {} written",
+                    r.ticks,
+                    r.written
+                );
+            }
+            let (off, shadow) = (&s[0].0, &s[1].0);
+            assert_eq!(off.would_hold, 0, "off computes nothing");
+            assert!(
+                shadow.would_hold > 0,
+                "the shadow's verdicts would have held frames: {}",
+                shadow.would_hold
+            );
+            for (r, _) in &s[2..] {
+                println!(
+                    "D46 | {}: ticks {}, written {}, skipped {}, held {}",
+                    r.shape.name(),
+                    r.ticks,
+                    r.written,
+                    r.skipped,
+                    r.held
+                );
+            }
         }
     }
 }

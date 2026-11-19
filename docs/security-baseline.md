@@ -754,8 +754,8 @@ as it is only after a check of its own shape:
 | Logged as it is | The check it passed |
 |---|---|
 | an upload's id (`files:end`, `files:cancel`, `files:resume`, a chunk) | `transfer_id` (above) |
-| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11448`) |
-| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10785`) |
+| `rc:layout.set`'s layout token | at most 16 hex digits (`agents/roomlerd/src/peer.rs:11465`) |
+| `rc:decode-error`'s codec and message | control characters dropped, cut short (`viewer_decode_error`, `agents/roomlerd/src/peer.rs:10802`) |
 
 The daemon's own ids (`anative-N`, `ahtml-N`, `aimg-N`, `ev-N`) and an error the
 host returns (its clipboard's, a socket's) hold nothing a viewer sent, and are
@@ -1313,9 +1313,9 @@ person at the device cannot turn the record off.
 The value in the daemon's line is never a secret, because no secret is on the config surface:
 `agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
 password record have no row there, and `apply` refuses them like any unknown key
-(`crates/agent-core/src/config_surface.rs:2913`). Two tests lock it:
-`secrets_and_identity_are_not_exposed` (`:4767`) and
-`no_external_credential_key_is_editable_through_the_config_surface` (`:5384`).
+(`crates/agent-core/src/config_surface.rs:2936`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:4790`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5449`).
 
 #3831 widened the allowlist by one read: `EncoderCaps`, the companion's encoder matrix. The
 daemon answers it from the probe's cached summary alone (`caps::summarize_cached`,
