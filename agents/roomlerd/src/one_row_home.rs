@@ -2789,7 +2789,12 @@ mod tests {
 
         /// A home as the package leaves it, on disk.
         fn a_home() -> (tempfile::TempDir, Places) {
-            let dir = tempfile::tempdir().unwrap();
+            a_home_in(&std::env::temp_dir())
+        }
+
+        /// [`a_home`], made under `root`.
+        fn a_home_in(root: &Path) -> (tempfile::TempDir, Places) {
+            let dir = tempfile::tempdir_in(root).unwrap();
             let at = Places::of(dir.path(), &RealFs);
             std::fs::create_dir_all(&at.folder).unwrap();
             std::fs::create_dir_all(&at.agents_dir).unwrap();
@@ -2931,7 +2936,10 @@ mod tests {
         /// `convert` over it is changed (3), not any other error (1).
         #[test]
         fn a_socket_at_the_config_is_not_regular() {
-            let (dir, at) = a_home();
+            // A socket's path holds at most 103 bytes on macOS (SUN_LEN), and
+            // the config's path under a Mac runner's `TMPDIR` is longer, so
+            // this home is made under `/tmp`.
+            let (dir, at) = a_home_in(Path::new("/tmp"));
             std::fs::remove_file(&at.config).unwrap();
             let _socket = std::os::unix::net::UnixListener::bind(&at.config).unwrap();
             assert!(matches!(
