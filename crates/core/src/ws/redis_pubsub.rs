@@ -40,8 +40,8 @@ impl RedisPubSub {
     /// old random id.
     pub async fn new(redis_url: &str, origin: String) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let publisher = RedisConnection::connect(client, RedisBounds::default()).await?;
-        info!("Redis Pub/Sub publisher connected to {}", redis_url);
+        let publisher = RedisConnection::connect(client.clone(), RedisBounds::default()).await?;
+        info!(addr = %client.get_connection_info().addr, "Redis Pub/Sub publisher connected");
         Ok(Self {
             publisher,
             channel: CHANNEL_NAME.to_string(),
