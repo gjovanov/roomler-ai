@@ -1203,6 +1203,7 @@ mod keeper_tests {
     use super::*;
     use crate::rc_sessions::RcSessionRegistry;
     use bson::oid::ObjectId;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering::SeqCst;
     use std::sync::{Condvar, Mutex, PoisonError};
     use std::time::Instant;
@@ -1216,8 +1217,11 @@ mod keeper_tests {
     /// A pass, a held request or a release comes within this of when it is
     /// due.
     const BOUND: Duration = Duration::from_millis(750);
-    /// A 10 ms timer later than this means the runtime stood still. The
-    /// daemon's canary warns at 100 ms; this leaves room for a loaded runner.
+    /// #4075 — the runtime stood still if its 10 ms timer was silent this much
+    /// longer than the control's, a 10 ms timer on a thread of its own, over
+    /// the same stretch ([`ControlTimer`]). The daemon's canary warns at a wake
+    /// 100 ms late; this leaves room for a loaded runner that wakes one thread
+    /// later than another.
     const LATE: Duration = Duration::from_millis(200);
     /// How long a request is left hanging while the keeper is watched.
     const HUNG_FOR: Duration = Duration::from_millis(1500);
@@ -1244,6 +1248,9 @@ mod keeper_tests {
         released: AtomicUsize,
         /// Each pass's posture, and when it was published.
         passes: Mutex<Vec<(Instant, Posture)>>,
+        /// #4075 — #3871's keeper put back, for one request
+        /// ([`Os::joined_on_the_runtime`]).
+        joins: AtomicBool,
     }
 
     impl Os {
@@ -1254,7 +1261,32 @@ mod keeper_tests {
                 began: AtomicUsize::new(0),
                 released: AtomicUsize::new(0),
                 passes: Mutex::new(Vec::new()),
+                joins: AtomicBool::new(false),
             }))
+        }
+
+        /// #4075 — #3871's keeper put back, to prove the test still catches
+        /// it: the first pass that finds a request in flight waits for it on
+        /// the runtime's thread it runs on, as that keeper's `acquire` joined
+        /// its `power-inhibit` thread there ([`Self::join_if_asked`]).
+        fn joined_on_the_runtime(self) -> Self {
+            self.0.joins.store(true, SeqCst);
+            self
+        }
+
+        /// The wait #3871 put inside a pass, when the test asked for it: until
+        /// the OS answers, or for as long as a request waits for an answer
+        /// that does not come. Once, so that the runtime goes on afterwards.
+        fn join_if_asked(&self) {
+            if self.began() == 0 || !self.0.joins.swap(false, SeqCst) {
+                return;
+            }
+            let answer = self.0.answer.lock().unwrap_or_else(PoisonError::into_inner);
+            let (_answer, _) = self
+                .0
+                .answered
+                .wait_timeout_while(answer, GIVES_UP, |answer| *answer == Answer::Hangs)
+                .unwrap_or_else(PoisonError::into_inner);
         }
 
         fn answer(&self, answer: Answer) {
@@ -1318,6 +1350,9 @@ mod keeper_tests {
                 }),
                 on_ac: Arc::new(|| Some(true)),
                 publish: Arc::new(move |p| {
+                    // #4075 — inside the pass, on the runtime's thread, where
+                    // #3871's keeper waited.
+                    records.join_if_asked();
                     records
                         .0
                         .passes
@@ -1409,21 +1444,94 @@ mod keeper_tests {
         }
     }
 
+    /// When a 10 ms timer woke, each time ([`canary`], [`ControlTimer`]).
+    #[derive(Clone, Default)]
+    struct Wakes(Arc<Mutex<Vec<Instant>>>);
+
+    impl Wakes {
+        fn woke(&self) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Instant::now());
+        }
+
+        /// The longest part of `from..to` in which the timer did not wake:
+        /// about 10 ms while it keeps time, and as long as it stood still
+        /// when it did. Both ends count as wakes, so a timer that has not
+        /// woken since it stood still is counted up to `to`.
+        fn longest_silence(&self, from: Instant, to: Instant) -> Duration {
+            let wakes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut last = from;
+            let mut longest = Duration::ZERO;
+            for at in wakes
+                .iter()
+                .copied()
+                .filter(|at| from < *at && *at < to)
+                .chain([to])
+            {
+                longest = longest.max(at.duration_since(last));
+                last = at;
+            }
+            longest
+        }
+    }
+
     /// A 10 ms timer beside the keeper, as the daemon's runtime canary is:
-    /// how late its latest wake came, at most.
-    fn canary() -> (Arc<Mutex<Duration>>, tokio::task::JoinHandle<()>) {
-        let worst = Arc::new(Mutex::new(Duration::ZERO));
-        let record = worst.clone();
+    /// when each of its wakes came.
+    fn canary() -> (Wakes, tokio::task::JoinHandle<()>) {
+        let wakes = Wakes::default();
+        let record = wakes.clone();
         let task = tokio::spawn(async move {
             loop {
-                let due = Instant::now() + Duration::from_millis(10);
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                let late = Instant::now().saturating_duration_since(due);
-                let mut worst = record.lock().unwrap_or_else(PoisonError::into_inner);
-                *worst = (*worst).max(late);
+                record.woke();
             }
         });
-        (worst, task)
+        (wakes, task)
+    }
+
+    /// #4075 — the control: a 10 ms timer like the canary, on a thread of its
+    /// own, which no request and no runtime can hold. A slow runner holds it
+    /// as it holds the runtime: a CI runner that does not schedule this
+    /// process, or `/usr/bin/sample` suspending the process to read every
+    /// thread's stack (`thread_dump`'s test points it at this one, beside
+    /// these on the macOS lane). What the runtime's timer stood still beyond
+    /// this one, the runtime stood still itself. Ticks until dropped.
+    struct ControlTimer {
+        wakes: Wakes,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ControlTimer {
+        fn start() -> Self {
+            let (wakes, stop) = (Wakes::default(), Arc::new(AtomicBool::new(false)));
+            let (record, stopped) = (wakes.clone(), stop.clone());
+            let thread = std::thread::Builder::new()
+                .name("control-timer".into())
+                .spawn(move || {
+                    while !stopped.load(SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                        record.woke();
+                    }
+                })
+                .expect("the control timer's thread starts");
+            Self {
+                wakes,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for ControlTimer {
+        fn drop(&mut self) {
+            self.stop.store(true, SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     /// Wait until `done`, `within` at most, or fail saying `what`.
@@ -1449,15 +1557,21 @@ mod keeper_tests {
 
     /// #3871 — logind paused while a session of `kind` is live: the request to
     /// stay awake hangs, and neither the keeper nor the runtime waits for it.
-    /// The passes go on at their pace and publish nothing held, a 10 ms timer
-    /// beside them stays on time, and one request is in flight however many
-    /// passes want one. Once the OS answers, the request is held; once the
-    /// session ends, it is let go. As in the field, the person socket's poll
-    /// has a lookup in flight on a blocking thread when the session starts.
-    async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(kind: Kind) {
-        let os = Os::answering(Answer::Hangs);
+    /// The runtime's 10 ms timer keeps time as well as a control on a thread
+    /// of its own does (#4075), the passes go on at their pace and publish
+    /// nothing held, and one request is in flight however many passes want
+    /// one. Once the OS answers, the request is held; once the session ends,
+    /// it is let go. As in the field, the person socket's poll has a lookup in
+    /// flight on a blocking thread when the session starts. `os` answers
+    /// nothing until told to, and may have #3871's keeper put back
+    /// ([`Os::joined_on_the_runtime`]).
+    async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(
+        kind: Kind,
+        os: Os,
+    ) {
         let device = Device::new();
-        let (worst, canary) = canary();
+        let (canary, canary_task) = canary();
+        let control = ControlTimer::start();
         let (stop, keeper) = device.keeper(&os);
         first_pass(&os).await;
         let poll = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(2500)));
@@ -1466,16 +1580,28 @@ mod keeper_tests {
         let session = device.start(kind);
         let started = Instant::now();
         tokio::time::sleep(HUNG_FOR).await;
+        let read = Instant::now();
         let passes = os.passes_since(started);
         let first = passes.first().map(|(at, _)| at.duration_since(started));
-        let late = *worst.lock().unwrap_or_else(PoisonError::into_inner);
+        // #4075 — both timers over the same stretch: whatever a slow runner
+        // did to this process, the control's silence shows as well.
+        let runtime = canary.longest_silence(started, read);
+        let runner = control.wakes.longest_silence(started, read);
         eprintln!(
             "{kind:?}: watched {:?} while the request hung: first pass after {first:?}, {} passes, \
-             {} held, {} requests began, the 10 ms timer at most {late:?} late",
-            started.elapsed(),
+             {} held, {} requests began; a 10 ms timer silent at most {runtime:?} on the runtime, \
+             {runner:?} on a thread of its own",
+            read.duration_since(started),
             passes.len(),
             passes.iter().filter(|(_, p)| p.held).count(),
             os.began(),
+        );
+        // First, as a runtime that stood still holds back every reading below.
+        assert!(
+            runtime <= runner + LATE,
+            "{kind:?}: the runtime's 10 ms timer was silent for {runtime:?}, {:?} longer than one \
+             on a thread of its own: the runtime stood still",
+            runtime.saturating_sub(runner)
         );
         assert!(
             first.is_some_and(|first| first <= EVERY + BOUND),
@@ -1493,10 +1619,6 @@ mod keeper_tests {
             "{kind:?}: nothing is published as held while the request hangs"
         );
         assert_eq!(os.began(), 1, "{kind:?}: one request in flight");
-        assert!(
-            late <= LATE,
-            "{kind:?}: the 10 ms timer woke {late:?} late: the runtime stood still"
-        );
 
         // The OS answers: held at once, not a pass later.
         let answered = Instant::now();
@@ -1520,7 +1642,7 @@ mod keeper_tests {
 
         let _ = stop.send(true);
         keeper.await.expect("the keeper ends");
-        canary.abort();
+        canary_task.abort();
         poll.await.expect("the stood-in poll lookup ends");
         assert_eq!(os.began(), 1, "{kind:?}: one request in all");
         assert_eq!(os.released(), 1, "{kind:?}: the one held, let go once");
@@ -1528,12 +1650,36 @@ mod keeper_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime_rc() {
-        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(Kind::Rc).await;
+        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(
+            Kind::Rc,
+            Os::answering(Answer::Hangs),
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime_ssh() {
-        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(Kind::Ssh).await;
+        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(
+            Kind::Ssh,
+            Os::answering(Answer::Hangs),
+        )
+        .await;
+    }
+
+    /// #4075 — the stall check still bites. With #3871's keeper put back, a
+    /// pass waits for the hung request on the runtime's thread: the runtime's
+    /// timer is silent until the request gives up while the control keeps
+    /// time, and the test fails on its first check, the runtime standing
+    /// still. One worker, so that the thread that waits is the one driving the
+    /// runtime's timers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[should_panic(expected = "the runtime stood still")]
+    async fn a_pass_that_waits_for_the_request_on_the_runtime_fails_as_a_stall() {
+        a_request_the_os_does_not_answer_holds_neither_the_keeper_nor_the_runtime(
+            Kind::Rc,
+            Os::answering(Answer::Hangs).joined_on_the_runtime(),
+        )
+        .await;
     }
 
     /// #3871 — a request the OS answers only after the session has ended is

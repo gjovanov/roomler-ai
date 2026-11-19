@@ -105,14 +105,37 @@ call.
 Tested in `power::keeper_tests`
 ([`power.rs:1202`](../agents/roomlerd/src/power.rs#L1202)) on a two-worker
 runtime with the OS stood in, on Linux, Windows and macOS. With the request
-unanswered, for an RC row and for an SSH hold, the passes go on at their pace and
-publish nothing held, a 10 ms timer beside them stays within 200 ms, and one
-request is in flight. Once answered, it is held at once and let go when the
-session ends. A request answered after the session ended is let go and never
-published as held. A keeper that stops while its request hangs stops at once, and
-the request is let go when it lands. A refused request is asked once a pass.
-Field verification is owed: a paused logind under a daemon-mode SSH session on a
-Linux system install.
+unanswered, for an RC row and for an SSH hold, the runtime keeps time, the passes
+go on at their pace and publish nothing held, and one request is in flight. Once
+answered, it is held at once and let go when the session ends. A request answered
+after the session ended is let go and never published as held. A keeper that
+stops while its request hangs stops at once, and the request is let go when it
+lands. A refused request is asked once a pass. Read in the field on the agent
+0.4.222 candidate (#3871): with logind paused for 45 s under a daemon-mode SSH
+shell, none of 3 runs stalled, against 2 of 3 on 0.4.221.
+
+**A runtime that stood still, told from a slow runner (#4075).** Whether the
+runtime kept time is read from two 10 ms timers over the same stretch: the canary
+on the runtime, and a control on a thread of its own that no request can hold
+([`power.rs:1501`](../agents/roomlerd/src/power.rs#L1501) `ControlTimer`). The
+test fails when the runtime's timer was silent more than 200 ms longer than the
+control's ([`power.rs:1601`](../agents/roomlerd/src/power.rs#L1601)). A slow
+runner holds both timers. On the macOS lane, for one, `thread_dump`'s test points
+`/usr/bin/sample` at the test process beside these, and `sample` suspends the
+process at every sample. In the run #4075 records, the runtime's timer woke 265 ms
+late while every other reading held. A pass that waits on the runtime holds only
+the runtime's timer.
+
+| Case | the runtime's timer | the control's | the test |
+|---|---|---|---|
+| A slow runner | silent while the process is held | silent as long | passes |
+| #3871's wait put back inside a pass | silent until the request gives up, 4 s | about 10 ms | fails: `the runtime stood still` |
+
+The second row runs in every lane
+([`power.rs:1677`](../agents/roomlerd/src/power.rs#L1677)
+`a_pass_that_waits_for_the_request_on_the_runtime_fails_as_a_stall`): the stood-in
+OS puts #3871's wait back inside a pass, on a runtime of one worker, and the test
+must fail saying the runtime stood still.
 
 ## 2. `power_policy`
 
@@ -311,7 +334,7 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
 
 | test | proves |
 |---|---|
-| `power::keeper_tests` (`roomlerd`) | the keeper never waits for the OS: a request logind does not answer holds neither the keeper nor the runtime, and is held once answered (§1.1) |
+| `power::keeper_tests` (`roomlerd`) | the keeper never waits for the OS: a request logind does not answer holds neither the keeper nor the runtime, and is held once answered. A runtime that stood still is told from a slow runner by a control timer on a thread of its own, and #3871's wait put back fails the test (§1.1) |
 | `power_brief_rides_the_heartbeat_and_is_optional`, `the_sleep_announcement_carries_the_posture_and_belongs_to_fleet` (`remote_control`) | the wire, both ways, and that a pre-P4 heartbeat still parses |
 | `an_announced_sleep_rides_the_offline_row_and_nothing_else_changes` (`fleet` `presence`) | the presence row, and the pre-P4 shape without a reason |
 | `sleep_notice::tests` (`roomlerd`) | the goodbye registry, the hold, the bound, the inhibitor rule |
