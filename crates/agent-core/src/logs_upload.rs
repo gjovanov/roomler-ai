@@ -108,6 +108,24 @@ pub const INITIAL_RETRY_BACKOFF_SECS: u64 = 5;
 
 pub const MAX_RETRY_BACKOFF_SECS: u64 = 60;
 
+/// #4067 — how long an idle connection may wait in the uploader's pool for
+/// the next batch. reqwest's default is 90 s, and the server closes an idle
+/// HTTP/1.1 connection after 30 s (#4018 measured it). A batch goes out on the
+/// first flush tick that finds lines queued, so a batch six ticks after the
+/// last one rode a connection idle for about 30 s, just as the server closed
+/// it: a request written in the last few tens of milliseconds before the
+/// server's FIN gets no answer. 10 s is a third of that close, the value of
+/// the self-view client's `POOL_IDLE_TIMEOUT`
+/// (`agents/roomlerd/src/self_view.rs`, #4066). A batch after a quiet spell
+/// dials a new connection, and a busy log's batches, one per tick, still share
+/// one. No POST is asked again at once: a failed batch is kept and sent after
+/// the backoff.
+pub const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const _: () = assert!(
+    POOL_IDLE_TIMEOUT.as_millis() <= 20_000,
+    "the pool must drop an idle connection well before the server's 30 s idle close (#4018)"
+);
+
 /// #3272 — lines the layer has dropped since the last batch said so. One
 /// process has one layer and one uploader, so a static joins them without
 /// changing what either hands over. A flood skews every fleet read off
@@ -295,10 +313,7 @@ pub async fn run_uploader(rx: mpsc::Receiver<LogLine>, config: UploadConfig) {
 }
 
 async fn run_uploader_paced(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig, pace: Pace) {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
+    let client = match client_builder(POOL_IDLE_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
             // Without a client we can't upload anything. Drain the
@@ -355,19 +370,7 @@ async fn run_uploader_paced(mut rx: mpsc::Receiver<LogLine>, config: UploadConfi
             continue;
         }
 
-        let payload = serde_json::json!({
-            "source": config.source.as_str(),
-            "agent_version": config.agent_version,
-            "host_id_hash": config.host_id_hash,
-            "lines": &buf,
-        });
-
-        let send = client
-            .post(&url)
-            .bearer_auth(config.agent_jwt.get())
-            .json(&payload)
-            .send()
-            .await;
+        let send = post_batch(&client, &url, &config, &buf).await;
 
         match send {
             Ok(resp) if resp.status().is_success() => {
@@ -411,6 +414,36 @@ async fn run_uploader_paced(mut rx: mpsc::Receiver<LogLine>, config: UploadConfi
 
         shed_oldest_half_if_full(&mut buf);
     }
+}
+
+/// The uploader's HTTP client, with `pool_idle` as its pool's idle timeout:
+/// [`POOL_IDLE_TIMEOUT`] in production, a short one in a test.
+fn client_builder(pool_idle: std::time::Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(pool_idle)
+}
+
+/// POSTs one batch of `lines` to `url`, with the enrollment's live token. What
+/// the answer, or a failed send, does to the batch is the caller's to decide.
+async fn post_batch(
+    client: &reqwest::Client,
+    url: &str,
+    config: &UploadConfig,
+    lines: &[LogLine],
+) -> reqwest::Result<reqwest::Response> {
+    let payload = serde_json::json!({
+        "source": config.source.as_str(),
+        "agent_version": config.agent_version,
+        "host_id_hash": config.host_id_hash,
+        "lines": lines,
+    });
+    client
+        .post(url)
+        .bearer_auth(config.agent_jwt.get())
+        .json(&payload)
+        .send()
+        .await
 }
 
 /// If the batch hits the cap after a failure (the queue keeps growing),
@@ -583,10 +616,42 @@ mod tests {
         max_backoff: Duration::from_millis(600),
     };
 
+    /// Reads one whole request off `s`, its head and then a body of its
+    /// Content-Length, and takes it out of `buf`, which keeps any bytes past
+    /// it for the next one. `false` when the connection ends first.
+    async fn read_request(s: &mut tokio::net::TcpStream, buf: &mut Vec<u8>) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 8192];
+        let mut want: Option<usize> = None;
+        loop {
+            if want.is_none()
+                && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                want = Some(end + 4 + len);
+            }
+            if let Some(total) = want
+                && buf.len() >= total
+            {
+                buf.drain(..total);
+                return true;
+            }
+            match s.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
     /// A loopback HTTP server that reads each whole request, counts it, and
     /// answers `status` with an empty body. Returns its base URL and the count.
     async fn counting_server(status: &'static str) -> (String, Arc<AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let posts = Arc::new(AtomicUsize::new(0));
@@ -595,31 +660,8 @@ mod tests {
             while let Ok((mut s, _)) = listener.accept().await {
                 let seen = seen.clone();
                 tokio::spawn(async move {
-                    let mut req: Vec<u8> = Vec::new();
-                    let mut chunk = [0u8; 8192];
-                    let mut want: Option<usize> = None;
-                    loop {
-                        if let Some(total) = want
-                            && req.len() >= total
-                        {
-                            break;
-                        }
-                        let n = s.read(&mut chunk).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        req.extend_from_slice(&chunk[..n]);
-                        if want.is_none()
-                            && let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n")
-                        {
-                            let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
-                            let len = head
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length:"))
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .unwrap_or(0);
-                            want = Some(end + 4 + len);
-                        }
+                    if !read_request(&mut s, &mut Vec::new()).await {
+                        return;
                     }
                     seen.fetch_add(1, Ordering::SeqCst);
                     let reply = format!(
@@ -630,6 +672,63 @@ mod tests {
             }
         });
         (base, posts)
+    }
+
+    struct KeptServer {
+        base: String,
+        connections: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl KeptServer {
+        /// `(connections accepted, requests read)` so far.
+        fn seen(&self) -> (usize, usize) {
+            (
+                self.connections.load(Ordering::SeqCst),
+                self.requests.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// #4067 — a loopback HTTP/1.1 server that answers every batch as the
+    /// server does, 201 and a short JSON body, and keeps the connection, so
+    /// the client's pool alone decides when one closes.
+    async fn keep_alive_server() -> KeptServer {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        {
+            let connections = connections.clone();
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = listener.accept().await {
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        while read_request(&mut s, &mut buf).await {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            let body = r#"{"status":"accepted"}"#;
+                            let reply = format!(
+                                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\n\r\n{body}",
+                                body.len()
+                            );
+                            if s.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        KeptServer {
+            base,
+            connections,
+            requests,
+        }
     }
 
     fn config(base: &str, token: &crate::token_slot::TokenSlot) -> UploadConfig {
@@ -709,6 +808,45 @@ mod tests {
         }
         uploader.abort();
         feeder.abort();
+    }
+
+    /// #4067 — the pool's idle timeout is the builder's, as #4066's is for the
+    /// self-view client: two batches 50 ms apart share one connection, and a
+    /// batch after the connection sat idle longer than the timeout dials a new
+    /// one. Production's value is held at 20 s or less by a const assertion
+    /// beside [`POOL_IDLE_TIMEOUT`]. The server answers as ours does, 201 with
+    /// a body nobody reads, so a connection is kept as it is in the field. The
+    /// timeout is 2 s so that a loaded CI runner would have to stall for almost
+    /// 2 s between the first two batches to split them.
+    #[tokio::test]
+    async fn a_connection_idle_past_the_pool_timeout_never_carries_a_batch() {
+        const IDLE: Duration = Duration::from_secs(2);
+        let srv = keep_alive_server().await;
+        let client = client_builder(IDLE).no_proxy().build().unwrap();
+        let token = crate::token_slot::TokenSlot::new("tok");
+        let cfg = config(&srv.base, &token);
+        let url = format!("{}/api/tenant/t1/agent/a1/logs", srv.base);
+        let lines = [LogLine {
+            ts: DateTime::now(),
+            level: LogLevel::Info,
+            target: "test".into(),
+            msg: "x".into(),
+            fields: Document::new(),
+        }];
+        let sent = post_batch(&client, &url, &cfg, &lines).await;
+        assert!(sent.unwrap().status().is_success());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sent = post_batch(&client, &url, &cfg, &lines).await;
+        assert!(sent.unwrap().status().is_success());
+        assert_eq!(srv.seen(), (1, 2), "50 ms apart: one connection");
+        tokio::time::sleep(IDLE + Duration::from_millis(500)).await;
+        let sent = post_batch(&client, &url, &cfg, &lines).await;
+        assert!(sent.unwrap().status().is_success());
+        assert_eq!(
+            srv.seen(),
+            (2, 3),
+            "idle past the timeout: a new connection"
+        );
     }
 
     /// #3816 — an uploaded line keeps its own text beside a field named

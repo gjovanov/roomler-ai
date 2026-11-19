@@ -1908,7 +1908,7 @@ neither line: its CLI names itself after an install (`installed: roomler <v>`, `
 dash, bash 5 and bash 3.2 (macOS's `/bin/sh`), both bashes in POSIX mode, against stand-ins for the
 feed, the downloads, `sudo` and the daemon. It checks every line above, that no control byte but newline
 and tab reaches the output, and that each case runs the commands `scripts/install-sh-output-check.calls`
-records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3131-3138`).
+records for its mode. CI runs it in the "macOS post-install roads" job (`.github/workflows/ci.yml:3133-3140`).
 
 ### What a bare host needs (#3204)
 
@@ -3296,7 +3296,7 @@ SIGPIPE, and the failed pipe read as "idle", as did a print that failed.
 container: a case for each reading, one where launchctl writes its answer in
 pieces, and a daemon that hangs on shutdown. CI's "macOS post-install roads"
 job runs it under the container's bash and again under bash 3.2, the version
-macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3129-3130`), and "macOS overlay
+macOS ships (`--bash 3.2`, `.github/workflows/ci.yml:3131-3132`), and "macOS overlay
 compile check" parses the script with a Mac's own `/bin/bash` (`bash -n`,
 `:1437-1442`).
 
