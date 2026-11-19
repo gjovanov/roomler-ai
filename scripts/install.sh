@@ -553,12 +553,12 @@ repair_tarball_owners() {
 
 # FR-96 — the update half of a per-user install. A per-user daemon runs as the
 # user and cannot write /usr, so its updates come from a ROOT one-shot helper
-# the package ships disabled: roomler-update.service, woken by
-# roomler-update.timer (boot + every 6 h) and roomler-update.path (the file a
-# pushed update touches). Enabled ONLY when this release's daemon steps aside
-# for it (`update-helper --capabilities` lists `step-aside`): beside a daemon
-# that still installs its own updates, two updaters would race. The words are
-# pinned by `the_capabilities_are_the_words_install_sh_matches`.
+# in the package, roomler-update.service, woken by roomler-update.timer
+# (boot + every 6 h) and roomler-update.path (the file a pushed update
+# touches); since FR-96 P5 the package's postinst enables both at its first
+# configure, this script ONLY when this release's daemon lists `step-aside`
+# in its `update-helper --capabilities`: else two updaters would race. The
+# words are pinned by `the_capabilities_are_the_words_install_sh_matches`.
 # ⚠️ Every branch here ends in a construct that returns 0: under `set -e` a
 # function whose last command fails would abort the whole install.
 enable_update_helper() {
@@ -1214,7 +1214,7 @@ install_tunnel_linux() {
             say "download-only: would run: sudo dpkg -i $deb (the tarball instead, if its dependencies cannot be met here)"
             return 0
         fi
-        sudo dpkg -i "$deb" || sudo apt-get -f install -y
+        sudo dpkg --force-confold -i "$deb" </dev/null || sudo apt-get -f install -y -o Dpkg::Options::=--force-confold </dev/null
         # #2472 — a .deb whose dependencies this distro cannot meet is REMOVED
         # again by `apt-get -f`, and nothing is installed: tunnel-v0.3.0-rc.266
         # wants libssl3t64, which Debian 12 and Ubuntu 22.04 call libssl3. The
@@ -1484,12 +1484,12 @@ as_root() {
 # package keeps it in the solution, so apt refuses instead and what dpkg unpacked
 # stays. --fix-broken has to stay too: without it apt will not touch a package
 # dpkg left half-configured, and stops before it looks for a dependency.
-# $2, optional, is one more apt-get option.
+# $2, optional, is one more apt-get option. An edited conffile is kept (#3926).
 deb_install() {
-    as_root dpkg -i "$1" && return 0
+    as_root dpkg --force-confold -i "$1" </dev/null && return 0
     as_root apt-get update -qq ||
         warn "apt-get update failed: resolving the dependencies from the package lists this host already has"
-    as_root apt-get install -y --fix-broken -o DPkg::Lock::Timeout=60 ${2:-} "$1"
+    as_root apt-get install -y --fix-broken -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold ${2:-} "$1" </dev/null
 }
 
 # Relay a privileged helper's report: every line said, every FAILED line
